@@ -102,10 +102,16 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameReader, FrameWriter};
-    use mqtt_codec::{packet::ConnAck, Packet, ProtocolVersion};
+    use super::{FrameReader, FrameWriter, MAX_BUFFERED_BYTES};
+    use crate::NetError;
+    use mqtt_codec::{packet::ConnAck, CodecError, Packet, ProtocolVersion};
+    use tokio::io::AsyncWriteExt;
 
     const V4: ProtocolVersion = ProtocolVersion::V311;
+
+    // Sanity for the oversized-packet test: its claimed size (2 MiB) really is
+    // beyond the buffer ceiling.
+    const _: () = assert!(2_097_152 > MAX_BUFFERED_BYTES);
 
     #[tokio::test]
     async fn write_then_read_roundtrip_over_duplex() {
@@ -136,5 +142,50 @@ mod tests {
         );
         // Clean EOF once the writer is dropped.
         assert_eq!(reader.next_packet().await.unwrap(), None);
+    }
+
+    /// A peer declaring a packet larger than the buffer ceiling must be cut off
+    /// with `PacketTooLarge`, not buffered without bound. The codec itself has
+    /// no size cap — this reader is the enforcement point.
+    #[tokio::test]
+    async fn oversized_packet_is_rejected_not_buffered() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+
+        // PUBLISH fixed header claiming a 2 MiB remaining length (varint), then
+        // a stream of filler the reader will buffer while waiting for the rest.
+        tokio::spawn(async move {
+            let header: &[u8] = &[0x30, 0x80, 0x80, 0x80, 0x01]; // 2_097_152
+            let _ = client.write_all(header).await;
+            let chunk = vec![0u8; 64 * 1024];
+            loop {
+                if client.write_all(&chunk).await.is_err() {
+                    return; // reader hung up after rejecting
+                }
+            }
+        });
+
+        let mut reader = FrameReader::new(server, V4);
+        match reader.next_packet().await {
+            Err(NetError::Codec(CodecError::PacketTooLarge)) => {}
+            other => panic!("expected PacketTooLarge, got {other:?}"),
+        }
+    }
+
+    /// A stream ending in the middle of a packet is an error, not a clean EOF —
+    /// silently dropping a half-received packet would mask truncation attacks.
+    #[tokio::test]
+    async fn eof_mid_packet_is_an_error() {
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        // First three bytes of a four-byte CONNACK, then hang up. Dropping the
+        // whole stream (not a split half, which would keep it open) is the EOF.
+        client.write_all(&[0x20, 0x02, 0x00]).await.unwrap();
+        drop(client);
+
+        let mut reader = FrameReader::new(server, V4);
+        match reader.next_packet().await {
+            Err(NetError::UnexpectedEof) => {}
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
     }
 }

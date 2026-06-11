@@ -115,4 +115,20 @@ mod tests {
         assert!(t.matching_clients("x").is_empty());
         assert_eq!(t.filter_count(), 0);
     }
+
+    /// Resubscribing is idempotent, and the gossiped interest snapshot lists
+    /// each filter once no matter how many clients share it.
+    #[test]
+    fn resubscribe_is_idempotent_and_filters_are_distinct() {
+        let mut t = SubscriptionTable::new();
+        t.subscribe(cid("a"), "x".into());
+        t.subscribe(cid("a"), "x".into());
+        t.subscribe(cid("b"), "x".into());
+        assert_eq!(t.matching_clients("x").len(), 2);
+        assert_eq!(t.filters(), vec!["x".to_string()]);
+
+        // Unsubscribing a filter that was never held is harmless.
+        t.unsubscribe(&cid("a"), "never-subscribed");
+        assert_eq!(t.matching_clients("x").len(), 2);
+    }
 }

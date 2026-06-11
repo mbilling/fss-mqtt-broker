@@ -473,3 +473,331 @@ fn publish_packet(topic: &str, payload: Bytes) -> Packet {
         payload,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Hub, HubCommand, Outbound, PeerOutbound, REPLAY_LIMIT};
+    use bytes::Bytes;
+    use mqtt_cluster::peer::PeerMessage;
+    use mqtt_cluster::NodeId;
+    use mqtt_codec::Packet;
+    use mqtt_core::ClientId;
+    use mqtt_storage::MemorySessionStore;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    type HubTx = mpsc::UnboundedSender<HubCommand>;
+
+    fn start_hub() -> HubTx {
+        let (hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            Box::new(MemorySessionStore::new()),
+        );
+        tokio::spawn(hub.run());
+        tx
+    }
+
+    async fn attach(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+        clean_session: bool,
+    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+        let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.into()),
+            conn_id,
+            clean_session,
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        let session_present = reply_rx.await.unwrap();
+        (out_rx, session_present)
+    }
+
+    fn detach(tx: &HubTx, client: &str, conn_id: u64) {
+        tx.send(HubCommand::Detach {
+            client: ClientId(client.into()),
+            conn_id,
+        })
+        .unwrap();
+    }
+
+    fn subscribe(tx: &HubTx, client: &str, filter: &str) {
+        tx.send(HubCommand::Subscribe {
+            client: ClientId(client.into()),
+            filters: vec![filter.into()],
+        })
+        .unwrap();
+    }
+
+    fn publish(tx: &HubTx, topic: &str, payload: &'static [u8]) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+        })
+        .unwrap();
+    }
+
+    fn connect_peer(tx: &HubTx, node: &str, conn_id: u64) -> mpsc::UnboundedReceiver<PeerMessage> {
+        let (peer_tx, peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+        tx.send(HubCommand::PeerConnected {
+            node: NodeId(node.into()),
+            conn_id,
+            tx: peer_tx,
+        })
+        .unwrap();
+        peer_rx
+    }
+
+    fn remote_interest(tx: &HubTx, node: &str, filters: &[&str]) {
+        tx.send(HubCommand::RemoteInterest {
+            node: NodeId(node.into()),
+            filters: filters.iter().map(|f| (*f).to_string()).collect(),
+        })
+        .unwrap();
+    }
+
+    async fn recv_packet(rx: &mut mpsc::UnboundedReceiver<Packet>) -> Option<Packet> {
+        timeout(Duration::from_millis(300), rx.recv()).await.ok()?
+    }
+
+    async fn recv_peer(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> Option<PeerMessage> {
+        timeout(Duration::from_millis(300), rx.recv()).await.ok()?
+    }
+
+    fn payload_of(packet: &Packet) -> &[u8] {
+        match packet {
+            Packet::Publish(p) => &p.payload,
+            other => panic!("expected a publish, got {other:?}"),
+        }
+    }
+
+    /// A second connection for the same client id takes the session over: the
+    /// old channel closes, and a stale `Detach` from the replaced connection
+    /// must not disturb the new one (the `conn_id` guard).
+    #[tokio::test]
+    async fn takeover_replaces_connection_and_ignores_stale_detach() {
+        let tx = start_hub();
+        let (mut rx1, _) = attach(&tx, "c", 1, false).await;
+        subscribe(&tx, "c", "t");
+
+        let (mut rx2, present) = attach(&tx, "c", 2, false).await;
+        assert!(present, "persistent session is present on takeover");
+        assert!(
+            recv_packet(&mut rx1).await.is_none(),
+            "old connection's channel must close on takeover"
+        );
+
+        publish(&tx, "t", b"after-takeover");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx2).await.unwrap()),
+            b"after-takeover"
+        );
+
+        // The replaced connection's deferred Detach arrives late.
+        detach(&tx, "c", 1);
+        publish(&tx, "t", b"still-live");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx2).await.unwrap()),
+            b"still-live",
+            "a stale detach must not deregister the new connection"
+        );
+    }
+
+    /// `PeerDead` drops the link and interest unconditionally; a stale
+    /// `PeerDisconnected` from the old link must not kill a replacement link.
+    #[tokio::test]
+    async fn peer_dead_drops_routing_and_stale_peer_disconnect_is_ignored() {
+        let tx = start_hub();
+        let mut p1 = connect_peer(&tx, "n", 1);
+        assert!(
+            matches!(recv_peer(&mut p1).await, Some(PeerMessage::Interest { .. })),
+            "link setup sends our interest snapshot"
+        );
+        remote_interest(&tx, "n", &["t/#"]);
+        publish(&tx, "t/x", b"1");
+        assert!(matches!(
+            recv_peer(&mut p1).await,
+            Some(PeerMessage::Publish { .. })
+        ));
+
+        tx.send(HubCommand::PeerDead {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
+        assert!(
+            recv_peer(&mut p1).await.is_none(),
+            "dropping the peer entry must close its outbound channel"
+        );
+
+        // The node rejoins on a new link; the old link's Detach is still in flight.
+        let mut p2 = connect_peer(&tx, "n", 2);
+        assert!(matches!(
+            recv_peer(&mut p2).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        remote_interest(&tx, "n", &["t/#"]);
+        tx.send(HubCommand::PeerDisconnected {
+            node: NodeId("n".into()),
+            conn_id: 1,
+        })
+        .unwrap();
+        publish(&tx, "t/y", b"2");
+        assert!(
+            matches!(recv_peer(&mut p2).await, Some(PeerMessage::Publish { .. })),
+            "a stale disconnect must not deregister the replacement link"
+        );
+    }
+
+    /// Offline messages queue for persistent sessions (and replay in order on
+    /// reconnect); clean sessions lose everything at detach.
+    #[tokio::test]
+    async fn offline_messages_queue_only_for_persistent_sessions() {
+        let tx = start_hub();
+
+        let (_rx, present) = attach(&tx, "p", 1, false).await;
+        assert!(!present);
+        subscribe(&tx, "p", "q/1");
+        detach(&tx, "p", 1);
+        publish(&tx, "q/1", b"first");
+        publish(&tx, "q/1", b"second");
+
+        let (mut rx, present) = attach(&tx, "p", 2, false).await;
+        assert!(present);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"first");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"second");
+
+        // Clean session: subscription and queue die with the connection.
+        let (_rx, _) = attach(&tx, "c", 3, true).await;
+        subscribe(&tx, "c", "q/2");
+        detach(&tx, "c", 3);
+        publish(&tx, "q/2", b"lost");
+        let (mut rx, present) = attach(&tx, "c", 4, true).await;
+        assert!(!present);
+        assert!(recv_packet(&mut rx).await.is_none());
+    }
+
+    /// Connecting with `clean_session=true` discards any prior persistent state
+    /// for that client id.
+    #[tokio::test]
+    async fn clean_session_attach_wipes_prior_persistent_state() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "w", 1, false).await;
+        subscribe(&tx, "w", "w/t");
+        detach(&tx, "w", 1);
+
+        let (_rx, present) = attach(&tx, "w", 2, true).await;
+        assert!(!present, "clean attach must not report a session");
+        detach(&tx, "w", 2);
+
+        publish(&tx, "w/t", b"gone");
+        let (mut rx, present) = attach(&tx, "w", 3, false).await;
+        assert!(!present, "the persistent session was wiped");
+        assert!(recv_packet(&mut rx).await.is_none(), "nothing was queued");
+    }
+
+    /// Publishes fan out only to peers whose announced interest matches
+    /// (wildcards honored), and a peer-forwarded publish is never re-forwarded.
+    #[tokio::test]
+    async fn publishes_forward_only_to_peers_with_matching_interest() {
+        let tx = start_hub();
+        let mut p1 = connect_peer(&tx, "n1", 1);
+        let mut p2 = connect_peer(&tx, "n2", 2);
+        recv_peer(&mut p1).await; // initial interest snapshots
+        recv_peer(&mut p2).await;
+        remote_interest(&tx, "n1", &["a/+/b"]);
+        remote_interest(&tx, "n2", &["x/#"]);
+
+        publish(&tx, "a/q/b", b"to-n1");
+        match recv_peer(&mut p1).await {
+            Some(PeerMessage::Publish { topic, .. }) => assert_eq!(topic, "a/q/b"),
+            other => panic!("n1 should receive the publish, got {other:?}"),
+        }
+
+        publish(&tx, "x/1", b"to-n2");
+        match recv_peer(&mut p2).await {
+            Some(PeerMessage::Publish { topic, .. }) => assert_eq!(topic, "x/1"),
+            other => panic!("n2 should receive the publish, got {other:?}"),
+        }
+
+        // A publish forwarded *from* a peer is delivered locally only.
+        tx.send(HubCommand::RemotePublish {
+            topic: "x/2".into(),
+            payload: Bytes::from_static(b"no-relay"),
+        })
+        .unwrap();
+        // Neither peer may see anything further (n1's non-match included).
+        assert!(recv_peer(&mut p2).await.is_none(), "remote publish relayed");
+        assert!(p1.try_recv().is_err(), "n1 got a non-matching publish");
+    }
+
+    /// Local interest changes (subscribe / unsubscribe / clean-session detach)
+    /// are gossiped to every connected peer as fresh snapshots.
+    #[tokio::test]
+    async fn interest_snapshots_follow_subscription_changes() {
+        let tx = start_hub();
+        let mut p = connect_peer(&tx, "n", 1);
+        match recv_peer(&mut p).await {
+            Some(PeerMessage::Interest { filters }) => assert!(filters.is_empty()),
+            other => panic!("expected the initial snapshot, got {other:?}"),
+        }
+
+        let (_rx, _) = attach(&tx, "g", 1, true).await;
+        subscribe(&tx, "g", "g/1");
+        match recv_peer(&mut p).await {
+            Some(PeerMessage::Interest { filters }) => assert_eq!(filters, vec!["g/1"]),
+            other => panic!("expected updated interest, got {other:?}"),
+        }
+
+        tx.send(HubCommand::Unsubscribe {
+            client: ClientId("g".into()),
+            filters: vec!["g/1".into()],
+        })
+        .unwrap();
+        match recv_peer(&mut p).await {
+            Some(PeerMessage::Interest { filters }) => assert!(filters.is_empty()),
+            other => panic!("expected emptied interest, got {other:?}"),
+        }
+
+        // A clean-session client disappearing also shrinks our interest.
+        subscribe(&tx, "g", "g/2");
+        recv_peer(&mut p).await; // snapshot with g/2
+        detach(&tx, "g", 1);
+        match recv_peer(&mut p).await {
+            Some(PeerMessage::Interest { filters }) => assert!(filters.is_empty()),
+            other => panic!("expected post-detach interest, got {other:?}"),
+        }
+    }
+
+    /// Replay is bounded by `REPLAY_LIMIT` per reconnect; the remainder stays
+    /// queued (unacked) for the next one.
+    #[tokio::test]
+    async fn replay_is_bounded_and_resumes_on_next_connect() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe(&tx, "r", "rl");
+        detach(&tx, "r", 1);
+        for _ in 0..(REPLAY_LIMIT + 2) {
+            publish(&tx, "rl", b"m");
+        }
+
+        let (mut rx, _) = attach(&tx, "r", 2, false).await;
+        let mut replayed = 0usize;
+        while recv_packet(&mut rx).await.is_some() {
+            replayed += 1;
+        }
+        assert_eq!(replayed, REPLAY_LIMIT);
+
+        detach(&tx, "r", 2);
+        let (mut rx, _) = attach(&tx, "r", 3, false).await;
+        let mut rest = 0usize;
+        while recv_packet(&mut rx).await.is_some() {
+            rest += 1;
+        }
+        assert_eq!(rest, 2, "unreplayed tail must survive for the next connect");
+    }
+}

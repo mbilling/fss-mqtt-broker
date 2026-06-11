@@ -74,12 +74,22 @@ pub fn client_connector(
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-/// Parse the host part of `addr` (`host:port` or bare host) into the
-/// [`ServerName`] to verify a dialed peer's certificate against.
+/// Parse the host part of `addr` (`host:port`, `[v6]:port`, or bare host) into
+/// the [`ServerName`] to verify a dialed peer's certificate against.
 ///
 /// # Errors
 /// [`NetError::Tls`] if the host is neither a valid DNS name nor an IP address.
 pub fn server_name(addr: &str) -> Result<ServerName<'static>, NetError> {
+    // Socket-address forms first ("127.0.0.1:7001", "[::1]:7001"): IPv6 hosts
+    // contain colons, so naive host:port splitting would mangle them.
+    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+        return Ok(ServerName::IpAddress(sock.ip().into()));
+    }
+    // A bare IP address ("::1", "10.0.0.1").
+    if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    // Otherwise a DNS name, optionally with a port to strip.
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
     ServerName::try_from(host.to_string())
         .map_err(|_| NetError::Tls(format!("invalid TLS server name: {host:?}")))
@@ -177,5 +187,18 @@ mod tests {
         assert!(server_name("127.0.0.1:7001").is_ok());
         assert!(server_name("broker.example.com").is_ok());
         assert!(server_name("not a hostname:1").is_err());
+    }
+
+    #[test]
+    fn server_name_handles_ipv6_hosts() {
+        use rustls::pki_types::ServerName;
+        // Bracketed socket-address form and bare-address forms must all resolve
+        // to IP server names, not be mangled by host:port splitting.
+        for addr in ["[::1]:7001", "::1", "2001:db8::1", "[2001:db8::1]:8883"] {
+            match server_name(addr) {
+                Ok(ServerName::IpAddress(_)) => {}
+                other => panic!("{addr:?} should parse as an IP server name, got {other:?}"),
+            }
+        }
     }
 }

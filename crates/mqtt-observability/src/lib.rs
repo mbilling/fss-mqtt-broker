@@ -64,12 +64,27 @@ impl AuditChain {
 }
 
 /// Placeholder chaining function — replaced by a cryptographic hash later.
+///
+/// Even as a placeholder it must absorb **every** field and keep field
+/// boundaries unambiguous (length-prefixed), or tampering with a subject — or
+/// shifting bytes between kind and detail — would go undetected.
 fn mix(prev: u64, event: &AuditEvent) -> u64 {
     let mut h = prev ^ 0x9e37_79b9_7f4a_7c15;
-    for b in event.kind.bytes().chain(event.detail.bytes()) {
+    h = absorb(h, event.kind.as_bytes());
+    h = absorb(
+        h,
+        event.subject.as_deref().unwrap_or("\u{0}none").as_bytes(),
+    );
+    h = absorb(h, event.detail.as_bytes());
+    h ^ event.seq
+}
+
+fn absorb(mut h: u64, bytes: &[u8]) -> u64 {
+    h = h.rotate_left(11) ^ (bytes.len() as u64);
+    for &b in bytes {
         h = h.rotate_left(5) ^ u64::from(b);
     }
-    h ^ event.seq
+    h
 }
 
 #[cfg(test)]
@@ -89,5 +104,42 @@ mod tests {
 
         // Different ordering of the same events yields a different head hash.
         assert_ne!(head_ab, b.head());
+    }
+
+    /// Tampering with **any** field of a recorded event — including the subject
+    /// — must change the chain head. This is the property the audit log exists
+    /// to provide.
+    #[test]
+    fn tampering_with_any_field_changes_the_head() {
+        let baseline = |kind: &str, subject: Option<&str>, detail: &str| {
+            let mut c = AuditChain::new();
+            c.append("auth.success", Some("alice".into()), "login");
+            c.append(kind, subject.map(String::from), detail);
+            c.head()
+        };
+        let original = baseline("acl.deny", Some("bob"), "publish a/b");
+
+        assert_ne!(original, baseline("acl.allow", Some("bob"), "publish a/b"));
+        assert_ne!(original, baseline("acl.deny", Some("eve"), "publish a/b"));
+        assert_ne!(original, baseline("acl.deny", None, "publish a/b"));
+        assert_ne!(original, baseline("acl.deny", Some("bob"), "publish a/c"));
+    }
+
+    /// Field boundaries are part of the hash: moving bytes between kind and
+    /// detail (same concatenation) must not collide.
+    #[test]
+    fn field_boundaries_are_unambiguous() {
+        let mut a = AuditChain::new();
+        a.append("ab", None, "c");
+        let mut b = AuditChain::new();
+        b.append("a", None, "bc");
+        assert_ne!(a.head(), b.head());
+
+        // A subject of "x" differs from no subject with "x" prepended to detail.
+        let mut c = AuditChain::new();
+        c.append("k", Some("x".into()), "d");
+        let mut d = AuditChain::new();
+        d.append("k", None, "xd");
+        assert_ne!(c.head(), d.head());
     }
 }

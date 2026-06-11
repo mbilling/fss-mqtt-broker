@@ -842,6 +842,153 @@ mod tests {
         assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
     }
 
+    /// The helper side of indirect probing: a `PingReq` is relayed as a fresh
+    /// `Ping`, and the target's `Ack` is reported back to the original
+    /// requester as an `IndirectAck`.
+    #[test]
+    fn helper_relays_pingreq_and_reports_indirect_ack() {
+        let mut h = node("h", "h:1", &[]);
+        let actions = h.handle(
+            m(
+                "a",
+                "a:1",
+                Kind::PingReq {
+                    target: "c".into(),
+                    target_addr: "c:1".into(),
+                },
+                vec![],
+            ),
+            0,
+        );
+        let relayed_seq = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { to, msg } if to == "c:1" => match msg.kind {
+                    Kind::Ping { seq } => Some(seq),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("helper relays a Ping to the target");
+
+        // The target acks the relayed ping: the requester gets an IndirectAck.
+        let actions = h.handle(m("c", "c:1", Kind::Ack { seq: relayed_seq }, vec![]), 10);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Send { to, msg } if to == "a:1"
+                && matches!(&msg.kind, Kind::IndirectAck { target } if target == "c")
+        )));
+    }
+
+    /// The requester side: an `IndirectAck` for the in-flight probe target
+    /// resolves the probe, so the target is never suspected.
+    #[test]
+    fn indirect_ack_rescues_probed_target() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+
+        s.tick(0); // bootstrap
+        s.tick(100); // Ping b
+        s.tick(120); // direct ack missed -> indirect phase (deadline 140)
+        s.handle(
+            m("c", "c:1", Kind::IndirectAck { target: "b".into() }, vec![]),
+            130,
+        );
+        // Past every deadline: b must still be Alive.
+        s.tick(141);
+        s.tick(400);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+    }
+
+    /// At equal incarnation the claim with higher precedence wins:
+    /// `Dead` > `Suspect` > `Alive`, and never backwards.
+    #[test]
+    fn equal_incarnation_uses_state_precedence() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        let claim = |state| Update {
+            id: "b".into(),
+            addr: "b:1".into(),
+            peer_addr: peer_addr_of("b:1"),
+            incarnation: 5,
+            state,
+        };
+
+        s.apply_update(&claim(MemberState::Alive), 0, &mut out);
+        s.apply_update(&claim(MemberState::Suspect), 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        // Alive at the same incarnation cannot clear the suspicion...
+        s.apply_update(&claim(MemberState::Alive), 2, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        // ...Dead supersedes Suspect, and nothing walks Dead back.
+        s.apply_update(&claim(MemberState::Dead), 3, &mut out);
+        s.apply_update(&claim(MemberState::Suspect), 4, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+    }
+
+    /// An update is piggybacked `~gossip_multiplier * log2(N)` times, then
+    /// dropped from the gossip buffer — dissemination must terminate.
+    #[test]
+    fn gossip_updates_stop_after_transmit_limit() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+
+        // One member: n = 1 + 2 = 3, floor(log2 3)+1 = 2 bits, limit = 3*2 = 6.
+        let mut transmissions = 0;
+        while !s.take_gossip().is_empty() {
+            transmissions += 1;
+            assert!(transmissions <= 6, "gossip never expired");
+        }
+        assert_eq!(transmissions, 6);
+    }
+
+    /// Dead members are excluded from the probe rotation.
+    #[test]
+    fn dead_members_are_not_probed() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(
+            &Update {
+                id: "b".into(),
+                addr: "b:1".into(),
+                peer_addr: peer_addr_of("b:1"),
+                incarnation: 0,
+                state: MemberState::Dead,
+            },
+            0,
+            &mut out,
+        );
+
+        s.tick(0); // bootstrap
+        for now in [100, 200, 300, 400] {
+            let actions = s.tick(now);
+            assert!(
+                !actions.iter().any(|a| matches!(
+                    a,
+                    Action::Send { msg, .. } if matches!(msg.kind, Kind::Ping { .. })
+                )),
+                "a dead member was probed at t={now}"
+            );
+        }
+    }
+
+    /// A member that moves (new addresses at a higher incarnation) has both its
+    /// SWIM and routing addresses adopted.
+    #[test]
+    fn address_change_at_higher_incarnation_is_adopted() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&alive_update("b", "b:9", 1), 1, &mut out);
+
+        let b = s.members().into_iter().find(|m| m.id.0 == "b").unwrap();
+        assert_eq!(b.addr, "b:9");
+        assert_eq!(b.peer_addr, peer_addr_of("b:9"));
+        assert_eq!(b.incarnation, 1);
+    }
+
     #[test]
     fn join_triggers_full_state_sync() {
         let mut s = node("a", "a:1", &[]);

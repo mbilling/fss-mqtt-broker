@@ -325,6 +325,76 @@ mod tests {
         assert_eq!(remaining[0].offset, 3);
     }
 
+    /// Re-delivering an ack (or a stale, already-truncated offset) must be a
+    /// no-op — failovers replay acks, and a panic or over-truncation here would
+    /// lose messages.
+    #[tokio::test]
+    async fn ack_is_idempotent_and_ignores_stale_offsets() {
+        let store = MemorySessionStore::new();
+        let c = cid("client");
+        store.ensure_session(&c).await.unwrap();
+        for _ in 0..3 {
+            store.enqueue(&c, &msg("a", b"x")).await.unwrap();
+        }
+        store.ack(&c, 2).await.unwrap();
+        store.ack(&c, 2).await.unwrap(); // repeat
+        store.ack(&c, 1).await.unwrap(); // stale
+        let remaining = store.pending(&c, 0, 100).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].offset, 3);
+    }
+
+    /// Walking the queue page by page (the reconnect-replay pattern) visits
+    /// every message exactly once, in offset order.
+    #[tokio::test]
+    async fn pending_pages_through_the_log_in_offset_order() {
+        let store = MemorySessionStore::new();
+        let c = cid("client");
+        store.ensure_session(&c).await.unwrap();
+        for _ in 0..5 {
+            store.enqueue(&c, &msg("a", b"x")).await.unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = store.pending(&c, after, 2).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().unwrap().offset;
+            seen.extend(page.into_iter().map(|m| m.offset));
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Subscriptions are replaced wholesale and survive until the session is
+    /// removed (broker-restart reconciliation depends on this).
+    #[tokio::test]
+    async fn subscriptions_roundtrip_and_replace() {
+        let store = MemorySessionStore::new();
+        let c = cid("client");
+        let sub = |f: &str| mqtt_core::Subscription {
+            filter: f.to_string(),
+            max_qos: QoS::AtMostOnce,
+            no_local: false,
+        };
+        store
+            .set_subscriptions(&c, &[sub("a/#"), sub("b/+")])
+            .await
+            .unwrap();
+        let got = store.subscriptions(&c).await.unwrap();
+        assert_eq!(got.len(), 2);
+
+        // Replacement is wholesale, not a merge.
+        store.set_subscriptions(&c, &[sub("c")]).await.unwrap();
+        let got = store.subscriptions(&c).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].filter, "c");
+
+        store.remove(&c).await.unwrap();
+        assert!(store.subscriptions(&c).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn remove_clears_session() {
         let store = MemorySessionStore::new();

@@ -105,4 +105,36 @@ mod tests {
         assert!(!z.authorize_publish(&id, &"a/b".to_string()));
         assert!(!z.authorize_subscribe(&id, &"a/#".to_string()));
     }
+
+    /// The allow path through the trait object: a custom policy can grant
+    /// per-identity access where `DenyAll` would refuse (the shape every real
+    /// `Authorizer` implementation will take).
+    #[test]
+    fn custom_authorizer_allow_path_works_through_the_trait() {
+        struct PrefixPolicy;
+        impl Authorizer for PrefixPolicy {
+            fn authorize_publish(&self, identity: &Identity, topic: &TopicName) -> bool {
+                topic.starts_with(&format!("users/{}/", identity.subject))
+            }
+            fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool {
+                identity.groups.iter().any(|g| g == "readers")
+                    || self.authorize_publish(identity, filter)
+            }
+        }
+
+        let alice = Identity {
+            subject: "alice".into(),
+            groups: vec![],
+        };
+        let reader = Identity {
+            subject: "bob".into(),
+            groups: vec!["readers".into()],
+        };
+        let z: &dyn Authorizer = &PrefixPolicy;
+
+        assert!(z.authorize_publish(&alice, &"users/alice/state".to_string()));
+        assert!(!z.authorize_publish(&alice, &"users/eve/state".to_string()));
+        assert!(z.authorize_subscribe(&reader, &"anything/#".to_string()));
+        assert!(!z.authorize_subscribe(&alice, &"anything/#".to_string()));
+    }
 }

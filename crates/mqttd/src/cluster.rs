@@ -77,3 +77,149 @@ pub async fn maintain_peer_links(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::maintain_peer_links;
+    use crate::hub::HubCommand;
+    use mqtt_cluster::swim::MemberState;
+    use mqtt_cluster::swim_driver::MembershipEvent;
+    use mqtt_cluster::NodeId;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    fn ev(id: &str, peer_addr: &str, state: MemberState) -> MembershipEvent {
+        MembershipEvent {
+            id: NodeId(id.into()),
+            addr: format!("{id}-swim"),
+            peer_addr: peer_addr.into(),
+            state,
+        }
+    }
+
+    /// Spawn the link manager for `local`, returning the event feed and the
+    /// stream of hub commands it produces.
+    fn start(
+        local: &str,
+    ) -> (
+        mpsc::UnboundedSender<MembershipEvent>,
+        mpsc::UnboundedReceiver<HubCommand>,
+    ) {
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        tokio::spawn(maintain_peer_links(
+            ev_rx,
+            NodeId(local.into()),
+            hub_tx,
+            None,
+        ));
+        (ev_tx, hub_rx)
+    }
+
+    /// An `Alive` member is dialed; a later `Dead` aborts the dialer (closing
+    /// the half-open link) and tells the hub to drop routing state.
+    #[tokio::test]
+    async fn alive_dials_and_dead_aborts_link_and_notifies_hub() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ev_tx, mut hub_rx) = start("a"); // "a" < "b": we own the link
+
+        ev_tx.send(ev("b", &addr, MemberState::Alive)).unwrap();
+        let (mut sock, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("alive member was never dialed")
+            .unwrap();
+        // The dialer speaks first: its Hello arrives.
+        let mut buf = [0u8; 256];
+        let n = timeout(Duration::from_secs(2), sock.read(&mut buf))
+            .await
+            .expect("no Hello from dialer")
+            .unwrap();
+        assert!(n > 0);
+
+        // Suspect changes nothing; Dead tears the link down.
+        ev_tx.send(ev("b", &addr, MemberState::Suspect)).unwrap();
+        ev_tx.send(ev("b", &addr, MemberState::Dead)).unwrap();
+        match timeout(Duration::from_secs(2), hub_rx.recv())
+            .await
+            .unwrap()
+        {
+            Some(HubCommand::PeerDead { node }) => assert_eq!(node.0, "b"),
+            other => panic!("expected PeerDead, got {other:?}"),
+        }
+        let n = timeout(Duration::from_secs(2), sock.read(&mut buf))
+            .await
+            .expect("aborted dialer should close its socket")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "the dead peer's link must be closed");
+    }
+
+    /// A refuted suspicion (`Dead` then `Alive` again) restarts the dialer.
+    #[tokio::test]
+    async fn alive_after_dead_restarts_the_dialer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ev_tx, mut hub_rx) = start("a");
+
+        ev_tx.send(ev("b", &addr, MemberState::Alive)).unwrap();
+        let _first = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("first dial")
+            .unwrap();
+
+        ev_tx.send(ev("b", &addr, MemberState::Dead)).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), hub_rx.recv())
+                .await
+                .unwrap(),
+            Some(HubCommand::PeerDead { .. })
+        ));
+
+        ev_tx.send(ev("b", &addr, MemberState::Alive)).unwrap();
+        let second = timeout(Duration::from_secs(2), listener.accept()).await;
+        assert!(second.is_ok(), "rejoined member was not redialed");
+    }
+
+    /// One link per pair: the larger node id never dials (the peer owns it).
+    #[tokio::test]
+    async fn larger_node_id_does_not_dial() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ev_tx, _hub_rx) = start("z"); // "z" > "b": the peer dials us
+
+        ev_tx.send(ev("b", &addr, MemberState::Alive)).unwrap();
+        let dialed = timeout(Duration::from_millis(400), listener.accept()).await;
+        assert!(dialed.is_err(), "the larger-id side must not dial");
+    }
+
+    /// An `Alive` member that gossiped no routing address cannot be dialed and
+    /// must be skipped without wedging the manager.
+    #[tokio::test]
+    async fn alive_without_routing_address_is_skipped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ev_tx, mut hub_rx) = start("a");
+
+        ev_tx.send(ev("b", "", MemberState::Alive)).unwrap();
+        // The manager is still serving events: a dialable member works...
+        ev_tx.send(ev("c", &addr, MemberState::Alive)).unwrap();
+        assert!(
+            timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_ok(),
+            "manager wedged after the undialable member"
+        );
+        // ...and the undialable member's death still clears routing state.
+        ev_tx.send(ev("b", "", MemberState::Dead)).unwrap();
+        match timeout(Duration::from_secs(2), hub_rx.recv())
+            .await
+            .unwrap()
+        {
+            Some(HubCommand::PeerDead { node }) => assert_eq!(node.0, "b"),
+            other => panic!("expected PeerDead for b, got {other:?}"),
+        }
+    }
+}

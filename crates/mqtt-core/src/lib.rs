@@ -106,4 +106,16 @@ mod tests {
         assert!(!topic_matches("+/broker", "$SYS/broker"));
         assert!(topic_matches("$SYS/#", "$SYS/broker/uptime"));
     }
+
+    /// Empty levels are real levels per the spec: `"a/"` is two levels
+    /// (`"a"`, `""`) and distinct from `"a"`.
+    #[test]
+    fn empty_levels_are_distinct_levels() {
+        assert!(topic_matches("a/+", "a/"));
+        assert!(!topic_matches("a/b/", "a/b"));
+        assert!(!topic_matches("a/b", "a/b/"));
+        assert!(topic_matches("+/+", "/finance"));
+        assert!(topic_matches("/+", "/finance"));
+        assert!(!topic_matches("+", "/finance"));
+    }
 }

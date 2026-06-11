@@ -214,3 +214,160 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     }
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::handle_stream;
+    use crate::hub::HubCommand;
+    use mqtt_codec::{
+        packet::{ConnAck, Connect},
+        Packet, ProtocolVersion,
+    };
+    use mqtt_net::{FrameReader, FrameWriter};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    const V4: ProtocolVersion = ProtocolVersion::V311;
+
+    type Reader = FrameReader<ReadHalf<DuplexStream>>;
+    type Writer = FrameWriter<WriteHalf<DuplexStream>>;
+
+    /// Start a connection task over an in-memory duplex; returns the client's
+    /// framed I/O and the hub command stream the connection produces.
+    fn start_conn() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        tokio::spawn(handle_stream(server, None, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
+    }
+
+    /// Minimal hub stub: accepts every Attach with `session_present = false`,
+    /// records the client ids it sees, and keeps outbound senders alive so the
+    /// connection's writer loop stays up.
+    fn stub_hub(mut hub_rx: mpsc::UnboundedReceiver<HubCommand>) -> Arc<Mutex<Vec<String>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                if let HubCommand::Attach {
+                    client,
+                    outbound,
+                    reply,
+                    ..
+                } = cmd
+                {
+                    record.lock().unwrap().push(client.0.clone());
+                    keep_alive.push(outbound);
+                    let _ = reply.send(false);
+                }
+            }
+        });
+        seen
+    }
+
+    fn connect_packet(id: &str, clean_session: bool) -> Packet {
+        Packet::Connect(Connect {
+            protocol: V4,
+            clean_session,
+            keep_alive: 30,
+            client_id: id.to_string(),
+            last_will: None,
+            username: None,
+            password: None,
+        })
+    }
+
+    /// Next packet within a short window; transport errors and EOF both map to
+    /// `None` (the assertions only care whether an MQTT packet arrived).
+    async fn recv(reader: &mut Reader) -> Option<Packet> {
+        timeout(Duration::from_millis(500), reader.next_packet())
+            .await
+            .expect("connection neither answered nor closed")
+            .unwrap_or(None)
+    }
+
+    #[tokio::test]
+    async fn non_connect_first_packet_closes_without_connack() {
+        let (mut reader, mut writer, _hub_rx) = start_conn();
+        writer.send(&Packet::PingReq).await.unwrap();
+        assert_eq!(recv(&mut reader).await, None);
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_version_closes_without_connack() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+        tokio::spawn(handle_stream(server, None, hub_tx));
+        let (rh, mut wh) = tokio::io::split(client);
+
+        // A CONNECT claiming protocol level 5: name "MQTT", level 0x05,
+        // clean-session flags, keepalive 60, client id "x".
+        let frame: &[u8] = &[
+            0x10, 0x0D, // CONNECT, remaining length 13
+            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3C, // var header
+            0x00, 0x01, b'x', // client id
+        ];
+        wh.write_all(frame).await.unwrap();
+
+        let mut reader: Reader = FrameReader::new(rh, V4);
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "an unsupported protocol version must never reach CONNACK 0x00"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_client_id_with_persistent_session_is_rejected() {
+        let (mut reader, mut writer, _hub_rx) = start_conn();
+        writer.send(&connect_packet("", false)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(ConnAck {
+                session_present,
+                code,
+            })) => {
+                assert_eq!(code, 0x02, "identifier rejected");
+                assert!(!session_present);
+            }
+            other => panic!("expected CONNACK 0x02, got {other:?}"),
+        }
+        assert_eq!(recv(&mut reader).await, None, "connection must close");
+    }
+
+    #[tokio::test]
+    async fn empty_client_id_with_clean_session_gets_auto_id() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let seen = stub_hub(hub_rx);
+        writer.send(&connect_packet("", true)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(ConnAck { code: 0, .. })) => {}
+            other => panic!("expected CONNACK 0x00, got {other:?}"),
+        }
+        let ids = seen.lock().unwrap().clone();
+        assert_eq!(ids.len(), 1);
+        assert!(
+            ids[0].starts_with("auto-"),
+            "server must assign an id, got {:?}",
+            ids[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn pingreq_and_qos2_release_are_answered() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_packet("k1", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&Packet::PingReq).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
+
+        writer.send(&Packet::PubRel(7)).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(7)));
+    }
+}
