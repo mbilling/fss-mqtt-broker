@@ -1,0 +1,19 @@
+[package]
+name = "mqtt-storage"
+description = "Pluggable persistence traits for sessions and retained messages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
+thiserror.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[lints]
+workspace = true

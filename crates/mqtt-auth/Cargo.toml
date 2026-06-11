@@ -1,0 +1,14 @@
+[package]
+name = "mqtt-auth"
+description = "Authentication and authorization traits and built-in providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

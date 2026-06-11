@@ -1,0 +1,22 @@
+[package]
+name = "mqtt-net"
+description = "Connection and listener layer (TCP, TLS, WebSocket)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+thiserror.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+
+[lints]
+workspace = true

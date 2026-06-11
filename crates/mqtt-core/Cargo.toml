@@ -1,0 +1,15 @@
+[package]
+name = "mqtt-core"
+description = "Broker core: sessions, subscriptions, retained messages, QoS state machines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+bytes.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

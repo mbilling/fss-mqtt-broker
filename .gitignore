@@ -1,0 +1,11 @@
+/target
+**/target
+# cargo-fuzz artifacts
+**/fuzz/corpus
+**/fuzz/artifacts
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+*.pem
+*.key
+*.crt

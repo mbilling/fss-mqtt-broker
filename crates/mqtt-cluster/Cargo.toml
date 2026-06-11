@@ -1,0 +1,19 @@
+[package]
+name = "mqtt-cluster"
+description = "Shared-nothing cluster: gossip membership, subscription routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
+thiserror.workspace = true
+serde = { workspace = true }
+bincode = "1"
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

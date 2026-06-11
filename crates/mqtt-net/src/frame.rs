@@ -1,0 +1,140 @@
+//! Packet framing over async byte streams.
+//!
+//! [`FrameReader`] and [`FrameWriter`] are deliberately split so they can own the
+//! two halves of a [`tokio::net::TcpStream`] independently — that lets a
+//! connection task read inbound packets and write outbound packets concurrently
+//! via `tokio::select!` without aliasing the same stream.
+
+use crate::NetError;
+use bytes::BytesMut;
+use mqtt_codec::{Packet, ProtocolVersion};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// A cap on the read buffer to bound memory from a slow or hostile peer.
+///
+/// A real deployment will derive this from the negotiated MQTT 5 Maximum Packet
+/// Size; for now it is a fixed safety ceiling.
+const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+
+/// Reads framed MQTT packets from an [`AsyncRead`].
+#[derive(Debug)]
+pub struct FrameReader<R> {
+    inner: R,
+    buf: BytesMut,
+    version: ProtocolVersion,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    /// Create a reader over `inner` for the given protocol `version`.
+    pub fn new(inner: R, version: ProtocolVersion) -> Self {
+        Self {
+            inner,
+            buf: BytesMut::with_capacity(2048),
+            version,
+        }
+    }
+
+    /// Update the protocol version (e.g. after a CONNECT negotiates v5).
+    pub fn set_version(&mut self, version: ProtocolVersion) {
+        self.version = version;
+    }
+
+    /// Read the next packet.
+    ///
+    /// Returns `Ok(None)` on a clean end-of-stream at a packet boundary.
+    ///
+    /// # Errors
+    /// - [`NetError::Codec`] if the peer sends a malformed packet.
+    /// - [`NetError::UnexpectedEof`] if the stream ends mid-packet.
+    /// - [`NetError::PacketTooLarge`](mqtt_codec::CodecError::PacketTooLarge)
+    ///   (wrapped) if a single packet would exceed [`MAX_BUFFERED_BYTES`].
+    /// - [`NetError::Io`] on a transport error.
+    pub async fn next_packet(&mut self) -> Result<Option<Packet>, NetError> {
+        loop {
+            if let Some(packet) = Packet::decode(&mut self.buf, self.version)? {
+                return Ok(Some(packet));
+            }
+            if self.buf.len() > MAX_BUFFERED_BYTES {
+                return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
+            }
+            let n = self.inner.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                return if self.buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(NetError::UnexpectedEof)
+                };
+            }
+        }
+    }
+}
+
+/// Writes framed MQTT packets to an [`AsyncWrite`].
+#[derive(Debug)]
+pub struct FrameWriter<W> {
+    inner: W,
+    version: ProtocolVersion,
+}
+
+impl<W: AsyncWrite + Unpin> FrameWriter<W> {
+    /// Create a writer over `inner` for the given protocol `version`.
+    pub fn new(inner: W, version: ProtocolVersion) -> Self {
+        Self { inner, version }
+    }
+
+    /// Update the protocol version.
+    pub fn set_version(&mut self, version: ProtocolVersion) {
+        self.version = version;
+    }
+
+    /// Encode and send a single packet, flushing the stream.
+    ///
+    /// # Errors
+    /// [`NetError::Codec`] if the packet cannot be encoded, or [`NetError::Io`].
+    pub async fn send(&mut self, packet: &Packet) -> Result<(), NetError> {
+        let mut out = Vec::new();
+        packet.encode(&mut out, self.version)?;
+        self.inner.write_all(&out).await?;
+        self.inner.flush().await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameReader, FrameWriter};
+    use mqtt_codec::{packet::ConnAck, Packet, ProtocolVersion};
+
+    const V4: ProtocolVersion = ProtocolVersion::V311;
+
+    #[tokio::test]
+    async fn write_then_read_roundtrip_over_duplex() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client);
+        let (sr, _sw) = tokio::io::split(server);
+
+        let mut writer = FrameWriter::new(cw, V4);
+        writer.send(&Packet::PingReq).await.unwrap();
+        writer
+            .send(&Packet::ConnAck(ConnAck {
+                session_present: false,
+                code: 0,
+            }))
+            .await
+            .unwrap();
+        drop(writer);
+        drop(cr);
+
+        let mut reader = FrameReader::new(sr, V4);
+        assert_eq!(reader.next_packet().await.unwrap(), Some(Packet::PingReq));
+        assert_eq!(
+            reader.next_packet().await.unwrap(),
+            Some(Packet::ConnAck(ConnAck {
+                session_present: false,
+                code: 0
+            }))
+        );
+        // Clean EOF once the writer is dropped.
+        assert_eq!(reader.next_packet().await.unwrap(), None);
+    }
+}
