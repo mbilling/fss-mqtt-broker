@@ -11,6 +11,8 @@
 //!
 //! Dev environment shims (until config-file loading lands):
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
+//! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
+//! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
 //! - `MQTTD_TLS_BIND`       — TLS client listener bind, e.g. `0.0.0.0:8883`
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
@@ -44,7 +46,7 @@ use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_config::Config;
 use mqtt_net::tls;
 use mqtt_observability::AuditLog;
-use mqtt_storage::MemorySessionStore;
+use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits};
 use mqttd::{cluster, conn, hub, peer};
 use std::path::Path;
 use std::sync::Arc;
@@ -76,8 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "configuration validated (secure defaults)"
     );
 
-    // Start the routing hub.
-    let (hub, hub_tx) = hub::Hub::with_config(node_id.clone(), Box::new(MemorySessionStore::new()));
+    // Start the routing hub. Offline session queues are bounded (ADR 0001 §6).
+    let store = MemorySessionStore::with_limits(queue_limits_from_env()?);
+    let (hub, hub_tx) = hub::Hub::with_config(node_id.clone(), Box::new(store));
     tokio::spawn(hub.run());
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
@@ -240,6 +243,36 @@ fn jwt_config_from_env() -> mqtt_auth::token::TokenConfig {
         audience: non_empty_env("MQTTD_JWT_AUDIENCE"),
         ..Default::default()
     }
+}
+
+/// Per-session offline-queue bounds (ADR 0001 §6) from `MQTTD_MAX_QUEUED_MESSAGES`
+/// and `MQTTD_QUEUE_OVERFLOW`. Bounded by default; an unparseable value is a
+/// startup error rather than a silent fallback.
+fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
+    let mut limits = QueueLimits::default();
+    if let Some(raw) = non_empty_env("MQTTD_MAX_QUEUED_MESSAGES") {
+        limits.max_messages = raw
+            .parse()
+            .map_err(|_| format!("MQTTD_MAX_QUEUED_MESSAGES is not a number: {raw:?}"))?;
+    }
+    if let Some(raw) = non_empty_env("MQTTD_QUEUE_OVERFLOW") {
+        limits.overflow = match raw.as_str() {
+            "drop-oldest" => OverflowPolicy::DropOldest,
+            "reject-newest" => OverflowPolicy::RejectNewest,
+            other => {
+                return Err(format!(
+                    "MQTTD_QUEUE_OVERFLOW must be drop-oldest or reject-newest, got {other:?}"
+                )
+                .into())
+            }
+        };
+    }
+    info!(
+        max_queued_messages = limits.max_messages,
+        overflow = ?limits.overflow,
+        "offline session queues bounded"
+    );
+    Ok(limits)
 }
 
 /// Build the cluster-bus mTLS context from `MQTTD_PEER_TLS_{CA,CERT,KEY}`.

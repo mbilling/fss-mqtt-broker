@@ -32,7 +32,9 @@ use mqtt_cluster::peer::PeerMessage;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{topic_matches, ClientId, Message, SubscriptionTable};
-use mqtt_storage::{MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore};
+use mqtt_storage::{
+    Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -543,9 +545,23 @@ impl Hub {
             if let Some(tx) = self.online.get(&c).map(|s| s.tx.clone()) {
                 self.send_to_client(&c, &tx, &message, false);
             } else if self.persistent.contains(&c) {
-                // Offline but persistent: queue for replay on reconnect.
-                if let Err(e) = self.store.enqueue(&c, &message).await {
-                    warn!(client = %c.0, error = %e, "failed to enqueue offline message");
+                // Offline but persistent: queue for replay on reconnect. The
+                // queue is bounded (ADR 0001 §6); log when the cap drops
+                // messages — a metrics counter is the proper operator signal
+                // and arrives with the observability phase.
+                match self.store.enqueue(&c, &message).await {
+                    Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
+                        warn!(client = %c.0, evicted, topic = %topic,
+                              "offline queue full: evicted oldest message(s)");
+                    }
+                    Ok(Enqueued::Rejected) => {
+                        warn!(client = %c.0, topic = %topic,
+                              "offline queue full: dropped message (reject-newest)");
+                    }
+                    Ok(Enqueued::Stored { .. }) => {}
+                    Err(e) => {
+                        warn!(client = %c.0, error = %e, "failed to enqueue offline message");
+                    }
                 }
             }
         }
@@ -788,7 +804,7 @@ mod tests {
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
     use mqtt_core::ClientId;
-    use mqtt_storage::MemorySessionStore;
+    use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits};
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
@@ -796,10 +812,11 @@ mod tests {
     type HubTx = mpsc::UnboundedSender<HubCommand>;
 
     fn start_hub() -> HubTx {
-        let (hub, tx) = Hub::with_config(
-            NodeId("hub-test".into()),
-            Box::new(MemorySessionStore::new()),
-        );
+        start_hub_with_store(MemorySessionStore::new())
+    }
+
+    fn start_hub_with_store(store: MemorySessionStore) -> HubTx {
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), Box::new(store));
         tokio::spawn(hub.run());
         tx
     }
@@ -1115,5 +1132,36 @@ mod tests {
             rest += 1;
         }
         assert_eq!(rest, 2, "unreplayed tail must survive for the next connect");
+    }
+
+    /// A bounded offline queue (ADR 0001 §6) drops the oldest while a persistent
+    /// subscriber is offline; on reconnect it replays only the newest messages
+    /// within the cap, not an unbounded backlog.
+    #[tokio::test]
+    async fn offline_queue_is_bounded_and_replays_newest() {
+        let tx = start_hub_with_store(MemorySessionStore::with_limits(QueueLimits {
+            max_messages: 3,
+            overflow: OverflowPolicy::DropOldest,
+        }));
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+
+        // Five messages arrive offline; the cap-3 queue keeps the newest three.
+        for n in [b"m1", b"m2", b"m3", b"m4", b"m5"] {
+            publish(&tx, "t", n);
+        }
+
+        let (mut rx, present) = attach(&tx, "p", 2, false).await;
+        assert!(present);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        while let Some(pkt) = recv_packet(&mut rx).await {
+            got.push(payload_of(&pkt).to_vec());
+        }
+        assert_eq!(
+            got,
+            vec![b"m3".to_vec(), b"m4".to_vec(), b"m5".to_vec()],
+            "only the newest cap-many messages survive the offline window"
+        );
     }
 }

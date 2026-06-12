@@ -154,6 +154,8 @@ or empty means "off"; every insecure fallback is logged at startup.
 | Variable | Purpose |
 |---|---|
 | `MQTTD_NODE_ID` | This node's id (default `node-local`) |
+| `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`) |
+| `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
 | `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
 | `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN |

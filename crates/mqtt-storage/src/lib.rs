@@ -44,6 +44,57 @@ pub struct QueuedMessage {
     pub message: Message,
 }
 
+/// What a session's offline queue does when it is full (ADR 0001 §6 — a
+/// dead-but-persistent client must not grow a queue without bound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowPolicy {
+    /// Evict the oldest queued message(s) to make room for the new one
+    /// (freshest-wins — the default; matches common broker behaviour and keeps
+    /// the latest state available on reconnect).
+    #[default]
+    DropOldest,
+    /// Keep the queue intact and drop the newly-arriving message.
+    RejectNewest,
+}
+
+/// Per-session offline-queue bounds. A message-count cap (not a byte cap) is the
+/// standard MQTT broker lever and the granularity a clustered backend shards on.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueLimits {
+    /// Maximum messages retained per session before `overflow` applies. Treated
+    /// as at least 1.
+    pub max_messages: usize,
+    /// What happens to the message that would exceed `max_messages`.
+    pub overflow: OverflowPolicy,
+}
+
+impl Default for QueueLimits {
+    fn default() -> Self {
+        // Bounded by default (anti-OOM) but generous enough not to surprise
+        // legitimate large offline queues; operators tune it down.
+        Self {
+            max_messages: 100_000,
+            overflow: OverflowPolicy::DropOldest,
+        }
+    }
+}
+
+/// The outcome of [`SessionStore::enqueue`]: whether the message was stored, and
+/// what the queue cap cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enqueued {
+    /// Stored at `offset`. `evicted` oldest messages were dropped to stay within
+    /// the cap (0 unless the drop-oldest policy fired).
+    Stored {
+        /// The offset assigned to the stored message.
+        offset: Offset,
+        /// How many oldest messages were evicted to make room.
+        evicted: u64,
+    },
+    /// The queue was full and the reject-newest policy dropped this message.
+    Rejected,
+}
+
 /// Durable storage for MQTT persistent sessions.
 ///
 /// Implementations must be safe to shard by [`ClientId`]. The durability contract
@@ -70,12 +121,14 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// Load a client's stored subscriptions (empty if none / no session).
     async fn subscriptions(&self, client: &ClientId) -> Result<Vec<Subscription>, StorageError>;
 
-    /// Append a message to the client's offline queue, returning its offset.
+    /// Append a message to the client's offline queue.
     ///
     /// This is the **durability-critical** write. A clustered backend
     /// quorum-replicates before returning; the producer's QoS≥1 PUBACK should be
-    /// gated on it.
-    async fn enqueue(&self, client: &ClientId, message: &Message) -> Result<Offset, StorageError>;
+    /// gated on it. The returned [`Enqueued`] reports whether the per-session
+    /// queue cap evicted older messages or rejected this one (ADR 0001 §6).
+    async fn enqueue(&self, client: &ClientId, message: &Message)
+        -> Result<Enqueued, StorageError>;
 
     /// Replay undelivered messages with offset strictly greater than `after`, up
     /// to `limit` items, in offset order. Used on reconnect / takeover.
@@ -128,13 +181,23 @@ struct SessionEntry {
 #[derive(Debug, Default)]
 pub struct MemorySessionStore {
     sessions: Mutex<HashMap<ClientId, SessionEntry>>,
+    limits: QueueLimits,
 }
 
 impl MemorySessionStore {
-    /// Create an empty store.
+    /// Create an empty store with default (bounded) queue limits.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty store with explicit per-session queue limits.
+    #[must_use]
+    pub fn with_limits(limits: QueueLimits) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            limits,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ClientId, SessionEntry>> {
@@ -174,9 +237,31 @@ impl SessionStore for MemorySessionStore {
             .unwrap_or_default())
     }
 
-    async fn enqueue(&self, client: &ClientId, message: &Message) -> Result<Offset, StorageError> {
+    async fn enqueue(
+        &self,
+        client: &ClientId,
+        message: &Message,
+    ) -> Result<Enqueued, StorageError> {
+        let cap = self.limits.max_messages.max(1);
         let mut map = self.lock();
         let entry = map.entry(client.clone()).or_default();
+
+        // Reject-newest: a full queue drops the arriving message, preserving the
+        // offsets and order already present.
+        if entry.queue.len() >= cap && self.limits.overflow == OverflowPolicy::RejectNewest {
+            return Ok(Enqueued::Rejected);
+        }
+        // Drop-oldest: evict from the front until there is room for one more.
+        // Offsets stay monotonic (next_offset never goes backwards), so `pending`
+        // and `ack` remain correct across eviction.
+        let mut evicted = 0u64;
+        while entry.queue.len() >= cap {
+            if entry.queue.pop_front().is_none() {
+                break;
+            }
+            evicted += 1;
+        }
+
         // Offsets are 1-based so that `0` is a valid "nothing yet" sentinel for
         // both `after` (pending) and `up_to` (ack).
         entry.next_offset += 1;
@@ -185,7 +270,7 @@ impl SessionStore for MemorySessionStore {
             offset,
             message: message.clone(),
         });
-        Ok(offset)
+        Ok(Enqueued::Stored { offset, evicted })
     }
 
     async fn pending(
@@ -267,11 +352,34 @@ impl RetainedStore for MemoryRetainedStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore};
+    use super::{
+        Enqueued, MemoryRetainedStore, MemorySessionStore, Offset, OverflowPolicy, QueueLimits,
+        RetainedStore, SessionStore,
+    };
     use mqtt_core::{ClientId, Message, QoS};
 
     fn cid(s: &str) -> ClientId {
         ClientId(s.to_string())
+    }
+
+    /// Offset of a `Stored` outcome; panics on `Rejected` (the tests that expect
+    /// rejection assert it explicitly).
+    fn offset_of(e: Enqueued) -> Offset {
+        match e {
+            Enqueued::Stored { offset, .. } => offset,
+            Enqueued::Rejected => panic!("unexpected reject"),
+        }
+    }
+
+    /// Current queue offsets for a client (oldest first).
+    async fn offsets(store: &MemorySessionStore, c: &ClientId) -> Vec<Offset> {
+        store
+            .pending(c, 0, usize::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.offset)
+            .collect()
     }
 
     fn msg(topic: &str, payload: &'static [u8]) -> Message {
@@ -290,9 +398,9 @@ mod tests {
         assert!(!store.ensure_session(&c).await.unwrap(), "fresh session");
         assert!(store.ensure_session(&c).await.unwrap(), "now it exists");
 
-        let o0 = store.enqueue(&c, &msg("a", b"0")).await.unwrap();
-        let o1 = store.enqueue(&c, &msg("a", b"1")).await.unwrap();
-        let o2 = store.enqueue(&c, &msg("a", b"2")).await.unwrap();
+        let o0 = offset_of(store.enqueue(&c, &msg("a", b"0")).await.unwrap());
+        let o1 = offset_of(store.enqueue(&c, &msg("a", b"1")).await.unwrap());
+        let o2 = offset_of(store.enqueue(&c, &msg("a", b"2")).await.unwrap());
         assert_eq!((o0, o1, o2), (1, 2, 3));
 
         let all = store.pending(&c, 0, 100).await.unwrap();
@@ -313,11 +421,8 @@ mod tests {
         let c = cid("client");
         store.ensure_session(&c).await.unwrap();
         for i in 0..5u8 {
-            store
-                .enqueue(&c, &msg("a", b"x"))
-                .await
-                .map(|o| assert_eq!(u64::from(i) + 1, o)) // 1-based: 1..=5
-                .unwrap();
+            let o = offset_of(store.enqueue(&c, &msg("a", b"x")).await.unwrap());
+            assert_eq!(u64::from(i) + 1, o); // 1-based: 1..=5
         }
         store.ack(&c, 2).await.unwrap(); // ack offsets 1,2
         let remaining = store.pending(&c, 0, 100).await.unwrap();
@@ -419,6 +524,89 @@ mod tests {
         assert_eq!(store.matching("sensors/+/temp").await.unwrap().len(), 1);
     }
 
+    /// Drop-oldest (the default) caps the queue at `max_messages`, evicting the
+    /// oldest to make room; offsets stay monotonic and the cap holds.
+    #[tokio::test]
+    async fn drop_oldest_evicts_oldest_and_keeps_newest() {
+        let store = MemorySessionStore::with_limits(QueueLimits {
+            max_messages: 3,
+            overflow: OverflowPolicy::DropOldest,
+        });
+        let c = cid("client");
+
+        // First three fit without eviction.
+        for expected in 1..=3 {
+            assert_eq!(
+                store.enqueue(&c, &msg("a", b"x")).await.unwrap(),
+                Enqueued::Stored {
+                    offset: expected,
+                    evicted: 0,
+                },
+            );
+        }
+        assert_eq!(offsets(&store, &c).await, vec![1, 2, 3]);
+
+        // The fourth evicts offset 1; the fifth evicts offset 2.
+        assert_eq!(
+            store.enqueue(&c, &msg("a", b"x")).await.unwrap(),
+            Enqueued::Stored {
+                offset: 4,
+                evicted: 1
+            }
+        );
+        assert_eq!(
+            store.enqueue(&c, &msg("a", b"x")).await.unwrap(),
+            Enqueued::Stored {
+                offset: 5,
+                evicted: 1
+            }
+        );
+        // Cap held; newest three retained; offsets still monotonic.
+        assert_eq!(offsets(&store, &c).await, vec![3, 4, 5]);
+
+        // Ack of an already-evicted offset is a harmless no-op.
+        store.ack(&c, 2).await.unwrap();
+        assert_eq!(offsets(&store, &c).await, vec![3, 4, 5]);
+        // Acking a live offset still truncates.
+        store.ack(&c, 4).await.unwrap();
+        assert_eq!(offsets(&store, &c).await, vec![5]);
+    }
+
+    /// Reject-newest keeps the queue intact and drops the arriving message once
+    /// the cap is reached.
+    #[tokio::test]
+    async fn reject_newest_keeps_oldest_and_drops_new() {
+        let store = MemorySessionStore::with_limits(QueueLimits {
+            max_messages: 3,
+            overflow: OverflowPolicy::RejectNewest,
+        });
+        let c = cid("client");
+        for _ in 0..3 {
+            assert!(matches!(
+                store.enqueue(&c, &msg("a", b"x")).await.unwrap(),
+                Enqueued::Stored { .. }
+            ));
+        }
+        // Full now: further enqueues are rejected, queue unchanged.
+        assert_eq!(
+            store.enqueue(&c, &msg("a", b"new")).await.unwrap(),
+            Enqueued::Rejected
+        );
+        assert_eq!(
+            store.enqueue(&c, &msg("a", b"new")).await.unwrap(),
+            Enqueued::Rejected
+        );
+        assert_eq!(offsets(&store, &c).await, vec![1, 2, 3]);
+
+        // After an ack frees room, enqueue succeeds again.
+        store.ack(&c, 1).await.unwrap();
+        assert!(matches!(
+            store.enqueue(&c, &msg("a", b"x")).await.unwrap(),
+            Enqueued::Stored { offset: 4, .. }
+        ));
+        assert_eq!(offsets(&store, &c).await, vec![2, 3, 4]);
+    }
+
     /// A persistent session that is being torn down behaves as a clustered
     /// failover would expect: unacked messages remain replayable.
     #[tokio::test]
@@ -426,7 +614,7 @@ mod tests {
         let store = MemorySessionStore::new();
         let c = cid("client");
         store.ensure_session(&c).await.unwrap();
-        let o = store.enqueue(&c, &msg("a", b"important")).await.unwrap();
+        let o = offset_of(store.enqueue(&c, &msg("a", b"important")).await.unwrap());
         // Simulate delivery attempt without ack (client dropped before PUBACK).
         let replay = store.pending(&c, 0, 100).await.unwrap();
         assert_eq!(replay.len(), 1);

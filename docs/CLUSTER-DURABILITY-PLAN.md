@@ -38,20 +38,23 @@ shared subscriptions.
 
 ## Workstreams
 
-### A — Bounded queues & overload policy  *(now; no prerequisites)*
+### A — Bounded queues & overload policy  ✅ *(done)*
 
-ADR 0001 §6, roadmap step 3. The memory queue is unbounded today — a
-dead-but-persistent client is an OOM/DoS vector, which "security is the product"
-should not tolerate even pre-cluster.
+ADR 0001 §6, roadmap step 3. The memory queue was unbounded — a
+dead-but-persistent client was an OOM/DoS vector.
 
-- Add a per-session cap and an overflow policy (`drop-oldest` /
-  `reject-newest`) to `SessionStore::enqueue` semantics; surface the chosen
-  policy + cap in config.
-- Implement in `MemorySessionStore`; emit an audit/metric event on overflow.
-- **Tests:** cap enforced; each overflow policy; overflow does not corrupt
-  offset monotonicity or replay order.
-- **Why first:** highest safety value, zero dependencies, and it nails down the
-  queue-bound semantics every later backend must honor.
+- `OverflowPolicy` (`DropOldest` default / `RejectNewest`) + per-session
+  `QueueLimits` in `mqtt-storage`; `SessionStore::enqueue` now returns an
+  `Enqueued { Stored { offset, evicted } | Rejected }` so callers observe the
+  cap. Bounded by default (100k messages); `MemorySessionStore::with_limits`
+  for explicit control. Config via `MQTTD_MAX_QUEUED_MESSAGES` /
+  `MQTTD_QUEUE_OVERFLOW`.
+- The hub logs evictions/rejections (a metrics counter is the eventual operator
+  signal); offsets stay monotonic across eviction so `pending`/`ack` are
+  unaffected.
+- **Tested:** each policy; cap enforcement; eviction preserves offset
+  monotonicity and ack/replay correctness; hub-level offline overflow replays
+  only the newest cap-many messages.
 
 ### B — Ownership ring over live membership  *(needs A's semantics settled)*
 
