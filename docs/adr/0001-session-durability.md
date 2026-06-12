@@ -144,10 +144,14 @@ needed when the clustered backend lands.
 
 ## Roadmap (implementation phasing)
 
-1. **Now:** incremental async `SessionStore` trait + in-memory single-node impl
-   (`MemorySessionStore`). Wire persistent-session handling in the broker against
-   this interface.
+1. **Done:** incremental async `SessionStore` trait + in-memory single-node impl
+   (`MemorySessionStore`). Persistent-session handling is wired in the broker
+   against this interface (offline queueing, replay, QoS 1/2 in-flight resume).
 2. **Cluster phase:** HRW ownership over SWIM membership; per-shard replicated log
    backend implementing `SessionStore`; takeover protocol.
 3. **Hardening:** queue caps + overflow policy; MQTT 5 session/message expiry;
    shared-subscription load balancing.
+
+A sequenced, dependency-aware breakdown of the unbuilt steps 2–3 — including the
+consensus-mechanism decision (a future ADR) and the MQTT 5.0 gating — lives in
+[Cluster Durability — Implementation Plan](../CLUSTER-DURABILITY-PLAN.md).

@@ -66,9 +66,10 @@ deliberately deferred.
 
 ## Deferred (tracked, deliberate)
 
-- **Node-id ↔ certificate binding.** The peer `Hello` still self-declares the
-  node id; a valid cluster cert is required to speak at all, but any admitted
-  node could claim any id. Bind the id to a SAN when cert-identity work lands.
+- **Node-id ↔ certificate binding.** The peer `Hello` self-declared the node id;
+  a valid cluster cert was required to speak at all, but any admitted node could
+  claim any id. **Resolved by [ADR 0004](0004-identity-and-authentication.md)
+  step 5**, which binds the node id to the peer certificate's Common Name.
 - **SWIM gossip plane security.** UDP datagrams remain unauthenticated — an
   attacker who can reach the gossip port can still inject membership claims
   (and SWIM-driven routing makes `Dead` claims a remote kill switch). Needs a
