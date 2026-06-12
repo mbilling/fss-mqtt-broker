@@ -34,6 +34,25 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
+    /// Create a reader pre-seeded with already-read bytes. Used when a stream is
+    /// handed off mid-flight (e.g. a session proxied to its owner, ADR 0005):
+    /// `prefix` holds bytes read past the handoff marker that belong to the MQTT
+    /// stream and must be parsed before reading more from `inner`.
+    pub fn with_buffer(inner: R, version: ProtocolVersion, prefix: BytesMut) -> Self {
+        Self {
+            inner,
+            buf: prefix,
+            version,
+        }
+    }
+
+    /// Decompose into the underlying reader and any bytes buffered past the last
+    /// returned packet — for resuming raw I/O on the same stream (e.g. splicing
+    /// a proxied session, ADR 0005).
+    pub fn into_parts(self) -> (R, BytesMut) {
+        (self.inner, self.buf)
+    }
+
     /// Update the protocol version (e.g. after a CONNECT negotiates v5).
     pub fn set_version(&mut self, version: ProtocolVersion) {
         self.version = version;
@@ -85,6 +104,12 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// Update the protocol version.
     pub fn set_version(&mut self, version: ProtocolVersion) {
         self.version = version;
+    }
+
+    /// Recover the underlying writer (e.g. to resume raw I/O when splicing a
+    /// proxied session, ADR 0005).
+    pub fn into_inner(self) -> W {
+        self.inner
     }
 
     /// Encode and send a single packet, flushing the stream.

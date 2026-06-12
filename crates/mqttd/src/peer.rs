@@ -327,6 +327,11 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
         PeerMessage::Hello { .. } => {
             warn!("unexpected duplicate Hello on established peer link");
         }
+        PeerMessage::ProxyHello { .. } => {
+            // A ProxyHello is only valid as the first frame of a session-proxy
+            // connection (ADR 0005), handled at accept time — never mid-link.
+            warn!("unexpected ProxyHello on established peer link");
+        }
     }
 }
 

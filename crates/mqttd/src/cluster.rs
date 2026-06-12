@@ -49,7 +49,7 @@ pub async fn maintain_peer_links(
         // Keep the placement ring in step with membership before routing reacts.
         if let Some(placement) = &placement {
             if let Ok(mut p) = placement.write() {
-                p.observe(&ev.id, ev.state);
+                p.observe(&ev.id, ev.state, &ev.peer_addr);
             }
         }
         match ev.state {

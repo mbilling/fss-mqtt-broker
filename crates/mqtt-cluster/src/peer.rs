@@ -45,6 +45,20 @@ pub enum PeerMessage {
         /// state is not replicated yet (Phase 3); carried for the wire format.
         retain: bool,
     },
+    /// First frame of a **session proxy** (ADR 0005): instead of a peer link,
+    /// this connection relocates a persistent client session to its placement
+    /// owner. The remaining bytes on the connection are the raw MQTT stream of
+    /// the proxied client, which the owner serves as a normal session.
+    ///
+    /// The connection arrived over the mutually-authenticated cluster bus, so
+    /// the sending node is a verified mesh member; `identity` is the client
+    /// identity that node **vouches** it already authenticated. The owner trusts
+    /// it within the cluster-CA boundary and records the vouching node.
+    ProxyHello {
+        /// The vouched, already-authenticated client identity (its subject),
+        /// or `None` if the client connected anonymously.
+        identity: Option<String>,
+    },
 }
 
 /// Errors from peer-frame coding.
@@ -121,6 +135,10 @@ mod tests {
             qos: 1,
             retain: false,
         });
+        roundtrip(&PeerMessage::ProxyHello {
+            identity: Some("device-7".into()),
+        });
+        roundtrip(&PeerMessage::ProxyHello { identity: None });
     }
 
     #[test]

@@ -16,7 +16,7 @@
 
 use crate::swim::MemberState;
 use crate::{hrw, NodeId};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Default replication factor: each session's replica set spans R nodes
 /// (ADR 0001 §1).
@@ -31,6 +31,9 @@ pub struct Placement {
     /// Nodes eligible to own sessions: this node plus non-`Dead` peers. A
     /// `BTreeSet` keeps the derived node list deterministic across calls.
     eligible: BTreeSet<NodeId>,
+    /// Each peer's inter-node (peer-link) address, so the owner of a session can
+    /// be reached for session relocation (ADR 0005).
+    addrs: BTreeMap<NodeId, String>,
 }
 
 impl Placement {
@@ -44,22 +47,28 @@ impl Placement {
             local,
             replicas: replicas.max(1),
             eligible,
+            addrs: BTreeMap::new(),
         }
     }
 
     /// Apply an observed membership state. A non-`Dead` peer becomes eligible
-    /// for placement; a `Dead` peer is removed. This node is always eligible and
-    /// is never removed — it cannot hand off its own participation.
-    pub fn observe(&mut self, id: &NodeId, state: MemberState) {
+    /// for placement (recording its peer-link `addr` for relocation); a `Dead`
+    /// peer is removed. This node is always eligible and is never removed — it
+    /// cannot hand off its own participation.
+    pub fn observe(&mut self, id: &NodeId, state: MemberState, addr: &str) {
         if id == &self.local {
             return;
         }
         match state {
             MemberState::Dead => {
                 self.eligible.remove(id);
+                self.addrs.remove(id);
             }
             MemberState::Alive | MemberState::Suspect => {
                 self.eligible.insert(id.clone());
+                if !addr.is_empty() {
+                    self.addrs.insert(id.clone(), addr.to_string());
+                }
             }
         }
     }
@@ -90,6 +99,19 @@ impl Placement {
         self.owner(client) == self.local
     }
 
+    /// Where to relocate `client`'s session: `Some((owner, peer_addr))` when the
+    /// owner is another node whose address is known, `None` when this node is the
+    /// owner (no relocation) or the owner's address is not yet learned (serve
+    /// locally — ADR 0005 degrade-don't-refuse).
+    #[must_use]
+    pub fn owner_route(&self, client: &str) -> Option<(NodeId, String)> {
+        let owner = self.owner(client);
+        if owner == self.local {
+            return None;
+        }
+        self.addrs.get(&owner).map(|addr| (owner, addr.clone()))
+    }
+
     /// Whether this node is in `client`'s replica set (owner or a failover
     /// replica).
     #[must_use]
@@ -114,11 +136,12 @@ mod tests {
         NodeId(s.to_string())
     }
 
-    /// Build a ring for `local` that has observed each of `peers` as Alive.
+    /// Build a ring for `local` that has observed each of `peers` as Alive
+    /// (each with a synthetic `<peer>:7000` peer-link address).
     fn ring(local: &str, peers: &[&str]) -> Placement {
         let mut p = Placement::new(node(local), DEFAULT_REPLICAS);
         for peer in peers {
-            p.observe(&node(peer), MemberState::Alive);
+            p.observe(&node(peer), MemberState::Alive, &format!("{peer}:7000"));
         }
         p
     }
@@ -140,15 +163,15 @@ mod tests {
         assert_eq!(p.member_count(), 3);
 
         // Suspect keeps the node in the ring (no churn on a transient blip).
-        p.observe(&node("b"), MemberState::Suspect);
+        p.observe(&node("b"), MemberState::Suspect, "b:7000");
         assert_eq!(p.member_count(), 3);
 
         // Dead removes it.
-        p.observe(&node("c"), MemberState::Dead);
+        p.observe(&node("c"), MemberState::Dead, "");
         assert_eq!(p.member_count(), 2);
 
         // A node first seen as Suspect is still a member.
-        p.observe(&node("d"), MemberState::Suspect);
+        p.observe(&node("d"), MemberState::Suspect, "d:7000");
         assert_eq!(p.member_count(), 3);
     }
 
@@ -156,10 +179,50 @@ mod tests {
     fn this_node_is_never_removed() {
         let mut p = ring("a", &["b"]);
         // Even a (spurious) Dead about ourselves must not drop us.
-        p.observe(&node("a"), MemberState::Dead);
+        p.observe(&node("a"), MemberState::Dead, "");
         assert_eq!(p.member_count(), 2);
         // We can still own keys.
         assert!(["x", "y", "z", "w"].iter().any(|c| p.owns(c)));
+    }
+
+    #[test]
+    fn owner_route_points_at_a_remote_owner_and_is_none_when_local() {
+        let p = ring("a", &["b", "c", "d", "e"]);
+        let mut remote = 0;
+        for i in 0..200 {
+            let c = format!("client-{i}");
+            match p.owner_route(&c) {
+                None => {
+                    // No route iff this node is the owner.
+                    assert!(p.owns(&c), "no route for {c} but it is not local-owned");
+                }
+                Some((owner, addr)) => {
+                    assert_ne!(owner, node("a"));
+                    assert_eq!(owner, p.owner(&c));
+                    assert_eq!(addr, format!("{}:7000", owner.0));
+                    remote += 1;
+                }
+            }
+        }
+        assert!(remote > 0, "some sessions should route to a remote owner");
+    }
+
+    #[test]
+    fn owner_route_is_none_until_the_owner_address_is_known() {
+        // A peer eligible for placement but with no address yet cannot be a relay
+        // target — serve locally rather than guess.
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
+        p.observe(&node("b"), MemberState::Alive, ""); // eligible, address unknown
+        for i in 0..200 {
+            let c = format!("client-{i}");
+            if p.owner(&c) == node("b") {
+                assert_eq!(
+                    p.owner_route(&c),
+                    None,
+                    "no address → no route → serve local"
+                );
+            }
+        }
     }
 
     #[test]
@@ -190,7 +253,7 @@ mod tests {
     fn a_dead_node_only_moves_the_keys_it_owned() {
         let before = ring("a", &["b", "c", "d"]); // 4 members
         let mut after = before.clone();
-        after.observe(&node("d"), MemberState::Dead); // 3 members
+        after.observe(&node("d"), MemberState::Dead, ""); // 3 members
 
         let mut moved = 0;
         let mut moved_were_ds = 0;
@@ -221,7 +284,7 @@ mod tests {
     fn a_joining_node_moves_only_a_minority() {
         let before = ring("a", &["b", "c", "d"]);
         let mut after = before.clone();
-        after.observe(&node("e"), MemberState::Alive);
+        after.observe(&node("e"), MemberState::Alive, "e:7000");
 
         let total = 2_000;
         let moved = (0..total)
