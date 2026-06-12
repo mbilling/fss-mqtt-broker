@@ -4,6 +4,9 @@
 //! are pluggable via traits so operators can wire mTLS, password, JWT/OIDC, LDAP,
 //! or custom identity providers without forking the broker.
 
+pub mod basic;
+pub mod mtls;
+
 use mqtt_core::{ClientId, TopicFilter, TopicName};
 
 /// An authenticated principal's identity within the broker.

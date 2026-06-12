@@ -114,7 +114,10 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
             let hub = hub_tx.clone();
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
-                    mqttd::conn::handle_stream(tls, Some(peer), hub).await;
+                    let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                        allow_anonymous: true,
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), None, auth, hub).await;
                 }
             });
         }
@@ -407,4 +410,145 @@ async fn plaintext_peer_is_rejected_by_mtls_listener() {
         n == 0 || buf[0] != 0x00,
         "plaintext intruder received a peer-protocol reply"
     );
+}
+
+// --- mTLS identity (ADR 0004) ---------------------------------------------------
+
+/// Start a node whose TLS listener enforces the production auth path: client
+/// certificates are required (`client_ca`), the verified leaf's CN becomes the
+/// broker identity via `conn::tls_identity`, and anonymous access is denied.
+async fn start_identity_node(pki: &Pki) -> SocketAddr {
+    let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, Some(&pki.ca)).unwrap();
+    let (hub, hub_tx) = Hub::with_config(
+        NodeId("id-node".into()),
+        Box::new(MemorySessionStore::new()),
+    );
+    tokio::spawn(hub.run());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let hub = hub_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let identity = mqttd::conn::tls_identity(&tls);
+                    let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                        allow_anonymous: false,
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), identity, auth, hub).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Mint a client leaf signed by the test CA with an explicit Common Name.
+fn mint_client_cert(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+    cn: &str,
+    dir_tag: &str,
+) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("mqttd-cn-{}-{dir_tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert_path = dir.join("client-cert.pem");
+    let key_path = dir.join("client-key.pem");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    (cert_path, key_path)
+}
+
+/// End to end (ADR 0004): with anonymous denied, a client presenting a
+/// CA-issued certificate is admitted — its CN is the broker identity — and a
+/// full pub/sub session works over the same connection pair.
+#[tokio::test]
+async fn mtls_common_name_identity_is_admitted_under_deny_anonymous() {
+    let (pki, ca_cert, ca_key) = mint_pki("cn-identity");
+    let (client_cert, client_key) = mint_client_cert(&ca_cert, &ca_key, "device-7", "admit");
+    let addr = start_identity_node(&pki).await;
+    let connector = test_connector(&pki.ca, Some((&client_cert, &client_key)));
+
+    let mut sub = Client::connect(tls_connect(addr, &connector).await.unwrap(), "sub").await;
+    sub.subscribe("id/+/data").await;
+    let mut publ = Client::connect(tls_connect(addr, &connector).await.unwrap(), "pub").await;
+    publ.publish("id/zone/data", b"authenticated").await;
+
+    match sub.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"authenticated"),
+        other => panic!("expected publish over authenticated session, got {other:?}"),
+    }
+}
+
+/// End to end (ADR 0004): the same deny-anonymous policy on a server-only TLS
+/// listener (no client CA, so no identity) refuses the CONNECT with 0x05.
+#[tokio::test]
+async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
+    let (pki, _, _) = mint_pki("cn-deny");
+    // Server-only TLS: handshake succeeds, but no identity is available.
+    let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, None).unwrap();
+    let (hub, hub_tx) = Hub::with_config(
+        NodeId("deny-node".into()),
+        Box::new(MemorySessionStore::new()),
+    );
+    tokio::spawn(hub.run());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let hub = hub_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let identity = mqttd::conn::tls_identity(&tls);
+                    let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                        allow_anonymous: false,
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), identity, auth, hub).await;
+                }
+            });
+        }
+    });
+
+    let connector = test_connector(&pki.ca, None);
+    let stream = tls_connect(addr, &connector).await.unwrap();
+    let (rh, wh) = tokio::io::split(stream);
+    let mut writer = mqtt_net::FrameWriter::new(wh, V4);
+    writer
+        .send(&Packet::Connect(Connect {
+            protocol: V4,
+            clean_session: true,
+            keep_alive: 30,
+            client_id: "anon".into(),
+            last_will: None,
+            username: None,
+            password: None,
+        }))
+        .await
+        .unwrap();
+    let mut reader = mqtt_net::FrameReader::new(rh, V4);
+    match timeout(Duration::from_millis(500), reader.next_packet()).await {
+        Ok(Ok(Some(Packet::ConnAck(ack)))) => {
+            assert_eq!(ack.code, 0x05, "expected not-authorized");
+            assert!(!ack.session_present);
+        }
+        other => panic!("expected CONNACK 0x05, got {other:?}"),
+    }
+    // The connection closes after the rejection.
+    match timeout(Duration::from_millis(500), reader.next_packet()).await {
+        Ok(Ok(None) | Err(_)) => {}
+        other => panic!("expected the connection to close, got {other:?}"),
+    }
 }

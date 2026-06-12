@@ -9,8 +9,9 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::hub::{HubCommand, Outbound};
+use mqtt_auth::{basic::BasicAuthenticator, Authenticator, Credentials, Identity};
 use mqtt_codec::{
-    packet::{ConnAck, Publish, SubAck},
+    packet::{ConnAck, Connect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
 };
 use mqtt_core::{ClientId, Message};
@@ -18,6 +19,7 @@ use mqtt_net::{FrameReader, FrameWriter, NetError};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -33,33 +35,70 @@ const KEEPALIVE_GRACE_DEN: u64 = 2;
 const CONNACK_UNACCEPTABLE_PROTOCOL: u8 = 0x01;
 /// CONNACK reason: identifier rejected (MQTT 3.1.1 return code 2).
 const CONNACK_IDENTIFIER_REJECTED: u8 = 0x02;
+/// CONNACK reason: bad user name or password (MQTT 3.1.1 return code 4).
+const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
+/// CONNACK reason: not authorized (MQTT 3.1.1 return code 5).
+const CONNACK_NOT_AUTHORIZED: u8 = 0x05;
 
 /// Monotonic source of unique connection ids (distinct from client ids).
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Counter for server-assigned client ids (empty-id clients).
 static AUTO_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Extract the mTLS identity (ADR 0004) from an accepted server-side TLS
+/// stream: the chain-verified leaf certificate's Subject Common Name.
+///
+/// Returns `None` when no client certificate was presented, or when a verified
+/// certificate carries no usable CN (logged — such a client can only proceed
+/// as anonymous, which the default policy denies).
+pub fn tls_identity<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Identity> {
+    let leaf = tls.get_ref().1.peer_certificates()?.first()?;
+    match mqtt_auth::mtls::identity_from_cert(leaf) {
+        Ok(identity) => Some(identity),
+        Err(e) => {
+            warn!(error = %e, "client certificate verified but has no usable Common Name");
+            None
+        }
+    }
+}
+
 /// Drive one accepted plaintext TCP connection to completion, logging any error.
+///
+/// Test-only convenience path: anonymous clients are permitted and no transport
+/// identity is attached. Production listeners go through [`handle_stream`] with
+/// the operator-configured policy.
 pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     let peer = stream.peer_addr().ok();
-    handle_stream(stream, peer, hub).await;
+    let auth: Arc<dyn Authenticator> = Arc::new(BasicAuthenticator {
+        allow_anonymous: true,
+    });
+    handle_stream(stream, peer, None, auth, hub).await;
 }
 
 /// Drive one accepted connection over any transport (TCP, TLS) to completion,
 /// logging any error. `peer` is the remote address, for diagnostics only.
+/// `identity` is the TLS-verified mTLS identity, `None` on plaintext or
+/// no-client-cert connections; `auth` decides whether the CONNECT may proceed.
 pub async fn handle_stream<S>(
     stream: S,
     peer: Option<SocketAddr>,
+    identity: Option<Identity>,
+    auth: Arc<dyn Authenticator>,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = run(stream, hub).await {
+    if let Err(e) = run(stream, identity, auth, hub).await {
         warn!(?peer, error = %e, "connection ended with error");
     }
 }
 
-async fn run<S>(stream: S, hub: mpsc::UnboundedSender<HubCommand>) -> Result<(), NetError>
+async fn run<S>(
+    stream: S,
+    identity: Option<Identity>,
+    auth: Arc<dyn Authenticator>,
+    hub: mpsc::UnboundedSender<HubCommand>,
+) -> Result<(), NetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -103,6 +142,15 @@ where
         ClientId(format!("auto-{}", AUTO_ID.fetch_add(1, Ordering::Relaxed)))
     } else {
         ClientId(connect.client_id.clone())
+    };
+
+    // Authentication gate: verify credentials BEFORE attaching to the hub, so
+    // a rejected client never touches session state.
+    // TODO(step 3): hand to the authorizer once ACLs land.
+    let Some(_authenticated) =
+        authenticate_connect(&mut writer, &client, &connect, identity.as_ref(), &*auth).await?
+    else {
+        return Ok(()); // rejected; the CONNACK was already sent
     };
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
@@ -158,6 +206,52 @@ where
         graceful,
     });
     result.map(|_| ())
+}
+
+/// Authenticate the CONNECT against the listener policy. Credentials priority:
+/// a TLS-verified certificate identity wins; otherwise CONNECT
+/// username/password; otherwise anonymous (only honored when the policy opts
+/// in). On failure this sends the rejecting CONNACK — 0x04 (bad user name or
+/// password) for password credentials, 0x05 (not authorized) otherwise — and
+/// returns `Ok(None)`: the caller must close without attaching to the hub.
+async fn authenticate_connect<W>(
+    writer: &mut FrameWriter<W>,
+    client: &ClientId,
+    connect: &Connect,
+    identity: Option<&Identity>,
+    auth: &dyn Authenticator,
+) -> Result<Option<Identity>, NetError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let creds = match (identity, &connect.username) {
+        (Some(id), _) => Credentials::ClientCert {
+            subject: &id.subject,
+        },
+        (None, Some(username)) => Credentials::Password {
+            username,
+            password: connect.password.as_deref().unwrap_or(&[]),
+        },
+        (None, None) => Credentials::Anonymous,
+    };
+    match auth.authenticate(client, &creds) {
+        Ok(id) => Ok(Some(id)),
+        Err(e) => {
+            let code = if matches!(creds, Credentials::Password { .. }) {
+                CONNACK_BAD_CREDENTIALS
+            } else {
+                CONNACK_NOT_AUTHORIZED
+            };
+            warn!(client = %client.0, error = %e, "CONNECT rejected: authentication failed");
+            writer
+                .send(&Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    code,
+                }))
+                .await?;
+            Ok(None)
+        }
+    }
 }
 
 /// Serve the connection until it ends. Returns `Ok(true)` only for a clean
@@ -323,6 +417,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 mod tests {
     use super::handle_stream;
     use crate::hub::HubCommand;
+    use mqtt_auth::{basic::BasicAuthenticator, Authenticator};
     use mqtt_codec::{
         packet::{ConnAck, Connect},
         Packet, ProtocolVersion,
@@ -339,12 +434,20 @@ mod tests {
     type Reader = FrameReader<ReadHalf<DuplexStream>>;
     type Writer = FrameWriter<WriteHalf<DuplexStream>>;
 
+    /// A wide-open authenticator so these tests exercise the protocol paths,
+    /// not the gate (covered in tests/auth.rs and mqtt-auth's unit tests).
+    fn permissive() -> Arc<dyn Authenticator> {
+        Arc::new(BasicAuthenticator {
+            allow_anonymous: true,
+        })
+    }
+
     /// Start a connection task over an in-memory duplex; returns the client's
     /// framed I/O and the hub command stream the connection produces.
     fn start_conn() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
-        tokio::spawn(handle_stream(server, None, hub_tx));
+        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
     }
@@ -406,7 +509,7 @@ mod tests {
     async fn unsupported_protocol_version_closes_without_connack() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
-        tokio::spawn(handle_stream(server, None, hub_tx));
+        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, mut wh) = tokio::io::split(client);
 
         // A CONNECT claiming protocol level 5: name "MQTT", level 0x05,

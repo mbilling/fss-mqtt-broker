@@ -1,6 +1,6 @@
 //! The MQTT broker server binary.
 //!
-//! Milestone: a clustered MQTT 3.1.1 broker — QoS 0/1/2 delivery, retained
+//! Milestone: a clustered MQTT 3.1.1 broker — `QoS` 0/1/2 delivery, retained
 //! messages, wills, keepalive — with transport security
 //! (ADR 0002). Clients connect over TLS 1.3; peer links run mutual TLS against
 //! a dedicated cluster CA; peers are discovered dynamically via SWIM gossip
@@ -16,6 +16,8 @@
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
 //!   certificate it issued (mTLS)
 //! - `MQTTD_PLAINTEXT_BIND` — insecure client listener bind, e.g. `127.0.0.1:1883`
+//! - `MQTTD_ALLOW_ANONYMOUS` — any non-empty value permits clients that present
+//!   no credentials at all; default-off and loudly logged as insecure
 //! - `MQTTD_PEER_BIND`      — inter-node listener bind, e.g. `127.0.0.1:7001`
 //! - `MQTTD_PEER_TLS_CA` / `MQTTD_PEER_TLS_CERT` / `MQTTD_PEER_TLS_KEY` —
 //!   cluster-bus mTLS material (set all three); without them peer links are
@@ -29,6 +31,8 @@
 //!   from `openssl rand -hex 32`; without it gossip is unauthenticated and
 //!   loudly logged
 
+use mqtt_auth::basic::BasicAuthenticator;
+use mqtt_auth::Authenticator;
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
@@ -37,6 +41,7 @@ use mqtt_net::tls;
 use mqtt_storage::MemorySessionStore;
 use mqttd::{cluster, conn, hub, peer};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -104,6 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replacing the need for a static MQTTD_PEERS list.
     start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref()).await?;
 
+    // CONNECT authentication policy (deny by default): anonymous access is an
+    // explicit, loudly-logged opt-in. Both client listeners share one policy.
+    let allow_anonymous = non_empty_env("MQTTD_ALLOW_ANONYMOUS").is_some();
+    if allow_anonymous {
+        warn!(
+            "INSECURE: anonymous MQTT clients are PERMITTED (MQTTD_ALLOW_ANONYMOUS) — \
+             testing use only"
+        );
+    }
+    let auth: Arc<dyn Authenticator> = Arc::new(BasicAuthenticator { allow_anonymous });
+
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
     // local-testing escape hatch.
     let mut listeners = Vec::new();
@@ -126,13 +142,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listener,
             acceptor,
             hub_tx.clone(),
+            auth.clone(),
         )));
     }
     if let Some(addr) = non_empty_env("MQTTD_PLAINTEXT_BIND") {
         warn!(%addr, "INSECURE: starting PLAINTEXT MQTT listener (no TLS) — testing use only");
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT 3.1.1 clients");
-        listeners.push(tokio::spawn(serve_plaintext_clients(listener, hub_tx)));
+        listeners.push(tokio::spawn(serve_plaintext_clients(
+            listener, hub_tx, auth,
+        )));
     }
     if listeners.is_empty() {
         warn!(
@@ -234,6 +253,7 @@ async fn serve_tls_clients(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    auth: Arc<dyn Authenticator>,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -246,10 +266,15 @@ async fn serve_tls_clients(
         debug!(%peer, "accepted TLS connection");
         let acceptor = acceptor.clone();
         let hub = hub_tx.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
-                Ok(tls_stream) => conn::handle_stream(tls_stream, Some(peer), hub).await,
+                Ok(tls_stream) => {
+                    // mTLS identity (ADR 0004): the verified leaf cert's CN.
+                    let identity = conn::tls_identity(&tls_stream);
+                    conn::handle_stream(tls_stream, Some(peer), identity, auth, hub).await;
+                }
                 Err(e) => debug!(%peer, error = %e, "TLS handshake failed"),
             }
         });
@@ -260,6 +285,7 @@ async fn serve_tls_clients(
 async fn serve_plaintext_clients(
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    auth: Arc<dyn Authenticator>,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -271,7 +297,13 @@ async fn serve_plaintext_clients(
         };
         debug!(%peer, "accepted connection");
         let _ = stream.set_nodelay(true);
-        tokio::spawn(conn::handle(stream, hub_tx.clone()));
+        tokio::spawn(conn::handle_stream(
+            stream,
+            Some(peer),
+            None,
+            auth.clone(),
+            hub_tx.clone(),
+        ));
     }
 }
 
