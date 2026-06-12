@@ -13,6 +13,7 @@
 
 pub mod hrw;
 pub mod peer;
+pub mod placement;
 pub mod swim;
 pub mod swim_auth;
 pub mod swim_driver;
@@ -20,7 +21,10 @@ pub mod swim_driver;
 use mqtt_core::Message;
 
 /// Stable identifier for a node in the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Ordering is lexicographic on the inner id — used for deterministic placement
+/// (`BTreeSet` membership) and the same tie-break the HRW ring applies.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub String);
 
 /// The health of a peer as tracked by the failure detector.
