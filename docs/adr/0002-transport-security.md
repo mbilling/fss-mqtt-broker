@@ -72,7 +72,8 @@ deliberately deferred.
 - **SWIM gossip plane security.** UDP datagrams remain unauthenticated — an
   attacker who can reach the gossip port can still inject membership claims
   (and SWIM-driven routing makes `Dead` claims a remote kill switch). Needs a
-  shared-key MAC or move onto the authenticated channel; separate ADR.
+  shared-key MAC or move onto the authenticated channel. **Resolved by
+  [ADR 0003](0003-gossip-authentication.md).**
 - **CRL / OCSP stapling, certificate rotation/reload** without dropping
   connections (pairs with hot-reloadable policy, Capability Plan §3).
 - **WebSocket-over-TLS** listener (Phase 4).

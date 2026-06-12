@@ -14,6 +14,7 @@ bincode = "1"
 bytes = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+ring = { workspace = true }
 
 [lints]
 workspace = true

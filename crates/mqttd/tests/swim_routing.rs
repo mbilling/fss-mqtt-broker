@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use mqtt_cluster::swim::{Config as SwimConfig, Swim};
+use mqtt_cluster::swim_auth::{SwimAuth, KEY_LEN};
 use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_codec::{
     packet::{Connect, Publish, Subscribe, SubscribeFilter},
@@ -69,11 +70,15 @@ async fn start_node(id: &str, swim_seeds: Vec<String>) -> (SocketAddr, String) {
         swim_seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    // The cluster-shared gossip key (ADR 0003): this test exercises the
+    // authenticated path end-to-end.
+    let auth = SwimAuth::new(&[0x5A; KEY_LEN]);
     tokio::spawn(swim_driver::run(
         socket,
         swim,
         Duration::from_millis(20),
         event_tx,
+        Some(auth),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(
         event_rx, node_id, hub_tx, None,

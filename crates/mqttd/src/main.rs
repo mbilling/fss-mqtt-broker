@@ -24,8 +24,12 @@
 //!   (requires `MQTTD_PEER_BIND`; peer links are then established from
 //!   membership, no `MQTTD_PEERS` needed)
 //! - `MQTTD_SWIM_SEEDS`     — comma-separated SWIM addresses of existing members
+//! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), e.g.
+//!   from `openssl rand -hex 32`; without it gossip is unauthenticated and
+//!   loudly logged
 
 use mqtt_cluster::swim::Swim;
+use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_config::Config;
 use mqtt_net::tls;
@@ -182,6 +186,18 @@ async fn start_swim_from_env(
                     gossips the peer-link address so other nodes can dial us"
             .into());
     };
+    // Gossip authentication (ADR 0003): keyed = membership claims require the
+    // cluster key; unkeyed is possible but loudly insecure.
+    let auth = if let Some(hex) = non_empty_env("MQTTD_SWIM_KEY") {
+        Some(SwimAuth::from_hex_key(&hex)?)
+    } else {
+        warn!(
+            "INSECURE: SWIM gossip is UNAUTHENTICATED (no MQTTD_SWIM_KEY) — \
+             anyone reaching the gossip port can inject membership claims, \
+             including Dead claims that tear down routing"
+        );
+        None
+    };
     let socket = UdpSocket::bind(&bind).await?;
     let seeds: Vec<String> = non_empty_env("MQTTD_SWIM_SEEDS")
         .map(|s| {
@@ -192,7 +208,7 @@ async fn start_swim_from_env(
                 .collect()
         })
         .unwrap_or_default();
-    info!(%bind, seeds = seeds.len(), "starting SWIM gossip membership");
+    info!(%bind, seeds = seeds.len(), authenticated = auth.is_some(), "starting SWIM gossip membership");
     let swim = Swim::new(
         node_id.clone(),
         bind,
@@ -201,7 +217,7 @@ async fn start_swim_from_env(
         seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    tokio::spawn(swim_driver::run(socket, swim, SWIM_TICK, event_tx));
+    tokio::spawn(swim_driver::run(socket, swim, SWIM_TICK, event_tx, auth));
     tokio::spawn(cluster::maintain_peer_links(
         event_rx,
         node_id.clone(),
