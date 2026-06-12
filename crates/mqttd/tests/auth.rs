@@ -35,12 +35,16 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            let policy = std::sync::Arc::new(mqttd::conn::ConnPolicy {
+                auth: auth.clone(),
+                authz: std::sync::Arc::new(mqtt_auth::AllowAll),
+                audit: std::sync::Arc::new(mqtt_observability::AuditLog::new()),
+            });
             tokio::spawn(mqttd::conn::handle_stream(
                 stream,
                 None,
                 identity.clone(),
-                auth.clone(),
-                std::sync::Arc::new(mqtt_auth::AllowAll),
+                policy,
                 hub_tx.clone(),
             ));
         }

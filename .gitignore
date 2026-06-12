@@ -9,3 +9,7 @@ Cargo.lock.orig
 *.pem
 *.key
 *.crt
+
+# Test-only PKI fixtures (not real secrets) must be committed despite *.pem
+!crates/mqtt-auth/src/testdata/
+!crates/mqtt-auth/src/testdata/*.pem

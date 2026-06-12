@@ -89,10 +89,31 @@ docs; the load-bearing decisions:
   time* check in the hub (needed if policies ever change under live
   subscriptions) is deferred along with hot reload.
 
-## Deferred (the rest of the auth plan)
+## Steps 4–6 (implemented)
 
-- **Step 4:** audit-chain integration for auth/ACL events.
-- **Step 5:** peer node-id ↔ certificate CN binding.
-- **Step 6:** Argon2id password file, JWT/OIDC; MQTT 5 enhanced auth after the
-  v5 codec.
-- SAN-based identity selection; per-listener auth policies; hot ACL reload.
+- **Step 4 — audit trail.** The connection layer records `auth.success`,
+  `auth.failure`, `acl.deny.publish`, `acl.deny.subscribe`, and
+  `acl.deny.will` into an [`AuditSink`]. The production `AuditLog` hash-chains
+  every event (tamper-evident head) and emits a structured `tracing` event
+  (target `audit`). Failures are keyed by client id, never a credential — no
+  secret reaches the log.
+- **Step 5 — peer node-id ↔ certificate CN binding.** On the cluster bus a
+  peer's `Hello { node_id }` must equal its certificate's Subject CN, checked
+  on both link directions before the tie-break. Closes the ADR 0002 hole where
+  any cluster-cert holder could claim any node id. No binding on the plaintext
+  (insecure) mesh.
+- **Step 6 — password and token authenticators.** `PasswordAuthenticator`
+  (Argon2id, `username:phc-hash` file, identical error for unknown-user and
+  wrong-password — no enumeration oracle) and `TokenAuthenticator` (JWT HS256 /
+  RS256 with a static key, `exp`/`iss`/`aud` validation, subject from `sub`,
+  groups from a configurable claim). A `ChainAuthenticator` tries cert →
+  password → token; each non-handling member abstains (`NotPermitted`) and the
+  first real verdict is final.
+
+## Deferred
+
+- Full OIDC discovery / JWKS rotation (step 6 takes a single static key); MQTT 5
+  enhanced auth after the v5 codec.
+- Delivery-time ACL re-check in the hub (enforcement is subscription-time only).
+- SAN-based identity selection; per-listener auth policies; hot ACL reload;
+  `%c` (client-id) substitution in ACL patterns.

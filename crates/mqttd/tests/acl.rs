@@ -41,13 +41,16 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
         loop {
             let (stream, peer) = listener.accept().await.unwrap();
             let identity = id_rx.recv().await;
-            let auth = Arc::new(BasicAuthenticator {
-                allow_anonymous: false,
+            let conn_policy = Arc::new(mqttd::conn::ConnPolicy {
+                auth: Arc::new(BasicAuthenticator {
+                    allow_anonymous: false,
+                }),
+                authz: policy.clone(),
+                audit: Arc::new(mqtt_observability::AuditLog::new()),
             });
-            let policy = policy.clone();
             let hub = hub_tx.clone();
             tokio::spawn(async move {
-                mqttd::conn::handle_stream(stream, Some(peer), identity, auth, policy, hub).await;
+                mqttd::conn::handle_stream(stream, Some(peer), identity, conn_policy, hub).await;
             });
         }
     });

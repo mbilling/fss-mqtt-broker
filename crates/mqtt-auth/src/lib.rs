@@ -6,7 +6,10 @@
 
 pub mod acl;
 pub mod basic;
+pub mod chain;
 pub mod mtls;
+pub mod password;
+pub mod token;
 
 use mqtt_core::{ClientId, TopicFilter, TopicName};
 

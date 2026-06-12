@@ -18,6 +18,7 @@ use mqtt_codec::{
 };
 use mqtt_core::{ClientId, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
+use mqtt_observability::{AuditLog, AuditSink};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,34 +67,56 @@ pub fn tls_identity<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Ident
     }
 }
 
+/// The policy a connection consults: who may connect ([`Authenticator`]), what
+/// they may do ([`Authorizer`]), and where security decisions are audited
+/// ([`AuditSink`], ADR 0004 step 4).
+pub struct ConnPolicy {
+    /// Authenticates the CONNECT credentials.
+    pub auth: Arc<dyn Authenticator>,
+    /// Authorizes publish/subscribe topics.
+    pub authz: Arc<dyn Authorizer>,
+    /// Records auth and authorization decisions.
+    pub audit: Arc<dyn AuditSink>,
+}
+
+impl std::fmt::Debug for ConnPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnPolicy").finish_non_exhaustive()
+    }
+}
+
 /// Drive one accepted plaintext TCP connection to completion, logging any error.
 ///
-/// Test-only convenience path: anonymous clients are permitted and no transport
-/// identity is attached. Production listeners go through [`handle_stream`] with
-/// the operator-configured policy.
+/// Test-only convenience path: anonymous clients are permitted, no transport
+/// identity is attached, and authorization is open. Production listeners go
+/// through [`handle_stream`] with the operator-configured [`ConnPolicy`].
 pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     let peer = stream.peer_addr().ok();
-    let auth: Arc<dyn Authenticator> = Arc::new(BasicAuthenticator {
-        allow_anonymous: true,
+    let policy = Arc::new(ConnPolicy {
+        auth: Arc::new(BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        authz: Arc::new(AllowAll),
+        audit: Arc::new(AuditLog::new()),
     });
-    handle_stream(stream, peer, None, auth, Arc::new(AllowAll), hub).await;
+    handle_stream(stream, peer, None, policy, hub).await;
 }
 
 /// Drive one accepted connection over any transport (TCP, TLS) to completion,
 /// logging any error. `peer` is the remote address, for diagnostics only.
 /// `identity` is the TLS-verified mTLS identity, `None` on plaintext or
-/// no-client-cert connections; `auth` decides whether the CONNECT may proceed.
+/// no-client-cert connections; `policy` decides authentication, authorization,
+/// and auditing.
 pub async fn handle_stream<S>(
     stream: S,
     peer: Option<SocketAddr>,
     identity: Option<Identity>,
-    auth: Arc<dyn Authenticator>,
-    authz: Arc<dyn Authorizer>,
+    policy: Arc<ConnPolicy>,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = run(stream, identity, auth, authz, hub).await {
+    if let Err(e) = run(stream, identity, &policy, hub).await {
         warn!(?peer, error = %e, "connection ended with error");
     }
 }
@@ -101,8 +124,7 @@ pub async fn handle_stream<S>(
 async fn run<S>(
     stream: S,
     identity: Option<Identity>,
-    auth: Arc<dyn Authenticator>,
-    authz: Arc<dyn Authorizer>,
+    policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) -> Result<(), NetError>
 where
@@ -130,7 +152,7 @@ where
     // Authentication gate: verify credentials BEFORE attaching to the hub, so
     // a rejected client never touches session state.
     let Some(principal) =
-        authenticate_connect(&mut writer, &client, &connect, identity.as_ref(), &*auth).await?
+        authenticate_connect(&mut writer, &client, &connect, identity.as_ref(), policy).await?
     else {
         return Ok(()); // rejected; the CONNACK was already sent
     };
@@ -138,8 +160,13 @@ where
     // A will is a deferred publish: it must be authorized at CONNECT, not at
     // the moment of death (ADR 0004 step 3).
     if let Some(w) = &connect.last_will {
-        if !authz.authorize_publish(&principal, &w.topic) {
+        if !policy.authz.authorize_publish(&principal, &w.topic) {
             warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
+            policy.audit.record(
+                "acl.deny.will",
+                Some(&principal.subject),
+                &format!("will topic {}", w.topic),
+            );
             writer
                 .send(&Packet::ConnAck(ConnAck {
                     session_present: false,
@@ -191,7 +218,7 @@ where
         &hub,
         &client,
         &principal,
-        &*authz,
+        policy,
         &mut out_rx,
         connect.keep_alive,
     )
@@ -257,7 +284,7 @@ async fn authenticate_connect<W>(
     client: &ClientId,
     connect: &Connect,
     identity: Option<&Identity>,
-    auth: &dyn Authenticator,
+    policy: &ConnPolicy,
 ) -> Result<Option<Identity>, NetError>
 where
     W: AsyncWrite + Unpin,
@@ -272,8 +299,21 @@ where
         },
         (None, None) => Credentials::Anonymous,
     };
-    match auth.authenticate(client, &creds) {
-        Ok(id) => Ok(Some(id)),
+    let method = match creds {
+        Credentials::ClientCert { .. } => "certificate",
+        Credentials::Password { .. } => "password",
+        Credentials::Token(_) => "token",
+        Credentials::Anonymous => "anonymous",
+    };
+    match policy.auth.authenticate(client, &creds) {
+        Ok(id) => {
+            policy.audit.record(
+                "auth.success",
+                Some(&id.subject),
+                &format!("client {} via {method}", client.0),
+            );
+            Ok(Some(id))
+        }
         Err(e) => {
             let code = if matches!(creds, Credentials::Password { .. }) {
                 CONNACK_BAD_CREDENTIALS
@@ -281,6 +321,12 @@ where
                 CONNACK_NOT_AUTHORIZED
             };
             warn!(client = %client.0, error = %e, "CONNECT rejected: authentication failed");
+            // The subject is the client id, not a credential — never log secrets.
+            policy.audit.record(
+                "auth.failure",
+                Some(&client.0),
+                &format!("rejected {method} credentials"),
+            );
             writer
                 .send(&Packet::ConnAck(ConnAck {
                     session_present: false,
@@ -302,7 +348,7 @@ async fn serve<R, W>(
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
     principal: &Identity,
-    authz: &dyn Authorizer,
+    policy: &ConnPolicy,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
 ) -> Result<bool, NetError>
@@ -334,7 +380,7 @@ where
                 match inbound? {
                     None => return Ok(false), // EOF without DISCONNECT
                     Some(packet) => {
-                        if handle_inbound(packet, writer, hub, client, principal, authz, &mut qos2_inbound).await? {
+                        if handle_inbound(packet, writer, hub, client, principal, policy, &mut qos2_inbound).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
                     }
@@ -365,7 +411,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
     principal: &Identity,
-    authz: &dyn Authorizer,
+    policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
 ) -> Result<bool, NetError> {
     let Publish {
@@ -386,10 +432,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped but still
     // acknowledged — 3.1.1 has no negative PUBACK, and not acking would leave
     // conforming publishers retrying forever.
-    let authorized = authz.authorize_publish(principal, &topic);
+    let authorized = policy.authz.authorize_publish(principal, &topic);
     if !authorized {
         debug!(client = %client.0, identity = %principal.subject, topic = %topic,
                "publish denied by ACL; dropping");
+        policy
+            .audit
+            .record("acl.deny.publish", Some(&principal.subject), &topic);
     }
     let forward = |hub: &mpsc::UnboundedSender<HubCommand>| {
         if authorized {
@@ -428,13 +477,23 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
     principal: &Identity,
-    authz: &dyn Authorizer,
+    policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
 ) -> Result<bool, NetError> {
     match packet {
         Packet::Publish(publish) => {
             // A wildcard topic is a protocol violation: close the connection.
-            if handle_publish(publish, writer, hub, client, principal, authz, qos2_inbound).await? {
+            if handle_publish(
+                publish,
+                writer,
+                hub,
+                client,
+                principal,
+                policy,
+                qos2_inbound,
+            )
+            .await?
+            {
                 return Ok(true);
             }
         }
@@ -469,12 +528,15 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             let mut granted: Vec<(String, QoS)> = Vec::new();
             let mut return_codes: Vec<u8> = Vec::with_capacity(s.filters.len());
             for f in &s.filters {
-                if authz.authorize_subscribe(principal, &f.path) {
+                if policy.authz.authorize_subscribe(principal, &f.path) {
                     granted.push((f.path.clone(), f.qos));
                     return_codes.push(f.qos as u8);
                 } else {
                     debug!(client = %client.0, identity = %principal.subject, filter = %f.path,
                            "subscription denied by ACL");
+                    policy
+                        .audit
+                        .record("acl.deny.subscribe", Some(&principal.subject), &f.path);
                     return_codes.push(SUBACK_FAILURE);
                 }
             }
@@ -507,9 +569,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::handle_stream;
+    use super::{handle_stream, ConnPolicy};
     use crate::hub::HubCommand;
-    use mqtt_auth::{basic::BasicAuthenticator, Authenticator};
+    use mqtt_auth::basic::BasicAuthenticator;
     use mqtt_codec::{
         packet::{ConnAck, Connect, Publish},
         Packet, ProtocolVersion, QoS,
@@ -526,11 +588,15 @@ mod tests {
     type Reader = FrameReader<ReadHalf<DuplexStream>>;
     type Writer = FrameWriter<WriteHalf<DuplexStream>>;
 
-    /// A wide-open authenticator so these tests exercise the protocol paths,
-    /// not the gate (covered in tests/auth.rs and mqtt-auth's unit tests).
-    fn permissive() -> Arc<dyn Authenticator> {
-        Arc::new(BasicAuthenticator {
-            allow_anonymous: true,
+    /// A wide-open policy so these tests exercise the protocol paths, not the
+    /// gate (covered in tests/auth.rs, tests/acl.rs, and mqtt-auth's tests).
+    fn permissive() -> Arc<ConnPolicy> {
+        Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
         })
     }
 
@@ -539,14 +605,7 @@ mod tests {
     fn start_conn() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
-        tokio::spawn(handle_stream(
-            server,
-            None,
-            None,
-            permissive(),
-            Arc::new(mqtt_auth::AllowAll),
-            hub_tx,
-        ));
+        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
     }
@@ -608,14 +667,7 @@ mod tests {
     async fn unsupported_protocol_version_closes_without_connack() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
-        tokio::spawn(handle_stream(
-            server,
-            None,
-            None,
-            permissive(),
-            Arc::new(mqtt_auth::AllowAll),
-            hub_tx,
-        ));
+        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, mut wh) = tokio::io::split(client);
 
         // A CONNECT claiming protocol level 5: name "MQTT", level 0x05,

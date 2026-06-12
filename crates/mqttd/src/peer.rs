@@ -24,6 +24,29 @@ use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
 
+/// The Subject Common Name of the verified peer certificate, if the link is
+/// mTLS and the leaf carries a usable CN.
+///
+/// The mTLS verifier has already required a cluster-CA-issued certificate; this
+/// only reads the CN that the [`handle`] binding check compares against the
+/// peer's `Hello`. A `None` here (plaintext link, no presented cert, or a
+/// CN-less cert) means *no binding* — see [`handle`] for the policy.
+///
+/// Works for both the accepting (`server::TlsStream`) and dialing
+/// (`client::TlsStream`) sides: both expose the verified chain through the same
+/// `CommonState` returned by their `get_ref().1`. We name it through the
+/// `tokio_rustls` re-export because `rustls` itself is only a dev-dependency.
+fn peer_cert_cn(state: &tokio_rustls::rustls::CommonState) -> Option<String> {
+    let leaf = state.peer_certificates()?.first()?;
+    match mqtt_auth::mtls::identity_from_cert(leaf) {
+        Ok(identity) => Some(identity.subject),
+        Err(e) => {
+            warn!(error = %e, "peer certificate verified but has no usable Common Name; no node-id binding");
+            None
+        }
+    }
+}
+
 /// The cluster bus mTLS context, built once from the cluster CA + node cert and
 /// shared by every peer link (both accepting and dialing sides).
 #[derive(Clone)]
@@ -67,13 +90,16 @@ pub async fn serve_listener(
                     let _ = stream.set_nodelay(true);
                     let result = match &tls {
                         Some(t) => match t.acceptor.accept(stream).await {
-                            Ok(s) => handle(s, local, hub, false).await,
+                            Ok(s) => {
+                                let expected_cn = peer_cert_cn(s.get_ref().1);
+                                handle(s, local, hub, false, expected_cn).await
+                            }
                             Err(e) => {
                                 debug!(error = %e, "peer mTLS handshake failed; link rejected");
                                 return;
                             }
                         },
-                        None => handle(stream, local, hub, false).await,
+                        None => handle(stream, local, hub, false, None).await,
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "inbound peer link ended");
@@ -119,7 +145,10 @@ pub async fn dial_forever(
                 let outcome = match (&tls, &server_name) {
                     (Some(t), Some(name)) => {
                         match t.connector.connect(name.clone(), stream).await {
-                            Ok(s) => handle(s, local.clone(), hub.clone(), true).await,
+                            Ok(s) => {
+                                let expected_cn = peer_cert_cn(s.get_ref().1);
+                                handle(s, local.clone(), hub.clone(), true, expected_cn).await
+                            }
                             Err(e) => {
                                 debug!(%addr, error = %e, "peer mTLS handshake failed; will retry");
                                 tokio::time::sleep(REDIAL_DELAY).await;
@@ -127,7 +156,7 @@ pub async fn dial_forever(
                             }
                         }
                     }
-                    _ => handle(stream, local.clone(), hub.clone(), true).await,
+                    _ => handle(stream, local.clone(), hub.clone(), true, None).await,
                 };
                 match outcome {
                     Ok(LinkOutcome::Redundant) => {
@@ -158,11 +187,19 @@ enum LinkOutcome {
 /// `initiated` is true when we dialed (vs. accepted). To guarantee exactly one
 /// link per node pair, the surviving link is the one whose initiating side has the
 /// **smaller node id**; the other direction is dropped right after the handshake.
+///
+/// `expected_cn` binds the peer's claimed identity to its certificate (ADR 0004
+/// step 5; resolves a deferred item from ADR 0002): when `Some(cn)`, the remote
+/// `Hello`'s `node_id` MUST equal `cn` (the Subject CN of the verified peer
+/// certificate), otherwise the link is dropped — a cluster-CA cert no longer
+/// admits a node under an arbitrary id. `None` (plaintext mesh, or a CN-less
+/// cert) applies no binding, keeping the unauthenticated mesh working.
 async fn handle<S>(
     stream: S,
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
     initiated: bool,
+    expected_cn: Option<String>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -187,6 +224,22 @@ where
         }
         None => return Ok(LinkOutcome::Closed),
     };
+
+    // Node-id ↔ certificate binding: the peer may only claim the node id that
+    // its certificate's Subject CN attests to. Enforced before the self-connect
+    // and tie-break checks so an impersonator is dropped regardless of either.
+    // For the dialer, a permanent mismatch simply redials, which is acceptable.
+    if let Some(cn) = &expected_cn {
+        if cn != &remote.0 {
+            warn!(
+                cert_cn = %cn,
+                claimed = %remote.0,
+                "peer Hello node id does not match its certificate Common Name; dropping link"
+            );
+            return Ok(LinkOutcome::Closed);
+        }
+    }
+
     if remote == local {
         debug!("ignoring self-connection");
         return Ok(LinkOutcome::Redundant);

@@ -117,15 +117,12 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: true,
                     });
-                    mqttd::conn::handle_stream(
-                        tls,
-                        Some(peer),
-                        None,
+                    let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth,
-                        Arc::new(mqtt_auth::AllowAll),
-                        hub,
-                    )
-                    .await;
+                        authz: Arc::new(mqtt_auth::AllowAll),
+                        audit: Arc::new(mqtt_observability::AuditLog::new()),
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
                 }
             });
         }
@@ -306,17 +303,48 @@ async fn plaintext_client_on_tls_port_is_rejected() {
 
 // --- cluster-bus (peer mTLS) tests ----------------------------------------------
 
-fn peer_tls(pki: &Pki) -> PeerTls {
+/// Mint a per-node peer leaf (CN == node id, SAN 127.0.0.1, server+client auth)
+/// signed by the shared cluster CA, and build its mTLS context. The CN binding
+/// (ADR 0004 step 5) requires each node's certificate CN to equal its node id.
+fn node_peer_tls(
+    ca_pem: &Path,
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+    node_id: &str,
+) -> PeerTls {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+    // Unique per call: concurrent cluster harnesses must not share cert files.
+    let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mqttd-peer-{}-{node_id}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, node_id);
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
     PeerTls {
-        acceptor: mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, Some(&pki.ca)).unwrap(),
-        connector: mqtt_net::tls::client_connector(&pki.ca, &pki.cert, &pki.key).unwrap(),
+        acceptor: mqtt_net::tls::server_acceptor(&cert_path, &key_path, Some(ca_pem)).unwrap(),
+        connector: mqtt_net::tls::client_connector(ca_pem, &cert_path, &key_path).unwrap(),
     }
 }
 
 /// Two-node cluster whose peer links run mutual TLS; returns client addresses
 /// and node B's peer-listener address (for the rejection test).
 async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
-    let (pki, _, _) = mint_pki("cluster");
+    let (pki, ca_cert, ca_key) = mint_pki("cluster");
+    let tls_a = node_peer_tls(&pki.ca, &ca_cert, &ca_key, "mtls-a");
+    let tls_b = node_peer_tls(&pki.ca, &ca_cert, &ca_key, "mtls-b");
 
     let peer_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -347,25 +375,25 @@ async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
         peer_a,
         id_a.clone(),
         tx_a.clone(),
-        Some(peer_tls(&pki)),
+        Some(tls_a.clone()),
     ));
     tokio::spawn(mqttd::peer::serve_listener(
         peer_b,
         id_b.clone(),
         tx_b.clone(),
-        Some(peer_tls(&pki)),
+        Some(tls_b.clone()),
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_b.to_string(),
         id_a,
         tx_a,
-        Some(peer_tls(&pki)),
+        Some(tls_a),
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_a.to_string(),
         id_b,
         tx_b,
-        Some(peer_tls(&pki)),
+        Some(tls_b),
     ));
 
     (caddr_a, caddr_b, paddr_b)
@@ -446,15 +474,12 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
-                    mqttd::conn::handle_stream(
-                        tls,
-                        Some(peer),
-                        identity,
+                    let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth,
-                        Arc::new(mqtt_auth::AllowAll),
-                        hub,
-                    )
-                    .await;
+                        authz: Arc::new(mqtt_auth::AllowAll),
+                        audit: Arc::new(mqtt_observability::AuditLog::new()),
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }
             });
         }
@@ -532,15 +557,12 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
-                    mqttd::conn::handle_stream(
-                        tls,
-                        Some(peer),
-                        identity,
+                    let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth,
-                        Arc::new(mqtt_auth::AllowAll),
-                        hub,
-                    )
-                    .await;
+                        authz: Arc::new(mqtt_auth::AllowAll),
+                        audit: Arc::new(mqtt_observability::AuditLog::new()),
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }
             });
         }
