@@ -24,7 +24,10 @@ pub fn identity_from_cert(der: &[u8]) -> Result<Identity, AuthError> {
         .ok_or(AuthError::Rejected)?
         .as_str()
         .map_err(|_| AuthError::Rejected)?;
-    if cn.is_empty() {
+    // Reject empty CNs and any carrying topic metacharacters: such a subject
+    // is unusable for routing and, substituted into a `%i` ACL pattern, could
+    // broaden a grant across namespaces (ADR 0004). Fail closed at the door.
+    if cn.is_empty() || cn.contains(['/', '+', '#']) {
         return Err(AuthError::Rejected);
     }
     Ok(Identity {
@@ -85,6 +88,24 @@ mod tests {
     fn empty_common_name_is_rejected() {
         let der = cert_der(&[(rcgen::DnType::CommonName, "")]);
         assert!(matches!(identity_from_cert(&der), Err(AuthError::Rejected)));
+    }
+
+    /// A CN carrying topic metacharacters is unusable as a broker identity and
+    /// a substitution hazard (ADR 0004): reject it at the door so it can never
+    /// reach the ACL engine. The CA controls CNs, but a sloppy or multi-tenant
+    /// CA must not be able to mint a wildcard-injecting identity.
+    #[test]
+    fn common_name_with_topic_metacharacters_is_rejected() {
+        for cn in ["+", "#", "a/b", "dev/+/x", "has#hash", "trailing/"] {
+            let der = cert_der(&[(rcgen::DnType::CommonName, cn)]);
+            assert!(
+                matches!(identity_from_cert(&der), Err(AuthError::Rejected)),
+                "CN {cn:?} should be rejected as an unsafe identity"
+            );
+        }
+        // A normal CN with other punctuation is still fine.
+        let der = cert_der(&[(rcgen::DnType::CommonName, "device-7.eu.example")]);
+        assert!(identity_from_cert(&der).is_ok());
     }
 
     #[test]

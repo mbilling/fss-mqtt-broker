@@ -117,7 +117,15 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: true,
                     });
-                    mqttd::conn::handle_stream(tls, Some(peer), None, auth, hub).await;
+                    mqttd::conn::handle_stream(
+                        tls,
+                        Some(peer),
+                        None,
+                        auth,
+                        Arc::new(mqtt_auth::AllowAll),
+                        hub,
+                    )
+                    .await;
                 }
             });
         }
@@ -438,7 +446,15 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
-                    mqttd::conn::handle_stream(tls, Some(peer), identity, auth, hub).await;
+                    mqttd::conn::handle_stream(
+                        tls,
+                        Some(peer),
+                        identity,
+                        auth,
+                        Arc::new(mqtt_auth::AllowAll),
+                        hub,
+                    )
+                    .await;
                 }
             });
         }
@@ -516,7 +532,15 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
-                    mqttd::conn::handle_stream(tls, Some(peer), identity, auth, hub).await;
+                    mqttd::conn::handle_stream(
+                        tls,
+                        Some(peer),
+                        identity,
+                        auth,
+                        Arc::new(mqtt_auth::AllowAll),
+                        hub,
+                    )
+                    .await;
                 }
             });
         }

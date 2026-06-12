@@ -58,11 +58,39 @@ requires an identity model before an authorization model, and decisions about
 - `conn::handle` remains a permissive anonymous shim for the integration test
   suites; production listeners do not use it.
 
+## Step 3 (implemented): the topic ACL engine
+
+A TOML policy file (`MQTTD_ACL_FILE`) evaluated per identity, action, and
+topic; without a policy file authorization is **not enforced** and the broker
+logs that loudly. Schema and full semantics live in `mqtt_auth::acl`'s module
+docs; the load-bearing decisions:
+
+- **Deny > allow > default(deny).** Rule order is irrelevant.
+- **Asymmetric topic tests for subscriptions.** Allow rules use *coverage*
+  (`mqtt_core::filter_covers`): granting `devices/+/state` does not admit a
+  `devices/#` subscription. Deny rules use *overlap*
+  (`mqtt_core::filters_overlap`): denying `secret/#` refuses any subscription
+  that could receive a matching message, including `#` — broad filters cannot
+  tunnel past denials. Publishes are concrete topics and use plain filter
+  matching for both effects.
+- **`$`-rooted topics mirror `topic_matches`:** wildcard-leading patterns
+  neither cover nor overlap `$`-rooted filters.
+- **Principals:** any-of `identities` globs (`*` only, byte-wise, literal
+  otherwise) or any-of `groups`; both empty = everyone.
+- **`%i`** substitutes the identity subject in rule topics at evaluation time.
+  `%c` (client id) is deferred until the `Authorizer` trait carries the client
+  id.
+- **Enforcement:** SUBSCRIBE → per-filter 0x80, denied filters never reach the
+  hub (so retained replay is implicitly gated); PUBLISH → dropped but still
+  acknowledged per `QoS` (3.1.1 has no negative PUBACK; not acking strands
+  conforming publishers in retry), logged; will topic → 0x05 at CONNECT (a
+  will is a deferred publish — refuse it before accepting the session).
+- **Known limitation:** enforcement is subscription-time only; a *delivery-
+  time* check in the hub (needed if policies ever change under live
+  subscriptions) is deferred along with hot reload.
+
 ## Deferred (the rest of the auth plan)
 
-- **Step 3:** file-based topic ACL engine (deny-by-default, `%c`/`%i`
-  substitution), enforced at SUBSCRIBE (0x80), PUBLISH (drop + audit), and the
-  will topic at CONNECT.
 - **Step 4:** audit-chain integration for auth/ACL events.
 - **Step 5:** peer node-id ↔ certificate CN binding.
 - **Step 6:** Argon2id password file, JWT/OIDC; MQTT 5 enhanced auth after the

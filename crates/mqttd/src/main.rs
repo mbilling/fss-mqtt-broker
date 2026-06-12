@@ -15,6 +15,8 @@
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
 //!   certificate it issued (mTLS)
+//! - `MQTTD_ACL_FILE`       — TOML topic-ACL policy (deny by default); without
+//!   it authorization is not enforced and loudly logged
 //! - `MQTTD_PLAINTEXT_BIND` — insecure client listener bind, e.g. `127.0.0.1:1883`
 //! - `MQTTD_ALLOW_ANONYMOUS` — any non-empty value permits clients that present
 //!   no credentials at all; default-off and loudly logged as insecure
@@ -32,7 +34,7 @@
 //!   loudly logged
 
 use mqtt_auth::basic::BasicAuthenticator;
-use mqtt_auth::Authenticator;
+use mqtt_auth::{Authenticator, Authorizer};
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
@@ -109,16 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replacing the need for a static MQTTD_PEERS list.
     start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref()).await?;
 
-    // CONNECT authentication policy (deny by default): anonymous access is an
-    // explicit, loudly-logged opt-in. Both client listeners share one policy.
-    let allow_anonymous = non_empty_env("MQTTD_ALLOW_ANONYMOUS").is_some();
-    if allow_anonymous {
-        warn!(
-            "INSECURE: anonymous MQTT clients are PERMITTED (MQTTD_ALLOW_ANONYMOUS) — \
-             testing use only"
-        );
-    }
-    let auth: Arc<dyn Authenticator> = Arc::new(BasicAuthenticator { allow_anonymous });
+    // Client authentication + topic authorization policy (ADR 0004), shared
+    // by both client listeners.
+    let (auth, authz) = client_policy_from_env()?;
 
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
     // local-testing escape hatch.
@@ -143,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             acceptor,
             hub_tx.clone(),
             auth.clone(),
+            authz.clone(),
         )));
     }
     if let Some(addr) = non_empty_env("MQTTD_PLAINTEXT_BIND") {
@@ -150,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT 3.1.1 clients");
         listeners.push(tokio::spawn(serve_plaintext_clients(
-            listener, hub_tx, auth,
+            listener, hub_tx, auth, authz,
         )));
     }
     if listeners.is_empty() {
@@ -164,6 +160,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = l.await;
     }
     Ok(())
+}
+
+/// Build the CONNECT authentication and topic-authorization policy from
+/// `MQTTD_ALLOW_ANONYMOUS` and `MQTTD_ACL_FILE` (ADR 0004). Both are
+/// deny-by-default; the insecure fallbacks are explicit and loudly logged.
+#[allow(clippy::type_complexity)]
+fn client_policy_from_env(
+) -> Result<(Arc<dyn Authenticator>, Arc<dyn Authorizer>), Box<dyn std::error::Error>> {
+    let allow_anonymous = non_empty_env("MQTTD_ALLOW_ANONYMOUS").is_some();
+    if allow_anonymous {
+        warn!(
+            "INSECURE: anonymous MQTT clients are PERMITTED (MQTTD_ALLOW_ANONYMOUS) — \
+             testing use only"
+        );
+    }
+    let auth: Arc<dyn Authenticator> = Arc::new(BasicAuthenticator { allow_anonymous });
+
+    // A TOML ACL file gives deny-by-default per-identity topic policy; without
+    // one, authorization is not enforced — loudly.
+    let authz: Arc<dyn Authorizer> = if let Some(path) = non_empty_env("MQTTD_ACL_FILE") {
+        let text = std::fs::read_to_string(&path)?;
+        let policy = mqtt_auth::acl::AclPolicy::from_toml_str(&text)?;
+        info!(%path, "topic ACL policy loaded (deny by default)");
+        Arc::new(policy)
+    } else {
+        warn!(
+            "INSECURE: no MQTTD_ACL_FILE configured — topic authorization is \
+             NOT enforced (every authenticated client may publish/subscribe \
+             anywhere)"
+        );
+        Arc::new(mqtt_auth::AllowAll)
+    };
+    Ok((auth, authz))
 }
 
 /// Build the cluster-bus mTLS context from `MQTTD_PEER_TLS_{CA,CERT,KEY}`.
@@ -254,6 +283,7 @@ async fn serve_tls_clients(
     acceptor: TlsAcceptor,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     auth: Arc<dyn Authenticator>,
+    authz: Arc<dyn Authorizer>,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -267,13 +297,14 @@ async fn serve_tls_clients(
         let acceptor = acceptor.clone();
         let hub = hub_tx.clone();
         let auth = auth.clone();
+        let authz = authz.clone();
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     // mTLS identity (ADR 0004): the verified leaf cert's CN.
                     let identity = conn::tls_identity(&tls_stream);
-                    conn::handle_stream(tls_stream, Some(peer), identity, auth, hub).await;
+                    conn::handle_stream(tls_stream, Some(peer), identity, auth, authz, hub).await;
                 }
                 Err(e) => debug!(%peer, error = %e, "TLS handshake failed"),
             }
@@ -286,6 +317,7 @@ async fn serve_plaintext_clients(
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     auth: Arc<dyn Authenticator>,
+    authz: Arc<dyn Authorizer>,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -302,6 +334,7 @@ async fn serve_plaintext_clients(
             Some(peer),
             None,
             auth.clone(),
+            authz.clone(),
             hub_tx.clone(),
         ));
     }

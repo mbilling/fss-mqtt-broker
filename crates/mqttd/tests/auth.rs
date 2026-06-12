@@ -40,6 +40,7 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
                 None,
                 identity.clone(),
                 auth.clone(),
+                std::sync::Arc::new(mqtt_auth::AllowAll),
                 hub_tx.clone(),
             ));
         }

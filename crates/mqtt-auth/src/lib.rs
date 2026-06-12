@@ -4,6 +4,7 @@
 //! are pluggable via traits so operators can wire mTLS, password, JWT/OIDC, LDAP,
 //! or custom identity providers without forking the broker.
 
+pub mod acl;
 pub mod basic;
 pub mod mtls;
 
@@ -79,6 +80,21 @@ pub trait Authorizer: Send + Sync {
     fn authorize_publish(&self, identity: &Identity, topic: &TopicName) -> bool;
     /// Returns `true` if subscribing to `filter` is permitted.
     fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool;
+}
+
+/// Permits every action. Used only when no ACL policy is configured at all —
+/// the broker logs that state loudly; configure an ACL file for real,
+/// deny-by-default authorization.
+#[derive(Debug, Default)]
+pub struct AllowAll;
+
+impl Authorizer for AllowAll {
+    fn authorize_publish(&self, _identity: &Identity, _topic: &TopicName) -> bool {
+        true
+    }
+    fn authorize_subscribe(&self, _identity: &Identity, _filter: &TopicFilter) -> bool {
+        true
+    }
 }
 
 /// A default-deny authorizer used until a real policy is configured.

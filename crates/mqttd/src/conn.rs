@@ -9,7 +9,9 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::hub::{HubCommand, Outbound};
-use mqtt_auth::{basic::BasicAuthenticator, Authenticator, Credentials, Identity};
+use mqtt_auth::{
+    basic::BasicAuthenticator, AllowAll, Authenticator, Authorizer, Credentials, Identity,
+};
 use mqtt_codec::{
     packet::{ConnAck, Connect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
@@ -39,6 +41,8 @@ const CONNACK_IDENTIFIER_REJECTED: u8 = 0x02;
 const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
 /// CONNACK reason: not authorized (MQTT 3.1.1 return code 5).
 const CONNACK_NOT_AUTHORIZED: u8 = 0x05;
+/// SUBACK return code: failure (subscription refused) [MQTT-3.9.3].
+const SUBACK_FAILURE: u8 = 0x80;
 
 /// Monotonic source of unique connection ids (distinct from client ids).
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -72,7 +76,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     let auth: Arc<dyn Authenticator> = Arc::new(BasicAuthenticator {
         allow_anonymous: true,
     });
-    handle_stream(stream, peer, None, auth, hub).await;
+    handle_stream(stream, peer, None, auth, Arc::new(AllowAll), hub).await;
 }
 
 /// Drive one accepted connection over any transport (TCP, TLS) to completion,
@@ -84,11 +88,12 @@ pub async fn handle_stream<S>(
     peer: Option<SocketAddr>,
     identity: Option<Identity>,
     auth: Arc<dyn Authenticator>,
+    authz: Arc<dyn Authorizer>,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = run(stream, identity, auth, hub).await {
+    if let Err(e) = run(stream, identity, auth, authz, hub).await {
         warn!(?peer, error = %e, "connection ended with error");
     }
 }
@@ -97,6 +102,7 @@ async fn run<S>(
     stream: S,
     identity: Option<Identity>,
     auth: Arc<dyn Authenticator>,
+    authz: Arc<dyn Authorizer>,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) -> Result<(), NetError>
 where
@@ -116,42 +122,33 @@ where
         None => return Ok(()),
     };
 
-    // This milestone speaks only MQTT 3.1.1.
-    if connect.protocol != ProtocolVersion::V311 {
-        writer
-            .send(&Packet::ConnAck(ConnAck {
-                session_present: false,
-                code: CONNACK_UNACCEPTABLE_PROTOCOL,
-            }))
-            .await?;
+    // Protocol-version and client-id validation may already reject the CONNECT.
+    let Some(client) = validate_connect(&mut writer, &connect).await? else {
         return Ok(());
-    }
-
-    // An empty client id is only valid with clean session (the server assigns an
-    // id). Pairing an empty id with a persistent session is rejected per spec.
-    let client = if connect.client_id.is_empty() {
-        if !connect.clean_session {
-            writer
-                .send(&Packet::ConnAck(ConnAck {
-                    session_present: false,
-                    code: CONNACK_IDENTIFIER_REJECTED,
-                }))
-                .await?;
-            return Ok(());
-        }
-        ClientId(format!("auto-{}", AUTO_ID.fetch_add(1, Ordering::Relaxed)))
-    } else {
-        ClientId(connect.client_id.clone())
     };
 
     // Authentication gate: verify credentials BEFORE attaching to the hub, so
     // a rejected client never touches session state.
-    // TODO(step 3): hand to the authorizer once ACLs land.
-    let Some(_authenticated) =
+    let Some(principal) =
         authenticate_connect(&mut writer, &client, &connect, identity.as_ref(), &*auth).await?
     else {
         return Ok(()); // rejected; the CONNACK was already sent
     };
+
+    // A will is a deferred publish: it must be authorized at CONNECT, not at
+    // the moment of death (ADR 0004 step 3).
+    if let Some(w) = &connect.last_will {
+        if !authz.authorize_publish(&principal, &w.topic) {
+            warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
+            writer
+                .send(&Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    code: CONNACK_NOT_AUTHORIZED,
+                }))
+                .await?;
+            return Ok(());
+        }
+    }
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
     let will = connect.last_will.map(|w| Message {
@@ -193,6 +190,8 @@ where
         &mut writer,
         &hub,
         &client,
+        &principal,
+        &*authz,
         &mut out_rx,
         connect.keep_alive,
     )
@@ -206,6 +205,45 @@ where
         graceful,
     });
     result.map(|_| ())
+}
+
+/// Validate the protocol version and client id of a CONNECT, replying with the
+/// rejecting CONNACK (0x01 / 0x02) and returning `None` when it must close.
+/// An empty client id is only valid with clean session (the server assigns an
+/// id); pairing it with a persistent session is rejected per spec.
+async fn validate_connect<W>(
+    writer: &mut FrameWriter<W>,
+    connect: &Connect,
+) -> Result<Option<ClientId>, NetError>
+where
+    W: AsyncWrite + Unpin,
+{
+    // This milestone speaks only MQTT 3.1.1.
+    if connect.protocol != ProtocolVersion::V311 {
+        writer
+            .send(&Packet::ConnAck(ConnAck {
+                session_present: false,
+                code: CONNACK_UNACCEPTABLE_PROTOCOL,
+            }))
+            .await?;
+        return Ok(None);
+    }
+    if connect.client_id.is_empty() {
+        if !connect.clean_session {
+            writer
+                .send(&Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    code: CONNACK_IDENTIFIER_REJECTED,
+                }))
+                .await?;
+            return Ok(None);
+        }
+        return Ok(Some(ClientId(format!(
+            "auto-{}",
+            AUTO_ID.fetch_add(1, Ordering::Relaxed)
+        ))));
+    }
+    Ok(Some(ClientId(connect.client_id.clone())))
 }
 
 /// Authenticate the CONNECT against the listener policy. Credentials priority:
@@ -257,11 +295,14 @@ where
 /// Serve the connection until it ends. Returns `Ok(true)` only for a clean
 /// client DISCONNECT; every other end (EOF, keepalive expiry, takeover) is
 /// ungraceful and will publish the client's will.
+#[allow(clippy::too_many_arguments)] // a connection's full serving context
 async fn serve<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
+    principal: &Identity,
+    authz: &dyn Authorizer,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
 ) -> Result<bool, NetError>
@@ -293,7 +334,7 @@ where
                 match inbound? {
                     None => return Ok(false), // EOF without DISCONNECT
                     Some(packet) => {
-                        if handle_inbound(packet, writer, hub, client, &mut qos2_inbound).await? {
+                        if handle_inbound(packet, writer, hub, client, principal, authz, &mut qos2_inbound).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
                     }
@@ -315,47 +356,86 @@ where
     }
 }
 
+/// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
+/// handshakes, and the exactly-once dedup window. Returns `Ok(true)` if the
+/// connection must close (a protocol violation).
+async fn handle_publish<W: AsyncWrite + Unpin>(
+    publish: Publish,
+    writer: &mut FrameWriter<W>,
+    hub: &mpsc::UnboundedSender<HubCommand>,
+    client: &ClientId,
+    principal: &Identity,
+    authz: &dyn Authorizer,
+    qos2_inbound: &mut HashSet<u16>,
+) -> Result<bool, NetError> {
+    let Publish {
+        qos,
+        pkid,
+        topic,
+        payload,
+        retain,
+        ..
+    } = publish;
+    // [MQTT-3.3.2-2]: a PUBLISH topic name MUST NOT contain wildcards. This is
+    // a protocol violation, not an ACL decision — close the connection rather
+    // than letting a `+`/`#` topic reach routing or ACL matching.
+    if topic.contains(['+', '#']) {
+        warn!(client = %client.0, topic = %topic, "PUBLISH topic contains wildcards; closing connection");
+        return Ok(true);
+    }
+    // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped but still
+    // acknowledged — 3.1.1 has no negative PUBACK, and not acking would leave
+    // conforming publishers retrying forever.
+    let authorized = authz.authorize_publish(principal, &topic);
+    if !authorized {
+        debug!(client = %client.0, identity = %principal.subject, topic = %topic,
+               "publish denied by ACL; dropping");
+    }
+    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| {
+        if authorized {
+            let _ = hub.send(HubCommand::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+            });
+        }
+    };
+    match (qos, pkid) {
+        (QoS::AtMostOnce, _) => forward(hub),
+        (QoS::AtLeastOnce, Some(id)) => {
+            forward(hub);
+            writer.send(&Packet::PubAck(id)).await?;
+        }
+        (QoS::ExactlyOnce, Some(id)) => {
+            // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
+            // sighting of this packet id; re-sent copies (DUP) before the
+            // PUBREL release are acknowledged but not re-delivered.
+            if qos2_inbound.insert(id) {
+                forward(hub);
+            }
+            writer.send(&Packet::PubRec(id)).await?;
+        }
+        _ => debug!(client = %client.0, "dropping QoS>0 publish without packet id"),
+    }
+    Ok(false)
+}
+
 /// Handle one inbound packet. Returns `Ok(true)` if the connection should close.
 async fn handle_inbound<W: AsyncWrite + Unpin>(
     packet: Packet,
     writer: &mut FrameWriter<W>,
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
+    principal: &Identity,
+    authz: &dyn Authorizer,
     qos2_inbound: &mut HashSet<u16>,
 ) -> Result<bool, NetError> {
     match packet {
-        Packet::Publish(Publish {
-            qos,
-            pkid,
-            topic,
-            payload,
-            retain,
-            ..
-        }) => {
-            let forward = |hub: &mpsc::UnboundedSender<HubCommand>| {
-                let _ = hub.send(HubCommand::Publish {
-                    topic,
-                    payload,
-                    qos,
-                    retain,
-                });
-            };
-            match (qos, pkid) {
-                (QoS::AtMostOnce, _) => forward(hub),
-                (QoS::AtLeastOnce, Some(id)) => {
-                    forward(hub);
-                    writer.send(&Packet::PubAck(id)).await?;
-                }
-                (QoS::ExactlyOnce, Some(id)) => {
-                    // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
-                    // sighting of this packet id; re-sent copies (DUP) before the
-                    // PUBREL release are acknowledged but not re-delivered.
-                    if qos2_inbound.insert(id) {
-                        forward(hub);
-                    }
-                    writer.send(&Packet::PubRec(id)).await?;
-                }
-                _ => debug!(client = %client.0, "dropping QoS>0 publish without packet id"),
+        Packet::Publish(publish) => {
+            // A wildcard topic is a protocol violation: close the connection.
+            if handle_publish(publish, writer, hub, client, principal, authz, qos2_inbound).await? {
+                return Ok(true);
             }
         }
         // QoS 2 publisher-side release: the id may be reused afterwards.
@@ -383,15 +463,27 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             });
         }
         Packet::Subscribe(s) => {
-            // Grant the requested QoS [MQTT-3.8.4-5/6]; the broker supports the
-            // full range, so the return code echoes the request.
-            let filters: Vec<(String, QoS)> =
-                s.filters.iter().map(|f| (f.path.clone(), f.qos)).collect();
-            let return_codes: Vec<u8> = filters.iter().map(|(_, q)| *q as u8).collect();
-            let _ = hub.send(HubCommand::Subscribe {
-                client: client.clone(),
-                filters,
-            });
+            // ACL gate per filter (ADR 0004 step 3): denied filters answer
+            // 0x80 [MQTT-3.9.3] and never reach the hub; granted filters get
+            // the requested QoS [MQTT-3.8.4-5/6].
+            let mut granted: Vec<(String, QoS)> = Vec::new();
+            let mut return_codes: Vec<u8> = Vec::with_capacity(s.filters.len());
+            for f in &s.filters {
+                if authz.authorize_subscribe(principal, &f.path) {
+                    granted.push((f.path.clone(), f.qos));
+                    return_codes.push(f.qos as u8);
+                } else {
+                    debug!(client = %client.0, identity = %principal.subject, filter = %f.path,
+                           "subscription denied by ACL");
+                    return_codes.push(SUBACK_FAILURE);
+                }
+            }
+            if !granted.is_empty() {
+                let _ = hub.send(HubCommand::Subscribe {
+                    client: client.clone(),
+                    filters: granted,
+                });
+            }
             writer
                 .send(&Packet::SubAck(SubAck {
                     pkid: s.pkid,
@@ -419,8 +511,8 @@ mod tests {
     use crate::hub::HubCommand;
     use mqtt_auth::{basic::BasicAuthenticator, Authenticator};
     use mqtt_codec::{
-        packet::{ConnAck, Connect},
-        Packet, ProtocolVersion,
+        packet::{ConnAck, Connect, Publish},
+        Packet, ProtocolVersion, QoS,
     };
     use mqtt_net::{FrameReader, FrameWriter};
     use std::sync::{Arc, Mutex};
@@ -447,7 +539,14 @@ mod tests {
     fn start_conn() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
-        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
+        tokio::spawn(handle_stream(
+            server,
+            None,
+            None,
+            permissive(),
+            Arc::new(mqtt_auth::AllowAll),
+            hub_tx,
+        ));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
     }
@@ -509,7 +608,14 @@ mod tests {
     async fn unsupported_protocol_version_closes_without_connack() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
-        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
+        tokio::spawn(handle_stream(
+            server,
+            None,
+            None,
+            permissive(),
+            Arc::new(mqtt_auth::AllowAll),
+            hub_tx,
+        ));
         let (rh, mut wh) = tokio::io::split(client);
 
         // A CONNECT claiming protocol level 5: name "MQTT", level 0x05,
@@ -576,5 +682,38 @@ mod tests {
 
         writer.send(&Packet::PubRel(7)).await.unwrap();
         assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(7)));
+    }
+
+    /// [MQTT-3.3.2-2]: a PUBLISH topic must not contain wildcards. Such a
+    /// packet is a protocol violation — the broker closes the connection and
+    /// never forwards it to the hub.
+    #[tokio::test]
+    async fn wildcard_publish_topic_closes_connection() {
+        for bad in ["a/+/b", "a/#", "#", "+"] {
+            let (mut reader, mut writer, hub_rx) = start_conn();
+            let _seen = stub_hub(hub_rx);
+            writer.send(&connect_packet("w", true)).await.unwrap();
+            assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+            writer
+                .send(&Packet::Publish(Publish {
+                    dup: false,
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    topic: bad.to_string(),
+                    pkid: None,
+                    payload: bytes::Bytes::from_static(b"x"),
+                }))
+                .await
+                .unwrap();
+
+            // The check runs before any forward, so closing the connection
+            // also guarantees the publish never reached routing.
+            assert_eq!(
+                recv(&mut reader).await,
+                None,
+                "a wildcard PUBLISH topic ({bad:?}) must close the connection"
+            );
+        }
     }
 }
