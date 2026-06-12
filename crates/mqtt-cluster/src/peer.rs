@@ -38,6 +38,12 @@ pub enum PeerMessage {
         topic: String,
         /// Application payload.
         payload: Vec<u8>,
+        /// Publish `QoS` as its 2-bit wire value (the receiver re-applies its
+        /// own per-subscriber downgrade).
+        qos: u8,
+        /// Whether the message was published with the retain flag. Retained
+        /// state is not replicated yet (Phase 3); carried for the wire format.
+        retain: bool,
     },
 }
 
@@ -112,6 +118,8 @@ mod tests {
         roundtrip(&PeerMessage::Publish {
             topic: "sensors/temp".into(),
             payload: b"21.5C".to_vec(),
+            qos: 1,
+            retain: false,
         });
     }
 
@@ -148,6 +156,8 @@ mod tests {
             &PeerMessage::Publish {
                 topic: "t".into(),
                 payload: vec![1, 2, 3],
+                qos: 0,
+                retain: false,
             },
             &mut out,
         )

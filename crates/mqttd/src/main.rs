@@ -1,6 +1,7 @@
 //! The MQTT broker server binary.
 //!
-//! Milestone: a clustered, QoS-0 MQTT 3.1.1 broker with transport security
+//! Milestone: a clustered MQTT 3.1.1 broker — QoS 0/1/2 delivery, retained
+//! messages, wills, keepalive — with transport security
 //! (ADR 0002). Clients connect over TLS 1.3; peer links run mutual TLS against
 //! a dedicated cluster CA; peers are discovered dynamically via SWIM gossip
 //! (preferred) or configured statically. Auth/authz arrive in later milestones.
@@ -130,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = non_empty_env("MQTTD_PLAINTEXT_BIND") {
         warn!(%addr, "INSECURE: starting PLAINTEXT MQTT listener (no TLS) — testing use only");
         let listener = TcpListener::bind(&addr).await?;
-        info!(%addr, "accepting MQTT 3.1.1 clients (QoS 0 delivery)");
+        info!(%addr, "accepting MQTT 3.1.1 clients");
         listeners.push(tokio::spawn(serve_plaintext_clients(listener, hub_tx)));
     }
     if listeners.is_empty() {

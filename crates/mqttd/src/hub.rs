@@ -1,22 +1,28 @@
 //! The broker hub: a single-owner actor that holds the subscription table, the
-//! session store, and every connected client's outbound channel.
+//! session store, retained messages, and every connected client's outbound
+//! channel.
 //!
 //! Connection tasks never share mutable state directly; they send [`HubCommand`]s
 //! to the hub, which owns routing and session lifecycle. This actor model maps
 //! cleanly onto the cluster design (ADR 0001): a node owns its local clients, and
 //! cross-node routing becomes another command source feeding the same hub.
 //!
+//! ## Delivery semantics
+//! Downstream delivery honors `QoS`: the effective `QoS` per subscriber is
+//! `min(publish QoS, granted QoS)` [MQTT-3.8.4-6]. `QoS` 1/2 messages are
+//! tracked per session in an in-flight table until acknowledged, are redelivered
+//! with `DUP` on session resume [MQTT-4.4.0-1], and `QoS` 2 runs the
+//! PUBREC/PUBREL/PUBCOMP handshake. Retained messages [MQTT-3.3.1] are stored in
+//! a [`RetainedStore`] and replayed (with the retain flag set) on every new
+//! subscription. A will message attached at CONNECT is published on any
+//! ungraceful end of the connection — including session takeover — and
+//! discarded on clean DISCONNECT [MQTT-3.14.4-3].
+//!
 //! ## Persistent sessions
 //! A client connecting with `clean_session = false` (MQTT 3.1.1) gets a session
-//! that survives disconnects:
-//! - its subscriptions stay in the routing table while it is offline, so matching
-//!   messages are **enqueued** in the [`SessionStore`] instead of dropped;
-//! - on reconnect the broker reports `session_present = true` and **replays** the
-//!   queued messages before resuming live delivery.
-//!
-//! Note: downstream delivery is still `QoS` 0 in this milestone, so offline
-//! queueing currently applies to all matching messages and replayed messages are
-//! sent at `QoS` 0. `QoS`-aware queueing arrives with `QoS` 1/2 delivery.
+//! that survives disconnects: subscriptions stay in the routing table, matching
+//! messages are enqueued in the [`SessionStore`] while it is offline, and
+//! unacknowledged in-flight messages are redelivered on reconnect.
 //!
 //! Outbound queues are currently *unbounded*; bounded queues with an overload
 //! policy are a Phase-2 hardening item (and the per-session queue caps in ADR 0001).
@@ -26,8 +32,8 @@ use mqtt_cluster::peer::PeerMessage;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{topic_matches, ClientId, Message, SubscriptionTable};
-use mqtt_storage::{MemorySessionStore, SessionStore};
-use std::collections::{HashMap, HashSet};
+use mqtt_storage::{MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -47,6 +53,52 @@ struct Online {
     conn_id: u64,
     /// Channel to this connection's writer.
     tx: Outbound,
+    /// Will message published if this connection ends ungracefully.
+    will: Option<Message>,
+}
+
+/// Downstream acknowledgement state of an unacked `QoS` > 0 message.
+// The shared `AwaitingPub*` prefix mirrors the MQTT packet names; renaming to
+// satisfy the lint would only make the states harder to map to the spec.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutState {
+    /// `QoS` 1: PUBLISH sent, waiting for PUBACK.
+    AwaitingPubAck,
+    /// `QoS` 2: PUBLISH sent, waiting for PUBREC.
+    AwaitingPubRec,
+    /// `QoS` 2: PUBREL sent, waiting for PUBCOMP.
+    AwaitingPubComp,
+}
+
+/// An unacknowledged outbound message.
+#[derive(Debug)]
+struct PendingOut {
+    message: Message,
+    state: OutState,
+}
+
+/// Per-session outbound `QoS` bookkeeping. Survives disconnects so persistent
+/// sessions can resume their in-flight messages (redelivered with `DUP`).
+#[derive(Debug, Default)]
+struct Inflight {
+    next_pkid: u16,
+    pending: BTreeMap<u16, PendingOut>,
+}
+
+impl Inflight {
+    /// Allocate the next free packet id (1..=65535, skipping ids in flight).
+    fn alloc_pkid(&mut self) -> u16 {
+        loop {
+            self.next_pkid = self.next_pkid.wrapping_add(1);
+            if self.next_pkid == 0 {
+                self.next_pkid = 1;
+            }
+            if !self.pending.contains_key(&self.next_pkid) {
+                return self.next_pkid;
+            }
+        }
+    }
 }
 
 /// A message from a connection task to the hub.
@@ -61,17 +113,19 @@ pub enum HubCommand {
         conn_id: u64,
         /// `false` keeps the session across disconnects (MQTT `clean_session=0`).
         clean_session: bool,
+        /// Will message to publish if the connection ends ungracefully.
+        will: Option<Message>,
         /// Channel the hub uses to deliver packets to this client.
         outbound: Outbound,
         /// Reply with `session_present` so the connection can send CONNACK.
         reply: oneshot::Sender<bool>,
     },
-    /// Add subscriptions for a client.
+    /// Add subscriptions (filter + granted `QoS`) for a client.
     Subscribe {
         /// The subscribing client.
         client: ClientId,
-        /// Topic filters being subscribed to.
-        filters: Vec<String>,
+        /// Topic filters being subscribed to, with their granted `QoS`.
+        filters: Vec<(String, QoS)>,
     },
     /// Remove subscriptions for a client.
     Unsubscribe {
@@ -80,13 +134,37 @@ pub enum HubCommand {
         /// Topic filters being removed.
         filters: Vec<String>,
     },
-    /// Route an application message to matching subscribers (`QoS` 0 live,
-    /// or enqueued for offline persistent sessions).
+    /// Route an application message to matching subscribers.
     Publish {
         /// Destination topic.
         topic: String,
         /// Application payload.
         payload: Bytes,
+        /// Publish `QoS` (each subscriber receives `min(qos, granted)`).
+        qos: QoS,
+        /// Whether to store the message as the topic's retained message.
+        retain: bool,
+    },
+    /// A subscriber acknowledged a `QoS` 1 delivery.
+    PubAck {
+        /// The acknowledging client.
+        client: ClientId,
+        /// The packet id being acknowledged.
+        pkid: u16,
+    },
+    /// A subscriber acknowledged receipt of a `QoS` 2 delivery (step 1 of 2).
+    PubRec {
+        /// The acknowledging client.
+        client: ClientId,
+        /// The packet id being acknowledged.
+        pkid: u16,
+    },
+    /// A subscriber completed a `QoS` 2 delivery (step 2 of 2).
+    PubComp {
+        /// The completing client.
+        client: ClientId,
+        /// The packet id being completed.
+        pkid: u16,
     },
     /// A client's connection ended; deregister it (honoring takeover).
     Detach {
@@ -94,6 +172,9 @@ pub enum HubCommand {
         client: ClientId,
         /// The connection id that is ending.
         conn_id: u64,
+        /// `true` for a clean DISCONNECT (the will is discarded); `false` for
+        /// any other end (the will is published) [MQTT-3.14.4-3].
+        graceful: bool,
     },
 
     /// A peer node's link came up; register it and send our interest snapshot.
@@ -131,6 +212,8 @@ pub enum HubCommand {
         topic: String,
         /// Application payload.
         payload: Bytes,
+        /// The original publish `QoS` (local downgrade still applies).
+        qos: QoS,
     },
 }
 
@@ -139,6 +222,15 @@ pub enum HubCommand {
 struct Peer {
     conn_id: u64,
     tx: PeerOutbound,
+}
+
+/// The smaller of two `QoS` levels (delivery downgrade rule [MQTT-3.8.4-6]).
+fn min_qos(a: QoS, b: QoS) -> QoS {
+    if (a as u8) <= (b as u8) {
+        a
+    } else {
+        b
+    }
 }
 
 /// The broker routing actor.
@@ -151,12 +243,16 @@ pub struct Hub {
     online: HashMap<ClientId, Online>,
     /// Clients whose current session is persistent (`clean_session=0`).
     persistent: HashSet<ClientId>,
-    /// Per-client subscription filters, for persistence and clean removal.
-    subs_by_client: HashMap<ClientId, HashSet<String>>,
+    /// Per-client subscription filters with their granted `QoS`.
+    subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
+    /// Per-session outbound `QoS` > 0 in-flight state.
+    inflight: HashMap<ClientId, Inflight>,
     /// Durable session/queue storage.
     store: Box<dyn SessionStore>,
+    /// Retained message storage.
+    retained: Box<dyn RetainedStore>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -164,8 +260,8 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// Create the hub (default node id and in-memory session store) and the
-    /// sender that connection tasks use to reach it.
+    /// Create the hub (default node id and in-memory stores) and the sender
+    /// that connection tasks use to reach it.
     #[must_use]
     pub fn new() -> (Self, mpsc::UnboundedSender<HubCommand>) {
         Self::with_config(
@@ -175,6 +271,8 @@ impl Hub {
     }
 
     /// Create the hub with an explicit node id and [`SessionStore`] backend.
+    /// Retained messages use an in-memory store; a pluggable backend arrives
+    /// with the persistence phase.
     #[must_use]
     pub fn with_config(
         node_id: NodeId,
@@ -189,7 +287,9 @@ impl Hub {
                 persistent: HashSet::new(),
                 subs_by_client: HashMap::new(),
                 table: SubscriptionTable::new(),
+                inflight: HashMap::new(),
                 store,
+                retained: Box::new(MemoryRetainedStore::new()),
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
             },
@@ -205,10 +305,11 @@ impl Hub {
                     client,
                     conn_id,
                     clean_session,
+                    will,
                     outbound,
                     reply,
                 } => {
-                    self.attach(client, conn_id, clean_session, outbound, reply)
+                    self.attach(client, conn_id, clean_session, will, outbound, reply)
                         .await;
                 }
                 HubCommand::Subscribe { client, filters } => {
@@ -217,18 +318,31 @@ impl Hub {
                 HubCommand::Unsubscribe { client, filters } => {
                     self.unsubscribe(&client, &filters).await;
                 }
-                HubCommand::Publish { topic, payload } => {
-                    // Originated locally: deliver to local subscribers and forward
-                    // to interested peers.
-                    self.deliver_local(&topic, &payload).await;
-                    self.forward_to_peers(&topic, &payload);
+                HubCommand::Publish {
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                } => {
+                    self.publish(&topic, &payload, qos, retain).await;
                 }
-                HubCommand::RemotePublish { topic, payload } => {
+                HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
+                HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
+                HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid),
+                HubCommand::RemotePublish {
+                    topic,
+                    payload,
+                    qos,
+                } => {
                     // Forwarded from a peer: local delivery only (no re-forward).
-                    self.deliver_local(&topic, &payload).await;
+                    self.deliver_local(&topic, &payload, qos).await;
                 }
-                HubCommand::Detach { client, conn_id } => {
-                    self.detach(&client, conn_id).await;
+                HubCommand::Detach {
+                    client,
+                    conn_id,
+                    graceful,
+                } => {
+                    self.detach(&client, conn_id, graceful).await;
                 }
                 HubCommand::PeerConnected { node, conn_id, tx } => {
                     self.peer_connected(node, conn_id, tx);
@@ -248,11 +362,33 @@ impl Hub {
         }
     }
 
+    /// Publish an application message: store/clear retained state, deliver to
+    /// local subscribers, and forward to interested peers.
+    async fn publish(&mut self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) {
+        if retain {
+            // A zero-length retained payload clears the retained message
+            // [MQTT-3.3.1-10]; `RetainedStore::set` implements both cases.
+            let message = Message {
+                topic: topic.to_string(),
+                payload: payload.clone(),
+                qos,
+                retain: true,
+            };
+            if let Err(e) = self.retained.set(&message).await {
+                warn!(topic = %topic, error = %e, "failed to update retained message");
+            }
+        }
+        // Live deliveries carry retain=0 [MQTT-3.3.1-9].
+        self.deliver_local(topic, payload, qos).await;
+        self.forward_to_peers(topic, payload, qos, retain);
+    }
+
     async fn attach(
         &mut self,
         client: ClientId,
         conn_id: u64,
         clean_session: bool,
+        will: Option<Message>,
         outbound: Outbound,
         reply: oneshot::Sender<bool>,
     ) {
@@ -260,6 +396,7 @@ impl Hub {
             // Discard any prior session state for this client.
             self.drop_subscriptions(&client);
             self.persistent.remove(&client);
+            self.inflight.remove(&client);
             let _ = self.store.remove(&client).await;
             false
         } else {
@@ -268,25 +405,30 @@ impl Hub {
             // Reconcile the routing table with persisted subscriptions (needed
             // after a broker restart; idempotent otherwise).
             if let Ok(subs) = self.store.subscriptions(&client).await {
-                let set = self.subs_by_client.entry(client.clone()).or_default();
+                let map = self.subs_by_client.entry(client.clone()).or_default();
                 for s in subs {
                     self.table.subscribe(client.clone(), s.filter.clone());
-                    set.insert(s.filter);
+                    map.insert(s.filter, s.max_qos);
                 }
             }
             existed
         };
 
         // Registering replaces any previous connection for this id; dropping the
-        // old `Outbound` causes the old connection's writer loop to close (takeover).
-        if self.online.contains_key(&client) {
+        // old `Outbound` closes the old writer loop (takeover). The server-side
+        // disconnect is not a client DISCONNECT, so the old will is published.
+        if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
+            if let Some(w) = old.will {
+                self.publish(&w.topic, &w.payload, w.qos, w.retain).await;
+            }
         }
         self.online.insert(
             client.clone(),
             Online {
                 conn_id,
                 tx: outbound.clone(),
+                will,
             },
         );
         info!(client = %client.0, persistent = !clean_session, session_present, "client attached");
@@ -294,12 +436,31 @@ impl Hub {
         // Tell the connection the result so it can CONNACK before any replay.
         let _ = reply.send(session_present);
 
-        // Replay queued messages (they land in the channel after CONNACK is sent).
+        // Resume in-flight QoS state: unacked PUBLISHes go out again with DUP
+        // [MQTT-4.4.0-1]; half-completed QoS 2 deliveries resume at PUBREL.
+        if let Some(inf) = self.inflight.get(&client) {
+            for (pkid, p) in &inf.pending {
+                let packet = match p.state {
+                    OutState::AwaitingPubAck | OutState::AwaitingPubRec => publish_packet(
+                        &p.message.topic,
+                        p.message.payload.clone(),
+                        p.message.qos,
+                        Some(*pkid),
+                        true,
+                        false,
+                    ),
+                    OutState::AwaitingPubComp => Packet::PubRel(*pkid),
+                };
+                let _ = outbound.send(packet);
+            }
+        }
+
+        // Replay queued messages (they land in the channel after CONNACK).
         if !clean_session {
             if let Ok(pending) = self.store.pending(&client, 0, REPLAY_LIMIT).await {
                 let mut last = 0;
                 for qm in pending {
-                    let _ = outbound.send(publish_packet(&qm.message.topic, qm.message.payload));
+                    self.send_to_client(&client, &outbound, &qm.message, false);
                     last = qm.offset;
                 }
                 if last > 0 {
@@ -310,46 +471,79 @@ impl Hub {
         }
     }
 
-    async fn subscribe(&mut self, client: &ClientId, filters: Vec<String>) {
-        let set = self.subs_by_client.entry(client.clone()).or_default();
-        for f in filters {
-            debug!(client = %client.0, filter = %f, "subscribe");
+    async fn subscribe(&mut self, client: &ClientId, filters: Vec<(String, QoS)>) {
+        for (f, q) in &filters {
+            debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
             self.table.subscribe(client.clone(), f.clone());
-            set.insert(f);
+            self.subs_by_client
+                .entry(client.clone())
+                .or_default()
+                .insert(f.clone(), *q);
         }
         self.persist_subscriptions(client).await;
         self.gossip_interest();
+
+        // Replay retained messages for every new subscription, with the retain
+        // flag set [MQTT-3.3.1-6].
+        let mut replay: Vec<Message> = Vec::new();
+        for (f, q) in &filters {
+            if let Ok(matching) = self.retained.matching(f).await {
+                for m in matching {
+                    replay.push(Message {
+                        qos: min_qos(m.qos, *q),
+                        retain: true,
+                        ..m
+                    });
+                }
+            }
+        }
+        if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
+            for m in replay {
+                self.send_to_client(client, &tx, &m, true);
+            }
+        }
     }
 
     async fn unsubscribe(&mut self, client: &ClientId, filters: &[String]) {
-        if let Some(set) = self.subs_by_client.get_mut(client) {
+        if let Some(map) = self.subs_by_client.get_mut(client) {
             for f in filters {
                 self.table.unsubscribe(client, f);
-                set.remove(f);
+                map.remove(f);
             }
         }
         self.persist_subscriptions(client).await;
         self.gossip_interest();
     }
 
-    /// Deliver a message to this node's local subscribers: online clients get it
-    /// live, offline persistent sessions have it queued. Does not touch peers.
-    async fn deliver_local(&mut self, topic: &str, payload: &Bytes) {
+    /// The highest `QoS` granted to `client` across its filters matching `topic`.
+    fn granted_qos(&self, client: &ClientId, topic: &str) -> QoS {
+        self.subs_by_client
+            .get(client)
+            .into_iter()
+            .flatten()
+            .filter(|(f, _)| topic_matches(f, topic))
+            .map(|(_, q)| *q)
+            .max_by_key(|q| *q as u8)
+            .unwrap_or(QoS::AtMostOnce)
+    }
+
+    /// Deliver a message to this node's local subscribers at
+    /// `min(qos, granted)` each: online clients get it live (with `QoS` > 0
+    /// tracked in flight), offline persistent sessions have it queued.
+    async fn deliver_local(&mut self, topic: &str, payload: &Bytes, qos: QoS) {
         let targets: Vec<ClientId> = self.table.matching_clients(topic).into_iter().collect();
         debug!(topic = %topic, local_subscribers = targets.len(), "local delivery");
         for c in targets {
-            if let Some(sess) = self.online.get(&c) {
-                // Ignore send errors: a closed channel means the client is gone
-                // and a Detach is already in flight.
-                let _ = sess.tx.send(publish_packet(topic, payload.clone()));
+            let message = Message {
+                topic: topic.to_string(),
+                payload: payload.clone(),
+                qos: min_qos(qos, self.granted_qos(&c, topic)),
+                retain: false,
+            };
+            if let Some(tx) = self.online.get(&c).map(|s| s.tx.clone()) {
+                self.send_to_client(&c, &tx, &message, false);
             } else if self.persistent.contains(&c) {
                 // Offline but persistent: queue for replay on reconnect.
-                let message = Message {
-                    topic: topic.to_string(),
-                    payload: payload.clone(),
-                    qos: QoS::AtMostOnce,
-                    retain: false,
-                };
                 if let Err(e) = self.store.enqueue(&c, &message).await {
                     warn!(client = %c.0, error = %e, "failed to enqueue offline message");
                 }
@@ -357,18 +551,121 @@ impl Hub {
         }
     }
 
-    async fn detach(&mut self, client: &ClientId, conn_id: u64) {
+    /// Send one message to an online client at its (already downgraded) `QoS`,
+    /// registering `QoS` > 0 deliveries in the in-flight table.
+    fn send_to_client(
+        &mut self,
+        client: &ClientId,
+        tx: &Outbound,
+        message: &Message,
+        retain: bool,
+    ) {
+        match message.qos {
+            QoS::AtMostOnce => {
+                // Ignore send errors: a closed channel means the client is gone
+                // and a Detach is already in flight.
+                let _ = tx.send(publish_packet(
+                    &message.topic,
+                    message.payload.clone(),
+                    QoS::AtMostOnce,
+                    None,
+                    false,
+                    retain,
+                ));
+            }
+            qos => {
+                let inf = self.inflight.entry(client.clone()).or_default();
+                let pkid = inf.alloc_pkid();
+                let state = if qos == QoS::AtLeastOnce {
+                    OutState::AwaitingPubAck
+                } else {
+                    OutState::AwaitingPubRec
+                };
+                inf.pending.insert(
+                    pkid,
+                    PendingOut {
+                        message: message.clone(),
+                        state,
+                    },
+                );
+                let _ = tx.send(publish_packet(
+                    &message.topic,
+                    message.payload.clone(),
+                    qos,
+                    Some(pkid),
+                    false,
+                    retain,
+                ));
+            }
+        }
+    }
+
+    /// PUBACK: completes a `QoS` 1 delivery.
+    fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
+        if let Some(inf) = self.inflight.get_mut(client) {
+            if inf
+                .pending
+                .get(&pkid)
+                .is_some_and(|p| p.state == OutState::AwaitingPubAck)
+            {
+                inf.pending.remove(&pkid);
+            }
+        }
+    }
+
+    /// PUBREC: advances a `QoS` 2 delivery to the release phase (send PUBREL).
+    fn pub_rec(&mut self, client: &ClientId, pkid: u16) {
+        let advanced =
+            self.inflight
+                .get_mut(client)
+                .is_some_and(|inf| match inf.pending.get_mut(&pkid) {
+                    Some(p) if p.state == OutState::AwaitingPubRec => {
+                        p.state = OutState::AwaitingPubComp;
+                        true
+                    }
+                    _ => false,
+                });
+        if advanced {
+            if let Some(sess) = self.online.get(client) {
+                let _ = sess.tx.send(Packet::PubRel(pkid));
+            }
+        }
+    }
+
+    /// PUBCOMP: completes a `QoS` 2 delivery.
+    fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
+        if let Some(inf) = self.inflight.get_mut(client) {
+            if inf
+                .pending
+                .get(&pkid)
+                .is_some_and(|p| p.state == OutState::AwaitingPubComp)
+            {
+                inf.pending.remove(&pkid);
+            }
+        }
+    }
+
+    async fn detach(&mut self, client: &ClientId, conn_id: u64, graceful: bool) {
         // Only act if this is still the current connection; a stale detach from a
         // connection that was already taken over must not disturb the new one.
         if self.online.get(client).map(|s| s.conn_id) != Some(conn_id) {
             return;
         }
-        self.online.remove(client);
+        let departed = self.online.remove(client);
+        // Any end other than a clean DISCONNECT publishes the will
+        // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
+        if !graceful {
+            if let Some(w) = departed.and_then(|o| o.will) {
+                info!(client = %client.0, topic = %w.topic, "publishing will (ungraceful disconnect)");
+                self.publish(&w.topic, &w.payload, w.qos, w.retain).await;
+            }
+        }
         if self.persistent.contains(client) {
-            // Keep subscriptions and queued state so messages are queued offline.
+            // Keep subscriptions, queue, and in-flight state for resumption.
             info!(client = %client.0, "client detached (session retained)");
         } else {
             self.drop_subscriptions(client);
+            self.inflight.remove(client);
             let _ = self.store.remove(client).await;
             info!(client = %client.0, "client detached (session discarded)");
             // Our local interest may have shrunk; let peers know.
@@ -386,9 +683,9 @@ impl Hub {
             .get(client)
             .into_iter()
             .flatten()
-            .map(|f| mqtt_core::Subscription {
+            .map(|(f, q)| mqtt_core::Subscription {
                 filter: f.clone(),
-                max_qos: QoS::AtMostOnce,
+                max_qos: *q,
                 no_local: false,
             })
             .collect();
@@ -405,13 +702,15 @@ impl Hub {
 
     /// Forward a locally-originated publish to every peer that has matching
     /// interest. Receivers deliver it locally only, so there is no relay/loop.
-    fn forward_to_peers(&self, topic: &str, payload: &Bytes) {
+    fn forward_to_peers(&self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) {
         for (node, filters) in &self.remote_interest {
             if filters.iter().any(|f| topic_matches(f, topic)) {
                 if let Some(peer) = self.peers.get(node) {
                     let _ = peer.tx.send(PeerMessage::Publish {
                         topic: topic.to_string(),
                         payload: payload.to_vec(),
+                        qos: qos as u8,
+                        retain,
                     });
                 }
             }
@@ -463,13 +762,20 @@ impl Hub {
     }
 }
 
-fn publish_packet(topic: &str, payload: Bytes) -> Packet {
+fn publish_packet(
+    topic: &str,
+    payload: Bytes,
+    qos: QoS,
+    pkid: Option<u16>,
+    dup: bool,
+    retain: bool,
+) -> Packet {
     Packet::Publish(Publish {
-        dup: false,
-        qos: QoS::AtMostOnce,
-        retain: false,
+        dup,
+        qos,
+        retain,
         topic: topic.to_string(),
-        pkid: None,
+        pkid,
         payload,
     })
 }
@@ -480,7 +786,7 @@ mod tests {
     use bytes::Bytes;
     use mqtt_cluster::peer::PeerMessage;
     use mqtt_cluster::NodeId;
-    use mqtt_codec::Packet;
+    use mqtt_codec::{Packet, QoS};
     use mqtt_core::ClientId;
     use mqtt_storage::MemorySessionStore;
     use std::time::Duration;
@@ -510,6 +816,7 @@ mod tests {
             client: ClientId(client.into()),
             conn_id,
             clean_session,
+            will: None,
             outbound: out_tx,
             reply: reply_tx,
         })
@@ -522,6 +829,7 @@ mod tests {
         tx.send(HubCommand::Detach {
             client: ClientId(client.into()),
             conn_id,
+            graceful: true,
         })
         .unwrap();
     }
@@ -529,7 +837,7 @@ mod tests {
     fn subscribe(tx: &HubTx, client: &str, filter: &str) {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
-            filters: vec![filter.into()],
+            filters: vec![(filter.into(), QoS::AtMostOnce)],
         })
         .unwrap();
     }
@@ -538,6 +846,8 @@ mod tests {
         tx.send(HubCommand::Publish {
             topic: topic.into(),
             payload: Bytes::from_static(payload),
+            qos: QoS::AtMostOnce,
+            retain: false,
         })
         .unwrap();
     }
@@ -599,7 +909,12 @@ mod tests {
         );
 
         // The replaced connection's deferred Detach arrives late.
-        detach(&tx, "c", 1);
+        tx.send(HubCommand::Detach {
+            client: ClientId("c".into()),
+            conn_id: 1,
+            graceful: false,
+        })
+        .unwrap();
         publish(&tx, "t", b"still-live");
         assert_eq!(
             payload_of(&recv_packet(&mut rx2).await.unwrap()),
@@ -728,6 +1043,7 @@ mod tests {
         tx.send(HubCommand::RemotePublish {
             topic: "x/2".into(),
             payload: Bytes::from_static(b"no-relay"),
+            qos: QoS::AtMostOnce,
         })
         .unwrap();
         // Neither peer may see anything further (n1's non-match included).

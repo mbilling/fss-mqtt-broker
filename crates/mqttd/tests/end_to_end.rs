@@ -180,12 +180,15 @@ async fn non_matching_topic_is_not_delivered() {
 async fn qos1_publish_is_acked_and_downgraded() {
     let addr = start_broker().await;
 
+    // Subscribe at QoS 0: delivery is min(publish QoS, granted QoS), so the
+    // QoS 1 publish below must arrive downgraded (the full QoS matrix is
+    // covered in tests/qos1.rs and tests/qos2.rs).
     let mut sub = Client::connect(addr, "sub3").await;
     sub.send(&Packet::Subscribe(Subscribe {
         pkid: 1,
         filters: vec![SubscribeFilter {
             path: "q".into(),
-            qos: QoS::ExactlyOnce,
+            qos: QoS::AtMostOnce,
         }],
     }))
     .await;

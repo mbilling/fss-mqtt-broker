@@ -1,19 +1,33 @@
 //! Per-connection task: CONNECT handshake, then a select loop multiplexing
-//! inbound client packets and outbound packets delivered by the hub.
+//! inbound client packets, outbound packets delivered by the hub, and the
+//! keepalive deadline.
+//!
+//! Keepalive [MQTT-3.1.2-24]: with a non-zero keepalive, the server closes the
+//! connection if nothing arrives from the client within 1.5x the interval; the
+//! deadline resets on *inbound* traffic only (outbound deliveries must not keep
+//! a dead client alive). An ungraceful end — EOF, error, keepalive expiry —
+//! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::hub::{HubCommand, Outbound};
 use mqtt_codec::{
     packet::{ConnAck, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
 };
-use mqtt_core::ClientId;
+use mqtt_core::{ClientId, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tracing::{debug, warn};
+
+/// Keepalive grace factor: the spec allows one and a half keepalive periods.
+const KEEPALIVE_GRACE_NUM: u64 = 3;
+const KEEPALIVE_GRACE_DEN: u64 = 2;
 
 /// CONNACK reason: unacceptable protocol version (MQTT 3.1.1 return code 1).
 const CONNACK_UNACCEPTABLE_PROTOCOL: u8 = 0x01;
@@ -92,6 +106,12 @@ where
     };
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
+    let will = connect.last_will.map(|w| Message {
+        topic: w.topic,
+        payload: w.payload,
+        qos: w.qos,
+        retain: w.retain,
+    });
     let (out_tx, mut out_rx): (Outbound, _) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = oneshot::channel();
     // Attach before sending CONNACK so we cannot miss a publish that races in, and
@@ -101,6 +121,7 @@ where
             client: client.clone(),
             conn_id,
             clean_session: connect.clean_session,
+            will,
             outbound: out_tx,
             reply: reply_tx,
         })
@@ -119,31 +140,67 @@ where
         .await?;
     debug!(client = %client.0, session_present, "CONNECT accepted");
 
-    let result = serve(&mut reader, &mut writer, &hub, &client, &mut out_rx).await;
-    // Always deregister, even on error. The hub ignores this if we were taken over.
-    let _ = hub.send(HubCommand::Detach { client, conn_id });
-    result
+    let result = serve(
+        &mut reader,
+        &mut writer,
+        &hub,
+        &client,
+        &mut out_rx,
+        connect.keep_alive,
+    )
+    .await;
+    // Always deregister, even on error. The hub ignores this if we were taken
+    // over. Only a clean DISCONNECT is graceful; anything else fires the will.
+    let graceful = matches!(result, Ok(true));
+    let _ = hub.send(HubCommand::Detach {
+        client,
+        conn_id,
+        graceful,
+    });
+    result.map(|_| ())
 }
 
+/// Serve the connection until it ends. Returns `Ok(true)` only for a clean
+/// client DISCONNECT; every other end (EOF, keepalive expiry, takeover) is
+/// ungraceful and will publish the client's will.
 async fn serve<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
-) -> Result<(), NetError>
+    keep_alive: u16,
+) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // [MQTT-3.1.2-24]: close after 1.5x the keepalive with no inbound traffic.
+    let grace = (keep_alive > 0).then(|| {
+        Duration::from_secs(u64::from(keep_alive) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN)
+    });
+    let mut deadline = grace.map(|g| Instant::now() + g);
+    // Inbound QoS 2 packet ids seen but not yet released (PUBREL); forwarding
+    // only on first sight is what makes inbound QoS 2 exactly-once
+    // [MQTT-4.3.3-2].
+    let mut qos2_inbound: HashSet<u16> = HashSet::new();
+
     loop {
+        let idle = async {
+            match deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             inbound = reader.next_packet() => {
+                // Any client packet resets the keepalive deadline.
+                deadline = grace.map(|g| Instant::now() + g);
                 match inbound? {
-                    None => return Ok(()), // clean EOF
+                    None => return Ok(false), // EOF without DISCONNECT
                     Some(packet) => {
-                        if handle_inbound(packet, writer, hub, client).await? {
-                            return Ok(()); // client sent DISCONNECT
+                        if handle_inbound(packet, writer, hub, client, &mut qos2_inbound).await? {
+                            return Ok(true); // client sent DISCONNECT
                         }
                     }
                 }
@@ -153,8 +210,12 @@ where
                     Some(pkt) => writer.send(&pkt).await?,
                     // The hub dropped our sender: we were taken over by a new
                     // connection for the same client id, or the hub shut down.
-                    None => return Ok(()),
+                    None => return Ok(false),
                 }
+            }
+            () = idle => {
+                debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
+                return Ok(false);
             }
         }
     }
@@ -166,6 +227,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
+    qos2_inbound: &mut HashSet<u16>,
 ) -> Result<bool, NetError> {
     match packet {
         Packet::Publish(Publish {
@@ -173,23 +235,65 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             pkid,
             topic,
             payload,
+            retain,
             ..
         }) => {
-            // All delivery is QoS 0 downstream in this milestone; we still honor
-            // the inbound QoS handshake so standard clients are not left retrying.
-            let _ = hub.send(HubCommand::Publish { topic, payload });
+            let forward = |hub: &mpsc::UnboundedSender<HubCommand>| {
+                let _ = hub.send(HubCommand::Publish {
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                });
+            };
             match (qos, pkid) {
-                (QoS::AtLeastOnce, Some(id)) => writer.send(&Packet::PubAck(id)).await?,
-                (QoS::ExactlyOnce, Some(id)) => writer.send(&Packet::PubRec(id)).await?,
-                _ => {}
+                (QoS::AtMostOnce, _) => forward(hub),
+                (QoS::AtLeastOnce, Some(id)) => {
+                    forward(hub);
+                    writer.send(&Packet::PubAck(id)).await?;
+                }
+                (QoS::ExactlyOnce, Some(id)) => {
+                    // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
+                    // sighting of this packet id; re-sent copies (DUP) before the
+                    // PUBREL release are acknowledged but not re-delivered.
+                    if qos2_inbound.insert(id) {
+                        forward(hub);
+                    }
+                    writer.send(&Packet::PubRec(id)).await?;
+                }
+                _ => debug!(client = %client.0, "dropping QoS>0 publish without packet id"),
             }
         }
-        // QoS 2 publisher-side completion: PUBREL -> PUBCOMP.
-        Packet::PubRel(id) => writer.send(&Packet::PubComp(id)).await?,
+        // QoS 2 publisher-side release: the id may be reused afterwards.
+        Packet::PubRel(id) => {
+            qos2_inbound.remove(&id);
+            writer.send(&Packet::PubComp(id)).await?;
+        }
+        // Subscriber-side acknowledgements for our downstream deliveries.
+        Packet::PubAck(id) => {
+            let _ = hub.send(HubCommand::PubAck {
+                client: client.clone(),
+                pkid: id,
+            });
+        }
+        Packet::PubRec(id) => {
+            let _ = hub.send(HubCommand::PubRec {
+                client: client.clone(),
+                pkid: id,
+            });
+        }
+        Packet::PubComp(id) => {
+            let _ = hub.send(HubCommand::PubComp {
+                client: client.clone(),
+                pkid: id,
+            });
+        }
         Packet::Subscribe(s) => {
-            let filters: Vec<String> = s.filters.iter().map(|f| f.path.clone()).collect();
-            // We grant QoS 0 for every filter (return code 0x00).
-            let return_codes = vec![0x00u8; filters.len()];
+            // Grant the requested QoS [MQTT-3.8.4-5/6]; the broker supports the
+            // full range, so the return code echoes the request.
+            let filters: Vec<(String, QoS)> =
+                s.filters.iter().map(|f| (f.path.clone(), f.qos)).collect();
+            let return_codes: Vec<u8> = filters.iter().map(|(_, q)| *q as u8).collect();
             let _ = hub.send(HubCommand::Subscribe {
                 client: client.clone(),
                 filters,
