@@ -40,6 +40,7 @@
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
+use mqtt_cluster::placement::{self, Placement};
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
@@ -49,7 +50,7 @@ use mqtt_observability::AuditLog;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits};
 use mqttd::{cluster, conn, hub, peer};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -78,9 +79,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "configuration validated (secure defaults)"
     );
 
+    // Session-placement ring (ADR 0005), kept in step with SWIM membership and
+    // read by the hub to identify each persistent session's owner node.
+    let placement = Arc::new(RwLock::new(Placement::new(
+        node_id.clone(),
+        placement::DEFAULT_REPLICAS,
+    )));
+
     // Start the routing hub. Offline session queues are bounded (ADR 0001 §6).
     let store = MemorySessionStore::with_limits(queue_limits_from_env()?);
-    let (hub, hub_tx) = hub::Hub::with_config(node_id.clone(), Box::new(store));
+    let (hub, hub_tx) = hub::Hub::with_config_and_placement(
+        node_id.clone(),
+        Box::new(store),
+        Some(placement.clone()),
+    );
     tokio::spawn(hub.run());
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
@@ -116,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SWIM gossip membership (opt-in): discovers peers and drives the peer mesh,
     // replacing the need for a static MQTTD_PEERS list.
-    start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref()).await?;
+    start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref(), placement).await?;
 
     // Client authentication + topic authorization + audit policy (ADR 0004),
     // shared by both client listeners.
@@ -306,6 +318,7 @@ async fn start_swim_from_env(
     peer_bind: Option<String>,
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
     peer_tls: Option<&peer::PeerTls>,
+    placement: Arc<RwLock<Placement>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = non_empty_env("MQTTD_SWIM_BIND") else {
         return Ok(());
@@ -352,6 +365,7 @@ async fn start_swim_from_env(
         node_id.clone(),
         hub_tx.clone(),
         peer_tls.cloned(),
+        Some(placement),
     ));
     Ok(())
 }

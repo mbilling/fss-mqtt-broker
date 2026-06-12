@@ -19,10 +19,12 @@
 
 use crate::hub::HubCommand;
 use crate::peer;
+use mqtt_cluster::placement::Placement;
 use mqtt_cluster::swim::MemberState;
 use mqtt_cluster::swim_driver::MembershipEvent;
 use mqtt_cluster::NodeId;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -30,17 +32,26 @@ use tracing::{info, warn};
 /// React to membership events until the event channel closes.
 ///
 /// `tls` is the cluster-bus mTLS context handed to every dialer; `None` means
-/// the (loudly logged, testing-only) plaintext mesh.
+/// the (loudly logged, testing-only) plaintext mesh. `placement`, when present,
+/// is kept in sync with membership (ADR 0005) so the hub can identify session
+/// owners.
 pub async fn maintain_peer_links(
     mut events: mpsc::UnboundedReceiver<MembershipEvent>,
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<peer::PeerTls>,
+    placement: Option<Arc<RwLock<Placement>>>,
 ) {
     // Active dialer per peer we own the link to.
     let mut dialers: HashMap<NodeId, JoinHandle<()>> = HashMap::new();
 
     while let Some(ev) = events.recv().await {
+        // Keep the placement ring in step with membership before routing reacts.
+        if let Some(placement) = &placement {
+            if let Ok(mut p) = placement.write() {
+                p.observe(&ev.id, ev.state);
+            }
+        }
         match ev.state {
             MemberState::Alive => {
                 // One link per pair: only the smaller-id node dials (the same
@@ -114,6 +125,7 @@ mod tests {
             ev_rx,
             NodeId(local.into()),
             hub_tx,
+            None,
             None,
         ));
         (ev_tx, hub_rx)

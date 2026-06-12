@@ -24,11 +24,14 @@
 //! messages are enqueued in the [`SessionStore`] while it is offline, and
 //! unacknowledged in-flight messages are redelivered on reconnect.
 //!
-//! Outbound queues are currently *unbounded*; bounded queues with an overload
-//! policy are a Phase-2 hardening item (and the per-session queue caps in ADR 0001).
+//! The per-session **offline queue** is bounded (ADR 0001 §6, workstream A): a
+//! cap with a drop-oldest/reject-newest policy. The per-connection **outbound
+//! socket channel** is still unbounded; a bounded channel with an overload
+//! policy remains a hardening item.
 
 use bytes::Bytes;
 use mqtt_cluster::peer::PeerMessage;
+use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{topic_matches, ClientId, Message, SubscriptionTable};
@@ -36,6 +39,7 @@ use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -259,6 +263,9 @@ pub struct Hub {
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
     remote_interest: HashMap<NodeId, HashSet<String>>,
+    /// Live session-placement ring (ADR 0005). `None` outside a cluster. Read at
+    /// persistent CONNECT to identify the session's owner.
+    placement: Option<Arc<RwLock<Placement>>>,
 }
 
 impl Hub {
@@ -280,6 +287,18 @@ impl Hub {
         node_id: NodeId,
         store: Box<dyn SessionStore>,
     ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
+        Self::with_config_and_placement(node_id, store, None)
+    }
+
+    /// As [`with_config`](Self::with_config), with a shared session-placement
+    /// ring (ADR 0005) so the hub can identify which node owns each persistent
+    /// session.
+    #[must_use]
+    pub fn with_config_and_placement(
+        node_id: NodeId,
+        store: Box<dyn SessionStore>,
+        placement: Option<Arc<RwLock<Placement>>>,
+    ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
@@ -294,6 +313,7 @@ impl Hub {
                 retained: Box::new(MemoryRetainedStore::new()),
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
+                placement,
             },
             tx,
         )
@@ -385,6 +405,25 @@ impl Hub {
         self.forward_to_peers(topic, payload, qos, retain);
     }
 
+    /// Log when a persistent session is served on a node that is not its
+    /// placement owner (ADR 0005). Until the session-proxy lands, such a session
+    /// is served locally — sharded by landing node, but not yet relocated to its
+    /// owner, and lost if *this* node dies (the ephemeral-sessions mode).
+    fn note_session_ownership(&self, client: &ClientId) {
+        let Some(placement) = &self.placement else {
+            return;
+        };
+        let Ok(p) = placement.read() else { return };
+        if p.member_count() > 1 && !p.owns(&client.0) {
+            warn!(
+                client = %client.0,
+                owner = %p.owner(&client.0).0,
+                "persistent session served locally but owned by another node \
+                 (ephemeral mode; cross-node affinity is ADR 0005 step 2)"
+            );
+        }
+    }
+
     async fn attach(
         &mut self,
         client: ClientId,
@@ -402,6 +441,7 @@ impl Hub {
             let _ = self.store.remove(&client).await;
             false
         } else {
+            self.note_session_ownership(&client);
             self.persistent.insert(client.clone());
             let existed = self.store.ensure_session(&client).await.unwrap_or(false);
             // Reconcile the routing table with persisted subscriptions (needed
