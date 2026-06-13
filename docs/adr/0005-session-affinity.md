@@ -101,10 +101,18 @@ is the decision this ADR exists to settle.
 
 ## Implementation phasing
 
-1. **Live placement + ownership awareness** *(foundation)*: a shared, membership-
-   driven `Placement` in the broker; persistent CONNECT consults it; the
-   ephemeral limitation is logged when a session is served off its owner.
-2. **The proxy data plane**: peer-mesh session relay with the vouched-identity
-   handoff and audit; the owner runs the real session.
+1. **Live placement + ownership awareness** ✅ *(done)*: a shared, membership-
+   driven `Placement` in the broker; persistent CONNECT consults it.
+2. **The proxy data plane** ✅ *(done)*: a persistent session whose owner is
+   another node is relocated there over the peer mesh — the landing node opens a
+   connection to the owner's peer listener, vouches for the authenticated
+   identity with a `PeerMessage::ProxyHello`, replays the CONNECT, and splices
+   the client stream to the owner, which runs the real session (`serve_proxied`
+   → `run_framed` with re-proxy disabled). Tested end to end: a persistent client
+   on a non-owner node is served by its owner and receives a publish across the
+   relay. **Limitations carried (ephemeral mode):** owner death mid-session drops
+   the session (no replica yet — workstream E); the splice is best-effort on
+   half-close. A delivery/lifecycle hardening pass and the audit `via=<node>`
+   detail are follow-ups.
 3. **MQTT 5 Server-Reference** as the eventual redirect-based replacement for the
    relay (with the v5 codec milestone).

@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use mqtt_auth::basic::BasicAuthenticator;
+use mqtt_auth::AllowAll;
 use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
 use mqtt_cluster::swim::{Config as SwimConfig, Swim};
 use mqtt_cluster::swim_auth::{SwimAuth, KEY_LEN};
@@ -14,7 +16,9 @@ use mqtt_codec::{
     packet::{Connect, Publish, Subscribe, SubscribeFilter},
     Packet, ProtocolVersion, QoS,
 };
+use mqtt_observability::AuditLog;
 use mqtt_storage::MemorySessionStore;
+use mqttd::conn::{ConnPolicy, ProxyContext};
 use mqttd::Hub;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -66,6 +70,7 @@ async fn start_node(
         node_id.clone(),
         hub_tx.clone(),
         None,
+        None,
     ));
 
     // SWIM membership driving the peer mesh. No static dialing anywhere.
@@ -107,6 +112,12 @@ struct Client {
 
 impl Client {
     async fn connect(addr: SocketAddr, id: &str) -> Self {
+        Self::connect_with(addr, id, true).await
+    }
+
+    /// Connect with an explicit clean-session flag; a persistent
+    /// (`clean_session=false`) session may be relocated to its owner (ADR 0005).
+    async fn connect_with(addr: SocketAddr, id: &str, clean_session: bool) -> Self {
         let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
         let mut c = Client {
             reader: mqtt_net::FrameReader::new(rh, V4),
@@ -115,7 +126,7 @@ impl Client {
         c.writer
             .send(&Packet::Connect(Connect {
                 protocol: V4,
-                clean_session: true,
+                clean_session,
                 keep_alive: 30,
                 client_id: id.to_string(),
                 last_will: None,
@@ -240,4 +251,133 @@ async fn placement_converges_across_the_cluster() {
         on_a > 0 && on_b > 0,
         "ownership not sharded: a={on_a} b={on_b}"
     );
+}
+
+/// Like [`start_node`], but with session relocation enabled (ADR 0005): the
+/// client listener serves through `handle_stream` with a proxy-capable policy,
+/// and the peer listener accepts sessions relocated here by other nodes. The
+/// plaintext mesh is used, so the proxy connector is `None`.
+async fn start_proxy_node(
+    id: &str,
+    swim_seeds: Vec<String>,
+) -> (SocketAddr, String, Arc<RwLock<Placement>>) {
+    let node_id = NodeId(id.to_string());
+    let placement = Arc::new(RwLock::new(Placement::new(
+        node_id.clone(),
+        DEFAULT_REPLICAS,
+    )));
+    let policy = Arc::new(ConnPolicy {
+        auth: Arc::new(BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        authz: Arc::new(AllowAll),
+        audit: Arc::new(AuditLog::new()),
+        proxy: Some(ProxyContext {
+            placement: placement.clone(),
+            connector: None, // plaintext mesh
+        }),
+    });
+    let (hub, hub_tx) = Hub::with_config(node_id.clone(), Box::new(MemorySessionStore::new()));
+    tokio::spawn(hub.run());
+
+    // Client listener: full handle_stream path (with relocation).
+    let cli = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cli_addr = cli.local_addr().unwrap();
+    let conn_tx = hub_tx.clone();
+    let conn_policy = policy.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = cli.accept().await.unwrap();
+            let p = conn_policy.clone();
+            let h = conn_tx.clone();
+            tokio::spawn(async move {
+                mqttd::conn::handle_stream(stream, Some(peer), None, p, h).await;
+            });
+        }
+    });
+
+    // Peer listener serves sessions relocated here (Some(policy)).
+    let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_listener.local_addr().unwrap().to_string();
+    tokio::spawn(mqttd::peer::serve_listener(
+        peer_listener,
+        node_id.clone(),
+        hub_tx.clone(),
+        None,
+        Some(policy.clone()),
+    ));
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let swim_addr = socket.local_addr().unwrap().to_string();
+    let swim = Swim::new(
+        node_id.clone(),
+        swim_addr.clone(),
+        peer_addr,
+        swim_cfg(),
+        swim_seeds,
+    );
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let auth = SwimAuth::new(&[0x5A; KEY_LEN]);
+    tokio::spawn(swim_driver::run(
+        socket,
+        swim,
+        Duration::from_millis(20),
+        event_tx,
+        Some(auth),
+    ));
+    tokio::spawn(mqttd::cluster::maintain_peer_links(
+        event_rx,
+        node_id,
+        hub_tx,
+        None,
+        Some(placement.clone()),
+    ));
+
+    (cli_addr, swim_addr, placement)
+}
+
+/// ADR 0005 step 2: a persistent session connecting to a node that is **not**
+/// its placement owner is relocated to the owner and served there — a publish
+/// reaches it across the proxy. This is the sharded-session-capacity milestone.
+#[tokio::test]
+async fn persistent_session_is_relocated_to_its_owner() {
+    let (cli_a, swim_a, pa) = start_proxy_node("proxy-a", vec![]).await;
+    let (cli_b, _swim_b, pb) = start_proxy_node("proxy-b", vec![swim_a]).await;
+
+    // Wait for placement convergence.
+    let converged = {
+        let mut ok = false;
+        for _ in 0..200 {
+            if pa.read().unwrap().member_count() == 2 && pb.read().unwrap().member_count() == 2 {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        ok
+    };
+    assert!(converged, "placement did not converge");
+
+    // Find a client id owned by B, and connect its persistent session to A — the
+    // non-owner. A must relocate it to B, where it really lives.
+    let owned_by_b = (0..500)
+        .map(|i| format!("dev-{i}"))
+        .find(|c| pa.read().unwrap().owner(c).0 == "proxy-b")
+        .expect("some client id is owned by proxy-b");
+
+    let mut sub = Client::connect_with(cli_a, &owned_by_b, false).await;
+    sub.subscribe("relocate/+/data").await;
+
+    // A publisher on B publishes; the relocated subscriber (served on B, relayed
+    // back through A) receives it. Retry while interest propagates.
+    let mut publ = Client::connect(cli_b, "publisher").await;
+    for attempt in 0..50 {
+        publ.publish("relocate/z/data", b"via-owner").await;
+        if let Some(Packet::Publish(p)) = sub.recv().await {
+            assert_eq!(p.topic, "relocate/z/data");
+            assert_eq!(&p.payload[..], b"via-owner");
+            return;
+        }
+        assert!(attempt < 49, "relocated session never received the publish");
+    }
 }

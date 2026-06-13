@@ -99,6 +99,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the accepting and dialing side of every peer link.
     let peer_tls = peer_tls_from_env()?;
 
+    // Client policy (ADR 0004 auth/authz/audit + ADR 0005 session relocation),
+    // built before the peer listener so the latter can serve sessions relocated
+    // here by other nodes. The same policy serves the client listeners below.
+    let proxy = conn::ProxyContext {
+        placement: placement.clone(),
+        connector: peer_tls.as_ref().map(|t| t.connector.clone()),
+    };
+    let policy = client_policy_from_env(Some(proxy))?;
+
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
     if let Some(bind) = &peer_bind {
@@ -112,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_id.clone(),
             hub_tx.clone(),
             peer_tls.clone(),
+            Some(policy.clone()),
         ));
     }
     if let Some(peers) = non_empty_env("MQTTD_PEERS") {
@@ -129,10 +139,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SWIM gossip membership (opt-in): discovers peers and drives the peer mesh,
     // replacing the need for a static MQTTD_PEERS list.
     start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref(), placement).await?;
-
-    // Client authentication + topic authorization + audit policy (ADR 0004),
-    // shared by both client listeners.
-    let policy = client_policy_from_env()?;
 
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
     // local-testing escape hatch.
@@ -183,7 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Build the connection policy — authentication, topic authorization, and
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
-fn client_policy_from_env() -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error::Error>> {
+fn client_policy_from_env(
+    proxy: Option<conn::ProxyContext>,
+) -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error::Error>> {
     let auth = authenticator_from_env()?;
 
     // A TOML ACL file gives deny-by-default per-identity topic policy; without
@@ -206,6 +214,7 @@ fn client_policy_from_env() -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error:
         auth,
         authz,
         audit: Arc::new(AuditLog::new()),
+        proxy,
     }))
 }
 

@@ -12,6 +12,7 @@ use crate::hub::{HubCommand, Outbound};
 use mqtt_auth::{
     basic::BasicAuthenticator, AllowAll, Authenticator, Authorizer, Credentials, Identity,
 };
+use mqtt_cluster::placement::Placement;
 use mqtt_codec::{
     packet::{ConnAck, Connect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
@@ -22,13 +23,14 @@ use mqtt_observability::{AuditLog, AuditSink};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tokio_rustls::TlsConnector;
+use tracing::{debug, info, warn};
 
 /// Keepalive grace factor: the spec allows one and a half keepalive periods.
 const KEEPALIVE_GRACE_NUM: u64 = 3;
@@ -67,9 +69,30 @@ pub fn tls_identity<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Ident
     }
 }
 
+/// What a landing node needs to relocate a persistent session to its placement
+/// owner (ADR 0005): the live ring (to find the owner and its address) and the
+/// cluster-bus connector (to reach the owner's peer listener over mTLS;
+/// `None` = plaintext mesh).
+#[derive(Clone)]
+pub struct ProxyContext {
+    /// The live session-placement ring.
+    pub placement: Arc<RwLock<Placement>>,
+    /// mTLS connector for dialing the owner's peer listener; `None` = plaintext.
+    pub connector: Option<TlsConnector>,
+}
+
+impl std::fmt::Debug for ProxyContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyContext")
+            .field("mtls", &self.connector.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The policy a connection consults: who may connect ([`Authenticator`]), what
-/// they may do ([`Authorizer`]), and where security decisions are audited
-/// ([`AuditSink`], ADR 0004 step 4).
+/// they may do ([`Authorizer`]), where security decisions are audited
+/// ([`AuditSink`], ADR 0004 step 4), and — when clustered — how to relocate a
+/// persistent session to its owner ([`ProxyContext`], ADR 0005).
 pub struct ConnPolicy {
     /// Authenticates the CONNECT credentials.
     pub auth: Arc<dyn Authenticator>,
@@ -77,6 +100,8 @@ pub struct ConnPolicy {
     pub authz: Arc<dyn Authorizer>,
     /// Records auth and authorization decisions.
     pub audit: Arc<dyn AuditSink>,
+    /// Session relocation context; `None` outside a cluster (serve locally).
+    pub proxy: Option<ProxyContext>,
 }
 
 impl std::fmt::Debug for ConnPolicy {
@@ -98,6 +123,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         }),
         authz: Arc::new(AllowAll),
         audit: Arc::new(AuditLog::new()),
+        proxy: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -131,9 +157,28 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (rh, wh) = tokio::io::split(stream);
-    let mut reader = FrameReader::new(rh, ProtocolVersion::V311);
-    let mut writer = FrameWriter::new(wh, ProtocolVersion::V311);
+    let reader = FrameReader::new(rh, ProtocolVersion::V311);
+    let writer = FrameWriter::new(wh, ProtocolVersion::V311);
+    // A directly-accepted client may be relocated to its placement owner.
+    run_framed(reader, writer, identity, policy, hub, true).await
+}
 
+/// Serve an MQTT connection over already-framed halves. `allow_proxy` is `true`
+/// for a directly-accepted client (which may be relocated to its owner,
+/// ADR 0005) and `false` for a session already proxied here (it is served
+/// locally — this node is the owner; re-proxying would loop).
+async fn run_framed<R, W>(
+    mut reader: FrameReader<R>,
+    mut writer: FrameWriter<W>,
+    identity: Option<Identity>,
+    policy: &ConnPolicy,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    allow_proxy: bool,
+) -> Result<(), NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     // Protocol requires CONNECT as the first packet on a connection.
     let connect = match reader.next_packet().await? {
         Some(Packet::Connect(c)) => c,
@@ -156,6 +201,23 @@ where
     else {
         return Ok(()); // rejected; the CONNACK was already sent
     };
+
+    // Session affinity (ADR 0005): a persistent session whose placement owner is
+    // another node is relocated there. The owner serves it (CONNACK onward);
+    // this node only relays. Clean sessions and owner-is-self stay local.
+    if allow_proxy && !connect.clean_session {
+        if let Some(proxy) = &policy.proxy {
+            let route = proxy
+                .placement
+                .read()
+                .ok()
+                .and_then(|p| p.owner_route(&client.0));
+            if let Some((owner, addr)) = route {
+                info!(client = %client.0, owner = %owner.0, "relocating persistent session to its owner (ADR 0005)");
+                return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr).await;
+            }
+        }
+    }
 
     // A will is a deferred publish: it must be authorized at CONNECT, not at
     // the moment of death (ADR 0004 step 3).
@@ -232,6 +294,106 @@ where
         graceful,
     });
     result.map(|_| ())
+}
+
+/// Relocate an authenticated persistent session to its owner (ADR 0005): open a
+/// connection to the owner's peer listener, vouch for the client's identity with
+/// a [`PeerMessage::ProxyHello`], replay the original CONNECT and any buffered
+/// client bytes, then splice the client stream to the owner — which serves the
+/// real session. This node never attaches the session locally.
+#[allow(clippy::similar_names)] // client_rh/client_wh and owner_rh/owner_wh are clear half names
+async fn proxy_to_owner<R, W>(
+    reader: FrameReader<R>,
+    writer: FrameWriter<W>,
+    connect: &Connect,
+    principal: &Identity,
+    proxy: &ProxyContext,
+    addr: &str,
+) -> Result<(), NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (client_rh, leftover) = reader.into_parts();
+    let client_wh = writer.into_inner();
+
+    // The owner reads: the ProxyHello frame (vouching the identity this node
+    // authenticated — including the "anonymous" principal, so the owner applies
+    // the same decision), then the raw MQTT stream (the original CONNECT, any
+    // already-buffered client bytes, and via the splice everything next).
+    let mut prelude = Vec::new();
+    mqtt_cluster::peer::encode(
+        &mqtt_cluster::peer::PeerMessage::ProxyHello {
+            identity: Some(principal.subject.clone()),
+        },
+        &mut prelude,
+    )
+    .map_err(|e| NetError::Io(std::io::Error::other(e.to_string())))?;
+    Packet::Connect(connect.clone()).encode(&mut prelude, ProtocolVersion::V311)?;
+    prelude.extend_from_slice(&leftover);
+
+    if let Some(connector) = &proxy.connector {
+        let name = mqtt_net::tls::server_name(addr)?;
+        let tcp = TcpStream::connect(addr).await?;
+        let _ = tcp.set_nodelay(true);
+        let owner = connector.connect(name, tcp).await?;
+        splice(client_rh, client_wh, prelude, owner).await
+    } else {
+        let owner = TcpStream::connect(addr).await?;
+        let _ = owner.set_nodelay(true);
+        splice(client_rh, client_wh, prelude, owner).await
+    }
+}
+
+/// Write `prelude` to the owner, then relay the client stream and the owner
+/// stream in both directions until either side closes.
+#[allow(clippy::similar_names)] // client_rh/client_wh and owner_rh/owner_wh are clear half names
+async fn splice<R, W, O>(
+    mut client_rh: R,
+    mut client_wh: W,
+    prelude: Vec<u8>,
+    owner: O,
+) -> Result<(), NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut owner_rh, mut owner_wh) = tokio::io::split(owner);
+    owner_wh.write_all(&prelude).await?;
+    owner_wh.flush().await?;
+    // Either direction reaching EOF ends the session; dropping the halves on
+    // return closes both connections.
+    tokio::select! {
+        _ = tokio::io::copy(&mut client_rh, &mut owner_wh) => {}
+        _ = tokio::io::copy(&mut owner_rh, &mut client_wh) => {}
+    }
+    Ok(())
+}
+
+/// Serve a session proxied to this node by another (ADR 0005): this node is the
+/// session's owner. `prefix` holds the client's MQTT bytes already read past the
+/// [`PeerMessage::ProxyHello`] marker; `identity` is the vouched, already-
+/// authenticated client identity. The session is served locally and never
+/// re-proxied.
+#[allow(clippy::similar_names)] // client_rh/client_wh are clear half names
+pub async fn serve_proxied<R, W>(
+    client_rh: R,
+    client_wh: W,
+    peer: Option<SocketAddr>,
+    identity: Option<Identity>,
+    policy: Arc<ConnPolicy>,
+    hub: mpsc::UnboundedSender<HubCommand>,
+    prefix: bytes::BytesMut,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let reader = FrameReader::with_buffer(client_rh, ProtocolVersion::V311, prefix);
+    let writer = FrameWriter::new(client_wh, ProtocolVersion::V311);
+    if let Err(e) = run_framed(reader, writer, identity, &policy, hub, false).await {
+        warn!(?peer, error = %e, "proxied session ended with error");
+    }
 }
 
 /// Validate the protocol version and client id of a CONNECT, replying with the
@@ -597,6 +759,7 @@ mod tests {
             }),
             authz: Arc::new(mqtt_auth::AllowAll),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
         })
     }
 

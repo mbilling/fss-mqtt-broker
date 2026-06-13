@@ -43,11 +43,13 @@ async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
         id_a.clone(),
         tx_a.clone(),
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::serve_listener(
         peer_b,
         id_b.clone(),
         tx_b.clone(),
+        None,
         None,
     ));
 

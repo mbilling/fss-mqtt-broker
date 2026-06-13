@@ -121,6 +121,7 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                         auth,
                         authz: Arc::new(mqtt_auth::AllowAll),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
+                        proxy: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
                 }
@@ -376,12 +377,14 @@ async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
         id_a.clone(),
         tx_a.clone(),
         Some(tls_a.clone()),
+        None,
     ));
     tokio::spawn(mqttd::peer::serve_listener(
         peer_b,
         id_b.clone(),
         tx_b.clone(),
         Some(tls_b.clone()),
+        None,
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_b.to_string(),
@@ -478,6 +481,7 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
                         auth,
                         authz: Arc::new(mqtt_auth::AllowAll),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
+                        proxy: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }
@@ -561,6 +565,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                         auth,
                         authz: Arc::new(mqtt_auth::AllowAll),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
+                        proxy: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
                 }

@@ -40,6 +40,7 @@ async fn start_node(
         auth: Arc::new(BasicAuthenticator { allow_anonymous }),
         authz,
         audit: audit.clone(),
+        proxy: None,
     });
 
     let (hub, hub_tx) = Hub::with_config(

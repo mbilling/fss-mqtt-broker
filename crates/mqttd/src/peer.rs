@@ -11,12 +11,14 @@
 //! a cluster-CA-issued cert is what admits a node to the mesh. Plaintext links
 //! remain possible only when no context is configured (loudly logged in `main`).
 
+use crate::conn::ConnPolicy;
 use crate::hub::{HubCommand, PeerOutbound};
 use bytes::BytesMut;
 use mqtt_cluster::peer::{self, PeerMessage};
 use mqtt_cluster::NodeId;
 use mqtt_net::tls;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -74,11 +76,15 @@ static PEER_CONN_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// With a [`PeerTls`] context, every link must complete an mTLS handshake
 /// (cluster-CA-issued client certificate) before a single frame is read.
+/// `client_policy` is used to serve sessions relocated here over the bus
+/// (ADR 0005): a `ProxyHello` connection runs a real client session under this
+/// policy. `None` declines proxied sessions (they are dropped).
 pub async fn serve_listener(
     listener: TcpListener,
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<PeerTls>,
+    client_policy: Option<Arc<ConnPolicy>>,
 ) {
     loop {
         match listener.accept().await {
@@ -86,20 +92,21 @@ pub async fn serve_listener(
                 let local = local.clone();
                 let hub = hub.clone();
                 let tls = tls.clone();
+                let policy = client_policy.clone();
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
                     let result = match &tls {
                         Some(t) => match t.acceptor.accept(stream).await {
                             Ok(s) => {
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local, hub, false, expected_cn).await
+                                handle(s, local, hub, false, expected_cn, policy).await
                             }
                             Err(e) => {
                                 debug!(error = %e, "peer mTLS handshake failed; link rejected");
                                 return;
                             }
                         },
-                        None => handle(stream, local, hub, false, None).await,
+                        None => handle(stream, local, hub, false, None, policy).await,
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "inbound peer link ended");
@@ -147,7 +154,7 @@ pub async fn dial_forever(
                         match t.connector.connect(name.clone(), stream).await {
                             Ok(s) => {
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local.clone(), hub.clone(), true, expected_cn).await
+                                handle(s, local.clone(), hub.clone(), true, expected_cn, None).await
                             }
                             Err(e) => {
                                 debug!(%addr, error = %e, "peer mTLS handshake failed; will retry");
@@ -156,7 +163,7 @@ pub async fn dial_forever(
                             }
                         }
                     }
-                    _ => handle(stream, local.clone(), hub.clone(), true, None).await,
+                    _ => handle(stream, local.clone(), hub.clone(), true, None, None).await,
                 };
                 match outcome {
                     Ok(LinkOutcome::Redundant) => {
@@ -200,29 +207,67 @@ async fn handle<S>(
     hub: mpsc::UnboundedSender<HubCommand>,
     initiated: bool,
     expected_cn: Option<String>,
+    client_policy: Option<Arc<ConnPolicy>>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut rh, mut wh) = tokio::io::split(stream);
-
-    // Send our Hello, then read the peer's Hello to learn its node id.
-    write_frame(
-        &mut wh,
-        &PeerMessage::Hello {
-            node_id: local.0.clone(),
-        },
-    )
-    .await?;
-
     let mut buf = BytesMut::with_capacity(4096);
-    let remote = match read_frame(&mut rh, &mut buf).await? {
-        Some(PeerMessage::Hello { node_id }) => NodeId(node_id),
-        Some(_) => {
-            warn!("peer did not send Hello first; dropping link");
-            return Ok(LinkOutcome::Closed);
+
+    // The dialer announces itself first; the accept side reads first so it can
+    // detect a session-proxy connection (ADR 0005) before announcing itself —
+    // a proxied client expects raw MQTT back, not our peer Hello.
+    let remote = if initiated {
+        write_frame(
+            &mut wh,
+            &PeerMessage::Hello {
+                node_id: local.0.clone(),
+            },
+        )
+        .await?;
+        match read_frame(&mut rh, &mut buf).await? {
+            Some(PeerMessage::Hello { node_id }) => NodeId(node_id),
+            Some(_) => {
+                warn!("peer did not send Hello first; dropping link");
+                return Ok(LinkOutcome::Closed);
+            }
+            None => return Ok(LinkOutcome::Closed),
         }
-        None => return Ok(LinkOutcome::Closed),
+    } else {
+        match read_frame(&mut rh, &mut buf).await? {
+            // A persistent session relocated here by its landing node (ADR 0005).
+            // The connection arrived over the mTLS bus, so the sender is a
+            // verified mesh member; we serve the vouched identity. The leftover
+            // `buf` holds the client's MQTT stream (its CONNECT onward).
+            Some(PeerMessage::ProxyHello { identity }) => {
+                let Some(policy) = client_policy else {
+                    debug!("ProxyHello received but no client policy configured; dropping");
+                    return Ok(LinkOutcome::Closed);
+                };
+                let identity = identity.map(|subject| mqtt_auth::Identity {
+                    subject,
+                    groups: Vec::new(),
+                });
+                crate::conn::serve_proxied(rh, wh, None, identity, policy, hub, buf).await;
+                return Ok(LinkOutcome::Closed);
+            }
+            Some(PeerMessage::Hello { node_id }) => {
+                write_frame(
+                    &mut wh,
+                    &PeerMessage::Hello {
+                        node_id: local.0.clone(),
+                    },
+                )
+                .await?;
+                NodeId(node_id)
+            }
+            Some(_) => {
+                warn!("peer did not send Hello first; dropping link");
+                return Ok(LinkOutcome::Closed);
+            }
+            None => return Ok(LinkOutcome::Closed),
+        }
     };
 
     // Node-id ↔ certificate binding: the peer may only claim the node id that

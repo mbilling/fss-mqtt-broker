@@ -70,7 +70,7 @@ ADR 0001 §1. Connect the dormant `hrw` module to SWIM.
   shrinks gracefully below R members.
 - **Delivers:** the foundation for C and F; no behavior change alone.
 
-### C — Session affinity & redirect  *(needs B; ships the "ephemeral" mode)*
+### C — Session affinity & redirect  ✅ *(done — ADR 0005)*
 
 ADR 0001 §5, alternative "no replication". Make each session live on exactly one
 node *without* replication yet.
