@@ -10,3 +10,4 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0002](0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted |
 | [0003](0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted |
 | [0004](0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted |
+| [0005](0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted |

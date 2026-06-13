@@ -68,13 +68,22 @@ full roadmap and [`docs/adr/`](docs/adr/) for the decisions behind it.
   mTLS peer links automatically — no static peer list required.
 - **Interest-based routing**: a publish fans out only to peers whose gossiped
   subscription interest matches the topic.
-- HRW (rendezvous) placement primitive, ready for the durability design below.
+- **Session placement** (HRW rendezvous over live membership): every persistent
+  session has a deterministic owner node, and ownership rebalances minimally as
+  the cluster changes ([ADR 0001](docs/adr/0001-session-durability.md)).
+- **Session relocation** ([ADR 0005](docs/adr/0005-session-affinity.md)): a
+  persistent session connecting to a node that is not its owner is relayed to the
+  owner over the mTLS bus and served there — sharded session capacity. The
+  landing node vouches for the client's authenticated identity within the
+  cluster-CA trust boundary. *Ephemeral until replicated storage lands:* an
+  owner's death drops its sessions (see below).
 
 ### In progress / planned
-- **Durable, replicated session storage + session takeover**
+- **Durable, replicated session storage + cross-node takeover**
   ([ADR 0001](docs/adr/0001-session-durability.md);
-  [implementation plan](docs/CLUSTER-DURABILITY-PLAN.md)). Sessions are in-memory
-  today.
+  [implementation plan](docs/CLUSTER-DURABILITY-PLAN.md)). Session state is still
+  in-memory and bounded but not replicated; an owner's death loses its sessions.
+  The next step is the consensus-mechanism decision, then the replicated log.
 - **MQTT 5.0**: properties, reason codes, session/message expiry, topic aliases,
   flow control, shared subscriptions, enhanced auth. (v5 CONNECT is currently
   rejected at the codec.)
@@ -94,7 +103,7 @@ full roadmap and [`docs/adr/`](docs/adr/) for the decisions behind it.
 | `mqtt-net` | Framing over any transport; the single audited TLS-config module |
 | `mqtt-auth` | `Authenticator`/`Authorizer` traits; mTLS-CN, Argon2id, JWT, ACL providers |
 | `mqtt-storage` | Pluggable persistence (`SessionStore`, `RetainedStore`) + in-memory impls |
-| `mqtt-cluster` | SWIM membership + gossip auth, HRW placement, peer wire protocol |
+| `mqtt-cluster` | SWIM membership + gossip auth, HRW placement ring, peer wire protocol |
 | `mqtt-observability` | Tracing + a hash-chained, tamper-evident audit log |
 | `mqtt-config` | Typed config with secure defaults |
 | `mqttd` | The server binary: hub routing actor, connections, peer mesh |
@@ -188,6 +197,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | [0002](docs/adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus |
 | [0003](docs/adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams |
 | [0004](docs/adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default |
+| [0005](docs/adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner |
 
 ## License
 
