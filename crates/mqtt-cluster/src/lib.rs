@@ -19,6 +19,7 @@ pub mod lease_raft;
 pub mod lease_store;
 pub mod peer;
 pub mod placement;
+pub mod raft_mesh;
 pub mod repl_net;
 pub mod swim;
 pub mod swim_auth;

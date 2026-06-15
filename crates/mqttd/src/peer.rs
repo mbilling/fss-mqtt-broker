@@ -384,6 +384,12 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             // durable backend is integrated (step 4). Drop unexpected frames.
             warn!("replication frame received but the durable backend is not yet wired in");
         }
+        PeerMessage::RaftRpc { .. } | PeerMessage::RaftRpcReply { .. } => {
+            // Lease-group consensus RPCs (ADR 0006 step 3b-ii mesh network): the
+            // network and dispatcher exist (`mqtt_cluster::raft_mesh`) but the lease
+            // group is not yet run by the live hub (step 4). Drop until then.
+            warn!("raft consensus frame received but the lease group is not yet wired in");
+        }
     }
 }
 

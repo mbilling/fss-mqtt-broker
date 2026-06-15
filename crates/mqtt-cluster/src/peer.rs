@@ -81,6 +81,23 @@ pub enum PeerMessage {
         /// Whether the replica applied the op (`false` if fenced).
         accepted: bool,
     },
+    /// An ownership-lease consensus (openraft) RPC carried over the peer bus
+    /// (ADR 0006 §1, workstream E step 3b-ii mesh network). The codec treats
+    /// `payload` as opaque — it is a serialized Raft RPC, encoded/decoded by
+    /// `raft_mesh`. `req_id` correlates the [`RaftRpcReply`](PeerMessage::RaftRpcReply).
+    RaftRpc {
+        /// Correlates this request with its reply on the same link.
+        req_id: u64,
+        /// The serialized Raft RPC (append-entries / vote / install-snapshot).
+        payload: Vec<u8>,
+    },
+    /// The reply to a [`RaftRpc`](PeerMessage::RaftRpc): the serialized RPC response.
+    RaftRpcReply {
+        /// The `req_id` of the [`RaftRpc`](PeerMessage::RaftRpc) being answered.
+        req_id: u64,
+        /// The serialized Raft RPC response.
+        payload: Vec<u8>,
+    },
 }
 
 /// Errors from peer-frame coding.
@@ -173,6 +190,14 @@ mod tests {
         roundtrip(&PeerMessage::ReplicateAck {
             req_id: 42,
             accepted: true,
+        });
+        roundtrip(&PeerMessage::RaftRpc {
+            req_id: 7,
+            payload: vec![1, 2, 3, 4],
+        });
+        roundtrip(&PeerMessage::RaftRpcReply {
+            req_id: 7,
+            payload: vec![9, 8, 7],
         });
     }
 

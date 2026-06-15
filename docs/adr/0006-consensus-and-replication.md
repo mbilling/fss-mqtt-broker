@@ -176,9 +176,12 @@ This ratifies the ADR as written; no amendment was required.
        single-node group elects itself and commits a lease, and a **three-node group
        elects a leader and replicates a committed lease to every replica** — through
        real consensus, into our `LeaseMap`.
-     - **mesh network**: carry the same RPCs over the mTLS peer bus (replacing the
-       in-memory router), mapping the cluster's string `NodeId` ↔ numeric
-       `RaftNodeId` (openraft node ids are `Copy`).
+     - **mesh network** ✅ *(done)*: `mqtt-cluster::raft_mesh` carries the same RPCs
+       over the peer bus (`PeerMessage::RaftRpc`/`RaftRpcReply`, `req_id`-correlated,
+       `fail_node` on link drop; a `dispatch` receive side). A test elects a leader
+       and replicates a committed lease across **two nodes over a serialized duplex
+       link** — consensus over the wire. Keyed by `RaftNodeId`; the string `NodeId` ↔
+       `RaftNodeId` mapping and live-hub wiring are step 4.
    - **3c — replicated exactly-once state**: extend the session state with the
      **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
      the `SessionStore` trait surface today, so exactly-once does not yet survive
