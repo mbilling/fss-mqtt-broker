@@ -39,7 +39,7 @@ use std::ops::Bound::{Excluded, Included};
 
 /// A replication operation the lease-holder ships to a replica. Carried with the
 /// holder's [`Epoch`] so the replica can fence a stale holder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReplOp {
     /// Store `record` at the leader-assigned `offset` in `key`'s log.
     Append {

@@ -59,6 +59,28 @@ pub enum PeerMessage {
         /// or `None` if the client connected anonymously.
         identity: Option<String>,
     },
+    /// A session-log replication op from a placement group's lease-holder to one of
+    /// its replicas (ADR 0006 §1, workstream E step 3b). The `epoch` is the
+    /// holder's leadership term; the replica fences a stale holder by rejecting an
+    /// epoch below the one it has acknowledged. `req_id` correlates the
+    /// [`ReplicateAck`](PeerMessage::ReplicateAck) the replica returns.
+    Replicate {
+        /// Correlates this request with its ack on the same link.
+        req_id: u64,
+        /// The lease-holder's leadership epoch (fence token).
+        epoch: crate::lease::Epoch,
+        /// The operation to apply (append / truncate / remove).
+        op: crate::cluster_log::ReplOp,
+    },
+    /// A replica's response to a [`Replicate`](PeerMessage::Replicate): whether it
+    /// accepted the op (`false` = fenced at a stale epoch). The lease-holder counts
+    /// accepts to decide quorum durability.
+    ReplicateAck {
+        /// The `req_id` of the [`Replicate`](PeerMessage::Replicate) being answered.
+        req_id: u64,
+        /// Whether the replica applied the op (`false` if fenced).
+        accepted: bool,
+    },
 }
 
 /// Errors from peer-frame coding.
@@ -139,6 +161,19 @@ mod tests {
             identity: Some("device-7".into()),
         });
         roundtrip(&PeerMessage::ProxyHello { identity: None });
+        roundtrip(&PeerMessage::Replicate {
+            req_id: 42,
+            epoch: 7,
+            op: crate::cluster_log::ReplOp::Append {
+                key: "client-x".into(),
+                offset: 3,
+                record: b"payload".to_vec(),
+            },
+        });
+        roundtrip(&PeerMessage::ReplicateAck {
+            req_id: 42,
+            accepted: true,
+        });
     }
 
     #[test]

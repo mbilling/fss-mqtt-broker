@@ -16,6 +16,7 @@ pub mod hrw;
 pub mod lease;
 pub mod peer;
 pub mod placement;
+pub mod repl_net;
 pub mod swim;
 pub mod swim_auth;
 pub mod swim_driver;

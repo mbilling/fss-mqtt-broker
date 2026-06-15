@@ -377,6 +377,13 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             // connection (ADR 0005), handled at accept time — never mid-link.
             warn!("unexpected ProxyHello on established peer link");
         }
+        PeerMessage::Replicate { .. } | PeerMessage::ReplicateAck { .. } => {
+            // Session-log replication (ADR 0006 step 3b) is not yet wired into the
+            // live hub: the transport and follower handler exist
+            // (`mqtt_cluster::repl_net`) but are driven only in tests until the
+            // durable backend is integrated (step 4). Drop unexpected frames.
+            warn!("replication frame received but the durable backend is not yet wired in");
+        }
     }
 }
 

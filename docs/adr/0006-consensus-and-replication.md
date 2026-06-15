@@ -152,9 +152,15 @@ This ratifies the ADR as written; no amendment was required.
      append, single-replica-loss survival (R=3/q=2), below-quorum rejection with no
      committed hole, stale-leader fencing, lazy local truncation, and the step-2
      `ReplicatedSessionStore` running unchanged on top.
-   - **3b — openraft lease manager + networked transport**: openraft enters the
-     build to manage the ownership lease/epoch; the `ReplicaTransport` is realized
-     over the mTLS peer mesh.
+   - **3b-i — networked transport** ✅ *(done)*: `mqtt-cluster::repl_net` —
+     `PeerReplicaTransport` realizes the `ReplicaTransport` seam over the peer mesh
+     (`PeerMessage::Replicate` / `ReplicateAck`, with `req_id` ack correlation and
+     `fail_node` on link drop). Pinned by tests over real framed streams: append
+     round-trip + follower apply, stale-epoch fencing over the wire, unreachable
+     replica, and in-flight failure on disconnect. Driven directly until the live
+     hub is wired (step 4).
+   - **3b-ii — openraft lease manager**: openraft enters the build to manage the
+     ownership lease/epoch that `ClusterLog` and the transport carry.
    - **3c — replicated exactly-once state**: extend the session state with the
      **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
      the `SessionStore` trait surface today, so exactly-once does not yet survive
