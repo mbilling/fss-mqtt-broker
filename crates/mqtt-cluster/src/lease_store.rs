@@ -14,7 +14,7 @@
 //! a Raft store. The network layer that turns this into a live, multi-node group is
 //! the next sub-step.
 
-use crate::lease_raft::{LeaseConfig, LeaseMap, LeaseResponse};
+use crate::lease_raft::{GroupId, LeaseConfig, LeaseMap, LeaseRecord, LeaseResponse};
 use openraft::{
     Entry, EntryPayload, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage,
     Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
@@ -67,6 +67,15 @@ impl LeaseStore {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The lease currently assigned to `group` in the applied state machine.
+    ///
+    /// Reads the committed-and-applied view (what consensus has agreed); for
+    /// inspection and for the wiring layer to learn the epoch a `ClusterLog` runs at.
+    #[must_use]
+    pub fn current_lease(&self, group: GroupId) -> Option<LeaseRecord> {
+        self.lock().sm.get(group)
     }
 }
 

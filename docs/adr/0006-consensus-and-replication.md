@@ -170,9 +170,15 @@ This ratifies the ADR as written; no amendment was required.
        openraft's `RaftStorage` over `LeaseMap` (log, vote, applied state, snapshots —
        in memory). Validated by openraft's own conformance `Suite`, which exercises
        every storage method against the protocol's correctness requirements.
-     - **network**: `RaftNetwork` over the peer mesh, then bring up a real lease
-       group and elect/commit a lease. (openraft requires `Copy` node ids, so the
-       wiring maps the cluster's string `NodeId` ↔ `RaftNodeId`.)
+     - **network + bring-up** ✅ *(done, in-memory)*: `mqtt-cluster::lease_group`
+       implements openraft's `RaftNetwork` (append-entries / vote / install-snapshot)
+       and brings up a real group. Tests prove the full stack end to end: a
+       single-node group elects itself and commits a lease, and a **three-node group
+       elects a leader and replicates a committed lease to every replica** — through
+       real consensus, into our `LeaseMap`.
+     - **mesh network**: carry the same RPCs over the mTLS peer bus (replacing the
+       in-memory router), mapping the cluster's string `NodeId` ↔ numeric
+       `RaftNodeId` (openraft node ids are `Copy`).
    - **3c — replicated exactly-once state**: extend the session state with the
      **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
      the `SessionStore` trait surface today, so exactly-once does not yet survive
