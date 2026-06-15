@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — step 2 (layering) done; **engine spike + durable backend next** |
+| E | Replicated session-log backend | 🔶 In progress — steps 1–2 done (engine ratified: **openraft**; layering + fencing prototypes); **durable backend (step 3) next** |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -141,8 +141,13 @@ phasing. The durable backend implementing `SessionStore`.
   sessions whole), so swapping `InMemoryReplicatedLog` for the consensus-backed log
   makes sessions durable with **no change to this layer**. Done ahead of the engine
   spike because it needs neither network nor an engine choice and de-risks the seam.
-- **Step 1 — engine spike** *(next)*: `cargo-deny` review of openraft (+
-  alternatives) and a prototype ownership-lease group; ratify or amend ADR 0006.
+- **Step 1 — engine spike** ✅ *(done)*: `cargo-deny` review of openraft (79
+  crates, **gate-clean**) vs raft-rs (15 crates but **fails** on an active
+  protobuf DoS advisory) ratified **openraft** as the engine; the engine-agnostic
+  ownership-lease / epoch-fencing state machine landed as `mqtt-cluster::lease`
+  (`LeaseGroup`, split-brain-safety pinned by tests). openraft does not enter the
+  build until step 3 wires it. Details in [ADR 0006](adr/0006-consensus-and-replication.md)
+  *Spike outcome*.
 - **Step 3 — the consensus-backed `ReplicatedLog`**: enqueue = append to the
   session's per-shard log, **quorum-replicated before the producer's QoS≥1 PUBACK
   is released** (the durability contract); dequeue/ack local-first and lazily

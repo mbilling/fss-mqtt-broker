@@ -1,7 +1,7 @@
 # ADR 0006 — Consensus & replication for durable sessions
 
-- **Status:** Accepted (architecture); engine choice gated on a spike (workstream E)
-- **Date:** 2026-06-13
+- **Status:** Accepted; engine **ratified (openraft)** by the workstream-E spike
+- **Date:** 2026-06-13 (engine ratified 2026-06-15)
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) §4, [ADR 0005](0005-session-affinity.md),
   [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream D,
@@ -44,10 +44,10 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    codebase). Hand-rolling leader election, fencing, and membership change is
    precisely the class of subtle distributed-systems bug a correctness- and
    security-first broker must not own. The fencing logic *we* write (rejecting
-   appends at a superseded epoch) sits on top of the engine's primitives. The
-   final library is gated on (a) a `cargo-deny` dependency review and (b) a
-   focused spike — the first task of workstream E — which may ratify or amend
-   this ADR.
+   appends at a superseded epoch) sits on top of the engine's primitives.
+   **The workstream-E spike ratified openraft** (see *Spike outcome* below): it is
+   the only mature async-native Raft that passes our `cargo-deny` gate clean. The
+   fencing layer is prototyped engine-agnostically in `mqtt-cluster::lease`.
 
 3. **`ReplicatedLog` is the seam.** A generic async append-log trait
    (`append` / `read` / `truncate` / `remove` over keyed, offset-addressed byte
@@ -69,6 +69,38 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    A stale lease-holder after a partition heals is **fenced**: replicas reject
    appends at a superseded epoch, so it cannot reach quorum and cannot diverge
    the log.
+
+## Spike outcome (workstream E step 1)
+
+The spike evaluated the two candidate engines against our `deny.toml` and built the
+engine-agnostic fencing prototype. Findings (2026-06-15):
+
+| Engine | Net-new crates | `cargo-deny` | Model | Verdict |
+|--------|---------------:|--------------|-------|---------|
+| **openraft** 0.9.24 | 79 | **clean** (advisories / licenses / bans / sources all ok) | async-native, actively maintained | **ratified** |
+| raft-rs (`raft`) 0.7.0 | 15 | **FAILS** — RUSTSEC-2024-0437 (protobuf 2.28 uncontrolled-recursion **DoS**, unfixed upstream in 0.7) + RUSTSEC-2025-0057 (`fxhash` unmaintained) | sync, protobuf-driven | rejected |
+
+- **openraft is ratified.** It is heavier (79 transitive crates — clap, chrono,
+  `rust_decimal`, `validit`, `anyerror` among them; ~+56% over the current
+  141-crate workspace) but it is the only mature async-native option and it passes
+  the supply-chain gate with **no new policy exceptions**. The weight is the
+  accepted cost ADR 0001/this ADR already anticipated; it is revisited if a
+  lighter, gate-clean alternative (e.g. a stable openraft 0.10, currently
+  alpha-only) appears before E step 3 binds it.
+- **raft-rs is rejected.** Despite a far smaller tree it ships an *active* DoS
+  vulnerability pinned through `raft-proto`'s protobuf 2.x — disqualifying for a
+  security-first broker.
+- **The engine is not yet a workspace dependency.** The spike measured it on a
+  throwaway branch and reverted; openraft lands for real at E step 3 (the
+  consensus-backed `ReplicatedLog`), so the 79 crates do not enter the build until
+  the code that needs them does.
+- **The fencing layer is built and proven** independent of the engine:
+  `mqtt-cluster::lease` (`LeaseGroup` / `OwnershipLease` / epoch fencing) is a pure,
+  sans-I/O state machine whose tests pin the split-brain-safety property (two
+  epochs can never both reach quorum; a superseded holder is fenced). It maps onto
+  openraft's leadership term at E step 3.
+
+This ratifies the ADR as written; no amendment was required.
 
 ## Consequences
 
@@ -101,8 +133,9 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
 
 ## Phasing (workstream E)
 
-1. **Spike + decide the engine**: `cargo-deny` review of openraft (and
-   alternatives) plus a prototype ownership-lease group; ratify or amend this ADR.
+1. **Spike + decide the engine** ✅ *(done)*: `cargo-deny` review of openraft and
+   raft-rs plus the engine-agnostic ownership-lease/fencing prototype
+   (`mqtt-cluster::lease`). Outcome above — openraft ratified, ADR unchanged.
 2. **`SessionStore` over `ReplicatedLog`** ✅ *(done)*: `ReplicatedSessionStore`
    (`mqtt-storage::logged`) implements the full `SessionStore` over a
    `ReplicatedLog`, holding no durable state of its own — queue in a `q/{client}`

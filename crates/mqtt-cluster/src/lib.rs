@@ -12,6 +12,7 @@
 //! set remains available as a fallback.
 
 pub mod hrw;
+pub mod lease;
 pub mod peer;
 pub mod placement;
 pub mod swim;
