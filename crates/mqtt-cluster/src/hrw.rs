@@ -34,6 +34,17 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A version-stable 64-bit hash of `bytes`, identical on every node and across
+/// process restarts (FNV-1a + a `SplitMix64` avalanche finalize).
+///
+/// Used where a value must hash the *same* everywhere — e.g. deriving a consensus
+/// node id from a cluster node id (`node_registry`) — which `std::hash` cannot
+/// guarantee (its hasher is randomly seeded per process).
+#[must_use]
+pub fn stable_id(bytes: &[u8]) -> u64 {
+    mix64(fnv1a(FNV_OFFSET, bytes))
+}
+
 /// The rendezvous weight of `node` for `key`. Higher wins.
 fn weight(node: &NodeId, key: &[u8]) -> u64 {
     // Hash the node id, then continue into the key, so each (node, key) pair gets

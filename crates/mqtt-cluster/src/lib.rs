@@ -17,6 +17,7 @@ pub mod lease;
 pub mod lease_group;
 pub mod lease_raft;
 pub mod lease_store;
+pub mod node_registry;
 pub mod peer;
 pub mod placement;
 pub mod raft_mesh;
