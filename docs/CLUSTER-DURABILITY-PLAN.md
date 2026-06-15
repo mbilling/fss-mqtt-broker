@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a**; **step 4 integration** ([ADR 0007](adr/0007-durable-store-integration.md): 4b–4f) remains |
+| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a, 4b**; **step 4 integration** ([ADR 0007](adr/0007-durable-store-integration.md): 4c–4f) remains |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -191,8 +191,12 @@ phasing. The durable backend implementing `SessionStore`.
     [ADR 0007](adr/0007-durable-store-integration.md))*. The components are all
     built; step 4 assembles them into `mqttd`. Sub-steps, each shippable/test-first:
     - **4a — `NodeId ↔ RaftNodeId` mapping** ✅ *(done)*: `node_registry`.
-    - **4b — placement groups**: `group(client) = hash % NUM_GROUPS`; per-group
-      replica set / owner over `Placement`; relocation refined to the group owner.
+    - **4b — placement groups** ✅ *(done)*: `placement::group_of(client) =
+      stable_hash % NUM_GROUPS` (256); `Placement` gained `group_owner` /
+      `group_replica_set` / `owns_group`, and the per-client queries now resolve
+      through the client's group — so a session is owned by and relocated to its
+      *group* owner (refining ADR 0005). The rendezvous properties (minimal
+      reassignment on join/leave) hold at group granularity.
     - **4c — hub RPC endpoints**: host the lease `Raft` + `MeshRaftNetwork` +
       `PeerReplicaTransport` + `ReplicaState` in the hub; route the four consensus/
       replication frames through `PeerConnected`/`forward_inbound`/`PeerDisconnected`.

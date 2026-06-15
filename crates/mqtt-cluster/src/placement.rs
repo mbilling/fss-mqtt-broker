@@ -1,4 +1,4 @@
-//! Session placement over live membership (ADR 0001 §1).
+//! Session placement over live membership (ADR 0001 §1, [ADR 0007](../../../docs/adr/0007-durable-store-integration.md)).
 //!
 //! Wraps the deterministic [`crate::hrw`] primitives with the *current* eligible
 //! member set — this node plus every peer not believed `Dead` — and recomputes
@@ -9,11 +9,22 @@
 //! the small group ADR 0001 scopes durability/consensus to, not the whole
 //! cluster.
 //!
+//! ## Placement groups ([ADR 0007](../../../docs/adr/0007-durable-store-integration.md) §1)
+//!
+//! Ownership granularity is the **placement group** (shard), not the individual
+//! client: `group(client) = stable_hash(client) % `[`NUM_GROUPS`]. A group's owner
+//! and replica set are HRW over the *group* key, so every session in a group shares
+//! one owner, one replica set, and (in the durable backend) one lease/epoch — which
+//! bounds the number of leases and replica sets to `NUM_GROUPS` regardless of how
+//! many sessions exist. The per-client queries below resolve through the client's
+//! group, so a session is owned by — and relocated to — its **group** owner.
+//!
 //! `Suspect` members stay in the ring: a transiently-slow node should not
 //! trigger ownership churn (and the reassignment it would reverse on
 //! refutation). Only a confirmed `Dead` removes a node, which is exactly the
 //! ADR 0001 takeover trigger.
 
+use crate::lease_raft::GroupId;
 use crate::swim::MemberState;
 use crate::{hrw, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +32,24 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Default replication factor: each session's replica set spans R nodes
 /// (ADR 0001 §1).
 pub const DEFAULT_REPLICAS: usize = 3;
+
+/// The number of placement groups (shards) the keyspace is partitioned into
+/// (ADR 0007 §1). A cluster-wide constant: changing it reshuffles group ownership,
+/// so every node must agree. Bounds the lease/replica-set count to this regardless
+/// of session count.
+pub const NUM_GROUPS: u64 = 256;
+
+/// The placement group a `client` belongs to — a deterministic, version-stable hash
+/// of its id modulo [`NUM_GROUPS`], identical on every node.
+#[must_use]
+pub fn group_of(client: &str) -> GroupId {
+    hrw::stable_id(client.as_bytes()) % NUM_GROUPS
+}
+
+/// The HRW key for a placement group (so groups hash independently of any client).
+fn group_key(group: GroupId) -> String {
+    format!("group/{group}")
+}
 
 /// The placement ring for one node: maps client ids to their owner and replica
 /// set over the current eligible membership.
@@ -77,23 +106,41 @@ impl Placement {
         self.eligible.iter().cloned().collect()
     }
 
-    /// The owner node for `client`. There is always an owner (this node is
-    /// always eligible).
+    /// The owner node of a placement `group`. There is always an owner (this node
+    /// is always eligible).
     #[must_use]
-    pub fn owner(&self, client: &str) -> NodeId {
-        hrw::owner(client.as_bytes(), &self.nodes())
+    pub fn group_owner(&self, group: GroupId) -> NodeId {
+        hrw::owner(group_key(group).as_bytes(), &self.nodes())
             .cloned()
             .unwrap_or_else(|| self.local.clone())
     }
 
-    /// The ordered replica set for `client` (owner first), capped at `R` and at
-    /// the current member count.
+    /// The ordered replica set of a placement `group` (owner first), capped at `R`
+    /// and at the current member count.
     #[must_use]
-    pub fn replica_set(&self, client: &str) -> Vec<NodeId> {
-        hrw::replica_set(client.as_bytes(), &self.nodes(), self.replicas)
+    pub fn group_replica_set(&self, group: GroupId) -> Vec<NodeId> {
+        hrw::replica_set(group_key(group).as_bytes(), &self.nodes(), self.replicas)
     }
 
-    /// Whether this node owns `client`.
+    /// Whether this node owns placement `group`.
+    #[must_use]
+    pub fn owns_group(&self, group: GroupId) -> bool {
+        self.group_owner(group) == self.local
+    }
+
+    /// The owner node for `client` — the owner of its placement group.
+    #[must_use]
+    pub fn owner(&self, client: &str) -> NodeId {
+        self.group_owner(group_of(client))
+    }
+
+    /// The ordered replica set for `client` (owner first) — its group's replica set.
+    #[must_use]
+    pub fn replica_set(&self, client: &str) -> Vec<NodeId> {
+        self.group_replica_set(group_of(client))
+    }
+
+    /// Whether this node owns `client` (i.e. owns its group).
     #[must_use]
     pub fn owns(&self, client: &str) -> bool {
         self.owner(client) == self.local
@@ -299,5 +346,61 @@ mod tests {
             moved < total / 3,
             "too many keys moved on join: {moved}/{total}"
         );
+    }
+
+    /// `group_of` is a deterministic hash into `[0, NUM_GROUPS)`.
+    #[test]
+    fn group_of_is_deterministic_and_in_range() {
+        use super::{group_of, NUM_GROUPS};
+        for i in 0..1_000 {
+            let c = format!("client-{i}");
+            let g = group_of(&c);
+            assert!(g < NUM_GROUPS);
+            assert_eq!(g, group_of(&c), "deterministic");
+        }
+        // The hash spreads across many groups (not all clients in one).
+        let groups: std::collections::BTreeSet<u64> =
+            (0..1_000).map(|i| group_of(&format!("c{i}"))).collect();
+        assert!(groups.len() > 100, "clients spread across groups");
+    }
+
+    /// Every client in a group shares that group's owner and replica set — the
+    /// locality the durable backend relies on (one lease/replica-set per group).
+    #[test]
+    fn clients_in_a_group_share_owner_and_replica_set() {
+        use super::group_of;
+        let p = ring("a", &["b", "c", "d", "e"]);
+        // Bucket clients by group, then check each bucket agrees internally.
+        let mut by_group: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for i in 0..2_000 {
+            let c = format!("client-{i}");
+            by_group.entry(group_of(&c)).or_default().push(c);
+        }
+        for (group, clients) in by_group.iter().filter(|(_, c)| c.len() >= 2) {
+            let owner = p.group_owner(*group);
+            let rs = p.group_replica_set(*group);
+            for c in clients {
+                assert_eq!(p.owner(c), owner, "client owner == its group owner");
+                assert_eq!(p.replica_set(c), rs, "client replica set == its group's");
+            }
+        }
+    }
+
+    /// `owns_group` / `group_owner` / `group_replica_set` are mutually consistent,
+    /// and a client's owner is the head of its group's replica set.
+    #[test]
+    fn group_queries_are_consistent() {
+        use super::{group_of, NUM_GROUPS};
+        let p = ring("a", &["b", "c", "d", "e"]);
+        for group in 0..NUM_GROUPS {
+            let rs = p.group_replica_set(group);
+            assert_eq!(p.group_owner(group), rs[0], "owner leads the replica set");
+            assert_eq!(p.owns_group(group), rs[0] == node("a"));
+        }
+        // A client routes through its group.
+        let c = "client-123";
+        assert_eq!(p.owner(c), p.group_owner(group_of(c)));
+        assert_eq!(p.owns(c), p.owns_group(group_of(c)));
     }
 }
