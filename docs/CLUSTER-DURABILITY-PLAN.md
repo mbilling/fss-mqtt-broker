@@ -224,11 +224,10 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 | Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
 | Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
 
-**Cross-cutting (outside this plan): no git remote / CI has never run.** A
-`.github/` gate (fmt, clippy, `cargo-deny`, `cargo-audit`) exists in the repo but
-all commits are local, so it has never executed. Recommend wiring a remote and
-enabling CI **before** the consensus dependency lands (E step 3), so the new
-supply-chain weight is checked on every push rather than only locally.
+**Cross-cutting: remote + CI now live** ✅. The repo has a remote and the
+`.github/` gate (fmt, clippy, `cargo-deny`, `cargo-audit`) runs on every push to
+`main` and on pull requests. The consensus dependency that lands in E will be
+supply-chain-checked in CI, not only locally.
 
 ## Test discipline
 
