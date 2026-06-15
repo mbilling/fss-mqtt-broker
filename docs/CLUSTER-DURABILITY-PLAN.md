@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — steps 1–2, **3a**, **3b-i** done (engine ratified; layering, fencing, quorum core, **networked transport**); **3b-ii openraft lease manager next** |
+| E | Replicated session-log backend | 🔶 In progress — steps 1–2, 3a, 3b-i, **3b-ii state machine** done (**openraft now in the build**; lease state machine + type binding); **openraft storage/network next** |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -164,8 +164,14 @@ phasing. The durable backend implementing `SessionStore`.
     (round-trip apply, stale-epoch fencing, unreachable replica, in-flight failure
     on disconnect). The three handles (outbound `tx`, ack routing, disconnect) map
     onto the existing hub mesh; driven directly until step 4 wires them in.
-  - **3b-ii — openraft lease manager** *(next)*: openraft enters the build to
-    manage the ownership lease/epoch that `ClusterLog` and the transport carry.
+  - **3b-ii — openraft lease manager**: *state machine + type binding* ✅ *(done)* —
+    openraft is now in the build (and through `cargo-deny`); `mqtt-cluster::lease_raft`
+    holds the replicated `LeaseMap` (`group -> (holder, epoch)`, monotonic epoch =
+    the fence source) bound to openraft via `declare_raft_types!(LeaseConfig)` over
+    numeric `RaftNodeId`s, compile-asserted as a valid `RaftTypeConfig`. *Next:*
+    implement openraft's storage / state-machine traits over `LeaseMap` and
+    `RaftNetwork` over the peer mesh, then bring up a real lease group (mapping the
+    cluster's string `NodeId` ↔ `RaftNodeId`, since openraft node ids are `Copy`).
   - **3c — replicated exactly-once state**: the **QoS-2 received-packet-id dedup
     set** + next-packet-id counter join the replicated state (a `SessionStore`
     surface extension), and the queue-cap count moves to a rebuildable per-key

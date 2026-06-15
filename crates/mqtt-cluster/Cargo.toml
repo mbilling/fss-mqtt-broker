@@ -17,6 +17,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 ring = { workspace = true }
 async-trait = "0.1"
+openraft = { version = "0.9.24", features = ["serde"] }
 
 [lints]
 workspace = true

@@ -159,8 +159,17 @@ This ratifies the ADR as written; no amendment was required.
      round-trip + follower apply, stale-epoch fencing over the wire, unreachable
      replica, and in-flight failure on disconnect. Driven directly until the live
      hub is wired (step 4).
-   - **3b-ii — openraft lease manager**: openraft enters the build to manage the
-     ownership lease/epoch that `ClusterLog` and the transport carry.
+   - **3b-ii — openraft lease manager**, in turn:
+     - **state machine + type binding** ✅ *(done)*: openraft is now a real
+       dependency (in the build, through `cargo-deny`). `mqtt-cluster::lease_raft`
+       defines the replicated `LeaseMap` (`group -> (holder, epoch)`, monotonic
+       epoch — the fence source) and binds it to openraft via
+       `declare_raft_types!(LeaseConfig)` over numeric `RaftNodeId`s, with a
+       compile-assert that it is a valid `RaftTypeConfig`.
+     - **storage + network**: implement openraft's log-storage / state-machine
+       traits over the `LeaseMap`, and `RaftNetwork` over the peer mesh, then bring
+       up a real lease group and elect/commit a lease. (openraft requires `Copy`
+       node ids, so the wiring maps the cluster's string `NodeId` ↔ `RaftNodeId`.)
    - **3c — replicated exactly-once state**: extend the session state with the
      **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
      the `SessionStore` trait surface today, so exactly-once does not yet survive
