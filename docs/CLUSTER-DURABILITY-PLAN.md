@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — steps 1–2 done (engine ratified: **openraft**; layering + fencing prototypes); **durable backend (step 3) next** |
+| E | Replicated session-log backend | 🔶 In progress — steps 1–2 + **3a** done (engine ratified; layering, fencing, **quorum-append core**); **3b networked transport / openraft next** |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -148,16 +148,22 @@ phasing. The durable backend implementing `SessionStore`.
   (`LeaseGroup`, split-brain-safety pinned by tests). openraft does not enter the
   build until step 3 wires it. Details in [ADR 0006](adr/0006-consensus-and-replication.md)
   *Spike outcome*.
-- **Step 3 — the consensus-backed `ReplicatedLog`**: enqueue = append to the
-  session's per-shard log, **quorum-replicated before the producer's QoS≥1 PUBACK
-  is released** (the durability contract); dequeue/ack local-first and lazily
-  truncated (no synchronous cross-node hop on the ack path). Replicated state
-  includes the **QoS-2 received-packet-id dedup set** and the next-packet-id
-  counter, so exactly-once survives failover.
-- **Tests (step 3):** enqueue survives a single replica loss (R=3, quorum=2); ack
-  truncation does not lose un-quorumed writes; QoS-2 dedup holds across a
-  simulated failover; a deterministic multi-node simulation (injectable loss /
-  reorder) mirroring the SWIM-sim approach.
+- **Step 3 — the consensus-backed `ReplicatedLog`**, decomposed:
+  - **3a — quorum-append core** ✅ *(done)*: `mqtt-cluster::cluster_log` —
+    `ClusterLog` quorum-replicates each append across the replica set behind a
+    `ReplicaTransport` seam, epoch-fenced via `ReplicaState`. Enqueue is
+    **quorum-durable before commit** (gating the QoS≥1 PUBACK); ack/truncate are
+    local-first and lazy. A deterministic loss-injecting sim pins the contract
+    (single-replica-loss survival at R=3/q=2, below-quorum rejection with no
+    committed hole, stale-leader fencing), and the step-2 `ReplicatedSessionStore`
+    runs unchanged on top — durable sessions, end to end, sans network.
+  - **3b — networked transport + openraft** *(next)*: openraft manages the
+    ownership lease/epoch (entering the build here); `ReplicaTransport` is realized
+    over the mTLS peer mesh.
+  - **3c — replicated exactly-once state**: the **QoS-2 received-packet-id dedup
+    set** + next-packet-id counter join the replicated state (a `SessionStore`
+    surface extension), and the queue-cap count moves to a rebuildable per-key
+    index, so exactly-once survives failover and cap enforcement is exact.
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
 
 ### F — Takeover / handoff protocol  *(needs B + E)*
@@ -221,11 +227,12 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 
 | Limitation | Impact | Resolved by |
 |------------|--------|-------------|
-| Sessions are **ephemeral** — an owner's death drops its queues | No durability across owner loss (sharded capacity only) | **E step 3** (durable log) + **F** (takeover) |
-| Consensus engine (openraft) **unratified** | Architecture accepted; the library is not yet chosen or `cargo-deny`-reviewed | **E step 1** (spike) |
-| QoS-2 dedup set + next-packet-id counter **not yet replicated state** (not on the `SessionStore` trait surface) | Exactly-once would not survive failover yet | **E step 3** (extends the replicated state) |
-| `ReplicatedSessionStore` cap enforcement is exact only under **serialized per-key appends**; the in-memory backend counts via an O(n) read | Soft policy may mis-evict under concurrent appends to one key; no correctness/durability impact | **E step 3** (lease serializes appends; backend keeps a rebuildable per-key index) |
-| `ReplicatedSessionStore` is **not wired into `mqttd`** (the broker still uses `MemorySessionStore`) | Layering proven in isolation, not in the live server | **E step 4** (swap the backend in) |
+| Sessions are **ephemeral** — an owner's death drops its queues | No durability across owner loss (sharded capacity only) | **E step 3b** (networked durable log) + **F** (takeover) |
+| ~~Consensus engine (openraft) unratified~~ | — | ✅ **E step 1** — openraft ratified |
+| The quorum-append core is **not yet networked** — `ClusterLog` runs only over the in-process sim transport | Durability proven deterministically, not yet over the wire | **E step 3b** (`ReplicaTransport` over the mTLS peer mesh + openraft lease) |
+| QoS-2 dedup set + next-packet-id counter **not yet replicated state** (not on the `SessionStore` trait surface) | Exactly-once would not survive failover yet | **E step 3c** (extends the replicated state) |
+| `ReplicatedSessionStore` cap enforcement is exact only under **serialized per-key appends**; the in-memory backend counts via an O(n) read | Soft policy may mis-evict under concurrent appends to one key; no correctness/durability impact | **E step 3c** (lease serializes appends; backend keeps a rebuildable per-key index) |
+| `ReplicatedSessionStore` / `ClusterLog` are **not wired into `mqttd`** (the broker still uses `MemorySessionStore`) | Layering proven in isolation, not in the live server | **E step 4** (swap the backend in) |
 | Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
 | Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
 

@@ -11,6 +11,7 @@
 //! the broker can establish peer links dynamically; a statically-configured peer
 //! set remains available as a fallback.
 
+pub mod cluster_log;
 pub mod hrw;
 pub mod lease;
 pub mod peer;

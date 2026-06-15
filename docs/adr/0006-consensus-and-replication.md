@@ -143,14 +143,24 @@ This ratifies the ADR as written; no amendment was required.
    over the same log sees the first's sessions in full, so a durable log yields
    durable sessions. Done **first** (ahead of the spike): it needs no network and
    no engine choice, and it validates the seam shape before any dependency lands.
-3. **The consensus-backed `ReplicatedLog`**: ownership lease + epoch-fenced
-   quorum-append, and the cluster `SessionStore` backend over it. This step also
-   extends the replicated session state with the **QoS-2 received-packet-id dedup
-   set and the next-packet-id counter** — not on the `SessionStore` trait surface
-   today, so exactly-once does not yet survive failover — and replaces the
-   in-memory backend's O(n) cap count with a rebuildable per-key index (the lease
-   serializes per-key appends, making cap enforcement exact rather than
-   best-effort).
+3. **The consensus-backed `ReplicatedLog`**, in three sub-steps:
+   - **3a — epoch-fenced quorum-append core** ✅ *(done)*: `mqtt-cluster::cluster_log`
+     — `ClusterLog` implements `ReplicatedLog` by quorum-replicating each append
+     across the replica set behind a `ReplicaTransport` seam, gated on the
+     lease-holder's epoch (`ReplicaState` fences a stale holder). Sans-I/O, with a
+     deterministic loss-injecting simulation pinning the contract: quorum-durable
+     append, single-replica-loss survival (R=3/q=2), below-quorum rejection with no
+     committed hole, stale-leader fencing, lazy local truncation, and the step-2
+     `ReplicatedSessionStore` running unchanged on top.
+   - **3b — openraft lease manager + networked transport**: openraft enters the
+     build to manage the ownership lease/epoch; the `ReplicaTransport` is realized
+     over the mTLS peer mesh.
+   - **3c — replicated exactly-once state**: extend the session state with the
+     **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
+     the `SessionStore` trait surface today, so exactly-once does not yet survive
+     failover), and replace the in-memory backend's O(n) cap count with a
+     rebuildable per-key index (the lease serializes per-key appends, making cap
+     enforcement exact).
 4. **Wire it in**: swap `mqttd`'s `MemorySessionStore` for the durable backend so
    relocated-session owners (ADR 0005) write through it — ephemeral sessions become
    durable — then cross-node takeover (workstream F).

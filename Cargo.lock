@@ -417,9 +417,11 @@ dependencies = [
 name = "mqtt-cluster"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
  "bytes",
  "mqtt-core",
+ "mqtt-storage",
  "ring",
  "serde",
  "thiserror 1.0.69",

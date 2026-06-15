@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
+mqtt-storage = { path = "../mqtt-storage", version = "0.1.0" }
 thiserror.workspace = true
 serde = { workspace = true }
 bincode = "1"
@@ -15,6 +16,7 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 ring = { workspace = true }
+async-trait = "0.1"
 
 [lints]
 workspace = true
