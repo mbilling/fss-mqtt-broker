@@ -83,7 +83,10 @@ full roadmap and [`docs/adr/`](docs/adr/) for the decisions behind it.
   ([ADR 0001](docs/adr/0001-session-durability.md);
   [implementation plan](docs/CLUSTER-DURABILITY-PLAN.md)). Session state is still
   in-memory and bounded but not replicated; an owner's death loses its sessions.
-  The next step is the consensus-mechanism decision, then the replicated log.
+  The consensus mechanism is now decided — lease-scoped consensus over a proven
+  engine, with a `ReplicatedLog` seam ([ADR 0006](docs/adr/0006-consensus-and-replication.md));
+  the in-memory backend ships today and the consensus-backed replicated log is
+  next (workstream E).
 - **MQTT 5.0**: properties, reason codes, session/message expiry, topic aliases,
   flow control, shared subscriptions, enhanced auth. (v5 CONNECT is currently
   rejected at the codec.)
@@ -198,6 +201,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | [0003](docs/adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams |
 | [0004](docs/adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default |
 | [0005](docs/adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner |
+| [0006](docs/adr/0006-consensus-and-replication.md) | Consensus & replication: lease-scoped consensus, a proven engine, the `ReplicatedLog` seam |
 
 ## License
 

@@ -90,24 +90,33 @@ node *without* replication yet.
 - **Delivers:** linear session *capacity* (sharded, no node holds all sessions)
   — a real scalability milestone — before any consensus work.
 
-### D — Decision: consensus / replication mechanism  *(ADR 0005, blocks E)*
+### D — Decision: consensus / replication mechanism  ✅ *(done — ADR 0006)*
 
 Capability Plan §8 open question; ADR 0001 §4 reserves consensus for "ownership
-+ the enqueue log only." This is a hard, expensive-to-reverse choice and gets
-its own ADR. Options to weigh:
++ the enqueue log only." This was a hard, expensive-to-reverse choice and got
+its own ADR. The decision ([ADR 0006](adr/0006-consensus-and-replication.md)):
 
-- A Rust Raft library (`openraft`, `raft-rs`) running **one small group per
-  shard** — not one global group (ADR 0001 rejects the global-leader ceiling).
-- A purpose-built quorum-append for an idempotent, offset-addressed log (the log
-  is simpler than general Raft state-machine replication; enqueue is an
-  append, truncation is idempotent).
-- Reuse of an external store as a `SessionStore` backend (ADR 0001's
-  externalized-store alternative) for operators who already run one.
+- **Consensus is scoped to ownership leases, not per log entry.** A small
+  consensus group establishes, per placement group, which node holds the lease
+  and at what epoch; the lease-holder then does **epoch-fenced quorum
+  replication** of the per-session append-log — one quorum round-trip per append,
+  not a leader election per entry. (Per-shard, never one global group — ADR 0001
+  rejects the global-leader ceiling.)
+- **Use a proven engine; do not hand-roll** leader election / fencing /
+  membership change. `openraft` is the leading candidate; the final library is
+  gated on a `cargo-deny` review + a focused spike (the first task of E, which
+  may ratify or amend the ADR).
+- An external store stays an operator-selectable `ReplicatedLog` backend (ADR
+  0001's externalized-store alternative), not the default.
 
-Decision criteria: split-brain safety on ownership, write-amplification cost,
-operational complexity, dependency/supply-chain weight (must pass `cargo-deny`),
-and whether per-shard groups can be created/torn down cheaply as membership
-moves. **Output:** ADR 0005 + a `ReplicatedLog` interface the backend targets.
+Decision criteria weighed: split-brain safety on ownership, write-amplification
+cost, operational complexity, dependency/supply-chain weight (must pass
+`cargo-deny`), and cheap per-shard group lifecycle as membership moves.
+**Output:** ADR 0006 + the `ReplicatedLog` seam — a generic async append-log
+trait (`append` / `read` / `truncate` / `remove` over keyed, offset-addressed
+byte records) in `mqtt-storage::repl`, with `InMemoryReplicatedLog` shipping now
+for development/tests/non-clustered use; the consensus-backed and external-store
+backends target E.
 
 ### E — Replicated session-log backend  *(needs B + D)*
 
@@ -158,7 +167,7 @@ for completeness and sequencing.
 ```
 A (queue caps) ─▶ B (ownership ring) ─▶ C (affinity / ephemeral mode)
                           │
-                          ├─▶ D (ADR 0005: consensus choice) ─▶ E (replicated log) ─▶ F (takeover)
+                          ├─▶ D (ADR 0006: consensus choice) ─▶ E (replicated log) ─▶ F (takeover)
                           │
                   (MQTT 5.0 codec milestone) ─────────────────▶ G (expiry, shared subs)
 ```
