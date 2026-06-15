@@ -19,9 +19,11 @@
 //! - **`q/{client}`** — the offline message queue. `enqueue` appends an encoded
 //!   message (the durability-critical write); `pending` reads it back; `ack`
 //!   truncates it. The log's per-key offset *is* the message offset.
-//! - **`m/{client}`** — session metadata (an existence marker and the subscription
-//!   set), last-writer-wins: `set_subscriptions` appends the new set and truncates
-//!   the older metadata, so a read takes the latest.
+//! - **`m/{client}`** — a single session-metadata snapshot (subscriptions, the
+//!   QoS-2 inbound dedup window, and the outbound packet-id counter). Each mutation
+//!   reads-modifies-writes the snapshot (append the new one, truncate the prior), so
+//!   a read takes the latest. Metadata is small and low-churn, so a snapshot is the
+//!   right shape; only the high-churn queue stays incremental.
 //!
 //! Because no state hides in the store, a *second* `ReplicatedSessionStore` over
 //! the same log observes the first's sessions in full — the test that pins the
@@ -41,6 +43,7 @@ use crate::repl::{ReplError, ReplicatedLog};
 use crate::{Enqueued, QueueLimits, QueuedMessage, SessionStore, StorageError};
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
+use std::collections::BTreeSet;
 
 impl From<ReplError> for StorageError {
     fn from(e: ReplError) -> Self {
@@ -88,22 +91,44 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
     fn meta_key(client: &ClientId) -> String {
         format!("m/{}", client.0)
     }
+
+    /// Read the session's metadata snapshot (`None` if no session record exists).
+    ///
+    /// The metadata log holds exactly one record — the latest snapshot — so we read
+    /// it whole. Metadata is small and low-churn (subscriptions, the dedup window,
+    /// the packet-id counter), so a read-modify-write snapshot is the right shape;
+    /// the high-churn queue stays incremental.
+    async fn load_meta(&self, client: &ClientId) -> Result<Option<SessionMeta>, StorageError> {
+        let mkey = Self::meta_key(client);
+        match self.log.read(&mkey, 0, usize::MAX).await?.last() {
+            Some(entry) => Ok(Some(decode_session_meta(&entry.record)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write the session's metadata snapshot, keeping exactly one record (append the
+    /// new snapshot, truncate the prior one).
+    async fn store_meta(&self, client: &ClientId, meta: &SessionMeta) -> Result<(), StorageError> {
+        let mkey = Self::meta_key(client);
+        let offset = self.log.append(&mkey, encode_session_meta(meta)).await?;
+        if offset > 1 {
+            self.log.truncate(&mkey, offset - 1).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> {
     async fn ensure_session(&self, client: &ClientId) -> Result<bool, StorageError> {
-        let mkey = Self::meta_key(client);
         let qkey = Self::queue_key(client);
-        // A session "exists" if any metadata or any queued message is present.
-        let existed = !self.log.read(&mkey, 0, 1).await?.is_empty()
+        // A session "exists" if a metadata snapshot or any queued message is present.
+        let existed = self.load_meta(client).await?.is_some()
             || !self.log.read(&qkey, 0, 1).await?.is_empty();
         if !existed {
-            // Persist an existence marker so a subscription-less, message-less
+            // Persist a default snapshot so a subscription-less, message-less
             // persistent session still round-trips as present.
-            self.log
-                .append(&mkey, encode_meta(&MetaRecord::Created))
-                .await?;
+            self.store_meta(client, &SessionMeta::default()).await?;
         }
         Ok(existed)
     }
@@ -113,27 +138,19 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         client: &ClientId,
         subscriptions: &[Subscription],
     ) -> Result<(), StorageError> {
-        let mkey = Self::meta_key(client);
-        let record = encode_meta(&MetaRecord::Subscriptions(subscriptions.to_vec()));
-        let offset = self.log.append(&mkey, record).await?;
-        // Last-writer-wins: drop every earlier metadata record (the prior
-        // subscription set and any existence marker), leaving just this one.
-        if offset > 1 {
-            self.log.truncate(&mkey, offset - 1).await?;
-        }
-        Ok(())
+        // Read-modify-write the snapshot so the dedup window and packet-id counter
+        // survive a subscription change.
+        let mut meta = self.load_meta(client).await?.unwrap_or_default();
+        meta.subscriptions = subscriptions.to_vec();
+        self.store_meta(client, &meta).await
     }
 
     async fn subscriptions(&self, client: &ClientId) -> Result<Vec<Subscription>, StorageError> {
-        let mkey = Self::meta_key(client);
-        let mut subs = Vec::new();
-        // Fold the metadata log; the latest Subscriptions record wins.
-        for entry in self.log.read(&mkey, 0, usize::MAX).await? {
-            if let MetaRecord::Subscriptions(s) = decode_meta(&entry.record)? {
-                subs = s;
-            }
-        }
-        Ok(subs)
+        Ok(self
+            .load_meta(client)
+            .await?
+            .map(|m| m.subscriptions)
+            .unwrap_or_default())
     }
 
     async fn enqueue(
@@ -190,6 +207,47 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         Ok(())
     }
 
+    async fn record_received(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+    ) -> Result<bool, StorageError> {
+        let mut meta = self.load_meta(client).await?.unwrap_or_default();
+        let newly = meta.received_qos2.insert(packet_id);
+        // Always persist: even a duplicate must have materialized the session, and
+        // the durable write is what gates the QoS-2 PUBREC.
+        self.store_meta(client, &meta).await?;
+        Ok(newly)
+    }
+
+    async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        if let Some(mut meta) = self.load_meta(client).await? {
+            if meta.received_qos2.remove(&packet_id) {
+                self.store_meta(client, &meta).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn received(&self, client: &ClientId) -> Result<Vec<u16>, StorageError> {
+        Ok(self
+            .load_meta(client)
+            .await?
+            .map(|m| m.received_qos2.into_iter().collect())
+            .unwrap_or_default())
+    }
+
+    async fn next_packet_id(&self, client: &ClientId) -> Result<u16, StorageError> {
+        let mut meta = self.load_meta(client).await?.unwrap_or_default();
+        meta.last_packet_id = if meta.last_packet_id == u16::MAX {
+            1
+        } else {
+            meta.last_packet_id + 1
+        };
+        self.store_meta(client, &meta).await?;
+        Ok(meta.last_packet_id)
+    }
+
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError> {
         self.log.remove(&Self::queue_key(client)).await?;
         self.log.remove(&Self::meta_key(client)).await?;
@@ -207,17 +265,17 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
 // backend error, never a panic (`#![forbid(unsafe_code)]` discipline).
 // ---------------------------------------------------------------------------
 
-/// A metadata-log record. The queue log holds bare messages; metadata is tagged
-/// because it carries two shapes.
-enum MetaRecord {
-    /// Existence marker for a session with no subscriptions yet.
-    Created,
-    /// The session's current subscription set (last-writer-wins).
-    Subscriptions(Vec<Subscription>),
+/// The whole of a session's durable metadata, stored as one snapshot record in the
+/// `m/{client}` log: subscriptions, the QoS-2 inbound dedup window, and the outbound
+/// packet-id counter. (The queue is separate, in the `q/{client}` log.)
+#[derive(Default)]
+struct SessionMeta {
+    subscriptions: Vec<Subscription>,
+    /// QoS-2 inbound packet ids received but not yet PUBREL-completed (dedup).
+    received_qos2: BTreeSet<u16>,
+    /// Last outbound packet id allocated (0 = none yet).
+    last_packet_id: u16,
 }
-
-const META_CREATED: u8 = 0;
-const META_SUBSCRIPTIONS: u8 = 1;
 
 fn qos_to_u8(q: QoS) -> u8 {
     match q {
@@ -248,21 +306,21 @@ fn encode_message(m: &Message) -> Vec<u8> {
     out
 }
 
-fn encode_meta(r: &MetaRecord) -> Vec<u8> {
+fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
     let mut out = Vec::new();
-    match r {
-        MetaRecord::Created => out.push(META_CREATED),
-        MetaRecord::Subscriptions(subs) => {
-            out.push(META_SUBSCRIPTIONS);
-            let n = u32::try_from(subs.len()).unwrap_or(u32::MAX);
-            out.extend_from_slice(&n.to_be_bytes());
-            for s in subs.iter().take(n as usize) {
-                put_str(&mut out, &s.filter);
-                out.push(qos_to_u8(s.max_qos));
-                out.push(u8::from(s.no_local));
-            }
-        }
+    let n = u32::try_from(m.subscriptions.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&n.to_be_bytes());
+    for s in m.subscriptions.iter().take(n as usize) {
+        put_str(&mut out, &s.filter);
+        out.push(qos_to_u8(s.max_qos));
+        out.push(u8::from(s.no_local));
     }
+    let rn = u32::try_from(m.received_qos2.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&rn.to_be_bytes());
+    for id in m.received_qos2.iter().take(rn as usize) {
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out.extend_from_slice(&m.last_packet_id.to_be_bytes());
     out
 }
 
@@ -291,6 +349,11 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, StorageError> {
         Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, StorageError> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
     fn u32(&mut self) -> Result<u32, StorageError> {
@@ -333,27 +396,31 @@ fn decode_message(buf: &[u8]) -> Result<Message, StorageError> {
     })
 }
 
-fn decode_meta(buf: &[u8]) -> Result<MetaRecord, StorageError> {
+fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
     let mut r = Reader::new(buf);
-    match r.u8()? {
-        META_CREATED => Ok(MetaRecord::Created),
-        META_SUBSCRIPTIONS => {
-            let n = r.u32()? as usize;
-            let mut subs = Vec::with_capacity(n.min(1024));
-            for _ in 0..n {
-                let filter = r.string()?;
-                let max_qos = qos_from_u8(r.u8()?)?;
-                let no_local = r.u8()? != 0;
-                subs.push(Subscription {
-                    filter,
-                    max_qos,
-                    no_local,
-                });
-            }
-            Ok(MetaRecord::Subscriptions(subs))
-        }
-        _ => Err(corrupt()),
+    let n = r.u32()? as usize;
+    let mut subscriptions = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let filter = r.string()?;
+        let max_qos = qos_from_u8(r.u8()?)?;
+        let no_local = r.u8()? != 0;
+        subscriptions.push(Subscription {
+            filter,
+            max_qos,
+            no_local,
+        });
     }
+    let rn = r.u32()? as usize;
+    let mut received_qos2 = BTreeSet::new();
+    for _ in 0..rn {
+        received_qos2.insert(r.u16()?);
+    }
+    let last_packet_id = r.u16()?;
+    Ok(SessionMeta {
+        subscriptions,
+        received_qos2,
+        last_packet_id,
+    })
 }
 
 #[cfg(test)]
@@ -644,5 +711,38 @@ mod tests {
         // An ack through the reader is visible to the writer — one shared log.
         reader.ack(&c, 1).await.unwrap();
         assert_eq!(offsets(&writer, &c).await, vec![2]);
+    }
+
+    /// The exactly-once state replicates through the log: a second store over the
+    /// same log sees the dedup window and the packet-id counter the first wrote —
+    /// so exactly-once survives a failover to that replica (ADR 0006 §4).
+    #[tokio::test]
+    async fn qos2_state_replicates_through_the_log() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let c = cid("c");
+
+        let writer = ReplicatedSessionStore::new(log.clone());
+        assert!(
+            writer.record_received(&c, 5).await.unwrap(),
+            "first receipt"
+        );
+        assert!(!writer.record_received(&c, 5).await.unwrap(), "duplicate");
+        assert_eq!(writer.next_packet_id(&c).await.unwrap(), 1);
+        assert_eq!(writer.next_packet_id(&c).await.unwrap(), 2);
+
+        // A fresh store (the failover replica) sharing only the log.
+        let reader = ReplicatedSessionStore::new(log.clone());
+        // The dedup window survived: 5 is still "received".
+        assert_eq!(reader.received(&c).await.unwrap(), vec![5]);
+        assert!(
+            !reader.record_received(&c, 5).await.unwrap(),
+            "5 is a duplicate to the replica too — no re-delivery after failover",
+        );
+        // The packet-id counter survived: allocation continues at 3, no collision.
+        assert_eq!(reader.next_packet_id(&c).await.unwrap(), 3);
+
+        // Clearing on the reader is visible to the writer (one shared log).
+        reader.clear_received(&c, 5).await.unwrap();
+        assert!(writer.received(&c).await.unwrap().is_empty());
     }
 }

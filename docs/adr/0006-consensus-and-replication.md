@@ -182,12 +182,13 @@ This ratifies the ADR as written; no amendment was required.
        and replicates a committed lease across **two nodes over a serialized duplex
        link** — consensus over the wire. Keyed by `RaftNodeId`; the string `NodeId` ↔
        `RaftNodeId` mapping and live-hub wiring are step 4.
-   - **3c — replicated exactly-once state**: extend the session state with the
-     **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
-     the `SessionStore` trait surface today, so exactly-once does not yet survive
-     failover), and replace the in-memory backend's O(n) cap count with a
-     rebuildable per-key index (the lease serializes per-key appends, making cap
-     enforcement exact).
+   - **3c — replicated exactly-once state** ✅ *(done)*: the `SessionStore` trait
+     gained `record_received` / `clear_received` / `received` / `next_packet_id`,
+     and `ReplicatedSessionStore` stores the **QoS-2 dedup window and the outbound
+     packet-id counter** in the replicated `m/{client}` snapshot — so a second store
+     over the same log sees them (exactly-once survives failover). *Remaining (minor,
+     correctness-neutral):* replace the in-memory backend's O(n) cap count with a
+     rebuildable per-key index.
 4. **Wire it in**: swap `mqttd`'s `MemorySessionStore` for the durable backend so
    relocated-session owners (ADR 0005) write through it — ephemeral sessions become
    durable — then cross-node takeover (workstream F).

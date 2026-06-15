@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — 1–2, 3a, **3b complete** (lease consensus runs over the peer wire; session-log quorum-append over the mesh); **3c (exactly-once state) + step 4 (wire into mqttd)** remain |
+| E | Replicated session-log backend | 🔶 In progress — 1–2, 3a, 3b, **3c (exactly-once state)** done; **step 4 (wire into mqttd)** remains (+ a minor cap-index optimization) |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -180,10 +180,13 @@ phasing. The durable backend implementing `SessionStore`.
     over the peer bus (`PeerMessage::RaftRpc`/`RaftRpcReply`); a test elects a leader
     and replicates a committed lease across **two nodes over a serialized duplex
     link**. *Next:* 3c and step 4.
-  - **3c — replicated exactly-once state**: the **QoS-2 received-packet-id dedup
-    set** + next-packet-id counter join the replicated state (a `SessionStore`
-    surface extension), and the queue-cap count moves to a rebuildable per-key
-    index, so exactly-once survives failover and cap enforcement is exact.
+  - **3c — replicated exactly-once state** ✅ *(done)*: `SessionStore` gained
+    `record_received` / `clear_received` / `received` / `next_packet_id`;
+    `ReplicatedSessionStore` keeps the **QoS-2 dedup window + outbound packet-id
+    counter** in the replicated `m/{client}` snapshot, so a failover replica sees
+    them (a test pins it: a second store over the same log treats an already-received
+    id as a duplicate and continues the counter without collision). *Remaining
+    (minor):* a rebuildable per-key cap index to retire the O(n) enqueue count.
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
 
 ### F — Takeover / handoff protocol  *(needs B + E)*
@@ -250,8 +253,8 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 | Sessions are **ephemeral** — an owner's death drops its queues | No durability across owner loss (sharded capacity only) | **E step 3b** (networked durable log) + **F** (takeover) |
 | ~~Consensus engine (openraft) unratified~~ | — | ✅ **E step 1** — openraft ratified |
 | The pieces exist and are wire-tested in isolation, but are **not yet connected or run by the live hub**: the lease group (`raft_mesh`/`lease_group`) mints epochs, the session-log transport (`repl_net`) replicates, but nothing yet feeds the lease epoch into a `ClusterLog` or runs either over the broker's real peer links | Consensus + replication proven over framed streams in tests, but not exercised by the running broker | **E step 4** (hub wiring: lease group → epoch → `ClusterLog` → mqttd's `SessionStore`) |
-| QoS-2 dedup set + next-packet-id counter **not yet replicated state** (not on the `SessionStore` trait surface) | Exactly-once would not survive failover yet | **E step 3c** (extends the replicated state) |
-| `ReplicatedSessionStore` cap enforcement is exact only under **serialized per-key appends**; the in-memory backend counts via an O(n) read | Soft policy may mis-evict under concurrent appends to one key; no correctness/durability impact | **E step 3c** (lease serializes appends; backend keeps a rebuildable per-key index) |
+| ~~QoS-2 dedup set + next-packet-id counter not yet replicated state~~ | — | ✅ **E step 3c** — now in the replicated `m/{client}` snapshot |
+| `ReplicatedSessionStore` enqueue counts the queue via an **O(n) read** for cap enforcement (exact only under serialized per-key appends, which the lease guarantees) | A larger constant on enqueue; no correctness/durability impact | **E step 3c remainder** (a rebuildable per-key cap index) |
 | `ReplicatedSessionStore` / `ClusterLog` are **not wired into `mqttd`** (the broker still uses `MemorySessionStore`) | Layering proven in isolation, not in the live server | **E step 4** (swap the backend in) |
 | Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
 | Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |

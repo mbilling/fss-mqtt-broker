@@ -15,7 +15,7 @@
 
 use async_trait::async_trait;
 use mqtt_core::{topic_matches, ClientId, Message, Subscription};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
 pub mod logged;
@@ -149,6 +149,31 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// not-yet-truncated messages after a failover is spec-legal for `QoS` 1.
     async fn ack(&self, client: &ClientId, up_to: Offset) -> Result<(), StorageError>;
 
+    /// Record receipt of an inbound QoS-2 PUBLISH with `packet_id` (the
+    /// exactly-once dedup window). Returns `true` if newly recorded, `false` if
+    /// `packet_id` was already present — a duplicate re-send the broker must not
+    /// deliver again.
+    ///
+    /// This is **replicated session state**: surviving failover is what keeps
+    /// exactly-once holding across an owner change (ADR 0001 §5, ADR 0006 §4).
+    async fn record_received(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+    ) -> Result<bool, StorageError>;
+
+    /// Clear `packet_id` from the QoS-2 dedup window once its PUBREL completes.
+    async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError>;
+
+    /// The QoS-2 packet ids currently received-but-not-completed, ascending — for
+    /// resume / takeover reconciliation.
+    async fn received(&self, client: &ClientId) -> Result<Vec<u16>, StorageError>;
+
+    /// Allocate the next outbound packet id (`1..=65535`, wrapping, never `0`),
+    /// persisting the advance so ids do not collide with still-in-flight ones after
+    /// a failover.
+    async fn next_packet_id(&self, client: &ClientId) -> Result<u16, StorageError>;
+
     /// Remove the session and its queue entirely (clean start / session expiry).
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError>;
 }
@@ -174,6 +199,10 @@ struct SessionEntry {
     subscriptions: Vec<Subscription>,
     queue: VecDeque<QueuedMessage>,
     next_offset: Offset,
+    /// QoS-2 inbound packet ids received but not yet PUBREL-completed (dedup).
+    received_qos2: BTreeSet<u16>,
+    /// Last outbound packet id allocated (0 = none yet).
+    last_packet_id: u16,
 }
 
 /// A non-durable, single-process [`SessionStore`] backed by in-memory maps.
@@ -303,6 +332,46 @@ impl SessionStore for MemorySessionStore {
             entry.queue.pop_front();
         }
         Ok(())
+    }
+
+    async fn record_received(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+    ) -> Result<bool, StorageError> {
+        let mut map = self.lock();
+        Ok(map
+            .entry(client.clone())
+            .or_default()
+            .received_qos2
+            .insert(packet_id))
+    }
+
+    async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        if let Some(entry) = self.lock().get_mut(client) {
+            entry.received_qos2.remove(&packet_id);
+        }
+        Ok(())
+    }
+
+    async fn received(&self, client: &ClientId) -> Result<Vec<u16>, StorageError> {
+        Ok(self
+            .lock()
+            .get(client)
+            .map(|e| e.received_qos2.iter().copied().collect())
+            .unwrap_or_default())
+    }
+
+    async fn next_packet_id(&self, client: &ClientId) -> Result<u16, StorageError> {
+        let mut map = self.lock();
+        let entry = map.entry(client.clone()).or_default();
+        // 1..=65535, wrapping, never 0.
+        entry.last_packet_id = if entry.last_packet_id == u16::MAX {
+            1
+        } else {
+            entry.last_packet_id + 1
+        };
+        Ok(entry.last_packet_id)
     }
 
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError> {
@@ -501,6 +570,33 @@ mod tests {
 
         store.remove(&c).await.unwrap();
         assert!(store.subscriptions(&c).await.unwrap().is_empty());
+    }
+
+    /// The QoS-2 dedup window and the outbound packet-id counter — the exactly-once
+    /// state (ADR 0006 §4).
+    #[tokio::test]
+    async fn qos2_dedup_and_packet_id_allocation() {
+        let store = MemorySessionStore::new();
+        let c = cid("client");
+        // First receipt of a packet id is new; a duplicate re-send is not.
+        assert!(store.record_received(&c, 7).await.unwrap());
+        assert!(!store.record_received(&c, 7).await.unwrap());
+        assert!(store.record_received(&c, 9).await.unwrap());
+        assert_eq!(store.received(&c).await.unwrap(), vec![7, 9]);
+        // Completing one frees it; a later re-use is new again.
+        store.clear_received(&c, 7).await.unwrap();
+        assert_eq!(store.received(&c).await.unwrap(), vec![9]);
+        assert!(store.record_received(&c, 7).await.unwrap());
+
+        // Outbound packet ids advance 1, 2, 3, ... (never 0).
+        let p = cid("producer");
+        assert_eq!(store.next_packet_id(&p).await.unwrap(), 1);
+        assert_eq!(store.next_packet_id(&p).await.unwrap(), 2);
+        assert_eq!(store.next_packet_id(&p).await.unwrap(), 3);
+
+        // Removing the session clears its dedup window.
+        store.remove(&c).await.unwrap();
+        assert!(store.received(&c).await.unwrap().is_empty());
     }
 
     #[tokio::test]
