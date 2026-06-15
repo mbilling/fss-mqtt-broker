@@ -12,6 +12,7 @@
 //! set remains available as a fallback.
 
 pub mod cluster_log;
+pub mod durable_plane;
 pub mod hrw;
 pub mod lease;
 pub mod lease_group;

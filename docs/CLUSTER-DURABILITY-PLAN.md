@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a, 4b**; **step 4 integration** ([ADR 0007](adr/0007-durable-store-integration.md): 4c–4f) remains |
+| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a, 4b, 4c**; **4d–4f** ([ADR 0007](adr/0007-durable-store-integration.md)) remain |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -197,9 +197,15 @@ phasing. The durable backend implementing `SessionStore`.
       through the client's group — so a session is owned by and relocated to its
       *group* owner (refining ADR 0005). The rendezvous properties (minimal
       reassignment on join/leave) hold at group granularity.
-    - **4c — hub RPC endpoints**: host the lease `Raft` + `MeshRaftNetwork` +
-      `PeerReplicaTransport` + `ReplicaState` in the hub; route the four consensus/
-      replication frames through `PeerConnected`/`forward_inbound`/`PeerDisconnected`.
+    - **4c — durable-plane endpoint** ✅ *(done)*: `mqtt-cluster::durable_plane::DurablePlane`
+      bundles the node's lease `Raft` + `MeshRaftNetwork` + `PeerReplicaTransport` +
+      `ReplicaState` and exposes `register` (on peer connect) / `fail` (on disconnect)
+      / `handle(frame) -> Option<reply>` for the four consensus/replication frames. A
+      two-node test over a duplex link runs **both** planes end to end through the
+      plane: the lease group elects + commits a lease, and a session-log append
+      quorum-replicates. *(Refines ADR 0007 §4: the plane is a shared handle the peer
+      links route to, keeping consensus/replication off the hub actor's serial loop;
+      the live peer-pump I/O wiring lands in 4f with the store swap.)*
     - **4d — membership reconciler**: SWIM membership → openraft voters (debounced,
       deterministic bootstrap).
     - **4e — durable cluster `SessionStore`**: lease → epoch → per-group `ClusterLog`

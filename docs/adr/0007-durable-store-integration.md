@@ -164,10 +164,16 @@ so nothing destabilizes the running broker until the stack underneath is proven.
 - **4a — `NodeId ↔ RaftNodeId` mapping** ✅ *(done)*: `node_registry`.
 - **4b — placement groups**: `group(client)`, per-group replica set / owner over
   `Placement`; refine relocation (ADR 0005) to the group owner. Pure, unit-tested.
-- **4c — hub RPC endpoints**: host the lease `Raft` + `MeshRaftNetwork` +
-  `PeerReplicaTransport` + `ReplicaState` in the hub; wire `PeerConnected` /
-  `forward_inbound` / `PeerDisconnected` for the four new frames. Tested with a
-  multi-node harness over the existing peer-link test scaffolding.
+- **4c — durable-plane endpoint** ✅ *(done)*: `mqtt-cluster::durable_plane::DurablePlane`
+  bundles the lease `Raft` + `MeshRaftNetwork` + `PeerReplicaTransport` +
+  `ReplicaState` behind `register` / `fail` / `handle(frame) -> Option<reply>`.
+  *Refinement:* rather than routing these frames through the hub actor's serial
+  command loop (where `handle`'s `await` would block all hub commands), the plane is
+  a **shared handle the peer-link tasks call directly** — the consensus/replication
+  plane stays off the actor. The live peer-pump I/O wiring (and registration on
+  connect / `fail` on disconnect) lands in 4f. Proven by a two-node duplex test that
+  elects + commits a lease and quorum-replicates a session-log append, all through
+  the plane.
 - **4d — membership reconciler**: SWIM membership → openraft voters (debounced,
   deterministic bootstrap). Tested with an in-memory membership feed.
 - **4e — the durable cluster `SessionStore`**: assemble lease → epoch → per-group
