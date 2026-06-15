@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — 1–2, 3a, 3b, **3c (exactly-once state)** done; **step 4 (wire into mqttd)** remains (+ a minor cap-index optimization) |
+| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a**; **step 4 integration** ([ADR 0007](adr/0007-durable-store-integration.md): 4b–4f) remains |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -187,6 +187,23 @@ phasing. The durable backend implementing `SessionStore`.
     them (a test pins it: a second store over the same log treats an already-received
     id as a duplicate and continues the counter without collision). *Remaining
     (minor):* a rebuildable per-key cap index to retire the O(n) enqueue count.
+  - **Step 4 — wire the stack into the live broker** *(designed in
+    [ADR 0007](adr/0007-durable-store-integration.md))*. The components are all
+    built; step 4 assembles them into `mqttd`. Sub-steps, each shippable/test-first:
+    - **4a — `NodeId ↔ RaftNodeId` mapping** ✅ *(done)*: `node_registry`.
+    - **4b — placement groups**: `group(client) = hash % NUM_GROUPS`; per-group
+      replica set / owner over `Placement`; relocation refined to the group owner.
+    - **4c — hub RPC endpoints**: host the lease `Raft` + `MeshRaftNetwork` +
+      `PeerReplicaTransport` + `ReplicaState` in the hub; route the four consensus/
+      replication frames through `PeerConnected`/`forward_inbound`/`PeerDisconnected`.
+    - **4d — membership reconciler**: SWIM membership → openraft voters (debounced,
+      deterministic bootstrap).
+    - **4e — durable cluster `SessionStore`**: lease → epoch → per-group `ClusterLog`
+      → `ReplicatedSessionStore`; lazy lease acquisition. Multi-node test: an enqueue
+      survives the owner's death.
+    - **4f — wire into `mqttd`**: `Arc<dyn SessionStore>`; `MQTTD_DURABLE_SESSIONS`
+      builds the durable store; connections use it for QoS-2 dedup / packet ids;
+      single-node path unchanged.
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
 
 ### F — Takeover / handoff protocol  *(needs B + E)*

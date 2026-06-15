@@ -202,6 +202,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | [0004](docs/adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default |
 | [0005](docs/adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner |
 | [0006](docs/adr/0006-consensus-and-replication.md) | Consensus & replication: lease-scoped consensus, a proven engine, the `ReplicatedLog` seam |
+| [0007](docs/adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker (placement groups, lease group, hub RPC, store swap) |
 
 ## License
 
