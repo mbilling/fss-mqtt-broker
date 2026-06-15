@@ -110,6 +110,35 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
     async fn remove(&self, key: &Self::Key) -> Result<(), ReplError>;
 }
 
+/// Forward [`ReplicatedLog`] through an [`Arc`](std::sync::Arc) so a single log
+/// can back several callers (e.g. a store and its failover view, or — in tests —
+/// two `SessionStore`s proving state lives in the log, not in store-local memory).
+#[async_trait]
+impl<L: ReplicatedLog + ?Sized> ReplicatedLog for std::sync::Arc<L> {
+    type Key = L::Key;
+
+    async fn append(&self, key: &Self::Key, record: Vec<u8>) -> Result<Offset, ReplError> {
+        (**self).append(key, record).await
+    }
+
+    async fn read(
+        &self,
+        key: &Self::Key,
+        after: Offset,
+        limit: usize,
+    ) -> Result<Vec<LogEntry>, ReplError> {
+        (**self).read(key, after, limit).await
+    }
+
+    async fn truncate(&self, key: &Self::Key, up_to: Offset) -> Result<(), ReplError> {
+        (**self).truncate(key, up_to).await
+    }
+
+    async fn remove(&self, key: &Self::Key) -> Result<(), ReplError> {
+        (**self).remove(key).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // In-memory, single-node backend.
 // ---------------------------------------------------------------------------

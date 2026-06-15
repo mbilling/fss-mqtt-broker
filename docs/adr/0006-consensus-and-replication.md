@@ -103,9 +103,13 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
 
 1. **Spike + decide the engine**: `cargo-deny` review of openraft (and
    alternatives) plus a prototype ownership-lease group; ratify or amend this ADR.
-2. **`SessionStore` over `ReplicatedLog`**: re-express the in-memory session
-   store on `InMemoryReplicatedLog` to prove the layering end to end before any
-   network code.
+2. **`SessionStore` over `ReplicatedLog`** ✅ *(done)*: `ReplicatedSessionStore`
+   (`mqtt-storage::logged`) implements the full `SessionStore` over a
+   `ReplicatedLog`, holding no durable state of its own — queue in a `q/{client}`
+   log, session metadata in `m/{client}`. A test pins the layering: a second store
+   over the same log sees the first's sessions in full, so a durable log yields
+   durable sessions. Done **first** (ahead of the spike): it needs no network and
+   no engine choice, and it validates the seam shape before any dependency lands.
 3. **The consensus-backed `ReplicatedLog`**: ownership lease + epoch-fenced
    quorum-append, and the cluster `SessionStore` backend over it.
 4. **Wire it in**: relocated-session owners (ADR 0005) write through the durable

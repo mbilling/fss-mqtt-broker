@@ -18,6 +18,7 @@ use mqtt_core::{topic_matches, ClientId, Message, Subscription};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
+pub mod logged;
 pub mod repl;
 
 /// A monotonically increasing position within a single session's queue log.

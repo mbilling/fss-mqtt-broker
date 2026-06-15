@@ -118,17 +118,28 @@ byte records) in `mqtt-storage::repl`, with `InMemoryReplicatedLog` shipping now
 for development/tests/non-clustered use; the consensus-backed and external-store
 backends target E.
 
-### E — Replicated session-log backend  *(needs B + D)*
+### E — Replicated session-log backend  *(needs B + D; in progress)*
 
-ADR 0001 §2–§3. The durable backend implementing `SessionStore`.
+ADR 0001 §2–§3, sequenced as the four steps in [ADR 0006](adr/0006-consensus-and-replication.md)'s
+phasing. The durable backend implementing `SessionStore`.
 
-- Enqueue = append to the session's per-shard log, **quorum-replicated before
-  the producer's QoS≥1 PUBACK is released** (the durability contract).
-- Dequeue/ack = local-first, lazily truncated; no synchronous cross-node hop on
-  the ack path.
-- Replicated state includes the **QoS-2 received-packet-id dedup set** and the
-  next-packet-id counter, so exactly-once survives failover.
-- **Tests:** enqueue survives a single replica loss (R=3, quorum=2); ack
+- **Step 2 — `SessionStore` over `ReplicatedLog`** ✅ *(done, landed first)*:
+  `ReplicatedSessionStore` (`mqtt-storage::logged`) implements the full
+  `SessionStore` purely over the `ReplicatedLog` seam, with no store-local durable
+  state — the queue lives in a `q/{client}` log, session metadata in `m/{client}`.
+  A test pins the layering (a second store over the same log sees the first's
+  sessions whole), so swapping `InMemoryReplicatedLog` for the consensus-backed log
+  makes sessions durable with **no change to this layer**. Done ahead of the engine
+  spike because it needs neither network nor an engine choice and de-risks the seam.
+- **Step 1 — engine spike** *(next)*: `cargo-deny` review of openraft (+
+  alternatives) and a prototype ownership-lease group; ratify or amend ADR 0006.
+- **Step 3 — the consensus-backed `ReplicatedLog`**: enqueue = append to the
+  session's per-shard log, **quorum-replicated before the producer's QoS≥1 PUBACK
+  is released** (the durability contract); dequeue/ack local-first and lazily
+  truncated (no synchronous cross-node hop on the ack path). Replicated state
+  includes the **QoS-2 received-packet-id dedup set** and the next-packet-id
+  counter, so exactly-once survives failover.
+- **Tests (step 3):** enqueue survives a single replica loss (R=3, quorum=2); ack
   truncation does not lose un-quorumed writes; QoS-2 dedup holds across a
   simulated failover; a deterministic multi-node simulation (injectable loss /
   reorder) mirroring the SWIM-sim approach.
