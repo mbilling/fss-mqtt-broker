@@ -109,6 +109,17 @@ rewriting an entire queue per change does not scale. The single-node in-memory
 implementation is built against this same interface so no second refactor is
 needed when the clustered backend lands.
 
+**Refinement ([ADR 0006](0006-consensus-and-replication.md)).** The clustered
+backend layers in two tiers: a generic `ReplicatedLog` append-log (the
+*replication mechanism* — keyed, offset-addressed byte records) with
+`SessionStore` *semantics* expressed over it. `mqtt-storage::logged::ReplicatedSessionStore`
+already realizes `SessionStore` over that seam against the single-node
+`InMemoryReplicatedLog` (queue in a `q/{client}` log, metadata in `m/{client}`),
+holding no durable state of its own — so substituting the consensus-backed log
+makes sessions durable with no change to the session-semantics layer. The QoS-2
+dedup set and next-packet-id counter (§5 above) are not on the `SessionStore`
+trait surface today; they join the replicated state with the durable backend.
+
 ## Consequences
 
 **Positive**
@@ -144,14 +155,24 @@ needed when the clustered backend lands.
 
 ## Roadmap (implementation phasing)
 
-1. **Done:** incremental async `SessionStore` trait + in-memory single-node impl
-   (`MemorySessionStore`). Persistent-session handling is wired in the broker
-   against this interface (offline queueing, replay, QoS 1/2 in-flight resume).
-2. **Cluster phase:** HRW ownership over SWIM membership; per-shard replicated log
-   backend implementing `SessionStore`; takeover protocol.
-3. **Hardening:** queue caps + overflow policy; MQTT 5 session/message expiry;
-   shared-subscription load balancing.
+The authoritative, dependency-sequenced breakdown — with per-workstream status and
+the carried limitations — lives in [Cluster Durability — Implementation
+Plan](../CLUSTER-DURABILITY-PLAN.md). In brief:
 
-A sequenced, dependency-aware breakdown of the unbuilt steps 2–3 — including the
-consensus-mechanism decision (a future ADR) and the MQTT 5.0 gating — lives in
-[Cluster Durability — Implementation Plan](../CLUSTER-DURABILITY-PLAN.md).
+1. **Done:** incremental async `SessionStore` trait + in-memory single-node impl
+   (`MemorySessionStore`); persistent-session handling wired in the broker
+   (offline queueing, replay, QoS 1/2 in-flight resume).
+2. **Done:** bounded queues + overflow policy (workstream A); HRW ownership over
+   SWIM membership (B); session affinity / relocation to the owner in ephemeral
+   mode ([ADR 0005](0005-session-affinity.md), C); the consensus-mechanism
+   decision ([ADR 0006](0006-consensus-and-replication.md), D); and the
+   `ReplicatedLog` seam with `SessionStore` expressed over it
+   (`ReplicatedSessionStore`, E step 2).
+3. **Next:** ratify the consensus engine (spike), then the consensus-backed
+   replicated log + durable backend (extending replicated state with the QoS-2
+   dedup set and packet-id counter) and the takeover protocol (E–F). Then MQTT 5
+   session/message expiry and shared-subscription load balancing (G, gated on the
+   v5 codec).
+
+Until step 3 lands, persistent sessions run in the documented **ephemeral mode**:
+sharded by owner (linear *capacity*), but an owner's death drops its queues.

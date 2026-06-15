@@ -38,6 +38,16 @@ shared subscriptions.
 
 ## Workstreams
 
+| # | Workstream | Status |
+|---|------------|--------|
+| A | Bounded queues & overload policy | ✅ Done |
+| B | Ownership ring over live membership | ✅ Done |
+| C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
+| D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
+| E | Replicated session-log backend | 🔶 In progress — step 2 (layering) done; **engine spike + durable backend next** |
+| F | Takeover / handoff protocol | ⬜ Not started (needs E) |
+| G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
+
 ### A — Bounded queues & overload policy  ✅ *(done)*
 
 ADR 0001 §6, roadmap step 3. The memory queue was unbounded — a
@@ -198,6 +208,27 @@ A (queue caps) ─▶ B (ownership ring) ─▶ C (affinity / ephemeral mode)
   interest gossip is a full snapshot per change; the digest is separate work.
 - **Retained-state replication** across nodes — related cluster state, but a
   distinct mechanism from the session log.
+
+## Carried limitations & where they resolve
+
+Each known gap in what has shipped, with the workstream that closes it. None is a
+silent cut — they are the explicit price of shipping capacity before durability.
+
+| Limitation | Impact | Resolved by |
+|------------|--------|-------------|
+| Sessions are **ephemeral** — an owner's death drops its queues | No durability across owner loss (sharded capacity only) | **E step 3** (durable log) + **F** (takeover) |
+| Consensus engine (openraft) **unratified** | Architecture accepted; the library is not yet chosen or `cargo-deny`-reviewed | **E step 1** (spike) |
+| QoS-2 dedup set + next-packet-id counter **not yet replicated state** (not on the `SessionStore` trait surface) | Exactly-once would not survive failover yet | **E step 3** (extends the replicated state) |
+| `ReplicatedSessionStore` cap enforcement is exact only under **serialized per-key appends**; the in-memory backend counts via an O(n) read | Soft policy may mis-evict under concurrent appends to one key; no correctness/durability impact | **E step 3** (lease serializes appends; backend keeps a rebuildable per-key index) |
+| `ReplicatedSessionStore` is **not wired into `mqttd`** (the broker still uses `MemorySessionStore`) | Layering proven in isolation, not in the live server | **E step 4** (swap the backend in) |
+| Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
+| Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
+
+**Cross-cutting (outside this plan): no git remote / CI has never run.** A
+`.github/` gate (fmt, clippy, `cargo-deny`, `cargo-audit`) exists in the repo but
+all commits are local, so it has never executed. Recommend wiring a remote and
+enabling CI **before** the consensus dependency lands (E step 3), so the new
+supply-chain weight is checked on every push rather than only locally.
 
 ## Test discipline
 
