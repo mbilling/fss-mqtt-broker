@@ -166,10 +166,13 @@ This ratifies the ADR as written; no amendment was required.
        epoch — the fence source) and binds it to openraft via
        `declare_raft_types!(LeaseConfig)` over numeric `RaftNodeId`s, with a
        compile-assert that it is a valid `RaftTypeConfig`.
-     - **storage + network**: implement openraft's log-storage / state-machine
-       traits over the `LeaseMap`, and `RaftNetwork` over the peer mesh, then bring
-       up a real lease group and elect/commit a lease. (openraft requires `Copy`
-       node ids, so the wiring maps the cluster's string `NodeId` ↔ `RaftNodeId`.)
+     - **storage** ✅ *(done)*: `mqtt-cluster::lease_store::LeaseStore` implements
+       openraft's `RaftStorage` over `LeaseMap` (log, vote, applied state, snapshots —
+       in memory). Validated by openraft's own conformance `Suite`, which exercises
+       every storage method against the protocol's correctness requirements.
+     - **network**: `RaftNetwork` over the peer mesh, then bring up a real lease
+       group and elect/commit a lease. (openraft requires `Copy` node ids, so the
+       wiring maps the cluster's string `NodeId` ↔ `RaftNodeId`.)
    - **3c — replicated exactly-once state**: extend the session state with the
      **QoS-2 received-packet-id dedup set and the next-packet-id counter** (not on
      the `SessionStore` trait surface today, so exactly-once does not yet survive

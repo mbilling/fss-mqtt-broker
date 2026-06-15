@@ -15,6 +15,7 @@ pub mod cluster_log;
 pub mod hrw;
 pub mod lease;
 pub mod lease_raft;
+pub mod lease_store;
 pub mod peer;
 pub mod placement;
 pub mod repl_net;

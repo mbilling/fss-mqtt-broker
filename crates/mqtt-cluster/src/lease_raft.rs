@@ -131,9 +131,13 @@ openraft::declare_raft_types!(
     /// openraft type binding for the lease consensus group: our request/response
     /// over numeric [`RaftNodeId`]s. Storage, network, and the remaining defaults
     /// are supplied by openraft.
+    ///
+    /// The response is `Option<LeaseResponse>`: a committed `Normal` entry (an
+    /// `Assign`) yields `Some(lease)`, while the `Blank`/`Membership` entries Raft
+    /// commits internally yield `None`.
     pub LeaseConfig:
         D = LeaseRequest,
-        R = LeaseResponse,
+        R = Option<LeaseResponse>,
         NodeId = RaftNodeId,
         Node = openraft::BasicNode,
 );

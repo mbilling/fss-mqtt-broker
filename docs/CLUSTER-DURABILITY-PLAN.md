@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — steps 1–2, 3a, 3b-i, **3b-ii state machine** done (**openraft now in the build**; lease state machine + type binding); **openraft storage/network next** |
+| E | Replicated session-log backend | 🔶 In progress — 1–2, 3a, 3b-i, 3b-ii **state machine + storage** done (lease store passes openraft's conformance suite); **RaftNetwork over the mesh next** |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -168,10 +168,14 @@ phasing. The durable backend implementing `SessionStore`.
     openraft is now in the build (and through `cargo-deny`); `mqtt-cluster::lease_raft`
     holds the replicated `LeaseMap` (`group -> (holder, epoch)`, monotonic epoch =
     the fence source) bound to openraft via `declare_raft_types!(LeaseConfig)` over
-    numeric `RaftNodeId`s, compile-asserted as a valid `RaftTypeConfig`. *Next:*
-    implement openraft's storage / state-machine traits over `LeaseMap` and
-    `RaftNetwork` over the peer mesh, then bring up a real lease group (mapping the
-    cluster's string `NodeId` ↔ `RaftNodeId`, since openraft node ids are `Copy`).
+    numeric `RaftNodeId`s, compile-asserted as a valid `RaftTypeConfig`.
+    *Storage* ✅ *(done)*: `lease_store::LeaseStore` implements openraft's
+    `RaftStorage` over `LeaseMap` (log/vote/applied-state/snapshots, in memory) and
+    **passes openraft's own conformance `Suite`** — every storage method checked
+    against the protocol's correctness requirements. *Next:* `RaftNetwork` over the
+    peer mesh, then bring up a real lease group and elect/commit a lease (mapping
+    the cluster's string `NodeId` ↔ `RaftNodeId`, since openraft node ids are
+    `Copy`).
   - **3c — replicated exactly-once state**: the **QoS-2 received-packet-id dedup
     set** + next-packet-id counter join the replicated state (a `SessionStore`
     surface extension), and the queue-cap count moves to a rebuildable per-key
