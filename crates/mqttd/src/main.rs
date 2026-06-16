@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = MemorySessionStore::with_limits(queue_limits_from_env()?);
     let (hub, hub_tx) = hub::Hub::with_config_and_placement(
         node_id.clone(),
-        Box::new(store),
+        Arc::new(store),
         Some(placement.clone()),
     );
     tokio::spawn(hub.run());

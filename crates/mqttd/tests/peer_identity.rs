@@ -122,7 +122,10 @@ async fn bind_node(node_id: NodeId) -> NodeHandles {
     let peer_addr = peer.local_addr().unwrap();
     let client_addr = cli.local_addr().unwrap();
 
-    let (hub, hub_tx) = Hub::with_config(node_id.clone(), Box::new(MemorySessionStore::new()));
+    let (hub, hub_tx) = Hub::with_config(
+        node_id.clone(),
+        std::sync::Arc::new(MemorySessionStore::new()),
+    );
     tokio::spawn(hub.run());
 
     let tx = hub_tx.clone();

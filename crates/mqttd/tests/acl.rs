@@ -30,7 +30,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
     let policy = Arc::new(AclPolicy::from_toml_str(policy_toml).expect("test policy parses"));
     let (hub, hub_tx) = Hub::with_config(
         NodeId("acl-node".into()),
-        Box::new(MemorySessionStore::new()),
+        std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
 

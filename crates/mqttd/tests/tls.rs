@@ -101,7 +101,7 @@ fn pem_certs(path: &Path) -> Vec<CertificateDer<'static>> {
 async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
     let (hub, hub_tx) = Hub::with_config(
         NodeId("tls-node".into()),
-        Box::new(MemorySessionStore::new()),
+        std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
 
@@ -358,8 +358,10 @@ async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
 
     let id_a = NodeId("mtls-a".into());
     let id_b = NodeId("mtls-b".into());
-    let (hub_a, tx_a) = Hub::with_config(id_a.clone(), Box::new(MemorySessionStore::new()));
-    let (hub_b, tx_b) = Hub::with_config(id_b.clone(), Box::new(MemorySessionStore::new()));
+    let (hub_a, tx_a) =
+        Hub::with_config(id_a.clone(), std::sync::Arc::new(MemorySessionStore::new()));
+    let (hub_b, tx_b) =
+        Hub::with_config(id_b.clone(), std::sync::Arc::new(MemorySessionStore::new()));
     tokio::spawn(hub_a.run());
     tokio::spawn(hub_b.run());
 
@@ -460,7 +462,7 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, Some(&pki.ca)).unwrap();
     let (hub, hub_tx) = Hub::with_config(
         NodeId("id-node".into()),
-        Box::new(MemorySessionStore::new()),
+        std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
 
@@ -545,7 +547,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, None).unwrap();
     let (hub, hub_tx) = Hub::with_config(
         NodeId("deny-node".into()),
-        Box::new(MemorySessionStore::new()),
+        std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

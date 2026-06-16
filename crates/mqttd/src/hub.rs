@@ -255,8 +255,9 @@ pub struct Hub {
     table: SubscriptionTable,
     /// Per-session outbound `QoS` > 0 in-flight state.
     inflight: HashMap<ClientId, Inflight>,
-    /// Durable session/queue storage.
-    store: Box<dyn SessionStore>,
+    /// Durable session/queue storage. `Arc` so connections can share it (e.g. for
+    /// the durable QoS-2 dedup window) — ADR 0007 §5.
+    store: Arc<dyn SessionStore>,
     /// Retained message storage.
     retained: Box<dyn RetainedStore>,
     /// Connected peer nodes.
@@ -275,7 +276,7 @@ impl Hub {
     pub fn new() -> (Self, mpsc::UnboundedSender<HubCommand>) {
         Self::with_config(
             NodeId("node-local".to_string()),
-            Box::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionStore::new()),
         )
     }
 
@@ -285,7 +286,7 @@ impl Hub {
     #[must_use]
     pub fn with_config(
         node_id: NodeId,
-        store: Box<dyn SessionStore>,
+        store: Arc<dyn SessionStore>,
     ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
         Self::with_config_and_placement(node_id, store, None)
     }
@@ -296,7 +297,7 @@ impl Hub {
     #[must_use]
     pub fn with_config_and_placement(
         node_id: NodeId,
-        store: Box<dyn SessionStore>,
+        store: Arc<dyn SessionStore>,
         placement: Option<Arc<RwLock<Placement>>>,
     ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -856,7 +857,7 @@ mod tests {
     }
 
     fn start_hub_with_store(store: MemorySessionStore) -> HubTx {
-        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), Box::new(store));
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), std::sync::Arc::new(store));
         tokio::spawn(hub.run());
         tx
     }

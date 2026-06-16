@@ -222,9 +222,18 @@ phasing. The durable backend implementing `SessionStore`.
       replicates to a follower** (the message survives the owner's loss), and a
       foreign group is refused. (The `LeaseSource` is stubbed here — the consensus
       group is already proven in 4c/4d; the openraft-backed source wires in at 4f.)
-    - **4f — wire into `mqttd`**: `Arc<dyn SessionStore>`; `MQTTD_DURABLE_SESSIONS`
-      builds the durable store; connections use it for QoS-2 dedup / packet ids;
-      single-node path unchanged.
+    - **4f — wire into `mqttd`** 🔶 *(in progress)*. The invasive final integration.
+      Sub-pieces:
+      - *store is `Arc`-shared* ✅ *(done)*: the hub's `Box<dyn SessionStore>` is now
+        `Arc<dyn SessionStore>` (zero behavior change; all suites green), so
+        connections can share it.
+      - *real `LeaseSource`* over `raft.client_write(Assign)`; the durable store +
+        lease group + `DurablePlane` constructed at startup behind
+        `MQTTD_DURABLE_SESSIONS` (single-node path keeps `MemorySessionStore`).
+      - *peer-pump wiring*: drive `DurablePlane::register`/`fail`/`handle` from the
+        peer link lifecycle; *membership reconciler driver* off SWIM (debounced).
+      - *connection QoS-2 dedup* through the shared store.
+      Warrants multi-node integration tests (swim-routing style).
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
 
 ### F — Takeover / handoff protocol  *(needs B + E)*

@@ -45,7 +45,7 @@ async fn start_node(
 
     let (hub, hub_tx) = Hub::with_config(
         NodeId("audit-node".into()),
-        Box::new(MemorySessionStore::new()),
+        std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
 

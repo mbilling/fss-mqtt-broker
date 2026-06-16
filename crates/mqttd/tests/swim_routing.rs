@@ -48,7 +48,10 @@ async fn start_node(
         node_id.clone(),
         DEFAULT_REPLICAS,
     )));
-    let (hub, hub_tx) = Hub::with_config(node_id.clone(), Box::new(MemorySessionStore::new()));
+    let (hub, hub_tx) = Hub::with_config(
+        node_id.clone(),
+        std::sync::Arc::new(MemorySessionStore::new()),
+    );
     tokio::spawn(hub.run());
 
     // Client listener.
@@ -277,7 +280,10 @@ async fn start_proxy_node(
             connector: None, // plaintext mesh
         }),
     });
-    let (hub, hub_tx) = Hub::with_config(node_id.clone(), Box::new(MemorySessionStore::new()));
+    let (hub, hub_tx) = Hub::with_config(
+        node_id.clone(),
+        std::sync::Arc::new(MemorySessionStore::new()),
+    );
     tokio::spawn(hub.run());
 
     // Client listener: full handle_stream path (with relocation).

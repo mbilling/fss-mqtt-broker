@@ -30,8 +30,10 @@ async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
 
     let id_a = NodeId("node-a".into());
     let id_b = NodeId("node-b".into());
-    let (hub_a, tx_a) = Hub::with_config(id_a.clone(), Box::new(MemorySessionStore::new()));
-    let (hub_b, tx_b) = Hub::with_config(id_b.clone(), Box::new(MemorySessionStore::new()));
+    let (hub_a, tx_a) =
+        Hub::with_config(id_a.clone(), std::sync::Arc::new(MemorySessionStore::new()));
+    let (hub_b, tx_b) =
+        Hub::with_config(id_b.clone(), std::sync::Arc::new(MemorySessionStore::new()));
     tokio::spawn(hub_a.run());
     tokio::spawn(hub_b.run());
 
