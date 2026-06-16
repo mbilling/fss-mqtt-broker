@@ -227,9 +227,12 @@ phasing. The durable backend implementing `SessionStore`.
       - *store is `Arc`-shared* ✅ *(done)*: the hub's `Box<dyn SessionStore>` is now
         `Arc<dyn SessionStore>` (zero behavior change; all suites green), so
         connections can share it.
-      - *real `LeaseSource`* over `raft.client_write(Assign)`; the durable store +
-        lease group + `DurablePlane` constructed at startup behind
-        `MQTTD_DURABLE_SESSIONS` (single-node path keeps `MemorySessionStore`).
+      - *real `LeaseSource`* ✅ *(done)*: `LocalLeaseSource` reads the leader-assigned
+        lease epoch from the local `LeaseStore` (ADR 0007 §3 leader-driven model — no
+        app-level write forwarding). *Remaining:* the durable store + lease group +
+        `DurablePlane` constructed at startup behind `MQTTD_DURABLE_SESSIONS`
+        (single-node path keeps `MemorySessionStore`), plus the leader-driven
+        lease-assignment task.
       - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
         (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
         frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to

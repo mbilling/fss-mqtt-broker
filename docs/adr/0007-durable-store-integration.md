@@ -77,16 +77,23 @@ Membership is driven by a dedicated **reconciler** task:
   ephemeral mode for affected groups rather than risking split-brain. Full dynamic
   reconfiguration hardening is future work, called out in the plan.
 
-### 3. Lease acquisition is lazy, on first owned-group activity
+### 3. Lease assignment is leader-driven; the owner reads its epoch locally
 
-When the broker first needs to durably write a session whose group it owns, the
-owner `client_write(Assign { group, node: self })`s to the lease group, receives the
-group's epoch, and constructs (or refreshes) a `ClusterLog` for that group at that
-epoch over the group's replica set. A rebalance (the group's owner changed) triggers
-re-acquisition by the new owner; the superseded owner is **fenced** by the new epoch
-(the mechanism `cluster_log`/`lease` already enforce). A node that is not the group
-owner, or cannot reach the lease group, serves the session in ephemeral mode (ADR
-0005 §5 "degrade, don't refuse").
+A group owner (chosen by HRW placement) is generally **not** the lease-group raft
+leader, and openraft's `client_write` does not forward from a follower to the leader.
+Rather than build an app-level forwarding RPC, lease assignment is **leader-driven**:
+the lease-group leader runs a reconcile task that, for each group, ensures the
+committed lease's holder is the group's current placement owner — issuing
+`client_write(Assign { group, owner })` when it differs (the lease state machine mints
+a fresh, monotonic epoch). That assignment replicates to every node.
+
+The group owner therefore **reads its lease epoch straight from its own applied
+`LeaseStore`** (`LocalLeaseSource`), with no write to forward, and builds (or
+refreshes) a `ClusterLog` for the group at that epoch over the group's replica set.
+A rebalance re-points the lease to the new owner; the superseded owner is **fenced**
+by the new epoch (`cluster_log`/`lease`). A node whose group's lease has not yet been
+assigned to it serves the session in ephemeral mode (ADR 0005 §5 "degrade, don't
+refuse") until the leader assigns it.
 
 ### 4. The hub hosts the consensus + replication endpoints
 
@@ -176,9 +183,11 @@ so nothing destabilizes the running broker until the stack underneath is proven.
   the plane.
 - **4d — membership reconciler**: SWIM membership → openraft voters (debounced,
   deterministic bootstrap). Tested with an in-memory membership feed.
-- **4e — the durable cluster `SessionStore`**: assemble lease → epoch → per-group
-  `ClusterLog` → `ReplicatedSessionStore`; lazy lease acquisition. A multi-node test
-  shows an enqueue surviving an owner's death (the durability claim).
+- **4e — the durable cluster `SessionStore`** ✅ *(done)*: `GroupRoutedLog` routes
+  each key to its group's `ClusterLog` (lease from a `LeaseSource`, replica set from
+  `Placement`) under `ReplicatedSessionStore`. The production `LocalLeaseSource`
+  (✅) reads the leader-assigned lease epoch from the local `LeaseStore`. A test
+  shows an enqueue replicating to a follower (durability).
 - **4f — wire into `mqttd`**: `Arc<dyn SessionStore>`; `MQTTD_DURABLE_SESSIONS` builds
   the durable store; connections use the store for QoS-2 dedup / packet ids;
   single-node path unchanged.

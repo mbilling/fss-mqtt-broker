@@ -26,7 +26,8 @@
 
 use crate::cluster_log::{ClusterLog, ReplicaTransport};
 use crate::lease::{Epoch, OwnershipLease};
-use crate::lease_raft::GroupId;
+use crate::lease_raft::{GroupId, RaftNodeId};
+use crate::lease_store::LeaseStore;
 use crate::placement::{group_of, Placement};
 use crate::NodeId;
 use async_trait::async_trait;
@@ -47,6 +48,42 @@ pub trait LeaseSource: Send + Sync {
     /// # Errors
     /// [`ReplError`] if the lease cannot be acquired (no quorum / not owner).
     async fn epoch_for(&self, group: GroupId) -> Result<Epoch, ReplError>;
+}
+
+/// The production [`LeaseSource`]: reads the group's lease epoch from this node's
+/// own replicated [`LeaseStore`].
+///
+/// Per ADR 0007, leases are **leader-driven**: the lease-group leader assigns each
+/// group's lease to the group's placement owner (the lease state machine mints the
+/// epoch). That assignment replicates to every node, so the owner reads its epoch
+/// straight from its applied `LeaseStore` — no app-level forwarding of a write to
+/// the leader. A group whose lease has not (yet) been assigned to this node returns
+/// [`ReplError::NotOwner`] (the caller serves it ephemerally until the leader
+/// assigns it — ADR 0005 degrade-don't-refuse).
+#[derive(Debug, Clone)]
+pub struct LocalLeaseSource {
+    store: LeaseStore,
+    local: RaftNodeId,
+}
+
+impl LocalLeaseSource {
+    /// A source reading `store` (this node's lease map) for leases held by `local`.
+    #[must_use]
+    pub fn new(store: LeaseStore, local: RaftNodeId) -> Self {
+        Self { store, local }
+    }
+}
+
+#[async_trait]
+impl LeaseSource for LocalLeaseSource {
+    async fn epoch_for(&self, group: GroupId) -> Result<Epoch, ReplError> {
+        match self.store.current_lease(group) {
+            // The lease is assigned to us — return the epoch we hold it at.
+            Some(rec) if rec.holder == self.local => Ok(rec.epoch),
+            // Assigned to another node, or not yet assigned: we cannot write durably.
+            _ => Err(ReplError::NotOwner),
+        }
+    }
 }
 
 /// A [`ReplicatedLog`] that routes each key to its placement group's
@@ -280,6 +317,70 @@ mod tests {
         );
         // The owner can read its own committed queue back.
         assert_eq!(store.pending(&client, 0, 100).await.unwrap().len(), 1);
+    }
+
+    /// `LocalLeaseSource` reads a lease the (leader-driven) consensus group assigned
+    /// to this node, and reports `NotOwner` for a group not assigned to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_lease_source_reads_an_assigned_lease() {
+        use crate::cluster_store::LocalLeaseSource;
+        use crate::lease_group::config;
+        use crate::lease_raft::LeaseRequest;
+        use crate::lease_store::LeaseStore;
+        use crate::node_registry::raft_id;
+        use crate::raft_mesh::MeshRaftNetwork;
+        use openraft::storage::Adaptor;
+        use openraft::{BasicNode, Raft, ServerState};
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let local = raft_id(&nid("lease-node"));
+        let store = LeaseStore::new();
+        let source = LocalLeaseSource::new(store.clone(), local);
+        let (ls, sm) = Adaptor::new(store);
+        let raft = Raft::new(local, config(), MeshRaftNetwork::new(), ls, sm)
+            .await
+            .unwrap();
+        raft.initialize(BTreeMap::from([(local, BasicNode::default())]))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "leader")
+            .await
+            .unwrap();
+
+        // No lease for group 7 yet → NotOwner.
+        assert!(source.epoch_for(7).await.is_err());
+
+        // Assign group 7 to this node; the owner reads its epoch locally.
+        let resp = raft
+            .client_write(LeaseRequest::Assign {
+                group: 7,
+                node: local,
+            })
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(resp.log_id.index), "applied")
+            .await
+            .unwrap();
+        assert_eq!(source.epoch_for(7).await.unwrap(), resp.data.unwrap().epoch);
+
+        // A group assigned to another node is NotOwner to us.
+        let resp = raft
+            .client_write(LeaseRequest::Assign {
+                group: 8,
+                node: local.wrapping_add(1),
+            })
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(resp.log_id.index), "applied")
+            .await
+            .unwrap();
+        assert!(source.epoch_for(8).await.is_err());
+
+        raft.shutdown().await.unwrap();
     }
 
     /// A session whose group this node does not own is refused (it belongs on the
