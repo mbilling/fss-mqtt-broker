@@ -229,10 +229,16 @@ phasing. The durable backend implementing `SessionStore`.
         connections can share it.
       - *real `LeaseSource`* ✅ *(done)*: `LocalLeaseSource` reads the leader-assigned
         lease epoch from the local `LeaseStore` (ADR 0007 §3 leader-driven model — no
-        app-level write forwarding). *Remaining:* the durable store + lease group +
-        `DurablePlane` constructed at startup behind `MQTTD_DURABLE_SESSIONS`
-        (single-node path keeps `MemorySessionStore`), plus the leader-driven
-        lease-assignment task.
+        app-level write forwarding).
+      - *leader-driven lease assignment* ✅ *(done)*: `mqtt-cluster::lease_assign::LeaseAssigner`
+        — `pending(store)` (pure: groups whose committed holder ≠ placement owner)
+        and `reconcile(raft, store)` (leader-only: `Assign` each pending group to its
+        owner; idempotent). A live test: the leader assigns all `NUM_GROUPS` to the
+        sole owner, then reconcile is a no-op.
+      - *Remaining:* the node assembly (durable store + lease group + `DurablePlane`
+        + the reconciler/assigner drivers) constructed at startup behind
+        `MQTTD_DURABLE_SESSIONS` (single-node path keeps `MemorySessionStore`), then
+        the multi-node integration test.
       - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
         (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
         frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to

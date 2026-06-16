@@ -16,6 +16,7 @@ pub mod cluster_store;
 pub mod durable_plane;
 pub mod hrw;
 pub mod lease;
+pub mod lease_assign;
 pub mod lease_group;
 pub mod lease_membership;
 pub mod lease_raft;
