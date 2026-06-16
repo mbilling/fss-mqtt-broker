@@ -380,7 +380,9 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
         frame @ (PeerMessage::Replicate { .. }
         | PeerMessage::ReplicateAck { .. }
         | PeerMessage::RaftRpc { .. }
-        | PeerMessage::RaftRpcReply { .. }) => {
+        | PeerMessage::RaftRpcReply { .. }
+        | PeerMessage::ReplicaRead { .. }
+        | PeerMessage::ReplicaReadReply { .. }) => {
             // Durable-plane frames (ADR 0006/0007): consensus RPCs and session-log
             // replication. Routed to the hub, which dispatches them to the
             // `DurablePlane` (a no-op until durable sessions are enabled, step 4f).

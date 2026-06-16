@@ -118,6 +118,21 @@ impl DurablePlane {
                 self.transport.complete_ack(req_id, accepted);
                 None
             }
+            // Recovery-read (workstream F): answer from our follower copy of the key.
+            PeerMessage::ReplicaRead { req_id, key } => {
+                let entries = self
+                    .lock_replicas()
+                    .entries(&key)
+                    .into_iter()
+                    .map(|e| (e.offset, e.record))
+                    .collect();
+                Some(PeerMessage::ReplicaReadReply { req_id, entries })
+            }
+            // Recovery-read reply → wake the waiting read.
+            PeerMessage::ReplicaReadReply { req_id, entries } => {
+                self.transport.complete_read(req_id, entries);
+                None
+            }
             // Not a durable-plane frame (Hello / Interest / Publish / ProxyHello):
             // handled elsewhere.
             _ => None,
@@ -290,5 +305,54 @@ mod tests {
         };
         assert!(!p.transport().deliver(&n("ghost"), 1, &op).await);
         p.raft().shutdown().await.unwrap();
+    }
+
+    /// Recovery-read (workstream F): after replicating to a follower, a new owner
+    /// reads that replica's log back over the wire — the entries a takeover rebuilds
+    /// from. An unreachable peer reads `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_read_returns_a_replicas_log_over_the_wire() {
+        let p1 = node("node-1").await;
+        let p2 = node("node-2").await;
+
+        let (io1, io2) = tokio::io::duplex(256 * 1024);
+        let (out1_tx, out1_rx) = mpsc::unbounded_channel();
+        let (out2_tx, out2_rx) = mpsc::unbounded_channel();
+        p1.register(&n("node-2"), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone());
+        spawn_link(p1.clone(), io1, out1_tx, out1_rx);
+        spawn_link(p2.clone(), io2, out2_tx, out2_rx);
+
+        // node-1 replicates two entries into node-2's follower copy.
+        for (offset, rec) in [(1u64, b"m1".as_slice()), (2, b"m2".as_slice())] {
+            let op = ReplOp::Append {
+                key: "q/c".to_string(),
+                offset,
+                record: rec.to_vec(),
+            };
+            assert!(p1.transport().deliver(&n("node-2"), 1, &op).await);
+        }
+
+        // node-1 recovery-reads node-2's log for the key.
+        let entries = p1
+            .transport()
+            .read_replica(&n("node-2"), "q/c")
+            .await
+            .expect("reachable replica");
+        assert_eq!(
+            entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(&entries[1].record, b"m2");
+
+        // An unreachable peer reads None.
+        assert!(p1
+            .transport()
+            .read_replica(&n("ghost"), "q/c")
+            .await
+            .is_none());
+
+        p1.raft().shutdown().await.unwrap();
+        p2.raft().shutdown().await.unwrap();
     }
 }

@@ -54,12 +54,20 @@ pub struct PeerReplicaTransport {
 struct Inner {
     followers: HashMap<NodeId, mpsc::UnboundedSender<PeerMessage>>,
     pending: HashMap<u64, Pending>,
+    /// In-flight recovery-reads (workstream F), keyed by `req_id`.
+    pending_reads: HashMap<u64, PendingRead>,
 }
 
 #[derive(Debug)]
 struct Pending {
     node: NodeId,
     ack: oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
+struct PendingRead {
+    node: NodeId,
+    reply: oneshot::Sender<Vec<(u64, Vec<u8>)>>,
 }
 
 impl PeerReplicaTransport {
@@ -95,6 +103,17 @@ impl PeerReplicaTransport {
                 let _ = p.ack.send(false);
             }
         }
+        // Fail in-flight recovery-reads to this replica too (dropping the sender
+        // resolves the awaiting `read_replica` to `None`).
+        let failed_reads: Vec<u64> = inner
+            .pending_reads
+            .iter()
+            .filter(|(_, p)| p.node == *node)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in failed_reads {
+            inner.pending_reads.remove(&id);
+        }
     }
 
     /// Resolve a pending request with the replica's verdict.
@@ -104,6 +123,15 @@ impl PeerReplicaTransport {
     pub fn complete_ack(&self, req_id: u64, accepted: bool) {
         if let Some(p) = self.lock().pending.remove(&req_id) {
             let _ = p.ack.send(accepted);
+        }
+    }
+
+    /// Resolve a pending recovery-read with the replica's entries.
+    ///
+    /// Called by the link handler when a [`PeerMessage::ReplicaReadReply`] arrives.
+    pub fn complete_read(&self, req_id: u64, entries: Vec<(u64, Vec<u8>)>) {
+        if let Some(p) = self.lock().pending_reads.remove(&req_id) {
+            let _ = p.reply.send(entries);
         }
     }
 
@@ -150,6 +178,43 @@ impl ReplicaTransport for PeerReplicaTransport {
         // Resolved by complete_ack (the replica replied) or fail_node (link
         // dropped); a closed channel also reads as "not accepted".
         ack_rx.await.unwrap_or(false)
+    }
+
+    async fn read_replica(
+        &self,
+        replica: &NodeId,
+        key: &str,
+    ) -> Option<Vec<mqtt_storage::repl::LogEntry>> {
+        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut inner = self.lock();
+            let Some(tx) = inner.followers.get(replica).cloned() else {
+                return None; // replica not connected
+            };
+            inner.pending_reads.insert(
+                req_id,
+                PendingRead {
+                    node: replica.clone(),
+                    reply: reply_tx,
+                },
+            );
+            let frame = PeerMessage::ReplicaRead {
+                req_id,
+                key: key.to_string(),
+            };
+            if tx.send(frame).is_err() {
+                inner.pending_reads.remove(&req_id);
+                return None;
+            }
+        }
+        let entries = reply_rx.await.ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|(offset, record)| mqtt_storage::repl::LogEntry { offset, record })
+                .collect(),
+        )
     }
 }
 

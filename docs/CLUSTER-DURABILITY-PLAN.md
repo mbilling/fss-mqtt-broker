@@ -45,7 +45,7 @@ shared subscriptions.
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
-| F | Takeover / handoff protocol | 🔶 In progress — **F-a** (log recovery mechanism) done; F-b–F-d remain |
+| F | Takeover / handoff protocol | 🔶 In progress — **F-a, F-b** done (recovery mechanism + recovery-read RPC); F-c, F-d remain |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
@@ -288,9 +288,13 @@ serving. Decomposed:
   gap — an uncommitted tail). Reading from a quorum guarantees no committed entry is
   lost. Tested: the merge (contiguous run, gap-drop, truncated prefix, empty) and a
   recovered log that replays its seeded entries and keeps appending.
-- **F-b — recovery-read RPC**: `PeerMessage::ReplicaRead{key}` → `ReplicaReadReply
-  {entries}` answered from the peer's `ReplicaState`, routed via the `DurablePlane`,
-  so a new owner can gather a quorum of replica logs.
+- **F-b — recovery-read RPC** ✅ *(done)*: `PeerMessage::ReplicaRead{key}` /
+  `ReplicaReadReply{entries}` (entries as `(offset, record)` tuples, so storage stays
+  serde-free). `ReplicaTransport` gains `read_replica(replica, key) -> Option<Vec<
+  LogEntry>>` (default `None`); `PeerReplicaTransport` implements it with `req_id`
+  correlation + `fail_node` on link drop; `DurablePlane::handle` answers a
+  `ReplicaRead` from its local `ReplicaState`. A test over the wire: after replicating
+  to a follower, the owner reads that replica's log back; an unreachable peer → `None`.
 - **F-c — rebuild on takeover**: `GroupRoutedLog` recovers a key's `ClusterLog` from
   a quorum recovery-read when it (re)builds the log at a bumped epoch — lazily, on
   the reconnect that lands on the new owner.

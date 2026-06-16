@@ -149,6 +149,13 @@ impl ReplicaState {
 pub trait ReplicaTransport: Send + Sync {
     /// Deliver `op` to `replica` at `epoch`; return whether it accepted.
     async fn deliver(&self, replica: &NodeId, epoch: Epoch, op: &ReplOp) -> bool;
+
+    /// Read `replica`'s stored log for `key`, for a new owner to rebuild the
+    /// committed log on takeover (workstream F). Returns `None` if the replica is
+    /// unreachable. The default supports no recovery-reads (single-node transports).
+    async fn read_replica(&self, _replica: &NodeId, _key: &str) -> Option<Vec<LogEntry>> {
+        None
+    }
 }
 
 /// Forward through an [`Arc`](std::sync::Arc) so a test can hold the transport to
@@ -157,6 +164,10 @@ pub trait ReplicaTransport: Send + Sync {
 impl<T: ReplicaTransport + ?Sized> ReplicaTransport for std::sync::Arc<T> {
     async fn deliver(&self, replica: &NodeId, epoch: Epoch, op: &ReplOp) -> bool {
         (**self).deliver(replica, epoch, op).await
+    }
+
+    async fn read_replica(&self, replica: &NodeId, key: &str) -> Option<Vec<LogEntry>> {
+        (**self).read_replica(replica, key).await
     }
 }
 

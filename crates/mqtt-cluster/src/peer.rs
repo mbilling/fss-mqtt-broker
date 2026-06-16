@@ -98,6 +98,24 @@ pub enum PeerMessage {
         /// The serialized Raft RPC response.
         payload: Vec<u8>,
     },
+    /// A new owner's request to read a replica's stored log for `key`, to rebuild
+    /// the committed log on takeover (workstream F). Answered with
+    /// [`ReplicaReadReply`](PeerMessage::ReplicaReadReply).
+    ReplicaRead {
+        /// Correlates this request with its reply on the same link.
+        req_id: u64,
+        /// The log (session key) to read.
+        key: String,
+    },
+    /// The reply to a [`ReplicaRead`](PeerMessage::ReplicaRead): the replica's stored
+    /// entries for the key, as `(offset, record)` pairs (kept as tuples so the
+    /// storage crate's `LogEntry` need not be serde-wire-encodable).
+    ReplicaReadReply {
+        /// The `req_id` of the [`ReplicaRead`](PeerMessage::ReplicaRead) answered.
+        req_id: u64,
+        /// The stored entries, in offset order.
+        entries: Vec<(u64, Vec<u8>)>,
+    },
 }
 
 /// Errors from peer-frame coding.
@@ -198,6 +216,14 @@ mod tests {
         roundtrip(&PeerMessage::RaftRpcReply {
             req_id: 7,
             payload: vec![9, 8, 7],
+        });
+        roundtrip(&PeerMessage::ReplicaRead {
+            req_id: 3,
+            key: "q/client-x".into(),
+        });
+        roundtrip(&PeerMessage::ReplicaReadReply {
+            req_id: 3,
+            entries: vec![(1, vec![1, 2]), (2, vec![3, 4])],
         });
     }
 
