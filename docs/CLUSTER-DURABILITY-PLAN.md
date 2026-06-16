@@ -45,7 +45,7 @@ shared subscriptions.
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
-| F | Takeover / handoff protocol | ⬜ Not started (needs E) |
+| F | Takeover / handoff protocol | 🔶 In progress — **F-a** (log recovery mechanism) done; F-b–F-d remain |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
@@ -273,18 +273,31 @@ phasing. The durable backend implementing `SessionStore`.
       Warrants multi-node integration tests (swim-routing style).
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
 
-### F — Takeover / handoff protocol  *(needs B + E)*
+### F — Takeover / handoff protocol  🔶 *(in progress; needs B + E)*
 
-ADR 0001 §5. Owner-dead path.
+ADR 0001 §5. The owner-dead path: on a SWIM `Dead` event, placement re-elects the
+next replica as owner and the lease driver reassigns the group at a **new epoch**
+(fencing the dead owner — the E mechanism). The missing piece is **log recovery**:
+the new owner — previously a replica — must rebuild the group's committed log before
+serving. Decomposed:
 
-- On owner death (a SWIM `Dead` event), a replica is promoted per the ring and
-  replays its log from the last durably-truncated offset to rebuild the queue;
-  the next reconnect lands on the new owner.
-- Reconciles with the existing local takeover (same-client-id disconnect).
-- **Tests:** kill the owner mid-session → a replica serves the reconnect with no
-  loss of durably-enqueued messages; concurrent reconnect during promotion does
-  not double-own (split-brain check); redelivery of in-flight QoS-1 is bounded
-  and spec-legal.
+- **F-a — log recovery mechanism** ✅ *(done)*: `mqtt-cluster::cluster_log` gains
+  `ClusterLog::recovered(...)` (seed a log's committed state from gathered entries,
+  appends continue from the watermark) and `merge_replica_logs(reads)` (the pure
+  quorum-recovery merge: union by offset, take the contiguous run, stop at the first
+  gap — an uncommitted tail). Reading from a quorum guarantees no committed entry is
+  lost. Tested: the merge (contiguous run, gap-drop, truncated prefix, empty) and a
+  recovered log that replays its seeded entries and keeps appending.
+- **F-b — recovery-read RPC**: `PeerMessage::ReplicaRead{key}` → `ReplicaReadReply
+  {entries}` answered from the peer's `ReplicaState`, routed via the `DurablePlane`,
+  so a new owner can gather a quorum of replica logs.
+- **F-c — rebuild on takeover**: `GroupRoutedLog` recovers a key's `ClusterLog` from
+  a quorum recovery-read when it (re)builds the log at a bumped epoch — lazily, on
+  the reconnect that lands on the new owner.
+- **F-d — integration test**: kill the owner mid-session → a replica serves the
+  reconnect with no loss of durably-enqueued messages; concurrent reconnect during
+  promotion does not double-own (split-brain check, via epoch fencing); redelivery
+  of in-flight QoS-1 is bounded and spec-legal.
 
 ### G — MQTT 5 expiry & shared subscriptions  *(gated on the MQTT 5.0 codec)*
 

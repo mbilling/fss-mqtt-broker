@@ -231,11 +231,96 @@ impl<T: ReplicaTransport> ClusterLog<T> {
         }
     }
 
+    /// A log whose committed state is **recovered** from `logs` — per key, the
+    /// entries a new owner gathered from a quorum of the replica set after a
+    /// takeover (workstream F). Each key's commit watermark is the highest recovered
+    /// offset and the truncation low-water is just below the lowest, so reads return
+    /// exactly the recovered live range and appends continue from the watermark.
+    ///
+    /// # Panics
+    /// As [`new`](Self::new).
+    #[must_use]
+    pub fn recovered(
+        local: NodeId,
+        lease: OwnershipLease,
+        replica_set: &[NodeId],
+        transport: T,
+        logs: BTreeMap<String, Vec<LogEntry>>,
+    ) -> Self {
+        assert!(
+            replica_set.contains(&local),
+            "the local node must be in its own replica set"
+        );
+        assert_eq!(
+            lease.holder, local,
+            "a ClusterLog is the lease-holder's log"
+        );
+        let quorum = replica_set.len() / 2 + 1;
+        let followers = replica_set
+            .iter()
+            .filter(|n| **n != local)
+            .cloned()
+            .collect();
+        let mut state = BTreeMap::new();
+        for (key, entries) in logs {
+            let mut ks = KeyState::default();
+            let mut lowest: Option<Offset> = None;
+            for entry in entries {
+                lowest = Some(lowest.map_or(entry.offset, |l| l.min(entry.offset)));
+                ks.committed = ks.committed.max(entry.offset);
+                ks.entries.insert(entry.offset, entry.record);
+            }
+            ks.truncated = lowest.map_or(0, |l| l.saturating_sub(1));
+            state.insert(key, ks);
+        }
+        Self {
+            local,
+            lease,
+            followers,
+            quorum,
+            transport,
+            state: tokio::sync::Mutex::new(state),
+        }
+    }
+
     /// The quorum size for this group.
     #[must_use]
     pub fn quorum(&self) -> usize {
         self.quorum
     }
+}
+
+/// Merge per-replica reads of one key's log into its recovered committed log: the
+/// union of entries by offset, then the contiguous run from the lowest offset
+/// present, stopping at the first gap.
+///
+/// A gap marks an uncommitted tail: the owner commits offsets in order, so it cannot
+/// have committed past a missing offset; and reading from a **quorum** guarantees
+/// every committed entry is seen (any committed entry is on ≥ quorum replicas, which
+/// intersect any quorum read). A truncated prefix (acked, dropped) simply means the
+/// run starts above 1.
+#[must_use]
+pub fn merge_replica_logs(reads: &[Vec<LogEntry>]) -> Vec<LogEntry> {
+    let mut by_offset: BTreeMap<Offset, Vec<u8>> = BTreeMap::new();
+    for read in reads {
+        for entry in read {
+            by_offset
+                .entry(entry.offset)
+                .or_insert_with(|| entry.record.clone());
+        }
+    }
+    let mut out = Vec::new();
+    let mut expected: Option<Offset> = None;
+    for (offset, record) in by_offset {
+        if let Some(e) = expected {
+            if offset != e {
+                break; // a gap — the rest is an uncommitted tail
+            }
+        }
+        expected = Some(offset + 1);
+        out.push(LogEntry { offset, record });
+    }
+    out
 }
 
 #[async_trait]
@@ -344,12 +429,12 @@ impl<T: ReplicaTransport> ReplicatedLog for ClusterLog<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterLog, ReplOp, ReplicaState, ReplicaTransport};
+    use super::{merge_replica_logs, ClusterLog, ReplOp, ReplicaState, ReplicaTransport};
     use crate::lease::{Epoch, OwnershipLease};
     use crate::NodeId;
     use async_trait::async_trait;
     use mqtt_storage::logged::ReplicatedSessionStore;
-    use mqtt_storage::repl::ReplicatedLog;
+    use mqtt_storage::repl::{LogEntry, ReplicatedLog};
     use mqtt_storage::SessionStore;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
@@ -568,5 +653,75 @@ mod tests {
         let pending = store.pending(&c, 0, 100).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(&pending[0].message.payload[..], b"payload");
+    }
+
+    fn entry(offset: u64, record: &[u8]) -> LogEntry {
+        LogEntry {
+            offset,
+            record: record.to_vec(),
+        }
+    }
+
+    /// The quorum-recovery merge takes the contiguous run from the union of reads.
+    #[test]
+    fn merge_takes_the_contiguous_run_from_a_quorum() {
+        // Two overlapping replica reads; their union is contiguous 1..=4.
+        let merged = merge_replica_logs(&[
+            vec![entry(1, b"a"), entry(2, b"b"), entry(3, b"c")],
+            vec![entry(2, b"b"), entry(3, b"c"), entry(4, b"d")],
+        ]);
+        assert_eq!(
+            merged.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    /// A gap drops the uncommitted tail beyond it; a truncated prefix starts above
+    /// 1; nothing merges to nothing.
+    #[test]
+    fn merge_stops_at_gaps_and_handles_truncation() {
+        // 1,2 then a gap at 3 with an uncommitted 4 → recovered [1,2].
+        assert_eq!(
+            merge_replica_logs(&[vec![entry(1, b"a"), entry(2, b"b"), entry(4, b"d")]])
+                .iter()
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+        );
+        // Truncated to start at 5 (acked) → recovered [5,6].
+        assert_eq!(
+            merge_replica_logs(&[vec![entry(5, b"e"), entry(6, b"f")]])
+                .iter()
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
+            vec![5, 6],
+        );
+        assert!(merge_replica_logs(&[]).is_empty());
+        assert!(merge_replica_logs(&[vec![]]).is_empty());
+    }
+
+    /// A recovered `ClusterLog` serves its seeded committed entries and continues
+    /// appending after the recovered watermark — the takeover rebuild (workstream F).
+    #[tokio::test]
+    async fn recovered_log_serves_seeded_entries_and_continues() {
+        let local = n("a");
+        let set = vec![n("a")]; // 1-node group, quorum 1
+        let sim = SimCluster::new(&[]);
+        let lease = OwnershipLease {
+            holder: local.clone(),
+            epoch: 5,
+        };
+        let mut logs = BTreeMap::new();
+        logs.insert("q/c".to_string(), vec![entry(1, b"m1"), entry(2, b"m2")]);
+        let log = ClusterLog::recovered(local, lease, &set, sim, logs);
+
+        let k = "q/c".to_string();
+        // The recovered entries replay.
+        let got = log.read(&k, 0, 100).await.unwrap();
+        assert_eq!(got.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(&got[1].record, b"m2");
+        // Appends continue after the recovered watermark, committing locally.
+        assert_eq!(log.append(&k, b"m3".to_vec()).await.unwrap(), 3);
+        assert_eq!(log.read(&k, 0, 100).await.unwrap().len(), 3);
     }
 }
