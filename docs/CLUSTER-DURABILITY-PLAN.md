@@ -240,11 +240,16 @@ phasing. The durable backend implementing `SessionStore`.
         driver (a tick-loop that reconciles voters off the live `Placement` membership
         and, as leader, assigns each group's lease to its owner). A single-node smoke
         test: the assembly bootstraps itself, then an enqueue commits and replays.
-      - *Remaining:* the multi-node integration test (3 nodes over the real mesh +
-        SWIM; enqueue replicates to a peer), then the `main.rs` gate on
-        `MQTTD_DURABLE_SESSIONS` (build the node, hand its store to the hub,
-        `attach_durable_plane`; single-node path keeps `MemorySessionStore`) + conn
-        QoS-2 dedup through the store.
+      - *integration test* ✅ *(done)*: `tests/durable_sessions.rs` boots **three
+        durable nodes over the real peer mesh + SWIM** (founder + two joiners) and a
+        durable `enqueue` commits on the group owner — which on a 3-node group
+        *requires* quorum (owner + ≥1 follower), so the message provably replicated
+        to a peer. Non-flaky (8/8, ~0.8s). Also fixed a real split-brain hazard: a
+        **founder gate** (`can_bootstrap`, a node with no SWIM seeds) so independently
+        starting nodes don't each create a rival single-node lease group.
+      - *Remaining:* the `main.rs` gate on `MQTTD_DURABLE_SESSIONS` (build the node,
+        hand its store to the hub, `attach_durable_plane`; single-node path keeps
+        `MemorySessionStore`), and conn QoS-2 dedup through the store.
       - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
         (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
         frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to

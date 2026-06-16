@@ -52,11 +52,16 @@ const DRIVER_TICK: Duration = Duration::from_millis(200);
 /// driver. Returns the store (for the hub) and the [`DurablePlane`] (to attach to
 /// the hub so it routes peer consensus/replication frames).
 ///
+/// `can_bootstrap` marks this node a **founder** (started with no SWIM seeds): only
+/// a founder creates the lease group; joiners wait to be added by the founder's
+/// leader. Exactly one founder per cluster (see [`MembershipReconciler::new`]).
+///
 /// # Panics
 /// Panics if the lease `Raft` fails to start (a programming/config error at boot).
 pub async fn build_durable_node(
     node_id: NodeId,
     placement: Arc<RwLock<Placement>>,
+    can_bootstrap: bool,
 ) -> (Arc<dyn SessionStore>, DurablePlane) {
     let local = raft_id(&node_id);
 
@@ -91,7 +96,7 @@ pub async fn build_durable_node(
         raft,
         lease_store,
         placement.clone(),
-        MembershipReconciler::new(local),
+        MembershipReconciler::new(local, can_bootstrap),
         LeaseAssigner::new(placement),
     ));
 
@@ -151,7 +156,7 @@ mod tests {
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, _plane) = build_durable_node(node, placement).await;
+        let (store, _plane) = build_durable_node(node, placement, true).await;
 
         let client = ClientId("c".to_string());
         let msg = Message {

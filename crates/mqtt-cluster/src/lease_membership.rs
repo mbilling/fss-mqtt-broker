@@ -67,13 +67,24 @@ pub enum MembershipError {
 #[derive(Debug, Clone, Copy)]
 pub struct MembershipReconciler {
     local: RaftNodeId,
+    can_bootstrap: bool,
 }
 
 impl MembershipReconciler {
     /// A reconciler for the node with raft id `local`.
+    ///
+    /// `can_bootstrap` gates whether this node may *create* the lease group (a
+    /// **founder** — a node started with no SWIM seeds). A non-founder never
+    /// initializes; it waits to be added by the founder's elected leader. This
+    /// prevents independently-starting nodes — each initially seeing only itself —
+    /// from each bootstrapping a separate single-node group (an unmergeable
+    /// split-brain). Exactly one founder per cluster.
     #[must_use]
-    pub fn new(local: RaftNodeId) -> Self {
-        Self { local }
+    pub fn new(local: RaftNodeId, can_bootstrap: bool) -> Self {
+        Self {
+            local,
+            can_bootstrap,
+        }
     }
 
     /// Decide the action to take given the current `view` and the `desired` stable
@@ -84,9 +95,10 @@ impl MembershipReconciler {
             return MembershipAction::None;
         }
         if !view.initialized {
-            // Deterministic bootstrap: only the smallest-id desired member starts the
-            // group, with itself; the elected leader grows it from there.
-            if desired.iter().min() == Some(&self.local) {
+            // Deterministic bootstrap: only a founder that is also the smallest-id
+            // desired member starts the group, with itself; the elected leader grows
+            // it from there. Non-founders wait to be added.
+            if self.can_bootstrap && desired.iter().min() == Some(&self.local) {
                 let mut just_me = BTreeSet::new();
                 just_me.insert(self.local);
                 return MembershipAction::Initialize(just_me);
@@ -195,7 +207,7 @@ mod tests {
 
     #[test]
     fn empty_desired_is_a_noop() {
-        let r = MembershipReconciler::new(1);
+        let r = MembershipReconciler::new(1, true);
         let view = RaftView {
             initialized: false,
             is_leader: false,
@@ -213,12 +225,27 @@ mod tests {
         };
         // Node 1 is the smallest in {1,2,3} → it bootstraps.
         assert_eq!(
-            MembershipReconciler::new(1).decide(&view, &set(&[1, 2, 3])),
+            MembershipReconciler::new(1, true).decide(&view, &set(&[1, 2, 3])),
             MembershipAction::Initialize(set(&[1])),
         );
         // Node 2 is not the smallest → it waits.
         assert_eq!(
-            MembershipReconciler::new(2).decide(&view, &set(&[1, 2, 3])),
+            MembershipReconciler::new(2, true).decide(&view, &set(&[1, 2, 3])),
+            MembershipAction::None,
+        );
+    }
+
+    #[test]
+    fn a_non_founder_never_bootstraps_even_as_the_smallest() {
+        let view = RaftView {
+            initialized: false,
+            is_leader: false,
+            voters: set(&[]),
+        };
+        // Node 1 is the smallest, but it is not a founder (started with seeds) — it
+        // waits to be added rather than starting a rival group.
+        assert_eq!(
+            MembershipReconciler::new(1, false).decide(&view, &set(&[1, 2, 3])),
             MembershipAction::None,
         );
     }
@@ -232,14 +259,14 @@ mod tests {
             voters: set(&[1]),
         };
         assert_eq!(
-            MembershipReconciler::new(2).decide(&follower, &desired),
+            MembershipReconciler::new(2, true).decide(&follower, &desired),
             MembershipAction::None,
         );
     }
 
     #[test]
     fn leader_grows_and_shrinks_the_voter_set() {
-        let r = MembershipReconciler::new(1);
+        let r = MembershipReconciler::new(1, true);
         // Grow {1} -> {1,2,3}: add 2 and 3 as learners.
         let view = RaftView {
             initialized: true,
@@ -359,7 +386,7 @@ mod tests {
         } else {
             (&p2, r2, &s1)
         };
-        let recon = MembershipReconciler::new(boot_id);
+        let recon = MembershipReconciler::new(boot_id, true);
 
         // Step 1: bootstrap (Initialize with self), then it wins the election.
         let action = recon.decide(&raft_view(boot.raft()), &desired);
