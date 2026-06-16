@@ -247,9 +247,11 @@ phasing. The durable backend implementing `SessionStore`.
         to a peer. Non-flaky (8/8, ~0.8s). Also fixed a real split-brain hazard: a
         **founder gate** (`can_bootstrap`, a node with no SWIM seeds) so independently
         starting nodes don't each create a rival single-node lease group.
-      - *Remaining:* the `main.rs` gate on `MQTTD_DURABLE_SESSIONS` (build the node,
-        hand its store to the hub, `attach_durable_plane`; single-node path keeps
-        `MemorySessionStore`), and conn QoS-2 dedup through the store.
+      - *`main.rs` gate* ✅ *(done)*: `MQTTD_DURABLE_SESSIONS=1` builds the durable
+        node, hands its store to the hub, and `attach_durable_plane`s it (founder =
+        no SWIM seeds); default-off keeps `MemorySessionStore`. The binary boots in
+        durable mode and serves clients.
+      - *Remaining:* conn QoS-2 dedup through the store (the last item in E).
       - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
         (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
         frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to

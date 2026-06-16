@@ -13,6 +13,10 @@
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
 //! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
 //! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
+//! - `MQTTD_DURABLE_SESSIONS` — `1`/`true` opts into the durable, consensus-backed
+//!   session store (ADR 0006/0007); persistent sessions replicate across the peer
+//!   mesh. Default-off (the in-memory store). A node with no `MQTTD_SWIM_SEEDS` is
+//!   the cluster founder that bootstraps the lease group (exactly one per cluster).
 //! - `MQTTD_TLS_BIND`       — TLS client listener bind, e.g. `0.0.0.0:8883`
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
@@ -86,14 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement::DEFAULT_REPLICAS,
     )));
 
-    // Start the routing hub. Offline session queues are bounded (ADR 0001 §6).
-    let store = MemorySessionStore::with_limits(queue_limits_from_env()?);
-    let (hub, hub_tx) = hub::Hub::with_config_and_placement(
-        node_id.clone(),
-        Arc::new(store),
-        Some(placement.clone()),
-    );
-    tokio::spawn(hub.run());
+    // Build and spawn the routing hub with its session store (durable opt-in, or
+    // the bounded in-memory default).
+    let hub_tx = start_hub(&node_id, &placement).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -269,6 +268,48 @@ fn jwt_config_from_env() -> mqtt_auth::token::TokenConfig {
 /// Per-session offline-queue bounds (ADR 0001 §6) from `MQTTD_MAX_QUEUED_MESSAGES`
 /// and `MQTTD_QUEUE_OVERFLOW`. Bounded by default; an unparseable value is a
 /// startup error rather than a silent fallback.
+/// Build and spawn the routing hub with its session store, returning the command
+/// sender. By default the store is the bounded in-memory backend (ADR 0001 §6).
+/// `MQTTD_DURABLE_SESSIONS` opts into the **durable, consensus-backed** store
+/// (ADR 0006/0007): a lease group over the peer mesh replicates each persistent
+/// session's log. Opt-in and loudly logged, like every cluster feature.
+async fn start_hub(
+    node_id: &NodeId,
+    placement: &Arc<RwLock<Placement>>,
+) -> Result<mpsc::UnboundedSender<hub::HubCommand>, Box<dyn std::error::Error>> {
+    let durable = non_empty_env("MQTTD_DURABLE_SESSIONS")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if durable {
+        // A node started with no SWIM seeds is the cluster founder — only it
+        // bootstraps the lease group (ADR 0007 §2). Exactly one founder per cluster.
+        let founder = non_empty_env("MQTTD_SWIM_SEEDS").is_none();
+        info!(
+            founder,
+            "DURABLE sessions enabled: consensus-backed replicated store"
+        );
+        let (store, plane) = mqtt_cluster::durable_node::build_durable_node(
+            node_id.clone(),
+            placement.clone(),
+            founder,
+        )
+        .await;
+        let (mut hub, hub_tx) =
+            hub::Hub::with_config_and_placement(node_id.clone(), store, Some(placement.clone()));
+        hub.attach_durable_plane(plane);
+        tokio::spawn(hub.run());
+        Ok(hub_tx)
+    } else {
+        let store = MemorySessionStore::with_limits(queue_limits_from_env()?);
+        let (hub, hub_tx) = hub::Hub::with_config_and_placement(
+            node_id.clone(),
+            Arc::new(store),
+            Some(placement.clone()),
+        );
+        tokio::spawn(hub.run());
+        Ok(hub_tx)
+    }
+}
+
 fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
     let mut limits = QueueLimits::default();
     if let Some(raw) = non_empty_env("MQTTD_MAX_QUEUED_MESSAGES") {
