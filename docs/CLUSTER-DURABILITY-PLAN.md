@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a–4d**; **4e (durable cluster store) + 4f (mqttd wiring)** remain |
+| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a–4e**; only **4f (wire into mqttd)** remains |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -214,9 +214,14 @@ phasing. The durable backend implementing `SessionStore`.
       exhaustively, and a live test where the reconciler bootstraps a node, grows the
       group to a second over the wire, and a committed lease replicates to the new
       voter. (Debounce is the driver's job, 4f.)
-    - **4e — durable cluster `SessionStore`**: lease → epoch → per-group `ClusterLog`
-      → `ReplicatedSessionStore`; lazy lease acquisition. Multi-node test: an enqueue
-      survives the owner's death.
+    - **4e — durable cluster `SessionStore`** ✅ *(done)*: `mqtt-cluster::cluster_store::GroupRoutedLog`
+      implements `ReplicatedLog` by routing each key to its group's `ClusterLog`,
+      built lazily (lease epoch from a `LeaseSource`, replica set from `Placement`);
+      a non-owned group returns `NotOwner`. Wrap it in `ReplicatedSessionStore` →
+      the durable cluster store. Test: an enqueue through the store **quorum-
+      replicates to a follower** (the message survives the owner's loss), and a
+      foreign group is refused. (The `LeaseSource` is stubbed here — the consensus
+      group is already proven in 4c/4d; the openraft-backed source wires in at 4f.)
     - **4f — wire into `mqttd`**: `Arc<dyn SessionStore>`; `MQTTD_DURABLE_SESSIONS`
       builds the durable store; connections use it for QoS-2 dedup / packet ids;
       single-node path unchanged.
