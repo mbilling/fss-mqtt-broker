@@ -13,6 +13,7 @@
 
 pub mod cluster_log;
 pub mod cluster_store;
+pub mod durable_node;
 pub mod durable_plane;
 pub mod hrw;
 pub mod lease;

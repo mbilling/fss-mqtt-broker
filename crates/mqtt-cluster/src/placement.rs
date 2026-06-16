@@ -171,6 +171,13 @@ impl Placement {
     pub fn member_count(&self) -> usize {
         self.eligible.len()
     }
+
+    /// The current eligible member set (this node plus non-`Dead` peers), in
+    /// deterministic order — e.g. for the lease group to track desired voters.
+    #[must_use]
+    pub fn members(&self) -> Vec<NodeId> {
+        self.eligible.iter().cloned().collect()
+    }
 }
 
 #[cfg(test)]

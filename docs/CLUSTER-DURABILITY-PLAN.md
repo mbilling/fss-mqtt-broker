@@ -235,10 +235,16 @@ phasing. The durable backend implementing `SessionStore`.
         and `reconcile(raft, store)` (leader-only: `Assign` each pending group to its
         owner; idempotent). A live test: the leader assigns all `NUM_GROUPS` to the
         sole owner, then reconcile is a no-op.
-      - *Remaining:* the node assembly (durable store + lease group + `DurablePlane`
-        + the reconciler/assigner drivers) constructed at startup behind
-        `MQTTD_DURABLE_SESSIONS` (single-node path keeps `MemorySessionStore`), then
-        the multi-node integration test.
+      - *node assembly* ✅ *(done)*: `mqtt-cluster::durable_node::build_durable_node`
+        ties the lease group + `DurablePlane` + durable store together and spawns the
+        driver (a tick-loop that reconciles voters off the live `Placement` membership
+        and, as leader, assigns each group's lease to its owner). A single-node smoke
+        test: the assembly bootstraps itself, then an enqueue commits and replays.
+      - *Remaining:* the multi-node integration test (3 nodes over the real mesh +
+        SWIM; enqueue replicates to a peer), then the `main.rs` gate on
+        `MQTTD_DURABLE_SESSIONS` (build the node, hand its store to the hub,
+        `attach_durable_plane`; single-node path keeps `MemorySessionStore`) + conn
+        QoS-2 dedup through the store.
       - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
         (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
         frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to
