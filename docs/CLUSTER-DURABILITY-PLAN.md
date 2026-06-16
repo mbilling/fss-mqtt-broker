@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a–4e**; only **4f (wire into mqttd)** remains |
+| E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -251,7 +251,17 @@ phasing. The durable backend implementing `SessionStore`.
         node, hands its store to the hub, and `attach_durable_plane`s it (founder =
         no SWIM seeds); default-off keeps `MemorySessionStore`. The binary boots in
         durable mode and serves clients.
-      - *Remaining:* conn QoS-2 dedup through the store (the last item in E).
+      - *conn QoS-2 dedup* ✅ *(done)*: `ConnPolicy` carries the shared store; the
+        connection records/clears the QoS-2 inbound packet id in the store
+        (`record_received` before PUBREC, `clear_received` on PUBREL) instead of a
+        per-connection set — so the exactly-once window is durable. `None` keeps the
+        in-memory fallback. A conn test drives QoS-2 over a store-backed policy and
+        asserts the window lives in the store.
+
+  **Workstream E is complete**: a durable, consensus-backed, quorum-replicated
+  session store — built, proven over a real 3-node cluster, and shippable behind
+  `MQTTD_DURABLE_SESSIONS`. (MQTT-observable session *survival* after an owner's
+  death is workstream **F**, takeover.)
       - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
         (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
         frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to
@@ -324,12 +334,13 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 
 | Limitation | Impact | Resolved by |
 |------------|--------|-------------|
-| Sessions are **ephemeral** — an owner's death drops its queues | No durability across owner loss (sharded capacity only) | **E step 3b** (networked durable log) + **F** (takeover) |
+| With `MQTTD_DURABLE_SESSIONS` **off** (the default), persistent sessions are ephemeral — an owner's death drops its queues | No durability across owner loss on the default path (sharded capacity only) | enable the durable store (E done); MQTT-observable survival needs **F** (takeover) |
+| Even with durable sessions on, a session is not yet **served after its owner dies** (the data is on a replica, but no node takes over) | Durable (the message survives), but the client can't yet reconnect-and-resume after owner loss | **F** (takeover/handoff) |
 | ~~Consensus engine (openraft) unratified~~ | — | ✅ **E step 1** — openraft ratified |
-| The pieces exist and are wire-tested in isolation, but are **not yet connected or run by the live hub**: the lease group (`raft_mesh`/`lease_group`) mints epochs, the session-log transport (`repl_net`) replicates, but nothing yet feeds the lease epoch into a `ClusterLog` or runs either over the broker's real peer links | Consensus + replication proven over framed streams in tests, but not exercised by the running broker | **E step 4** (hub wiring: lease group → epoch → `ClusterLog` → mqttd's `SessionStore`) |
+| ~~Consensus + replication not run by the live hub~~ | — | ✅ **E step 4** — the durable stack runs in the broker; proven by the 3-node integration test |
 | ~~QoS-2 dedup set + next-packet-id counter not yet replicated state~~ | — | ✅ **E step 3c** — now in the replicated `m/{client}` snapshot |
 | `ReplicatedSessionStore` enqueue counts the queue via an **O(n) read** for cap enforcement (exact only under serialized per-key appends, which the lease guarantees) | A larger constant on enqueue; no correctness/durability impact | **E step 3c remainder** (a rebuildable per-key cap index) |
-| `ReplicatedSessionStore` / `ClusterLog` are **not wired into `mqttd`** (the broker still uses `MemorySessionStore`) | Layering proven in isolation, not in the live server | **E step 4** (swap the backend in) |
+| Lease assignment is **eager** (the leader assigns all `NUM_GROUPS` on first leadership) and membership debounce is one tick | A startup burst of small consensus writes; conservative under rapid churn | minor hardening (demand-driven assignment, longer debounce) |
 | Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
 | Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
 

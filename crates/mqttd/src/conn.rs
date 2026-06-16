@@ -102,6 +102,12 @@ pub struct ConnPolicy {
     pub audit: Arc<dyn AuditSink>,
     /// Session relocation context; `None` outside a cluster (serve locally).
     pub proxy: Option<ProxyContext>,
+    /// The session store, shared with the hub, backing the **durable** QoS-2 inbound
+    /// dedup window (ADR 0007 §5): `record_received` quorum-replicates the packet id
+    /// before PUBREC, so exactly-once survives a failover. `None` falls back to a
+    /// per-connection in-memory window (lost on disconnect — fine for clean sessions
+    /// and the in-memory backend).
+    pub store: Option<Arc<dyn mqtt_storage::SessionStore>>,
 }
 
 impl std::fmt::Debug for ConnPolicy {
@@ -124,6 +130,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         authz: Arc::new(AllowAll),
         audit: Arc::new(AuditLog::new()),
         proxy: None,
+        store: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -621,8 +628,15 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         (QoS::ExactlyOnce, Some(id)) => {
             // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
             // sighting of this packet id; re-sent copies (DUP) before the
-            // PUBREL release are acknowledged but not re-delivered.
-            if qos2_inbound.insert(id) {
+            // PUBREL release are acknowledged but not re-delivered. The dedup
+            // window is the durable session store when present (so it survives a
+            // failover), else a per-connection set. A store error degrades to
+            // forwarding (at-least-once) rather than dropping the flow.
+            let first_sighting = match &policy.store {
+                Some(store) => store.record_received(client, id).await.unwrap_or(true),
+                None => qos2_inbound.insert(id),
+            };
+            if first_sighting {
                 forward(hub);
             }
             writer.send(&Packet::PubRec(id)).await?;
@@ -661,7 +675,14 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
         }
         // QoS 2 publisher-side release: the id may be reused afterwards.
         Packet::PubRel(id) => {
-            qos2_inbound.remove(&id);
+            match &policy.store {
+                Some(store) => {
+                    let _ = store.clear_received(client, id).await;
+                }
+                None => {
+                    qos2_inbound.remove(&id);
+                }
+            }
             writer.send(&Packet::PubComp(id)).await?;
         }
         // Subscriber-side acknowledgements for our downstream deliveries.
@@ -738,6 +759,7 @@ mod tests {
         packet::{ConnAck, Connect, Publish},
         Packet, ProtocolVersion, QoS,
     };
+    use mqtt_core::ClientId;
     use mqtt_net::{FrameReader, FrameWriter};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -760,6 +782,7 @@ mod tests {
             authz: Arc::new(mqtt_auth::AllowAll),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            store: None,
         })
     }
 
@@ -930,5 +953,66 @@ mod tests {
                 "a wildcard PUBLISH topic ({bad:?}) must close the connection"
             );
         }
+    }
+
+    /// Start a connection whose policy backs the QoS-2 dedup window with `store`.
+    fn start_conn_with_store(
+        store: Arc<dyn mqtt_storage::SessionStore>,
+    ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            store: Some(store),
+        });
+        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
+    }
+
+    fn qos2_publish(id: u16) -> Packet {
+        Packet::Publish(Publish {
+            dup: false,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            topic: "t".to_string(),
+            pkid: Some(id),
+            payload: bytes::Bytes::from_static(b"x"),
+        })
+    }
+
+    /// When the policy carries a session store, the QoS-2 inbound dedup window lives
+    /// in the **store** (not a per-connection set), so it is durable: the packet id
+    /// is recorded on PUBLISH (before PUBREC) and cleared on PUBREL.
+    #[tokio::test]
+    async fn qos2_dedup_window_is_backed_by_the_store() {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let (mut reader, mut writer, hub_rx) = start_conn_with_store(store.clone());
+        let _seen = stub_hub(hub_rx);
+
+        writer.send(&connect_packet("c1", false)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        let client = ClientId("c1".to_string());
+
+        // First QoS-2 PUBLISH: recorded in the store before PUBREC.
+        writer.send(&qos2_publish(5)).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5)));
+        assert_eq!(store.received(&client).await.unwrap(), vec![5]);
+
+        // A duplicate (same id) is still acknowledged; the window is unchanged.
+        writer.send(&qos2_publish(5)).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5)));
+        assert_eq!(store.received(&client).await.unwrap(), vec![5]);
+
+        // PUBREL completes the flow and clears the id from the (durable) window.
+        writer.send(&Packet::PubRel(5)).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(5)));
+        assert!(store.received(&client).await.unwrap().is_empty());
     }
 }

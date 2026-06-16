@@ -9,9 +9,12 @@ messages, wills, keepalive, persistent sessions). Transport security
 (TLS 1.3 + mutually-authenticated cluster bus), authenticated gossip membership
 with dynamic cross-node routing, and a full identity/authorization stack
 (mTLS-CN / password / JWT → topic ACLs → tamper-evident audit) are in place.
-**Durable replicated storage** and the **MQTT 5.0 codec** are the next
-milestones. See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the
-full roadmap and [`docs/adr/`](docs/adr/) for the decisions behind it.
+**Durable, consensus-backed replicated session storage** (openraft lease group +
+epoch-fenced quorum replication, opt-in via `MQTTD_DURABLE_SESSIONS`) is built and
+proven over a real cluster. **Cross-node takeover** (serving a session after its
+owner dies) and the **MQTT 5.0 codec** are the next milestones. See
+[`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the full roadmap and
+[`docs/adr/`](docs/adr/) for the decisions behind it.
 
 ## Principles
 
@@ -75,18 +78,24 @@ full roadmap and [`docs/adr/`](docs/adr/) for the decisions behind it.
   persistent session connecting to a node that is not its owner is relayed to the
   owner over the mTLS bus and served there — sharded session capacity. The
   landing node vouches for the client's authenticated identity within the
-  cluster-CA trust boundary. *Ephemeral until replicated storage lands:* an
-  owner's death drops its sessions (see below).
+  cluster-CA trust boundary. With `MQTTD_DURABLE_SESSIONS` the owner's session log
+  is quorum-replicated (below); on the default in-memory path an owner's death
+  still drops its sessions.
+
+- **Durable, replicated session storage** ([ADR 0001](docs/adr/0001-session-durability.md),
+  [0006](docs/adr/0006-consensus-and-replication.md),
+  [0007](docs/adr/0007-durable-store-integration.md);
+  [implementation plan](docs/CLUSTER-DURABILITY-PLAN.md)). Opt-in via
+  `MQTTD_DURABLE_SESSIONS`: an openraft lease group (per placement group, leader-
+  assigned) mints an epoch, and each persistent session's append-log is
+  quorum-replicated across its replica set, epoch-fenced against a stale owner. The
+  default remains the bounded in-memory store. Proven by a 3-node integration test
+  (an enqueue is quorum-durable across the real peer mesh).
 
 ### In progress / planned
-- **Durable, replicated session storage + cross-node takeover**
-  ([ADR 0001](docs/adr/0001-session-durability.md);
-  [implementation plan](docs/CLUSTER-DURABILITY-PLAN.md)). Session state is still
-  in-memory and bounded but not replicated; an owner's death loses its sessions.
-  The consensus mechanism is now decided — lease-scoped consensus over a proven
-  engine, with a `ReplicatedLog` seam ([ADR 0006](docs/adr/0006-consensus-and-replication.md));
-  the in-memory backend ships today and the consensus-backed replicated log is
-  next (workstream E).
+- **Cross-node takeover**: on an owner's death, a replica is promoted and serves the
+  reconnect (workstream F) — so a durable session *survives* an owner loss
+  end-to-end, not just on disk.
 - **MQTT 5.0**: properties, reason codes, session/message expiry, topic aliases,
   flow control, shared subscriptions, enhanced auth. (v5 CONNECT is currently
   rejected at the codec.)

@@ -41,6 +41,7 @@ async fn start_node(
         authz,
         audit: audit.clone(),
         proxy: None,
+        store: None,
     });
 
     let (hub, hub_tx) = Hub::with_config(

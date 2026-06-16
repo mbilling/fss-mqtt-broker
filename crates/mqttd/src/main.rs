@@ -51,7 +51,7 @@ use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_config::Config;
 use mqtt_net::tls;
 use mqtt_observability::AuditLog;
-use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits};
+use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
 use mqttd::{cluster, conn, hub, peer};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -91,8 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
 
     // Build and spawn the routing hub with its session store (durable opt-in, or
-    // the bounded in-memory default).
-    let hub_tx = start_hub(&node_id, &placement).await?;
+    // the bounded in-memory default). The store is shared with connections for the
+    // QoS-2 dedup window (ADR 0007 §5).
+    let (hub_tx, store) = start_hub(&node_id, &placement).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -105,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let policy = client_policy_from_env(Some(proxy))?;
+    let policy = client_policy_from_env(Some(proxy), store)?;
 
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
@@ -190,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the insecure fallbacks are explicit and loudly logged.
 fn client_policy_from_env(
     proxy: Option<conn::ProxyContext>,
+    store: Arc<dyn SessionStore>,
 ) -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error::Error>> {
     let auth = authenticator_from_env()?;
 
@@ -214,6 +216,7 @@ fn client_policy_from_env(
         authz,
         audit: Arc::new(AuditLog::new()),
         proxy,
+        store: Some(store),
     }))
 }
 
@@ -273,10 +276,15 @@ fn jwt_config_from_env() -> mqtt_auth::token::TokenConfig {
 /// `MQTTD_DURABLE_SESSIONS` opts into the **durable, consensus-backed** store
 /// (ADR 0006/0007): a lease group over the peer mesh replicates each persistent
 /// session's log. Opt-in and loudly logged, like every cluster feature.
+type HubHandle = (
+    mpsc::UnboundedSender<hub::HubCommand>,
+    Arc<dyn SessionStore>,
+);
+
 async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
-) -> Result<mpsc::UnboundedSender<hub::HubCommand>, Box<dyn std::error::Error>> {
+) -> Result<HubHandle, Box<dyn std::error::Error>> {
     let durable = non_empty_env("MQTTD_DURABLE_SESSIONS")
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if durable {
@@ -293,20 +301,24 @@ async fn start_hub(
             founder,
         )
         .await;
-        let (mut hub, hub_tx) =
-            hub::Hub::with_config_and_placement(node_id.clone(), store, Some(placement.clone()));
+        let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
+            node_id.clone(),
+            store.clone(),
+            Some(placement.clone()),
+        );
         hub.attach_durable_plane(plane);
         tokio::spawn(hub.run());
-        Ok(hub_tx)
+        Ok((hub_tx, store))
     } else {
-        let store = MemorySessionStore::with_limits(queue_limits_from_env()?);
+        let store: Arc<dyn SessionStore> =
+            Arc::new(MemorySessionStore::with_limits(queue_limits_from_env()?));
         let (hub, hub_tx) = hub::Hub::with_config_and_placement(
             node_id.clone(),
-            Arc::new(store),
+            store.clone(),
             Some(placement.clone()),
         );
         tokio::spawn(hub.run());
-        Ok(hub_tx)
+        Ok((hub_tx, store))
     }
 }
 

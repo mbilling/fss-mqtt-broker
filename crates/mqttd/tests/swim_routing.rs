@@ -279,6 +279,7 @@ async fn start_proxy_node(
             placement: placement.clone(),
             connector: None, // plaintext mesh
         }),
+        store: None,
     });
     let (hub, hub_tx) = Hub::with_config(
         node_id.clone(),
