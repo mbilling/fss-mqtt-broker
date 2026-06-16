@@ -30,6 +30,7 @@
 //! policy remains a hardening item.
 
 use bytes::Bytes;
+use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::PeerMessage;
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
@@ -221,6 +222,16 @@ pub enum HubCommand {
         /// The original publish `QoS` (local downgrade still applies).
         qos: QoS,
     },
+    /// A durable-plane frame (consensus / session-log replication, ADR 0006/0007)
+    /// from `node`, routed to the [`DurablePlane`]. The hub spawns its handling so
+    /// the (potentially slow) raft dispatch never blocks the actor loop, and sends
+    /// any reply back over `node`'s link.
+    DurableFrame {
+        /// The peer the frame arrived from (where a reply is sent).
+        node: NodeId,
+        /// The durable-plane frame to route.
+        frame: PeerMessage,
+    },
 }
 
 /// A connected peer node's link.
@@ -258,6 +269,9 @@ pub struct Hub {
     /// Durable session/queue storage. `Arc` so connections can share it (e.g. for
     /// the durable QoS-2 dedup window) — ADR 0007 §5.
     store: Arc<dyn SessionStore>,
+    /// The durable-plane endpoint (consensus + replication), when durable sessions
+    /// are enabled (ADR 0007). `None` for the single-node / non-durable default.
+    durable_plane: Option<DurablePlane>,
     /// Retained message storage.
     retained: Box<dyn RetainedStore>,
     /// Connected peer nodes.
@@ -311,6 +325,7 @@ impl Hub {
                 table: SubscriptionTable::new(),
                 inflight: HashMap::new(),
                 store,
+                durable_plane: None,
                 retained: Box::new(MemoryRetainedStore::new()),
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
@@ -318,6 +333,13 @@ impl Hub {
             },
             tx,
         )
+    }
+
+    /// Attach the durable-plane endpoint (consensus + replication) before
+    /// [`run`](Self::run). Enables routing of [`HubCommand::DurableFrame`]s and
+    /// peer (de)registration on the plane. Only set when durable sessions are on.
+    pub fn attach_durable_plane(&mut self, plane: DurablePlane) {
+        self.durable_plane = Some(plane);
     }
 
     /// Run the hub event loop until all command senders are dropped.
@@ -375,6 +397,9 @@ impl Hub {
                 }
                 HubCommand::PeerDead { node } => {
                     self.peer_dead(&node);
+                }
+                HubCommand::DurableFrame { node, frame } => {
+                    self.handle_durable_frame(&node, frame);
                 }
                 HubCommand::RemoteInterest { node, filters } => {
                     debug!(node = %node.0, filters = filters.len(), "remote interest updated");
@@ -780,6 +805,11 @@ impl Hub {
         let _ = tx.send(PeerMessage::Interest {
             filters: self.table.filters(),
         });
+        // Register the link with the durable plane (consensus + replication) so its
+        // RPCs to this peer route over the same channel.
+        if let Some(plane) = &self.durable_plane {
+            plane.register(&node, tx.clone());
+        }
         self.peers.insert(node, Peer { conn_id, tx });
     }
 
@@ -791,6 +821,9 @@ impl Hub {
         info!(peer = %node.0, "peer link lost");
         self.peers.remove(node);
         self.remote_interest.remove(node);
+        if let Some(plane) = &self.durable_plane {
+            plane.fail(node);
+        }
     }
 
     /// Drop all routing state for a node the failure detector confirmed dead.
@@ -803,6 +836,26 @@ impl Hub {
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
         }
+        if let Some(plane) = &self.durable_plane {
+            plane.fail(node);
+        }
+    }
+
+    /// Route a durable-plane frame from `node`: spawn its handling (so a slow raft
+    /// dispatch never blocks the actor loop) and send any reply back over the peer's
+    /// link. A no-op when no durable plane is attached.
+    fn handle_durable_frame(&self, node: &NodeId, frame: PeerMessage) {
+        let Some(plane) = self.durable_plane.clone() else {
+            return;
+        };
+        let reply_to = self.peers.get(node).map(|p| p.tx.clone());
+        tokio::spawn(async move {
+            if let Some(reply) = plane.handle(frame).await {
+                if let Some(tx) = reply_to {
+                    let _ = tx.send(reply);
+                }
+            }
+        });
     }
 
     /// Send this node's current interest snapshot to all connected peers.

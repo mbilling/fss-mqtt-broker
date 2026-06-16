@@ -377,18 +377,17 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             // connection (ADR 0005), handled at accept time — never mid-link.
             warn!("unexpected ProxyHello on established peer link");
         }
-        PeerMessage::Replicate { .. } | PeerMessage::ReplicateAck { .. } => {
-            // Session-log replication (ADR 0006 step 3b) is not yet wired into the
-            // live hub: the transport and follower handler exist
-            // (`mqtt_cluster::repl_net`) but are driven only in tests until the
-            // durable backend is integrated (step 4). Drop unexpected frames.
-            warn!("replication frame received but the durable backend is not yet wired in");
-        }
-        PeerMessage::RaftRpc { .. } | PeerMessage::RaftRpcReply { .. } => {
-            // Lease-group consensus RPCs (ADR 0006 step 3b-ii mesh network): the
-            // network and dispatcher exist (`mqtt_cluster::raft_mesh`) but the lease
-            // group is not yet run by the live hub (step 4). Drop until then.
-            warn!("raft consensus frame received but the lease group is not yet wired in");
+        frame @ (PeerMessage::Replicate { .. }
+        | PeerMessage::ReplicateAck { .. }
+        | PeerMessage::RaftRpc { .. }
+        | PeerMessage::RaftRpcReply { .. }) => {
+            // Durable-plane frames (ADR 0006/0007): consensus RPCs and session-log
+            // replication. Routed to the hub, which dispatches them to the
+            // `DurablePlane` (a no-op until durable sessions are enabled, step 4f).
+            let _ = hub.send(HubCommand::DurableFrame {
+                node: remote.clone(),
+                frame,
+            });
         }
     }
 }

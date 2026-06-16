@@ -230,8 +230,13 @@ phasing. The durable backend implementing `SessionStore`.
       - *real `LeaseSource`* over `raft.client_write(Assign)`; the durable store +
         lease group + `DurablePlane` constructed at startup behind
         `MQTTD_DURABLE_SESSIONS` (single-node path keeps `MemorySessionStore`).
-      - *peer-pump wiring*: drive `DurablePlane::register`/`fail`/`handle` from the
-        peer link lifecycle; *membership reconciler driver* off SWIM (debounced).
+      - *hub plane routing* ✅ *(done)*: the hub holds an optional `DurablePlane`
+        (`attach_durable_plane`); `forward_inbound` routes the four durable-plane
+        frames to a new `HubCommand::DurableFrame`, which the hub **spawns** to
+        `plane.handle` (off the actor loop) and replies over the peer's link;
+        `register`/`fail` ride `PeerConnected`/`PeerDisconnected`/`PeerDead`. No-op
+        until a plane is attached (single-node path unchanged; all suites green).
+      - *membership reconciler driver* off SWIM (debounced).
       - *connection QoS-2 dedup* through the shared store.
       Warrants multi-node integration tests (swim-routing style).
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
