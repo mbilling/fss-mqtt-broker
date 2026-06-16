@@ -44,7 +44,7 @@ shared subscriptions.
 | B | Ownership ring over live membership | ✅ Done |
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
-| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a, 4b, 4c**; **4d–4f** ([ADR 0007](adr/0007-durable-store-integration.md)) remain |
+| E | Replicated session-log backend | 🔶 In progress — components done (1–2, 3a, 3b, 3c) + **4a–4d**; **4e (durable cluster store) + 4f (mqttd wiring)** remain |
 | F | Takeover / handoff protocol | ⬜ Not started (needs E) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
@@ -206,8 +206,14 @@ phasing. The durable backend implementing `SessionStore`.
       quorum-replicates. *(Refines ADR 0007 §4: the plane is a shared handle the peer
       links route to, keeping consensus/replication off the hub actor's serial loop;
       the live peer-pump I/O wiring lands in 4f with the store swap.)*
-    - **4d — membership reconciler**: SWIM membership → openraft voters (debounced,
-      deterministic bootstrap).
+    - **4d — membership reconciler** ✅ *(done)*: `mqtt-cluster::lease_membership` —
+      a pure `MembershipReconciler::decide(view, desired) -> MembershipAction`
+      (deterministic bootstrap by smallest id; only the leader reconciles voters;
+      learners-then-promote), plus `apply_action` (initialize / add_learner +
+      change_membership) and `raft_view` (from metrics). Tested: the pure policy
+      exhaustively, and a live test where the reconciler bootstraps a node, grows the
+      group to a second over the wire, and a committed lease replicates to the new
+      voter. (Debounce is the driver's job, 4f.)
     - **4e — durable cluster `SessionStore`**: lease → epoch → per-group `ClusterLog`
       → `ReplicatedSessionStore`; lazy lease acquisition. Multi-node test: an enqueue
       survives the owner's death.
