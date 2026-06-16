@@ -45,7 +45,7 @@ shared subscriptions.
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
-| F | Takeover / handoff protocol | 🔶 In progress — **F-a, F-b** done (recovery mechanism + recovery-read RPC); F-c, F-d remain |
+| F | Takeover / handoff protocol | 🔶 In progress — **F-a, F-b, F-c** done (recovery mechanism + recovery-read RPC + rebuild on takeover); F-d remains |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
@@ -295,9 +295,19 @@ serving. Decomposed:
   correlation + `fail_node` on link drop; `DurablePlane::handle` answers a
   `ReplicaRead` from its local `ReplicaState`. A test over the wire: after replicating
   to a follower, the owner reads that replica's log back; an unreachable peer → `None`.
-- **F-c — rebuild on takeover**: `GroupRoutedLog` recovers a key's `ClusterLog` from
-  a quorum recovery-read when it (re)builds the log at a bumped epoch — lazily, on
-  the reconnect that lands on the new owner.
+- **F-c — rebuild on takeover** ✅ *(done)*: `GroupRoutedLog` recovers each key once,
+  on its first touch after a takeover. The new owner was a replica, so its committed
+  copy lives in the follower `ReplicaState` it shares with the `DurablePlane`;
+  `recover_key` reads that local copy plus a quorum of peers (`read_replica`), merges
+  them (`merge_replica_logs`), and `seed_key`s the group's `ClusterLog` so the
+  recovered queue replays and appends continue at the next offset — `NoQuorum` if
+  fewer than a quorum can be read (recovery would be unsafe). `build_durable_node`
+  now threads one shared `ReplicaState` into both the plane and the store. Tested:
+  a `GroupRoutedLog` whose shared `ReplicaState` is pre-seeded with a key's committed
+  entries recovers and replays them, then continues appending past the watermark.
+  *Carried:* the per-group log cache is not epoch-invalidated (a regain-after-loss
+  self-fences but never serves a stale cache divergently); recovery adds one quorum
+  read on the first touch of each key (a fresh session simply recovers to empty).
 - **F-d — integration test**: kill the owner mid-session → a replica serves the
   reconnect with no loss of durably-enqueued messages; concurrent reconnect during
   promotion does not double-own (split-brain check, via epoch fencing); redelivery

@@ -299,6 +299,34 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     pub fn quorum(&self) -> usize {
         self.quorum
     }
+
+    /// The leadership epoch this log writes at (its lease's epoch).
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.lease.epoch
+    }
+
+    /// Seed `key`'s committed state from `entries` recovered from a quorum of
+    /// replicas on takeover (workstream F). Idempotent and non-clobbering: only a
+    /// key with no state yet is seeded, so a re-recovery or a concurrent builder is
+    /// a no-op. Appends then continue from the recovered watermark.
+    pub async fn seed_key(&self, key: &str, entries: Vec<LogEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        let ks = state.entry(key.to_string()).or_default();
+        if !ks.entries.is_empty() || ks.committed != 0 {
+            return; // already has state — do not clobber
+        }
+        let mut lowest: Option<Offset> = None;
+        for entry in entries {
+            lowest = Some(lowest.map_or(entry.offset, |l| l.min(entry.offset)));
+            ks.committed = ks.committed.max(entry.offset);
+            ks.entries.insert(entry.offset, entry.record);
+        }
+        ks.truncated = lowest.map_or(0, |l| l.saturating_sub(1));
+    }
 }
 
 /// Merge per-replica reads of one key's log into its recovered committed log: the

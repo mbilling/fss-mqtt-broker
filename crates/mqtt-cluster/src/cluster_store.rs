@@ -24,7 +24,7 @@
 //!   without standing up the consensus group; the openraft-backed source is wired in
 //!   at step 4f.
 
-use crate::cluster_log::{ClusterLog, ReplicaTransport};
+use crate::cluster_log::{merge_replica_logs, ClusterLog, ReplicaState, ReplicaTransport};
 use crate::lease::{Epoch, OwnershipLease};
 use crate::lease_raft::{GroupId, RaftNodeId};
 use crate::lease_store::LeaseStore;
@@ -33,7 +33,7 @@ use crate::NodeId;
 use async_trait::async_trait;
 use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Yields the current ownership-lease epoch for a group this node owns.
@@ -87,15 +87,23 @@ impl LeaseSource for LocalLeaseSource {
 }
 
 /// A [`ReplicatedLog`] that routes each key to its placement group's
-/// [`ClusterLog`], building (and caching) that log lazily on first touch.
+/// [`ClusterLog`], building (and caching) that log lazily on first touch, and
+/// **recovering** each key from a quorum of replicas the first time it is served
+/// after a takeover (workstream F).
 pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone> {
     local: NodeId,
     placement: Arc<RwLock<Placement>>,
     transport: T,
     leases: S,
+    /// This node's own follower copy of the session logs (shared with the
+    /// `DurablePlane`). On takeover this node was a replica, so its committed copy of
+    /// a key lives here — it is one of the quorum reads recovery merges.
+    local_replicas: Arc<Mutex<ReplicaState>>,
     /// Per-group `ClusterLog`, built lazily. Cached so a group's offset state is
     /// stable across calls.
     logs: Mutex<BTreeMap<GroupId, Arc<ClusterLog<T>>>>,
+    /// Keys already recovered (so the recovery-read runs once per key).
+    recovered: Mutex<BTreeSet<String>>,
 }
 
 impl<S: LeaseSource, T: ReplicaTransport + Clone> std::fmt::Debug for GroupRoutedLog<S, T> {
@@ -108,15 +116,24 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> std::fmt::Debug for GroupRoute
 
 impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
     /// Build a group-routed log for `local`, resolving ownership/replica-sets from
-    /// `placement`, replicating over `transport`, and acquiring leases from `leases`.
+    /// `placement`, replicating over `transport`, acquiring leases from `leases`, and
+    /// recovering from `local_replicas` + peer reads on takeover.
     #[must_use]
-    pub fn new(local: NodeId, placement: Arc<RwLock<Placement>>, transport: T, leases: S) -> Self {
+    pub fn new(
+        local: NodeId,
+        placement: Arc<RwLock<Placement>>,
+        transport: T,
+        leases: S,
+        local_replicas: Arc<Mutex<ReplicaState>>,
+    ) -> Self {
         Self {
             local,
             placement,
             transport,
             leases,
+            local_replicas,
             logs: Mutex::new(BTreeMap::new()),
+            recovered: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -126,18 +143,15 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The `ClusterLog` for `key`'s group, built lazily. Errors with
-    /// [`ReplError::NotOwner`] if this node does not own the group.
+    /// The `ClusterLog` for `key`'s group, built and recovered lazily. Errors with
+    /// [`ReplError::NotOwner`] if this node does not own the group, or
+    /// [`ReplError::NoQuorum`] if recovery cannot reach a quorum of replicas.
     async fn log_for_key(&self, key: &str) -> Result<Arc<ClusterLog<T>>, ReplError> {
         // Keys are `q/<client>` / `m/<client>`; the client follows the 2-byte prefix.
         let client = key.get(2..).unwrap_or(key);
         let group = group_of(client);
 
-        if let Some(log) = self.cache().get(&group).cloned() {
-            return Ok(log);
-        }
-
-        // Resolve ownership + replica set without holding the lock across the await.
+        // Resolve ownership + replica set without holding a lock across an await.
         let replica_set = {
             let placement = self
                 .placement
@@ -149,20 +163,73 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
             placement.group_replica_set(group)
         };
 
-        let epoch = self.leases.epoch_for(group).await?;
-        let lease = OwnershipLease {
-            holder: self.local.clone(),
-            epoch,
+        // Get or build the group's ClusterLog. Resolve the cache hit into an owned
+        // `Arc` and drop the guard before any await (the guard is not `Send`).
+        let cached = self.cache().get(&group).cloned();
+        let log = if let Some(log) = cached {
+            log
+        } else {
+            let epoch = self.leases.epoch_for(group).await?;
+            let lease = OwnershipLease {
+                holder: self.local.clone(),
+                epoch,
+            };
+            let log = Arc::new(ClusterLog::new(
+                self.local.clone(),
+                lease,
+                &replica_set,
+                self.transport.clone(),
+            ));
+            // or_insert so concurrent builders converge on one canonical log.
+            self.cache().entry(group).or_insert(log).clone()
         };
-        let log = Arc::new(ClusterLog::new(
-            self.local.clone(),
-            lease,
-            &replica_set,
-            self.transport.clone(),
-        ));
-        // or_insert so concurrent builders converge on one canonical log (no
-        // divergent offset state).
-        Ok(self.cache().entry(group).or_insert(log).clone())
+
+        // Recover this key once: a new owner was a replica, so the committed log
+        // lives in the replica set (its own copy + peers). Seeding it lets the
+        // recovered queue replay (a fresh session simply recovers to empty).
+        let recover = !self
+            .recovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key);
+        if recover {
+            let recovered = self.recover_key(key, &replica_set).await?;
+            log.seed_key(key, recovered).await;
+            self.recovered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.to_string());
+        }
+        Ok(log)
+    }
+
+    /// Recover `key`'s committed log by reading a quorum of the replica set: this
+    /// node's own follower copy plus the reachable peers'. Errors with
+    /// [`ReplError::NoQuorum`] if fewer than a quorum can be read (recovery is unsafe
+    /// — a committed entry might live only on an unread replica).
+    async fn recover_key(
+        &self,
+        key: &str,
+        replica_set: &[NodeId],
+    ) -> Result<Vec<LogEntry>, ReplError> {
+        let quorum = replica_set.len() / 2 + 1;
+        // Local copy first (sync; the guard is dropped before any await).
+        let mut reads = vec![self
+            .local_replicas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries(key)];
+        let mut have = 1;
+        for replica in replica_set.iter().filter(|n| **n != self.local) {
+            if let Some(entries) = self.transport.read_replica(replica, key).await {
+                reads.push(entries);
+                have += 1;
+            }
+        }
+        if have < quorum {
+            return Err(ReplError::NoQuorum);
+        }
+        Ok(merge_replica_logs(&reads))
     }
 }
 
@@ -195,7 +262,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> ReplicatedLog for GroupRoutedL
 #[cfg(test)]
 mod tests {
     use super::{GroupRoutedLog, LeaseSource};
-    use crate::cluster_log::ReplicaState;
+    use crate::cluster_log::{ReplOp, ReplicaState};
     use crate::lease::Epoch;
     use crate::lease_raft::GroupId;
     use crate::peer::PeerMessage;
@@ -206,6 +273,7 @@ mod tests {
     use async_trait::async_trait;
     use mqtt_core::{ClientId, Message, QoS};
     use mqtt_storage::logged::ReplicatedSessionStore;
+    use mqtt_storage::repl::ReplicatedLog;
     use mqtt_storage::SessionStore;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::sync::mpsc;
@@ -227,7 +295,8 @@ mod tests {
 
     /// A follower: read replication frames off its link channel, apply to its
     /// `ReplicaState`, and ack on the owner's transport (in-process stand-in for the
-    /// peer link, which the wire tests already cover).
+    /// peer link, which the wire tests already cover). Also answers recovery-reads
+    /// (`ReplicaRead`) from its stored copy, as the real plane does.
     fn spawn_follower(
         transport: Arc<PeerReplicaTransport>,
         state: Arc<Mutex<ReplicaState>>,
@@ -235,9 +304,22 @@ mod tests {
     ) {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let PeerMessage::Replicate { req_id, epoch, op } = msg {
-                    let accepted = state.lock().unwrap().apply(epoch, &op);
-                    transport.complete_ack(req_id, accepted);
+                match msg {
+                    PeerMessage::Replicate { req_id, epoch, op } => {
+                        let accepted = state.lock().unwrap().apply(epoch, &op);
+                        transport.complete_ack(req_id, accepted);
+                    }
+                    PeerMessage::ReplicaRead { req_id, key } => {
+                        let entries = state
+                            .lock()
+                            .unwrap()
+                            .entries(&key)
+                            .into_iter()
+                            .map(|e| (e.offset, e.record))
+                            .collect();
+                        transport.complete_read(req_id, entries);
+                    }
+                    _ => {}
                 }
             }
         });
@@ -295,6 +377,7 @@ mod tests {
             placement.clone(),
             transport.clone(),
             FixedLease(1),
+            Arc::new(Mutex::new(ReplicaState::new())),
         ));
 
         let (group, client) = owned_group_and_client(&placement.read().unwrap());
@@ -398,6 +481,7 @@ mod tests {
             placement.clone(),
             Arc::new(PeerReplicaTransport::new()),
             FixedLease(1),
+            Arc::new(Mutex::new(ReplicaState::new())),
         ));
 
         let foreign = foreign_client(&placement.read().unwrap());
@@ -411,5 +495,53 @@ mod tests {
             store.enqueue(&foreign, &msg).await.is_err(),
             "a non-owned group must be refused"
         );
+    }
+
+    /// Takeover recovery: a new owner was a replica, so its committed copy of a key
+    /// lives in the shared follower `ReplicaState`. On the key's first touch the
+    /// store recovers it from a quorum of the replica set (here just this node's own
+    /// copy), replays the recovered entries, and continues appending after the
+    /// recovered watermark — the heart of workstream F.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn takeover_recovers_a_keys_log_from_the_shared_replica_state() {
+        let owner = nid("owner");
+        // A single-node group (quorum 1): recovery reads only this node's own copy.
+        let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        // This node was a replica: its follower copy already holds the committed
+        // queue (offsets 1, 2), applied at some prior epoch.
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        {
+            let mut r = replicas.lock().unwrap();
+            for (offset, record) in [(1u64, b"m1".to_vec()), (2u64, b"m2".to_vec())] {
+                r.apply(
+                    3,
+                    &ReplOp::Append {
+                        key: qkey.clone(),
+                        offset,
+                        record,
+                    },
+                );
+            }
+        }
+
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            Arc::new(PeerReplicaTransport::new()),
+            FixedLease(7),
+            replicas,
+        );
+
+        // First touch recovers the committed copy; the recovered entries replay.
+        let got = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(got.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(&got[1].record, b"m2");
+
+        // Appends continue after the recovered watermark (no offset reuse).
+        assert_eq!(log.append(&qkey, b"m3".to_vec()).await.unwrap(), 3);
+        assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 3);
     }
 }

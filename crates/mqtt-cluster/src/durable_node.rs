@@ -79,16 +79,20 @@ pub async fn build_durable_node(
     .await
     .expect("lease raft starts");
     let transport = Arc::new(PeerReplicaTransport::new());
-    let plane = DurablePlane::new(
-        raft.clone(),
-        network,
-        transport.clone(),
-        Arc::new(Mutex::new(ReplicaState::new())),
-    );
+    // One follower-copy `ReplicaState`, shared: the plane applies inbound Replicates
+    // into it, and the store reads it back for takeover recovery (workstream F).
+    let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+    let plane = DurablePlane::new(raft.clone(), network, transport.clone(), replicas.clone());
 
     // --- durable store over the shared transport ---
     let lease_source = LocalLeaseSource::new(lease_store.clone(), local);
-    let group_log = GroupRoutedLog::new(node_id, placement.clone(), transport, lease_source);
+    let group_log = GroupRoutedLog::new(
+        node_id,
+        placement.clone(),
+        transport,
+        lease_source,
+        replicas,
+    );
     let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::new(group_log));
 
     // --- driver: membership + lease assignment over the live placement ---
