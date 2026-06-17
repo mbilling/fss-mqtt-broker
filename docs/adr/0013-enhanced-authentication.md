@@ -76,23 +76,35 @@ inevitable failure, to blunt user enumeration (the verify-time difference remain
 a known minor side channel). This reuses the `ring` primitive already vetted for
 the gossip MAC (ADR 0003).
 
-### 4. Scope: initial authentication only
+### 4. Re-authentication reuses the same exchange in the serve loop
 
-This ADR covers enhanced auth **at connect**. Post-connect **re-authentication**
-(an AUTH with reason `0x19` mid-session) is deferred: it needs a hook in the
-serve loop and a policy for what a failed re-auth does to an established session,
-and is independent of getting the connect-time exchange right.
+Post-connect **re-authentication** ([MQTT-4.12]) is supported for client-initiated
+exchanges. An AUTH packet arriving on an established session is intercepted in the
+serve loop: reason `0x19` (Re-authenticate) starts a fresh exchange driven by the
+**same** challenge/response code as connect-time auth (`drive_auth_exchange`),
+differing only at the edges — the Authentication Method must match the one from
+CONNECT [MQTT-4.12.1-1] (else DISCONNECT `0x82`), success is signalled with an
+AUTH `0x00` (not a CONNACK) and **updates the principal** used for subsequent ACL
+checks, and failure sends DISCONNECT `0x87` and closes. Any other AUTH on an
+established session (a stray `0x18`/`0x00`, or `0x19` when connect did not use
+enhanced auth) is a protocol error (DISCONNECT `0x82`).
+
+**Server-initiated** re-auth (the server sending AUTH `0x19` to demand the client
+re-authenticate, e.g. on credential expiry) is deferred: it needs a trigger
+mechanism and interacts with the select loop's outbound path, and is independent
+of the client-initiated case.
 
 ## Consequences
 
 - **Good:** secrets are proven, not transmitted; pluggable per method via one small
   trait pair; the single-shot path and every existing authenticator are untouched;
   the reference HMAC mechanism is real crypto with constant-time verification.
-- **Cost / limits:** re-authentication (`0x19`) is not yet supported (§4); the AUTH
+- **Cost / limits:** server-initiated re-auth is not yet supported (§4); the AUTH
   exchange blocks on the client between rounds with no dedicated timeout (the same
-  surface as the existing pre-CONNACK reads); enumeration resistance is partial
-  (§3); the reference mechanism configures secrets in memory — a real deployment
-  would back it with a secret store.
+  surface as the existing pre-CONNACK reads), and a client-initiated re-auth
+  likewise stalls outbound delivery for its (brief) duration; enumeration resistance
+  is partial (§3); the reference mechanism configures secrets in memory — a real
+  deployment would back it with a secret store.
 
 ## Alternatives considered
 

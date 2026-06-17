@@ -12,13 +12,13 @@ use crate::aliases::{InboundAliases, OutboundAliases};
 use crate::hub::{HubCommand, Outbound};
 use bytes::Bytes;
 use mqtt_auth::{
-    basic::BasicAuthenticator, AllowAll, AuthStep, Authenticator, Authorizer, Credentials,
-    EnhancedAuthenticator, Identity,
+    basic::BasicAuthenticator, AllowAll, AuthSession, AuthStep, Authenticator, Authorizer,
+    Credentials, EnhancedAuthenticator, Identity,
 };
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{
-    packet::{Auth, ConnAck, Connect, Publish, SubAck},
+    packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
 };
 use mqtt_core::{is_shared_filter, parse_shared, ClientId, Message};
@@ -50,12 +50,20 @@ const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
 const CONNACK_NOT_AUTHORIZED: u8 = 0x05;
 /// SUBACK return code: failure (subscription refused) [MQTT-3.9.3].
 const SUBACK_FAILURE: u8 = 0x80;
+/// AUTH reason code: success (the enhanced-auth exchange completed) (ADR 0013).
+const AUTH_SUCCESS: u8 = 0x00;
 /// AUTH reason code: continue the enhanced-authentication exchange (ADR 0013).
 const AUTH_CONTINUE: u8 = 0x18;
+/// AUTH reason code: re-authenticate an established session (ADR 0013 §4).
+const AUTH_REAUTH: u8 = 0x19;
 /// CONNACK reason (v5): not authorized.
 const CONNACK_V5_NOT_AUTHORIZED: u8 = 0x87;
 /// CONNACK reason (v5): the requested authentication method is not supported.
 const CONNACK_V5_BAD_AUTH_METHOD: u8 = 0x8C;
+/// DISCONNECT reason (v5): protocol error.
+const DISCONNECT_PROTOCOL_ERROR: u8 = 0x82;
+/// DISCONNECT reason (v5): not authorized (a failed re-authentication, ADR 0013 §4).
+const DISCONNECT_NOT_AUTHORIZED: u8 = 0x87;
 /// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
 /// topic alias the server will accept on a connection.
 const SERVER_TOPIC_ALIAS_MAX: u16 = 16;
@@ -322,8 +330,7 @@ where
         return Ok(()); // rejected; CONNACK/close already handled
     };
 
-    // The version-agnostic session policy (ADR 0009): whether to start clean, and how
-    // long the session is retained after disconnect.
+    // Version-agnostic session policy (ADR 0009): clean-start + retention interval.
     let (clean_start, session_expiry) = session_policy(&connect);
 
     // Session affinity (ADR 0005): a retained session whose placement owner is another
@@ -343,12 +350,7 @@ where
     }
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
-    let will = connect.last_will.map(|w| Message {
-        topic: w.topic,
-        payload: w.payload,
-        qos: w.qos,
-        retain: w.retain,
-    });
+    let will = connect.last_will.map(into_will);
     let (out_tx, mut out_rx): (Outbound, _) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = oneshot::channel();
     // The client's Receive Maximum bounds how many unacked QoS>0 PUBLISHes the hub
@@ -387,12 +389,18 @@ where
         .await?;
     debug!(client = %client.0, session_present, "CONNECT accepted");
 
+    // The connect Authentication Method (if any) bounds a later re-auth (ADR 0013 §4).
+    let auth_method = connect
+        .properties
+        .authentication_method()
+        .map(str::to_string);
     let result = serve(
         &mut reader,
         &mut writer,
         &hub,
         &client,
-        &principal,
+        principal,
+        auth_method,
         policy,
         &mut out_rx,
         connect.keep_alive,
@@ -701,30 +709,66 @@ where
 
     let mut session = authenticator.start();
     // The CONNECT's initial Authentication Data seeds the exchange.
-    let mut step = session.step(
+    let first = session.step(
         client,
         connect.properties.authentication_data().unwrap_or_default(),
     );
+    match drive_auth_exchange(reader, writer, client, method, &mut session, first).await? {
+        ExchangeResult::Success(id) => {
+            policy.audit.record(
+                "auth.success",
+                Some(&id.subject),
+                &format!("client {} via enhanced:{method}", client.0),
+            );
+            Ok(Some(id))
+        }
+        ExchangeResult::Failed => {
+            warn!(client = %client.0, method, "enhanced authentication failed");
+            policy.audit.record(
+                "auth.failure",
+                Some(&client.0),
+                &format!("rejected enhanced:{method}"),
+            );
+            reject_connack(writer, CONNACK_V5_NOT_AUTHORIZED).await?;
+            Ok(None)
+        }
+        ExchangeResult::Aborted => Ok(None),
+    }
+}
+
+/// The terminal outcome of an enhanced-auth challenge/response exchange (ADR 0013).
+enum ExchangeResult {
+    /// The mechanism authenticated the client as this identity.
+    Success(Identity),
+    /// The mechanism rejected the client.
+    Failed,
+    /// The exchange could not complete (EOF, an unexpected packet, or the method
+    /// changed mid-exchange): the caller must just close, with no further packet.
+    Aborted,
+}
+
+/// Drive the challenge/response rounds of an exchange, starting from `first` (the
+/// step the mechanism produced from the initiating packet's data). Sends
+/// AUTH(Continue) challenges and reads the client's AUTH(Continue) replies,
+/// enforcing that the Authentication Method is held constant, until the mechanism
+/// resolves. Shared by connect-time enhanced auth and mid-session re-auth.
+async fn drive_auth_exchange<R, W>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    client: &ClientId,
+    method: &str,
+    session: &mut Box<dyn AuthSession>,
+    first: AuthStep,
+) -> Result<ExchangeResult, NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut step = first;
     loop {
         match step {
-            AuthStep::Success(id) => {
-                policy.audit.record(
-                    "auth.success",
-                    Some(&id.subject),
-                    &format!("client {} via enhanced:{method}", client.0),
-                );
-                return Ok(Some(id));
-            }
-            AuthStep::Failure => {
-                warn!(client = %client.0, method, "enhanced authentication failed");
-                policy.audit.record(
-                    "auth.failure",
-                    Some(&client.0),
-                    &format!("rejected enhanced:{method}"),
-                );
-                reject_connack(writer, CONNACK_V5_NOT_AUTHORIZED).await?;
-                return Ok(None);
-            }
+            AuthStep::Success(id) => return Ok(ExchangeResult::Success(id)),
+            AuthStep::Failure => return Ok(ExchangeResult::Failed),
             AuthStep::Challenge(data) => {
                 let mut props = mqtt_codec::Properties::new();
                 props.0.push(mqtt_codec::Property::AuthenticationMethod(
@@ -742,22 +786,17 @@ where
 
                 // The reply must be an AUTH(Continue) keeping the same method.
                 let reply = match reader.next_packet().await? {
-                    Some(Packet::Auth(a)) => a,
+                    Some(Packet::Auth(a)) if a.reason == AUTH_CONTINUE => a,
                     Some(other) => {
                         warn!(client = %client.0, packet = ?other.packet_type(),
-                              "expected AUTH during enhanced auth; closing");
-                        return Ok(None);
+                              "expected AUTH(continue); aborting auth exchange");
+                        return Ok(ExchangeResult::Aborted);
                     }
-                    None => return Ok(None), // EOF mid-exchange
+                    None => return Ok(ExchangeResult::Aborted), // EOF mid-exchange
                 };
-                if reply.reason != AUTH_CONTINUE {
-                    warn!(client = %client.0, reason = reply.reason, "unexpected AUTH reason; closing");
-                    return Ok(None);
-                }
                 if reply.properties.authentication_method() != Some(method) {
-                    warn!(client = %client.0, "AUTH method changed mid-exchange; closing");
-                    reject_connack(writer, CONNACK_V5_BAD_AUTH_METHOD).await?;
-                    return Ok(None);
+                    warn!(client = %client.0, "AUTH method changed mid-exchange; aborting");
+                    return Ok(ExchangeResult::Aborted);
                 }
                 step = session.step(
                     client,
@@ -765,6 +804,109 @@ where
                 );
             }
         }
+    }
+}
+
+/// Convert a CONNECT's Last Will into a deferred will [`Message`].
+fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
+    Message {
+        topic: w.topic,
+        payload: w.payload,
+        qos: w.qos,
+        retain: w.retain,
+    }
+}
+
+/// Send a v5 DISCONNECT with `reason` and no properties.
+async fn disconnect<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    reason: u8,
+) -> Result<(), NetError> {
+    writer
+        .send(&Packet::Disconnect(Disconnect {
+            reason,
+            properties: mqtt_codec::Properties::new(),
+        }))
+        .await
+}
+
+/// Handle a client-initiated re-authentication (AUTH `0x19`) on an established
+/// session (ADR 0013 §4). On success, updates `principal` and answers AUTH(Success);
+/// on failure or protocol violation, sends DISCONNECT. Returns `Ok(true)` to keep
+/// serving, `Ok(false)` to close.
+async fn reauthenticate<R, W>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    client: &ClientId,
+    auth: &Auth,
+    connect_method: Option<&str>,
+    principal: &mut Identity,
+    policy: &ConnPolicy,
+) -> Result<bool, NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Only a Re-authenticate (0x19) initiates an exchange in the serve loop; any
+    // other AUTH is a protocol error.
+    if auth.reason != AUTH_REAUTH {
+        warn!(client = %client.0, reason = auth.reason, "unexpected AUTH on established session");
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        return Ok(false);
+    }
+    // Re-auth requires that connect used enhanced auth, with the **same** method
+    // [MQTT-4.12.1-1].
+    let Some(method) = auth
+        .properties
+        .authentication_method()
+        .filter(|m| connect_method == Some(*m))
+    else {
+        warn!(client = %client.0, "re-auth method missing or changed; disconnecting");
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        return Ok(false);
+    };
+    let Some(authenticator) = policy.enhanced.as_ref().filter(|a| a.method() == method) else {
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        return Ok(false);
+    };
+
+    let mut session = authenticator.start();
+    let first = session.step(
+        client,
+        auth.properties.authentication_data().unwrap_or_default(),
+    );
+    match drive_auth_exchange(reader, writer, client, method, &mut session, first).await? {
+        ExchangeResult::Success(id) => {
+            info!(client = %client.0, subject = %id.subject, "re-authenticated");
+            policy.audit.record(
+                "auth.reauth",
+                Some(&id.subject),
+                &format!("client {} via enhanced:{method}", client.0),
+            );
+            *principal = id;
+            let mut props = mqtt_codec::Properties::new();
+            props.0.push(mqtt_codec::Property::AuthenticationMethod(
+                method.to_string(),
+            ));
+            writer
+                .send(&Packet::Auth(Auth {
+                    reason: AUTH_SUCCESS,
+                    properties: props,
+                }))
+                .await?;
+            Ok(true)
+        }
+        ExchangeResult::Failed => {
+            warn!(client = %client.0, "re-authentication failed; disconnecting");
+            policy.audit.record(
+                "auth.reauth.failure",
+                Some(&client.0),
+                &format!("rejected enhanced:{method}"),
+            );
+            disconnect(writer, DISCONNECT_NOT_AUTHORIZED).await?;
+            Ok(false)
+        }
+        ExchangeResult::Aborted => Ok(false),
     }
 }
 
@@ -822,7 +964,8 @@ async fn serve<R, W>(
     writer: &mut FrameWriter<W>,
     hub: &mpsc::UnboundedSender<HubCommand>,
     client: &ClientId,
-    principal: &Identity,
+    mut principal: Identity,
+    auth_method: Option<String>,
     policy: &ConnPolicy,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
@@ -838,9 +981,8 @@ where
         Duration::from_secs(u64::from(keep_alive) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN)
     });
     let mut deadline = grace.map(|g| Instant::now() + g);
-    // Inbound QoS 2 packet ids seen but not yet released (PUBREL); forwarding
-    // only on first sight is what makes inbound QoS 2 exactly-once
-    // [MQTT-4.3.3-2].
+    // Inbound QoS 2 ids seen but not yet PUBREL-released; forwarding only on first
+    // sight is what makes inbound QoS 2 exactly-once [MQTT-4.3.3-2].
     let mut qos2_inbound: HashSet<u16> = HashSet::new();
 
     loop {
@@ -856,8 +998,15 @@ where
                 deadline = grace.map(|g| Instant::now() + g);
                 match inbound? {
                     None => return Ok(false), // EOF without DISCONNECT
+                    // An AUTH on an established session is a re-authentication
+                    // (ADR 0013 §4); it may update the principal used for ACL checks.
+                    Some(Packet::Auth(auth)) => {
+                        if !reauthenticate(reader, writer, client, &auth, auth_method.as_deref(), &mut principal, policy).await? {
+                            return Ok(false);
+                        }
+                    }
                     Some(packet) => {
-                        if handle_inbound(packet, writer, hub, client, principal, policy, &mut qos2_inbound, inbound_aliases).await? {
+                        if handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, inbound_aliases).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
                     }
@@ -1194,6 +1343,49 @@ mod tests {
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V5), FrameWriter::new(wh, V5))
+    }
+
+    /// An AUTH packet for the HMAC-SHA256 method with the given reason and data.
+    fn hmac_auth(reason: u8, data: &[u8]) -> Packet {
+        Packet::Auth(Auth {
+            reason,
+            properties: Properties(vec![
+                Property::AuthenticationMethod("HMAC-SHA256".into()),
+                Property::AuthenticationData(Bytes::copy_from_slice(data)),
+            ]),
+        })
+    }
+
+    /// HMAC-SHA256 proof over `nonce` with alice's secret.
+    fn alice_proof(nonce: &[u8]) -> Vec<u8> {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"alice-secret");
+        ring::hmac::sign(&key, nonce).as_ref().to_vec()
+    }
+
+    /// Drive a full connect-time HMAC enhanced-auth handshake to a successful CONNACK.
+    async fn connect_and_authenticate(reader: &mut Reader, writer: &mut Writer) {
+        writer
+            .send(&connect_v5(
+                "c",
+                vec![
+                    Property::AuthenticationMethod("HMAC-SHA256".into()),
+                    Property::AuthenticationData(Bytes::from_static(b"alice")),
+                ],
+            ))
+            .await
+            .unwrap();
+        let nonce = match recv(reader).await {
+            Some(Packet::Auth(a)) => a.properties.authentication_data().unwrap().to_vec(),
+            other => panic!("expected AUTH challenge, got {other:?}"),
+        };
+        writer
+            .send(&hmac_auth(0x18, &alice_proof(&nonce)))
+            .await
+            .unwrap();
+        match recv(reader).await {
+            Some(Packet::ConnAck(a)) => assert_eq!(a.code, 0, "connect auth succeeds"),
+            other => panic!("expected CONNACK, got {other:?}"),
+        }
     }
 
     fn connect_v5(id: &str, properties: Vec<Property>) -> Packet {
@@ -1822,6 +2014,81 @@ mod tests {
                 assert_eq!(a.code, super::CONNACK_V5_BAD_AUTH_METHOD, "bad auth method");
             }
             other => panic!("expected rejecting CONNACK, got {other:?}"),
+        }
+    }
+
+    /// After an enhanced-auth connect, a client-initiated AUTH `0x19` runs a fresh
+    /// exchange and the broker answers AUTH `0x00` on success (ADR 0013 §4).
+    #[tokio::test]
+    async fn v5_reauthentication_succeeds() {
+        let (mut reader, mut writer) = enhanced_conn();
+        connect_and_authenticate(&mut reader, &mut writer).await;
+
+        writer.send(&hmac_auth(0x19, b"alice")).await.unwrap();
+        let nonce = match recv(&mut reader).await {
+            Some(Packet::Auth(a)) => {
+                assert_eq!(a.reason, 0x18, "re-auth challenge");
+                a.properties.authentication_data().unwrap().to_vec()
+            }
+            other => panic!("expected AUTH challenge, got {other:?}"),
+        };
+        writer
+            .send(&hmac_auth(0x18, &alice_proof(&nonce)))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Auth(a)) => assert_eq!(a.reason, 0x00, "re-auth succeeded"),
+            other => panic!("expected AUTH success, got {other:?}"),
+        }
+    }
+
+    /// A wrong proof during re-auth disconnects the established session (0x87).
+    #[tokio::test]
+    async fn v5_reauthentication_wrong_proof_disconnects() {
+        let (mut reader, mut writer) = enhanced_conn();
+        connect_and_authenticate(&mut reader, &mut writer).await;
+
+        writer.send(&hmac_auth(0x19, b"alice")).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::Auth(_))));
+        // Proof under the wrong key.
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"wrong");
+        let proof = ring::hmac::sign(&key, b"x");
+        writer.send(&hmac_auth(0x18, proof.as_ref())).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Disconnect(d)) => {
+                assert_eq!(
+                    d.reason,
+                    super::DISCONNECT_NOT_AUTHORIZED,
+                    "failed re-auth disconnects"
+                );
+            }
+            other => panic!("expected DISCONNECT, got {other:?}"),
+        }
+    }
+
+    /// Re-authenticating with a different method than connect is a protocol error
+    /// (DISCONNECT 0x82) — the method must not change [MQTT-4.12.1-1].
+    #[tokio::test]
+    async fn v5_reauthentication_method_change_is_protocol_error() {
+        let (mut reader, mut writer) = enhanced_conn();
+        connect_and_authenticate(&mut reader, &mut writer).await;
+
+        writer
+            .send(&Packet::Auth(Auth {
+                reason: 0x19,
+                properties: Properties(vec![Property::AuthenticationMethod("SCRAM-SHA-1".into())]),
+            }))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Disconnect(d)) => {
+                assert_eq!(
+                    d.reason,
+                    super::DISCONNECT_PROTOCOL_ERROR,
+                    "method must not change"
+                );
+            }
+            other => panic!("expected DISCONNECT, got {other:?}"),
         }
     }
 

@@ -46,7 +46,7 @@ shared subscriptions.
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
 | F | Takeover / handoff protocol | ✅ Done — **F-a–F-d** (recovery mechanism + recovery-read RPC + rebuild on takeover + owner-death integration test) |
-| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); **topic aliases** done (ADR 0011); **flow control** done (ADR 0012); **enhanced auth** done (ADR 0013); re-auth + durable expiry deadline (0009 phase 3) remain |
+| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); **topic aliases** done (ADR 0011); **flow control** done (ADR 0012); **enhanced auth + re-auth** done (ADR 0013); durable expiry deadline (0009 phase 3) remains |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
 
@@ -356,8 +356,10 @@ for completeness and sequencing.
   multi-round challenge/response driven by the Authentication Method/Data
   properties and AUTH packets, plugged in via an `EnhancedAuthenticator`/
   `AuthSession` trait pair in mqtt-auth, with a reference HMAC-SHA256 mechanism
-  (constant-time verify). The single-shot credential path is untouched. Carried
-  limitation: post-connect **re-authentication** (`0x19`) is deferred.
+  (constant-time verify). The single-shot credential path is untouched.
+  Client-initiated **re-authentication** (AUTH `0x19`) reuses the same exchange in
+  the serve loop and updates the principal on success; carried limitation:
+  server-initiated re-auth is deferred.
 - The **durable expiry deadline** (ADR 0009 phase 3) remains.
 
 ## Sequencing
