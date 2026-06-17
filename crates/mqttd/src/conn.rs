@@ -792,7 +792,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             writer.send(&Packet::UnsubAck(u.pkid.into())).await?;
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
-        Packet::Disconnect => return Ok(true),
+        Packet::Disconnect(_) => return Ok(true),
         other => debug!(packet = ?other.packet_type(), "ignoring unexpected packet"),
     }
     Ok(false)

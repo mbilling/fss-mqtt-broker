@@ -362,7 +362,8 @@ async fn unacked_qos1_message_is_redelivered_with_dup_on_reconnect() {
 
     // Ack it this time; a further reconnect must deliver nothing.
     sub.puback(pkid).await;
-    sub.send(&Packet::Disconnect).await;
+    sub.send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     sub.expect_closed().await;
 
     let (mut sub, present) = Client::connect_opts(addr, "redeliver", false).await;
@@ -382,7 +383,8 @@ async fn offline_qos1_message_replays_at_qos1_until_acked() {
     sub.subscribe(1, "off/topic", QoS::AtLeastOnce).await;
     // Disconnect cleanly; waiting for the close guarantees the Detach is
     // enqueued at the hub before we publish.
-    sub.send(&Packet::Disconnect).await;
+    sub.send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     sub.expect_closed().await;
 
     // Publish QoS 1 while the subscriber is away; the PUBACK guarantees the
@@ -408,7 +410,8 @@ async fn offline_qos1_message_replays_at_qos1_until_acked() {
 
     // Ack it; after a further reconnect nothing may be redelivered.
     sub.puback(pkid).await;
-    sub.send(&Packet::Disconnect).await;
+    sub.send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     sub.expect_closed().await;
 
     let (mut sub, present) = Client::connect_opts(addr, "offline-q1", false).await;

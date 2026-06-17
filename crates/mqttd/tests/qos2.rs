@@ -464,7 +464,8 @@ async fn unacked_downstream_qos2_is_resent_with_dup_until_pubcomp() {
 
     // 6. Disconnect cleanly and resume once more: the handshake completed, so
     //    nothing may be redelivered.
-    sub.send(&Packet::Disconnect).await;
+    sub.send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     sub.expect_closed().await;
     let (mut sub, present) = Client::connect_opts(addr, "durable-q2", false).await;
     assert!(present, "session should still be present");

@@ -96,10 +96,11 @@ owner dies) and the **MQTT 5.0 codec** are the next milestones. See
 - **Cross-node takeover**: on an owner's death, a replica is promoted and serves the
   reconnect (workstream F) — so a durable session *survives* an owner loss
   end-to-end, not just on disk.
-- **MQTT 5.0**: properties, reason codes, session/message expiry, topic aliases,
-  flow control, shared subscriptions, enhanced auth. (Codec in progress per
-  [ADR 0008](docs/adr/0008-mqtt-5-codec.md): the property block and v5
-  CONNECT/CONNACK round-trip; the remaining packets, then the v5 semantics, follow.)
+- **MQTT 5.0**: session/message expiry, topic aliases, flow control, shared
+  subscriptions, enhanced auth. (Per [ADR 0008](docs/adr/0008-mqtt-5-codec.md), the
+  v5 **wire codec is complete** — every control packet round-trips with its
+  properties, reason codes, subscription options, and AUTH. Negotiating v5 at the
+  broker and the v5 *semantics* are the remaining work.)
 - Subscription digests (bloom) for sub-linear fan-out; retained-state
   replication across nodes.
 - WebSocket/WSS listener; Prometheus metrics; admin/management API. (Kubernetes-style

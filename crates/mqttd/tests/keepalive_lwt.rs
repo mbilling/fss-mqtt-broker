@@ -235,7 +235,9 @@ async fn graceful_disconnect_discards_will() {
     sub.subscribe("will/t").await;
 
     let mut client_a = Client::connect_with(addr, "lwt-a-graceful", 30, Some(will("will/t"))).await;
-    client_a.send(&Packet::Disconnect).await;
+    client_a
+        .send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     // Wait for the broker to actually tear down A's connection so any
     // (erroneous) will publication would have happened before we check.
     client_a.expect_closed_within(Duration::from_secs(2)).await;

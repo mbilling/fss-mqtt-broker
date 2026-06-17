@@ -249,7 +249,8 @@ async fn persistent_session_queues_offline_and_replays_on_reconnect() {
 
     // 2. Subscriber disconnects cleanly. Waiting for the broker to close the
     //    socket guarantees the Detach is enqueued before we publish.
-    sub.send(&Packet::Disconnect).await;
+    sub.send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     sub.expect_closed().await;
 
     // 3. Publish while the subscriber is offline. QoS 1 + waiting for PUBACK
@@ -299,7 +300,8 @@ async fn clean_session_does_not_persist() {
     }))
     .await;
     assert!(matches!(sub.recv().await, Packet::SubAck(_)));
-    sub.send(&Packet::Disconnect).await;
+    sub.send(&Packet::Disconnect(mqtt_codec::Disconnect::default()))
+        .await;
     sub.expect_closed().await;
 
     // Publish while gone — must NOT be queued for a clean session.

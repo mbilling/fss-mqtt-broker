@@ -1,10 +1,10 @@
 //! Fixed header, the [`Packet`] enum, and per-packet encode/decode.
 //!
-//! This module implements the complete **MQTT 3.1.1** control packet set and the
-//! **MQTT 5.0** framing for CONNECT/CONNACK (properties blocks, ADR 0008 phase 2).
-//! Packets whose v5 form is not yet implemented are guarded with an explicit error
-//! so a v5 packet is never silently mis-parsed as v4; the remaining v5 paths land in
-//! later phases.
+//! This module implements the complete **MQTT 3.1.1** and **MQTT 5.0** control
+//! packet sets (ADR 0008): every packet's variable header and payload, version-tagged
+//! through [`Packet::encode`]/[`Packet::decode`]. The v5 additions — property blocks,
+//! reason codes, subscription options, and the AUTH packet — are carried on the same
+//! types, defaulted/empty for v3.1.1 so the older wire is unaffected.
 
 use crate::io::{self, Reader};
 use crate::{varint, CodecError, Properties, ProtocolVersion, QoS};
@@ -320,6 +320,29 @@ impl From<u16> for UnsubAck {
     }
 }
 
+/// A DISCONNECT packet. v3.1.1 carries no payload; MQTT 5.0 adds an optional reason
+/// code and properties — both omitted (the short form) when the reason is Normal
+/// Disconnection (0) with no properties, giving the same empty body as v3.1.1.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Disconnect {
+    /// Reason code (MQTT 5.0; 0 = Normal Disconnection). Always 0 on v3.1.1.
+    pub reason: u8,
+    /// DISCONNECT properties (MQTT 5.0; e.g. session expiry, reason string). Empty
+    /// for v3.1.1.
+    pub properties: Properties,
+}
+
+/// An AUTH packet — an extended-authentication exchange (**MQTT 5.0 only**). Carries
+/// a reason code and properties; the short form omits both when the reason is Success
+/// (0) with no properties.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Auth {
+    /// Reason code (0 = Success, 0x18 = Continue authentication, 0x19 = Re-auth).
+    pub reason: u8,
+    /// AUTH properties (e.g. authentication method/data, reason string).
+    pub properties: Properties,
+}
+
 /// A decoded MQTT control packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
@@ -350,11 +373,10 @@ pub enum Packet {
     /// PINGRESP.
     PingResp,
     /// DISCONNECT.
-    Disconnect,
+    Disconnect(Disconnect),
+    /// AUTH (MQTT 5.0 only).
+    Auth(Auth),
 }
-
-const V5_UNSUPPORTED: CodecError =
-    CodecError::ProtocolViolation("MQTT 5.0 codec not yet implemented");
 
 impl Packet {
     /// The packet type discriminant.
@@ -374,7 +396,8 @@ impl Packet {
             Packet::UnsubAck(_) => PacketType::UnsubAck,
             Packet::PingReq => PacketType::PingReq,
             Packet::PingResp => PacketType::PingResp,
-            Packet::Disconnect => PacketType::Disconnect,
+            Packet::Disconnect(_) => PacketType::Disconnect,
+            Packet::Auth(_) => PacketType::Auth,
         }
     }
 
@@ -405,27 +428,6 @@ impl Packet {
         let mut frame = buf.split_to(total).freeze();
         frame.advance(header_len);
         let mut r = Reader::new(frame);
-
-        // The v5 forms implemented so far (ADR 0008 phases 2–4); other packets' v5
-        // forms are not done yet — refuse rather than mis-parse as v4.
-        if version == ProtocolVersion::V5
-            && !matches!(
-                header.packet_type,
-                PacketType::Connect
-                    | PacketType::ConnAck
-                    | PacketType::Publish
-                    | PacketType::PubAck
-                    | PacketType::PubRec
-                    | PacketType::PubRel
-                    | PacketType::PubComp
-                    | PacketType::Subscribe
-                    | PacketType::SubAck
-                    | PacketType::Unsubscribe
-                    | PacketType::UnsubAck
-            )
-        {
-            return Err(V5_UNSUPPORTED);
-        }
 
         let packet = match header.packet_type {
             PacketType::Connect => Packet::Connect(decode_connect(&mut r)?),
@@ -478,10 +480,17 @@ impl Packet {
             }
             PacketType::Disconnect => {
                 expect_flags(header.flags, 0)?;
-                expect_empty(&r)?;
-                Packet::Disconnect
+                Packet::Disconnect(decode_disconnect(version, &mut r)?)
             }
-            PacketType::Auth => return Err(V5_UNSUPPORTED),
+            PacketType::Auth => {
+                // AUTH is an MQTT 5.0 control packet; it does not exist in v3.1.1.
+                if version != ProtocolVersion::V5 {
+                    return Err(CodecError::ProtocolViolation("AUTH is MQTT 5.0 only"));
+                }
+                expect_flags(header.flags, 0)?;
+                let (reason, properties) = decode_reason_and_properties(&mut r)?;
+                Packet::Auth(Auth { reason, properties })
+            }
         };
         Ok(Some(packet))
     }
@@ -489,26 +498,12 @@ impl Packet {
     /// Encode this packet into `out` for the given protocol `version`.
     ///
     /// # Errors
-    /// Returns [`CodecError`] if a field is out of range or the version is not
-    /// yet supported.
+    /// Returns [`CodecError`] if a field is out of range, or an MQTT 5.0-only packet
+    /// (AUTH) is encoded for a v3.1.1 connection.
     pub fn encode(&self, out: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), CodecError> {
-        if version == ProtocolVersion::V5
-            && !matches!(
-                self,
-                Packet::Connect(_)
-                    | Packet::ConnAck(_)
-                    | Packet::Publish(_)
-                    | Packet::PubAck(_)
-                    | Packet::PubRec(_)
-                    | Packet::PubRel(_)
-                    | Packet::PubComp(_)
-                    | Packet::Subscribe(_)
-                    | Packet::SubAck(_)
-                    | Packet::Unsubscribe(_)
-                    | Packet::UnsubAck(_)
-            )
-        {
-            return Err(V5_UNSUPPORTED);
+        // AUTH does not exist in v3.1.1.
+        if version != ProtocolVersion::V5 && matches!(self, Packet::Auth(_)) {
+            return Err(CodecError::ProtocolViolation("AUTH is MQTT 5.0 only"));
         }
         // Build the body separately so we can prefix it with the remaining length.
         let mut body = Vec::new();
@@ -551,7 +546,15 @@ impl Packet {
                 encode_unsubscribe(u, &mut body, version)?;
                 0x02
             }
-            Packet::PingReq | Packet::PingResp | Packet::Disconnect => 0,
+            Packet::Disconnect(d) => {
+                encode_disconnect(d, &mut body, version)?;
+                0
+            }
+            Packet::Auth(a) => {
+                encode_reason_and_properties(a.reason, &a.properties, &mut body)?;
+                0
+            }
+            Packet::PingReq | Packet::PingResp => 0,
         };
 
         let remaining = u32::try_from(body.len())
@@ -1061,6 +1064,58 @@ fn encode_unsuback(
     Ok(())
 }
 
+/// Decode a v5 "reason code + properties" body (shared by DISCONNECT and AUTH), with
+/// the short forms: an empty body is reason 0 with no properties; a reason with no
+/// trailing bytes omits the property length (no properties).
+fn decode_reason_and_properties(r: &mut Reader) -> Result<(u8, Properties), CodecError> {
+    if r.is_empty() {
+        return Ok((0, Properties::new()));
+    }
+    let reason = r.read_u8()?;
+    let properties = if r.is_empty() {
+        Properties::new()
+    } else {
+        Properties::decode(r)?
+    };
+    expect_empty(r)?;
+    Ok((reason, properties))
+}
+
+/// Encode a v5 "reason code + properties" body: omitted entirely (the short form)
+/// when the reason is 0 and there are no properties.
+fn encode_reason_and_properties(
+    reason: u8,
+    properties: &Properties,
+    out: &mut Vec<u8>,
+) -> Result<(), CodecError> {
+    if reason != 0 || !properties.is_empty() {
+        io::put_u8(out, reason);
+        properties.encode(out)?;
+    }
+    Ok(())
+}
+
+fn decode_disconnect(version: ProtocolVersion, r: &mut Reader) -> Result<Disconnect, CodecError> {
+    if version != ProtocolVersion::V5 {
+        // v3.1.1 DISCONNECT has no payload.
+        expect_empty(r)?;
+        return Ok(Disconnect::default());
+    }
+    let (reason, properties) = decode_reason_and_properties(r)?;
+    Ok(Disconnect { reason, properties })
+}
+
+fn encode_disconnect(
+    d: &Disconnect,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
+    if version == ProtocolVersion::V5 {
+        encode_reason_and_properties(d.reason, &d.properties, out)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1412,7 +1467,50 @@ mod tests {
     fn roundtrip_pings_and_disconnect() {
         roundtrip(&Packet::PingReq);
         roundtrip(&Packet::PingResp);
-        roundtrip(&Packet::Disconnect);
+        roundtrip(&Packet::Disconnect(Disconnect::default()));
+    }
+
+    #[test]
+    fn roundtrip_disconnect_and_auth_v5() {
+        // PINGREQ/PINGRESP and the v4-style (empty) DISCONNECT also work over v5.
+        roundtrip_version(&Packet::PingReq, V5);
+        roundtrip_version(&Packet::Disconnect(Disconnect::default()), V5);
+        // DISCONNECT with a reason + properties (the long form).
+        roundtrip_version(
+            &Packet::Disconnect(Disconnect {
+                reason: 0x8D, // Keep Alive timeout
+                properties: Properties(vec![Property::ReasonString("too slow".into())]),
+            }),
+            V5,
+        );
+        // AUTH short form (Success, no properties) and long form.
+        roundtrip_version(&Packet::Auth(Auth::default()), V5);
+        roundtrip_version(
+            &Packet::Auth(Auth {
+                reason: 0x18, // Continue authentication
+                properties: Properties(vec![
+                    Property::AuthenticationMethod("SCRAM-SHA-256".into()),
+                    Property::AuthenticationData(Bytes::from_static(&[1, 2, 3])),
+                ]),
+            }),
+            V5,
+        );
+    }
+
+    #[test]
+    fn auth_is_rejected_on_v3_1_1() {
+        // Decoding an AUTH (15<<4) on a v4 connection is a protocol error.
+        let mut buf = BytesMut::from(&[0xF0u8, 0x00][..]);
+        assert!(matches!(
+            Packet::decode(&mut buf, V4),
+            Err(CodecError::ProtocolViolation(_))
+        ));
+        // Encoding one for v4 is likewise refused.
+        let mut out = Vec::new();
+        assert!(matches!(
+            Packet::Auth(Auth::default()).encode(&mut out, V4),
+            Err(CodecError::ProtocolViolation(_))
+        ));
     }
 
     #[test]
@@ -1445,12 +1543,14 @@ mod tests {
     fn two_packets_in_one_buffer() {
         let mut out = Vec::new();
         Packet::PingReq.encode(&mut out, V4).unwrap();
-        Packet::Disconnect.encode(&mut out, V4).unwrap();
+        Packet::Disconnect(Disconnect::default())
+            .encode(&mut out, V4)
+            .unwrap();
         let mut buf = BytesMut::from(&out[..]);
         assert_eq!(Packet::decode(&mut buf, V4).unwrap(), Some(Packet::PingReq));
         assert_eq!(
             Packet::decode(&mut buf, V4).unwrap(),
-            Some(Packet::Disconnect)
+            Some(Packet::Disconnect(Disconnect::default()))
         );
         assert_eq!(Packet::decode(&mut buf, V4).unwrap(), None);
     }
@@ -1475,12 +1575,11 @@ mod tests {
         ));
     }
 
+    /// Every control packet now has a v5 form; a PINGREQ (unchanged on the wire)
+    /// decodes over a v5 connection rather than being refused.
     #[test]
-    fn v5_non_connect_is_rejected_for_now() {
+    fn ping_decodes_over_v5() {
         let mut buf = BytesMut::from(&[0xC0u8, 0x00][..]); // PINGREQ
-        assert!(matches!(
-            Packet::decode(&mut buf, ProtocolVersion::V5),
-            Err(CodecError::ProtocolViolation(_))
-        ));
+        assert_eq!(Packet::decode(&mut buf, V5).unwrap(), Some(Packet::PingReq));
     }
 }
