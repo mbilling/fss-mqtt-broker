@@ -352,29 +352,31 @@ where
     }
 }
 
-/// Write `prelude` to the owner, then relay the client stream and the owner
-/// stream in both directions until either side closes.
-#[allow(clippy::similar_names)] // client_rh/client_wh and owner_rh/owner_wh are clear half names
+/// Write `prelude` to the owner, then relay the client and owner streams in both
+/// directions with **proper half-close**: when one side reaches EOF its peer's
+/// write half is shut down, but the other direction keeps relaying until it too
+/// closes. So a final PUBLISH/PUBACK/DISCONNECT the owner sends after the client
+/// has stopped writing still reaches the client — the previous select-of-two-copies
+/// dropped it the instant either direction ended.
+#[allow(clippy::similar_names)] // client_rh/client_wh are clear half names
 async fn splice<R, W, O>(
-    mut client_rh: R,
-    mut client_wh: W,
+    client_rh: R,
+    client_wh: W,
     prelude: Vec<u8>,
-    owner: O,
+    mut owner: O,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     O: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut owner_rh, mut owner_wh) = tokio::io::split(owner);
-    owner_wh.write_all(&prelude).await?;
-    owner_wh.flush().await?;
-    // Either direction reaching EOF ends the session; dropping the halves on
-    // return closes both connections.
-    tokio::select! {
-        _ = tokio::io::copy(&mut client_rh, &mut owner_wh) => {}
-        _ = tokio::io::copy(&mut owner_rh, &mut client_wh) => {}
-    }
+    owner.write_all(&prelude).await?;
+    owner.flush().await?;
+    // Rejoin the client halves into one duplex stream so copy_bidirectional can
+    // drive (and half-close) both directions. A reset/error at teardown is not
+    // failure-worthy — the session simply ended — so the relay result is ignored.
+    let mut client = tokio::io::join(client_rh, client_wh);
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut owner).await;
     Ok(())
 }
 
@@ -840,6 +842,47 @@ mod tests {
             .await
             .expect("connection neither answered nor closed")
             .unwrap_or(None)
+    }
+
+    /// `splice` half-closes correctly: after the client stops writing (EOF toward
+    /// the owner), bytes the owner sends back still reach the client instead of being
+    /// truncated at teardown — the regression the select-of-two-copies had.
+    #[tokio::test]
+    async fn splice_relays_owner_bytes_after_client_half_close() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client_end, splice_client) = tokio::io::duplex(1024);
+        let (splice_owner, mut owner_end) = tokio::io::duplex(1024);
+        let (read_half, write_half) = tokio::io::split(splice_client);
+
+        let task = tokio::spawn(super::splice(
+            read_half,
+            write_half,
+            b"PRELUDE".to_vec(),
+            splice_owner,
+        ));
+
+        // The owner first receives the prelude this node writes ahead of the splice.
+        let mut pre = [0u8; 7];
+        owner_end.read_exact(&mut pre).await.unwrap();
+        assert_eq!(&pre, b"PRELUDE");
+
+        // The client sends a request, then half-closes its write side (EOF → owner).
+        client_end.write_all(b"req").await.unwrap();
+        client_end.shutdown().await.unwrap();
+        let mut got = [0u8; 3];
+        owner_end.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"req");
+
+        // AFTER the client's EOF, the owner sends a final reply; it must still arrive
+        // (and then both sides close).
+        owner_end.write_all(b"reply").await.unwrap();
+        owner_end.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        client_end.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

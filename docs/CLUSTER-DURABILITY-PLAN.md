@@ -380,7 +380,7 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 | ~~QoS-2 dedup set + next-packet-id counter not yet replicated state~~ | — | ✅ **E step 3c** — now in the replicated `m/{client}` snapshot |
 | ~~`ReplicatedSessionStore` enqueue counted the queue via an **O(n) read** (materializing the whole queue) for cap enforcement~~ | — | ✅ **hardening** — counts via `ReplicatedLog::live_range`, an O(1) offset-watermark query on the real backends; nothing materializes the queue on the hot path |
 | ~~Lease assignment issued one consensus write **per group** (all `NUM_GROUPS` on first leadership / a rebalance)~~ | — | ✅ **hardening** — `reconcile` batches every pending assignment into one `AssignMany` entry (each still mints its own fresh epoch); the lease log no longer bursts |
-| Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
+| ~~Session-proxy splice was **best-effort on half-close** (a select over two one-way copies dropped in-flight bytes the instant either direction ended)~~ | — | ✅ **hardening** — splice uses `copy_bidirectional`, which half-closes properly: a final PUBLISH/PUBACK/DISCONNECT the owner sends after the client stops writing still reaches the client |
 | Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
 
 **Cross-cutting: remote + CI now live** ✅. The repo has a remote and the
