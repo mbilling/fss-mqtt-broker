@@ -1,10 +1,10 @@
 //! Cluster routing tests over a two-node peer mesh: cross-node `QoS` > 0 delivery,
-//! and the two documented carried limitations — shared subscriptions deliver
-//! per-node (ADR 0010 §5), and retained state is not replicated across nodes
-//! (peer.rs / ADR 0001 phase 3). See `docs/TEST-PLAN.md`.
+//! cross-node retained replication (ADR 0014), and the remaining documented
+//! limitation — shared subscriptions deliver per-node, not cluster-wide
+//! (ADR 0010 §5). See `docs/TEST-PLAN.md`.
 //!
 //! Cross-node routing is eventually consistent (interest is gossiped on subscribe),
-//! so these retry the publish until interest has propagated, mirroring `cluster.rs`.
+//! so these retry until propagation completes, mirroring `cluster.rs`.
 
 mod common;
 
@@ -21,8 +21,9 @@ async fn route(
     qos: QoS,
 ) -> mqtt_codec::packet::Publish {
     for attempt in 0..50u16 {
-        pubr.publish(topic, payload, qos, Some(attempt + 1), vec![])
-            .await;
+        // QoS 0 carries no packet id; QoS > 0 needs a distinct one per attempt.
+        let pkid = (qos != QoS::AtMostOnce).then_some(attempt + 1);
+        pubr.publish(topic, payload, qos, pkid, vec![]).await;
         if let Some(Packet::Publish(p)) = sub.try_recv().await {
             return p;
         }
@@ -94,23 +95,40 @@ async fn shared_subscription_delivers_once_per_node() {
 }
 
 #[tokio::test]
-async fn retained_message_is_not_replicated_across_nodes() {
+async fn retained_message_replicates_across_nodes() {
     let (a, b) = start_two_node_cluster().await;
 
-    // Retain a message on node B.
+    // Warm up the B -> A peer link: a retained publish replicates to the peers that
+    // are members at publish time (ADR 0014), so confirm the link is up first.
+    let mut warmup = Client::connect_v5_ok(a, "warmup-sub").await;
+    warmup.subscribe(1, "warmup", QoS::AtMostOnce).await;
     let mut pubr = Client::connect_v5_ok(b, "ret-pub").await;
+    let _ = route(&mut pubr, &mut warmup, "warmup", b"up", QoS::AtMostOnce).await;
+
+    // Retain a message on node B.
     pubr.publish_retained("only/here", b"r").await;
 
-    // A subscriber on the same node (B) receives it: same-node retained works.
+    // A subscriber on the same node (B) receives it immediately.
     let mut same_node = Client::connect_v5_ok(b, "same-node").await;
     same_node.subscribe(1, "only/here", QoS::AtMostOnce).await;
     let p = same_node.expect_publish().await;
     assert_eq!(&p.payload[..], b"r");
     assert!(p.retain, "same-node retained delivery sets the retain flag");
 
-    // A subscriber on the other node (A) receives nothing: retained state is not
-    // replicated across nodes (carried limitation, ADR 0001 phase 3).
-    let mut other_node = Client::connect_v5_ok(a, "other-node").await;
-    other_node.subscribe(1, "only/here", QoS::AtMostOnce).await;
-    other_node.expect_silence().await;
+    // A subscriber on the *other* node (A) also receives it: retained state is now
+    // replicated across nodes (ADR 0014). Cross-node propagation is eventually
+    // consistent, so re-subscribe until the replicated retained message arrives.
+    let mut cross = Client::connect_v5_ok(a, "cross-node").await;
+    for attempt in 0..50 {
+        cross.subscribe(2, "only/here", QoS::AtMostOnce).await;
+        if let Some(Packet::Publish(p)) = cross.try_recv().await {
+            assert_eq!(&p.payload[..], b"r");
+            assert!(
+                p.retain,
+                "cross-node retained delivery sets the retain flag"
+            );
+            return;
+        }
+        assert!(attempt < 49, "retained never replicated to the other node");
+    }
 }

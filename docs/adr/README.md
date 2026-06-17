@@ -19,3 +19,4 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0011](0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted (design); implementation phased |
 | [0012](0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted (design); implementation phased |
 | [0013](0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted (design); implementation phased |
+| [0014](0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted |

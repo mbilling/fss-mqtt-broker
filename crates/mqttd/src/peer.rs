@@ -361,12 +361,13 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             topic,
             payload,
             qos,
-            retain: _, // retained-state replication is Phase 3 work
+            retain,
         } => {
             let _ = hub.send(HubCommand::RemotePublish {
                 topic,
                 payload: payload.into(),
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                retain,
             });
         }
         PeerMessage::Hello { .. } => {

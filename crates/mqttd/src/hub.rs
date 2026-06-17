@@ -277,6 +277,9 @@ pub enum HubCommand {
         payload: Bytes,
         /// The original publish `QoS` (local downgrade still applies).
         qos: QoS,
+        /// Whether to store this as the topic's retained message on this node, so a
+        /// later subscriber here sees it (cross-node retained replication, ADR 0014).
+        retain: bool,
     },
     /// A durable-plane frame (consensus / session-log replication, ADR 0006/0007)
     /// from `node`, routed to the [`DurablePlane`]. The hub spawns its handling so
@@ -478,11 +481,14 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                retain,
             } => {
-                // Forwarded from a peer: local delivery only (no re-forward). The
-                // peer link does not yet carry the message-expiry interval, so a
-                // cross-node delivery has no deadline (carried limitation).
-                self.deliver_local(&topic, &payload, qos, None).await;
+                // Forwarded from a peer: apply locally (deliver + store retained) but
+                // never re-forward. A retained copy updates this node's store so a
+                // later local subscriber sees it (ADR 0014). The peer link does not
+                // yet carry the message-expiry interval, so a cross-node delivery has
+                // no deadline (carried limitation).
+                self.deliver(&topic, &payload, qos, retain, None).await;
             }
             HubCommand::Detach {
                 client,
@@ -516,9 +522,27 @@ impl Hub {
         }
     }
 
-    /// Publish an application message: store/clear retained state, deliver to
-    /// local subscribers, and forward to interested peers.
+    /// Publish a locally-originated message: apply it on this node, then forward to
+    /// peers (interested peers for live delivery; **all** peers for retained, so each
+    /// node stores it for its future subscribers — ADR 0014).
     async fn publish(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        retain: bool,
+        message_expiry: Option<u32>,
+    ) {
+        self.deliver(topic, payload, qos, retain, message_expiry)
+            .await;
+        self.forward_to_peers(topic, payload, qos, retain);
+    }
+
+    /// Apply a message on this node: store/clear retained state and deliver to local
+    /// subscribers. Does **not** forward — used both for local publishes (via
+    /// [`publish`](Self::publish)) and for publishes received from a peer, which must
+    /// never be re-forwarded.
+    async fn deliver(
         &mut self,
         topic: &str,
         payload: &Bytes,
@@ -542,7 +566,6 @@ impl Hub {
         // Live deliveries carry retain=0 [MQTT-3.3.1-9].
         self.deliver_local(topic, payload, qos, message_expiry)
             .await;
-        self.forward_to_peers(topic, payload, qos, retain);
     }
 
     /// Log when a persistent session is served on a node that is not its
@@ -1137,19 +1160,24 @@ impl Hub {
 
     // --- cluster ---------------------------------------------------------------
 
-    /// Forward a locally-originated publish to every peer that has matching
-    /// interest. Receivers deliver it locally only, so there is no relay/loop.
+    /// Forward a locally-originated publish to peers. A non-retained message goes
+    /// only to peers whose announced interest matches (live delivery). A **retained**
+    /// message goes to *every* peer regardless of current interest, so each node
+    /// stores it for its future subscribers (ADR 0014). Receivers apply it locally
+    /// only, so there is no relay/loop.
     fn forward_to_peers(&self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) {
-        for (node, filters) in &self.remote_interest {
-            if filters.iter().any(|f| topic_matches(f, topic)) {
-                if let Some(peer) = self.peers.get(node) {
-                    let _ = peer.tx.send(PeerMessage::Publish {
-                        topic: topic.to_string(),
-                        payload: payload.to_vec(),
-                        qos: qos as u8,
-                        retain,
-                    });
-                }
+        for (node, peer) in &self.peers {
+            let interested = self
+                .remote_interest
+                .get(node)
+                .is_some_and(|filters| filters.iter().any(|f| topic_matches(f, topic)));
+            if retain || interested {
+                let _ = peer.tx.send(PeerMessage::Publish {
+                    topic: topic.to_string(),
+                    payload: payload.to_vec(),
+                    qos: qos as u8,
+                    retain,
+                });
             }
         }
     }
@@ -1912,6 +1940,7 @@ mod tests {
             topic: "x/2".into(),
             payload: Bytes::from_static(b"no-relay"),
             qos: QoS::AtMostOnce,
+            retain: false,
         })
         .unwrap();
         // Neither peer may see anything further (n1's non-match included).
