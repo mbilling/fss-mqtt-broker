@@ -46,17 +46,24 @@ Keep **both** client styles, deliberately:
 - **A thin real-client interop suite** (`rumqttc`, behind an opt-in `interop`
   feature so it is CI-only): a foreign client doing a pub/sub round-trip in v3.1.1
   and v5. This catches codec-conformance drift the self-codec cannot. ~6 tests.
-- **One process-level smoke test** (later): launch the real `mqttd` binary with a
-  config file, since the in-process harness never exercises `main.rs` wiring.
+  **Not yet added** — pulling a third-party client drags in a dependency tree that
+  `cargo deny` will scrutinise; for a security-first broker this is a deliberate
+  supply-chain decision for the maintainer, not an incidental dev-dep. Tracked as
+  an explicit follow-up.
+- **One process-level smoke test** — done (`binary_smoke`): launches the real
+  `mqttd` binary (env-var config, plaintext listener) and drives a pub/sub
+  round-trip, the only test exercising `main.rs`.
 
 ### Priority
 
-1. Shared harness + **v5 sunshine** suite (the real risk).
-2. **Darksky** protocol-violation + security suite.
-3. Cluster sunshine/chaos gaps (QoS>0 across nodes, retained across nodes, partition heal).
-4. `rumqttc` interop.
-5. Binary smoke test.
-6. Retrofit the existing 13 files onto the shared harness (mechanical; lowest value).
+1. ✅ Shared harness + **v5 sunshine** suite (the real risk).
+2. ✅ **Darksky** protocol-violation + security suite.
+3. ✅ Cluster routing gaps (cross-node QoS 1; shared per-node; retained-not-replicated).
+4. ✅ Binary smoke test.
+5. `rumqttc` interop — pending a supply-chain decision (see Strategy).
+6. Deeper cluster chaos: partition+heal reconvergence, owner-dies-mid-publish,
+   takeover-across-nodes with in-flight messages, QoS 2 across nodes.
+7. Retrofit the existing 13 files onto the shared harness (mechanical; lowest value).
 
 ## Scenario catalog
 
@@ -107,6 +114,9 @@ Legend: ☐ missing · ☑ covered (file).
 - ☐ flow-control backlog under a stalled consumer (documents unbounded-in-memory limit)
 - ☑ idle client reaped by keepalive (3.1.1, `keepalive_lwt`); ☐ same under v5
 - ☐ client connects but never sends CONNECT; dribble/slow-loris bytes
+
+**Process-level**:
+- ☑ the real `mqttd` binary serves a plaintext pub/sub round-trip (`binary_smoke`)
 
 **Cluster chaos** (mostly ☐):
 - ☑ replica serves session after owner dies (`durable_sessions`)
