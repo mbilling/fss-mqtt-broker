@@ -45,7 +45,7 @@ shared subscriptions.
 | C | Session affinity & redirect ([ADR 0005](adr/0005-session-affinity.md)) | ✅ Done — **ephemeral mode** |
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
-| F | Takeover / handoff protocol | 🔶 In progress — **F-a, F-b, F-c** done (recovery mechanism + recovery-read RPC + rebuild on takeover); F-d remains |
+| F | Takeover / handoff protocol | ✅ Done — **F-a–F-d** (recovery mechanism + recovery-read RPC + rebuild on takeover + owner-death integration test) |
 | G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
@@ -273,7 +273,7 @@ phasing. The durable backend implementing `SessionStore`.
       Warrants multi-node integration tests (swim-routing style).
 - **Delivers:** durable sessions — ADR 0001's headline guarantee.
 
-### F — Takeover / handoff protocol  🔶 *(in progress; needs B + E)*
+### F — Takeover / handoff protocol  ✅ *(done; needs B + E)*
 
 ADR 0001 §5. The owner-dead path: on a SWIM `Dead` event, placement re-elects the
 next replica as owner and the lease driver reassigns the group at a **new epoch**
@@ -308,10 +308,19 @@ serving. Decomposed:
   *Carried:* the per-group log cache is not epoch-invalidated (a regain-after-loss
   self-fences but never serves a stale cache divergently); recovery adds one quorum
   read on the first touch of each key (a fresh session simply recovers to empty).
-- **F-d — integration test**: kill the owner mid-session → a replica serves the
-  reconnect with no loss of durably-enqueued messages; concurrent reconnect during
-  promotion does not double-own (split-brain check, via epoch fencing); redelivery
-  of in-flight QoS-1 is bounded and spec-legal.
+- **F-d — integration test** ✅ *(done)*: `durable_sessions::a_replica_serves_the_
+  session_after_the_owner_dies` — a 3-node SWIM cluster durably enqueues on a
+  client's owner, waits until the lease group has grown to all three voters (so
+  losing one still leaves a raft quorum), then **crashes the owner** (aborts all its
+  tasks). The survivors detect it dead, drop it from placement, re-elect the lease
+  leader, and reassign the group to a surviving replica at a new epoch; the new owner
+  — previously a replica — rebuilds the committed log from a quorum and serves the
+  session, replaying the enqueued message with no loss. The double-own / split-brain
+  safety is covered by the epoch-fencing unit test (`cluster_log::stale_leader_is_
+  fenced`): a superseded holder cannot reach quorum at its old epoch. Non-flaky over
+  repeated runs. *Deferred to a later hardening pass:* a client-facing reconnect
+  through the MQTT front end during promotion (here the takeover-serve is asserted
+  through the store, which is what recovers); spec-legal QoS-1 redelivery bounds.
 
 ### G — MQTT 5 expiry & shared subscriptions  *(gated on the MQTT 5.0 codec)*
 

@@ -78,6 +78,19 @@ impl DurablePlane {
         &self.transport
     }
 
+    /// The number of voters currently configured in the lease group, read from the
+    /// raft metrics. A readiness signal: a failover is only safe once the group has
+    /// grown to enough voters that losing one still leaves a quorum.
+    #[must_use]
+    pub fn voter_count(&self) -> usize {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .count()
+    }
+
     /// Register a peer's outbound link channel for *both* planes — consensus
     /// (keyed by the peer's [`raft_id`]) and replication (keyed by its [`NodeId`]).
     /// Called when a peer link is established.
