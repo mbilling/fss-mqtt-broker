@@ -46,7 +46,7 @@ shared subscriptions.
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
 | F | Takeover / handoff protocol | ✅ Done — **F-a–F-d** (recovery mechanism + recovery-read RPC + rebuild on takeover + owner-death integration test) |
-| G | MQTT 5 expiry & shared subscriptions | ⬜ Blocked on the v5 codec |
+| G | MQTT 5 expiry & shared subscriptions | 🔶 Unblocked — the v5 codec is complete (ADR 0008, phases 1–6); the v5 *semantics* are now the work |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
 
