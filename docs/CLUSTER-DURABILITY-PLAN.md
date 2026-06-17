@@ -381,7 +381,7 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 | ~~`ReplicatedSessionStore` enqueue counted the queue via an **O(n) read** (materializing the whole queue) for cap enforcement~~ | — | ✅ **hardening** — counts via `ReplicatedLog::live_range`, an O(1) offset-watermark query on the real backends; nothing materializes the queue on the hot path |
 | ~~Lease assignment issued one consensus write **per group** (all `NUM_GROUPS` on first leadership / a rebalance)~~ | — | ✅ **hardening** — `reconcile` batches every pending assignment into one `AssignMany` entry (each still mints its own fresh epoch); the lease log no longer bursts |
 | ~~Session-proxy splice was **best-effort on half-close** (a select over two one-way copies dropped in-flight bytes the instant either direction ended)~~ | — | ✅ **hardening** — splice uses `copy_bidirectional`, which half-closes properly: a final PUBLISH/PUBACK/DISCONNECT the owner sends after the client stops writing still reaches the client |
-| Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
+| ~~Audit did not record the **vouching node** of a relocated session~~ | — | ✅ **hardening** — `ProxyHello` carries the landing node's id; the owner records `(relayed by node <id>)` on the session's `auth.success` audit event |
 
 **Cross-cutting: remote + CI now live** ✅. The repo has a remote and the
 `.github/` gate (fmt, clippy, `cargo-deny`, `cargo-audit`) runs on every push to

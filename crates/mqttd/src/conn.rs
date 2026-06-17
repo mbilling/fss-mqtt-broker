@@ -13,6 +13,7 @@ use mqtt_auth::{
     basic::BasicAuthenticator, AllowAll, Authenticator, Authorizer, Credentials, Identity,
 };
 use mqtt_cluster::placement::Placement;
+use mqtt_cluster::NodeId;
 use mqtt_codec::{
     packet::{ConnAck, Connect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
@@ -75,6 +76,9 @@ pub fn tls_identity<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Ident
 /// `None` = plaintext mesh).
 #[derive(Clone)]
 pub struct ProxyContext {
+    /// This node's id — sent in the `ProxyHello` so the owner can attribute the
+    /// relocated session to the node that vouched for it (audit `via`).
+    pub node: NodeId,
     /// The live session-placement ring.
     pub placement: Arc<RwLock<Placement>>,
     /// mTLS connector for dialing the owner's peer listener; `None` = plaintext.
@@ -84,6 +88,7 @@ pub struct ProxyContext {
 impl std::fmt::Debug for ProxyContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyContext")
+            .field("node", &self.node.0)
             .field("mtls", &self.connector.is_some())
             .finish_non_exhaustive()
     }
@@ -166,14 +171,37 @@ where
     let (rh, wh) = tokio::io::split(stream);
     let reader = FrameReader::new(rh, ProtocolVersion::V311);
     let writer = FrameWriter::new(wh, ProtocolVersion::V311);
-    // A directly-accepted client may be relocated to its placement owner.
-    run_framed(reader, writer, identity, policy, hub, true).await
+    // A directly-accepted client may be relocated to its placement owner; it has no
+    // relaying node (`via = None`).
+    run_framed(reader, writer, identity, policy, hub, true, None).await
 }
 
 /// Serve an MQTT connection over already-framed halves. `allow_proxy` is `true`
 /// for a directly-accepted client (which may be relocated to its owner,
 /// ADR 0005) and `false` for a session already proxied here (it is served
 /// locally — this node is the owner; re-proxying would loop).
+/// Resolve whether a CONNECT should be relocated to another node (ADR 0005):
+/// `Some((proxy, owner, addr))` when proxying is allowed, the session is persistent,
+/// this node has a `ProxyContext`, and the placement ring names a remote owner whose
+/// address is known. `None` keeps the session local.
+fn relocation_target<'a>(
+    policy: &'a ConnPolicy,
+    client: &ClientId,
+    allow_proxy: bool,
+    clean_session: bool,
+) -> Option<(&'a ProxyContext, NodeId, String)> {
+    if !allow_proxy || clean_session {
+        return None;
+    }
+    let proxy = policy.proxy.as_ref()?;
+    let (owner, addr) = proxy
+        .placement
+        .read()
+        .ok()
+        .and_then(|p| p.owner_route(&client.0))?;
+    Some((proxy, owner, addr))
+}
+
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
@@ -181,6 +209,7 @@ async fn run_framed<R, W>(
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
     allow_proxy: bool,
+    via: Option<String>,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -203,27 +232,26 @@ where
 
     // Authentication gate: verify credentials BEFORE attaching to the hub, so
     // a rejected client never touches session state.
-    let Some(principal) =
-        authenticate_connect(&mut writer, &client, &connect, identity.as_ref(), policy).await?
-    else {
+    let auth = authenticate_connect(
+        &mut writer,
+        &client,
+        &connect,
+        identity.as_ref(),
+        policy,
+        via,
+    );
+    let Some(principal) = auth.await? else {
         return Ok(()); // rejected; the CONNACK was already sent
     };
 
     // Session affinity (ADR 0005): a persistent session whose placement owner is
-    // another node is relocated there. The owner serves it (CONNACK onward);
-    // this node only relays. Clean sessions and owner-is-self stay local.
-    if allow_proxy && !connect.clean_session {
-        if let Some(proxy) = &policy.proxy {
-            let route = proxy
-                .placement
-                .read()
-                .ok()
-                .and_then(|p| p.owner_route(&client.0));
-            if let Some((owner, addr)) = route {
-                info!(client = %client.0, owner = %owner.0, "relocating persistent session to its owner (ADR 0005)");
-                return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr).await;
-            }
-        }
+    // another node is relocated there. The owner serves it (CONNACK onward); this
+    // node only relays. Clean sessions and owner-is-self stay local.
+    if let Some((proxy, owner, addr)) =
+        relocation_target(policy, &client, allow_proxy, connect.clean_session)
+    {
+        info!(client = %client.0, owner = %owner.0, "relocating persistent session to its owner (ADR 0005)");
+        return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr).await;
     }
 
     // A will is a deferred publish: it must be authorized at CONNECT, not at
@@ -332,6 +360,7 @@ where
     mqtt_cluster::peer::encode(
         &mqtt_cluster::peer::PeerMessage::ProxyHello {
             identity: Some(principal.subject.clone()),
+            via: Some(proxy.node.0.clone()),
         },
         &mut prelude,
     )
@@ -385,7 +414,9 @@ where
 /// [`PeerMessage::ProxyHello`] marker; `identity` is the vouched, already-
 /// authenticated client identity. The session is served locally and never
 /// re-proxied.
-#[allow(clippy::similar_names)] // client_rh/client_wh are clear half names
+// A thin wiring shim onto run_framed; every arg is the stream/identity/policy it
+// needs to serve the relocated session, so the count is inherent.
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
 pub async fn serve_proxied<R, W>(
     client_rh: R,
     client_wh: W,
@@ -394,13 +425,16 @@ pub async fn serve_proxied<R, W>(
     policy: Arc<ConnPolicy>,
     hub: mpsc::UnboundedSender<HubCommand>,
     prefix: bytes::BytesMut,
+    via: Option<String>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let reader = FrameReader::with_buffer(client_rh, ProtocolVersion::V311, prefix);
     let writer = FrameWriter::new(client_wh, ProtocolVersion::V311);
-    if let Err(e) = run_framed(reader, writer, identity, &policy, hub, false).await {
+    // A proxied session is never re-proxied (`allow_proxy = false`); `via` is the
+    // relaying node, recorded in the auth audit.
+    if let Err(e) = run_framed(reader, writer, identity, &policy, hub, false, via).await {
         warn!(?peer, error = %e, "proxied session ended with error");
     }
 }
@@ -456,6 +490,7 @@ async fn authenticate_connect<W>(
     connect: &Connect,
     identity: Option<&Identity>,
     policy: &ConnPolicy,
+    via: Option<String>,
 ) -> Result<Option<Identity>, NetError>
 where
     W: AsyncWrite + Unpin,
@@ -478,10 +513,13 @@ where
     };
     match policy.auth.authenticate(client, &creds) {
         Ok(id) => {
+            // For a relocated session, attribute it to the node that vouched (ADR
+            // 0005); a direct client has no `via`.
+            let relayed = via.map_or_else(String::new, |node| format!(" (relayed by node {node})"));
             policy.audit.record(
                 "auth.success",
                 Some(&id.subject),
-                &format!("client {} via {method}", client.0),
+                &format!("client {} via {method}{relayed}", client.0),
             );
             Ok(Some(id))
         }
@@ -890,6 +928,65 @@ mod tests {
         let (mut reader, mut writer, _hub_rx) = start_conn();
         writer.send(&Packet::PingReq).await.unwrap();
         assert_eq!(recv(&mut reader).await, None);
+    }
+
+    /// A session relocated here by another node records that node in the auth audit
+    /// (`via`), so a vouched relocation is attributable (ADR 0005 / ADR 0004 audit).
+    #[tokio::test]
+    async fn proxied_session_records_the_relaying_node_in_the_audit() {
+        let audit = Arc::new(mqtt_observability::RecordingAuditSink::new());
+        let policy = Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: audit.clone(),
+            proxy: None,
+            store: None,
+        });
+
+        let (client, owner_side) = tokio::io::duplex(4096);
+        let (owner_read, owner_write) = tokio::io::split(owner_side);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let _seen = stub_hub(hub_rx);
+
+        // The owner serves a session "node-a" relayed here, vouching "device-7".
+        tokio::spawn(super::serve_proxied(
+            owner_read,
+            owner_write,
+            None,
+            Some(mqtt_auth::Identity {
+                subject: "device-7".to_string(),
+                groups: Vec::new(),
+            }),
+            policy,
+            hub_tx,
+            bytes::BytesMut::new(),
+            Some("node-a".to_string()),
+        ));
+
+        // Drive the proxied client's persistent CONNECT; the owner answers CONNACK.
+        let (client_read, client_write) = tokio::io::split(client);
+        let mut reader: Reader = FrameReader::new(client_read, V4);
+        let mut writer: Writer = FrameWriter::new(client_write, V4);
+        writer
+            .send(&connect_packet("device-7", false))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // The auth.success event names the relaying node.
+        let events = audit.events();
+        let auth = events
+            .iter()
+            .find(|e| e.kind == "auth.success")
+            .expect("auth.success recorded");
+        assert_eq!(auth.subject.as_deref(), Some("device-7"));
+        assert!(
+            auth.detail.contains("relayed by node node-a"),
+            "audit detail should attribute the relaying node, got: {}",
+            auth.detail
+        );
     }
 
     #[tokio::test]

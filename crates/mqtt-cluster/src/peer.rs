@@ -58,6 +58,9 @@ pub enum PeerMessage {
         /// The vouched, already-authenticated client identity (its subject),
         /// or `None` if the client connected anonymously.
         identity: Option<String>,
+        /// The id of the landing node relaying (vouching for) this session — the
+        /// owner records it for audit attribution. `None` if unidentified.
+        via: Option<String>,
     },
     /// A session-log replication op from a placement group's lease-holder to one of
     /// its replicas (ADR 0006 §1, workstream E step 3b). The `epoch` is the
@@ -194,8 +197,12 @@ mod tests {
         });
         roundtrip(&PeerMessage::ProxyHello {
             identity: Some("device-7".into()),
+            via: Some("node-a".into()),
         });
-        roundtrip(&PeerMessage::ProxyHello { identity: None });
+        roundtrip(&PeerMessage::ProxyHello {
+            identity: None,
+            via: None,
+        });
         roundtrip(&PeerMessage::Replicate {
             req_id: 42,
             epoch: 7,

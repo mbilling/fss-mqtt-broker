@@ -112,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // built before the peer listener so the latter can serve sessions relocated
     // here by other nodes. The same policy serves the client listeners below.
     let proxy = conn::ProxyContext {
+        node: node_id.clone(),
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };

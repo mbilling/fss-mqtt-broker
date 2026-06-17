@@ -240,7 +240,7 @@ where
             // The connection arrived over the mTLS bus, so the sender is a
             // verified mesh member; we serve the vouched identity. The leftover
             // `buf` holds the client's MQTT stream (its CONNECT onward).
-            Some(PeerMessage::ProxyHello { identity }) => {
+            Some(PeerMessage::ProxyHello { identity, via }) => {
                 let Some(policy) = client_policy else {
                     debug!("ProxyHello received but no client policy configured; dropping");
                     return Ok(LinkOutcome::Closed);
@@ -249,7 +249,7 @@ where
                     subject,
                     groups: Vec::new(),
                 });
-                crate::conn::serve_proxied(rh, wh, None, identity, policy, hub, buf).await;
+                crate::conn::serve_proxied(rh, wh, None, identity, policy, hub, buf, via).await;
                 return Ok(LinkOutcome::Closed);
             }
             Some(PeerMessage::Hello { node_id }) => {

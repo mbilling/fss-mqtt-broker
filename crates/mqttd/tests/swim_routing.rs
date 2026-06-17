@@ -276,6 +276,7 @@ async fn start_proxy_node(
         authz: Arc::new(AllowAll),
         audit: Arc::new(AuditLog::new()),
         proxy: Some(ProxyContext {
+            node: node_id.clone(),
             placement: placement.clone(),
             connector: None, // plaintext mesh
         }),
