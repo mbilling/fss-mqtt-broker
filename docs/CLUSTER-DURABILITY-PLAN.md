@@ -373,6 +373,7 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 | With `MQTTD_DURABLE_SESSIONS` **off** (the default), persistent sessions are ephemeral — an owner's death drops its queues | No durability across owner loss on the default path (sharded capacity only) | enable the durable store (E done); survival across owner loss done in **F** (takeover) |
 | ~~A durable session is not yet **served after its owner dies**~~ | — | ✅ **F** — a surviving replica rebuilds the committed log from a quorum and serves the session (`a_replica_serves_the_session_after_the_owner_dies`) |
 | ~~A wedged-but-connected peer (half-open link) could hang an append's quorum wait or a takeover recovery-read indefinitely~~ | — | ✅ **hardening** — the replication transport bounds every RPC (`DEFAULT_RPC_TIMEOUT`); on timeout the request resolves as unreachable and is reaped |
+| ~~The per-group `ClusterLog` cache was not epoch-invalidated: a group lost then regained kept serving at the stale epoch and self-fenced forever~~ | — | ✅ **hardening** — `GroupRoutedLog` reads the lease epoch on every op and rebuilds (and re-recovers) the group's log when it advances |
 | ~~Consensus engine (openraft) unratified~~ | — | ✅ **E step 1** — openraft ratified |
 | ~~Consensus + replication not run by the live hub~~ | — | ✅ **E step 4** — the durable stack runs in the broker; proven by the 3-node integration test |
 | ~~QoS-2 dedup set + next-packet-id counter not yet replicated state~~ | — | ✅ **E step 3c** — now in the replicated `m/{client}` snapshot |

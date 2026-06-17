@@ -86,10 +86,22 @@ impl LeaseSource for LocalLeaseSource {
     }
 }
 
+/// A group's cached `ClusterLog` together with the keys already recovered against
+/// it. The recovery markers live **with** the log so that rebuilding the log on an
+/// epoch change (below) atomically resets recovery for the whole group — every key
+/// must re-recover against the new lease's replica set, not trust a marker set under
+/// the old epoch.
+struct GroupEntry<T: ReplicaTransport> {
+    log: Arc<ClusterLog<T>>,
+    recovered: Mutex<BTreeSet<String>>,
+}
+
 /// A [`ReplicatedLog`] that routes each key to its placement group's
-/// [`ClusterLog`], building (and caching) that log lazily on first touch, and
+/// [`ClusterLog`], building (and caching) that log lazily on first touch,
 /// **recovering** each key from a quorum of replicas the first time it is served
-/// after a takeover (workstream F).
+/// after a takeover (workstream F), and **rebuilding** the cached log when the
+/// group's lease epoch advances (ownership lost and regained — the stale log would
+/// self-fence forever).
 pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone> {
     local: NodeId,
     placement: Arc<RwLock<Placement>>,
@@ -99,11 +111,9 @@ pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone> {
     /// `DurablePlane`). On takeover this node was a replica, so its committed copy of
     /// a key lives here — it is one of the quorum reads recovery merges.
     local_replicas: Arc<Mutex<ReplicaState>>,
-    /// Per-group `ClusterLog`, built lazily. Cached so a group's offset state is
-    /// stable across calls.
-    logs: Mutex<BTreeMap<GroupId, Arc<ClusterLog<T>>>>,
-    /// Keys already recovered (so the recovery-read runs once per key).
-    recovered: Mutex<BTreeSet<String>>,
+    /// Per-group cached log + recovery markers, built lazily and rebuilt when the
+    /// lease epoch advances. Cached so a group's offset state is stable across calls.
+    groups: Mutex<BTreeMap<GroupId, Arc<GroupEntry<T>>>>,
 }
 
 impl<S: LeaseSource, T: ReplicaTransport + Clone> std::fmt::Debug for GroupRoutedLog<S, T> {
@@ -132,13 +142,12 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
             transport,
             leases,
             local_replicas,
-            logs: Mutex::new(BTreeMap::new()),
-            recovered: Mutex::new(BTreeSet::new()),
+            groups: Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, BTreeMap<GroupId, Arc<ClusterLog<T>>>> {
-        self.logs
+    fn cache(&self) -> std::sync::MutexGuard<'_, BTreeMap<GroupId, Arc<GroupEntry<T>>>> {
+        self.groups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -163,44 +172,57 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
             placement.group_replica_set(group)
         };
 
-        // Get or build the group's ClusterLog. Resolve the cache hit into an owned
+        // Read the group's current lease epoch on every call. A higher epoch than the
+        // cached log's means ownership was lost and regained: the cached log writes at
+        // the old epoch and would be fenced by followers forever, so it must be rebuilt
+        // (and the group's keys re-recovered) against the new lease.
+        let epoch = self.leases.epoch_for(group).await?;
+
+        // Get-or-(re)build the group entry at the current epoch. Resolve to an owned
         // `Arc` and drop the guard before any await (the guard is not `Send`).
-        let cached = self.cache().get(&group).cloned();
-        let log = if let Some(log) = cached {
-            log
-        } else {
-            let epoch = self.leases.epoch_for(group).await?;
-            let lease = OwnershipLease {
-                holder: self.local.clone(),
-                epoch,
-            };
-            let log = Arc::new(ClusterLog::new(
-                self.local.clone(),
-                lease,
-                &replica_set,
-                self.transport.clone(),
-            ));
-            // or_insert so concurrent builders converge on one canonical log.
-            self.cache().entry(group).or_insert(log).clone()
+        let entry = {
+            let mut cache = self.cache();
+            match cache.get(&group) {
+                Some(entry) if entry.log.epoch() == epoch => entry.clone(),
+                _ => {
+                    let lease = OwnershipLease {
+                        holder: self.local.clone(),
+                        epoch,
+                    };
+                    let entry = Arc::new(GroupEntry {
+                        log: Arc::new(ClusterLog::new(
+                            self.local.clone(),
+                            lease,
+                            &replica_set,
+                            self.transport.clone(),
+                        )),
+                        recovered: Mutex::new(BTreeSet::new()),
+                    });
+                    cache.insert(group, entry.clone());
+                    entry
+                }
+            }
         };
 
-        // Recover this key once: a new owner was a replica, so the committed log
-        // lives in the replica set (its own copy + peers). Seeding it lets the
-        // recovered queue replay (a fresh session simply recovers to empty).
-        let recover = !self
+        // Recover this key once per epoch: a new owner was a replica, so the committed
+        // log lives in the replica set (its own copy + peers). Seeding it lets the
+        // recovered queue replay (a fresh session simply recovers to empty). The marker
+        // lives in the entry, so an epoch rebuild above resets it for the group.
+        let recover = !entry
             .recovered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(key);
         if recover {
             let recovered = self.recover_key(key, &replica_set).await?;
-            log.seed_key(key, recovered).await;
-            self.recovered
+            entry.log.seed_key(key, recovered).await;
+            entry
+                .recovered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key.to_string());
         }
-        Ok(log)
+        Ok(entry.log.clone())
     }
 
     /// Recover `key`'s committed log by reading a quorum of the replica set: this
@@ -543,5 +565,84 @@ mod tests {
         // Appends continue after the recovered watermark (no offset reuse).
         assert_eq!(log.append(&qkey, b"m3".to_vec()).await.unwrap(), 3);
         assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 3);
+    }
+
+    /// When a group's lease epoch advances (ownership lost then regained), the cached
+    /// `ClusterLog` — which writes at the stale epoch and would be fenced by followers
+    /// forever — is rebuilt at the new epoch and the group's keys are re-recovered
+    /// from the replica set. Without the rebuild the second read would return the
+    /// stale recovered range, never seeing the entry committed under the new owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_higher_lease_epoch_rebuilds_and_re_recovers_the_log() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// A lease source whose epoch can be bumped to simulate a regain.
+        #[derive(Clone)]
+        struct BumpableLease(Arc<AtomicU64>);
+        #[async_trait]
+        impl LeaseSource for BumpableLease {
+            async fn epoch_for(
+                &self,
+                _group: GroupId,
+            ) -> Result<Epoch, mqtt_storage::repl::ReplError> {
+                Ok(self.0.load(Ordering::Relaxed))
+            }
+        }
+
+        let owner = nid("owner");
+        // Single-node group (quorum 1): recovery reads only this node's own copy.
+        let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        // This node's follower copy holds the committed queue (offsets 1, 2).
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        {
+            let mut r = replicas.lock().unwrap();
+            for (offset, record) in [(1u64, b"m1".to_vec()), (2u64, b"m2".to_vec())] {
+                r.apply(
+                    3,
+                    &ReplOp::Append {
+                        key: qkey.clone(),
+                        offset,
+                        record,
+                    },
+                );
+            }
+        }
+
+        let epoch = Arc::new(AtomicU64::new(3));
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            Arc::new(PeerReplicaTransport::new()),
+            BumpableLease(epoch.clone()),
+            replicas.clone(),
+        );
+
+        // At epoch 3 the log recovers [1, 2].
+        let got = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(got.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![1, 2]);
+
+        // Ownership was lost then regained at a higher epoch; meanwhile a committed
+        // entry (offset 3) landed in this node's replica copy. Bumping the epoch must
+        // rebuild the log and re-recover, picking up offset 3 the stale cached log
+        // would never see.
+        replicas.lock().unwrap().apply(
+            7,
+            &ReplOp::Append {
+                key: qkey.clone(),
+                offset: 3,
+                record: b"m3".to_vec(),
+            },
+        );
+        epoch.store(7, Ordering::Relaxed);
+
+        let got = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(&got[2].record, b"m3");
     }
 }
