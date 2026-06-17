@@ -7,18 +7,12 @@
 
 mod common;
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use common::{start_broker, start_broker_with_policy, Client};
-use mqtt_codec::{
-    packet::{Auth, Connect},
-    Packet, Properties, Property, ProtocolVersion, QoS,
-};
-use mqttd::conn::ConnPolicy;
+use common::{enhanced, start_broker, start_broker_with_policy, Client};
+use mqtt_codec::{packet::Connect, Packet, Properties, Property, ProtocolVersion, QoS};
 
-fn property<F, T>(props: &Properties, f: F) -> Option<T>
+fn find<F, T>(props: &Properties, f: F) -> Option<T>
 where
     F: Fn(&Property) -> Option<T>,
 {
@@ -26,14 +20,14 @@ where
 }
 
 fn topic_alias(props: &Properties) -> Option<u16> {
-    property(props, |p| match p {
+    find(props, |p| match p {
         Property::TopicAlias(v) => Some(*v),
         _ => None,
     })
 }
 
 fn message_expiry(props: &Properties) -> Option<u32> {
-    property(props, |p| match p {
+    find(props, |p| match p {
         Property::MessageExpiryInterval(v) => Some(*v),
         _ => None,
     })
@@ -304,48 +298,18 @@ async fn v5_receive_maximum_limits_inflight_until_acked() {
 
 // --- enhanced authentication + re-auth (ADR 0013) ---------------------------
 
-fn hmac_policy() -> Arc<ConnPolicy> {
-    let mut secrets = HashMap::new();
-    secrets.insert("alice".to_string(), b"alice-secret".to_vec());
-    Arc::new(ConnPolicy {
-        auth: Arc::new(mqtt_auth::basic::BasicAuthenticator {
-            allow_anonymous: true,
-        }),
-        enhanced: Some(Arc::new(mqtt_auth::HmacChallengeAuthenticator::new(
-            secrets,
-        ))),
-        authz: Arc::new(mqtt_auth::AllowAll),
-        audit: Arc::new(mqtt_observability::AuditLog::new()),
-        proxy: None,
-        store: None,
-    })
-}
-
-fn alice_proof(nonce: &[u8]) -> Vec<u8> {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"alice-secret");
-    ring::hmac::sign(&key, nonce).as_ref().to_vec()
-}
-
-fn hmac_auth(reason: u8, data: &[u8]) -> Packet {
-    Packet::Auth(Auth {
-        reason,
-        properties: Properties(vec![
-            Property::AuthenticationMethod("HMAC-SHA256".into()),
-            Property::AuthenticationData(bytes::Bytes::copy_from_slice(data)),
-        ]),
-    })
-}
-
 #[tokio::test]
 async fn v5_enhanced_auth_then_reauthentication() {
-    let addr = start_broker_with_policy(hmac_policy()).await;
+    let addr = start_broker_with_policy(enhanced::policy()).await;
     let mut c = Client::open(addr, ProtocolVersion::V5).await;
 
     // CONNECT names the method and seeds the exchange with the subject.
     c.send(&Packet::Connect(Connect {
         properties: Properties(vec![
-            Property::AuthenticationMethod("HMAC-SHA256".into()),
-            Property::AuthenticationData(bytes::Bytes::from_static(b"alice")),
+            Property::AuthenticationMethod(enhanced::METHOD.into()),
+            Property::AuthenticationData(bytes::Bytes::copy_from_slice(
+                enhanced::SUBJECT.as_bytes(),
+            )),
         ]),
         protocol: ProtocolVersion::V5,
         clean_session: true,
@@ -360,26 +324,21 @@ async fn v5_enhanced_auth_then_reauthentication() {
     // Challenge -> proof -> CONNACK success.
     let challenge = c.expect_auth().await;
     assert_eq!(challenge.reason, 0x18);
-    let nonce = property(&challenge.properties, |p| match p {
-        Property::AuthenticationData(b) => Some(b.to_vec()),
-        _ => None,
-    })
-    .expect("a challenge nonce");
-    c.send(&hmac_auth(0x18, &alice_proof(&nonce))).await;
+    let nonce = enhanced::nonce_of(&challenge.properties);
+    c.send(&enhanced::auth(0x18, &enhanced::proof(&nonce)))
+        .await;
     match c.recv().await {
         Packet::ConnAck(a) => assert_eq!(a.code, 0, "enhanced auth accepted"),
         other => panic!("expected CONNACK, got {other:?}"),
     }
 
     // Re-authenticate mid-session: AUTH 0x19 -> challenge -> proof -> AUTH 0x00.
-    c.send(&hmac_auth(0x19, b"alice")).await;
+    c.send(&enhanced::auth(0x19, enhanced::SUBJECT.as_bytes()))
+        .await;
     let challenge = c.expect_auth().await;
     assert_eq!(challenge.reason, 0x18, "re-auth challenge");
-    let nonce = property(&challenge.properties, |p| match p {
-        Property::AuthenticationData(b) => Some(b.to_vec()),
-        _ => None,
-    })
-    .expect("a re-auth nonce");
-    c.send(&hmac_auth(0x18, &alice_proof(&nonce))).await;
+    let nonce = enhanced::nonce_of(&challenge.properties);
+    c.send(&enhanced::auth(0x18, &enhanced::proof(&nonce)))
+        .await;
     assert_eq!(c.expect_auth().await.reason, 0x00, "re-auth succeeded");
 }

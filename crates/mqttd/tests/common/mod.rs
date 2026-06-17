@@ -272,3 +272,65 @@ impl Client {
         }
     }
 }
+
+/// Helpers for the HMAC-SHA256 enhanced-authentication mechanism (ADR 0013): a
+/// broker policy configured with one subject ("alice"), the proof the client
+/// returns, and an AUTH-packet builder. Shared by the sunshine and darksky suites.
+pub mod enhanced {
+    use super::{Arc, ConnPolicy, Packet, Properties, Property};
+
+    pub const METHOD: &str = "HMAC-SHA256";
+    pub const SUBJECT: &str = "alice";
+    const SECRET: &[u8] = b"alice-secret";
+
+    /// A broker policy whose enhanced authenticator knows `SUBJECT`'s secret.
+    #[must_use]
+    pub fn policy() -> Arc<ConnPolicy> {
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(SUBJECT.to_string(), SECRET.to_vec());
+        Arc::new(ConnPolicy {
+            auth: Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            enhanced: Some(Arc::new(mqtt_auth::HmacChallengeAuthenticator::new(
+                secrets,
+            ))),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            store: None,
+        })
+    }
+
+    /// The correct HMAC-SHA256 proof over `nonce` for `SUBJECT`.
+    #[must_use]
+    pub fn proof(nonce: &[u8]) -> Vec<u8> {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, SECRET);
+        ring::hmac::sign(&key, nonce).as_ref().to_vec()
+    }
+
+    /// An AUTH packet for `METHOD` with the given reason and data.
+    #[must_use]
+    pub fn auth(reason: u8, data: &[u8]) -> Packet {
+        Packet::Auth(mqtt_codec::packet::Auth {
+            reason,
+            properties: Properties(vec![
+                Property::AuthenticationMethod(METHOD.into()),
+                Property::AuthenticationData(bytes::Bytes::copy_from_slice(data)),
+            ]),
+        })
+    }
+
+    /// Extract a challenge nonce (Authentication Data) from an AUTH's properties.
+    #[must_use]
+    pub fn nonce_of(props: &Properties) -> Vec<u8> {
+        props
+            .0
+            .iter()
+            .find_map(|p| match p {
+                Property::AuthenticationData(b) => Some(b.to_vec()),
+                _ => None,
+            })
+            .expect("an AUTH challenge nonce")
+    }
+}
