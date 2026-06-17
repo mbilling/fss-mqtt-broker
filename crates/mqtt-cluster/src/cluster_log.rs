@@ -363,7 +363,7 @@ pub fn merge_replica_logs(reads: &[Vec<LogEntry>]) -> Vec<LogEntry> {
 }
 
 #[async_trait]
-impl<T: ReplicaTransport> ReplicatedLog for ClusterLog<T> {
+impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
     type Key = String;
 
     async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
@@ -379,15 +379,33 @@ impl<T: ReplicaTransport> ReplicatedLog for ClusterLog<T> {
             offset,
             record,
         };
-        // The leader holds the entry locally — one ack toward quorum.
+
+        // Fan out to every follower **concurrently** and commit as soon as a quorum
+        // has accepted — the leader's own copy is one ack. A slow or wedged replica
+        // no longer serializes the append: once quorum is met the remaining
+        // deliveries are abandoned (their frames were already sent, so a reachable
+        // replica still applies them for best-effort spread; the transport reaps the
+        // in-flight entry on timeout). Any committed entry is therefore on ≥ quorum
+        // replicas, which a quorum recovery-read is guaranteed to intersect.
         let mut acks = 1usize;
-        for follower in &self.followers {
-            if self
-                .transport
-                .deliver(follower, self.lease.epoch, &op)
-                .await
-            {
-                acks += 1;
+        if acks < self.quorum {
+            let mut inflight = tokio::task::JoinSet::new();
+            for follower in &self.followers {
+                let transport = self.transport.clone();
+                let follower = follower.clone();
+                let epoch = self.lease.epoch;
+                let op = op.clone();
+                inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
+            }
+            while acks < self.quorum {
+                match inflight.join_next().await {
+                    Some(Ok(true)) => acks += 1,
+                    // A reject/unreachable, or a delivery task that failed — keep
+                    // waiting for the other followers.
+                    Some(Ok(false) | Err(_)) => {}
+                    // Every follower has reported; quorum was not reached.
+                    None => break,
+                }
             }
         }
 
@@ -593,6 +611,48 @@ mod tests {
         let all = log.read(&k, 0, 100).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(&all[0].record, b"kept");
+    }
+
+    /// A wedged follower (its delivery never completes — a half-open link) does not
+    /// block an append: the leader plus the healthy follower form a quorum, so the
+    /// append commits promptly and the stuck delivery is abandoned. With the old
+    /// sequential fan-out this would hang on the wedged replica.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_commits_at_quorum_without_waiting_on_a_wedged_replica() {
+        /// Delivers instantly to every replica except `wedged`, whose delivery never
+        /// resolves.
+        #[derive(Clone)]
+        struct WedgedFor {
+            wedged: NodeId,
+        }
+        #[async_trait]
+        impl ReplicaTransport for WedgedFor {
+            async fn deliver(&self, replica: &NodeId, _epoch: Epoch, _op: &ReplOp) -> bool {
+                if *replica == self.wedged {
+                    std::future::pending::<()>().await;
+                }
+                true
+            }
+        }
+
+        let local = n("a");
+        let set = vec![n("a"), n("b"), n("c")]; // R=3, quorum=2
+        let lease = OwnershipLease {
+            holder: local.clone(),
+            epoch: 1,
+        };
+        // b is wedged; the leader + c still make quorum.
+        let log = ClusterLog::new(local, lease, &set, WedgedFor { wedged: n("b") });
+
+        let k = "x".to_string();
+        let appended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            log.append(&k, b"v".to_vec()),
+        )
+        .await
+        .expect("append must not hang on the wedged replica");
+        assert_eq!(appended.unwrap(), 1);
+        assert_eq!(log.read(&k, 0, 100).await.unwrap().len(), 1);
     }
 
     /// A superseded lease-holder is fenced: once a quorum of followers has moved to

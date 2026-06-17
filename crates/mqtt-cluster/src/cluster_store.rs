@@ -102,7 +102,7 @@ struct GroupEntry<T: ReplicaTransport> {
 /// after a takeover (workstream F), and **rebuilding** the cached log when the
 /// group's lease epoch advances (ownership lost and regained — the stale log would
 /// self-fence forever).
-pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone> {
+pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone + 'static> {
     local: NodeId,
     placement: Arc<RwLock<Placement>>,
     transport: T,
@@ -116,7 +116,9 @@ pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone> {
     groups: Mutex<BTreeMap<GroupId, Arc<GroupEntry<T>>>>,
 }
 
-impl<S: LeaseSource, T: ReplicaTransport + Clone> std::fmt::Debug for GroupRoutedLog<S, T> {
+impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> std::fmt::Debug
+    for GroupRoutedLog<S, T>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupRoutedLog")
             .field("local", &self.local)
@@ -124,7 +126,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> std::fmt::Debug for GroupRoute
     }
 }
 
-impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
+impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T> {
     /// Build a group-routed log for `local`, resolving ownership/replica-sets from
     /// `placement`, replicating over `transport`, acquiring leases from `leases`, and
     /// recovering from `local_replicas` + peer reads on takeover.
@@ -256,7 +258,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone> GroupRoutedLog<S, T> {
 }
 
 #[async_trait]
-impl<S: LeaseSource, T: ReplicaTransport + Clone> ReplicatedLog for GroupRoutedLog<S, T> {
+impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for GroupRoutedLog<S, T> {
     type Key = String;
 
     async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
