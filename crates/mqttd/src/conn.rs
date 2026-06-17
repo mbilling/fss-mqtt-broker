@@ -202,6 +202,38 @@ fn relocation_target<'a>(
     Some((proxy, owner, addr))
 }
 
+/// If the CONNECT carries a will whose topic the client may not publish to, send the
+/// rejecting CONNACK and return `true` (the caller must close). `false` when there is
+/// no will or it is authorized.
+async fn will_rejected<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    connect: &Connect,
+    client: &ClientId,
+    principal: &Identity,
+    policy: &ConnPolicy,
+) -> Result<bool, NetError> {
+    let Some(w) = &connect.last_will else {
+        return Ok(false);
+    };
+    if policy.authz.authorize_publish(principal, &w.topic) {
+        return Ok(false);
+    }
+    warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
+    policy.audit.record(
+        "acl.deny.will",
+        Some(&principal.subject),
+        &format!("will topic {}", w.topic),
+    );
+    writer
+        .send(&Packet::ConnAck(ConnAck {
+            properties: mqtt_codec::Properties::new(),
+            session_present: false,
+            code: connack_code(CONNACK_NOT_AUTHORIZED, connect.protocol),
+        }))
+        .await?;
+    Ok(true)
+}
+
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
@@ -225,7 +257,12 @@ where
         None => return Ok(()),
     };
 
-    // Protocol-version and client-id validation may already reject the CONNECT.
+    // Negotiate the version the CONNECT declared; every later packet and the CONNACK
+    // is framed at it (a no-op for the v3.1.1 readers/writers created above).
+    reader.set_version(connect.protocol);
+    writer.set_version(connect.protocol);
+
+    // Client-id validation may already reject the CONNECT.
     let Some(client) = validate_connect(&mut writer, &connect).await? else {
         return Ok(());
     };
@@ -254,25 +291,10 @@ where
         return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr).await;
     }
 
-    // A will is a deferred publish: it must be authorized at CONNECT, not at
-    // the moment of death (ADR 0004 step 3).
-    if let Some(w) = &connect.last_will {
-        if !policy.authz.authorize_publish(&principal, &w.topic) {
-            warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
-            policy.audit.record(
-                "acl.deny.will",
-                Some(&principal.subject),
-                &format!("will topic {}", w.topic),
-            );
-            writer
-                .send(&Packet::ConnAck(ConnAck {
-                    properties: mqtt_codec::Properties::new(),
-                    session_present: false,
-                    code: CONNACK_NOT_AUTHORIZED,
-                }))
-                .await?;
-            return Ok(());
-        }
+    // A will is a deferred publish: authorize it at CONNECT, not at the moment of
+    // death (ADR 0004 step 3). An unauthorized will closes with a rejecting CONNACK.
+    if will_rejected(&mut writer, &connect, &client, &principal, policy).await? {
+        return Ok(());
     }
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
@@ -367,7 +389,9 @@ where
         &mut prelude,
     )
     .map_err(|e| NetError::Io(std::io::Error::other(e.to_string())))?;
-    Packet::Connect(connect.clone()).encode(&mut prelude, ProtocolVersion::V311)?;
+    // Re-encode the CONNECT at its own negotiated version so the owner sees (and
+    // serves) the same v3.1.1 or v5 session the client opened.
+    Packet::Connect(connect.clone()).encode(&mut prelude, connect.protocol)?;
     prelude.extend_from_slice(&leftover);
 
     if let Some(connector) = &proxy.connector {
@@ -441,10 +465,26 @@ pub async fn serve_proxied<R, W>(
     }
 }
 
-/// Validate the protocol version and client id of a CONNECT, replying with the
-/// rejecting CONNACK (0x01 / 0x02) and returning `None` when it must close.
-/// An empty client id is only valid with clean session (the server assigns an
-/// id); pairing it with a persistent session is rejected per spec.
+/// Map a v3.1.1 CONNACK return code to the MQTT 5.0 reason code for the same
+/// failure (the two code spaces differ); a no-op for v3.1.1 and for success (0x00).
+fn connack_code(v3: u8, version: ProtocolVersion) -> u8 {
+    if version != ProtocolVersion::V5 {
+        return v3;
+    }
+    match v3 {
+        CONNACK_UNACCEPTABLE_PROTOCOL => 0x84, // Unsupported Protocol Version
+        CONNACK_IDENTIFIER_REJECTED => 0x85,   // Client Identifier not valid
+        CONNACK_BAD_CREDENTIALS => 0x86,       // Bad User Name or Password
+        CONNACK_NOT_AUTHORIZED => 0x87,        // Not authorized
+        other => other,
+    }
+}
+
+/// Validate the client id of a CONNECT, replying with the rejecting CONNACK and
+/// returning `None` when it must close. An empty client id is only valid with clean
+/// session (the server assigns an id); pairing it with a persistent session is
+/// rejected per spec. The protocol version itself is already negotiated (v3.1.1 and
+/// v5 are both accepted; an unknown level is refused at the codec).
 async fn validate_connect<W>(
     writer: &mut FrameWriter<W>,
     connect: &Connect,
@@ -452,24 +492,13 @@ async fn validate_connect<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    // This milestone speaks only MQTT 3.1.1.
-    if connect.protocol != ProtocolVersion::V311 {
-        writer
-            .send(&Packet::ConnAck(ConnAck {
-                properties: mqtt_codec::Properties::new(),
-                session_present: false,
-                code: CONNACK_UNACCEPTABLE_PROTOCOL,
-            }))
-            .await?;
-        return Ok(None);
-    }
     if connect.client_id.is_empty() {
         if !connect.clean_session {
             writer
                 .send(&Packet::ConnAck(ConnAck {
                     properties: mqtt_codec::Properties::new(),
                     session_present: false,
-                    code: CONNACK_IDENTIFIER_REJECTED,
+                    code: connack_code(CONNACK_IDENTIFIER_REJECTED, connect.protocol),
                 }))
                 .await?;
             return Ok(None);
@@ -544,7 +573,7 @@ where
                 .send(&Packet::ConnAck(ConnAck {
                     properties: mqtt_codec::Properties::new(),
                     session_present: false,
-                    code,
+                    code: connack_code(code, connect.protocol),
                 }))
                 .await?;
             Ok(None)
@@ -804,8 +833,8 @@ mod tests {
     use crate::hub::HubCommand;
     use mqtt_auth::basic::BasicAuthenticator;
     use mqtt_codec::{
-        packet::{ConnAck, Connect, Publish},
-        Packet, ProtocolVersion, QoS,
+        packet::{ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},
+        Packet, Properties, Property, ProtocolVersion, QoS,
     };
     use mqtt_core::ClientId;
     use mqtt_net::{FrameReader, FrameWriter};
@@ -816,6 +845,7 @@ mod tests {
     use tokio::time::timeout;
 
     const V4: ProtocolVersion = ProtocolVersion::V311;
+    const V5: ProtocolVersion = ProtocolVersion::V5;
 
     type Reader = FrameReader<ReadHalf<DuplexStream>>;
     type Writer = FrameWriter<WriteHalf<DuplexStream>>;
@@ -999,17 +1029,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_protocol_version_closes_without_connack() {
+    async fn unknown_protocol_version_closes_without_connack() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, mut wh) = tokio::io::split(client);
 
-        // A CONNECT claiming protocol level 5: name "MQTT", level 0x05,
-        // clean-session flags, keepalive 60, client id "x".
+        // A CONNECT claiming protocol level 3 (neither v3.1.1 nor v5): name "MQTT",
+        // level 0x03, clean-session flags, keepalive 60, client id "x". The codec
+        // refuses the unknown level, so the connection closes with no CONNACK.
         let frame: &[u8] = &[
             0x10, 0x0D, // CONNECT, remaining length 13
-            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3C, // var header
+            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x03, 0x02, 0x00, 0x3C, // var header
             0x00, 0x01, b'x', // client id
         ];
         wh.write_all(frame).await.unwrap();
@@ -1018,7 +1049,78 @@ mod tests {
         assert_eq!(
             recv(&mut reader).await,
             None,
-            "an unsupported protocol version must never reach CONNACK 0x00"
+            "an unknown protocol version must never reach CONNACK 0x00"
+        );
+    }
+
+    /// An MQTT 5.0 client connects, the broker answers a v5 CONNACK, a v5 SUBSCRIBE
+    /// (with options + a subscription identifier) is answered with a v5 SUBACK, and a
+    /// v5 DISCONNECT closes the session — the whole v5 path negotiated end to end.
+    #[tokio::test]
+    async fn v5_client_connects_subscribes_and_disconnects() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let _seen = stub_hub(hub_rx);
+        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        // The client speaks v5; the broker negotiates it from the CONNECT.
+        let mut reader: Reader = FrameReader::new(rh, V5);
+        let mut writer: Writer = FrameWriter::new(wh, V5);
+
+        writer
+            .send(&Packet::Connect(Connect {
+                protocol: V5,
+                clean_session: true,
+                keep_alive: 30,
+                client_id: "v5-client".into(),
+                last_will: None,
+                username: None,
+                password: None,
+                properties: Properties(vec![Property::SessionExpiryInterval(120)]),
+            }))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => {
+                assert_eq!(a.code, 0, "v5 CONNACK success");
+                assert!(!a.session_present);
+            }
+            other => panic!("expected v5 CONNACK, got {other:?}"),
+        }
+
+        writer
+            .send(&Packet::Subscribe(Subscribe {
+                pkid: 1,
+                filters: vec![SubscribeFilter {
+                    path: "a/b".into(),
+                    qos: QoS::AtLeastOnce,
+                    options: mqtt_codec::SubscriptionOptions {
+                        no_local: true,
+                        ..Default::default()
+                    },
+                }],
+                properties: Properties(vec![Property::SubscriptionIdentifier(5)]),
+            }))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::SubAck(SubAck {
+                pkid, return_codes, ..
+            })) => {
+                assert_eq!(pkid, 1);
+                assert_eq!(return_codes, vec![QoS::AtLeastOnce as u8]);
+            }
+            other => panic!("expected v5 SUBACK, got {other:?}"),
+        }
+
+        writer
+            .send(&Packet::Disconnect(Disconnect::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "DISCONNECT closes the session"
         );
     }
 

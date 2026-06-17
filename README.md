@@ -1,6 +1,6 @@
 # mqttd — a security-first, cluster-native MQTT broker
 
-> An MQTT 3.1.1 broker (5.0 in progress) built to be the most cyber-secure
+> An MQTT 3.1.1 + 5.0 broker built to be the most cyber-secure
 > broker available, with linear horizontal scalability and a 100% open feature
 > set.
 
@@ -11,8 +11,9 @@ with dynamic cross-node routing, and a full identity/authorization stack
 (mTLS-CN / password / JWT → topic ACLs → tamper-evident audit) are in place.
 **Durable, consensus-backed replicated session storage** (openraft lease group +
 epoch-fenced quorum replication, opt-in via `MQTTD_DURABLE_SESSIONS`) is built and
-proven over a real cluster. **Cross-node takeover** (serving a session after its
-owner dies) and the **MQTT 5.0 codec** are the next milestones. See
+proven over a real cluster, with **cross-node takeover** (a replica serves a session
+after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
+**negotiates v5 at CONNECT**; the v5 *semantics* are the next milestone. See
 [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the full roadmap and
 [`docs/adr/`](docs/adr/) for the decisions behind it.
 
@@ -93,14 +94,11 @@ owner dies) and the **MQTT 5.0 codec** are the next milestones. See
   (an enqueue is quorum-durable across the real peer mesh).
 
 ### In progress / planned
-- **Cross-node takeover**: on an owner's death, a replica is promoted and serves the
-  reconnect (workstream F) — so a durable session *survives* an owner loss
-  end-to-end, not just on disk.
 - **MQTT 5.0**: session/message expiry, topic aliases, flow control, shared
   subscriptions, enhanced auth. (Per [ADR 0008](docs/adr/0008-mqtt-5-codec.md), the
-  v5 **wire codec is complete** — every control packet round-trips with its
-  properties, reason codes, subscription options, and AUTH. Negotiating v5 at the
-  broker and the v5 *semantics* are the remaining work.)
+  v5 **wire codec is complete** and the broker **negotiates v5 at CONNECT** — a v5
+  client connects, gets a v5 CONNACK with v5 reason codes, and exchanges v5-framed
+  packets. The v5 *semantics* listed above are the remaining work.)
 - Subscription digests (bloom) for sub-linear fan-out; retained-state
   replication across nodes.
 - WebSocket/WSS listener; Prometheus metrics; admin/management API. (Kubernetes-style
@@ -113,7 +111,7 @@ owner dies) and the **MQTT 5.0 codec** are the next milestones. See
 
 | Crate | Responsibility |
 |---|---|
-| `mqtt-codec` | MQTT 3.1.1 wire codec (all packet types) + fuzz harness; 5.0 next |
+| `mqtt-codec` | MQTT 3.1.1 + 5.0 wire codec (all packets, properties, reason codes) + fuzz harness |
 | `mqtt-core` | Sessions, subscription table, topic matching, ACL filter relations |
 | `mqtt-net` | Framing over any transport; the single audited TLS-config module |
 | `mqtt-auth` | `Authenticator`/`Authorizer` traits; mTLS-CN, Argon2id, JWT, ACL providers |
