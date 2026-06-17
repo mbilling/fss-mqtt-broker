@@ -110,7 +110,7 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ peer with mismatched cert CN rejected (`peer_identity`); ☐ forged/replayed SWIM datagram dropped
 
 **Resource / abuse**:
-- ☐ offline-queue overflow → drop-oldest/reject-newest observed downstream
+- ☑ offline-queue overflow → drop-oldest observed downstream (`resource_limits`)
 - ☐ flow-control backlog under a stalled consumer (documents unbounded-in-memory limit)
 - ☑ idle client reaped by keepalive (3.1.1, `keepalive_lwt`); ☐ same under v5
 - ☐ client connects but never sends CONNECT; dribble/slow-loris bytes

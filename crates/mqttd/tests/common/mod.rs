@@ -48,6 +48,22 @@ pub async fn start_broker() -> SocketAddr {
     addr
 }
 
+/// Spawn a permissive broker whose per-session offline queue uses the given limits,
+/// for exercising the bounded-queue overflow policy (ADR 0001 §6) end to end.
+pub async fn start_broker_with_queue_limits(limits: mqtt_storage::QueueLimits) -> SocketAddr {
+    use mqtt_cluster::NodeId;
+    use mqtt_storage::MemorySessionStore;
+
+    let store = Arc::new(MemorySessionStore::with_limits(limits));
+    let (hub, hub_tx) = Hub::with_config(NodeId("node-local".into()), store);
+    tokio::spawn(hub.run());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_client_loop(listener, hub_tx);
+    addr
+}
+
 /// Bring up a two-node cluster (full peer mesh) on ephemeral ports and return each
 /// node's client address. Cross-node routing is eventually consistent (interest is
 /// gossiped on subscribe), so cluster tests retry until interest has propagated.
