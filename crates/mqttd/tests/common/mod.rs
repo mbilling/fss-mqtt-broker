@@ -48,6 +48,74 @@ pub async fn start_broker() -> SocketAddr {
     addr
 }
 
+/// Bring up a two-node cluster (full peer mesh) on ephemeral ports and return each
+/// node's client address. Cross-node routing is eventually consistent (interest is
+/// gossiped on subscribe), so cluster tests retry until interest has propagated.
+pub async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
+    use mqtt_cluster::NodeId;
+    use mqtt_storage::MemorySessionStore;
+
+    let peer_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paddr_a = peer_a.local_addr().unwrap();
+    let paddr_b = peer_b.local_addr().unwrap();
+    let cli_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cli_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let caddr_a = cli_a.local_addr().unwrap();
+    let caddr_b = cli_b.local_addr().unwrap();
+
+    let id_a = NodeId("node-a".into());
+    let id_b = NodeId("node-b".into());
+    let (hub_a, tx_a) = Hub::with_config(id_a.clone(), Arc::new(MemorySessionStore::new()));
+    let (hub_b, tx_b) = Hub::with_config(id_b.clone(), Arc::new(MemorySessionStore::new()));
+    tokio::spawn(hub_a.run());
+    tokio::spawn(hub_b.run());
+
+    spawn_client_loop(cli_a, tx_a.clone());
+    spawn_client_loop(cli_b, tx_b.clone());
+
+    tokio::spawn(mqttd::peer::serve_listener(
+        peer_a,
+        id_a.clone(),
+        tx_a.clone(),
+        None,
+        None,
+    ));
+    tokio::spawn(mqttd::peer::serve_listener(
+        peer_b,
+        id_b.clone(),
+        tx_b.clone(),
+        None,
+        None,
+    ));
+    tokio::spawn(mqttd::peer::dial_forever(
+        paddr_b.to_string(),
+        id_a,
+        tx_a,
+        None,
+    ));
+    tokio::spawn(mqttd::peer::dial_forever(
+        paddr_a.to_string(),
+        id_b,
+        tx_b,
+        None,
+    ));
+
+    (caddr_a, caddr_b)
+}
+
+fn spawn_client_loop(
+    listener: TcpListener,
+    tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(mqttd::conn::handle(stream, tx.clone()));
+        }
+    });
+}
+
 /// Spawn an in-process broker driven by a caller-supplied [`ConnPolicy`] — for
 /// tests that need a specific authenticator, ACL, or enhanced-auth mechanism.
 pub async fn start_broker_with_policy(policy: Arc<ConnPolicy>) -> SocketAddr {

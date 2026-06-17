@@ -79,11 +79,11 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ retained replace/clear/wildcard/resubscribe (`retained`)
 - ☑ persistent offline queue + replay; clean session discards (`end_to_end`, `durable_sessions`)
 
-**Cluster** (gaps ☐):
+**Cluster**:
 - ☑ QoS 0 publish crosses nodes (`cluster`)
-- ☐ QoS 1/2 delivered across nodes (not just QoS 0)
-- ☐ retained published on node A delivered to later subscriber on node B
-- ☐ shared-subscription members split across two nodes (documents one-per-node limit)
+- ☑ QoS 1 delivered + acked across nodes (`cluster_chaos`); ☐ QoS 2 across nodes
+- ☑ shared-subscription members split across two nodes — one-per-node (`cluster_chaos`)
+- ☑ retained is **not** replicated across nodes — documents the limitation (`cluster_chaos`)
 
 ### 🌑 Darksky
 
