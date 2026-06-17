@@ -46,7 +46,7 @@ shared subscriptions.
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
 | F | Takeover / handoff protocol | ✅ Done — **F-a–F-d** (recovery mechanism + recovery-read RPC + rebuild on takeover + owner-death integration test) |
-| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); topic aliases, flow control, shared subs, durable expiry deadline (phase 3) remain |
+| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); topic aliases, flow control, durable expiry deadline (0009 phase 3) remain |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
 
@@ -333,11 +333,12 @@ for completeness and sequencing.
   expired copies are dropped at replay and the remaining interval is forwarded on
   the rest. Carried limitation: the deadline is durable in the log but the
   in-memory session-expiry timer restarts on takeover (ADR 0009 phase 3).
-- **Shared subscriptions** (`$share/<group>/<filter>`) — the in-protocol lever
-  for *consumer* linear scale (Capability Plan §4). Routing-layer work (group
-  membership, load-balanced delivery across group members) on top of the v5
-  codec; interacts with placement but is largely independent of the durability
-  backend.
+- **Shared subscriptions** (`$share/<group>/<filter>`) — done (ADR 0010): named
+  groups with round-robin, online-preferring single delivery; reuses the QoS,
+  persistence, and expiry machinery; retained messages are not replayed to a
+  shared subscription. Carried limitation: cross-node delivery is one-per-node,
+  not cluster-wide — true cluster-wide single delivery is deferred to the
+  placement/ownership work (ADR 0005).
 
 ## Sequencing
 

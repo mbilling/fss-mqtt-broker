@@ -35,7 +35,9 @@ use mqtt_cluster::peer::PeerMessage;
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
-use mqtt_core::{topic_matches, ClientId, Message, SubscriptionTable};
+use mqtt_core::{
+    parse_shared, topic_matches, ClientId, Message, SharedSubscriptionTable, SubscriptionTable,
+};
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore,
 };
@@ -292,6 +294,9 @@ pub struct Hub {
     subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
+    /// Shared-subscription groups (`$share/<group>/<filter>`), delivered to one
+    /// member each, round-robin (ADR 0010).
+    shared: SharedSubscriptionTable,
     /// Per-session outbound `QoS` > 0 in-flight state.
     inflight: HashMap<ClientId, Inflight>,
     /// Durable session/queue storage. `Arc` so connections can share it (e.g. for
@@ -352,6 +357,7 @@ impl Hub {
                 expiring: HashMap::new(),
                 subs_by_client: HashMap::new(),
                 table: SubscriptionTable::new(),
+                shared: SharedSubscriptionTable::new(),
                 inflight: HashMap::new(),
                 store,
                 durable_plane: None,
@@ -545,10 +551,17 @@ impl Hub {
             // Reconcile the routing table with persisted subscriptions (needed
             // after a broker restart; idempotent otherwise).
             if let Ok(subs) = self.store.subscriptions(&client).await {
-                let map = self.subs_by_client.entry(client.clone()).or_default();
                 for s in subs {
-                    self.table.subscribe(client.clone(), s.filter.clone());
-                    map.insert(s.filter, s.max_qos);
+                    if let Some((group, filter)) = parse_shared(&s.filter) {
+                        self.shared
+                            .subscribe(client.clone(), group, filter, s.max_qos);
+                    } else {
+                        self.table.subscribe(client.clone(), s.filter.clone());
+                    }
+                    self.subs_by_client
+                        .entry(client.clone())
+                        .or_default()
+                        .insert(s.filter, s.max_qos);
                 }
             }
             existed
@@ -641,21 +654,23 @@ impl Hub {
     }
 
     async fn subscribe(&mut self, client: &ClientId, filters: Vec<(String, QoS)>) {
+        // Retained messages are replayed only for ordinary subscriptions; a new
+        // shared subscription does not receive them (ADR 0010 §3, [MQTT-3.8.4]).
+        let mut replay: Vec<Message> = Vec::new();
         for (f, q) in &filters {
-            debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
-            self.table.subscribe(client.clone(), f.clone());
+            // Keep the full filter string (including any `$share/` prefix) so it is
+            // persisted; `$share/...` never matches a concrete topic in `granted_qos`.
             self.subs_by_client
                 .entry(client.clone())
                 .or_default()
                 .insert(f.clone(), *q);
-        }
-        self.persist_subscriptions(client).await;
-        self.gossip_interest();
-
-        // Replay retained messages for every new subscription, with the retain
-        // flag set [MQTT-3.3.1-6].
-        let mut replay: Vec<Message> = Vec::new();
-        for (f, q) in &filters {
+            if let Some((group, filter)) = parse_shared(f) {
+                debug!(client = %client.0, group, filter, qos = *q as u8, "shared subscribe");
+                self.shared.subscribe(client.clone(), group, filter, *q);
+                continue;
+            }
+            debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
+            self.table.subscribe(client.clone(), f.clone());
             if let Ok(matching) = self.retained.matching(f).await {
                 for m in matching {
                     replay.push(Message {
@@ -666,6 +681,9 @@ impl Hub {
                 }
             }
         }
+        self.persist_subscriptions(client).await;
+        self.gossip_interest();
+
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             for m in replay {
                 self.send_to_client(client, &tx, &m, true, None);
@@ -674,10 +692,14 @@ impl Hub {
     }
 
     async fn unsubscribe(&mut self, client: &ClientId, filters: &[String]) {
-        if let Some(map) = self.subs_by_client.get_mut(client) {
-            for f in filters {
-                self.table.unsubscribe(client, f);
+        for f in filters {
+            if let Some(map) = self.subs_by_client.get_mut(client) {
                 map.remove(f);
+            }
+            if let Some((group, filter)) = parse_shared(f) {
+                self.shared.unsubscribe(client, group, filter);
+            } else {
+                self.table.unsubscribe(client, f);
             }
         }
         self.persist_subscriptions(client).await;
@@ -710,13 +732,39 @@ impl Hub {
         // the interval. Online deliveries leave the wire immediately, so they carry
         // the full interval; queued copies carry the absolute deadline.
         let expiry_at = message_expiry.map(|secs| now_epoch_secs() + u64::from(secs));
-        let targets: Vec<ClientId> = self.table.matching_clients(topic).into_iter().collect();
-        debug!(topic = %topic, local_subscribers = targets.len(), "local delivery");
-        for c in targets {
+
+        // Ordinary subscribers (fan out to all) carry their per-filter granted QoS;
+        // each shared group (ADR 0010) contributes exactly one chosen member.
+        let mut targets: Vec<(ClientId, QoS)> = self
+            .table
+            .matching_clients(topic)
+            .into_iter()
+            .map(|c| {
+                let granted = self.granted_qos(&c, topic);
+                (c, granted)
+            })
+            .collect();
+        let ordinary = targets.len();
+        for rotation in self.shared.rotations(topic) {
+            // Prefer an online member; otherwise queue for a persistent offline one;
+            // a group with no reachable member drops the message for that group.
+            let pick = rotation
+                .iter()
+                .find(|(c, _)| self.online.contains_key(c))
+                .or_else(|| rotation.iter().find(|(c, _)| self.is_persistent(c)))
+                .cloned();
+            if let Some((c, granted)) = pick {
+                targets.push((c, granted));
+            } else {
+                debug!(topic = %topic, "shared group has no reachable member");
+            }
+        }
+        debug!(topic = %topic, ordinary, shared = targets.len() - ordinary, "local delivery");
+        for (c, granted) in targets {
             let message = Message {
                 topic: topic.to_string(),
                 payload: payload.clone(),
-                qos: min_qos(qos, self.granted_qos(&c, topic)),
+                qos: min_qos(qos, granted),
                 retain: false,
             };
             if let Some(tx) = self.online.get(&c).map(|s| s.tx.clone()) {
@@ -943,6 +991,7 @@ impl Hub {
     fn drop_subscriptions(&mut self, client: &ClientId) {
         self.subs_by_client.remove(client);
         self.table.remove_client(client);
+        self.shared.remove_client(client);
     }
 
     // --- cluster ---------------------------------------------------------------
@@ -968,7 +1017,7 @@ impl Hub {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest so the peer can route to us immediately.
         let _ = tx.send(PeerMessage::Interest {
-            filters: self.table.filters(),
+            filters: self.local_interest(),
         });
         // Register the link with the durable plane (consensus + replication) so its
         // RPCs to this peer route over the same channel.
@@ -1023,12 +1072,25 @@ impl Hub {
         });
     }
 
+    /// This node's interest snapshot for cluster gossip: ordinary filters plus the
+    /// underlying `{filter}` of every shared group (ADR 0010 §5), so peers forward
+    /// matching publishes to us for both.
+    fn local_interest(&self) -> Vec<String> {
+        let mut filters = self.table.filters();
+        for f in self.shared.filters() {
+            if !filters.contains(&f) {
+                filters.push(f);
+            }
+        }
+        filters
+    }
+
     /// Send this node's current interest snapshot to all connected peers.
     fn gossip_interest(&self) {
         if self.peers.is_empty() {
             return;
         }
-        let filters = self.table.filters();
+        let filters = self.local_interest();
         for peer in self.peers.values() {
             let _ = peer.tx.send(PeerMessage::Interest {
                 filters: filters.clone(),
@@ -1378,6 +1440,104 @@ mod tests {
             remaining > 0 && remaining <= 3600,
             "remaining interval within bounds: {remaining}"
         );
+    }
+
+    fn publish_retained(tx: &HubTx, topic: &str, payload: &'static [u8]) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+        })
+        .unwrap();
+    }
+
+    /// A shared subscription (ADR 0010) delivers each matching message to exactly
+    /// one group member, round-robin — not to every member.
+    #[tokio::test]
+    async fn shared_subscription_round_robins_one_member() {
+        let tx = start_hub();
+        let (mut a, _) = attach(&tx, "a", 1, true).await;
+        let (mut b, _) = attach(&tx, "b", 2, true).await;
+        subscribe(&tx, "a", "$share/grp/t/+");
+        subscribe(&tx, "b", "$share/grp/t/+");
+
+        publish(&tx, "t/1", b"m1");
+        publish(&tx, "t/2", b"m2");
+
+        // Round-robin in subscribe order: a gets the first, b the second, and
+        // neither sees a duplicate.
+        assert_eq!(payload_of(&recv_packet(&mut a).await.unwrap()), b"m1");
+        assert_eq!(payload_of(&recv_packet(&mut b).await.unwrap()), b"m2");
+        assert!(recv_packet(&mut a).await.is_none());
+        assert!(recv_packet(&mut b).await.is_none());
+    }
+
+    /// An ordinary and a shared subscription matching the same topic are
+    /// independent: both receive the message.
+    #[tokio::test]
+    async fn ordinary_and_shared_subscriptions_are_independent() {
+        let tx = start_hub();
+        let (mut ord, _) = attach(&tx, "o", 1, true).await;
+        let (mut sh, _) = attach(&tx, "s", 2, true).await;
+        subscribe(&tx, "o", "t");
+        subscribe(&tx, "s", "$share/g/t");
+        publish(&tx, "t", b"x");
+        assert_eq!(payload_of(&recv_packet(&mut ord).await.unwrap()), b"x");
+        assert_eq!(payload_of(&recv_packet(&mut sh).await.unwrap()), b"x");
+    }
+
+    /// A new shared subscription is not sent retained messages [MQTT-3.8.4];
+    /// an ordinary one still is.
+    #[tokio::test]
+    async fn shared_subscription_skips_retained_messages() {
+        let tx = start_hub();
+        publish_retained(&tx, "t", b"r");
+
+        let (mut sh, _) = attach(&tx, "s", 1, true).await;
+        subscribe(&tx, "s", "$share/g/t");
+        assert!(
+            recv_packet(&mut sh).await.is_none(),
+            "shared subscriptions receive no retained messages"
+        );
+
+        let (mut ord, _) = attach(&tx, "o", 2, true).await;
+        subscribe(&tx, "o", "t");
+        assert_eq!(payload_of(&recv_packet(&mut ord).await.unwrap()), b"r");
+    }
+
+    /// With no online member, a shared message queues for a persistent offline
+    /// member and replays on its reconnect.
+    #[tokio::test]
+    async fn shared_message_queues_for_offline_persistent_member() {
+        let tx = start_hub();
+        let (_a, _) = attach(&tx, "a", 1, false).await;
+        subscribe(&tx, "a", "$share/g/t");
+        detach(&tx, "a", 1);
+
+        publish(&tx, "t", b"queued");
+
+        let (mut a, present) = attach(&tx, "a", 2, false).await;
+        assert!(present);
+        assert_eq!(payload_of(&recv_packet(&mut a).await.unwrap()), b"queued");
+    }
+
+    /// Selection prefers an online member over a persistent offline one, so a
+    /// live consumer is never starved by round-robin landing on a sleeping peer.
+    #[tokio::test]
+    async fn shared_delivery_prefers_online_over_offline_member() {
+        let tx = start_hub();
+        let (_off, _) = attach(&tx, "off", 1, false).await;
+        let (mut on, _) = attach(&tx, "on", 2, true).await;
+        subscribe(&tx, "off", "$share/g/t");
+        subscribe(&tx, "on", "$share/g/t");
+        detach(&tx, "off", 1); // now offline but persistent
+
+        publish(&tx, "t", b"1");
+        publish(&tx, "t", b"2");
+        assert_eq!(payload_of(&recv_packet(&mut on).await.unwrap()), b"1");
+        assert_eq!(payload_of(&recv_packet(&mut on).await.unwrap()), b"2");
     }
 
     /// Connecting with `clean_session=true` discards any prior persistent state

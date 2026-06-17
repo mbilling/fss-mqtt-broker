@@ -13,3 +13,6 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0005](0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted |
 | [0006](0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted; engine ratified (openraft) |
 | [0007](0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted (design); implementation phased |
+| [0008](0008-mqtt-5-codec.md) | MQTT 5.0 wire codec | Accepted |
+| [0009](0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted (design); implementation phased |
+| [0010](0010-shared-subscriptions.md) | Shared subscriptions | Accepted (design); implementation phased |

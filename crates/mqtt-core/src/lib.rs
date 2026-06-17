@@ -10,6 +10,9 @@ pub use mqtt_codec::QoS;
 pub mod subscriptions;
 pub use subscriptions::SubscriptionTable;
 
+pub mod shared;
+pub use shared::{is_shared_filter, parse_shared, SharedSubscriptionTable};
+
 /// A normalized topic name (no wildcards) as published.
 pub type TopicName = String;
 

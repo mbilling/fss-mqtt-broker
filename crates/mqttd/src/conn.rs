@@ -18,7 +18,7 @@ use mqtt_codec::{
     packet::{ConnAck, Connect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
 };
-use mqtt_core::{ClientId, Message};
+use mqtt_core::{is_shared_filter, parse_shared, ClientId, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
 use mqtt_observability::{AuditLog, AuditSink};
 use std::collections::HashSet;
@@ -816,7 +816,12 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             let mut granted: Vec<(String, QoS)> = Vec::new();
             let mut return_codes: Vec<u8> = Vec::with_capacity(s.filters.len());
             for f in &s.filters {
-                if policy.authz.authorize_subscribe(principal, &f.path) {
+                // A malformed `$share/...` filter (bad share name / empty filter) is
+                // rejected outright (ADR 0010 §1) before the ACL even sees it.
+                if is_shared_filter(&f.path) && parse_shared(&f.path).is_none() {
+                    debug!(client = %client.0, filter = %f.path, "malformed shared subscription");
+                    return_codes.push(SUBACK_FAILURE);
+                } else if policy.authz.authorize_subscribe(principal, &f.path) {
                     granted.push((f.path.clone(), f.qos));
                     return_codes.push(f.qos as u8);
                 } else {
@@ -1151,6 +1156,53 @@ mod tests {
             None,
             "DISCONNECT closes the session"
         );
+    }
+
+    /// A malformed `$share/...` filter is answered with 0x80 in the SUBACK
+    /// (ADR 0010 §1), while a well-formed one and an ordinary filter are granted.
+    #[tokio::test]
+    async fn malformed_shared_subscription_is_rejected_in_suback() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_packet("c", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        let filter = |path: &str| SubscribeFilter {
+            path: path.into(),
+            qos: QoS::AtLeastOnce,
+            options: mqtt_codec::SubscriptionOptions::default(),
+        };
+        writer
+            .send(&Packet::Subscribe(Subscribe {
+                pkid: 7,
+                filters: vec![
+                    filter("$share/g/t"), // valid shared
+                    filter("plain/t"),    // ordinary
+                    filter("$share/g"),   // malformed: no filter part
+                    filter("$share//f"),  // malformed: empty share name
+                ],
+                properties: Properties::new(),
+            }))
+            .await
+            .unwrap();
+
+        match recv(&mut reader).await {
+            Some(Packet::SubAck(SubAck {
+                pkid, return_codes, ..
+            })) => {
+                assert_eq!(pkid, 7);
+                assert_eq!(
+                    return_codes,
+                    vec![
+                        QoS::AtLeastOnce as u8,
+                        QoS::AtLeastOnce as u8,
+                        super::SUBACK_FAILURE,
+                        super::SUBACK_FAILURE,
+                    ]
+                );
+            }
+            other => panic!("expected SUBACK, got {other:?}"),
+        }
     }
 
     #[tokio::test]
