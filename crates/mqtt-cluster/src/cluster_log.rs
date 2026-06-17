@@ -442,6 +442,15 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             .collect())
     }
 
+    async fn live_range(&self, key: &String) -> Result<Option<(Offset, Offset)>, ReplError> {
+        // O(1) from the watermarks: the live committed range is (truncated,
+        // committed], i.e. low = truncated + 1, high = committed.
+        let state = self.state.lock().await;
+        Ok(state.get(key).and_then(|ks| {
+            (ks.committed > ks.truncated).then_some((ks.truncated + 1, ks.committed))
+        }))
+    }
+
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
         let mut state = self.state.lock().await;
         let mut op = None;
@@ -691,6 +700,31 @@ mod tests {
             stale.append(&k, b"stale".to_vec()).await,
             Err(mqtt_storage::repl::ReplError::NoQuorum)
         ));
+    }
+
+    /// `live_range` reflects the committed watermarks: an uncommitted (below-quorum)
+    /// append is excluded, and truncation advances the low edge. This is the O(1)
+    /// count the queue cap relies on.
+    #[tokio::test]
+    async fn live_range_reflects_committed_watermarks() {
+        let (log, sim, followers) = group(1);
+        let k = "x".to_string();
+        assert_eq!(log.live_range(&k).await.unwrap(), None);
+
+        for _ in 0..4 {
+            log.append(&k, b"x".to_vec()).await.unwrap();
+        }
+        assert_eq!(log.live_range(&k).await.unwrap(), Some((1, 4)));
+
+        // An append that cannot reach quorum does not commit → range unchanged.
+        sim.down(&followers[0]);
+        sim.down(&followers[1]);
+        assert!(log.append(&k, b"lost".to_vec()).await.is_err());
+        assert_eq!(log.live_range(&k).await.unwrap(), Some((1, 4)));
+
+        // Truncation advances the low edge (local-first, no quorum needed).
+        log.truncate(&k, 2).await.unwrap();
+        assert_eq!(log.live_range(&k).await.unwrap(), Some((3, 4)));
     }
 
     #[tokio::test]

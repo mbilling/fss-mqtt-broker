@@ -274,6 +274,10 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
         self.log_for_key(key).await?.read(key, after, limit).await
     }
 
+    async fn live_range(&self, key: &String) -> Result<Option<(Offset, Offset)>, ReplError> {
+        self.log_for_key(key).await?.live_range(key).await
+    }
+
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
         self.log_for_key(key).await?.truncate(key, up_to).await
     }

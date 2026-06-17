@@ -102,6 +102,23 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
         limit: usize,
     ) -> Result<Vec<LogEntry>, ReplError>;
 
+    /// The offset range `[low, high]` of `key`'s currently-retained ("live")
+    /// entries, or `None` if empty. The retained range is contiguous (append extends
+    /// the tail, [`truncate`](Self::truncate) drops a prefix), so `high - low + 1` is
+    /// the live count — what queue-cap enforcement needs without materializing the
+    /// whole queue.
+    ///
+    /// The default reads the whole log (O(n)); a backend that tracks offset
+    /// watermarks should override it with an O(1) answer, since this is on the
+    /// enqueue hot path.
+    async fn live_range(&self, key: &Self::Key) -> Result<Option<(Offset, Offset)>, ReplError> {
+        let entries = self.read(key, 0, usize::MAX).await?;
+        match (entries.first(), entries.last()) {
+            (Some(first), Some(last)) => Ok(Some((first.offset, last.offset))),
+            _ => Ok(None),
+        }
+    }
+
     /// Truncate `key`'s log up to and including `up_to`. Local-first and lazy;
     /// idempotent and tolerant of stale / already-truncated offsets.
     async fn truncate(&self, key: &Self::Key, up_to: Offset) -> Result<(), ReplError>;
@@ -128,6 +145,10 @@ impl<L: ReplicatedLog + ?Sized> ReplicatedLog for std::sync::Arc<L> {
         limit: usize,
     ) -> Result<Vec<LogEntry>, ReplError> {
         (**self).read(key, after, limit).await
+    }
+
+    async fn live_range(&self, key: &Self::Key) -> Result<Option<(Offset, Offset)>, ReplError> {
+        (**self).live_range(key).await
     }
 
     async fn truncate(&self, key: &Self::Key, up_to: Offset) -> Result<(), ReplError> {
@@ -210,6 +231,17 @@ impl ReplicatedLog for InMemoryReplicatedLog {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn live_range(&self, key: &String) -> Result<Option<(Offset, Offset)>, ReplError> {
+        // VecDeque front/back are O(1); the retained range is contiguous.
+        Ok(self
+            .lock()
+            .get(key)
+            .and_then(|s| match (s.entries.front(), s.entries.back()) {
+                (Some(front), Some(back)) => Some((front.offset, back.offset)),
+                _ => None,
+            }))
     }
 
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
@@ -362,6 +394,32 @@ mod tests {
         assert!(log.read(&k, 0, 100).await.unwrap().is_empty());
         // Next append is offset 4, not 1.
         assert_eq!(log.append(&k, rec(b"x")).await.unwrap(), 4);
+    }
+
+    /// `live_range` reports the retained `[low, high]` offsets — `None` when empty,
+    /// and the low edge advances as a prefix is truncated (the cheap count the queue
+    /// cap uses).
+    #[tokio::test]
+    async fn live_range_tracks_the_retained_offsets() {
+        let log = InMemoryReplicatedLog::new();
+        let k = "k".to_string();
+        assert_eq!(log.live_range(&k).await.unwrap(), None);
+
+        for _ in 0..5 {
+            log.append(&k, rec(b"x")).await.unwrap();
+        }
+        // Live offsets are 1..=5.
+        assert_eq!(log.live_range(&k).await.unwrap(), Some((1, 5)));
+
+        // Truncating a prefix advances the low edge; count = high - low + 1 = 3.
+        log.truncate(&k, 2).await.unwrap();
+        assert_eq!(log.live_range(&k).await.unwrap(), Some((3, 5)));
+
+        // Emptying the log reports None again (offsets do not reset).
+        log.truncate(&k, 5).await.unwrap();
+        assert_eq!(log.live_range(&k).await.unwrap(), None);
+        assert_eq!(log.append(&k, rec(b"y")).await.unwrap(), 6);
+        assert_eq!(log.live_range(&k).await.unwrap(), Some((6, 6)));
     }
 
     #[tokio::test]

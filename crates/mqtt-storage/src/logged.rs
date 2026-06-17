@@ -32,12 +32,13 @@
 //! ## Queue cap (ADR 0001 §6) lives here, above the seam
 //!
 //! The log is a pure, unbounded append-log; the per-session [`QueueLimits`] are a
-//! `SessionStore` policy and are enforced in this layer by reading the queue and
+//! `SessionStore` policy and are enforced in this layer by counting the queue and
 //! truncating (drop-oldest) or refusing (reject-newest). Enforcement is exact when
 //! appends to one key are serialized — which the production backend guarantees via
-//! the ownership lease, and which holds trivially for sequential callers. The
-//! single-node backend reads the whole queue to count; the consensus backend will
-//! maintain an in-memory index (a rebuildable accelerator, not durable state).
+//! the ownership lease, and which holds trivially for sequential callers. The count
+//! comes from [`ReplicatedLog::live_range`](crate::repl::ReplicatedLog::live_range)
+//! — an O(1) offset-watermark query on the real backends — so the hot enqueue path
+//! never materializes the whole queue.
 
 use crate::repl::{ReplError, ReplicatedLog};
 use crate::{Enqueued, QueueLimits, QueuedMessage, SessionStore, StorageError};
@@ -162,20 +163,24 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         let cap = self.limits.max_messages.max(1);
 
         // Apply the queue cap before appending (ADR 0001 §6). The log itself is
-        // unbounded; the policy lives in this layer.
-        let live = self.log.read(&qkey, 0, usize::MAX).await?;
+        // unbounded; the policy lives in this layer. Count via the cheap range query
+        // (O(1) on a watermark-tracking backend) rather than materializing the whole
+        // queue — the retained range is contiguous, so `high - low + 1` is the count.
         let mut evicted = 0u64;
-        if live.len() >= cap {
-            match self.limits.overflow {
-                crate::OverflowPolicy::RejectNewest => return Ok(Enqueued::Rejected),
-                crate::OverflowPolicy::DropOldest => {
-                    // Evict the oldest entries so that, after the append, the queue
-                    // holds exactly `cap`. They are the lowest offsets; one
-                    // truncate up to the highest evicted offset drops them all.
-                    let evict_count = live.len() - cap + 1;
-                    let up_to = live[evict_count - 1].offset;
-                    self.log.truncate(&qkey, up_to).await?;
-                    evicted = evict_count as u64;
+        if let Some((low, high)) = self.log.live_range(&qkey).await? {
+            let count = usize::try_from(high - low + 1).unwrap_or(usize::MAX);
+            if count >= cap {
+                match self.limits.overflow {
+                    crate::OverflowPolicy::RejectNewest => return Ok(Enqueued::Rejected),
+                    crate::OverflowPolicy::DropOldest => {
+                        // Evict the oldest entries so that, after the append, the
+                        // queue holds exactly `cap`. They are the lowest offsets
+                        // `[low, low + evict_count - 1]`; one truncate drops them all.
+                        let evict_count = count - cap + 1;
+                        let up_to = low + evict_count as u64 - 1;
+                        self.log.truncate(&qkey, up_to).await?;
+                        evicted = evict_count as u64;
+                    }
                 }
             }
         }
