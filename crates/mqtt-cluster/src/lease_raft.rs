@@ -49,6 +49,15 @@ pub enum LeaseRequest {
         /// The node to grant the lease to.
         node: RaftNodeId,
     },
+    /// (Re)assign many groups' leases in one committed entry, each minting its own
+    /// fresh epoch (in order). The leader's reconcile batches all pending
+    /// assignments into a single consensus write rather than one per group, so a
+    /// fresh leader (or a rebalance) does not burst hundreds of tiny entries through
+    /// the log.
+    AssignMany {
+        /// The `(group, node)` assignments to apply, in order.
+        assignments: Vec<(GroupId, RaftNodeId)>,
+    },
 }
 
 /// The result of applying a [`LeaseRequest`]: the group's now-current lease.
@@ -88,29 +97,39 @@ impl LeaseMap {
         Self::default()
     }
 
-    /// Apply a committed request, returning the resulting lease.
+    /// Apply a committed request. Returns the resulting lease for a single
+    /// [`Assign`](LeaseRequest::Assign), the **last** lease for an
+    /// [`AssignMany`](LeaseRequest::AssignMany) (each is minted in order), or `None`
+    /// for an empty batch.
     ///
     /// Each assignment mints a **strictly increasing** epoch from a monotonic
     /// counter, so a new holder always supersedes the previous one and a stale
     /// holder is fenced at the replication layer (ADR 0006 §1).
-    pub fn apply(&mut self, req: &LeaseRequest) -> LeaseResponse {
+    pub fn apply(&mut self, req: &LeaseRequest) -> Option<LeaseResponse> {
         match req {
-            LeaseRequest::Assign { group, node } => {
-                self.next_epoch += 1;
-                let epoch = self.next_epoch;
-                self.leases.insert(
-                    *group,
-                    LeaseRecord {
-                        holder: *node,
-                        epoch,
-                    },
-                );
-                LeaseResponse {
-                    group: *group,
-                    holder: *node,
-                    epoch,
-                }
-            }
+            LeaseRequest::Assign { group, node } => Some(self.assign_one(*group, *node)),
+            LeaseRequest::AssignMany { assignments } => assignments
+                .iter()
+                .map(|(group, node)| self.assign_one(*group, *node))
+                .last(),
+        }
+    }
+
+    /// Assign one group to `node` at a fresh epoch, returning the minted lease.
+    fn assign_one(&mut self, group: GroupId, node: RaftNodeId) -> LeaseResponse {
+        self.next_epoch += 1;
+        let epoch = self.next_epoch;
+        self.leases.insert(
+            group,
+            LeaseRecord {
+                holder: node,
+                epoch,
+            },
+        );
+        LeaseResponse {
+            group,
+            holder: node,
+            epoch,
         }
     }
 
@@ -133,8 +152,9 @@ openraft::declare_raft_types!(
     /// are supplied by openraft.
     ///
     /// The response is `Option<LeaseResponse>`: a committed `Normal` entry (an
-    /// `Assign`) yields `Some(lease)`, while the `Blank`/`Membership` entries Raft
-    /// commits internally yield `None`.
+    /// `Assign` or `AssignMany`) yields `Some(lease)` (the last, for a batch), while
+    /// the `Blank`/`Membership` entries Raft commits internally — and an empty batch
+    /// — yield `None`.
     pub LeaseConfig:
         D = LeaseRequest,
         R = Option<LeaseResponse>,
@@ -161,7 +181,7 @@ mod tests {
     #[test]
     fn assign_mints_a_lease_at_a_fresh_epoch() {
         let mut m = LeaseMap::new();
-        let r = m.apply(&assign(1, 10));
+        let r = m.apply(&assign(1, 10)).unwrap();
         assert_eq!(r.epoch, 1);
         assert_eq!(r.holder, 10);
         let lease = m.get(1).unwrap();
@@ -173,8 +193,8 @@ mod tests {
     #[test]
     fn reassign_bumps_the_epoch_monotonically() {
         let mut m = LeaseMap::new();
-        assert_eq!(m.apply(&assign(1, 10)).epoch, 1);
-        let r = m.apply(&assign(1, 20));
+        assert_eq!(m.apply(&assign(1, 10)).unwrap().epoch, 1);
+        let r = m.apply(&assign(1, 20)).unwrap();
         assert_eq!(r.epoch, 2);
         assert_eq!(m.get(1).unwrap().holder, 20);
         assert_eq!(m.get(1).unwrap().epoch, 2);
@@ -185,12 +205,57 @@ mod tests {
     #[test]
     fn epochs_are_globally_monotonic_across_groups() {
         let mut m = LeaseMap::new();
-        assert_eq!(m.apply(&assign(1, 10)).epoch, 1);
-        assert_eq!(m.apply(&assign(2, 10)).epoch, 2);
-        assert_eq!(m.apply(&assign(1, 20)).epoch, 3);
+        assert_eq!(m.apply(&assign(1, 10)).unwrap().epoch, 1);
+        assert_eq!(m.apply(&assign(2, 10)).unwrap().epoch, 2);
+        assert_eq!(m.apply(&assign(1, 20)).unwrap().epoch, 3);
         assert_eq!(m.high_epoch(), 3);
         assert_eq!(m.get(1).unwrap().epoch, 3);
         assert_eq!(m.get(2).unwrap().epoch, 2);
+    }
+
+    /// A batched `AssignMany` mints a fresh, increasing epoch per assignment (in
+    /// order) and applies them all, returning the last — equivalent to the same
+    /// sequence of single `Assign`s but in one committed entry.
+    #[test]
+    fn assign_many_applies_each_at_a_fresh_epoch() {
+        let mut m = LeaseMap::new();
+        let last = m
+            .apply(&LeaseRequest::AssignMany {
+                assignments: vec![(1, 10), (2, 20), (3, 30)],
+            })
+            .unwrap();
+        assert_eq!(last.group, 3);
+        assert_eq!(last.epoch, 3);
+        assert_eq!(
+            m.get(1).unwrap(),
+            super::LeaseRecord {
+                holder: 10,
+                epoch: 1
+            }
+        );
+        assert_eq!(
+            m.get(2).unwrap(),
+            super::LeaseRecord {
+                holder: 20,
+                epoch: 2
+            }
+        );
+        assert_eq!(
+            m.get(3).unwrap(),
+            super::LeaseRecord {
+                holder: 30,
+                epoch: 3
+            }
+        );
+        assert_eq!(m.high_epoch(), 3);
+
+        // An empty batch is a no-op with no response.
+        assert!(m
+            .apply(&LeaseRequest::AssignMany {
+                assignments: vec![],
+            })
+            .is_none());
+        assert_eq!(m.high_epoch(), 3);
     }
 
     #[test]

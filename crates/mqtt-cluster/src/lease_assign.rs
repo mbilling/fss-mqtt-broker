@@ -66,12 +66,17 @@ impl LeaseAssigner {
             .collect()
     }
 
-    /// As the lease-group leader, assign every pending group to its placement owner.
-    /// Returns how many were assigned. A **no-op on a follower** (only the leader can
-    /// `client_write`).
+    /// As the lease-group leader, assign every pending group to its placement owner
+    /// in a **single** batched consensus write. Returns how many were assigned. A
+    /// **no-op on a follower** (only the leader can `client_write`) and when nothing
+    /// is pending (so reconcile stays idempotent — no empty entries appended).
+    ///
+    /// Batching matters at scale: a fresh leader sees every group unassigned, and a
+    /// membership change moves many groups at once. One `AssignMany` entry replaces
+    /// hundreds of single `Assign`s, so the lease log does not burst.
     ///
     /// # Errors
-    /// [`AssignError::Raft`] if a lease assignment fails.
+    /// [`AssignError::Raft`] if the assignment write fails.
     pub async fn reconcile(
         &self,
         raft: &LeaseRaft,
@@ -80,13 +85,14 @@ impl LeaseAssigner {
         if !raft_view(raft).is_leader {
             return Ok(0);
         }
-        let pending = self.pending(store);
-        let count = pending.len();
-        for (group, node) in pending {
-            raft.client_write(LeaseRequest::Assign { group, node })
-                .await
-                .map_err(|e| AssignError::Raft(e.to_string()))?;
+        let assignments = self.pending(store);
+        if assignments.is_empty() {
+            return Ok(0);
         }
+        let count = assignments.len();
+        raft.client_write(LeaseRequest::AssignMany { assignments })
+            .await
+            .map_err(|e| AssignError::Raft(e.to_string()))?;
         Ok(count)
     }
 }

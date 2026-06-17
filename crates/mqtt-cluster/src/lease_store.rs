@@ -207,8 +207,12 @@ impl RaftStorage<LeaseConfig> for LeaseStore {
             match &entry.payload {
                 // A no-op leader entry: nothing to apply.
                 EntryPayload::Blank => responses.push(None),
-                // A lease assignment: drive the state machine.
-                EntryPayload::Normal(req) => responses.push(Some(inner.sm.apply(req))),
+                // A lease assignment (single or batched): drive the state machine,
+                // which yields the resulting lease (or `None` for an empty batch).
+                EntryPayload::Normal(req) => {
+                    let response = inner.sm.apply(req);
+                    responses.push(response);
+                }
                 // A membership change: record it; no business logic.
                 EntryPayload::Membership(membership) => {
                     inner.last_membership =

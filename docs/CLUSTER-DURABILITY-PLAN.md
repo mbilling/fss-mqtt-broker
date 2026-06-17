@@ -379,7 +379,7 @@ silent cut — they are the explicit price of shipping capacity before durabilit
 | ~~Consensus + replication not run by the live hub~~ | — | ✅ **E step 4** — the durable stack runs in the broker; proven by the 3-node integration test |
 | ~~QoS-2 dedup set + next-packet-id counter not yet replicated state~~ | — | ✅ **E step 3c** — now in the replicated `m/{client}` snapshot |
 | `ReplicatedSessionStore` enqueue counts the queue via an **O(n) read** for cap enforcement (exact only under serialized per-key appends, which the lease guarantees) | A larger constant on enqueue; no correctness/durability impact | **E step 3c remainder** (a rebuildable per-key cap index) |
-| Lease assignment is **eager** (the leader assigns all `NUM_GROUPS` on first leadership) and membership debounce is one tick | A startup burst of small consensus writes; conservative under rapid churn | minor hardening (demand-driven assignment, longer debounce) |
+| ~~Lease assignment issued one consensus write **per group** (all `NUM_GROUPS` on first leadership / a rebalance)~~ | — | ✅ **hardening** — `reconcile` batches every pending assignment into one `AssignMany` entry (each still mints its own fresh epoch); the lease log no longer bursts |
 | Session-proxy splice is **best-effort on half-close**; no delivery/lifecycle hardening | Edge-case message loss at relay teardown | **C hardening** (ADR 0005 step 2 follow-up) |
 | Audit **`via=<node>` vouching detail** not recorded | Vouched relocations not yet attributable in the audit log | **C hardening** (ADR 0005 §3 mitigation) |
 
