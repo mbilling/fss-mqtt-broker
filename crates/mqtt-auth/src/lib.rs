@@ -7,9 +7,12 @@
 pub mod acl;
 pub mod basic;
 pub mod chain;
+pub mod enhanced;
 pub mod mtls;
 pub mod password;
 pub mod token;
+
+pub use enhanced::{AuthSession, AuthStep, EnhancedAuthenticator, HmacChallengeAuthenticator};
 
 use mqtt_core::{ClientId, TopicFilter, TopicName};
 

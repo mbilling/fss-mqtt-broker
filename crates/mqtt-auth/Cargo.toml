@@ -15,6 +15,7 @@ toml.workspace = true
 argon2.workspace = true
 jsonwebtoken.workspace = true
 serde_json.workspace = true
+ring = { workspace = true }
 
 [dev-dependencies]
 rcgen.workspace = true

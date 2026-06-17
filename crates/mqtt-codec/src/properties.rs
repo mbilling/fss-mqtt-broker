@@ -239,6 +239,24 @@ impl Properties {
         })
     }
 
+    /// The Authentication Method (`0x15`) for enhanced auth, if present (MQTT 5.0).
+    #[must_use]
+    pub fn authentication_method(&self) -> Option<&str> {
+        self.0.iter().find_map(|p| match p {
+            Property::AuthenticationMethod(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The Authentication Data (`0x16`) for enhanced auth, if present (MQTT 5.0).
+    #[must_use]
+    pub fn authentication_data(&self) -> Option<&[u8]> {
+        self.0.iter().find_map(|p| match p {
+            Property::AuthenticationData(b) => Some(&b[..]),
+            _ => None,
+        })
+    }
+
     /// The Receive Maximum (`0x21`) — concurrent unacked `QoS` > 0 the sender will
     /// accept — if present (MQTT 5.0).
     #[must_use]

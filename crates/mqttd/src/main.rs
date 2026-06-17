@@ -227,6 +227,7 @@ fn client_policy_from_env(
         audit: Arc::new(AuditLog::new()),
         proxy,
         store: Some(store),
+        enhanced: None,
     }))
 }
 

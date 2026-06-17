@@ -10,13 +10,15 @@
 
 use crate::aliases::{InboundAliases, OutboundAliases};
 use crate::hub::{HubCommand, Outbound};
+use bytes::Bytes;
 use mqtt_auth::{
-    basic::BasicAuthenticator, AllowAll, Authenticator, Authorizer, Credentials, Identity,
+    basic::BasicAuthenticator, AllowAll, AuthStep, Authenticator, Authorizer, Credentials,
+    EnhancedAuthenticator, Identity,
 };
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{
-    packet::{ConnAck, Connect, Publish, SubAck},
+    packet::{Auth, ConnAck, Connect, Publish, SubAck},
     Packet, ProtocolVersion, QoS,
 };
 use mqtt_core::{is_shared_filter, parse_shared, ClientId, Message};
@@ -48,6 +50,12 @@ const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
 const CONNACK_NOT_AUTHORIZED: u8 = 0x05;
 /// SUBACK return code: failure (subscription refused) [MQTT-3.9.3].
 const SUBACK_FAILURE: u8 = 0x80;
+/// AUTH reason code: continue the enhanced-authentication exchange (ADR 0013).
+const AUTH_CONTINUE: u8 = 0x18;
+/// CONNACK reason (v5): not authorized.
+const CONNACK_V5_NOT_AUTHORIZED: u8 = 0x87;
+/// CONNACK reason (v5): the requested authentication method is not supported.
+const CONNACK_V5_BAD_AUTH_METHOD: u8 = 0x8C;
 /// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
 /// topic alias the server will accept on a connection.
 const SERVER_TOPIC_ALIAS_MAX: u16 = 16;
@@ -108,6 +116,9 @@ impl std::fmt::Debug for ProxyContext {
 pub struct ConnPolicy {
     /// Authenticates the CONNECT credentials.
     pub auth: Arc<dyn Authenticator>,
+    /// Optional MQTT 5.0 enhanced-authentication mechanism (ADR 0013): runs the
+    /// SASL-style AUTH exchange when a CONNECT names its method. `None` disables it.
+    pub enhanced: Option<Arc<dyn EnhancedAuthenticator>>,
     /// Authorizes publish/subscribe topics.
     pub authz: Arc<dyn Authorizer>,
     /// Records auth and authorization decisions.
@@ -143,6 +154,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         audit: Arc::new(AuditLog::new()),
         proxy: None,
         store: None,
+        enhanced: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -294,18 +306,20 @@ where
         return Ok(());
     };
 
-    // Authentication gate: verify credentials BEFORE attaching to the hub, so
-    // a rejected client never touches session state.
-    let auth = authenticate_connect(
+    // Authentication gate: verify credentials BEFORE attaching to the hub, so a
+    // rejected client never touches session state (enhanced exchange or single-shot).
+    let Some(principal) = authenticate(
+        &mut reader,
         &mut writer,
         &client,
         &connect,
         identity.as_ref(),
         policy,
         via,
-    );
-    let Some(principal) = auth.await? else {
-        return Ok(()); // rejected; the CONNACK was already sent
+    )
+    .await?
+    else {
+        return Ok(()); // rejected; CONNACK/close already handled
     };
 
     // The version-agnostic session policy (ADR 0009): whether to start clean, and how
@@ -553,6 +567,31 @@ where
     Ok(Some(ClientId(connect.client_id.clone())))
 }
 
+/// The authentication gate: run the MQTT 5.0 enhanced (AUTH) exchange when the
+/// CONNECT names an Authentication Method (ADR 0013), otherwise the single-shot
+/// credential check. Returns `None` (with the rejecting CONNACK/close already sent)
+/// when the client is refused.
+#[allow(clippy::too_many_arguments)] // the full authentication context
+async fn authenticate<R, W>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    client: &ClientId,
+    connect: &Connect,
+    identity: Option<&Identity>,
+    policy: &ConnPolicy,
+    via: Option<String>,
+) -> Result<Option<Identity>, NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if let Some(method) = connect.properties.authentication_method() {
+        enhanced_auth(reader, writer, client, connect, method, policy).await
+    } else {
+        authenticate_connect(writer, client, connect, identity, policy, via).await
+    }
+}
+
 /// Authenticate the CONNECT against the listener policy. Credentials priority:
 /// a TLS-verified certificate identity wins; otherwise CONNECT
 /// username/password; otherwise anonymous (only honored when the policy opts
@@ -619,6 +658,112 @@ where
                 }))
                 .await?;
             Ok(None)
+        }
+    }
+}
+
+/// Send a v5 CONNACK that refuses the connection with `code` and no session.
+async fn reject_connack<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    code: u8,
+) -> Result<(), NetError> {
+    writer
+        .send(&Packet::ConnAck(ConnAck {
+            properties: mqtt_codec::Properties::new(),
+            session_present: false,
+            code,
+        }))
+        .await
+}
+
+/// Run the MQTT 5.0 enhanced-authentication (AUTH) exchange for a CONNECT that named
+/// an Authentication Method (ADR 0013). Returns the authenticated [`Identity`], or
+/// `None` when the connection was rejected/closed (the CONNACK or close is handled
+/// here). The exchange runs before the CONNACK, so a failure never attaches a session.
+async fn enhanced_auth<R, W>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    client: &ClientId,
+    connect: &Connect,
+    method: &str,
+    policy: &ConnPolicy,
+) -> Result<Option<Identity>, NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // The named method must match a configured mechanism, else Bad Auth Method.
+    let Some(authenticator) = policy.enhanced.as_ref().filter(|a| a.method() == method) else {
+        warn!(client = %client.0, method, "unsupported authentication method");
+        reject_connack(writer, CONNACK_V5_BAD_AUTH_METHOD).await?;
+        return Ok(None);
+    };
+
+    let mut session = authenticator.start();
+    // The CONNECT's initial Authentication Data seeds the exchange.
+    let mut step = session.step(
+        client,
+        connect.properties.authentication_data().unwrap_or_default(),
+    );
+    loop {
+        match step {
+            AuthStep::Success(id) => {
+                policy.audit.record(
+                    "auth.success",
+                    Some(&id.subject),
+                    &format!("client {} via enhanced:{method}", client.0),
+                );
+                return Ok(Some(id));
+            }
+            AuthStep::Failure => {
+                warn!(client = %client.0, method, "enhanced authentication failed");
+                policy.audit.record(
+                    "auth.failure",
+                    Some(&client.0),
+                    &format!("rejected enhanced:{method}"),
+                );
+                reject_connack(writer, CONNACK_V5_NOT_AUTHORIZED).await?;
+                return Ok(None);
+            }
+            AuthStep::Challenge(data) => {
+                let mut props = mqtt_codec::Properties::new();
+                props.0.push(mqtt_codec::Property::AuthenticationMethod(
+                    method.to_string(),
+                ));
+                props
+                    .0
+                    .push(mqtt_codec::Property::AuthenticationData(Bytes::from(data)));
+                writer
+                    .send(&Packet::Auth(Auth {
+                        reason: AUTH_CONTINUE,
+                        properties: props,
+                    }))
+                    .await?;
+
+                // The reply must be an AUTH(Continue) keeping the same method.
+                let reply = match reader.next_packet().await? {
+                    Some(Packet::Auth(a)) => a,
+                    Some(other) => {
+                        warn!(client = %client.0, packet = ?other.packet_type(),
+                              "expected AUTH during enhanced auth; closing");
+                        return Ok(None);
+                    }
+                    None => return Ok(None), // EOF mid-exchange
+                };
+                if reply.reason != AUTH_CONTINUE {
+                    warn!(client = %client.0, reason = reply.reason, "unexpected AUTH reason; closing");
+                    return Ok(None);
+                }
+                if reply.properties.authentication_method() != Some(method) {
+                    warn!(client = %client.0, "AUTH method changed mid-exchange; closing");
+                    reject_connack(writer, CONNACK_V5_BAD_AUTH_METHOD).await?;
+                    return Ok(None);
+                }
+                step = session.step(
+                    client,
+                    reply.properties.authentication_data().unwrap_or_default(),
+                );
+            }
         }
     }
 }
@@ -950,7 +1095,7 @@ mod tests {
     use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
     use mqtt_codec::{
-        packet::{ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},
+        packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},
         Packet, Properties, Property, ProtocolVersion, QoS,
     };
     use mqtt_core::ClientId;
@@ -978,6 +1123,7 @@ mod tests {
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
+            enhanced: None,
         })
     }
 
@@ -1023,6 +1169,31 @@ mod tests {
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V5), FrameWriter::new(wh, V5), hub_rx)
+    }
+
+    /// A v5 connection whose policy has an enhanced HMAC-SHA256 authenticator
+    /// configured with one subject ("alice"). The hub stub accepts every Attach.
+    fn enhanced_conn() -> (Reader, Writer) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let _seen = stub_hub(hub_rx);
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert("alice".to_string(), b"alice-secret".to_vec());
+        let policy = Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            enhanced: Some(Arc::new(mqtt_auth::HmacChallengeAuthenticator::new(
+                secrets,
+            ))),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            store: None,
+        });
+        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (FrameReader::new(rh, V5), FrameWriter::new(wh, V5))
     }
 
     fn connect_v5(id: &str, properties: Vec<Property>) -> Packet {
@@ -1212,6 +1383,7 @@ mod tests {
             audit: audit.clone(),
             proxy: None,
             store: None,
+            enhanced: None,
         });
 
         let (client, owner_side) = tokio::io::duplex(4096);
@@ -1552,6 +1724,107 @@ mod tests {
         assert_eq!(forwarded, u16::MAX, "v3.1.1 imposes no outbound quota");
     }
 
+    /// A v5 connection with an enhanced HMAC-SHA256 authenticator: the broker
+    /// challenges with a nonce, the client returns a correct HMAC, and the CONNACK
+    /// succeeds (ADR 0013).
+    #[tokio::test]
+    async fn v5_enhanced_auth_hmac_succeeds() {
+        let (mut reader, mut writer) = enhanced_conn();
+        writer
+            .send(&connect_v5(
+                "c",
+                vec![
+                    Property::AuthenticationMethod("HMAC-SHA256".into()),
+                    Property::AuthenticationData(Bytes::from_static(b"alice")),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let nonce = match recv(&mut reader).await {
+            Some(Packet::Auth(a)) => {
+                assert_eq!(a.reason, 0x18, "AUTH continue");
+                assert_eq!(a.properties.authentication_method(), Some("HMAC-SHA256"));
+                a.properties.authentication_data().unwrap().to_vec()
+            }
+            other => panic!("expected AUTH challenge, got {other:?}"),
+        };
+
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"alice-secret");
+        let proof = ring::hmac::sign(&key, &nonce);
+        writer
+            .send(&Packet::Auth(Auth {
+                reason: 0x18,
+                properties: Properties(vec![
+                    Property::AuthenticationMethod("HMAC-SHA256".into()),
+                    Property::AuthenticationData(Bytes::copy_from_slice(proof.as_ref())),
+                ]),
+            }))
+            .await
+            .unwrap();
+
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => assert_eq!(a.code, 0, "enhanced auth accepted"),
+            other => panic!("expected CONNACK success, got {other:?}"),
+        }
+    }
+
+    /// A wrong HMAC proof is rejected with CONNACK 0x87 (Not authorized).
+    #[tokio::test]
+    async fn v5_enhanced_auth_wrong_proof_is_rejected() {
+        let (mut reader, mut writer) = enhanced_conn();
+        writer
+            .send(&connect_v5(
+                "c",
+                vec![
+                    Property::AuthenticationMethod("HMAC-SHA256".into()),
+                    Property::AuthenticationData(Bytes::from_static(b"alice")),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::Auth(_))));
+
+        // A proof under the wrong key.
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"guessed");
+        let proof = ring::hmac::sign(&key, b"any-nonce");
+        writer
+            .send(&Packet::Auth(Auth {
+                reason: 0x18,
+                properties: Properties(vec![
+                    Property::AuthenticationMethod("HMAC-SHA256".into()),
+                    Property::AuthenticationData(Bytes::copy_from_slice(proof.as_ref())),
+                ]),
+            }))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => {
+                assert_eq!(a.code, super::CONNACK_V5_NOT_AUTHORIZED, "rejected");
+            }
+            other => panic!("expected rejecting CONNACK, got {other:?}"),
+        }
+    }
+
+    /// A method with no configured mechanism is refused with CONNACK 0x8C.
+    #[tokio::test]
+    async fn v5_enhanced_auth_unknown_method_is_rejected() {
+        let (mut reader, mut writer) = enhanced_conn();
+        writer
+            .send(&connect_v5(
+                "c",
+                vec![Property::AuthenticationMethod("SCRAM-SHA-1".into())],
+            ))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => {
+                assert_eq!(a.code, super::CONNACK_V5_BAD_AUTH_METHOD, "bad auth method");
+            }
+            other => panic!("expected rejecting CONNACK, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn empty_client_id_with_persistent_session_is_rejected() {
         let (mut reader, mut writer, _hub_rx) = start_conn();
@@ -1650,6 +1923,7 @@ mod tests {
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: Some(store),
+            enhanced: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);

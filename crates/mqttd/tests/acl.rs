@@ -49,6 +49,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
                 audit: Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
                 store: None,
+                enhanced: None,
             });
             let hub = hub_tx.clone();
             tokio::spawn(async move {

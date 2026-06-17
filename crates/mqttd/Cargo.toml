@@ -28,6 +28,7 @@ tokio-rustls.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+ring = { workspace = true }
 rustls.workspace = true
 rustls-pki-types.workspace = true
 # `test-util` enables tokio's paused-clock test helpers (start_paused) for the
