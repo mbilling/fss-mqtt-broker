@@ -129,6 +129,7 @@ impl Client {
     /// dropped but still acknowledged — 3.1.1 has no negative PUBACK).
     async fn publish_qos1(&mut self, topic: &str, pkid: u16, payload: &'static [u8]) {
         self.send(&Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
             dup: false,
             qos: QoS::AtLeastOnce,
             retain: false,

@@ -129,6 +129,7 @@ impl Client {
         self.next_pkid += 1;
         let pkid = self.next_pkid;
         self.send(&Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
             dup: false,
             qos: QoS::AtLeastOnce,
             retain,

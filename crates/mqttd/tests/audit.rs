@@ -180,6 +180,7 @@ async fn denied_publish_and_subscribe_are_audited() {
 
     // Denied publish → dropped+acked + audited.
     c.send(&Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtLeastOnce,
         retain: false,

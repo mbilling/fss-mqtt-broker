@@ -130,6 +130,7 @@ impl Client {
     async fn publish(&mut self, topic: &str, payload: &'static [u8]) {
         self.writer
             .send(&Packet::Publish(Publish {
+                properties: mqtt_codec::Properties::new(),
                 dup: false,
                 qos: QoS::AtMostOnce,
                 retain: false,

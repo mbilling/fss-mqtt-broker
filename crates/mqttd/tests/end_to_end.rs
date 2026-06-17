@@ -125,6 +125,7 @@ async fn publish_reaches_matching_subscriber() {
     // Publish from a second client to a topic that matches the subscription.
     let mut pubr = Client::connect(addr, "publisher").await;
     pubr.send(&Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtMostOnce,
         retain: false,
@@ -162,6 +163,7 @@ async fn non_matching_topic_is_not_delivered() {
 
     let mut pubr = Client::connect(addr, "pub2").await;
     pubr.send(&Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtMostOnce,
         retain: false,
@@ -197,6 +199,7 @@ async fn qos1_publish_is_acked_and_downgraded() {
 
     let mut pubr = Client::connect(addr, "pub3").await;
     pubr.send(&Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtLeastOnce,
         retain: false,
@@ -246,6 +249,7 @@ async fn persistent_session_queues_offline_and_replays_on_reconnect() {
     //    before we reconnect.
     let mut pubr = Client::connect(addr, "pub-offline").await;
     pubr.send(&Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtLeastOnce,
         retain: false,
@@ -291,6 +295,7 @@ async fn clean_session_does_not_persist() {
     // Publish while gone — must NOT be queued for a clean session.
     let mut pubr = Client::connect(addr, "pub-clean").await;
     pubr.send(&Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtLeastOnce,
         retain: false,

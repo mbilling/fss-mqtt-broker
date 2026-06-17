@@ -191,6 +191,9 @@ pub struct Publish {
     pub topic: String,
     /// Packet identifier, present iff `qos > 0`.
     pub pkid: Option<u16>,
+    /// PUBLISH properties (MQTT 5.0; e.g. topic alias, content type, message
+    /// expiry). Empty for v3.1.1.
+    pub properties: Properties,
     /// Application payload.
     pub payload: Bytes,
 }
@@ -322,7 +325,7 @@ impl Packet {
         if version == ProtocolVersion::V5
             && !matches!(
                 header.packet_type,
-                PacketType::Connect | PacketType::ConnAck
+                PacketType::Connect | PacketType::ConnAck | PacketType::Publish
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -334,7 +337,7 @@ impl Packet {
                 expect_flags(header.flags, 0)?;
                 Packet::ConnAck(decode_connack(&mut r, version)?)
             }
-            PacketType::Publish => Packet::Publish(decode_publish(header.flags, &mut r)?),
+            PacketType::Publish => Packet::Publish(decode_publish(version, header.flags, &mut r)?),
             PacketType::PubAck => {
                 expect_flags(header.flags, 0)?;
                 Packet::PubAck(decode_pkid_only(&mut r)?)
@@ -394,7 +397,10 @@ impl Packet {
     /// yet supported.
     pub fn encode(&self, out: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), CodecError> {
         if version == ProtocolVersion::V5
-            && !matches!(self, Packet::Connect(_) | Packet::ConnAck(_))
+            && !matches!(
+                self,
+                Packet::Connect(_) | Packet::ConnAck(_) | Packet::Publish(_)
+            )
         {
             return Err(V5_UNSUPPORTED);
         }
@@ -410,7 +416,7 @@ impl Packet {
                 0
             }
             Packet::Publish(p) => {
-                encode_publish(p, &mut body)?;
+                encode_publish(p, &mut body, version)?;
                 publish_flags(p)
             }
             // PUBACK, PUBREC, PUBCOMP and UNSUBACK share an identical body and zero flags.
@@ -650,7 +656,11 @@ fn publish_flags(p: &Publish) -> u8 {
     f
 }
 
-fn decode_publish(flags: u8, r: &mut Reader) -> Result<Publish, CodecError> {
+fn decode_publish(
+    version: ProtocolVersion,
+    flags: u8,
+    r: &mut Reader,
+) -> Result<Publish, CodecError> {
     let dup = flags & 0x08 != 0;
     let qos = QoS::from_u8((flags >> 1) & 0x03)
         .ok_or(CodecError::MalformedPacket("invalid PUBLISH QoS (3)"))?;
@@ -671,6 +681,12 @@ fn decode_publish(flags: u8, r: &mut Reader) -> Result<Publish, CodecError> {
         }
         Some(id)
     };
+    // The PUBLISH properties block (v5) sits between the packet id and the payload.
+    let properties = if version == ProtocolVersion::V5 {
+        Properties::decode(r)?
+    } else {
+        Properties::new()
+    };
     let payload = r.read_remaining();
     Ok(Publish {
         dup,
@@ -678,11 +694,16 @@ fn decode_publish(flags: u8, r: &mut Reader) -> Result<Publish, CodecError> {
         retain,
         topic,
         pkid,
+        properties,
         payload,
     })
 }
 
-fn encode_publish(p: &Publish, out: &mut Vec<u8>) -> Result<(), CodecError> {
+fn encode_publish(
+    p: &Publish,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
     io::put_string(out, &p.topic)?;
     match (p.qos, p.pkid) {
         (QoS::AtMostOnce, None) => {}
@@ -697,6 +718,9 @@ fn encode_publish(p: &Publish, out: &mut Vec<u8>) -> Result<(), CodecError> {
                 "missing packet id on QoS>0 PUBLISH",
             ))
         }
+    }
+    if version == ProtocolVersion::V5 {
+        p.properties.encode(out)?;
     }
     out.extend_from_slice(&p.payload);
     Ok(())
@@ -912,6 +936,7 @@ mod tests {
             retain: false,
             topic: "a/b/c".into(),
             pkid: None,
+            properties: Properties::new(),
             payload: Bytes::from_static(b"hello"),
         }));
     }
@@ -924,8 +949,30 @@ mod tests {
             retain: true,
             topic: "sensors/temp".into(),
             pkid: Some(42),
+            properties: Properties::new(),
             payload: Bytes::from_static(b"21.5C"),
         }));
+    }
+
+    #[test]
+    fn roundtrip_publish_v5_with_properties() {
+        roundtrip_version(
+            &Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: String::new(), // empty topic is valid when a topic alias is set
+                pkid: Some(9),
+                properties: Properties(vec![
+                    Property::TopicAlias(3),
+                    Property::PayloadFormatIndicator(1),
+                    Property::ContentType("text/plain".into()),
+                    Property::UserProperty("k".into(), "v".into()),
+                ]),
+                payload: Bytes::from_static(b"hi"),
+            }),
+            V5,
+        );
     }
 
     #[test]

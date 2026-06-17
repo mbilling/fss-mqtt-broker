@@ -892,6 +892,7 @@ fn publish_packet(
     retain: bool,
 ) -> Packet {
     Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup,
         qos,
         retain,

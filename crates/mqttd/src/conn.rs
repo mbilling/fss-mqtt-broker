@@ -1082,6 +1082,7 @@ mod tests {
 
             writer
                 .send(&Packet::Publish(Publish {
+                    properties: mqtt_codec::Properties::new(),
                     dup: false,
                     qos: QoS::AtMostOnce,
                     retain: false,
@@ -1124,6 +1125,7 @@ mod tests {
 
     fn qos2_publish(id: u16) -> Packet {
         Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
             dup: false,
             qos: QoS::ExactlyOnce,
             retain: false,

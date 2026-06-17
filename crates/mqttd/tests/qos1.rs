@@ -138,6 +138,7 @@ impl Client {
     /// Publish `payload` to `topic` at `qos`; `pkid` must be `Some` iff `qos > 0`.
     async fn publish(&mut self, topic: &str, qos: QoS, pkid: Option<u16>, payload: &'static [u8]) {
         self.send(&Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
             dup: false,
             qos,
             retain: false,

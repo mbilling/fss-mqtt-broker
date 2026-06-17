@@ -142,6 +142,7 @@ fn subscribe_packet(filter: &str) -> Packet {
 
 fn publish_packet(topic: &str, payload: &'static [u8]) -> Packet {
     Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
         dup: false,
         qos: QoS::AtMostOnce,
         retain: false,

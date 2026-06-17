@@ -174,6 +174,7 @@ impl Client {
     /// exactly-once handshake; the broker must answer with PUBREC).
     async fn publish_qos2(&mut self, topic: &str, pkid: u16, payload: &'static [u8], dup: bool) {
         self.send(&Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
             dup,
             qos: QoS::ExactlyOnce,
             retain: false,
