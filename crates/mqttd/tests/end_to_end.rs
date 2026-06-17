@@ -107,8 +107,10 @@ async fn publish_reaches_matching_subscriber() {
 
     let mut sub = Client::connect(addr, "subscriber").await;
     sub.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 1,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: "sensors/+/temp".into(),
             qos: QoS::AtMostOnce,
         }],
@@ -152,8 +154,10 @@ async fn non_matching_topic_is_not_delivered() {
 
     let mut sub = Client::connect(addr, "sub2").await;
     sub.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 7,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: "a/b".into(),
             qos: QoS::AtMostOnce,
         }],
@@ -188,8 +192,10 @@ async fn qos1_publish_is_acked_and_downgraded() {
     // covered in tests/qos1.rs and tests/qos2.rs).
     let mut sub = Client::connect(addr, "sub3").await;
     sub.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 1,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: "q".into(),
             qos: QoS::AtMostOnce,
         }],
@@ -230,8 +236,10 @@ async fn persistent_session_queues_offline_and_replays_on_reconnect() {
     let (mut sub, present) = Client::connect_opts(addr, "durable", false).await;
     assert!(!present, "no session should exist yet");
     sub.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 1,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: "offline/topic".into(),
             qos: QoS::AtMostOnce,
         }],
@@ -281,8 +289,10 @@ async fn clean_session_does_not_persist() {
     let (mut sub, present) = Client::connect_opts(addr, "ephemeral", true).await;
     assert!(!present);
     sub.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 1,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: "x".into(),
             qos: QoS::AtMostOnce,
         }],

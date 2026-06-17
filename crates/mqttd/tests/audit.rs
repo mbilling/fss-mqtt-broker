@@ -169,8 +169,10 @@ async fn denied_publish_and_subscribe_are_audited() {
 
     // Denied subscribe → 0x80 + audited.
     c.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 1,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: "forbidden/#".into(),
             qos: QoS::AtMostOnce,
         }],

@@ -231,6 +231,19 @@ impl From<u16> for Ack {
     }
 }
 
+/// MQTT 5.0 subscription options carried in each SUBSCRIBE filter's option byte
+/// (bits above the requested `QoS`). All default to the v3.1.1-equivalent meaning,
+/// so v4 filters leave them unset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscriptionOptions {
+    /// No Local: do not forward a message back to the connection that published it.
+    pub no_local: bool,
+    /// Retain As Published: keep the original PUBLISH retain flag when forwarding.
+    pub retain_as_published: bool,
+    /// Retain Handling (0/1/2): when retained messages are sent at subscribe time.
+    pub retain_handling: u8,
+}
+
 /// A single entry in a SUBSCRIBE packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeFilter {
@@ -238,6 +251,8 @@ pub struct SubscribeFilter {
     pub path: String,
     /// Maximum `QoS` requested for this subscription.
     pub qos: QoS,
+    /// MQTT 5.0 subscription options; default (all off) for v3.1.1.
+    pub options: SubscriptionOptions,
 }
 
 /// A SUBSCRIBE packet.
@@ -247,6 +262,8 @@ pub struct Subscribe {
     pub pkid: u16,
     /// One or more topic filters (a SUBSCRIBE with zero filters is malformed).
     pub filters: Vec<SubscribeFilter>,
+    /// SUBSCRIBE properties (MQTT 5.0; e.g. subscription identifier). Empty for v3.1.1.
+    pub properties: Properties,
 }
 
 /// A SUBACK packet.
@@ -353,8 +370,8 @@ impl Packet {
         frame.advance(header_len);
         let mut r = Reader::new(frame);
 
-        // CONNECT/CONNACK have v5 forms (ADR 0008 phase 2); other packets' v5 forms
-        // are not implemented yet — refuse rather than mis-parse as v4.
+        // The v5 forms implemented so far (ADR 0008 phases 2–4); other packets' v5
+        // forms are not done yet — refuse rather than mis-parse as v4.
         if version == ProtocolVersion::V5
             && !matches!(
                 header.packet_type,
@@ -365,6 +382,7 @@ impl Packet {
                     | PacketType::PubRec
                     | PacketType::PubRel
                     | PacketType::PubComp
+                    | PacketType::Subscribe
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -395,7 +413,7 @@ impl Packet {
             }
             PacketType::Subscribe => {
                 expect_flags(header.flags, 0x02)?;
-                Packet::Subscribe(decode_subscribe(&mut r)?)
+                Packet::Subscribe(decode_subscribe(version, &mut r)?)
             }
             PacketType::SubAck => {
                 expect_flags(header.flags, 0)?;
@@ -445,6 +463,7 @@ impl Packet {
                     | Packet::PubRec(_)
                     | Packet::PubRel(_)
                     | Packet::PubComp(_)
+                    | Packet::Subscribe(_)
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -481,7 +500,7 @@ impl Packet {
                 0
             }
             Packet::Subscribe(s) => {
-                encode_subscribe(s, &mut body)?;
+                encode_subscribe(s, &mut body, version)?;
                 0x02
             }
             Packet::SubAck(a) => {
@@ -815,36 +834,85 @@ fn encode_publish(
     Ok(())
 }
 
-fn decode_subscribe(r: &mut Reader) -> Result<Subscribe, CodecError> {
+fn decode_subscribe(version: ProtocolVersion, r: &mut Reader) -> Result<Subscribe, CodecError> {
+    let is_v5 = version == ProtocolVersion::V5;
     let pkid = r.read_u16()?;
+    let properties = if is_v5 {
+        Properties::decode(r)?
+    } else {
+        Properties::new()
+    };
     let mut filters = Vec::new();
     while !r.is_empty() {
         let path = r.read_string()?;
-        let options = r.read_u8()?;
-        // MQTT 3.1.1: only the low two QoS bits are defined; the rest are reserved.
-        if options & 0xFC != 0 {
-            return Err(CodecError::MalformedPacket(
-                "reserved SUBSCRIBE option bits",
-            ));
-        }
-        let qos = QoS::from_u8(options & 0x03)
+        let byte = r.read_u8()?;
+        let qos = QoS::from_u8(byte & 0x03)
             .ok_or(CodecError::MalformedPacket("invalid requested QoS"))?;
-        filters.push(SubscribeFilter { path, qos });
+        let options = if is_v5 {
+            // v5 option byte: bits 2 No-Local, 3 Retain-As-Published, 4-5 Retain
+            // Handling (0/1/2), 6-7 reserved.
+            if byte & 0xC0 != 0 {
+                return Err(CodecError::MalformedPacket(
+                    "reserved SUBSCRIBE option bits",
+                ));
+            }
+            let retain_handling = (byte >> 4) & 0x03;
+            if retain_handling == 3 {
+                return Err(CodecError::ProtocolViolation(
+                    "invalid SUBSCRIBE retain handling (3)",
+                ));
+            }
+            SubscriptionOptions {
+                no_local: byte & 0x04 != 0,
+                retain_as_published: byte & 0x08 != 0,
+                retain_handling,
+            }
+        } else {
+            // v3.1.1: only the low two QoS bits are defined; the rest are reserved.
+            if byte & 0xFC != 0 {
+                return Err(CodecError::MalformedPacket(
+                    "reserved SUBSCRIBE option bits",
+                ));
+            }
+            SubscriptionOptions::default()
+        };
+        filters.push(SubscribeFilter { path, qos, options });
     }
     if filters.is_empty() {
         return Err(CodecError::ProtocolViolation("SUBSCRIBE with no filters"));
     }
-    Ok(Subscribe { pkid, filters })
+    Ok(Subscribe {
+        pkid,
+        filters,
+        properties,
+    })
 }
 
-fn encode_subscribe(s: &Subscribe, out: &mut Vec<u8>) -> Result<(), CodecError> {
+fn encode_subscribe(
+    s: &Subscribe,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
     if s.filters.is_empty() {
         return Err(CodecError::ProtocolViolation("SUBSCRIBE with no filters"));
     }
     io::put_u16(out, s.pkid);
+    if version == ProtocolVersion::V5 {
+        s.properties.encode(out)?;
+    }
     for f in &s.filters {
         io::put_string(out, &f.path)?;
-        io::put_u8(out, f.qos as u8);
+        let mut byte = f.qos as u8;
+        if version == ProtocolVersion::V5 {
+            if f.options.no_local {
+                byte |= 0x04;
+            }
+            if f.options.retain_as_published {
+                byte |= 0x08;
+            }
+            byte |= (f.options.retain_handling & 0x03) << 4;
+        }
+        io::put_u8(out, byte);
     }
     Ok(())
 }
@@ -1123,17 +1191,66 @@ mod tests {
                 SubscribeFilter {
                     path: "a/#".into(),
                     qos: QoS::AtLeastOnce,
+                    options: SubscriptionOptions::default(),
                 },
                 SubscribeFilter {
                     path: "b/+/c".into(),
                     qos: QoS::ExactlyOnce,
+                    options: SubscriptionOptions::default(),
                 },
             ],
+            properties: Properties::new(),
         }));
         roundtrip(&Packet::SubAck(SubAck {
             pkid: 1,
             return_codes: vec![0x00, 0x01, 0x80],
         }));
+    }
+
+    #[test]
+    fn roundtrip_subscribe_v5_with_options_and_properties() {
+        roundtrip_version(
+            &Packet::Subscribe(Subscribe {
+                pkid: 7,
+                filters: vec![
+                    SubscribeFilter {
+                        path: "a/#".into(),
+                        qos: QoS::ExactlyOnce,
+                        options: SubscriptionOptions {
+                            no_local: true,
+                            retain_as_published: true,
+                            retain_handling: 2,
+                        },
+                    },
+                    SubscribeFilter {
+                        path: "b/+".into(),
+                        qos: QoS::AtMostOnce,
+                        options: SubscriptionOptions::default(),
+                    },
+                ],
+                properties: Properties(vec![Property::SubscriptionIdentifier(42)]),
+            }),
+            V5,
+        );
+    }
+
+    #[test]
+    fn subscribe_v5_reserved_and_bad_retain_handling_are_rejected() {
+        // SUBSCRIBE (8<<4 | 0x02), pkid 1, empty props, filter "a" with an option
+        // byte whose bit 7 (reserved) is set → malformed.
+        let mut reserved =
+            BytesMut::from(&[0x82u8, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'a', 0x80][..]);
+        assert!(matches!(
+            Packet::decode(&mut reserved, V5),
+            Err(CodecError::MalformedPacket(_))
+        ));
+        // Retain handling bits = 3 (0x30) → protocol error.
+        let mut bad_rh =
+            BytesMut::from(&[0x82u8, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'a', 0x30][..]);
+        assert!(matches!(
+            Packet::decode(&mut bad_rh, V5),
+            Err(CodecError::ProtocolViolation(_))
+        ));
     }
 
     #[test]

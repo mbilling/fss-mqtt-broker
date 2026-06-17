@@ -144,8 +144,10 @@ impl Client {
     /// returns that return code for the caller to pin further.
     async fn subscribe(&mut self, pkid: u16, filter: &str, qos: QoS) -> u8 {
         self.send(&Packet::Subscribe(Subscribe {
+            properties: mqtt_codec::Properties::new(),
             pkid,
             filters: vec![SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
                 path: filter.into(),
                 qos,
             }],
@@ -227,17 +229,21 @@ async fn suback_grants_requested_qos_up_to_2() {
 
     let mut sub = Client::connect(addr, "grant-sub").await;
     sub.send(&Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 3,
         filters: vec![
             SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
                 path: "grant/q0".into(),
                 qos: QoS::AtMostOnce,
             },
             SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
                 path: "grant/q1".into(),
                 qos: QoS::AtLeastOnce,
             },
             SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
                 path: "grant/q2".into(),
                 qos: QoS::ExactlyOnce,
             },

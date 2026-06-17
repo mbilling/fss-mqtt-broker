@@ -107,8 +107,10 @@ impl Client {
     /// SUBSCRIBE to a single filter at `QoS` 0 and wait for the SUBACK.
     async fn subscribe(&mut self, pkid: u16, filter: &str) {
         self.send(&Packet::Subscribe(Subscribe {
+            properties: mqtt_codec::Properties::new(),
             pkid,
             filters: vec![SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
                 path: filter.into(),
                 qos: QoS::AtMostOnce,
             }],

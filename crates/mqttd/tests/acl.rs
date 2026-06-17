@@ -109,10 +109,12 @@ impl Client {
     /// Subscribe to `filters`, returning the SUBACK return codes.
     async fn subscribe(&mut self, filters: &[(&str, QoS)]) -> Vec<u8> {
         self.send(&Packet::Subscribe(Subscribe {
+            properties: mqtt_codec::Properties::new(),
             pkid: 1,
             filters: filters
                 .iter()
                 .map(|(path, qos)| SubscribeFilter {
+                    options: mqtt_codec::SubscriptionOptions::default(),
                     path: (*path).to_string(),
                     qos: *qos,
                 })

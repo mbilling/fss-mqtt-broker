@@ -132,8 +132,10 @@ impl Client {
 
 fn subscribe_packet(filter: &str) -> Packet {
     Packet::Subscribe(Subscribe {
+        properties: mqtt_codec::Properties::new(),
         pkid: 1,
         filters: vec![SubscribeFilter {
+            options: mqtt_codec::SubscriptionOptions::default(),
             path: filter.to_string(),
             qos: QoS::AtMostOnce,
         }],

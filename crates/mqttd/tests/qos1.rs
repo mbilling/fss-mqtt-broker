@@ -112,8 +112,10 @@ impl Client {
     /// requested `QoS` [MQTT-3.8.4-5/6].
     async fn subscribe(&mut self, pkid: u16, filter: &str, qos: QoS) {
         self.send(&Packet::Subscribe(Subscribe {
+            properties: mqtt_codec::Properties::new(),
             pkid,
             filters: vec![SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
                 path: filter.into(),
                 qos,
             }],

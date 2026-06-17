@@ -166,8 +166,10 @@ impl<S: AsyncRead + AsyncWrite> Client<S> {
     async fn subscribe(&mut self, filter: &str) {
         self.writer
             .send(&Packet::Subscribe(Subscribe {
+                properties: mqtt_codec::Properties::new(),
                 pkid: 1,
                 filters: vec![SubscribeFilter {
+                    options: mqtt_codec::SubscriptionOptions::default(),
                     path: filter.to_string(),
                     qos: QoS::AtMostOnce,
                 }],
