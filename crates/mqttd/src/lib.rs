@@ -4,6 +4,7 @@
 //! tests over real TCP sockets (see `tests/`), with the `mqttd` binary as a thin
 //! wrapper that wires in listeners and configuration.
 
+pub mod aliases;
 pub mod cluster;
 pub mod conn;
 pub mod health;

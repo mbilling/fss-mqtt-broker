@@ -46,7 +46,7 @@ shared subscriptions.
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
 | F | Takeover / handoff protocol | ✅ Done — **F-a–F-d** (recovery mechanism + recovery-read RPC + rebuild on takeover + owner-death integration test) |
-| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); topic aliases, flow control, durable expiry deadline (0009 phase 3) remain |
+| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); **topic aliases** done (ADR 0011); flow control, durable expiry deadline (0009 phase 3) remain |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
 
@@ -339,6 +339,15 @@ for completeness and sequencing.
   shared subscription. Carried limitation: cross-node delivery is one-per-node,
   not cluster-wide — true cluster-wide single delivery is deferred to the
   placement/ownership work (ADR 0005).
+- **Topic aliases** — done (ADR 0011): negotiated per connection in both
+  directions and resolved entirely at the connection edge, so routing, storage,
+  and the cluster only ever see full topic names. We advertise an inbound maximum
+  in CONNACK and resolve/validate inbound aliases; outbound, we assign-until-full
+  up to the client's maximum. Carried limitations: no outbound LRU eviction, and
+  an invalid alias closes the connection rather than sending DISCONNECT `0x94`
+  (pending the v5 reason-code work).
+- **Flow control** (Receive Maximum) and the **durable expiry deadline**
+  (ADR 0009 phase 3) remain.
 
 ## Sequencing
 

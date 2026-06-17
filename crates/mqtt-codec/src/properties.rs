@@ -239,6 +239,24 @@ impl Properties {
         })
     }
 
+    /// The Topic Alias Maximum (`0x22`) the sender will accept, if present (MQTT 5.0).
+    #[must_use]
+    pub fn topic_alias_maximum(&self) -> Option<u16> {
+        self.0.iter().find_map(|p| match p {
+            Property::TopicAliasMaximum(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The Topic Alias (`0x23`) for this PUBLISH, if present (MQTT 5.0).
+    #[must_use]
+    pub fn topic_alias(&self) -> Option<u16> {
+        self.0.iter().find_map(|p| match p {
+            Property::TopicAlias(v) => Some(*v),
+            _ => None,
+        })
+    }
+
     /// Append the length-prefixed block to `out`.
     ///
     /// # Errors

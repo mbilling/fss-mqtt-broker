@@ -8,6 +8,7 @@
 //! a dead client alive). An ungraceful end — EOF, error, keepalive expiry —
 //! publishes the client's will; a clean DISCONNECT discards it.
 
+use crate::aliases::{InboundAliases, OutboundAliases};
 use crate::hub::{HubCommand, Outbound};
 use mqtt_auth::{
     basic::BasicAuthenticator, AllowAll, Authenticator, Authorizer, Credentials, Identity,
@@ -47,6 +48,9 @@ const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
 const CONNACK_NOT_AUTHORIZED: u8 = 0x05;
 /// SUBACK return code: failure (subscription refused) [MQTT-3.9.3].
 const SUBACK_FAILURE: u8 = 0x80;
+/// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
+/// topic alias the server will accept on a connection.
+const SERVER_TOPIC_ALIAS_MAX: u16 = 16;
 
 /// Monotonic source of unique connection ids (distinct from client ids).
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -349,9 +353,13 @@ where
     let Ok(session_present) = reply_rx.await else {
         return Ok(()); // hub dropped the reply
     };
+    // Topic aliases are negotiated per connection (ADR 0011): the CONNACK advertises
+    // our inbound maximum; the client's CONNECT value bounds our outbound aliasing.
+    let (connack_props, mut inbound_aliases, mut outbound_aliases) =
+        negotiate_topic_aliases(connect.protocol, &connect.properties);
     writer
         .send(&Packet::ConnAck(ConnAck {
-            properties: mqtt_codec::Properties::new(),
+            properties: connack_props,
             session_present,
             code: 0,
         }))
@@ -367,6 +375,8 @@ where
         policy,
         &mut out_rx,
         connect.keep_alive,
+        &mut inbound_aliases,
+        &mut outbound_aliases,
     )
     .await;
     // Always deregister, even on error. The hub ignores this if we were taken
@@ -609,6 +619,32 @@ where
 /// Serve the connection until it ends. Returns `Ok(true)` only for a clean
 /// client DISCONNECT; every other end (EOF, keepalive expiry, takeover) is
 /// ungraceful and will publish the client's will.
+/// Negotiate per-connection topic-alias limits (ADR 0011) and build the CONNACK
+/// property block. v3.1.1 has no aliases, so both directions come out disabled.
+fn negotiate_topic_aliases(
+    protocol: ProtocolVersion,
+    properties: &mqtt_codec::Properties,
+) -> (mqtt_codec::Properties, InboundAliases, OutboundAliases) {
+    let is_v5 = protocol == ProtocolVersion::V5;
+    let server_max = if is_v5 { SERVER_TOPIC_ALIAS_MAX } else { 0 };
+    let client_max = if is_v5 {
+        properties.topic_alias_maximum().unwrap_or(0)
+    } else {
+        0
+    };
+    let mut props = mqtt_codec::Properties::new();
+    if server_max > 0 {
+        props
+            .0
+            .push(mqtt_codec::Property::TopicAliasMaximum(server_max));
+    }
+    (
+        props,
+        InboundAliases::new(server_max),
+        OutboundAliases::new(client_max),
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // a connection's full serving context
 async fn serve<R, W>(
     reader: &mut FrameReader<R>,
@@ -619,6 +655,8 @@ async fn serve<R, W>(
     policy: &ConnPolicy,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
+    inbound_aliases: &mut InboundAliases,
+    outbound_aliases: &mut OutboundAliases,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
@@ -648,7 +686,7 @@ where
                 match inbound? {
                     None => return Ok(false), // EOF without DISCONNECT
                     Some(packet) => {
-                        if handle_inbound(packet, writer, hub, client, principal, policy, &mut qos2_inbound).await? {
+                        if handle_inbound(packet, writer, hub, client, principal, policy, &mut qos2_inbound, inbound_aliases).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
                     }
@@ -656,7 +694,14 @@ where
             }
             maybe_out = out_rx.recv() => {
                 match maybe_out {
-                    Some(pkt) => writer.send(&pkt).await?,
+                    // Rewrite outbound PUBLISHes to use topic aliases where the
+                    // client allowed them (ADR 0011 §3); other packets pass through.
+                    Some(mut pkt) => {
+                        if let Packet::Publish(p) = &mut pkt {
+                            outbound_aliases.apply(p);
+                        }
+                        writer.send(&pkt).await?;
+                    }
                     // The hub dropped our sender: we were taken over by a new
                     // connection for the same client id, or the hub shut down.
                     None => return Ok(false),
@@ -673,6 +718,7 @@ where
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
 /// handshakes, and the exactly-once dedup window. Returns `Ok(true)` if the
 /// connection must close (a protocol violation).
+#[allow(clippy::too_many_arguments)] // a connection's full publish-handling context
 async fn handle_publish<W: AsyncWrite + Unpin>(
     publish: Publish,
     writer: &mut FrameWriter<W>,
@@ -681,14 +727,21 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     principal: &Identity,
     policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
+    inbound_aliases: &mut InboundAliases,
 ) -> Result<bool, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
     let message_expiry = publish.properties.message_expiry_interval();
+    // Resolve any topic alias to the full topic name before anything else sees it
+    // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
+    let alias = publish.properties.topic_alias();
+    let Ok(topic) = inbound_aliases.resolve(&publish.topic, alias) else {
+        warn!(client = %client.0, alias = ?alias, "invalid topic alias; closing connection");
+        return Ok(true);
+    };
     let Publish {
         qos,
         pkid,
-        topic,
         payload,
         retain,
         ..
@@ -750,6 +803,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
 }
 
 /// Handle one inbound packet. Returns `Ok(true)` if the connection should close.
+#[allow(clippy::too_many_arguments)] // a connection's full inbound-handling context
 async fn handle_inbound<W: AsyncWrite + Unpin>(
     packet: Packet,
     writer: &mut FrameWriter<W>,
@@ -758,6 +812,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     principal: &Identity,
     policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
+    inbound_aliases: &mut InboundAliases,
 ) -> Result<bool, NetError> {
     match packet {
         Packet::Publish(publish) => {
@@ -770,6 +825,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 principal,
                 policy,
                 qos2_inbound,
+                inbound_aliases,
             )
             .await?
             {
@@ -863,8 +919,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_stream, ConnPolicy};
-    use crate::hub::HubCommand;
+    use super::{handle_stream, ConnPolicy, SERVER_TOPIC_ALIAS_MAX};
+    use crate::hub::{HubCommand, Outbound};
+    use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
     use mqtt_codec::{
         packet::{ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},
@@ -875,7 +932,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
 
     const V4: ProtocolVersion = ProtocolVersion::V311;
@@ -931,6 +988,91 @@ mod tests {
             }
         });
         seen
+    }
+
+    /// A v5 connection over an in-memory duplex (the v5 analogue of `start_conn`).
+    fn v5_pipe() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (FrameReader::new(rh, V5), FrameWriter::new(wh, V5), hub_rx)
+    }
+
+    fn connect_v5(id: &str, properties: Vec<Property>) -> Packet {
+        Packet::Connect(Connect {
+            properties: Properties(properties),
+            protocol: V5,
+            clean_session: true,
+            keep_alive: 30,
+            client_id: id.to_string(),
+            last_will: None,
+            username: None,
+            password: None,
+        })
+    }
+
+    fn server_publish(topic: &str) -> Packet {
+        Packet::Publish(Publish {
+            properties: Properties::new(),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: topic.into(),
+            pkid: None,
+            payload: Bytes::from_static(b"p"),
+        })
+    }
+
+    /// Hub stub that answers Attach and republishes each `Publish` command's topic
+    /// on a channel, so a test can assert what (fully-resolved) topic reached routing.
+    fn stub_hub_topics(
+        mut hub_rx: mpsc::UnboundedReceiver<HubCommand>,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                match cmd {
+                    HubCommand::Attach {
+                        outbound, reply, ..
+                    } => {
+                        keep_alive.push(outbound);
+                        let _ = reply.send(false);
+                    }
+                    HubCommand::Publish { topic, .. } => {
+                        let _ = tx.send(topic);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        rx
+    }
+
+    /// Hub stub that answers Attach and hands the connection's outbound sender back
+    /// to the test, so it can drive server→client publishes through the writer path.
+    fn stub_hub_capture_outbound(
+        mut hub_rx: mpsc::UnboundedReceiver<HubCommand>,
+    ) -> oneshot::Receiver<Outbound> {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut sender = Some(tx);
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                if let HubCommand::Attach {
+                    outbound, reply, ..
+                } = cmd
+                {
+                    let _ = reply.send(false);
+                    if let Some(s) = sender.take() {
+                        let _ = s.send(outbound.clone());
+                    }
+                    keep_alive.push(outbound);
+                }
+            }
+        });
+        rx
     }
 
     fn connect_packet(id: &str, clean_session: bool) -> Packet {
@@ -1202,6 +1344,114 @@ mod tests {
                 );
             }
             other => panic!("expected SUBACK, got {other:?}"),
+        }
+    }
+
+    /// The v5 CONNACK advertises the server's inbound Topic Alias Maximum, and an
+    /// inbound PUBLISH that establishes an alias then references it (empty topic)
+    /// resolves to the full topic name before reaching routing (ADR 0011 §2).
+    #[tokio::test]
+    async fn v5_inbound_topic_alias_resolves_to_full_topic() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let mut topics = stub_hub_topics(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => assert_eq!(
+                a.properties.topic_alias_maximum(),
+                Some(SERVER_TOPIC_ALIAS_MAX),
+                "CONNACK advertises our inbound maximum"
+            ),
+            other => panic!("expected CONNACK, got {other:?}"),
+        }
+
+        let publish_alias = |topic: &str| {
+            Packet::Publish(Publish {
+                properties: Properties(vec![Property::TopicAlias(3)]),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: topic.into(),
+                pkid: None,
+                payload: Bytes::from_static(b"x"),
+            })
+        };
+        // Establish 3 -> "sensors/t", then reference it with an empty topic name.
+        writer.send(&publish_alias("sensors/t")).await.unwrap();
+        writer.send(&publish_alias("")).await.unwrap();
+
+        let first = timeout(Duration::from_millis(500), topics.recv())
+            .await
+            .expect("a forwarded publish")
+            .unwrap();
+        let second = timeout(Duration::from_millis(500), topics.recv())
+            .await
+            .expect("a forwarded publish")
+            .unwrap();
+        assert_eq!(first, "sensors/t", "establishing PUBLISH carries the topic");
+        assert_eq!(second, "sensors/t", "reference resolves to the same topic");
+    }
+
+    /// Referencing a topic alias that was never established is a protocol error and
+    /// closes the connection (ADR 0011 §2).
+    #[tokio::test]
+    async fn v5_invalid_topic_alias_closes_connection() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let _topics = stub_hub_topics(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer
+            .send(&Packet::Publish(Publish {
+                properties: Properties(vec![Property::TopicAlias(7)]),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: String::new(), // reference, but 7 was never set
+                pkid: None,
+                payload: Bytes::from_static(b"x"),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "an unmapped alias reference closes the connection"
+        );
+    }
+
+    /// When the client advertises a Topic Alias Maximum, the server assigns an alias
+    /// on the first PUBLISH of a topic (full name + alias) and references it on the
+    /// next (empty name + alias) — ADR 0011 §3.
+    #[tokio::test]
+    async fn v5_outbound_topic_alias_assigns_then_references() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let out_rx = stub_hub_capture_outbound(hub_rx);
+        writer
+            .send(&connect_v5("c", vec![Property::TopicAliasMaximum(5)]))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        let out = timeout(Duration::from_millis(500), out_rx)
+            .await
+            .expect("attach")
+            .expect("outbound sender");
+
+        out.send(server_publish("room/temp")).unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(p.topic, "room/temp", "first send keeps the full topic");
+                assert_eq!(p.properties.topic_alias(), Some(1));
+            }
+            other => panic!("expected PUBLISH, got {other:?}"),
+        }
+
+        out.send(server_publish("room/temp")).unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(p.topic, "", "second send references the alias");
+                assert_eq!(p.properties.topic_alias(), Some(1));
+            }
+            other => panic!("expected PUBLISH, got {other:?}"),
         }
     }
 
