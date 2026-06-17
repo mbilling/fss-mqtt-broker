@@ -125,6 +125,7 @@ impl Client {
             Packet::SubAck(SubAck {
                 pkid: ack_pkid,
                 return_codes,
+                ..
             }) => {
                 assert_eq!(ack_pkid, pkid, "SUBACK pkid must echo the SUBSCRIBE");
                 assert_eq!(

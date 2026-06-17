@@ -780,6 +780,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 .send(&Packet::SubAck(SubAck {
                     pkid: s.pkid,
                     return_codes,
+                    properties: mqtt_codec::Properties::new(),
                 }))
                 .await?;
         }
@@ -788,7 +789,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 client: client.clone(),
                 filters: u.filters.clone(),
             });
-            writer.send(&Packet::UnsubAck(u.pkid)).await?;
+            writer.send(&Packet::UnsubAck(u.pkid.into())).await?;
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
         Packet::Disconnect => return Ok(true),

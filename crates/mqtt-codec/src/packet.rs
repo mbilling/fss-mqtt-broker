@@ -271,8 +271,11 @@ pub struct Subscribe {
 pub struct SubAck {
     /// Packet identifier matching the SUBSCRIBE.
     pub pkid: u16,
-    /// Per-filter return codes (0/1/2 = granted `QoS`, 0x80 = failure).
+    /// Per-filter return / reason codes (0/1/2 = granted `QoS`, 0x80 = failure;
+    /// MQTT 5.0 adds a richer set in the same byte).
     pub return_codes: Vec<u8>,
+    /// SUBACK properties (MQTT 5.0; e.g. reason string). Empty for v3.1.1.
+    pub properties: Properties,
 }
 
 /// An UNSUBSCRIBE packet.
@@ -282,6 +285,39 @@ pub struct Unsubscribe {
     pub pkid: u16,
     /// Topic filters to remove (a packet with zero filters is malformed).
     pub filters: Vec<String>,
+    /// UNSUBSCRIBE properties (MQTT 5.0; user properties only). Empty for v3.1.1.
+    pub properties: Properties,
+}
+
+/// An UNSUBACK packet. v3.1.1 carries only the packet identifier; MQTT 5.0 adds a
+/// properties block and a reason code per unsubscribed filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsubAck {
+    /// Packet identifier matching the UNSUBSCRIBE.
+    pub pkid: u16,
+    /// Per-filter reason codes (MQTT 5.0; one per UNSUBSCRIBE filter). Empty for
+    /// v3.1.1, which has no per-filter acknowledgement.
+    pub reason_codes: Vec<u8>,
+    /// UNSUBACK properties (MQTT 5.0; e.g. reason string). Empty for v3.1.1.
+    pub properties: Properties,
+}
+
+impl UnsubAck {
+    /// A v3.1.1-style acknowledgement of `pkid` (no reason codes or properties).
+    #[must_use]
+    pub fn new(pkid: u16) -> Self {
+        Self {
+            pkid,
+            reason_codes: Vec::new(),
+            properties: Properties::new(),
+        }
+    }
+}
+
+impl From<u16> for UnsubAck {
+    fn from(pkid: u16) -> Self {
+        Self::new(pkid)
+    }
 }
 
 /// A decoded MQTT control packet.
@@ -307,8 +343,8 @@ pub enum Packet {
     SubAck(SubAck),
     /// UNSUBSCRIBE.
     Unsubscribe(Unsubscribe),
-    /// UNSUBACK (carries the packet identifier).
-    UnsubAck(u16),
+    /// UNSUBACK.
+    UnsubAck(UnsubAck),
     /// PINGREQ.
     PingReq,
     /// PINGRESP.
@@ -383,6 +419,9 @@ impl Packet {
                     | PacketType::PubRel
                     | PacketType::PubComp
                     | PacketType::Subscribe
+                    | PacketType::SubAck
+                    | PacketType::Unsubscribe
+                    | PacketType::UnsubAck
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -417,15 +456,15 @@ impl Packet {
             }
             PacketType::SubAck => {
                 expect_flags(header.flags, 0)?;
-                Packet::SubAck(decode_suback(&mut r)?)
+                Packet::SubAck(decode_suback(version, &mut r)?)
             }
             PacketType::Unsubscribe => {
                 expect_flags(header.flags, 0x02)?;
-                Packet::Unsubscribe(decode_unsubscribe(&mut r)?)
+                Packet::Unsubscribe(decode_unsubscribe(version, &mut r)?)
             }
             PacketType::UnsubAck => {
                 expect_flags(header.flags, 0)?;
-                Packet::UnsubAck(decode_pkid_only(&mut r)?)
+                Packet::UnsubAck(decode_unsuback(version, &mut r)?)
             }
             PacketType::PingReq => {
                 expect_flags(header.flags, 0)?;
@@ -464,6 +503,9 @@ impl Packet {
                     | Packet::PubRel(_)
                     | Packet::PubComp(_)
                     | Packet::Subscribe(_)
+                    | Packet::SubAck(_)
+                    | Packet::Unsubscribe(_)
+                    | Packet::UnsubAck(_)
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -493,10 +535,8 @@ impl Packet {
                 encode_ack(a, &mut body, version)?;
                 0x02
             }
-            // UNSUBACK is still the v3.1.1 packet-id-only form (its v5 form lands in a
-            // later phase).
-            Packet::UnsubAck(id) => {
-                io::put_u16(&mut body, *id);
+            Packet::UnsubAck(a) => {
+                encode_unsuback(a, &mut body, version)?;
                 0
             }
             Packet::Subscribe(s) => {
@@ -504,11 +544,11 @@ impl Packet {
                 0x02
             }
             Packet::SubAck(a) => {
-                encode_suback(a, &mut body);
+                encode_suback(a, &mut body, version)?;
                 0
             }
             Packet::Unsubscribe(u) => {
-                encode_unsubscribe(u, &mut body)?;
+                encode_unsubscribe(u, &mut body, version)?;
                 0x02
             }
             Packet::PingReq | Packet::PingResp | Packet::Disconnect => 0,
@@ -539,12 +579,6 @@ fn expect_empty(r: &Reader) -> Result<(), CodecError> {
     } else {
         Err(CodecError::MalformedPacket("unexpected payload bytes"))
     }
-}
-
-fn decode_pkid_only(r: &mut Reader) -> Result<u16, CodecError> {
-    let pkid = r.read_u16()?;
-    expect_empty(r)?;
-    Ok(pkid)
 }
 
 /// Decode a PUBACK/PUBREC/PUBREL/PUBCOMP body. v3.1.1 is just the packet id. v5
@@ -917,8 +951,13 @@ fn encode_subscribe(
     Ok(())
 }
 
-fn decode_suback(r: &mut Reader) -> Result<SubAck, CodecError> {
+fn decode_suback(version: ProtocolVersion, r: &mut Reader) -> Result<SubAck, CodecError> {
     let pkid = r.read_u16()?;
+    let properties = if version == ProtocolVersion::V5 {
+        Properties::decode(r)?
+    } else {
+        Properties::new()
+    };
     let mut return_codes = Vec::new();
     while !r.is_empty() {
         return_codes.push(r.read_u8()?);
@@ -926,16 +965,33 @@ fn decode_suback(r: &mut Reader) -> Result<SubAck, CodecError> {
     if return_codes.is_empty() {
         return Err(CodecError::ProtocolViolation("SUBACK with no return codes"));
     }
-    Ok(SubAck { pkid, return_codes })
+    Ok(SubAck {
+        pkid,
+        return_codes,
+        properties,
+    })
 }
 
-fn encode_suback(a: &SubAck, out: &mut Vec<u8>) {
+fn encode_suback(
+    a: &SubAck,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
     io::put_u16(out, a.pkid);
+    if version == ProtocolVersion::V5 {
+        a.properties.encode(out)?;
+    }
     out.extend_from_slice(&a.return_codes);
+    Ok(())
 }
 
-fn decode_unsubscribe(r: &mut Reader) -> Result<Unsubscribe, CodecError> {
+fn decode_unsubscribe(version: ProtocolVersion, r: &mut Reader) -> Result<Unsubscribe, CodecError> {
     let pkid = r.read_u16()?;
+    let properties = if version == ProtocolVersion::V5 {
+        Properties::decode(r)?
+    } else {
+        Properties::new()
+    };
     let mut filters = Vec::new();
     while !r.is_empty() {
         filters.push(r.read_string()?);
@@ -943,16 +999,64 @@ fn decode_unsubscribe(r: &mut Reader) -> Result<Unsubscribe, CodecError> {
     if filters.is_empty() {
         return Err(CodecError::ProtocolViolation("UNSUBSCRIBE with no filters"));
     }
-    Ok(Unsubscribe { pkid, filters })
+    Ok(Unsubscribe {
+        pkid,
+        filters,
+        properties,
+    })
 }
 
-fn encode_unsubscribe(u: &Unsubscribe, out: &mut Vec<u8>) -> Result<(), CodecError> {
+fn encode_unsubscribe(
+    u: &Unsubscribe,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
     if u.filters.is_empty() {
         return Err(CodecError::ProtocolViolation("UNSUBSCRIBE with no filters"));
     }
     io::put_u16(out, u.pkid);
+    if version == ProtocolVersion::V5 {
+        u.properties.encode(out)?;
+    }
     for f in &u.filters {
         io::put_string(out, f)?;
+    }
+    Ok(())
+}
+
+fn decode_unsuback(version: ProtocolVersion, r: &mut Reader) -> Result<UnsubAck, CodecError> {
+    let pkid = r.read_u16()?;
+    if version != ProtocolVersion::V5 {
+        // v3.1.1 UNSUBACK is just the packet id — no per-filter codes.
+        expect_empty(r)?;
+        return Ok(UnsubAck::new(pkid));
+    }
+    let properties = Properties::decode(r)?;
+    let mut reason_codes = Vec::new();
+    while !r.is_empty() {
+        reason_codes.push(r.read_u8()?);
+    }
+    if reason_codes.is_empty() {
+        return Err(CodecError::ProtocolViolation(
+            "UNSUBACK with no reason codes",
+        ));
+    }
+    Ok(UnsubAck {
+        pkid,
+        reason_codes,
+        properties,
+    })
+}
+
+fn encode_unsuback(
+    a: &UnsubAck,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
+    io::put_u16(out, a.pkid);
+    if version == ProtocolVersion::V5 {
+        a.properties.encode(out)?;
+        out.extend_from_slice(&a.reason_codes);
     }
     Ok(())
 }
@@ -1138,7 +1242,7 @@ mod tests {
         roundtrip(&Packet::PubRec(8.into()));
         roundtrip(&Packet::PubRel(9.into()));
         roundtrip(&Packet::PubComp(10.into()));
-        roundtrip(&Packet::UnsubAck(11));
+        roundtrip(&Packet::UnsubAck(11.into()));
     }
 
     #[test]
@@ -1204,6 +1308,7 @@ mod tests {
         roundtrip(&Packet::SubAck(SubAck {
             pkid: 1,
             return_codes: vec![0x00, 0x01, 0x80],
+            properties: Properties::new(),
         }));
     }
 
@@ -1258,7 +1363,49 @@ mod tests {
         roundtrip(&Packet::Unsubscribe(Unsubscribe {
             pkid: 2,
             filters: vec!["a/#".into(), "b/c".into()],
+            properties: Properties::new(),
         }));
+    }
+
+    #[test]
+    fn roundtrip_suback_unsubscribe_unsuback_v5() {
+        roundtrip_version(
+            &Packet::SubAck(SubAck {
+                pkid: 1,
+                return_codes: vec![0x00, 0x02, 0x87], // granted QoS / granted / not authorized
+                properties: Properties(vec![Property::ReasonString("ok".into())]),
+            }),
+            V5,
+        );
+        roundtrip_version(
+            &Packet::Unsubscribe(Unsubscribe {
+                pkid: 2,
+                filters: vec!["a/#".into()],
+                properties: Properties(vec![Property::UserProperty("k".into(), "v".into())]),
+            }),
+            V5,
+        );
+        roundtrip_version(
+            &Packet::UnsubAck(UnsubAck {
+                pkid: 3,
+                reason_codes: vec![0x00, 0x11], // success / no subscription existed
+                properties: Properties::new(),
+            }),
+            V5,
+        );
+    }
+
+    /// The v3.1.1 UNSUBACK short form (just the packet id) round-trips, and a v5
+    /// UNSUBACK with no reason codes is a protocol error.
+    #[test]
+    fn unsuback_v4_is_pkid_only_and_v5_requires_reason_codes() {
+        roundtrip(&Packet::UnsubAck(7.into()));
+        // UNSUBACK (11<<4), remaining 3: pkid 0x0007, property length 0, no codes.
+        let mut empty = BytesMut::from(&[0xB0u8, 0x03, 0x00, 0x07, 0x00][..]);
+        assert!(matches!(
+            Packet::decode(&mut empty, V5),
+            Err(CodecError::ProtocolViolation(_))
+        ));
     }
 
     #[test]

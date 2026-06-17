@@ -17,7 +17,7 @@ pub mod packet;
 pub mod properties;
 pub mod varint;
 
-pub use packet::{Ack, FixedHeader, Packet, PacketType, SubscriptionOptions};
+pub use packet::{Ack, FixedHeader, Packet, PacketType, SubscriptionOptions, UnsubAck};
 pub use properties::{Properties, Property};
 
 /// Supported MQTT protocol levels.
