@@ -30,6 +30,9 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+# `test-util` enables tokio's paused-clock test helpers (start_paused) for the
+# time-based session-expiry tests (ADR 0009).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

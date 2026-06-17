@@ -180,17 +180,37 @@ where
 /// for a directly-accepted client (which may be relocated to its owner,
 /// ADR 0005) and `false` for a session already proxied here (it is served
 /// locally — this node is the owner; re-proxying would loop).
+/// Translate a CONNECT into the version-agnostic session policy the hub speaks
+/// (ADR 0009): `(clean_start, session_expiry)`. v3.1.1 `clean_session` maps to clean
+/// start plus an expiry of 0 (discard at disconnect) or `u32::MAX` (keep forever); v5
+/// carries clean start in the same flag and the Session Expiry Interval as a property
+/// (absent = 0).
+fn session_policy(connect: &Connect) -> (bool, u32) {
+    let clean_start = connect.clean_session;
+    let session_expiry = match connect.protocol {
+        ProtocolVersion::V5 => connect.properties.session_expiry_interval().unwrap_or(0),
+        ProtocolVersion::V311 => {
+            if clean_start {
+                0
+            } else {
+                u32::MAX
+            }
+        }
+    };
+    (clean_start, session_expiry)
+}
+
 /// Resolve whether a CONNECT should be relocated to another node (ADR 0005):
-/// `Some((proxy, owner, addr))` when proxying is allowed, the session is persistent,
-/// this node has a `ProxyContext`, and the placement ring names a remote owner whose
-/// address is known. `None` keeps the session local.
+/// `Some((proxy, owner, addr))` when proxying is allowed, the session is retained
+/// (survives disconnect), this node has a `ProxyContext`, and the placement ring names
+/// a remote owner whose address is known. `None` keeps the session local.
 fn relocation_target<'a>(
     policy: &'a ConnPolicy,
     client: &ClientId,
     allow_proxy: bool,
-    clean_session: bool,
+    persistent: bool,
 ) -> Option<(&'a ProxyContext, NodeId, String)> {
-    if !allow_proxy || clean_session {
+    if !allow_proxy || !persistent {
         return None;
     }
     let proxy = policy.proxy.as_ref()?;
@@ -281,11 +301,15 @@ where
         return Ok(()); // rejected; the CONNACK was already sent
     };
 
-    // Session affinity (ADR 0005): a persistent session whose placement owner is
-    // another node is relocated there. The owner serves it (CONNACK onward); this
-    // node only relays. Clean sessions and owner-is-self stay local.
+    // The version-agnostic session policy (ADR 0009): whether to start clean, and how
+    // long the session is retained after disconnect.
+    let (clean_start, session_expiry) = session_policy(&connect);
+
+    // Session affinity (ADR 0005): a retained session whose placement owner is another
+    // node is relocated there. The owner serves it (CONNACK onward); this node only
+    // relays. Non-retained sessions and owner-is-self stay local.
     if let Some((proxy, owner, addr)) =
-        relocation_target(policy, &client, allow_proxy, connect.clean_session)
+        relocation_target(policy, &client, allow_proxy, session_expiry != 0)
     {
         info!(client = %client.0, owner = %owner.0, "relocating persistent session to its owner (ADR 0005)");
         return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr).await;
@@ -312,7 +336,8 @@ where
         .send(HubCommand::Attach {
             client: client.clone(),
             conn_id,
-            clean_session: connect.clean_session,
+            clean_start,
+            session_expiry,
             will,
             outbound: out_tx,
             reply: reply_tx,

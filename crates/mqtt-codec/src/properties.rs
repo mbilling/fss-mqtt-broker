@@ -221,6 +221,15 @@ impl Properties {
         self.0.len()
     }
 
+    /// The Session Expiry Interval (`0x11`) in seconds, if present (MQTT 5.0).
+    #[must_use]
+    pub fn session_expiry_interval(&self) -> Option<u32> {
+        self.0.iter().find_map(|p| match p {
+            Property::SessionExpiryInterval(v) => Some(*v),
+            _ => None,
+        })
+    }
+
     /// Append the length-prefixed block to `out`.
     ///
     /// # Errors

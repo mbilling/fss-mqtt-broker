@@ -41,11 +41,21 @@ use mqtt_storage::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
+
+/// How often the hub sweeps for sessions whose MQTT 5.0 Session Expiry Interval has
+/// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// MQTT 5.0 Session Expiry Interval meaning "never expire" (0xFFFFFFFF). v3.1.1
+/// `clean_session=0` maps to this.
+const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
 
 /// Sender for packets destined to a single client's socket.
 pub type Outbound = mpsc::UnboundedSender<Packet>;
@@ -118,8 +128,12 @@ pub enum HubCommand {
         client: ClientId,
         /// Unique id for this physical connection.
         conn_id: u64,
-        /// `false` keeps the session across disconnects (MQTT `clean_session=0`).
-        clean_session: bool,
+        /// MQTT 5.0 Clean Start: discard any existing session before attaching
+        /// (v3.1.1 `clean_session=1` maps to `true`).
+        clean_start: bool,
+        /// MQTT 5.0 Session Expiry Interval (seconds) — how long to keep the session
+        /// after disconnect; `0` discards at disconnect, `u32::MAX` never expires.
+        session_expiry: u32,
         /// Will message to publish if the connection ends ungracefully.
         will: Option<Message>,
         /// Channel the hub uses to deliver packets to this client.
@@ -264,8 +278,13 @@ pub struct Hub {
     node_id: NodeId,
     /// Currently-connected clients.
     online: HashMap<ClientId, Online>,
-    /// Clients whose current session is persistent (`clean_session=0`).
-    persistent: HashSet<ClientId>,
+    /// Retained sessions and their MQTT 5.0 Session Expiry Interval (seconds). A
+    /// client is present here iff its session survives disconnect (expiry != 0);
+    /// v3.1.1 `clean_session=0` maps to `u32::MAX` (never expire). See ADR 0009.
+    session_expiry: HashMap<ClientId, u32>,
+    /// Disconnected sessions with a finite expiry, and the instant they expire. The
+    /// sweep discards those past due; a reconnect cancels the entry.
+    expiring: HashMap<ClientId, Instant>,
     /// Per-client subscription filters with their granted `QoS`.
     subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
     /// Routing index covering online clients and offline persistent sessions.
@@ -326,7 +345,8 @@ impl Hub {
                 rx,
                 node_id,
                 online: HashMap::new(),
-                persistent: HashSet::new(),
+                session_expiry: HashMap::new(),
+                expiring: HashMap::new(),
                 subs_by_client: HashMap::new(),
                 table: SubscriptionTable::new(),
                 inflight: HashMap::new(),
@@ -348,75 +368,98 @@ impl Hub {
         self.durable_plane = Some(plane);
     }
 
-    /// Run the hub event loop until all command senders are dropped.
+    /// Run the hub event loop: dispatch commands and periodically sweep expired
+    /// sessions (ADR 0009), until all command senders are dropped.
     pub async fn run(mut self) {
-        while let Some(cmd) = self.rx.recv().await {
-            match cmd {
-                HubCommand::Attach {
+        let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                cmd = self.rx.recv() => match cmd {
+                    Some(cmd) => self.dispatch(cmd).await,
+                    None => break,
+                },
+                _ = sweep.tick() => self.sweep_expired_sessions().await,
+            }
+        }
+    }
+
+    /// Dispatch one command to its handler.
+    async fn dispatch(&mut self, cmd: HubCommand) {
+        match cmd {
+            HubCommand::Attach {
+                client,
+                conn_id,
+                clean_start,
+                session_expiry,
+                will,
+                outbound,
+                reply,
+            } => {
+                self.attach(
                     client,
                     conn_id,
-                    clean_session,
+                    clean_start,
+                    session_expiry,
                     will,
                     outbound,
                     reply,
-                } => {
-                    self.attach(client, conn_id, clean_session, will, outbound, reply)
-                        .await;
-                }
-                HubCommand::Subscribe { client, filters } => {
-                    self.subscribe(&client, filters).await;
-                }
-                HubCommand::Unsubscribe { client, filters } => {
-                    self.unsubscribe(&client, &filters).await;
-                }
-                HubCommand::Publish {
-                    topic,
-                    payload,
-                    qos,
-                    retain,
-                } => {
-                    self.publish(&topic, &payload, qos, retain).await;
-                }
-                HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
-                HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
-                HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid),
-                HubCommand::RemotePublish {
-                    topic,
-                    payload,
-                    qos,
-                } => {
-                    // Forwarded from a peer: local delivery only (no re-forward).
-                    self.deliver_local(&topic, &payload, qos).await;
-                }
-                HubCommand::Detach {
-                    client,
-                    conn_id,
-                    graceful,
-                } => {
-                    self.detach(&client, conn_id, graceful).await;
-                }
-                HubCommand::PeerConnected { node, conn_id, tx } => {
-                    self.peer_connected(node, conn_id, tx);
-                }
-                HubCommand::PeerDisconnected { node, conn_id } => {
-                    self.peer_disconnected(&node, conn_id);
-                }
-                HubCommand::PeerDead { node } => {
-                    self.peer_dead(&node);
-                }
-                HubCommand::DurableFrame { node, frame } => {
-                    self.handle_durable_frame(&node, frame);
-                }
-                HubCommand::Ping { reply } => {
-                    // Reached the loop → it is live. The receiver may be gone if the
-                    // prober timed out; that is fine.
-                    let _ = reply.send(());
-                }
-                HubCommand::RemoteInterest { node, filters } => {
-                    debug!(node = %node.0, filters = filters.len(), "remote interest updated");
-                    self.remote_interest
-                        .insert(node, filters.into_iter().collect());
-                }
+                )
+                .await;
+            }
+            HubCommand::Subscribe { client, filters } => {
+                self.subscribe(&client, filters).await;
+            }
+            HubCommand::Unsubscribe { client, filters } => {
+                self.unsubscribe(&client, &filters).await;
+            }
+            HubCommand::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+            } => {
+                self.publish(&topic, &payload, qos, retain).await;
+            }
+            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
+            HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
+            HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid),
+            HubCommand::RemotePublish {
+                topic,
+                payload,
+                qos,
+            } => {
+                // Forwarded from a peer: local delivery only (no re-forward).
+                self.deliver_local(&topic, &payload, qos).await;
+            }
+            HubCommand::Detach {
+                client,
+                conn_id,
+                graceful,
+            } => {
+                self.detach(&client, conn_id, graceful).await;
+            }
+            HubCommand::PeerConnected { node, conn_id, tx } => {
+                self.peer_connected(node, conn_id, tx);
+            }
+            HubCommand::PeerDisconnected { node, conn_id } => {
+                self.peer_disconnected(&node, conn_id);
+            }
+            HubCommand::PeerDead { node } => {
+                self.peer_dead(&node);
+            }
+            HubCommand::DurableFrame { node, frame } => {
+                self.handle_durable_frame(&node, frame);
+            }
+            HubCommand::Ping { reply } => {
+                // Reached the loop → it is live. The receiver may be gone if the
+                // prober timed out; that is fine.
+                let _ = reply.send(());
+            }
+            HubCommand::RemoteInterest { node, filters } => {
+                debug!(node = %node.0, filters = filters.len(), "remote interest updated");
+                self.remote_interest
+                    .insert(node, filters.into_iter().collect());
             }
         }
     }
@@ -461,25 +504,28 @@ impl Hub {
         }
     }
 
+    // The parameters mirror the `Attach` command's fields one-for-one; bundling them
+    // into a struct would only move the destructuring, not remove it.
+    #[allow(clippy::too_many_arguments)]
     async fn attach(
         &mut self,
         client: ClientId,
         conn_id: u64,
-        clean_session: bool,
+        clean_start: bool,
+        session_expiry: u32,
         will: Option<Message>,
         outbound: Outbound,
         reply: oneshot::Sender<bool>,
     ) {
-        let session_present = if clean_session {
-            // Discard any prior session state for this client.
-            self.drop_subscriptions(&client);
-            self.persistent.remove(&client);
-            self.inflight.remove(&client);
-            let _ = self.store.remove(&client).await;
+        // A reconnect cancels any pending expiry for this session (ADR 0009).
+        self.expiring.remove(&client);
+
+        let session_present = if clean_start {
+            // Clean Start: discard any prior session state for this client.
+            self.discard_session(&client).await;
             false
         } else {
             self.note_session_ownership(&client);
-            self.persistent.insert(client.clone());
             let existed = self.store.ensure_session(&client).await.unwrap_or(false);
             // Reconcile the routing table with persisted subscriptions (needed
             // after a broker restart; idempotent otherwise).
@@ -492,6 +538,15 @@ impl Hub {
             }
             existed
         };
+
+        // Record this session's retention: it survives disconnect iff the expiry
+        // interval is non-zero. A zero interval (or v3.1.1 clean_session=1) means the
+        // session is dropped at disconnect.
+        if session_expiry == 0 {
+            self.session_expiry.remove(&client);
+        } else {
+            self.session_expiry.insert(client.clone(), session_expiry);
+        }
 
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
@@ -510,7 +565,7 @@ impl Hub {
                 will,
             },
         );
-        info!(client = %client.0, persistent = !clean_session, session_present, "client attached");
+        info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
 
         // Tell the connection the result so it can CONNACK before any replay.
         let _ = reply.send(session_present);
@@ -535,7 +590,7 @@ impl Hub {
         }
 
         // Replay queued messages (they land in the channel after CONNACK).
-        if !clean_session {
+        if !clean_start {
             if let Ok(pending) = self.store.pending(&client, 0, REPLAY_LIMIT).await {
                 let mut last = 0;
                 for qm in pending {
@@ -621,7 +676,7 @@ impl Hub {
             };
             if let Some(tx) = self.online.get(&c).map(|s| s.tx.clone()) {
                 self.send_to_client(&c, &tx, &message, false);
-            } else if self.persistent.contains(&c) {
+            } else if self.is_persistent(&c) {
                 // Offline but persistent: queue for replay on reconnect. The
                 // queue is bounded (ADR 0001 §6); log when the cap drops
                 // messages — a metrics counter is the proper operator signal
@@ -753,22 +808,67 @@ impl Hub {
                 self.publish(&w.topic, &w.payload, w.qos, w.retain).await;
             }
         }
-        if self.persistent.contains(client) {
-            // Keep subscriptions, queue, and in-flight state for resumption.
-            info!(client = %client.0, "client detached (session retained)");
-        } else {
-            self.drop_subscriptions(client);
-            self.inflight.remove(client);
-            let _ = self.store.remove(client).await;
-            info!(client = %client.0, "client detached (session discarded)");
-            // Our local interest may have shrunk; let peers know.
-            self.gossip_interest();
+        // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
+        // session indefinitely; a finite interval schedules expiry for the sweep.
+        match self.session_expiry.get(client).copied() {
+            None | Some(0) => {
+                self.discard_session(client).await;
+                info!(client = %client.0, "client detached (session discarded)");
+                // Our local interest may have shrunk; let peers know.
+                self.gossip_interest();
+            }
+            Some(SESSION_EXPIRY_NEVER) => {
+                info!(client = %client.0, "client detached (session retained)");
+            }
+            Some(secs) => {
+                let deadline = Instant::now() + Duration::from_secs(u64::from(secs));
+                self.expiring.insert(client.clone(), deadline);
+                info!(client = %client.0, expires_in_s = secs, "client detached (session expiring)");
+            }
         }
+    }
+
+    /// Whether `client` has a retained session (survives disconnect) — its MQTT 5.0
+    /// Session Expiry Interval is non-zero (ADR 0009).
+    fn is_persistent(&self, client: &ClientId) -> bool {
+        self.session_expiry.contains_key(client)
+    }
+
+    /// Discard a session entirely: routing subscriptions, in-flight state, the stored
+    /// queue/metadata, and all expiry bookkeeping. Used by Clean Start, a zero-expiry
+    /// disconnect, and the expiry sweep.
+    async fn discard_session(&mut self, client: &ClientId) {
+        self.drop_subscriptions(client);
+        self.inflight.remove(client);
+        self.session_expiry.remove(client);
+        self.expiring.remove(client);
+        let _ = self.store.remove(client).await;
+    }
+
+    /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
+    /// (ADR 0009). Runs on the hub's periodic sweep tick.
+    async fn sweep_expired_sessions(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<ClientId> = self
+            .expiring
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(client, _)| client.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for client in &expired {
+            self.discard_session(client).await;
+            info!(client = %client.0, "session expired and discarded");
+        }
+        // Interest may have shrunk now that expired subscriptions are gone.
+        self.gossip_interest();
     }
 
     /// Persist the current subscription set for a client if its session is durable.
     async fn persist_subscriptions(&mut self, client: &ClientId) {
-        if !self.persistent.contains(client) {
+        if !self.is_persistent(client) {
             return;
         }
         let subs: Vec<mqtt_core::Subscription> = self
@@ -927,18 +1027,34 @@ mod tests {
         tx
     }
 
+    /// Attach with the v3.1.1 `clean_session` semantics (the common test case):
+    /// `clean_session=1` → clean start + expire-at-disconnect; `0` → resume + never
+    /// expire. `attach_v5` covers explicit Session Expiry Intervals.
     async fn attach(
         tx: &HubTx,
         client: &str,
         conn_id: u64,
         clean_session: bool,
     ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+        let expiry = if clean_session { 0 } else { u32::MAX };
+        attach_v5(tx, client, conn_id, clean_session, expiry).await
+    }
+
+    /// Attach with explicit MQTT 5.0 `(clean_start, session_expiry)`.
+    async fn attach_v5(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+        clean_start: bool,
+        session_expiry: u32,
+    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
         let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
             conn_id,
-            clean_session,
+            clean_start,
+            session_expiry,
             will: None,
             outbound: out_tx,
             reply: reply_tx,
@@ -1136,6 +1252,76 @@ mod tests {
         let (mut rx, present) = attach(&tx, "w", 3, false).await;
         assert!(!present, "the persistent session was wiped");
         assert!(recv_packet(&mut rx).await.is_none(), "nothing was queued");
+    }
+
+    /// MQTT 5.0 Session Expiry Interval 0 (clean start = false) keeps the session for
+    /// the connection but discards it at disconnect — nothing is queued afterwards
+    /// and the next connect sees no prior session (ADR 0009).
+    #[tokio::test]
+    async fn session_expiry_zero_discards_at_disconnect() {
+        let tx = start_hub();
+        let (_rx, _) = attach_v5(&tx, "z", 1, false, 0).await;
+        subscribe(&tx, "z", "z/t");
+        detach(&tx, "z", 1);
+        publish(&tx, "z/t", b"lost");
+
+        let (mut rx, present) = attach_v5(&tx, "z", 2, false, 0).await;
+        assert!(
+            !present,
+            "a zero-expiry session must not survive disconnect"
+        );
+        assert!(recv_packet(&mut rx).await.is_none(), "nothing was queued");
+    }
+
+    /// A finite Session Expiry Interval retains the session (offline messages queue),
+    /// then the sweep discards it once the interval elapses (ADR 0009).
+    #[tokio::test(start_paused = true)]
+    async fn session_expiry_finite_retains_then_expires() {
+        let tx = start_hub();
+        let (_rx, _) = attach_v5(&tx, "e", 1, false, 1).await;
+        subscribe(&tx, "e", "e/t");
+        detach(&tx, "e", 1);
+        // Retained during the expiry window: the offline message queues.
+        publish(&tx, "e/t", b"m");
+
+        // Advance past the 1s interval; the hub's sweep discards the session.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let (mut rx, present) = attach_v5(&tx, "e", 2, false, 1).await;
+        assert!(!present, "the session must have expired");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the expired session's queue is gone"
+        );
+    }
+
+    /// Reconnecting before the expiry interval elapses cancels the pending expiry:
+    /// the session is still present, with its queued messages intact (ADR 0009).
+    #[tokio::test(start_paused = true)]
+    async fn session_expiry_reconnect_cancels_expiry() {
+        let tx = start_hub();
+        let (_rx, _) = attach_v5(&tx, "r", 1, false, 100).await;
+        subscribe(&tx, "r", "r/t");
+        detach(&tx, "r", 1);
+        publish(&tx, "r/t", b"kept");
+
+        // Well within the 100s window; the session must still be there.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let (mut rx, present) = attach_v5(&tx, "r", 2, false, 100).await;
+        assert!(
+            present,
+            "the session must survive a reconnect within its expiry"
+        );
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"kept");
+
+        // It is no longer scheduled to expire: advancing past the original deadline
+        // leaves the now-online session untouched.
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        publish(&tx, "r/t", b"still-here");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"still-here"
+        );
     }
 
     /// Publishes fan out only to peers whose announced interest matches
