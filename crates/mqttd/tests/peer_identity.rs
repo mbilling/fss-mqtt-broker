@@ -188,6 +188,7 @@ impl Client {
         };
         c.writer
             .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
                 protocol: V4,
                 clean_session: true,
                 keep_alive: 30,

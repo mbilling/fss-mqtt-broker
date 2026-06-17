@@ -79,6 +79,7 @@ impl Client {
             writer: mqtt_net::FrameWriter::new(wh, V4),
         };
         c.send(&Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
             protocol: V4,
             clean_session: true,
             keep_alive: 30,
@@ -213,6 +214,7 @@ async fn unauthorized_will_is_audited() {
     "#;
     let (addr, audit) = start_node(false, Some(acl), Some(identity("dev-1"))).await;
     let will = LastWill {
+        properties: mqtt_codec::Properties::new(),
         topic: "status/other".into(),
         payload: bytes::Bytes::from_static(b"gone"),
         qos: QoS::AtMostOnce,

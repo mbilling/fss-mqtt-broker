@@ -76,6 +76,7 @@ impl Client {
         };
         client
             .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
                 protocol: V4,
                 clean_session,
                 keep_alive: 30,

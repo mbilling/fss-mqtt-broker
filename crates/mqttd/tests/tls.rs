@@ -148,6 +148,7 @@ impl<S: AsyncRead + AsyncWrite> Client<S> {
         };
         c.writer
             .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
                 protocol: V4,
                 clean_session: true,
                 keep_alive: 30,
@@ -247,6 +248,7 @@ async fn mtls_listener_rejects_clients_without_certificates() {
             let mut writer = mqtt_net::FrameWriter::new(wh, V4);
             let _ = writer
                 .send(&Packet::Connect(Connect {
+                    properties: mqtt_codec::Properties::new(),
                     protocol: V4,
                     clean_session: true,
                     keep_alive: 30,
@@ -284,6 +286,7 @@ async fn plaintext_client_on_tls_port_is_rejected() {
     let mut writer = mqtt_net::FrameWriter::new(wh, V4);
     let _ = writer
         .send(&Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
             protocol: V4,
             clean_session: true,
             keep_alive: 30,
@@ -584,6 +587,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
     let mut writer = mqtt_net::FrameWriter::new(wh, V4);
     writer
         .send(&Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
             protocol: V4,
             clean_session: true,
             keep_alive: 30,

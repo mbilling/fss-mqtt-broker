@@ -266,6 +266,7 @@ where
             );
             writer
                 .send(&Packet::ConnAck(ConnAck {
+                    properties: mqtt_codec::Properties::new(),
                     session_present: false,
                     code: CONNACK_NOT_AUTHORIZED,
                 }))
@@ -303,6 +304,7 @@ where
     };
     writer
         .send(&Packet::ConnAck(ConnAck {
+            properties: mqtt_codec::Properties::new(),
             session_present,
             code: 0,
         }))
@@ -454,6 +456,7 @@ where
     if connect.protocol != ProtocolVersion::V311 {
         writer
             .send(&Packet::ConnAck(ConnAck {
+                properties: mqtt_codec::Properties::new(),
                 session_present: false,
                 code: CONNACK_UNACCEPTABLE_PROTOCOL,
             }))
@@ -464,6 +467,7 @@ where
         if !connect.clean_session {
             writer
                 .send(&Packet::ConnAck(ConnAck {
+                    properties: mqtt_codec::Properties::new(),
                     session_present: false,
                     code: CONNACK_IDENTIFIER_REJECTED,
                 }))
@@ -538,6 +542,7 @@ where
             );
             writer
                 .send(&Packet::ConnAck(ConnAck {
+                    properties: mqtt_codec::Properties::new(),
                     session_present: false,
                     code,
                 }))
@@ -863,6 +868,7 @@ mod tests {
 
     fn connect_packet(id: &str, clean_session: bool) -> Packet {
         Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
             protocol: V4,
             clean_session,
             keep_alive: 30,
@@ -1021,6 +1027,7 @@ mod tests {
             Some(Packet::ConnAck(ConnAck {
                 session_present,
                 code,
+                ..
             })) => {
                 assert_eq!(code, 0x02, "identifier rejected");
                 assert!(!session_present);

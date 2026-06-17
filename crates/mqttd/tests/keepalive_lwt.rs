@@ -66,6 +66,7 @@ impl Client {
         };
         client
             .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
                 protocol: V4,
                 clean_session: true,
                 keep_alive,
@@ -188,6 +189,7 @@ async fn zero_keepalive_is_never_idle_disconnected() {
 /// The will for the LWT tests: topic "will/t", payload "gone", `QoS` 0.
 fn will(topic: &str) -> LastWill {
     LastWill {
+        properties: mqtt_codec::Properties::new(),
         topic: topic.into(),
         payload: bytes::Bytes::from_static(b"gone"),
         qos: QoS::AtMostOnce,

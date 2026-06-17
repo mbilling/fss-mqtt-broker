@@ -1,12 +1,13 @@
 //! Fixed header, the [`Packet`] enum, and per-packet encode/decode.
 //!
-//! This module currently implements the complete **MQTT 3.1.1** control packet
-//! set. MQTT 5.0 framing (which adds a properties block to most packets) is
-//! guarded with an explicit error so that a v5 packet is never silently
-//! mis-parsed as v4; the v5 paths land in the next milestone.
+//! This module implements the complete **MQTT 3.1.1** control packet set and the
+//! **MQTT 5.0** framing for CONNECT/CONNACK (properties blocks, ADR 0008 phase 2).
+//! Packets whose v5 form is not yet implemented are guarded with an explicit error
+//! so a v5 packet is never silently mis-parsed as v4; the remaining v5 paths land in
+//! later phases.
 
 use crate::io::{self, Reader};
-use crate::{varint, CodecError, ProtocolVersion, QoS};
+use crate::{varint, CodecError, Properties, ProtocolVersion, QoS};
 use bytes::{Buf, Bytes, BytesMut};
 
 /// The fixed-header packet type (the high nibble of the first byte).
@@ -139,6 +140,8 @@ pub struct LastWill {
     pub qos: QoS,
     /// Whether the will is retained.
     pub retain: bool,
+    /// Will properties (MQTT 5.0; e.g. will delay interval). Empty for v3.1.1.
+    pub properties: Properties,
 }
 
 /// A CONNECT packet.
@@ -158,6 +161,9 @@ pub struct Connect {
     pub username: Option<String>,
     /// Optional password.
     pub password: Option<Bytes>,
+    /// CONNECT properties (MQTT 5.0; e.g. session expiry, receive maximum). Empty
+    /// for v3.1.1.
+    pub properties: Properties,
 }
 
 /// A CONNACK packet.
@@ -167,6 +173,9 @@ pub struct ConnAck {
     pub session_present: bool,
     /// Return code (MQTT 3.1.1) / reason code (MQTT 5.0). 0 = success.
     pub code: u8,
+    /// CONNACK properties (MQTT 5.0; e.g. assigned client id, server keep-alive).
+    /// Empty for v3.1.1.
+    pub properties: Properties,
 }
 
 /// A PUBLISH packet.
@@ -308,8 +317,14 @@ impl Packet {
         frame.advance(header_len);
         let mut r = Reader::new(frame);
 
-        // Every non-CONNECT packet's v5 form differs (properties); refuse for now.
-        if version == ProtocolVersion::V5 && header.packet_type != PacketType::Connect {
+        // CONNECT/CONNACK have v5 forms (ADR 0008 phase 2); other packets' v5 forms
+        // are not implemented yet — refuse rather than mis-parse as v4.
+        if version == ProtocolVersion::V5
+            && !matches!(
+                header.packet_type,
+                PacketType::Connect | PacketType::ConnAck
+            )
+        {
             return Err(V5_UNSUPPORTED);
         }
 
@@ -317,7 +332,7 @@ impl Packet {
             PacketType::Connect => Packet::Connect(decode_connect(&mut r)?),
             PacketType::ConnAck => {
                 expect_flags(header.flags, 0)?;
-                Packet::ConnAck(decode_connack(&mut r)?)
+                Packet::ConnAck(decode_connack(&mut r, version)?)
             }
             PacketType::Publish => Packet::Publish(decode_publish(header.flags, &mut r)?),
             PacketType::PubAck => {
@@ -378,7 +393,9 @@ impl Packet {
     /// Returns [`CodecError`] if a field is out of range or the version is not
     /// yet supported.
     pub fn encode(&self, out: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), CodecError> {
-        if version == ProtocolVersion::V5 && !matches!(self, Packet::Connect(_)) {
+        if version == ProtocolVersion::V5
+            && !matches!(self, Packet::Connect(_) | Packet::ConnAck(_))
+        {
             return Err(V5_UNSUPPORTED);
         }
         // Build the body separately so we can prefix it with the remaining length.
@@ -389,7 +406,7 @@ impl Packet {
                 0
             }
             Packet::ConnAck(a) => {
-                encode_connack(a, &mut body);
+                encode_connack(a, &mut body, version)?;
                 0
             }
             Packet::Publish(p) => {
@@ -465,9 +482,7 @@ fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
     let level = r.read_u8()?;
     let protocol =
         ProtocolVersion::from_level(level).ok_or(CodecError::UnsupportedProtocol(level))?;
-    if protocol == ProtocolVersion::V5 {
-        return Err(V5_UNSUPPORTED);
-    }
+    let is_v5 = protocol == ProtocolVersion::V5;
 
     let flags = r.read_u8()?;
     if flags & 0x01 != 0 {
@@ -487,11 +502,23 @@ fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
     }
 
     let keep_alive = r.read_u16()?;
+    // The CONNECT properties block (v5) ends the variable header, before the payload.
+    let properties = if is_v5 {
+        Properties::decode(r)?
+    } else {
+        Properties::new()
+    };
     let client_id = r.read_string()?;
 
     let last_will = if will_flag {
         let qos =
             QoS::from_u8(will_qos_bits).ok_or(CodecError::MalformedPacket("invalid will QoS"))?;
+        // Will properties (v5) precede the will topic in the payload.
+        let will_properties = if is_v5 {
+            Properties::decode(r)?
+        } else {
+            Properties::new()
+        };
         let topic = r.read_string()?;
         let payload = r.read_binary()?;
         Some(LastWill {
@@ -499,6 +526,7 @@ fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
             payload,
             qos,
             retain: will_retain,
+            properties: will_properties,
         })
     } else {
         None
@@ -530,13 +558,12 @@ fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
         last_will,
         username,
         password,
+        properties,
     })
 }
 
 fn encode_connect(c: &Connect, out: &mut Vec<u8>) -> Result<(), CodecError> {
-    if c.protocol == ProtocolVersion::V5 {
-        return Err(V5_UNSUPPORTED);
-    }
+    let is_v5 = c.protocol == ProtocolVersion::V5;
     io::put_string(out, "MQTT")?;
     io::put_u8(out, c.protocol.level());
 
@@ -559,9 +586,15 @@ fn encode_connect(c: &Connect, out: &mut Vec<u8>) -> Result<(), CodecError> {
     }
     io::put_u8(out, flags);
     io::put_u16(out, c.keep_alive);
+    if is_v5 {
+        c.properties.encode(out)?;
+    }
 
     io::put_string(out, &c.client_id)?;
     if let Some(w) = &c.last_will {
+        if is_v5 {
+            w.properties.encode(out)?;
+        }
         io::put_string(out, &w.topic)?;
         io::put_binary(out, &w.payload)?;
     }
@@ -574,22 +607,36 @@ fn encode_connect(c: &Connect, out: &mut Vec<u8>) -> Result<(), CodecError> {
     Ok(())
 }
 
-fn decode_connack(r: &mut Reader) -> Result<ConnAck, CodecError> {
+fn decode_connack(r: &mut Reader, version: ProtocolVersion) -> Result<ConnAck, CodecError> {
     let ack_flags = r.read_u8()?;
     if ack_flags & 0xFE != 0 {
         return Err(CodecError::MalformedPacket("CONNACK reserved flags set"));
     }
     let code = r.read_u8()?;
+    let properties = if version == ProtocolVersion::V5 {
+        Properties::decode(r)?
+    } else {
+        Properties::new()
+    };
     expect_empty(r)?;
     Ok(ConnAck {
         session_present: ack_flags & 0x01 != 0,
         code,
+        properties,
     })
 }
 
-fn encode_connack(a: &ConnAck, out: &mut Vec<u8>) {
+fn encode_connack(
+    a: &ConnAck,
+    out: &mut Vec<u8>,
+    version: ProtocolVersion,
+) -> Result<(), CodecError> {
     io::put_u8(out, u8::from(a.session_present));
     io::put_u8(out, a.code);
+    if version == ProtocolVersion::V5 {
+        a.properties.encode(out)?;
+    }
+    Ok(())
 }
 
 fn publish_flags(p: &Publish) -> u8 {
@@ -732,14 +779,20 @@ fn encode_unsubscribe(u: &Unsubscribe, out: &mut Vec<u8>) -> Result<(), CodecErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Property;
 
     const V4: ProtocolVersion = ProtocolVersion::V311;
+    const V5: ProtocolVersion = ProtocolVersion::V5;
 
     fn roundtrip(packet: &Packet) {
+        roundtrip_version(packet, V4);
+    }
+
+    fn roundtrip_version(packet: &Packet, version: ProtocolVersion) {
         let mut out = Vec::new();
-        packet.encode(&mut out, V4).unwrap();
+        packet.encode(&mut out, version).unwrap();
         let mut buf = BytesMut::from(&out[..]);
-        let decoded = Packet::decode(&mut buf, V4).unwrap().unwrap();
+        let decoded = Packet::decode(&mut buf, version).unwrap().unwrap();
         assert_eq!(&decoded, packet);
         assert!(buf.is_empty(), "decode left trailing bytes");
     }
@@ -754,6 +807,7 @@ mod tests {
             last_will: None,
             username: None,
             password: None,
+            properties: Properties::new(),
         }));
     }
 
@@ -769,9 +823,11 @@ mod tests {
                 payload: Bytes::from_static(b"bye"),
                 qos: QoS::AtLeastOnce,
                 retain: true,
+                properties: Properties::new(),
             }),
             username: Some("alice".into()),
             password: Some(Bytes::from_static(b"s3cret")),
+            properties: Properties::new(),
         }));
     }
 
@@ -780,7 +836,72 @@ mod tests {
         roundtrip(&Packet::ConnAck(ConnAck {
             session_present: true,
             code: 0,
+            properties: Properties::new(),
         }));
+    }
+
+    #[test]
+    fn roundtrip_connect_v5_with_properties() {
+        roundtrip_version(
+            &Packet::Connect(Connect {
+                protocol: V5,
+                clean_session: true,
+                keep_alive: 30,
+                client_id: "c5".into(),
+                last_will: Some(LastWill {
+                    topic: "will/t".into(),
+                    payload: Bytes::from_static(b"bye"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    properties: Properties(vec![Property::WillDelayInterval(10)]),
+                }),
+                username: Some("u".into()),
+                password: Some(Bytes::from_static(b"p")),
+                properties: Properties(vec![
+                    Property::SessionExpiryInterval(3600),
+                    Property::ReceiveMaximum(20),
+                    Property::UserProperty("k".into(), "v".into()),
+                ]),
+            }),
+            V5,
+        );
+    }
+
+    #[test]
+    fn roundtrip_connack_v5_with_properties() {
+        roundtrip_version(
+            &Packet::ConnAck(ConnAck {
+                session_present: false,
+                code: 0,
+                properties: Properties(vec![
+                    Property::AssignedClientIdentifier("auto-7".into()),
+                    Property::ServerKeepAlive(45),
+                ]),
+            }),
+            V5,
+        );
+    }
+
+    /// A v4 CONNECT/CONNACK encodes byte-identically with or without the (empty) v5
+    /// properties present — the new fields never leak into the v3.1.1 wire.
+    #[test]
+    fn v4_wire_is_unchanged_by_empty_properties() {
+        let connect = Packet::Connect(Connect {
+            protocol: V4,
+            clean_session: true,
+            keep_alive: 15,
+            client_id: "c".into(),
+            last_will: None,
+            username: None,
+            password: None,
+            properties: Properties::new(),
+        });
+        let mut out = Vec::new();
+        connect.encode(&mut out, V4).unwrap();
+        // The v4 CONNECT variable header ends at keep-alive; no property-length byte.
+        // 10-byte var header (proto name 6 + level 1 + flags 1 + keepalive 2) + 2-byte
+        // client-id length + "c".
+        assert_eq!(out.len(), 2 + 10 + 2 + 1);
     }
 
     #[test]
@@ -864,6 +985,7 @@ mod tests {
             last_will: None,
             username: None,
             password: None,
+            properties: Properties::new(),
         })
         .encode(&mut out, V4)
         .unwrap();

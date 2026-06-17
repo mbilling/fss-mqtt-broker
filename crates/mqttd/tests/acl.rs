@@ -89,6 +89,7 @@ impl Client {
             writer: mqtt_net::FrameWriter::new(wh, V4),
         };
         c.send(&Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
             protocol: V4,
             clean_session: true,
             keep_alive: 30,
@@ -244,6 +245,7 @@ async fn unauthorized_will_topic_is_refused_at_connect() {
     )
     .await;
     let will = |topic: &str| LastWill {
+        properties: mqtt_codec::Properties::new(),
         topic: topic.into(),
         payload: bytes::Bytes::from_static(b"gone"),
         qos: QoS::AtMostOnce,

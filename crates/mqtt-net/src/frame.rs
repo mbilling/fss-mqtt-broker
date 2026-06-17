@@ -148,6 +148,7 @@ mod tests {
         writer.send(&Packet::PingReq).await.unwrap();
         writer
             .send(&Packet::ConnAck(ConnAck {
+                properties: mqtt_codec::Properties::new(),
                 session_present: false,
                 code: 0,
             }))
@@ -161,6 +162,7 @@ mod tests {
         assert_eq!(
             reader.next_packet().await.unwrap(),
             Some(Packet::ConnAck(ConnAck {
+                properties: mqtt_codec::Properties::new(),
                 session_present: false,
                 code: 0
             }))

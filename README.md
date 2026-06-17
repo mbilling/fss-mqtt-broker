@@ -97,8 +97,9 @@ owner dies) and the **MQTT 5.0 codec** are the next milestones. See
   reconnect (workstream F) — so a durable session *survives* an owner loss
   end-to-end, not just on disk.
 - **MQTT 5.0**: properties, reason codes, session/message expiry, topic aliases,
-  flow control, shared subscriptions, enhanced auth. (v5 CONNECT is currently
-  rejected at the codec.)
+  flow control, shared subscriptions, enhanced auth. (Codec in progress per
+  [ADR 0008](docs/adr/0008-mqtt-5-codec.md): the property block and v5
+  CONNECT/CONNACK round-trip; the remaining packets, then the v5 semantics, follow.)
 - Subscription digests (bloom) for sub-linear fan-out; retained-state
   replication across nodes.
 - WebSocket/WSS listener; Prometheus metrics; admin/management API. (Kubernetes-style
