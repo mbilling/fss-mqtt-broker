@@ -37,17 +37,37 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// Default timeout for a replication RPC (an append ack or a recovery read).
+///
+/// Bounds a **half-open** peer link — TCP still up but the peer wedged — so an
+/// append cannot hang quorum, and a takeover recovery-read cannot hang serving a
+/// session, waiting on a reply that will never come. On timeout the request
+/// resolves exactly as a dropped link would (an append counts no ack; a read reads
+/// unreachable) and its in-flight entry is reaped. `fail_node` still handles the
+/// common case (a link that actually drops) faster; this is the backstop for a link
+/// that stays up but stops answering.
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A leader-side [`ReplicaTransport`] that replicates over the peer mesh.
 ///
 /// Holds, per replica, the outbound channel into that peer's link, and a table of
 /// in-flight requests keyed by `req_id`. See the module docs for how the three
 /// handles map onto the mesh.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PeerReplicaTransport {
     inner: Mutex<Inner>,
     next_id: AtomicU64,
+    /// How long to wait for a peer's reply before treating it as unreachable.
+    rpc_timeout: Duration,
+}
+
+impl Default for PeerReplicaTransport {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -71,10 +91,23 @@ struct PendingRead {
 }
 
 impl PeerReplicaTransport {
-    /// An empty transport with no replicas registered.
+    /// An empty transport with no replicas registered, using the default RPC
+    /// timeout ([`DEFAULT_RPC_TIMEOUT`]).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_timeout(DEFAULT_RPC_TIMEOUT)
+    }
+
+    /// An empty transport whose RPCs (append acks, recovery reads) resolve to
+    /// unreachable after `rpc_timeout` with no reply. Mainly for tests; production
+    /// uses [`new`](Self::new).
+    #[must_use]
+    pub fn with_timeout(rpc_timeout: Duration) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            next_id: AtomicU64::new(0),
+            rpc_timeout,
+        }
     }
 
     /// Register (or replace) the outbound link channel for a replica.
@@ -176,8 +209,14 @@ impl ReplicaTransport for PeerReplicaTransport {
         }
 
         // Resolved by complete_ack (the replica replied) or fail_node (link
-        // dropped); a closed channel also reads as "not accepted".
-        ack_rx.await.unwrap_or(false)
+        // dropped); a closed channel also reads as "not accepted". A wedged but
+        // still-connected replica is bounded by the RPC timeout, after which the
+        // pending entry is reaped and the append counts no ack toward quorum.
+        let Ok(res) = tokio::time::timeout(self.rpc_timeout, ack_rx).await else {
+            self.lock().pending.remove(&req_id);
+            return false;
+        };
+        res.unwrap_or(false)
     }
 
     async fn read_replica(
@@ -208,7 +247,12 @@ impl ReplicaTransport for PeerReplicaTransport {
                 return None;
             }
         }
-        let entries = reply_rx.await.ok()?;
+        // Bounded like deliver: a wedged replica must not hang a takeover recovery.
+        let Ok(res) = tokio::time::timeout(self.rpc_timeout, reply_rx).await else {
+            self.lock().pending_reads.remove(&req_id);
+            return None;
+        };
+        let entries = res.ok()?;
         Some(
             entries
                 .into_iter()
@@ -226,6 +270,7 @@ mod tests {
     use crate::NodeId;
     use bytes::BytesMut;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::sync::mpsc;
 
@@ -359,6 +404,34 @@ mod tests {
     async fn deliver_to_unknown_replica_is_false() {
         let transport = PeerReplicaTransport::new();
         assert!(!transport.deliver(&n("ghost"), 1, &append("c", 1)).await);
+    }
+
+    /// A replica whose link is up but **wedged** (it never answers) does not hang an
+    /// append forever: the RPC timeout resolves the deliver to "not accepted" and
+    /// reaps the in-flight entry, so the append can fall short of quorum and retry.
+    #[tokio::test]
+    async fn deliver_times_out_on_a_wedged_replica() {
+        let transport = Arc::new(PeerReplicaTransport::with_timeout(Duration::from_millis(
+            50,
+        )));
+        let b = n("b");
+        // Registered (so the send succeeds) but never serviced — no ack ever comes.
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        transport.register(b.clone(), out_tx);
+        assert!(!transport.deliver(&b, 1, &append("c", 1)).await);
+    }
+
+    /// Likewise a recovery-read against a wedged replica times out to `None` rather
+    /// than hanging a takeover.
+    #[tokio::test]
+    async fn read_replica_times_out_on_a_wedged_replica() {
+        let transport = Arc::new(PeerReplicaTransport::with_timeout(Duration::from_millis(
+            50,
+        )));
+        let b = n("b");
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        transport.register(b.clone(), out_tx);
+        assert!(transport.read_replica(&b, "k").await.is_none());
     }
 
     /// If a replica's link drops with a request in flight, `fail_node` resolves it
