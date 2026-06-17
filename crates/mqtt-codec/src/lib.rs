@@ -7,15 +7,18 @@
 //! # Layout
 //! - [`varint`] — variable byte integer encode/decode (the remaining-length field)
 //! - [`io`] — bounds-checked readers and writers for MQTT primitive types
+//! - [`properties`] — the MQTT 5.0 typed property block (ADR 0008)
 //! - [`packet`] — fixed header, the [`Packet`] enum, and per-packet codecs
 //!
 //! The top-level entry points are [`Packet::decode`] and [`Packet::encode`].
 
 pub mod io;
 pub mod packet;
+pub mod properties;
 pub mod varint;
 
 pub use packet::{FixedHeader, Packet, PacketType};
+pub use properties::{Properties, Property};
 
 /// Supported MQTT protocol levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

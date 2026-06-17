@@ -231,6 +231,7 @@ plain HTTP (no framework — a minimal hand-rolled server):
 | [0005](docs/adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner |
 | [0006](docs/adr/0006-consensus-and-replication.md) | Consensus & replication: lease-scoped consensus, a proven engine, the `ReplicatedLog` seam |
 | [0007](docs/adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker (placement groups, lease group, hub RPC, store swap) |
+| [0008](docs/adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec: properties model, version-tagged packets, reason codes, phased rollout |
 
 ## License
 
