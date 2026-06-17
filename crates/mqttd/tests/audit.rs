@@ -189,7 +189,7 @@ async fn denied_publish_and_subscribe_are_audited() {
         payload: bytes::Bytes::from_static(b"x"),
     }))
     .await;
-    assert_eq!(c.recv().await, Some(Packet::PubAck(7)));
+    assert_eq!(c.recv().await, Some(Packet::PubAck(7.into())));
 
     assert!(wait_for_kind(&audit, "acl.deny.subscribe").await);
     assert!(wait_for_kind(&audit, "acl.deny.publish").await);

@@ -160,7 +160,7 @@ impl Client {
 
     /// Acknowledge a `QoS` 1 PUBLISH received from the broker.
     async fn puback(&mut self, pkid: u16) {
-        self.send(&Packet::PubAck(pkid)).await;
+        self.send(&Packet::PubAck(pkid.into())).await;
     }
 
     /// Assert that nothing arrives within the receive window (the connection
@@ -211,7 +211,7 @@ async fn qos1_publish_is_delivered_downstream_at_qos1() {
         .await;
     assert_eq!(
         pubr.recv().await,
-        Packet::PubAck(42),
+        Packet::PubAck(42.into()),
         "broker must PUBACK the inbound QoS 1 publish"
     );
 
@@ -250,7 +250,7 @@ async fn delivery_qos_is_min_of_publish_and_granted_qos() {
     // QoS 1 publish -> QoS 0 subscription: downgraded to QoS 0, no packet id.
     pubr.publish("min/down", QoS::AtLeastOnce, Some(7), b"downgraded")
         .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(7));
+    assert_eq!(pubr.recv().await, Packet::PubAck(7.into()));
     let p = sub0.recv_publish().await;
     assert_eq!(p.topic, "min/down");
     assert_eq!(&p.payload[..], b"downgraded");
@@ -288,10 +288,10 @@ async fn inflight_qos1_messages_have_distinct_packet_ids() {
     let mut pubr = Client::connect(addr, "dist-pub").await;
     pubr.publish("dist/topic", QoS::AtLeastOnce, Some(10), b"first")
         .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(10));
+    assert_eq!(pubr.recv().await, Packet::PubAck(10.into()));
     pubr.publish("dist/topic", QoS::AtLeastOnce, Some(11), b"second")
         .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(11));
+    assert_eq!(pubr.recv().await, Packet::PubAck(11.into()));
 
     // Receive both without acking either, so both stay in flight.
     let first = sub.recv_publish().await;
@@ -328,7 +328,7 @@ async fn unacked_qos1_message_is_redelivered_with_dup_on_reconnect() {
     let mut pubr = Client::connect(addr, "redeliver-pub").await;
     pubr.publish("redo/topic", QoS::AtLeastOnce, Some(5), b"needs-ack")
         .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(5));
+    assert_eq!(pubr.recv().await, Packet::PubAck(5.into()));
 
     // First delivery arrives at QoS 1 — but the subscriber never PUBACKs it and
     // its connection drops (no DISCONNECT, simulating a network failure).
@@ -387,7 +387,7 @@ async fn offline_qos1_message_replays_at_qos1_until_acked() {
     let mut pubr = Client::connect(addr, "offline-q1-pub").await;
     pubr.publish("off/topic", QoS::AtLeastOnce, Some(3), b"stored")
         .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(3));
+    assert_eq!(pubr.recv().await, Packet::PubAck(3.into()));
 
     // Reconnect: the queued message must replay as a QoS 1 PUBLISH.
     let (mut sub, present) = Client::connect_opts(addr, "offline-q1", false).await;

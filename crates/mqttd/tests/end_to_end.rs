@@ -209,7 +209,7 @@ async fn qos1_publish_is_acked_and_downgraded() {
     }))
     .await;
     // Publisher gets PUBACK for its QoS 1 message.
-    assert_eq!(pubr.recv().await, Packet::PubAck(99));
+    assert_eq!(pubr.recv().await, Packet::PubAck(99.into()));
 
     // Subscriber receives it downgraded to QoS 0.
     match sub.recv().await {
@@ -258,7 +258,7 @@ async fn persistent_session_queues_offline_and_replays_on_reconnect() {
         payload: bytes::Bytes::from_static(b"queued-while-away"),
     }))
     .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(1));
+    assert_eq!(pubr.recv().await, Packet::PubAck(1.into()));
 
     // 4. Reconnect with the same id and clean_session=false: the session must be
     //    present and the queued message replayed.
@@ -304,7 +304,7 @@ async fn clean_session_does_not_persist() {
         payload: bytes::Bytes::from_static(b"dropped"),
     }))
     .await;
-    assert_eq!(pubr.recv().await, Packet::PubAck(1));
+    assert_eq!(pubr.recv().await, Packet::PubAck(1.into()));
 
     // Reconnect clean: no session, and a PINGREQ round-trip shows nothing queued.
     let (mut sub, present) = Client::connect_opts(addr, "ephemeral", true).await;

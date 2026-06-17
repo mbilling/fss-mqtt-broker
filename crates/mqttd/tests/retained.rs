@@ -140,7 +140,7 @@ impl Client {
         .await;
         assert_eq!(
             self.recv().await,
-            Packet::PubAck(pkid),
+            Packet::PubAck(pkid.into()),
             "publisher should get a PUBACK for its QoS 1 publish"
         );
     }

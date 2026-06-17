@@ -191,31 +191,31 @@ impl Client {
         self.publish_qos2(topic, pkid, payload, false).await;
         assert_eq!(
             self.recv().await,
-            Packet::PubRec(pkid),
+            Packet::PubRec(pkid.into()),
             "QoS 2 PUBLISH must be answered with PUBREC"
         );
         self.pubrel(pkid).await;
         assert_eq!(
             self.recv().await,
-            Packet::PubComp(pkid),
+            Packet::PubComp(pkid.into()),
             "PUBREL must be answered with PUBCOMP"
         );
     }
 
     async fn puback(&mut self, pkid: u16) {
-        self.send(&Packet::PubAck(pkid)).await;
+        self.send(&Packet::PubAck(pkid.into())).await;
     }
 
     async fn pubrec(&mut self, pkid: u16) {
-        self.send(&Packet::PubRec(pkid)).await;
+        self.send(&Packet::PubRec(pkid.into())).await;
     }
 
     async fn pubrel(&mut self, pkid: u16) {
-        self.send(&Packet::PubRel(pkid)).await;
+        self.send(&Packet::PubRel(pkid.into())).await;
     }
 
     async fn pubcomp(&mut self, pkid: u16) {
-        self.send(&Packet::PubComp(pkid)).await;
+        self.send(&Packet::PubComp(pkid.into())).await;
     }
 }
 
@@ -295,18 +295,18 @@ async fn resent_qos2_publish_before_pubrel_is_deduplicated() {
     let mut pubr = Client::connect(addr, "dedup-pub").await;
     pubr.publish_qos2("dedup/topic", 11, b"no-dups", false)
         .await;
-    assert_eq!(pubr.recv().await, Packet::PubRec(11));
+    assert_eq!(pubr.recv().await, Packet::PubRec(11.into()));
 
     // Pretend the PUBREC was lost: re-send the same PUBLISH with DUP set.
     pubr.publish_qos2("dedup/topic", 11, b"no-dups", true).await;
     assert_eq!(
         pubr.recv().await,
-        Packet::PubRec(11),
+        Packet::PubRec(11.into()),
         "[MQTT-4.3.3] a re-sent PUBLISH must be acknowledged with PUBREC again"
     );
 
     pubr.pubrel(11).await;
-    assert_eq!(pubr.recv().await, Packet::PubComp(11));
+    assert_eq!(pubr.recv().await, Packet::PubComp(11.into()));
 
     // Exactly one copy reaches the subscriber. Be lenient about the delivery
     // QoS here (test 4 pins it); if it arrives at QoS 2, complete the
@@ -319,7 +319,7 @@ async fn resent_qos2_publish_before_pubrel_is_deduplicated() {
             .pkid
             .expect("QoS 2 PUBLISH must carry a packet identifier");
         sub.pubrec(id).await;
-        assert_eq!(sub.recv().await, Packet::PubRel(id));
+        assert_eq!(sub.recv().await, Packet::PubRel(id.into()));
         sub.pubcomp(id).await;
     }
     sub.expect_silence().await;
@@ -354,7 +354,7 @@ async fn downstream_qos2_uses_four_way_handshake() {
     sub.pubrec(id).await;
     assert_eq!(
         sub.recv().await,
-        Packet::PubRel(id),
+        Packet::PubRel(id.into()),
         "the broker must answer the subscriber's PUBREC with PUBREL"
     );
     sub.pubcomp(id).await;
@@ -453,7 +453,7 @@ async fn unacked_downstream_qos2_is_resent_with_dup_until_pubcomp() {
 
     // 5. Complete the downstream handshake this time.
     sub.pubrec(id).await;
-    assert_eq!(sub.recv().await, Packet::PubRel(id));
+    assert_eq!(sub.recv().await, Packet::PubRel(id.into()));
     sub.pubcomp(id).await;
 
     // 6. Disconnect cleanly and resume once more: the handshake completed, so

@@ -528,7 +528,7 @@ impl Hub {
                         true,
                         false,
                     ),
-                    OutState::AwaitingPubComp => Packet::PubRel(*pkid),
+                    OutState::AwaitingPubComp => Packet::PubRel((*pkid).into()),
                 };
                 let _ = outbound.send(packet);
             }
@@ -720,7 +720,7 @@ impl Hub {
                 });
         if advanced {
             if let Some(sess) = self.online.get(client) {
-                let _ = sess.tx.send(Packet::PubRel(pkid));
+                let _ = sess.tx.send(Packet::PubRel(pkid.into()));
             }
         }
     }

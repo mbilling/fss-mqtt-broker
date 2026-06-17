@@ -198,6 +198,39 @@ pub struct Publish {
     pub payload: Bytes,
 }
 
+/// A PUBACK / PUBREC / PUBREL / PUBCOMP packet — the four `QoS` acknowledgements
+/// share an identical shape: a packet identifier, plus (MQTT 5.0) a reason code and
+/// a properties block. For v3.1.1 the packet is just the 2-byte `pkid`; the `reason`
+/// (0 = success) and `properties` are unused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ack {
+    /// Packet identifier being acknowledged.
+    pub pkid: u16,
+    /// Reason code (MQTT 5.0; 0 = success). Always 0 on v3.1.1.
+    pub reason: u8,
+    /// Acknowledgement properties (MQTT 5.0; e.g. reason string). Empty for v3.1.1.
+    pub properties: Properties,
+}
+
+impl Ack {
+    /// A success acknowledgement of `pkid` (reason 0, no properties) — the v3.1.1
+    /// form and the v5 short form.
+    #[must_use]
+    pub fn new(pkid: u16) -> Self {
+        Self {
+            pkid,
+            reason: 0,
+            properties: Properties::new(),
+        }
+    }
+}
+
+impl From<u16> for Ack {
+    fn from(pkid: u16) -> Self {
+        Self::new(pkid)
+    }
+}
+
 /// A single entry in a SUBSCRIBE packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeFilter {
@@ -243,14 +276,14 @@ pub enum Packet {
     ConnAck(ConnAck),
     /// PUBLISH.
     Publish(Publish),
-    /// PUBACK (carries the packet identifier).
-    PubAck(u16),
-    /// PUBREC (carries the packet identifier).
-    PubRec(u16),
-    /// PUBREL (carries the packet identifier).
-    PubRel(u16),
-    /// PUBCOMP (carries the packet identifier).
-    PubComp(u16),
+    /// PUBACK (`QoS` 1 acknowledgement).
+    PubAck(Ack),
+    /// PUBREC (`QoS` 2, part 1).
+    PubRec(Ack),
+    /// PUBREL (`QoS` 2, part 2).
+    PubRel(Ack),
+    /// PUBCOMP (`QoS` 2, part 3).
+    PubComp(Ack),
     /// SUBSCRIBE.
     Subscribe(Subscribe),
     /// SUBACK.
@@ -325,7 +358,13 @@ impl Packet {
         if version == ProtocolVersion::V5
             && !matches!(
                 header.packet_type,
-                PacketType::Connect | PacketType::ConnAck | PacketType::Publish
+                PacketType::Connect
+                    | PacketType::ConnAck
+                    | PacketType::Publish
+                    | PacketType::PubAck
+                    | PacketType::PubRec
+                    | PacketType::PubRel
+                    | PacketType::PubComp
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -340,19 +379,19 @@ impl Packet {
             PacketType::Publish => Packet::Publish(decode_publish(version, header.flags, &mut r)?),
             PacketType::PubAck => {
                 expect_flags(header.flags, 0)?;
-                Packet::PubAck(decode_pkid_only(&mut r)?)
+                Packet::PubAck(decode_ack(version, &mut r)?)
             }
             PacketType::PubRec => {
                 expect_flags(header.flags, 0)?;
-                Packet::PubRec(decode_pkid_only(&mut r)?)
+                Packet::PubRec(decode_ack(version, &mut r)?)
             }
             PacketType::PubRel => {
                 expect_flags(header.flags, 0x02)?;
-                Packet::PubRel(decode_pkid_only(&mut r)?)
+                Packet::PubRel(decode_ack(version, &mut r)?)
             }
             PacketType::PubComp => {
                 expect_flags(header.flags, 0)?;
-                Packet::PubComp(decode_pkid_only(&mut r)?)
+                Packet::PubComp(decode_ack(version, &mut r)?)
             }
             PacketType::Subscribe => {
                 expect_flags(header.flags, 0x02)?;
@@ -399,7 +438,13 @@ impl Packet {
         if version == ProtocolVersion::V5
             && !matches!(
                 self,
-                Packet::Connect(_) | Packet::ConnAck(_) | Packet::Publish(_)
+                Packet::Connect(_)
+                    | Packet::ConnAck(_)
+                    | Packet::Publish(_)
+                    | Packet::PubAck(_)
+                    | Packet::PubRec(_)
+                    | Packet::PubRel(_)
+                    | Packet::PubComp(_)
             )
         {
             return Err(V5_UNSUPPORTED);
@@ -419,18 +464,21 @@ impl Packet {
                 encode_publish(p, &mut body, version)?;
                 publish_flags(p)
             }
-            // PUBACK, PUBREC, PUBCOMP and UNSUBACK share an identical body and zero flags.
-            Packet::PubAck(id)
-            | Packet::PubRec(id)
-            | Packet::PubComp(id)
-            | Packet::UnsubAck(id) => {
-                io::put_u16(&mut body, *id);
+            // PUBACK, PUBREC and PUBCOMP share an identical body and zero flags.
+            Packet::PubAck(a) | Packet::PubRec(a) | Packet::PubComp(a) => {
+                encode_ack(a, &mut body, version)?;
                 0
             }
             // PUBREL is the same body but, like SUBSCRIBE/UNSUBSCRIBE, requires flags 0x02.
-            Packet::PubRel(id) => {
-                io::put_u16(&mut body, *id);
+            Packet::PubRel(a) => {
+                encode_ack(a, &mut body, version)?;
                 0x02
+            }
+            // UNSUBACK is still the v3.1.1 packet-id-only form (its v5 form lands in a
+            // later phase).
+            Packet::UnsubAck(id) => {
+                io::put_u16(&mut body, *id);
+                0
             }
             Packet::Subscribe(s) => {
                 encode_subscribe(s, &mut body)?;
@@ -478,6 +526,47 @@ fn decode_pkid_only(r: &mut Reader) -> Result<u16, CodecError> {
     let pkid = r.read_u16()?;
     expect_empty(r)?;
     Ok(pkid)
+}
+
+/// Decode a PUBACK/PUBREC/PUBREL/PUBCOMP body. v3.1.1 is just the packet id. v5
+/// adds an optional reason code and properties: the reason and the property length
+/// may both be omitted (Success, no properties) — remaining length 2 — and the
+/// property length alone may be omitted when no properties follow.
+fn decode_ack(version: ProtocolVersion, r: &mut Reader) -> Result<Ack, CodecError> {
+    let pkid = r.read_u16()?;
+    if version != ProtocolVersion::V5 {
+        expect_empty(r)?;
+        return Ok(Ack::new(pkid));
+    }
+    // v5 short form: remaining length 2 means reason 0x00 (Success), no properties.
+    if r.is_empty() {
+        return Ok(Ack::new(pkid));
+    }
+    let reason = r.read_u8()?;
+    // Remaining length 3 (reason present, property length omitted) means no properties.
+    let properties = if r.is_empty() {
+        Properties::new()
+    } else {
+        Properties::decode(r)?
+    };
+    expect_empty(r)?;
+    Ok(Ack {
+        pkid,
+        reason,
+        properties,
+    })
+}
+
+/// Encode a PUBACK/PUBREC/PUBREL/PUBCOMP body. v3.1.1 writes only the packet id; v5
+/// adds the reason code and properties unless both are absent (Success, no
+/// properties), in which case it emits the 2-byte short form.
+fn encode_ack(a: &Ack, out: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), CodecError> {
+    io::put_u16(out, a.pkid);
+    if version == ProtocolVersion::V5 && (a.reason != 0 || !a.properties.is_empty()) {
+        io::put_u8(out, a.reason);
+        a.properties.encode(out)?;
+    }
+    Ok(())
 }
 
 fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
@@ -977,11 +1066,53 @@ mod tests {
 
     #[test]
     fn roundtrip_ack_family() {
-        roundtrip(&Packet::PubAck(7));
-        roundtrip(&Packet::PubRec(8));
-        roundtrip(&Packet::PubRel(9));
-        roundtrip(&Packet::PubComp(10));
+        roundtrip(&Packet::PubAck(7.into()));
+        roundtrip(&Packet::PubRec(8.into()));
+        roundtrip(&Packet::PubRel(9.into()));
+        roundtrip(&Packet::PubComp(10.into()));
         roundtrip(&Packet::UnsubAck(11));
+    }
+
+    #[test]
+    fn roundtrip_ack_family_v5() {
+        // v5 short form (reason 0, no properties) is byte-identical to v3.1.1.
+        roundtrip_version(&Packet::PubAck(7.into()), V5);
+        // A non-success reason with properties uses the long form.
+        roundtrip_version(
+            &Packet::PubRec(Ack {
+                pkid: 8,
+                reason: 0x87, // Not authorized
+                properties: Properties(vec![Property::ReasonString("nope".into())]),
+            }),
+            V5,
+        );
+        // A non-success reason with no properties (the length-3 short form on decode).
+        roundtrip_version(
+            &Packet::PubComp(Ack {
+                pkid: 9,
+                reason: 0x92, // Packet identifier not found
+                properties: Properties::new(),
+            }),
+            V5,
+        );
+    }
+
+    /// A v5 PUBACK whose reason is non-zero but carries no properties decodes the same
+    /// whether the sender wrote the 3-byte form (no property length) or the 4-byte
+    /// form (explicit 0 property length).
+    #[test]
+    fn ack_v5_short_and_long_no_property_forms_agree() {
+        // pkid 5, reason 0x10 (No matching subscribers): 3-byte body vs 4-byte body.
+        let three = BytesMut::from(&[0x40u8, 0x03, 0x00, 0x05, 0x10][..]);
+        let four = BytesMut::from(&[0x40u8, 0x04, 0x00, 0x05, 0x10, 0x00][..]);
+        let want = Packet::PubAck(Ack {
+            pkid: 5,
+            reason: 0x10,
+            properties: Properties::new(),
+        });
+        for mut buf in [three, four] {
+            assert_eq!(Packet::decode(&mut buf, V5).unwrap(), Some(want.clone()));
+        }
     }
 
     #[test]

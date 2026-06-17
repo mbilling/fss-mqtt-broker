@@ -668,7 +668,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         (QoS::AtMostOnce, _) => forward(hub),
         (QoS::AtLeastOnce, Some(id)) => {
             forward(hub);
-            writer.send(&Packet::PubAck(id)).await?;
+            writer.send(&Packet::PubAck(id.into())).await?;
         }
         (QoS::ExactlyOnce, Some(id)) => {
             // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
@@ -684,7 +684,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             if first_sighting {
                 forward(hub);
             }
-            writer.send(&Packet::PubRec(id)).await?;
+            writer.send(&Packet::PubRec(id.into())).await?;
         }
         _ => debug!(client = %client.0, "dropping QoS>0 publish without packet id"),
     }
@@ -718,8 +718,10 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 return Ok(true);
             }
         }
-        // QoS 2 publisher-side release: the id may be reused afterwards.
-        Packet::PubRel(id) => {
+        // QoS 2 publisher-side release: the id may be reused afterwards. (A v5
+        // reason code on these acks is not acted on yet — workstream G.)
+        Packet::PubRel(ack) => {
+            let id = ack.pkid;
             match &policy.store {
                 Some(store) => {
                     let _ = store.clear_received(client, id).await;
@@ -728,25 +730,25 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     qos2_inbound.remove(&id);
                 }
             }
-            writer.send(&Packet::PubComp(id)).await?;
+            writer.send(&Packet::PubComp(id.into())).await?;
         }
         // Subscriber-side acknowledgements for our downstream deliveries.
-        Packet::PubAck(id) => {
+        Packet::PubAck(ack) => {
             let _ = hub.send(HubCommand::PubAck {
                 client: client.clone(),
-                pkid: id,
+                pkid: ack.pkid,
             });
         }
-        Packet::PubRec(id) => {
+        Packet::PubRec(ack) => {
             let _ = hub.send(HubCommand::PubRec {
                 client: client.clone(),
-                pkid: id,
+                pkid: ack.pkid,
             });
         }
-        Packet::PubComp(id) => {
+        Packet::PubComp(ack) => {
             let _ = hub.send(HubCommand::PubComp {
                 client: client.clone(),
-                pkid: id,
+                pkid: ack.pkid,
             });
         }
         Packet::Subscribe(s) => {
@@ -1065,8 +1067,8 @@ mod tests {
         writer.send(&Packet::PingReq).await.unwrap();
         assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
 
-        writer.send(&Packet::PubRel(7)).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(7)));
+        writer.send(&Packet::PubRel(7.into())).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(7.into())));
     }
 
     /// [MQTT-3.3.2-2]: a PUBLISH topic must not contain wildcards. Such a
@@ -1151,17 +1153,17 @@ mod tests {
 
         // First QoS-2 PUBLISH: recorded in the store before PUBREC.
         writer.send(&qos2_publish(5)).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5)));
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5.into())));
         assert_eq!(store.received(&client).await.unwrap(), vec![5]);
 
         // A duplicate (same id) is still acknowledged; the window is unchanged.
         writer.send(&qos2_publish(5)).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5)));
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5.into())));
         assert_eq!(store.received(&client).await.unwrap(), vec![5]);
 
         // PUBREL completes the flow and clears the id from the (durable) window.
-        writer.send(&Packet::PubRel(5)).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(5)));
+        writer.send(&Packet::PubRel(5.into())).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(5.into())));
         assert!(store.received(&client).await.unwrap().is_empty());
     }
 }

@@ -140,7 +140,7 @@ impl Client {
         .await;
         assert_eq!(
             self.recv().await,
-            Some(Packet::PubAck(pkid)),
+            Some(Packet::PubAck(pkid.into())),
             "publishes must be acked whether or not the ACL forwards them"
         );
     }
