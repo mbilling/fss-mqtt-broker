@@ -41,6 +41,11 @@
 //! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), e.g.
 //!   from `openssl rand -hex 32`; without it gossip is unauthenticated and
 //!   loudly logged
+//! - `MQTTD_HEALTH_BIND`    — HTTP health-probe bind for orchestrators, e.g.
+//!   `0.0.0.0:8080`; serves `GET /livez` (hub responsive) and `GET /readyz`
+//!   (mesh + durable-store ready). Unset = no health server.
+//! - `MQTTD_READY_MIN_MEMBERS` — smallest mesh size `/readyz` accepts (default 1;
+//!   raise it to hold a node out of rotation until it has joined its peers)
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
@@ -93,7 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
     // QoS-2 dedup window (ADR 0007 §5).
-    let (hub_tx, store) = start_hub(&node_id, &placement).await?;
+    let (hub_tx, store, durable_plane) = start_hub(&node_id, &placement).await?;
+
+    // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
+    // /livez (hub responsive) and /readyz (mesh + durable-store ready).
+    start_health_from_env(&hub_tx, &placement, durable_plane).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -279,6 +288,7 @@ fn jwt_config_from_env() -> mqtt_auth::token::TokenConfig {
 type HubHandle = (
     mpsc::UnboundedSender<hub::HubCommand>,
     Arc<dyn SessionStore>,
+    Option<mqtt_cluster::durable_plane::DurablePlane>,
 );
 
 async fn start_hub(
@@ -306,9 +316,11 @@ async fn start_hub(
             store.clone(),
             Some(placement.clone()),
         );
+        // Keep a plane clone for the health endpoint's lease-group readiness signal.
+        let plane_for_health = plane.clone();
         hub.attach_durable_plane(plane);
         tokio::spawn(hub.run());
-        Ok((hub_tx, store))
+        Ok((hub_tx, store, Some(plane_for_health)))
     } else {
         let store: Arc<dyn SessionStore> =
             Arc::new(MemorySessionStore::with_limits(queue_limits_from_env()?));
@@ -318,8 +330,38 @@ async fn start_hub(
             Some(placement.clone()),
         );
         tokio::spawn(hub.run());
-        Ok((hub_tx, store))
+        Ok((hub_tx, store, None))
     }
+}
+
+/// Start the health endpoint server from `MQTTD_HEALTH_BIND` (no-op when unset).
+/// `/livez` reports hub liveness; `/readyz` additionally requires the mesh to have
+/// at least `MQTTD_READY_MIN_MEMBERS` members (default 1) and, when durable sessions
+/// are on, the lease group to be ready (a leader exists and this node is a voter).
+async fn start_health_from_env(
+    hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
+    placement: &Arc<RwLock<Placement>>,
+    durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(bind) = non_empty_env("MQTTD_HEALTH_BIND") else {
+        return Ok(());
+    };
+    let min_members = match non_empty_env("MQTTD_READY_MIN_MEMBERS") {
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| format!("MQTTD_READY_MIN_MEMBERS is not a number: {raw:?}"))?,
+        None => 1,
+    };
+    let listener = TcpListener::bind(&bind).await?;
+    info!(%bind, min_members, "serving health endpoints (/livez, /readyz, /healthz)");
+    let state = mqttd::health::HealthState::new(
+        hub_tx.clone(),
+        Some(placement.clone()),
+        durable_plane,
+        min_members,
+    );
+    tokio::spawn(mqttd::health::serve(listener, state));
+    Ok(())
 }
 
 fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {

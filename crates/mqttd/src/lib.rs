@@ -6,6 +6,7 @@
 
 pub mod cluster;
 pub mod conn;
+pub mod health;
 pub mod hub;
 pub mod peer;
 

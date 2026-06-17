@@ -101,7 +101,8 @@ owner dies) and the **MQTT 5.0 codec** are the next milestones. See
   rejected at the codec.)
 - Subscription digests (bloom) for sub-linear fan-out; retained-state
   replication across nodes.
-- WebSocket/WSS listener; Prometheus metrics; admin/management API.
+- WebSocket/WSS listener; Prometheus metrics; admin/management API. (Kubernetes-style
+  `GET /livez` + `/readyz` health probes already ship — see `MQTTD_HEALTH_BIND`.)
 - Bounded outbound queues, rate limits, connection caps.
 - MQTT conformance suite, continuous fuzzing, SBOM + signed reproducible
   releases.
@@ -201,6 +202,23 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_SWIM_BIND` | SWIM gossip UDP bind (needs `MQTTD_PEER_BIND`) |
 | `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
 | `MQTTD_SWIM_KEY` | 64-hex-char cluster gossip key (`openssl rand -hex 32`) |
+| `MQTTD_HEALTH_BIND` | HTTP health-probe bind, e.g. `0.0.0.0:8080` — serves `GET /livez` & `/readyz` |
+| `MQTTD_READY_MIN_MEMBERS` | Smallest mesh size `/readyz` accepts (default 1) |
+
+### Health probes
+
+With `MQTTD_HEALTH_BIND` set, the broker serves two Kubernetes-style endpoints over
+plain HTTP (no framework — a minimal hand-rolled server):
+
+- **`GET /livez`** (alias `/healthz`) — *liveness*: `200` while the routing hub is
+  draining commands; `503` if it is wedged. Wire to a k8s **livenessProbe** (restart
+  on failure).
+- **`GET /readyz`** — *readiness*: `200` only when the node is live, the mesh has at
+  least `MQTTD_READY_MIN_MEMBERS` members, and — with `MQTTD_DURABLE_SESSIONS` on —
+  the lease group is ready (a leader exists and this node is a voter, so it can
+  durably own the sessions it would be handed). Wire to a k8s **readinessProbe** so a
+  node is pulled from the Service during a rolling restart or a transient lease blip
+  *without* being killed. Body example: `{"status":"ok","live":true,"ready":true,"members":3,"lease_group_ready":true}`.
 
 ## Architecture decisions
 

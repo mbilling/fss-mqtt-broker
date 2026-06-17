@@ -232,6 +232,12 @@ pub enum HubCommand {
         /// The durable-plane frame to route.
         frame: PeerMessage,
     },
+    /// Liveness probe (the health endpoint): the hub replies as soon as the actor
+    /// loop dequeues this command, proving the loop is draining and not wedged.
+    Ping {
+        /// Replied to with `()` when the loop reaches this command.
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// A connected peer node's link.
@@ -400,6 +406,11 @@ impl Hub {
                 }
                 HubCommand::DurableFrame { node, frame } => {
                     self.handle_durable_frame(&node, frame);
+                }
+                HubCommand::Ping { reply } => {
+                    // Reached the loop → it is live. The receiver may be gone if the
+                    // prober timed out; that is fine.
+                    let _ = reply.send(());
                 }
                 HubCommand::RemoteInterest { node, filters } => {
                     debug!(node = %node.0, filters = filters.len(), "remote interest updated");

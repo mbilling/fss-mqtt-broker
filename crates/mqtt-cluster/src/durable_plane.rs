@@ -91,6 +91,23 @@ impl DurablePlane {
             .count()
     }
 
+    /// Whether the lease group can serve this node's durable sessions: it has a
+    /// current leader (so consensus is making progress and leases can be assigned)
+    /// **and** this node is a voter (so the leader can assign it ownership, and a
+    /// takeover would keep quorum). A node still catching up as a learner — or one in
+    /// a group with no leader — reports not-ready, which is the signal an orchestrator
+    /// should gate client traffic on (the node should not take sessions it cannot yet
+    /// durably own). See [`voter_count`](Self::voter_count).
+    #[must_use]
+    pub fn lease_group_ready(&self) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics.current_leader.is_some()
+            && metrics
+                .membership_config
+                .voter_ids()
+                .any(|id| id == metrics.id)
+    }
+
     /// Register a peer's outbound link channel for *both* planes — consensus
     /// (keyed by the peer's [`raft_id`]) and replication (keyed by its [`NodeId`]).
     /// Called when a peer link is established.
@@ -304,6 +321,27 @@ mod tests {
 
         p1.raft().shutdown().await.unwrap();
         p2.raft().shutdown().await.unwrap();
+    }
+
+    /// `lease_group_ready` is the health endpoint's durable-readiness signal: false
+    /// before the lease group is initialized (no leader, not a voter), true once a
+    /// node has bootstrapped it (a leader exists and this node is a voter).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lease_group_ready_tracks_leadership_and_voter_membership() {
+        let p = node("ready-node").await;
+        // Un-initialized: no leader and not yet a voter → not ready.
+        assert!(!p.lease_group_ready());
+
+        p.raft().initialize(members(&["ready-node"])).await.unwrap();
+        p.raft()
+            .wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "node leads its own group")
+            .await
+            .unwrap();
+        // Leader of a group it is a voter in → ready.
+        assert!(p.lease_group_ready());
+
+        p.raft().shutdown().await.unwrap();
     }
 
     /// A delivery to an unregistered peer fails fast (no hang) — the plane reports
