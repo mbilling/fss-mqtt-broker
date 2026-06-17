@@ -51,6 +51,9 @@ const SUBACK_FAILURE: u8 = 0x80;
 /// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
 /// topic alias the server will accept on a connection.
 const SERVER_TOPIC_ALIAS_MAX: u16 = 16;
+/// Receive Maximum advertised to v5 clients (ADR 0012 §3): the most unacked
+/// `QoS` > 0 publishes the server invites the client to have outstanding to it.
+const SERVER_RECEIVE_MAXIMUM: u16 = 256;
 
 /// Monotonic source of unique connection ids (distinct from client ids).
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -334,6 +337,9 @@ where
     });
     let (out_tx, mut out_rx): (Outbound, _) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = oneshot::channel();
+    // The client's Receive Maximum bounds how many unacked QoS>0 PUBLISHes the hub
+    // may have outstanding to it (ADR 0012); 0/absent means unlimited.
+    let receive_maximum = client_receive_maximum(connect.protocol, &connect.properties);
     // Attach before sending CONNACK so we cannot miss a publish that races in, and
     // so the hub can tell us whether a session was already present.
     if hub
@@ -342,6 +348,7 @@ where
             conn_id,
             clean_start,
             session_expiry,
+            receive_maximum,
             will,
             outbound: out_tx,
             reply: reply_tx,
@@ -353,10 +360,10 @@ where
     let Ok(session_present) = reply_rx.await else {
         return Ok(()); // hub dropped the reply
     };
-    // Topic aliases are negotiated per connection (ADR 0011): the CONNACK advertises
-    // our inbound maximum; the client's CONNECT value bounds our outbound aliasing.
+    // Build the v5 CONNACK properties (Topic Alias Maximum, Receive Maximum) and the
+    // per-connection alias maps (ADR 0011, ADR 0012).
     let (connack_props, mut inbound_aliases, mut outbound_aliases) =
-        negotiate_topic_aliases(connect.protocol, &connect.properties);
+        negotiate_v5_properties(connect.protocol, &connect.properties);
     writer
         .send(&Packet::ConnAck(ConnAck {
             properties: connack_props,
@@ -619,29 +626,48 @@ where
 /// Serve the connection until it ends. Returns `Ok(true)` only for a clean
 /// client DISCONNECT; every other end (EOF, keepalive expiry, takeover) is
 /// ungraceful and will publish the client's will.
-/// Negotiate per-connection topic-alias limits (ADR 0011) and build the CONNACK
-/// property block. v3.1.1 has no aliases, so both directions come out disabled.
-fn negotiate_topic_aliases(
+/// The outbound Receive Maximum quota for a connection (ADR 0012): the client's
+/// advertised value, treating 0/absent as unlimited. v3.1.1 has no such property.
+fn client_receive_maximum(protocol: ProtocolVersion, properties: &mqtt_codec::Properties) -> u16 {
+    if protocol == ProtocolVersion::V5 {
+        properties
+            .receive_maximum()
+            .filter(|&v| v > 0)
+            .unwrap_or(u16::MAX)
+    } else {
+        u16::MAX
+    }
+}
+
+/// Build the v5 CONNACK property block — Topic Alias Maximum (ADR 0011) and Receive
+/// Maximum (ADR 0012) — and the per-connection topic-alias maps. v3.1.1 has neither
+/// feature, so the maps come out disabled and the property block empty.
+fn negotiate_v5_properties(
     protocol: ProtocolVersion,
     properties: &mqtt_codec::Properties,
 ) -> (mqtt_codec::Properties, InboundAliases, OutboundAliases) {
     let is_v5 = protocol == ProtocolVersion::V5;
-    let server_max = if is_v5 { SERVER_TOPIC_ALIAS_MAX } else { 0 };
-    let client_max = if is_v5 {
+    let server_alias_max = if is_v5 { SERVER_TOPIC_ALIAS_MAX } else { 0 };
+    let client_alias_max = if is_v5 {
         properties.topic_alias_maximum().unwrap_or(0)
     } else {
         0
     };
     let mut props = mqtt_codec::Properties::new();
-    if server_max > 0 {
+    if is_v5 {
         props
             .0
-            .push(mqtt_codec::Property::TopicAliasMaximum(server_max));
+            .push(mqtt_codec::Property::ReceiveMaximum(SERVER_RECEIVE_MAXIMUM));
+    }
+    if server_alias_max > 0 {
+        props
+            .0
+            .push(mqtt_codec::Property::TopicAliasMaximum(server_alias_max));
     }
     (
         props,
-        InboundAliases::new(server_max),
-        OutboundAliases::new(client_max),
+        InboundAliases::new(server_alias_max),
+        OutboundAliases::new(client_alias_max),
     )
 }
 
@@ -919,7 +945,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_stream, ConnPolicy, SERVER_TOPIC_ALIAS_MAX};
+    use super::{handle_stream, ConnPolicy, SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAX};
     use crate::hub::{HubCommand, Outbound};
     use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
@@ -1067,6 +1093,34 @@ mod tests {
                     let _ = reply.send(false);
                     if let Some(s) = sender.take() {
                         let _ = s.send(outbound.clone());
+                    }
+                    keep_alive.push(outbound);
+                }
+            }
+        });
+        rx
+    }
+
+    /// Hub stub that answers Attach and reports the Receive Maximum it carried, so a
+    /// test can assert the connection translated the CONNECT property correctly.
+    fn stub_hub_capture_receive_maximum(
+        mut hub_rx: mpsc::UnboundedReceiver<HubCommand>,
+    ) -> oneshot::Receiver<u16> {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut sender = Some(tx);
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                if let HubCommand::Attach {
+                    outbound,
+                    reply,
+                    receive_maximum,
+                    ..
+                } = cmd
+                {
+                    let _ = reply.send(false);
+                    if let Some(s) = sender.take() {
+                        let _ = s.send(receive_maximum);
                     }
                     keep_alive.push(outbound);
                 }
@@ -1453,6 +1507,49 @@ mod tests {
             }
             other => panic!("expected PUBLISH, got {other:?}"),
         }
+    }
+
+    /// The v5 CONNACK advertises the server's Receive Maximum, and the client's
+    /// CONNECT Receive Maximum is forwarded to the hub as the outbound quota (ADR 0012).
+    #[tokio::test]
+    async fn v5_receive_maximum_is_advertised_and_forwarded() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let rx_max = stub_hub_capture_receive_maximum(hub_rx);
+        writer
+            .send(&connect_v5("c", vec![Property::ReceiveMaximum(7)]))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => assert_eq!(
+                a.properties.receive_maximum(),
+                Some(SERVER_RECEIVE_MAXIMUM),
+                "CONNACK advertises our inbound Receive Maximum"
+            ),
+            other => panic!("expected CONNACK, got {other:?}"),
+        }
+        let forwarded = timeout(Duration::from_millis(500), rx_max)
+            .await
+            .expect("attach")
+            .expect("receive maximum");
+        assert_eq!(
+            forwarded, 7,
+            "the client's Receive Maximum drives the outbound quota"
+        );
+    }
+
+    /// A v3.1.1 connection has no Receive Maximum property, so the hub gets the
+    /// unlimited default.
+    #[tokio::test]
+    async fn v311_receive_maximum_defaults_to_unlimited() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let rx_max = stub_hub_capture_receive_maximum(hub_rx);
+        writer.send(&connect_packet("c", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        let forwarded = timeout(Duration::from_millis(500), rx_max)
+            .await
+            .expect("attach")
+            .expect("receive maximum");
+        assert_eq!(forwarded, u16::MAX, "v3.1.1 imposes no outbound quota");
     }
 
     #[tokio::test]

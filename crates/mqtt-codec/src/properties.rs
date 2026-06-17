@@ -239,6 +239,16 @@ impl Properties {
         })
     }
 
+    /// The Receive Maximum (`0x21`) — concurrent unacked `QoS` > 0 the sender will
+    /// accept — if present (MQTT 5.0).
+    #[must_use]
+    pub fn receive_maximum(&self) -> Option<u16> {
+        self.0.iter().find_map(|p| match p {
+            Property::ReceiveMaximum(v) => Some(*v),
+            _ => None,
+        })
+    }
+
     /// The Topic Alias Maximum (`0x22`) the sender will accept, if present (MQTT 5.0).
     #[must_use]
     pub fn topic_alias_maximum(&self) -> Option<u16> {

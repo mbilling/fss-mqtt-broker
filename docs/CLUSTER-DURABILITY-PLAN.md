@@ -46,7 +46,7 @@ shared subscriptions.
 | D | Consensus / replication decision ([ADR 0006](adr/0006-consensus-and-replication.md)) | ✅ Done |
 | E | Replicated session-log backend | ✅ **Done** — durable, consensus-backed store, proven over a real 3-node cluster, shippable behind `MQTTD_DURABLE_SESSIONS` |
 | F | Takeover / handoff protocol | ✅ Done — **F-a–F-d** (recovery mechanism + recovery-read RPC + rebuild on takeover + owner-death integration test) |
-| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); **topic aliases** done (ADR 0011); flow control, durable expiry deadline (0009 phase 3) remain |
+| G | MQTT 5 expiry & shared subscriptions | 🔶 In progress — v5 codec done (ADR 0008); **session expiry** done (ADR 0009 phase 1); **message expiry** done (ADR 0009 phase 2); **shared subscriptions** done (ADR 0010); **topic aliases** done (ADR 0011); **flow control** done (ADR 0012); enhanced auth, durable expiry deadline (0009 phase 3) remain |
 
 ### A — Bounded queues & overload policy  ✅ *(done)*
 
@@ -346,7 +346,13 @@ for completeness and sequencing.
   up to the client's maximum. Carried limitations: no outbound LRU eviction, and
   an invalid alias closes the connection rather than sending DISCONNECT `0x94`
   (pending the v5 reason-code work).
-- **Flow control** (Receive Maximum) and the **durable expiry deadline**
+- **Flow control** (Receive Maximum) — done (ADR 0012): the hub honours a client's
+  advertised quota by holding QoS > 0 deliveries past the limit in a per-session
+  backlog and draining it as PUBACK/PUBCOMP free slots; a persistent session's
+  backlog spills to the durable queue on detach. The server advertises its inbound
+  Receive Maximum but does not yet strictly enforce it (it acks promptly), and the
+  backlog is unbounded in memory while online — both carried limitations.
+- **Enhanced authentication** (AUTH exchange) and the **durable expiry deadline**
   (ADR 0009 phase 3) remain.
 
 ## Sequencing

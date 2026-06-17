@@ -41,7 +41,7 @@ use mqtt_core::{
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -50,6 +50,10 @@ use tracing::{debug, info, warn};
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
+
+/// Default outbound Receive Maximum when the client advertised none — effectively
+/// unlimited (ADR 0012). v3.1.1 sessions always use this.
+const RECEIVE_MAXIMUM_DEFAULT: u16 = u16::MAX;
 
 /// How often the hub sweeps for sessions whose MQTT 5.0 Session Expiry Interval has
 /// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
@@ -97,12 +101,37 @@ struct PendingOut {
     state: OutState,
 }
 
+/// A `QoS` > 0 message held back because the session's Receive Maximum quota is full
+/// (ADR 0012). It has no packet id yet — one is assigned when it is finally sent.
+#[derive(Debug)]
+struct Backlog {
+    message: Message,
+    retain: bool,
+    message_expiry: Option<u32>,
+}
+
 /// Per-session outbound `QoS` bookkeeping. Survives disconnects so persistent
 /// sessions can resume their in-flight messages (redelivered with `DUP`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inflight {
     next_pkid: u16,
     pending: BTreeMap<u16, PendingOut>,
+    /// The client's MQTT 5.0 Receive Maximum: the most `QoS` > 0 publishes we may
+    /// have unacked to it at once (ADR 0012).
+    receive_maximum: u16,
+    /// `QoS` > 0 messages waiting for quota; drained FIFO as PUBACK/PUBCOMP frees slots.
+    backlog: VecDeque<Backlog>,
+}
+
+impl Default for Inflight {
+    fn default() -> Self {
+        Self {
+            next_pkid: 0,
+            pending: BTreeMap::new(),
+            receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
+            backlog: VecDeque::new(),
+        }
+    }
 }
 
 impl Inflight {
@@ -117,6 +146,11 @@ impl Inflight {
                 return self.next_pkid;
             }
         }
+    }
+
+    /// Whether the `QoS` > 0 in-flight quota is exhausted (ADR 0012).
+    fn quota_full(&self) -> bool {
+        self.pending.len() >= self.receive_maximum as usize
     }
 }
 
@@ -136,6 +170,9 @@ pub enum HubCommand {
         /// MQTT 5.0 Session Expiry Interval (seconds) — how long to keep the session
         /// after disconnect; `0` discards at disconnect, `u32::MAX` never expires.
         session_expiry: u32,
+        /// MQTT 5.0 Receive Maximum: the most unacked `QoS` > 0 publishes the server
+        /// may have outstanding to this client at once (ADR 0012).
+        receive_maximum: u16,
         /// Will message to publish if the connection ends ungracefully.
         will: Option<Message>,
         /// Channel the hub uses to deliver packets to this client.
@@ -401,6 +438,7 @@ impl Hub {
                 conn_id,
                 clean_start,
                 session_expiry,
+                receive_maximum,
                 will,
                 outbound,
                 reply,
@@ -410,6 +448,7 @@ impl Hub {
                     conn_id,
                     clean_start,
                     session_expiry,
+                    receive_maximum,
                     will,
                     outbound,
                     reply,
@@ -534,6 +573,7 @@ impl Hub {
         conn_id: u64,
         clean_start: bool,
         session_expiry: u32,
+        receive_maximum: u16,
         will: Option<Message>,
         outbound: Outbound,
         reply: oneshot::Sender<bool>,
@@ -575,6 +615,13 @@ impl Hub {
         } else {
             self.session_expiry.insert(client.clone(), session_expiry);
         }
+
+        // Adopt this connection's outbound Receive Maximum quota (ADR 0012). A
+        // reconnect may carry a different value than the prior one.
+        self.inflight
+            .entry(client.clone())
+            .or_default()
+            .receive_maximum = receive_maximum;
 
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
@@ -821,44 +868,108 @@ impl Hub {
                     message_expiry,
                 ));
             }
-            qos => {
-                let inf = self.inflight.entry(client.clone()).or_default();
-                let pkid = inf.alloc_pkid();
-                let state = if qos == QoS::AtLeastOnce {
-                    OutState::AwaitingPubAck
+            _ => {
+                // QoS > 0: respect the client's Receive Maximum (ADR 0012). If the
+                // quota is full, hold the message in the backlog; a PUBACK/PUBCOMP
+                // will drain it later. Otherwise send it now.
+                if self
+                    .inflight
+                    .entry(client.clone())
+                    .or_default()
+                    .quota_full()
+                {
+                    self.inflight
+                        .entry(client.clone())
+                        .or_default()
+                        .backlog
+                        .push_back(Backlog {
+                            message: message.clone(),
+                            retain,
+                            message_expiry,
+                        });
                 } else {
-                    OutState::AwaitingPubRec
-                };
-                inf.pending.insert(
-                    pkid,
-                    PendingOut {
-                        message: message.clone(),
-                        state,
-                    },
-                );
-                let _ = tx.send(publish_packet(
-                    &message.topic,
-                    message.payload.clone(),
-                    qos,
-                    Some(pkid),
-                    false,
-                    retain,
-                    message_expiry,
-                ));
+                    self.send_qos_publish(client, tx, message, retain, message_expiry);
+                }
             }
         }
     }
 
-    /// PUBACK: completes a `QoS` 1 delivery.
+    /// Put one `QoS` > 0 message on the wire: allocate a packet id, register it in the
+    /// in-flight table, and send. The caller has already confirmed quota is available
+    /// (ADR 0012).
+    fn send_qos_publish(
+        &mut self,
+        client: &ClientId,
+        tx: &Outbound,
+        message: &Message,
+        retain: bool,
+        message_expiry: Option<u32>,
+    ) {
+        let inf = self.inflight.entry(client.clone()).or_default();
+        let pkid = inf.alloc_pkid();
+        let state = if message.qos == QoS::AtLeastOnce {
+            OutState::AwaitingPubAck
+        } else {
+            OutState::AwaitingPubRec
+        };
+        inf.pending.insert(
+            pkid,
+            PendingOut {
+                message: message.clone(),
+                state,
+            },
+        );
+        let _ = tx.send(publish_packet(
+            &message.topic,
+            message.payload.clone(),
+            message.qos,
+            Some(pkid),
+            false,
+            retain,
+            message_expiry,
+        ));
+    }
+
+    /// Drain backlogged `QoS` > 0 messages onto the wire while the client is online and
+    /// quota is available (ADR 0012). Called after a PUBACK/PUBCOMP frees a slot.
+    fn drain_backlog(&mut self, client: &ClientId) {
+        let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) else {
+            return;
+        };
+        loop {
+            let inf = self.inflight.entry(client.clone()).or_default();
+            if inf.quota_full() {
+                break;
+            }
+            let Some(entry) = inf.backlog.pop_front() else {
+                break;
+            };
+            self.send_qos_publish(
+                client,
+                &tx,
+                &entry.message,
+                entry.retain,
+                entry.message_expiry,
+            );
+        }
+    }
+
+    /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012).
     fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
-        if let Some(inf) = self.inflight.get_mut(client) {
+        let completed = self.inflight.get_mut(client).is_some_and(|inf| {
             if inf
                 .pending
                 .get(&pkid)
                 .is_some_and(|p| p.state == OutState::AwaitingPubAck)
             {
                 inf.pending.remove(&pkid);
+                true
+            } else {
+                false
             }
+        });
+        if completed {
+            self.drain_backlog(client);
         }
     }
 
@@ -881,16 +992,22 @@ impl Hub {
         }
     }
 
-    /// PUBCOMP: completes a `QoS` 2 delivery.
+    /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012).
     fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
-        if let Some(inf) = self.inflight.get_mut(client) {
+        let completed = self.inflight.get_mut(client).is_some_and(|inf| {
             if inf
                 .pending
                 .get(&pkid)
                 .is_some_and(|p| p.state == OutState::AwaitingPubComp)
             {
                 inf.pending.remove(&pkid);
+                true
+            } else {
+                false
             }
+        });
+        if completed {
+            self.drain_backlog(client);
         }
     }
 
@@ -920,12 +1037,36 @@ impl Hub {
                 self.gossip_interest();
             }
             Some(SESSION_EXPIRY_NEVER) => {
+                self.flush_backlog_to_store(client).await;
                 info!(client = %client.0, "client detached (session retained)");
             }
             Some(secs) => {
+                self.flush_backlog_to_store(client).await;
                 let deadline = Instant::now() + Duration::from_secs(u64::from(secs));
                 self.expiring.insert(client.clone(), deadline);
                 info!(client = %client.0, expires_in_s = secs, "client detached (session expiring)");
+            }
+        }
+    }
+
+    /// Spill a persistent session's never-sent backlog (`QoS` > 0 messages held for
+    /// quota, ADR 0012) into the durable offline queue so they replay on reconnect
+    /// rather than being lost when the connection ends. Already-sent in-flight
+    /// entries keep their DUP-redelivery behaviour and are left untouched.
+    async fn flush_backlog_to_store(&mut self, client: &ClientId) {
+        let backlog: Vec<Backlog> = match self.inflight.get_mut(client) {
+            Some(inf) if !inf.backlog.is_empty() => inf.backlog.drain(..).collect(),
+            _ => return,
+        };
+        let now = now_epoch_secs();
+        for entry in backlog {
+            let expiry_at = entry.message_expiry.map(|s| now + u64::from(s));
+            if let Err(e) = self
+                .store
+                .enqueue_with_expiry(client, &entry.message, expiry_at)
+                .await
+            {
+                warn!(client = %client.0, error = %e, "failed to spill backlog to store");
             }
         }
     }
@@ -1171,13 +1312,26 @@ mod tests {
         attach_v5(tx, client, conn_id, clean_session, expiry).await
     }
 
-    /// Attach with explicit MQTT 5.0 `(clean_start, session_expiry)`.
+    /// Attach with explicit MQTT 5.0 `(clean_start, session_expiry)` and no outbound
+    /// quota limit (the common case).
     async fn attach_v5(
         tx: &HubTx,
         client: &str,
         conn_id: u64,
         clean_start: bool,
         session_expiry: u32,
+    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+        attach_full(tx, client, conn_id, clean_start, session_expiry, u16::MAX).await
+    }
+
+    /// Attach with an explicit Receive Maximum quota (ADR 0012), for flow-control tests.
+    async fn attach_full(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+        clean_start: bool,
+        session_expiry: u32,
+        receive_maximum: u16,
     ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
         let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1186,6 +1340,7 @@ mod tests {
             conn_id,
             clean_start,
             session_expiry,
+            receive_maximum,
             will: None,
             outbound: out_tx,
             reply: reply_tx,
@@ -1230,6 +1385,40 @@ mod tests {
             message_expiry,
         })
         .unwrap();
+    }
+
+    fn subscribe_qos(tx: &HubTx, client: &str, filter: &str, qos: QoS) {
+        tx.send(HubCommand::Subscribe {
+            client: ClientId(client.into()),
+            filters: vec![(filter.into(), qos)],
+        })
+        .unwrap();
+    }
+
+    fn publish_qos1(tx: &HubTx, topic: &str, payload: &'static [u8]) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+        })
+        .unwrap();
+    }
+
+    fn pub_ack(tx: &HubTx, client: &str, pkid: u16) {
+        tx.send(HubCommand::PubAck {
+            client: ClientId(client.into()),
+            pkid,
+        })
+        .unwrap();
+    }
+
+    fn pkid_of(packet: &Packet) -> u16 {
+        match packet {
+            Packet::Publish(p) => p.pkid.expect("a QoS > 0 publish carries a packet id"),
+            other => panic!("expected a publish, got {other:?}"),
+        }
     }
 
     fn connect_peer(tx: &HubTx, node: &str, conn_id: u64) -> mpsc::UnboundedReceiver<PeerMessage> {
@@ -1439,6 +1628,71 @@ mod tests {
         assert!(
             remaining > 0 && remaining <= 3600,
             "remaining interval within bounds: {remaining}"
+        );
+    }
+
+    /// Receive Maximum bounds in-flight `QoS` > 0 deliveries: with a quota of 1, the
+    /// second message waits until the first is acked, then drains (ADR 0012).
+    #[tokio::test]
+    async fn receive_maximum_holds_excess_until_acked() {
+        let tx = start_hub();
+        let (mut rx, _) = attach_full(&tx, "c", 1, true, 0, 1).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "t", b"m1");
+        publish_qos1(&tx, "t", b"m2");
+
+        let p1 = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&p1), b"m1");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the second publish is held until the quota frees"
+        );
+
+        pub_ack(&tx, "c", pkid_of(&p1));
+        let p2 = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&p2), b"m2", "acking drains the backlog");
+    }
+
+    /// `QoS` 0 is never throttled by Receive Maximum, even with the `QoS` > 0 quota full.
+    #[tokio::test]
+    async fn qos0_is_not_subject_to_receive_maximum() {
+        let tx = start_hub();
+        let (mut rx, _) = attach_full(&tx, "c", 1, true, 0, 1).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "t", b"q1"); // fills the quota of 1
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"q1");
+
+        publish(&tx, "t", b"zero"); // QoS 0 — flows despite the full quota
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"zero");
+    }
+
+    /// A persistent session's never-sent backlog spills to the durable queue on
+    /// detach and replays on reconnect, after the DUP-redelivered in-flight (ADR 0012).
+    #[tokio::test]
+    async fn quota_backlog_spills_to_store_on_persistent_detach() {
+        let tx = start_hub();
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 1).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        publish_qos1(&tx, "t", b"m1");
+        publish_qos1(&tx, "t", b"m2"); // backlogged behind the quota
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"m1");
+
+        // Disconnect without acking m1: m1 stays in-flight, m2 spills to the store.
+        detach(&tx, "c", 1);
+
+        let (mut rx2, present) = attach_full(&tx, "c", 2, false, u32::MAX, 8).await;
+        assert!(present);
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx2).await.unwrap()),
+            b"m1",
+            "DUP resume first"
+        );
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx2).await.unwrap()),
+            b"m2",
+            "then the spilled backlog"
         );
     }
 
