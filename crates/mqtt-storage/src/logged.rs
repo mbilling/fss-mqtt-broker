@@ -154,10 +154,11 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             .unwrap_or_default())
     }
 
-    async fn enqueue(
+    async fn enqueue_with_expiry(
         &self,
         client: &ClientId,
         message: &Message,
+        expiry_at: Option<u64>,
     ) -> Result<Enqueued, StorageError> {
         let qkey = Self::queue_key(client);
         let cap = self.limits.max_messages.max(1);
@@ -185,7 +186,10 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             }
         }
 
-        let offset = self.log.append(&qkey, encode_message(message)).await?;
+        let offset = self
+            .log
+            .append(&qkey, encode_queued(message, expiry_at))
+            .await?;
         Ok(Enqueued::Stored { offset, evicted })
     }
 
@@ -198,9 +202,11 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         let qkey = Self::queue_key(client);
         let mut out = Vec::new();
         for entry in self.log.read(&qkey, after, limit).await? {
+            let (message, expiry_at) = decode_queued(&entry.record)?;
             out.push(QueuedMessage {
                 offset: entry.offset,
-                message: decode_message(&entry.record)?,
+                message,
+                expiry_at,
             });
         }
         Ok(out)
@@ -311,6 +317,20 @@ fn encode_message(m: &Message) -> Vec<u8> {
     out
 }
 
+/// Encode a queue entry: the message followed by its optional absolute expiry
+/// deadline (a presence flag, then a `u64` of Unix epoch seconds when present).
+fn encode_queued(m: &Message, expiry_at: Option<u64>) -> Vec<u8> {
+    let mut out = encode_message(m);
+    match expiry_at {
+        Some(deadline) => {
+            out.push(1);
+            out.extend_from_slice(&deadline.to_be_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
 fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
     let mut out = Vec::new();
     let n = u32::try_from(m.subscriptions.len()).unwrap_or(u32::MAX);
@@ -366,6 +386,11 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    fn u64(&mut self) -> Result<u64, StorageError> {
+        let b: [u8; 8] = self.take(8)?.try_into().map_err(|_| corrupt())?;
+        Ok(u64::from_be_bytes(b))
+    }
+
     fn bytes(&mut self) -> Result<&'a [u8], StorageError> {
         let len = self.u32()? as usize;
         self.take(len)
@@ -387,18 +412,22 @@ fn qos_from_u8(v: u8) -> Result<QoS, StorageError> {
     QoS::from_u8(v).ok_or_else(corrupt)
 }
 
-fn decode_message(buf: &[u8]) -> Result<Message, StorageError> {
+fn decode_queued(buf: &[u8]) -> Result<(Message, Option<u64>), StorageError> {
     let mut r = Reader::new(buf);
     let topic = r.string()?;
     let payload = bytes::Bytes::copy_from_slice(r.bytes()?);
     let qos = qos_from_u8(r.u8()?)?;
     let retain = r.u8()? != 0;
-    Ok(Message {
-        topic,
-        payload,
-        qos,
-        retain,
-    })
+    let expiry_at = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+    Ok((
+        Message {
+            topic,
+            payload,
+            qos,
+            retain,
+        },
+        expiry_at,
+    ))
 }
 
 fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
@@ -526,9 +555,30 @@ mod tests {
         assert_eq!(&all[1].message.payload[..], b"11");
         assert_eq!(all[1].message.qos, QoS::ExactlyOnce);
 
+        // The expiry deadline (absent here) round-trips as None.
+        assert_eq!(all[0].expiry_at, None);
+        assert_eq!(all[1].expiry_at, None);
+
         // `after` cursor and `limit` both honored.
         assert_eq!(s.pending(&c, o1, 100).await.unwrap().len(), 1);
         assert_eq!(s.pending(&c, 0, 1).await.unwrap().len(), 1);
+    }
+
+    /// An absolute expiry deadline survives the encode/decode round-trip
+    /// alongside the message (ADR 0009 §3).
+    #[tokio::test]
+    async fn enqueue_with_expiry_round_trips_the_deadline() {
+        let s = store();
+        let c = cid("c");
+        s.enqueue_with_expiry(&c, &msg("a", b"0", QoS::AtLeastOnce), Some(1_700_000_000))
+            .await
+            .unwrap();
+        s.enqueue_with_expiry(&c, &msg("b", b"1", QoS::AtLeastOnce), None)
+            .await
+            .unwrap();
+        let all = s.pending(&c, 0, 100).await.unwrap();
+        assert_eq!(all[0].expiry_at, Some(1_700_000_000));
+        assert_eq!(all[1].expiry_at, None);
     }
 
     #[tokio::test]

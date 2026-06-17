@@ -45,6 +45,10 @@ pub struct QueuedMessage {
     pub offset: Offset,
     /// The message payload and metadata.
     pub message: Message,
+    /// Absolute expiry deadline in Unix epoch seconds (MQTT 5.0 Message Expiry
+    /// Interval), or `None` for no expiry. A message past its deadline is dropped on
+    /// replay rather than delivered (ADR 0009 §3).
+    pub expiry_at: Option<u64>,
 }
 
 /// What a session's offline queue does when it is full (ADR 0001 §6 — a
@@ -124,14 +128,30 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// Load a client's stored subscriptions (empty if none / no session).
     async fn subscriptions(&self, client: &ClientId) -> Result<Vec<Subscription>, StorageError>;
 
-    /// Append a message to the client's offline queue.
+    /// Append a message to the client's offline queue with no expiry. Convenience
+    /// over [`enqueue_with_expiry`](Self::enqueue_with_expiry).
+    async fn enqueue(
+        &self,
+        client: &ClientId,
+        message: &Message,
+    ) -> Result<Enqueued, StorageError> {
+        self.enqueue_with_expiry(client, message, None).await
+    }
+
+    /// Append a message with an optional absolute expiry deadline (Unix epoch
+    /// seconds — the MQTT 5.0 Message Expiry Interval applied to receipt time).
     ///
     /// This is the **durability-critical** write. A clustered backend
     /// quorum-replicates before returning; the producer's QoS≥1 PUBACK should be
     /// gated on it. The returned [`Enqueued`] reports whether the per-session
-    /// queue cap evicted older messages or rejected this one (ADR 0001 §6).
-    async fn enqueue(&self, client: &ClientId, message: &Message)
-        -> Result<Enqueued, StorageError>;
+    /// queue cap evicted older messages or rejected this one (ADR 0001 §6). A
+    /// message past its deadline is dropped on replay, not delivered (ADR 0009 §3).
+    async fn enqueue_with_expiry(
+        &self,
+        client: &ClientId,
+        message: &Message,
+        expiry_at: Option<u64>,
+    ) -> Result<Enqueued, StorageError>;
 
     /// Replay undelivered messages with offset strictly greater than `after`, up
     /// to `limit` items, in offset order. Used on reconnect / takeover.
@@ -269,10 +289,11 @@ impl SessionStore for MemorySessionStore {
             .unwrap_or_default())
     }
 
-    async fn enqueue(
+    async fn enqueue_with_expiry(
         &self,
         client: &ClientId,
         message: &Message,
+        expiry_at: Option<u64>,
     ) -> Result<Enqueued, StorageError> {
         let cap = self.limits.max_messages.max(1);
         let mut map = self.lock();
@@ -301,6 +322,7 @@ impl SessionStore for MemorySessionStore {
         entry.queue.push_back(QueuedMessage {
             offset,
             message: message.clone(),
+            expiry_at,
         });
         Ok(Enqueued::Stored { offset, evicted })
     }

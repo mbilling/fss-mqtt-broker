@@ -165,6 +165,9 @@ pub enum HubCommand {
         qos: QoS,
         /// Whether to store the message as the topic's retained message.
         retain: bool,
+        /// MQTT 5.0 Message Expiry Interval in seconds, if the publisher set one.
+        /// A queued copy past its deadline is dropped on replay (ADR 0009 §3).
+        message_expiry: Option<u32>,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -418,8 +421,10 @@ impl Hub {
                 payload,
                 qos,
                 retain,
+                message_expiry,
             } => {
-                self.publish(&topic, &payload, qos, retain).await;
+                self.publish(&topic, &payload, qos, retain, message_expiry)
+                    .await;
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
@@ -429,8 +434,10 @@ impl Hub {
                 payload,
                 qos,
             } => {
-                // Forwarded from a peer: local delivery only (no re-forward).
-                self.deliver_local(&topic, &payload, qos).await;
+                // Forwarded from a peer: local delivery only (no re-forward). The
+                // peer link does not yet carry the message-expiry interval, so a
+                // cross-node delivery has no deadline (carried limitation).
+                self.deliver_local(&topic, &payload, qos, None).await;
             }
             HubCommand::Detach {
                 client,
@@ -466,7 +473,14 @@ impl Hub {
 
     /// Publish an application message: store/clear retained state, deliver to
     /// local subscribers, and forward to interested peers.
-    async fn publish(&mut self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) {
+    async fn publish(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        retain: bool,
+        message_expiry: Option<u32>,
+    ) {
         if retain {
             // A zero-length retained payload clears the retained message
             // [MQTT-3.3.1-10]; `RetainedStore::set` implements both cases.
@@ -481,7 +495,8 @@ impl Hub {
             }
         }
         // Live deliveries carry retain=0 [MQTT-3.3.1-9].
-        self.deliver_local(topic, payload, qos).await;
+        self.deliver_local(topic, payload, qos, message_expiry)
+            .await;
         self.forward_to_peers(topic, payload, qos, retain);
     }
 
@@ -554,7 +569,8 @@ impl Hub {
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             if let Some(w) = old.will {
-                self.publish(&w.topic, &w.payload, w.qos, w.retain).await;
+                self.publish(&w.topic, &w.payload, w.qos, w.retain, None)
+                    .await;
             }
         }
         self.online.insert(
@@ -582,6 +598,7 @@ impl Hub {
                         Some(*pkid),
                         true,
                         false,
+                        None,
                     ),
                     OutState::AwaitingPubComp => Packet::PubRel((*pkid).into()),
                 };
@@ -589,13 +606,31 @@ impl Hub {
             }
         }
 
-        // Replay queued messages (they land in the channel after CONNACK).
+        // Replay queued messages (they land in the channel after CONNACK). A message
+        // whose MQTT 5.0 expiry deadline has passed is dropped, not delivered, and the
+        // remaining interval is forwarded on the rest (ADR 0009 §3).
         if !clean_start {
             if let Ok(pending) = self.store.pending(&client, 0, REPLAY_LIMIT).await {
+                let now = now_epoch_secs();
                 let mut last = 0;
                 for qm in pending {
-                    self.send_to_client(&client, &outbound, &qm.message, false);
                     last = qm.offset;
+                    match qm.expiry_at {
+                        Some(deadline) if deadline <= now => {
+                            debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
+                        }
+                        Some(deadline) => {
+                            let remaining = u32::try_from(deadline - now).unwrap_or(u32::MAX);
+                            self.send_to_client(
+                                &client,
+                                &outbound,
+                                &qm.message,
+                                false,
+                                Some(remaining),
+                            );
+                        }
+                        None => self.send_to_client(&client, &outbound, &qm.message, false, None),
+                    }
                 }
                 if last > 0 {
                     debug!(client = %client.0, up_to = last, "replayed queued messages");
@@ -633,7 +668,7 @@ impl Hub {
         }
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             for m in replay {
-                self.send_to_client(client, &tx, &m, true);
+                self.send_to_client(client, &tx, &m, true, None);
             }
         }
     }
@@ -664,7 +699,17 @@ impl Hub {
     /// Deliver a message to this node's local subscribers at
     /// `min(qos, granted)` each: online clients get it live (with `QoS` > 0
     /// tracked in flight), offline persistent sessions have it queued.
-    async fn deliver_local(&mut self, topic: &str, payload: &Bytes, qos: QoS) {
+    async fn deliver_local(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+    ) {
+        // The absolute deadline for a queued copy (ADR 0009 §3): receipt time plus
+        // the interval. Online deliveries leave the wire immediately, so they carry
+        // the full interval; queued copies carry the absolute deadline.
+        let expiry_at = message_expiry.map(|secs| now_epoch_secs() + u64::from(secs));
         let targets: Vec<ClientId> = self.table.matching_clients(topic).into_iter().collect();
         debug!(topic = %topic, local_subscribers = targets.len(), "local delivery");
         for c in targets {
@@ -675,13 +720,17 @@ impl Hub {
                 retain: false,
             };
             if let Some(tx) = self.online.get(&c).map(|s| s.tx.clone()) {
-                self.send_to_client(&c, &tx, &message, false);
+                self.send_to_client(&c, &tx, &message, false, message_expiry);
             } else if self.is_persistent(&c) {
                 // Offline but persistent: queue for replay on reconnect. The
                 // queue is bounded (ADR 0001 §6); log when the cap drops
                 // messages — a metrics counter is the proper operator signal
                 // and arrives with the observability phase.
-                match self.store.enqueue(&c, &message).await {
+                match self
+                    .store
+                    .enqueue_with_expiry(&c, &message, expiry_at)
+                    .await
+                {
                     Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
                         warn!(client = %c.0, evicted, topic = %topic,
                               "offline queue full: evicted oldest message(s)");
@@ -700,13 +749,15 @@ impl Hub {
     }
 
     /// Send one message to an online client at its (already downgraded) `QoS`,
-    /// registering `QoS` > 0 deliveries in the in-flight table.
+    /// registering `QoS` > 0 deliveries in the in-flight table. `message_expiry` is
+    /// the MQTT 5.0 Message Expiry Interval to forward (the remaining seconds), if any.
     fn send_to_client(
         &mut self,
         client: &ClientId,
         tx: &Outbound,
         message: &Message,
         retain: bool,
+        message_expiry: Option<u32>,
     ) {
         match message.qos {
             QoS::AtMostOnce => {
@@ -719,6 +770,7 @@ impl Hub {
                     None,
                     false,
                     retain,
+                    message_expiry,
                 ));
             }
             qos => {
@@ -743,6 +795,7 @@ impl Hub {
                     Some(pkid),
                     false,
                     retain,
+                    message_expiry,
                 ));
             }
         }
@@ -805,7 +858,8 @@ impl Hub {
         if !graceful {
             if let Some(w) = departed.and_then(|o| o.will) {
                 info!(client = %client.0, topic = %w.topic, "publishing will (ungraceful disconnect)");
-                self.publish(&w.topic, &w.payload, w.qos, w.retain).await;
+                self.publish(&w.topic, &w.payload, w.qos, w.retain, None)
+                    .await;
             }
         }
         // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
@@ -983,6 +1037,7 @@ impl Hub {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // a thin PUBLISH constructor; all fields are the wire packet's
 fn publish_packet(
     topic: &str,
     payload: Bytes,
@@ -990,9 +1045,16 @@ fn publish_packet(
     pkid: Option<u16>,
     dup: bool,
     retain: bool,
+    message_expiry: Option<u32>,
 ) -> Packet {
+    let mut properties = mqtt_codec::Properties::new();
+    if let Some(secs) = message_expiry {
+        properties
+            .0
+            .push(mqtt_codec::Property::MessageExpiryInterval(secs));
+    }
     Packet::Publish(Publish {
-        properties: mqtt_codec::Properties::new(),
+        properties,
         dup,
         qos,
         retain,
@@ -1000,6 +1062,13 @@ fn publish_packet(
         pkid,
         payload,
     })
+}
+
+/// The current time in Unix epoch seconds (for absolute message-expiry deadlines).
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -1082,11 +1151,21 @@ mod tests {
     }
 
     fn publish(tx: &HubTx, topic: &str, payload: &'static [u8]) {
+        publish_with_expiry(tx, topic, payload, None);
+    }
+
+    fn publish_with_expiry(
+        tx: &HubTx,
+        topic: &str,
+        payload: &'static [u8],
+        message_expiry: Option<u32>,
+    ) {
         tx.send(HubCommand::Publish {
             topic: topic.into(),
             payload: Bytes::from_static(payload),
             qos: QoS::AtMostOnce,
             retain: false,
+            message_expiry,
         })
         .unwrap();
     }
@@ -1121,6 +1200,13 @@ mod tests {
     fn payload_of(packet: &Packet) -> &[u8] {
         match packet {
             Packet::Publish(p) => &p.payload,
+            other => panic!("expected a publish, got {other:?}"),
+        }
+    }
+
+    fn message_expiry_of(packet: &Packet) -> Option<u32> {
+        match packet {
+            Packet::Publish(p) => p.properties.message_expiry_interval(),
             other => panic!("expected a publish, got {other:?}"),
         }
     }
@@ -1233,6 +1319,65 @@ mod tests {
         let (mut rx, present) = attach(&tx, "c", 4, true).await;
         assert!(!present);
         assert!(recv_packet(&mut rx).await.is_none());
+    }
+
+    /// A message published with an MQTT 5.0 expiry interval carries that
+    /// interval to an online subscriber (ADR 0009 §3).
+    #[tokio::test]
+    async fn live_delivery_carries_message_expiry_interval() {
+        let tx = start_hub();
+        let (mut rx, _) = attach(&tx, "s", 1, true).await;
+        subscribe(&tx, "s", "t");
+        publish_with_expiry(&tx, "t", b"hi", Some(120));
+        let pkt = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&pkt), b"hi");
+        assert_eq!(message_expiry_of(&pkt), Some(120));
+    }
+
+    /// A queued message whose expiry deadline has passed is dropped at replay,
+    /// not delivered (ADR 0009 §3). A 0-second interval expires the instant the
+    /// message is received, so it is always stale by the time the session
+    /// reconnects; the still-fresh message behind it replays normally.
+    #[tokio::test]
+    async fn expired_queued_message_is_dropped_at_replay() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+        publish_with_expiry(&tx, "t", b"stale", Some(0));
+        publish_with_expiry(&tx, "t", b"fresh", Some(3600));
+
+        let (mut rx, _) = attach(&tx, "p", 2, false).await;
+        let pkt = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(
+            payload_of(&pkt),
+            b"fresh",
+            "the expired message must be skipped"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "only the still-fresh message replays"
+        );
+    }
+
+    /// A queued message with a live deadline replays with the *remaining*
+    /// interval, not the original one it was published with (ADR 0009 §3).
+    #[tokio::test]
+    async fn replayed_message_forwards_remaining_expiry_interval() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+        publish_with_expiry(&tx, "t", b"q", Some(3600));
+
+        let (mut rx, _) = attach(&tx, "p", 2, false).await;
+        let pkt = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&pkt), b"q");
+        let remaining = message_expiry_of(&pkt).expect("a forwarded expiry interval");
+        assert!(
+            remaining > 0 && remaining <= 3600,
+            "remaining interval within bounds: {remaining}"
+        );
     }
 
     /// Connecting with `clean_session=true` discards any prior persistent state

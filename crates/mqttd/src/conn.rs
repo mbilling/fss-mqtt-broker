@@ -682,6 +682,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
 ) -> Result<bool, NetError> {
+    // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
+    // a queued copy is deliverable (ADR 0009 §3).
+    let message_expiry = publish.properties.message_expiry_interval();
     let Publish {
         qos,
         pkid,
@@ -715,6 +718,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 payload,
                 qos,
                 retain,
+                message_expiry,
             });
         }
     };
