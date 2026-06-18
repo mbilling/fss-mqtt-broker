@@ -9,7 +9,16 @@
 //! three-node group quorum = the owner plus at least one follower — so a committed
 //! enqueue has, by definition, replicated to a peer and would survive the owner's
 //! loss. (Serving the session *after* the owner dies is takeover, workstream F.)
+//!
+//! These also check that a durable node serves ordinary MQTT clients through its hub
+//! (`a_durable_node_serves_a_client_pubsub`). **Known gap** (see `docs/TEST-PLAN.md`):
+//! a *persistent* client reconnecting to the **new owner after a takeover** does not
+//! get its CONNACK — the attach-path durable session op does not resolve in that
+//! post-takeover state, so client-observable failover is not yet wired end to end.
 
+mod common;
+
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -42,6 +51,9 @@ struct DurableNode {
     store: Arc<dyn SessionStore>,
     placement: Arc<RwLock<Placement>>,
     swim_addr: String,
+    /// This node's MQTT client listener address, for the client-observable failover
+    /// test (a reconnecting client served by the new owner).
+    client_addr: SocketAddr,
     /// A clone of this node's durable plane, kept only to observe lease-group
     /// readiness (`voter_count`) from the test.
     plane: mqtt_cluster::durable_plane::DurablePlane,
@@ -78,6 +90,23 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
         Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()));
     hub.attach_durable_plane(plane);
     let mut aborts = vec![tokio::spawn(hub.run()).abort_handle()];
+
+    // MQTT client listener (permissive, served by this node's hub). Clients connect
+    // here directly; for the failover test a client reconnects to the new owner.
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client_listener.local_addr().unwrap();
+    {
+        let tx = hub_tx.clone();
+        aborts.push(
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = client_listener.accept().await.unwrap();
+                    tokio::spawn(mqttd::conn::handle(stream, tx.clone()));
+                }
+            })
+            .abort_handle(),
+        );
+    }
 
     // Peer-link listener (plaintext mesh for the test); SWIM gossips its address.
     let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -131,6 +160,7 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
         store,
         placement,
         swim_addr,
+        client_addr,
         plane: plane_observer,
         aborts,
     }
@@ -194,6 +224,30 @@ async fn enqueue_is_durable_across_a_three_node_cluster() {
     let pending = owner_node.store.pending(&client, 0, 100).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(&pending[0].message.payload[..], b"survives");
+}
+
+/// A durable node must still serve ordinary MQTT clients through its hub: connect,
+/// subscribe, publish, deliver — proving the durable store's session operations in
+/// the attach/serve path complete (not just direct store reads).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_durable_node_serves_a_client_pubsub() {
+    let a = start_durable_node("solo-a", vec![]).await; // founder, bootstraps alone
+
+    // Clean-session client: a fresh subscribe + publish round-trip on the owner node.
+    let mut sub = common::Client::connect(a.client_addr, "dur-sub").await;
+    sub.subscribe(1, "t", QoS::AtMostOnce).await;
+    let mut pubr = common::Client::connect(a.client_addr, "dur-pub").await;
+    pubr.publish("t", b"served", QoS::AtMostOnce, None, vec![])
+        .await;
+
+    let p = sub.expect_publish().await;
+    assert_eq!(&p.payload[..], b"served");
+
+    // A persistent (clean_session=false) connect must also complete its CONNACK —
+    // the attach path's durable ensure_session/subscriptions reads have to resolve.
+    let (mut persistent, _present) =
+        common::Client::connect_v311(a.client_addr, "dur-persistent", false).await;
+    persistent.subscribe(2, "p", QoS::AtMostOnce).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

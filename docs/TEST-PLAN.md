@@ -119,10 +119,15 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ the real `mqttd` binary serves a plaintext pub/sub round-trip (`binary_smoke`)
 
 **Cluster chaos**:
-- ☑ replica serves session after owner dies (`durable_sessions`)
+- ☑ replica serves session after owner dies — quorum-durable message survives at the store layer (`durable_sessions`)
+- ☑ a durable node serves ordinary MQTT clients (clean + persistent) through its hub (`durable_sessions`)
 - ☑ partition + heal → routing reconverges (severed link, delivery resumes) (`cluster_chaos`)
-- ☐ owner dies mid-publish → in-flight not lost
-- ☐ session takeover across nodes (relocation) with messages in flight
+- 🔴 **Known gap:** client-observable durable failover — a *persistent* client
+  reconnecting to the **new owner after takeover** never gets its CONNACK; the
+  attach-path durable session op does not resolve in that post-takeover state. The
+  store-level recovery works (above); wiring the takeover → client-serving path is a
+  durable-plane follow-up, not a test gap.
+- ☐ session takeover across nodes (relocation) with messages in flight (blocked by the gap above)
 
 ## Conventions
 
