@@ -33,9 +33,26 @@ pub enum StorageError {
     /// The requested session does not exist.
     #[error("not found")]
     NotFound,
-    /// A backend-specific failure (I/O, replication quorum not reached, ...).
+    /// The backend cannot answer authoritatively *right now*, but the condition is
+    /// **transient and self-healing**: the ownership lease is being reassigned, or a
+    /// replication quorum is momentarily unreachable (ADR 0017). The caller must treat
+    /// this as "not ready, retry" — never as "no session" — because a real, recoverable
+    /// session may be on the other side of it. Distinct from [`Self::Backend`], which is
+    /// a terminal failure.
+    #[error("storage temporarily unavailable: {0}")]
+    Unavailable(String),
+    /// A backend-specific, **terminal** failure (I/O, serialization, engine error, ...).
     #[error("storage backend error: {0}")]
     Backend(String),
+}
+
+impl StorageError {
+    /// Whether this error is the transient, retry-able [`Self::Unavailable`] condition
+    /// (lease in flux / quorum momentarily unreachable) rather than a terminal failure.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
 }
 
 /// A queued message together with the offset it was assigned on `enqueue`.

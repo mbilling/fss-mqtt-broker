@@ -508,7 +508,8 @@ mod tests {
     }
 
     /// A session whose group this node does not own is refused (it belongs on the
-    /// group owner — relocation, ADR 0005), surfaced as a storage backend error.
+    /// group owner — relocation, ADR 0005), surfaced as the transient `Unavailable`
+    /// error (the lease may yet land here) rather than a terminal failure (ADR 0017).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn foreign_group_is_not_owned() {
         let owner = nid("owner");
@@ -532,9 +533,10 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
         };
+        let err = store.enqueue(&foreign, &msg).await.unwrap_err();
         assert!(
-            store.enqueue(&foreign, &msg).await.is_err(),
-            "a non-owned group must be refused"
+            err.is_transient(),
+            "a non-owned group must be refused as transient (lease may land here), got {err:?}"
         );
     }
 

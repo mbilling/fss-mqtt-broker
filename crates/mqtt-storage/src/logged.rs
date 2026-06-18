@@ -49,10 +49,12 @@ use std::collections::BTreeSet;
 impl From<ReplError> for StorageError {
     fn from(e: ReplError) -> Self {
         match e {
-            // The session-store contract has no "not owner" / "no quorum" surface;
-            // they collapse into a backend failure the caller already handles
-            // (and which gates the QoS≥1 PUBACK exactly as a dropped append would).
-            ReplError::NotOwner | ReplError::NoQuorum => StorageError::Backend(e.to_string()),
+            // "Not owner" / "no quorum" are **transient**: the lease is being reassigned
+            // or a quorum is momentarily unreachable, both self-healing. They surface as
+            // `Unavailable` so the durable attach path waits/retries instead of treating
+            // a recoverable session as absent (ADR 0017). For QoS≥1 appends this still
+            // (correctly) gates the PUBACK exactly as a dropped append would.
+            ReplError::NotOwner | ReplError::NoQuorum => StorageError::Unavailable(e.to_string()),
             ReplError::Backend(m) => StorageError::Backend(m),
         }
     }
