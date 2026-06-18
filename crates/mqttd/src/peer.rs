@@ -405,6 +405,19 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
             });
         }
+        PeerMessage::RetainedSnapshot { messages } => {
+            let messages = messages
+                .into_iter()
+                .map(|(topic, payload, qos)| {
+                    (
+                        topic,
+                        payload.into(),
+                        mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                    )
+                })
+                .collect();
+            let _ = hub.send(HubCommand::RemoteRetainedSnapshot { messages });
+        }
         PeerMessage::Hello { .. } => {
             warn!("unexpected duplicate Hello on established peer link");
         }

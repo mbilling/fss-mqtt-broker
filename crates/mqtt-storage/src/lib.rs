@@ -208,6 +208,10 @@ pub trait RetainedStore: Send + Sync + std::fmt::Debug {
 
     /// Return all retained messages whose topic matches the given filter.
     async fn matching(&self, filter: &str) -> Result<Vec<Message>, StorageError>;
+
+    /// Return every retained message (including `$`-rooted topics), for the
+    /// cross-node retained snapshot a peer sends on link-up (ADR 0014 §3).
+    async fn all(&self) -> Result<Vec<Message>, StorageError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +445,14 @@ impl RetainedStore for MemoryRetainedStore {
             .filter(|m| topic_matches(filter, &m.topic))
             .cloned()
             .collect())
+    }
+
+    async fn all(&self) -> Result<Vec<Message>, StorageError> {
+        let map = self
+            .by_topic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(map.values().cloned().collect())
     }
 }
 

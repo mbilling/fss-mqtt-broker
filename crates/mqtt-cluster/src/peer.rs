@@ -45,8 +45,8 @@ pub enum PeerMessage {
         /// Publish `QoS` as its 2-bit wire value (the receiver re-applies its
         /// own per-subscriber downgrade).
         qos: u8,
-        /// Whether the message was published with the retain flag. Retained
-        /// state is not replicated yet (Phase 3); carried for the wire format.
+        /// Whether the message was published with the retain flag. The receiver
+        /// stores it as retained too (cross-node replication, ADR 0014).
         retain: bool,
     },
     /// A full snapshot of the sender's shared-subscription membership (ADR 0015 §2),
@@ -55,6 +55,13 @@ pub enum PeerMessage {
     SharedInterest {
         /// Each shared group: `(ShareName, filter, [(client id, granted QoS u8)])`.
         groups: SharedGroupsWire,
+    },
+    /// The sender's full retained-message set, sent once on link establishment so a
+    /// node that joined after a retained publish is back-filled (ADR 0014 §3). The
+    /// receiver fills only topics it does not already have (gap-fill, not overwrite).
+    RetainedSnapshot {
+        /// Each retained message: `(topic, payload, QoS u8)`.
+        messages: Vec<(String, Vec<u8>, u8)>,
     },
     /// A targeted shared-subscription delivery (ADR 0015 §1): the sending node chose
     /// this `client` (a member on the receiver) for a shared group; the receiver
@@ -231,6 +238,12 @@ mod tests {
             topic: "t/x".into(),
             payload: b"hi".to_vec(),
             qos: 2,
+        });
+        roundtrip(&PeerMessage::RetainedSnapshot {
+            messages: vec![
+                ("t/a".into(), b"v".to_vec(), 1),
+                ("$SYS/x".into(), b"w".to_vec(), 0),
+            ],
         });
         roundtrip(&PeerMessage::ProxyHello {
             identity: Some("device-7".into()),

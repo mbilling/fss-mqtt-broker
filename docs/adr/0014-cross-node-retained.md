@@ -46,30 +46,41 @@ same as locally [MQTT-3.3.1-10].
 This keeps one code path (`deliver`) for "apply a message on this node"; `publish`
 is just `deliver` + `forward_to_peers`.
 
-### 3. Replication is at publish time, to current members (eventual, not back-filled)
+### 3. Replication is at publish time, plus back-fill on join
 
 A retained message replicates to the nodes that are **peers at publish time**.
 Propagation is asynchronous (it rides the peer link), so a subscriber on another
 node sees it *eventually*, not synchronously — the test re-subscribes until it
 arrives.
 
-A node that joins the cluster **after** a retained message was published does **not**
-receive the existing retained state: there is no anti-entropy / on-join sync of the
-retained store. Back-filling a late-joining node needs a retained-state digest
-exchanged on link establishment (the same shape as the durable-session anti-entropy
-work, ADR 0006/0007) and is deferred. For steady-state clusters and any node present
-when the message is published, retained now works cluster-wide.
+A node that joins the cluster **after** a retained message was published is
+**back-filled on link establishment**: a node sends its full retained set
+(`PeerMessage::RetainedSnapshot`, via `RetainedStore::all`) to each new peer, and the
+receiver applies it **gap-fill** — it sets a retained message only for a topic it
+does not already hold, so a peer's snapshot never clobbers our own (possibly newer)
+value. A fresh joiner therefore catches up on the whole existing retained set; an
+established node ignores topics it already has. This is a full-snapshot exchange, not
+a digest diff — simpler, and correct for the join case; a digest-based diff (to avoid
+re-sending the whole set on every link-up) is a possible later optimization.
+
+**Conflict on partition heal** (two nodes holding *different* values for the same
+topic) is left unresolved: gap-fill keeps each side's own value, so they stay
+divergent until the next publish. Resolving that needs per-message timestamps /
+version vectors and is out of scope. Snapshot size is bounded by the peer frame
+limit; chunking a very large retained set is deferred.
 
 ## Consequences
 
-- **Good:** retained messages behave cluster-wide for the common case (members
-  present at publish time); one `deliver` path for local and remote application;
-  clears propagate; no relay loops; non-retained forwarding is unchanged.
+- **Good:** retained messages behave cluster-wide — both for members present at
+  publish time and for nodes that join later (back-filled on link-up, §3); one
+  `deliver` path for local and remote application; clears propagate; no relay loops;
+  non-retained forwarding is unchanged.
 - **Cost / limits:** every retained publish fans out to all peers (O(nodes); retained
-  publishes are typically infrequent); a node joining after a publish misses the
-  existing retained state until that topic is re-published (no on-join back-fill —
-  see §3); cross-node delivery still carries no message-expiry deadline (the peer
-  link does not yet carry the interval — pre-existing carried limitation).
+  publishes are typically infrequent); back-fill re-sends the full retained set on
+  each link-up (a digest diff is a later optimization, §3); partition-heal divergence
+  on the same topic is not reconciled (§3); cross-node delivery still carries no
+  message-expiry deadline (the peer link does not yet carry the interval — pre-existing
+  carried limitation).
 
 ## Alternatives considered
 

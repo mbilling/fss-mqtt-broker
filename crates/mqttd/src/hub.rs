@@ -309,6 +309,13 @@ pub enum HubCommand {
         /// That node's shared groups with members.
         groups: Vec<SharedGroup>,
     },
+    /// A peer's retained-message snapshot, sent on link-up to back-fill a node that
+    /// joined after a retained publish (ADR 0014 §3). Applied gap-fill (topics we do
+    /// not already retain), never overwriting our own.
+    RemoteRetainedSnapshot {
+        /// Each retained message as `(topic, payload, QoS)`.
+        messages: Vec<(String, Bytes, QoS)>,
+    },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
     RemoteSharedDeliver {
@@ -557,7 +564,10 @@ impl Hub {
                 self.detach(&client, conn_id, graceful).await;
             }
             HubCommand::PeerConnected { node, conn_id, tx } => {
-                self.peer_connected(node, conn_id, tx);
+                self.peer_connected(node.clone(), conn_id, tx);
+                // Back-fill the new peer with our retained state so a node that
+                // joined after a retained publish catches up (ADR 0014 §3).
+                self.send_retained_snapshot(&node).await;
             }
             HubCommand::PeerDisconnected { node, conn_id } => {
                 self.peer_disconnected(&node, conn_id);
@@ -581,6 +591,9 @@ impl Hub {
             HubCommand::RemoteSharedInterest { node, groups } => {
                 debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
                 self.remote_shared.insert(node, groups);
+            }
+            HubCommand::RemoteRetainedSnapshot { messages } => {
+                self.apply_retained_snapshot(messages).await;
             }
             HubCommand::RemoteSharedDeliver {
                 client,
@@ -1346,6 +1359,54 @@ impl Hub {
         }
     }
 
+    /// Send our full retained set to `node` so it can back-fill any retained
+    /// messages published before it joined (ADR 0014 §3). A no-op when we have no
+    /// retained messages or the peer link is gone.
+    async fn send_retained_snapshot(&self, node: &NodeId) {
+        let Some(peer) = self.peers.get(node) else {
+            return;
+        };
+        let Ok(retained) = self.retained.all().await else {
+            return;
+        };
+        if retained.is_empty() {
+            return;
+        }
+        let messages = retained
+            .into_iter()
+            .map(|m| (m.topic, m.payload.to_vec(), m.qos as u8))
+            .collect();
+        let _ = peer.tx.send(PeerMessage::RetainedSnapshot { messages });
+    }
+
+    /// Apply a peer's retained snapshot, **gap-fill** only: set a retained message
+    /// for a topic only if we do not already retain that topic, so we never clobber
+    /// our own (possibly newer) value with a peer's (ADR 0014 §3).
+    async fn apply_retained_snapshot(&mut self, messages: Vec<(String, Bytes, QoS)>) {
+        let have: HashSet<String> = match self.retained.all().await {
+            Ok(all) => all.into_iter().map(|m| m.topic).collect(),
+            Err(_) => return,
+        };
+        let mut filled = 0;
+        for (topic, payload, qos) in messages {
+            if have.contains(&topic) {
+                continue;
+            }
+            let message = Message {
+                topic,
+                payload,
+                qos,
+                retain: true,
+            };
+            if self.retained.set(&message).await.is_ok() {
+                filled += 1;
+            }
+        }
+        if filled > 0 {
+            debug!(filled, "back-filled retained messages from a peer snapshot");
+        }
+    }
+
     fn peer_connected(&mut self, node: NodeId, conn_id: u64, tx: PeerOutbound) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest + shared membership so the peer can route to us
@@ -1809,6 +1870,69 @@ mod tests {
         assert!(
             recv_packet(&mut ra).await.is_none(),
             "single delivery per publish"
+        );
+    }
+
+    /// On link-up the hub sends its retained set to the new peer, so a node that
+    /// joined after a retained publish is back-filled (ADR 0014 §3).
+    #[tokio::test]
+    async fn retained_snapshot_is_sent_to_a_new_peer() {
+        let tx = start_hub();
+        publish_retained(&tx, "t", b"r");
+        let mut peer = connect_peer(&tx, "n", 1);
+
+        // The peer gets our interest snapshot, then our retained snapshot.
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedSnapshot { messages }) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].0, "t");
+                assert_eq!(&messages[0].1[..], b"r");
+            }
+            other => panic!("expected RetainedSnapshot, got {other:?}"),
+        }
+    }
+
+    /// A received retained snapshot back-fills the store, so a later local
+    /// subscriber gets the message (ADR 0014 §3).
+    #[tokio::test]
+    async fn received_retained_snapshot_replays_on_subscribe() {
+        let tx = start_hub();
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            messages: vec![("room/t".into(), Bytes::from_static(b"v"), QoS::AtMostOnce)],
+        })
+        .unwrap();
+
+        let (mut rx, _) = attach(&tx, "c", 1, true).await;
+        subscribe(&tx, "c", "room/t");
+        let p = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&p), b"v");
+    }
+
+    /// Back-fill is gap-fill: a snapshot never overwrites a retained message we
+    /// already hold with the peer's (possibly stale) value (ADR 0014 §3).
+    #[tokio::test]
+    async fn retained_snapshot_does_not_overwrite_existing() {
+        let tx = start_hub();
+        publish_retained(&tx, "t", b"local");
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"peer-stale"),
+                QoS::AtMostOnce,
+            )],
+        })
+        .unwrap();
+
+        let (mut rx, _) = attach(&tx, "c", 1, true).await;
+        subscribe(&tx, "c", "t");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"local",
+            "our own retained value is kept"
         );
     }
 

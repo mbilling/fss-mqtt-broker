@@ -64,6 +64,65 @@ pub async fn start_broker_with_queue_limits(limits: mqtt_storage::QueueLimits) -
     addr
 }
 
+/// A single in-process cluster node: its client + peer listener addresses, plus the
+/// handles needed to dial another node (for tests that link nodes on demand, e.g.
+/// to exercise a node joining *after* a publish).
+pub struct Node {
+    /// Address clients connect to.
+    pub client_addr: SocketAddr,
+    /// Address peers dial to establish the cluster bus link.
+    pub peer_addr: SocketAddr,
+    id: mqtt_cluster::NodeId,
+    tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+}
+
+/// Start a standalone cluster node (hub + client listener + peer listener), not yet
+/// linked to anything. Use [`link`] to join it to another node.
+pub async fn start_node(name: &str) -> Node {
+    use mqtt_cluster::NodeId;
+    use mqtt_storage::MemorySessionStore;
+
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let cli = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = cli.local_addr().unwrap();
+
+    let id = NodeId(name.to_string());
+    let (hub, tx) = Hub::with_config(id.clone(), Arc::new(MemorySessionStore::new()));
+    tokio::spawn(hub.run());
+    spawn_client_loop(cli, tx.clone());
+    tokio::spawn(mqttd::peer::serve_listener(
+        peer,
+        id.clone(),
+        tx.clone(),
+        None,
+        None,
+    ));
+
+    Node {
+        client_addr,
+        peer_addr,
+        id,
+        tx,
+    }
+}
+
+/// Link two nodes into a full mesh: each dials the other's peer listener.
+pub fn link(a: &Node, b: &Node) {
+    tokio::spawn(mqttd::peer::dial_forever(
+        b.peer_addr.to_string(),
+        a.id.clone(),
+        a.tx.clone(),
+        None,
+    ));
+    tokio::spawn(mqttd::peer::dial_forever(
+        a.peer_addr.to_string(),
+        b.id.clone(),
+        b.tx.clone(),
+        None,
+    ));
+}
+
 /// Bring up a two-node cluster (full peer mesh) on ephemeral ports and return each
 /// node's client address. Cross-node routing is eventually consistent (interest is
 /// gossiped on subscribe), so cluster tests retry until interest has propagated.

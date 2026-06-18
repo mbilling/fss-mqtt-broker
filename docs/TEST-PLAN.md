@@ -90,7 +90,7 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ QoS 0 publish crosses nodes (`cluster`)
 - ☑ QoS 1 delivered + acked across nodes (`cluster_chaos`); ☐ QoS 2 across nodes
 - ☑ shared-subscription members split across two nodes — once **cluster-wide** (`cluster_chaos`, ADR 0015)
-- ☑ retained **replicates** across nodes (`cluster_chaos`, ADR 0014); ☐ back-fill to a late-joining node
+- ☑ retained **replicates** across nodes and **back-fills** a node that joins after the publish (`cluster_chaos`, ADR 0014)
 
 ### 🌑 Darksky
 

@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{start_two_node_cluster, Client};
+use common::{link, start_node, start_two_node_cluster, Client};
 use mqtt_codec::{Packet, QoS};
 
 /// Retry a QoS-tagged publish from `pubr` until `sub` receives it, returning the
@@ -141,5 +141,33 @@ async fn retained_message_replicates_across_nodes() {
             return;
         }
         assert!(attempt < 49, "retained never replicated to the other node");
+    }
+}
+
+#[tokio::test]
+async fn retained_back_fills_a_node_that_joins_after_the_publish() {
+    // Node A is up alone; retain a message before any peer exists.
+    let a = start_node("a").await;
+    let mut pubr = Client::connect_v5_ok(a.client_addr, "ret-pub").await;
+    pubr.publish_retained("history/t", b"r").await;
+
+    // Node B joins the cluster *after* the publish and links to A. On link-up A
+    // sends B its retained snapshot, so B back-fills (ADR 0014 §3) — a subscriber
+    // on B then sees the message it was never live for.
+    let b = start_node("b").await;
+    link(&a, &b);
+
+    let mut late = Client::connect_v5_ok(b.client_addr, "late-sub").await;
+    for attempt in 0..50 {
+        late.subscribe(1, "history/t", QoS::AtMostOnce).await;
+        if let Some(Packet::Publish(p)) = late.try_recv().await {
+            assert_eq!(&p.payload[..], b"r");
+            assert!(
+                p.retain,
+                "back-filled retained delivery sets the retain flag"
+            );
+            return;
+        }
+        assert!(attempt < 49, "the late-joining node was never back-filled");
     }
 }
