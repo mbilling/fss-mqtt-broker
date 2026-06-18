@@ -88,7 +88,7 @@ Legend: ☐ missing · ☑ covered (file).
 
 **Cluster**:
 - ☑ QoS 0 publish crosses nodes (`cluster`)
-- ☑ QoS 1 delivered + acked across nodes (`cluster_chaos`); ☐ QoS 2 across nodes
+- ☑ QoS 1 and QoS 2 delivered (exactly-once) across nodes (`cluster_chaos`)
 - ☑ shared-subscription members split across two nodes — once **cluster-wide** (`cluster_chaos`, ADR 0015)
 - ☑ retained **replicates** across nodes and **back-fills** a node that joins after the publish (`cluster_chaos`, ADR 0014)
 
@@ -118,12 +118,11 @@ Legend: ☐ missing · ☑ covered (file).
 **Process-level**:
 - ☑ the real `mqttd` binary serves a plaintext pub/sub round-trip (`binary_smoke`)
 
-**Cluster chaos** (mostly ☐):
+**Cluster chaos**:
 - ☑ replica serves session after owner dies (`durable_sessions`)
+- ☑ partition + heal → routing reconverges (severed link, delivery resumes) (`cluster_chaos`)
 - ☐ owner dies mid-publish → in-flight not lost
-- ☐ partition + heal → routing reconverges, no dup/lost delivery
 - ☐ session takeover across nodes (relocation) with messages in flight
-- ☐ node rejoins with stale interest → no ghost routes
 
 ## Conventions
 

@@ -107,20 +107,42 @@ pub async fn start_node(name: &str) -> Node {
     }
 }
 
-/// Link two nodes into a full mesh: each dials the other's peer listener.
-pub fn link(a: &Node, b: &Node) {
-    tokio::spawn(mqttd::peer::dial_forever(
+/// A live peer link between two nodes. Dropping it leaves the link up (the dial
+/// tasks detach); [`Link::sever`] tears it down (and stops it re-dialing), to
+/// simulate a network partition. Re-`link` the nodes to heal.
+pub struct Link {
+    dials: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Link {
+    /// Sever the link: abort the dial tasks, which cancels the in-flight serve and
+    /// drops the TCP connection, and stops any re-dial. The peer that was accepting
+    /// sees the EOF and drops its routing.
+    pub fn sever(self) {
+        for d in self.dials {
+            d.abort();
+        }
+    }
+}
+
+/// Link two nodes into a full mesh: each dials the other's peer listener. Returns a
+/// handle that can [`sever`](Link::sever) the link.
+pub fn link(a: &Node, b: &Node) -> Link {
+    let d1 = tokio::spawn(mqttd::peer::dial_forever(
         b.peer_addr.to_string(),
         a.id.clone(),
         a.tx.clone(),
         None,
     ));
-    tokio::spawn(mqttd::peer::dial_forever(
+    let d2 = tokio::spawn(mqttd::peer::dial_forever(
         a.peer_addr.to_string(),
         b.id.clone(),
         b.tx.clone(),
         None,
     ));
+    Link {
+        dials: vec![d1, d2],
+    }
 }
 
 /// Bring up a two-node cluster (full peer mesh) on ephemeral ports and return each
@@ -404,6 +426,18 @@ impl Client {
 
     pub async fn puback(&mut self, pkid: u16) {
         self.send(&Packet::PubAck(pkid.into())).await;
+    }
+
+    pub async fn pubrec(&mut self, pkid: u16) {
+        self.send(&Packet::PubRec(pkid.into())).await;
+    }
+
+    pub async fn pubrel(&mut self, pkid: u16) {
+        self.send(&Packet::PubRel(pkid.into())).await;
+    }
+
+    pub async fn pubcomp(&mut self, pkid: u16) {
+        self.send(&Packet::PubComp(pkid.into())).await;
     }
 
     /// Send a clean DISCONNECT and wait for the broker to close the socket. Waiting

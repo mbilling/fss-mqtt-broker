@@ -1,12 +1,14 @@
-//! Cluster routing tests over a two-node peer mesh: cross-node `QoS` > 0 delivery,
-//! cross-node retained replication (ADR 0014), and the remaining documented
-//! limitation — shared subscriptions deliver per-node, not cluster-wide
-//! (ADR 0010 §5). See `docs/TEST-PLAN.md`.
+//! Cluster routing + chaos tests over a peer mesh: cross-node `QoS` 1/2 delivery,
+//! retained replication and back-fill on join (ADR 0014), cluster-wide shared
+//! subscriptions (ADR 0015), and a partition/heal reconvergence. See
+//! `docs/TEST-PLAN.md`.
 //!
 //! Cross-node routing is eventually consistent (interest is gossiped on subscribe),
 //! so these retry until propagation completes, mirroring `cluster.rs`.
 
 mod common;
+
+use std::time::Duration;
 
 use common::{link, start_node, start_two_node_cluster, Client};
 use mqtt_codec::{Packet, QoS};
@@ -53,6 +55,75 @@ async fn qos1_is_delivered_and_acked_across_nodes() {
     sub.puback(p.pkid.expect("a cross-node QoS1 delivery has a packet id"))
         .await;
     sub.expect_silence().await;
+}
+
+#[tokio::test]
+async fn qos2_is_delivered_across_nodes_exactly_once() {
+    let (a, b) = start_two_node_cluster().await;
+    let mut sub = Client::connect_v5_ok(a, "q2-sub").await;
+    sub.subscribe(1, "warmup", QoS::AtMostOnce).await;
+    sub.subscribe(2, "t", QoS::ExactlyOnce).await;
+    let mut pubr = Client::connect_v5_ok(b, "q2-pub").await;
+
+    // Warm up the B -> A route; this also confirms A's "t" interest reached B (a
+    // single interest snapshot carries both filters).
+    let _ = route(&mut pubr, &mut sub, "warmup", b"up", QoS::AtMostOnce).await;
+
+    // Publish QoS 2 on B and complete the publisher-side handshake there.
+    pubr.publish("t", b"q2", QoS::ExactlyOnce, Some(7), vec![])
+        .await;
+    match pubr.recv().await {
+        Packet::PubRec(r) => assert_eq!(r.pkid, 7),
+        other => panic!("expected PUBREC, got {other:?}"),
+    }
+    pubr.pubrel(7).await;
+    match pubr.recv().await {
+        Packet::PubComp(r) => assert_eq!(r.pkid, 7),
+        other => panic!("expected PUBCOMP, got {other:?}"),
+    }
+
+    // The subscriber on A receives it at QoS 2 and completes the downstream handshake.
+    let p = sub.expect_publish().await;
+    assert_eq!(p.qos, QoS::ExactlyOnce, "QoS 2 preserved across the hop");
+    assert_eq!(&p.payload[..], b"q2");
+    let pkid = p.pkid.expect("a QoS2 delivery has a packet id");
+    sub.pubrec(pkid).await;
+    match sub.recv().await {
+        Packet::PubRel(r) => assert_eq!(r.pkid, pkid),
+        other => panic!("expected PUBREL, got {other:?}"),
+    }
+    sub.pubcomp(pkid).await;
+    sub.expect_silence().await;
+}
+
+#[tokio::test]
+async fn partition_severs_delivery_and_heal_reconverges() {
+    let a = start_node("a").await;
+    let b = start_node("b").await;
+    let live = link(&a, &b);
+
+    let mut sub = Client::connect_v5_ok(a.client_addr, "p-sub").await;
+    sub.subscribe(1, "t", QoS::AtMostOnce).await;
+    let mut pubr = Client::connect_v5_ok(b.client_addr, "p-pub").await;
+
+    // Route is up: a publish on B reaches the subscriber on A.
+    let _ = route(&mut pubr, &mut sub, "t", b"before", QoS::AtMostOnce).await;
+
+    // Partition: sever the link and let the teardown propagate.
+    live.sever();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // During the partition, publishes on B do not reach A.
+    for _ in 0..5 {
+        pubr.publish("t", b"during", QoS::AtMostOnce, None, vec![])
+            .await;
+    }
+    sub.expect_silence().await;
+
+    // Heal: re-link the nodes; routing reconverges and delivery resumes.
+    let _healed = link(&a, &b);
+    let p = route(&mut pubr, &mut sub, "t", b"after", QoS::AtMostOnce).await;
+    assert_eq!(&p.payload[..], b"after", "delivery resumes after the heal");
 }
 
 #[tokio::test]
