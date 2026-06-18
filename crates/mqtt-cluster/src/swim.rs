@@ -58,6 +58,11 @@ pub struct Config {
     pub ack_timeout_ms: u64,
     /// How long a member stays `Suspect` before being declared `Dead`.
     pub suspicion_timeout_ms: u64,
+    /// How long a `Dead` member is kept as a tombstone (ADR 0016 phase 1): during this
+    /// window no gossip can revive it, after which it is pruned and the id may rejoin.
+    /// Set comfortably above the gossip drain time so a stale refutation cannot outlive
+    /// the tombstone.
+    pub dead_ttl_ms: u64,
     /// Number of helpers (`k`) asked to probe indirectly.
     pub indirect_probes: usize,
     /// Maximum membership updates piggybacked per outgoing message.
@@ -72,6 +77,7 @@ impl Default for Config {
             protocol_period_ms: 1000,
             ack_timeout_ms: 250,
             suspicion_timeout_ms: 4000,
+            dead_ttl_ms: 30_000,
             indirect_probes: 3,
             gossip_fanout: 6,
             gossip_multiplier: 3,
@@ -95,6 +101,9 @@ pub struct Member {
     pub state: MemberState,
     /// Clock time (ms) when it entered `state`; drives the suspicion timeout.
     state_since: u64,
+    /// When this member's `Dead` tombstone is pruned (ADR 0016 phase 1). `Some` iff
+    /// the member is `Dead`; while set, gossip cannot revive the member.
+    tombstone_deadline: Option<u64>,
 }
 
 /// A membership update disseminated via gossip.
@@ -345,6 +354,13 @@ impl Swim {
 
         let id = NodeId(u.id.clone());
         if let Some(m) = self.members.get_mut(&id) {
+            // Tombstone fence (ADR 0016 phase 1): while a `Dead` member is tombstoned,
+            // no non-`Dead` gossip can revive it — not even a higher incarnation (e.g.
+            // the node's own last refutation still in flight when it died). Only the
+            // prune in `tick` clears the tombstone, after which the id may rejoin.
+            if m.tombstone_deadline.is_some() && u.state != MemberState::Dead {
+                return;
+            }
             let supersedes = u.incarnation > m.incarnation
                 || (u.incarnation == m.incarnation && u.state.precedence() > m.state.precedence());
             if !supersedes {
@@ -361,6 +377,11 @@ impl Swim {
             if changed {
                 m.state = u.state;
                 m.state_since = now;
+                m.tombstone_deadline = if u.state == MemberState::Dead {
+                    Some(now + self.cfg.dead_ttl_ms)
+                } else {
+                    None
+                };
                 out.push(Action::StateChange {
                     id: id.clone(),
                     addr: u.addr.clone(),
@@ -378,6 +399,11 @@ impl Swim {
                     incarnation: u.incarnation,
                     state: u.state,
                     state_since: now,
+                    tombstone_deadline: if u.state == MemberState::Dead {
+                        Some(now + self.cfg.dead_ttl_ms)
+                    } else {
+                        None
+                    },
                 },
             );
             out.push(Action::StateChange {
@@ -409,6 +435,7 @@ impl Swim {
     /// membership changes observed.
     pub fn tick(&mut self, now: u64) -> Vec<Action> {
         let mut out = Vec::new();
+        self.prune_tombstones(now);
         if !self.bootstrapped {
             self.bootstrapped = true;
             self.next_probe_at = now + self.cfg.protocol_period_ms;
@@ -460,6 +487,14 @@ impl Swim {
                 self.declare(&target, MemberState::Suspect, now, out);
             }
         }
+    }
+
+    /// Remove tombstoned `Dead` members whose `dead_ttl_ms` has elapsed (ADR 0016
+    /// phase 1). By now stale gossip has drained, so the id may rejoin as a fresh
+    /// member without having to out-race a lingering refutation.
+    fn prune_tombstones(&mut self, now: u64) {
+        self.members
+            .retain(|_, m| m.tombstone_deadline.map_or(true, |d| now < d));
     }
 
     fn expire_suspects(&mut self, now: u64, out: &mut Vec<Action>) {
@@ -656,6 +691,7 @@ mod tests {
             protocol_period_ms: 100,
             ack_timeout_ms: 20,
             suspicion_timeout_ms: 200,
+            dead_ttl_ms: 2000,
             indirect_probes: 2,
             gossip_fanout: 8,
             gossip_multiplier: 3,
@@ -684,6 +720,13 @@ mod tests {
             peer_addr: peer_addr_of(addr),
             incarnation: inc,
             state: MemberState::Alive,
+        }
+    }
+
+    fn dead_update(id: &str, addr: &str, inc: u64) -> Update {
+        Update {
+            state: MemberState::Dead,
+            ..alive_update(id, addr, inc)
         }
     }
 
@@ -825,6 +868,71 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a, Action::StateChange { id, state: MemberState::Dead, .. } if id.0 == "b"
         )));
+    }
+
+    /// ADR 0016 phase 1: once a member is `Dead` it is tombstoned, and no gossiped
+    /// update revives it — not even a higher-incarnation `Alive` (e.g. the node's own
+    /// last refutation still in flight when it died). This is the resurrection that
+    /// corrupted the recovery replica set after a takeover.
+    #[test]
+    fn a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&dead_update("b", "b:1", 0), 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        // A stale Alive about b at a much higher incarnation arrives — it must NOT
+        // revive the tombstone.
+        s.apply_update(&alive_update("b", "b:1", 99), 1, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Dead),
+            "a tombstoned dead node stays dead"
+        );
+        // Nor does a Suspect (a downgrade attempt) move it off Dead.
+        s.apply_update(
+            &Update {
+                state: MemberState::Suspect,
+                ..alive_update("b", "b:1", 50)
+            },
+            2,
+            &mut out,
+        );
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+    }
+
+    /// ADR 0016 phase 1: a tombstone is pruned after `dead_ttl_ms` (by when stale
+    /// gossip has drained), after which the id may rejoin fresh.
+    #[test]
+    fn a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&dead_update("b", "b:1", 0), 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        let ttl = fast_cfg().dead_ttl_ms;
+        // Before the TTL, the tombstone still fences a revive.
+        s.tick(ttl / 2);
+        s.apply_update(&alive_update("b", "b:1", 99), ttl / 2, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        // After the TTL, the tombstone is pruned.
+        s.tick(ttl + 1);
+        assert_eq!(
+            member_state(&s, "b"),
+            None,
+            "the tombstone is pruned after its TTL"
+        );
+
+        // The id can rejoin fresh (e.g. a restarted node greets us).
+        s.handle(m("b", "b:1", Kind::Join, vec![]), ttl + 2);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Alive),
+            "the id rejoins as a fresh member after the tombstone expires"
+        );
     }
 
     #[test]
