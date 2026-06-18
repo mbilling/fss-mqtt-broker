@@ -132,6 +132,23 @@ fn spawn_client_loop(
     });
 }
 
+/// A permissive (anonymous, open-ACL) [`ConnPolicy`] with an explicit connect
+/// deadline — for the half-open / slow-loris darksky tests.
+#[must_use]
+pub fn permissive_policy(connect_timeout: Duration) -> Arc<ConnPolicy> {
+    Arc::new(ConnPolicy {
+        auth: Arc::new(mqtt_auth::basic::BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        enhanced: None,
+        authz: Arc::new(mqtt_auth::AllowAll),
+        audit: Arc::new(mqtt_observability::AuditLog::new()),
+        proxy: None,
+        store: None,
+        connect_timeout,
+    })
+}
+
 /// Spawn an in-process broker driven by a caller-supplied [`ConnPolicy`] — for
 /// tests that need a specific authenticator, ACL, or enhanced-auth mechanism.
 pub async fn start_broker_with_policy(policy: Arc<ConnPolicy>) -> SocketAddr {
@@ -383,6 +400,7 @@ pub mod enhanced {
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
+            connect_timeout: std::time::Duration::from_secs(10),
         })
     }
 

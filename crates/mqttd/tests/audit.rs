@@ -42,6 +42,7 @@ async fn start_node(
         audit: audit.clone(),
         proxy: None,
         store: None,
+        connect_timeout: std::time::Duration::from_secs(10),
         enhanced: None,
     });
 

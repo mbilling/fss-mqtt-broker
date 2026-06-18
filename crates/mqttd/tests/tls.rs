@@ -123,6 +123,7 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
+                        connect_timeout: std::time::Duration::from_secs(10),
                         enhanced: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
@@ -493,6 +494,7 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
+                        connect_timeout: std::time::Duration::from_secs(10),
                         enhanced: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;
@@ -579,6 +581,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
+                        connect_timeout: std::time::Duration::from_secs(10),
                         enhanced: None,
                     });
                     mqttd::conn::handle_stream(tls, Some(peer), identity, policy, hub).await;

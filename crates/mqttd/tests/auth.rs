@@ -41,6 +41,7 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
                 audit: std::sync::Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
                 store: None,
+                connect_timeout: std::time::Duration::from_secs(10),
                 enhanced: None,
             });
             tokio::spawn(mqttd::conn::handle_stream(

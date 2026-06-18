@@ -5,11 +5,14 @@
 
 mod common;
 
-use common::{enhanced, start_broker, start_broker_with_policy, Client};
+use std::time::Duration;
+
+use common::{enhanced, permissive_policy, start_broker, start_broker_with_policy, Client};
 use mqtt_codec::{
     packet::{Auth, Connect, Publish},
     Packet, Properties, Property, ProtocolVersion, QoS,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // --- protocol violations close the connection -------------------------------
 
@@ -39,6 +42,37 @@ async fn first_packet_not_connect_closes_connection() {
     }))
     .await;
     c.expect_closed().await;
+}
+
+// --- half-open / slow-loris: the connect deadline ---------------------------
+
+#[tokio::test]
+async fn connection_idle_before_connect_is_closed_after_deadline() {
+    let addr = start_broker_with_policy(permissive_policy(Duration::from_millis(300))).await;
+    // Open the socket and send nothing. The keepalive timer only starts after
+    // CONNECT, so the connect deadline is what must reap this half-open connection.
+    let mut c = Client::open(addr, ProtocolVersion::V5).await;
+    c.expect_closed().await;
+}
+
+#[tokio::test]
+async fn partial_connect_then_stall_is_closed_after_deadline() {
+    let addr = start_broker_with_policy(permissive_policy(Duration::from_millis(300))).await;
+    // A slow-loris: announce a CONNECT fixed header (remaining length 16) but send
+    // only part of the body, then stall. The frame never completes, so the connect
+    // deadline must close the connection.
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[0x10, 0x10, 0x00, 0x04, b'M', b'Q'])
+        .await
+        .unwrap();
+
+    // A read returns 0 (EOF) once the broker closes the connection.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .expect("broker should close the stalled connection")
+        .expect("read");
+    assert_eq!(n, 0, "the broker closed the half-sent CONNECT");
 }
 
 // --- topic-alias violations (ADR 0011) --------------------------------------

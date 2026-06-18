@@ -285,6 +285,7 @@ async fn start_proxy_node(
             connector: None, // plaintext mesh
         }),
         store: None,
+        connect_timeout: std::time::Duration::from_secs(10),
         enhanced: None,
     });
     let (hub, hub_tx) = Hub::with_config(

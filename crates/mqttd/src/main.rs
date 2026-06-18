@@ -227,6 +227,7 @@ fn client_policy_from_env(
         audit: Arc::new(AuditLog::new()),
         proxy,
         store: Some(store),
+        connect_timeout: conn::DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
     }))
 }

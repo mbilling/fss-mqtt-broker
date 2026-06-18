@@ -139,7 +139,16 @@ pub struct ConnPolicy {
     /// per-connection in-memory window (lost on disconnect — fine for clean sessions
     /// and the in-memory backend).
     pub store: Option<Arc<dyn mqtt_storage::SessionStore>>,
+    /// How long a freshly-accepted connection has to send its CONNECT before the
+    /// broker closes it. Bounds the unauthenticated half-open / slow-loris surface:
+    /// the keepalive timer only starts after CONNECT, so without this a client that
+    /// connects and stalls would hold a connection task indefinitely.
+    pub connect_timeout: Duration,
 }
+
+/// Default [`ConnPolicy::connect_timeout`]: generous for a real handshake on a slow
+/// link, but bounded so an idle/stalled pre-CONNECT connection cannot live forever.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl std::fmt::Debug for ConnPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -162,6 +171,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         audit: Arc::new(AuditLog::new()),
         proxy: None,
         store: None,
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
@@ -281,6 +291,30 @@ async fn will_rejected<W: AsyncWrite + Unpin>(
     Ok(true)
 }
 
+/// Read the connection's first packet, which must be a CONNECT arriving within
+/// `deadline`. `Ok(None)` means the connection must close — a timeout, EOF, or a
+/// non-CONNECT first packet; `Err` is a transport/codec error.
+async fn read_connect<R: AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+    deadline: Duration,
+) -> Result<Option<Connect>, NetError> {
+    let Ok(framed) = tokio::time::timeout(deadline, reader.next_packet()).await else {
+        warn!(
+            timeout_s = deadline.as_secs(),
+            "no CONNECT before deadline; closing"
+        );
+        return Ok(None);
+    };
+    match framed? {
+        Some(Packet::Connect(c)) => Ok(Some(c)),
+        Some(other) => {
+            warn!(packet = ?other.packet_type(), "first packet was not CONNECT; closing");
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
@@ -294,14 +328,11 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // Protocol requires CONNECT as the first packet on a connection.
-    let connect = match reader.next_packet().await? {
-        Some(Packet::Connect(c)) => c,
-        Some(other) => {
-            warn!(packet = ?other.packet_type(), "first packet was not CONNECT; closing");
-            return Ok(());
-        }
-        None => return Ok(()),
+    // CONNECT must be the first packet and arrive within the connect deadline, else
+    // the connection is closed (bounds the unauthenticated half-open / slow-loris
+    // surface; the keepalive timer only starts after CONNECT).
+    let Some(connect) = read_connect(&mut reader, policy.connect_timeout).await? else {
+        return Ok(());
     };
 
     // Negotiate the version the CONNECT declared; every later packet and the CONNACK
@@ -1239,7 +1270,10 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_stream, ConnPolicy, SERVER_RECEIVE_MAXIMUM, SERVER_TOPIC_ALIAS_MAX};
+    use super::{
+        handle_stream, ConnPolicy, DEFAULT_CONNECT_TIMEOUT, SERVER_RECEIVE_MAXIMUM,
+        SERVER_TOPIC_ALIAS_MAX,
+    };
     use crate::hub::{HubCommand, Outbound};
     use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
@@ -1272,6 +1306,7 @@ mod tests {
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
         })
     }
@@ -1339,6 +1374,7 @@ mod tests {
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -1575,6 +1611,7 @@ mod tests {
             audit: audit.clone(),
             proxy: None,
             store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
         });
 
@@ -2190,6 +2227,7 @@ mod tests {
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: Some(store),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
