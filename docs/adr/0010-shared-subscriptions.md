@@ -81,15 +81,17 @@ in the same in-flight table. A persistent session's shared memberships are persi
 reconstructed on reconnect/restart. Clean Start, zero-expiry disconnect, and the
 expiry sweep tear down a client's shared memberships alongside its plain ones.
 
-### 5. Cluster: per-node single delivery (carried limitation)
+### 5. Cluster: per-node single delivery (~~carried limitation~~ — superseded)
+
+> **Superseded by [ADR 0015](0015-cluster-shared-subscriptions.md).** Shared
+> subscriptions now deliver **once cluster-wide**: the publishing node selects one
+> member across gossiped global membership and targets it directly. The original
+> per-node behaviour is described below for history.
 
 A node gossips a shared group's underlying `{filter}` as ordinary interest, so a peer
 forwards matching publishes to it, and the receiving node delivers to one of **its
 local** group members. With members spread across N nodes this means up to **one
-delivery per node that has a member**, not one cluster-wide. True cluster-wide single
-delivery needs a designated-node-per-group or a cross-node claim protocol; that is
-deferred. For the common single-node and consumer-pool-per-node deployments this is
-correct; the limitation is documented and revisited with placement (ADR 0005).
+delivery per node that has a member**, not one cluster-wide.
 
 ## Consequences
 

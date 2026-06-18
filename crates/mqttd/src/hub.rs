@@ -36,7 +36,8 @@ use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{
-    parse_shared, topic_matches, ClientId, Message, SharedSubscriptionTable, SubscriptionTable,
+    parse_shared, topic_matches, ClientId, Message, SharedGroup, SharedSubscriptionTable,
+    SubscriptionTable,
 };
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore,
@@ -62,6 +63,21 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// MQTT 5.0 Session Expiry Interval meaning "never expire" (0xFFFFFFFF). v3.1.1
 /// `clean_session=0` maps to this.
 const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
+
+/// A shared subscription's identity: `(ShareName, filter)` (ADR 0015).
+type SharedKey = (String, String);
+
+/// A shared group keyed for selection, with its global candidate list (ADR 0015).
+type SharedMatch = (SharedKey, Vec<SharedCandidate>);
+
+/// One candidate recipient for a shared group's single cluster-wide delivery: a
+/// local member (`node` = `None`) or a member on a peer (ADR 0015).
+#[derive(Debug, Clone)]
+struct SharedCandidate {
+    node: Option<NodeId>,
+    client: ClientId,
+    qos: QoS,
+}
 
 /// Sender for packets destined to a single client's socket.
 pub type Outbound = mpsc::UnboundedSender<Packet>;
@@ -269,6 +285,26 @@ pub enum HubCommand {
         /// Every topic filter with subscribers on that node.
         filters: Vec<String>,
     },
+    /// A peer's shared-subscription membership snapshot (ADR 0015 §2), used to select
+    /// one member per group across the cluster.
+    RemoteSharedInterest {
+        /// The announcing node.
+        node: NodeId,
+        /// That node's shared groups with members.
+        groups: Vec<SharedGroup>,
+    },
+    /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
+    /// exactly `client` (a local member), no further selection or re-forward.
+    RemoteSharedDeliver {
+        /// The chosen local group member.
+        client: ClientId,
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Bytes,
+        /// Already-downgraded delivery `QoS`.
+        qos: QoS,
+    },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
         /// Destination topic.
@@ -334,9 +370,14 @@ pub struct Hub {
     subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
-    /// Shared-subscription groups (`$share/<group>/<filter>`), delivered to one
-    /// member each, round-robin (ADR 0010).
+    /// Local shared-subscription groups (`$share/<group>/<filter>`) — this node's
+    /// members (ADR 0010).
     shared: SharedSubscriptionTable,
+    /// Each peer's last-announced shared-subscription membership, so this node can
+    /// select one member per group across the whole cluster (ADR 0015 §2).
+    remote_shared: HashMap<NodeId, Vec<SharedGroup>>,
+    /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
+    shared_cursor: HashMap<SharedKey, usize>,
     /// Per-session outbound `QoS` > 0 in-flight state.
     inflight: HashMap<ClientId, Inflight>,
     /// Durable session/queue storage. `Arc` so connections can share it (e.g. for
@@ -398,6 +439,8 @@ impl Hub {
                 subs_by_client: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
+                remote_shared: HashMap::new(),
+                shared_cursor: HashMap::new(),
                 inflight: HashMap::new(),
                 store,
                 durable_plane: None,
@@ -519,6 +562,21 @@ impl Hub {
                 self.remote_interest
                     .insert(node, filters.into_iter().collect());
             }
+            HubCommand::RemoteSharedInterest { node, groups } => {
+                debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
+                self.remote_shared.insert(node, groups);
+            }
+            HubCommand::RemoteSharedDeliver {
+                client,
+                topic,
+                payload,
+                qos,
+            } => {
+                // Targeted by a peer's shared selection: deliver to this one client
+                // (ADR 0015), never re-selected or re-forwarded.
+                self.deliver_to_client(&client, &topic, &payload, qos, None)
+                    .await;
+            }
         }
     }
 
@@ -535,11 +593,16 @@ impl Hub {
     ) {
         self.deliver(topic, payload, qos, retain, message_expiry)
             .await;
+        // Shared subscriptions are selected once cluster-wide by the originating
+        // node (ADR 0015), so this runs only for locally-originated publishes.
+        self.deliver_shared(topic, payload, qos, message_expiry)
+            .await;
         self.forward_to_peers(topic, payload, qos, retain);
     }
 
     /// Apply a message on this node: store/clear retained state and deliver to local
-    /// subscribers. Does **not** forward — used both for local publishes (via
+    /// ordinary subscribers. Does **not** forward or run shared selection — used both
+    /// for local publishes (via
     /// [`publish`](Self::publish)) and for publishes received from a peer, which must
     /// never be re-forwarded.
     async fn deliver(
@@ -788,9 +851,9 @@ impl Hub {
             .unwrap_or(QoS::AtMostOnce)
     }
 
-    /// Deliver a message to this node's local subscribers at
-    /// `min(qos, granted)` each: online clients get it live (with `QoS` > 0
-    /// tracked in flight), offline persistent sessions have it queued.
+    /// Deliver a message to this node's **ordinary** local subscribers at
+    /// `min(qos, granted)` each. Shared subscriptions are routed separately by
+    /// [`deliver_shared`](Self::deliver_shared) (ADR 0015).
     async fn deliver_local(
         &mut self,
         topic: &str,
@@ -798,14 +861,7 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
     ) {
-        // The absolute deadline for a queued copy (ADR 0009 §3): receipt time plus
-        // the interval. Online deliveries leave the wire immediately, so they carry
-        // the full interval; queued copies carry the absolute deadline.
-        let expiry_at = message_expiry.map(|secs| now_epoch_secs() + u64::from(secs));
-
-        // Ordinary subscribers (fan out to all) carry their per-filter granted QoS;
-        // each shared group (ADR 0010) contributes exactly one chosen member.
-        let mut targets: Vec<(ClientId, QoS)> = self
+        let targets: Vec<(ClientId, QoS)> = self
             .table
             .matching_clients(topic)
             .into_iter()
@@ -814,56 +870,153 @@ impl Hub {
                 (c, granted)
             })
             .collect();
-        let ordinary = targets.len();
-        for rotation in self.shared.rotations(topic) {
-            // Prefer an online member; otherwise queue for a persistent offline one;
-            // a group with no reachable member drops the message for that group.
-            let pick = rotation
-                .iter()
-                .find(|(c, _)| self.online.contains_key(c))
-                .or_else(|| rotation.iter().find(|(c, _)| self.is_persistent(c)))
-                .cloned();
-            if let Some((c, granted)) = pick {
-                targets.push((c, granted));
-            } else {
-                debug!(topic = %topic, "shared group has no reachable member");
-            }
-        }
-        debug!(topic = %topic, ordinary, shared = targets.len() - ordinary, "local delivery");
+        debug!(topic = %topic, ordinary = targets.len(), "local delivery");
         for (c, granted) in targets {
-            let message = Message {
-                topic: topic.to_string(),
-                payload: payload.clone(),
-                qos: min_qos(qos, granted),
-                retain: false,
-            };
-            if let Some(tx) = self.online.get(&c).map(|s| s.tx.clone()) {
-                self.send_to_client(&c, &tx, &message, false, message_expiry);
-            } else if self.is_persistent(&c) {
-                // Offline but persistent: queue for replay on reconnect. The
-                // queue is bounded (ADR 0001 §6); log when the cap drops
-                // messages — a metrics counter is the proper operator signal
-                // and arrives with the observability phase.
-                match self
-                    .store
-                    .enqueue_with_expiry(&c, &message, expiry_at)
-                    .await
-                {
-                    Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
-                        warn!(client = %c.0, evicted, topic = %topic,
-                              "offline queue full: evicted oldest message(s)");
-                    }
-                    Ok(Enqueued::Rejected) => {
-                        warn!(client = %c.0, topic = %topic,
-                              "offline queue full: dropped message (reject-newest)");
-                    }
-                    Ok(Enqueued::Stored { .. }) => {}
-                    Err(e) => {
-                        warn!(client = %c.0, error = %e, "failed to enqueue offline message");
-                    }
+            self.deliver_to_client(&c, topic, payload, min_qos(qos, granted), message_expiry)
+                .await;
+        }
+    }
+
+    /// Deliver one message to a single named recipient: live if online (tracking
+    /// `QoS` > 0 in flight), else queued if the session is persistent, else dropped.
+    /// The unit of both ordinary and shared (ADR 0015) delivery; `qos` is the
+    /// already-downgraded delivery `QoS`.
+    async fn deliver_to_client(
+        &mut self,
+        client: &ClientId,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+    ) {
+        let message = Message {
+            topic: topic.to_string(),
+            payload: payload.clone(),
+            qos,
+            retain: false,
+        };
+        if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
+            self.send_to_client(client, &tx, &message, false, message_expiry);
+        } else if self.is_persistent(client) {
+            // Offline but persistent: queue for replay on reconnect. The absolute
+            // deadline (ADR 0009 §3) is receipt time plus the interval. The queue is
+            // bounded (ADR 0001 §6); log when the cap drops messages.
+            let expiry_at = message_expiry.map(|secs| now_epoch_secs() + u64::from(secs));
+            match self
+                .store
+                .enqueue_with_expiry(client, &message, expiry_at)
+                .await
+            {
+                Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
+                    warn!(client = %client.0, evicted, topic = %topic,
+                          "offline queue full: evicted oldest message(s)");
+                }
+                Ok(Enqueued::Rejected) => {
+                    warn!(client = %client.0, topic = %topic,
+                          "offline queue full: dropped message (reject-newest)");
+                }
+                Ok(Enqueued::Stored { .. }) => {}
+                Err(e) => {
+                    warn!(client = %client.0, error = %e, "failed to enqueue offline message");
                 }
             }
         }
+    }
+
+    /// Route a message to the shared subscriptions matching `topic`: for each group,
+    /// select exactly one member across the **whole cluster** (round-robin) and
+    /// deliver to it — locally, or via a targeted `SharedDeliver` to the member's
+    /// node (ADR 0015). The originating node is the sole selector, so there is no
+    /// double delivery.
+    async fn deliver_shared(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+    ) {
+        for (key, candidates) in self.shared_candidates(topic) {
+            let Some(chosen) = self.select_shared(&key, &candidates) else {
+                debug!(topic = %topic, "shared group has no reachable member");
+                continue;
+            };
+            let delivered_qos = min_qos(qos, chosen.qos);
+            match chosen.node {
+                None => {
+                    self.deliver_to_client(
+                        &chosen.client,
+                        topic,
+                        payload,
+                        delivered_qos,
+                        message_expiry,
+                    )
+                    .await;
+                }
+                Some(node) => {
+                    self.send_shared_to_peer(&node, &chosen.client, topic, payload, delivered_qos);
+                }
+            }
+        }
+    }
+
+    /// The shared groups matching `topic`, each with its global candidate list:
+    /// local members (`node` = None) first, then each peer's members in node-id
+    /// order, so the round-robin cursor is stable (ADR 0015 §2).
+    fn shared_candidates(&self, topic: &str) -> Vec<SharedMatch> {
+        let mut by_key: BTreeMap<SharedKey, Vec<SharedCandidate>> = BTreeMap::new();
+        for g in self.shared.matching(topic) {
+            let entry = by_key.entry((g.group, g.filter)).or_default();
+            for (client, qos) in g.members {
+                entry.push(SharedCandidate {
+                    node: None,
+                    client,
+                    qos,
+                });
+            }
+        }
+        for (node, groups) in self.remote_shared.iter().collect::<BTreeMap<_, _>>() {
+            for g in groups {
+                if !topic_matches(&g.filter, topic) {
+                    continue;
+                }
+                let entry = by_key
+                    .entry((g.group.clone(), g.filter.clone()))
+                    .or_default();
+                for (client, qos) in &g.members {
+                    entry.push(SharedCandidate {
+                        node: Some((*node).clone()),
+                        client: client.clone(),
+                        qos: *qos,
+                    });
+                }
+            }
+        }
+        by_key.into_iter().collect()
+    }
+
+    /// Round-robin one member for a shared group, advancing the per-group cursor.
+    /// Prefers a member that can receive now — a **local online** or **any remote**
+    /// member — and falls back to a **local persistent** (queued) member (ADR 0015 §4).
+    fn select_shared(
+        &mut self,
+        key: &SharedKey,
+        candidates: &[SharedCandidate],
+    ) -> Option<SharedCandidate> {
+        let n = candidates.len();
+        if n == 0 {
+            return None;
+        }
+        let start = self.shared_cursor.get(key).copied().unwrap_or(0) % n;
+        self.shared_cursor.insert(key.clone(), (start + 1) % n);
+        let rotated = || candidates.iter().cycle().skip(start).take(n);
+        // Immediately deliverable: a local online member or any remote member.
+        let immediate = rotated().find(|c| match &c.node {
+            None => self.online.contains_key(&c.client),
+            Some(_) => true,
+        });
+        immediate
+            .or_else(|| rotated().find(|c| c.node.is_none() && self.is_persistent(&c.client)))
+            .cloned()
     }
 
     /// Send one message to an online client at its (already downgraded) `QoS`,
@@ -1184,9 +1337,13 @@ impl Hub {
 
     fn peer_connected(&mut self, node: NodeId, conn_id: u64, tx: PeerOutbound) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
-        // Send our current interest so the peer can route to us immediately.
+        // Send our current interest + shared membership so the peer can route to us
+        // immediately (ordinary fan-out and cluster-wide shared selection, ADR 0015).
         let _ = tx.send(PeerMessage::Interest {
             filters: self.local_interest(),
+        });
+        let _ = tx.send(PeerMessage::SharedInterest {
+            groups: self.shared_snapshot(),
         });
         // Register the link with the durable plane (consensus + replication) so its
         // RPCs to this peer route over the same channel.
@@ -1204,6 +1361,7 @@ impl Hub {
         info!(peer = %node.0, "peer link lost");
         self.peers.remove(node);
         self.remote_interest.remove(node);
+        self.remote_shared.remove(node);
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
         }
@@ -1216,6 +1374,7 @@ impl Hub {
     fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
         let had_interest = self.remote_interest.remove(node).is_some();
+        self.remote_shared.remove(node);
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
         }
@@ -1241,28 +1400,58 @@ impl Hub {
         });
     }
 
-    /// This node's interest snapshot for cluster gossip: ordinary filters plus the
-    /// underlying `{filter}` of every shared group (ADR 0010 §5), so peers forward
-    /// matching publishes to us for both.
+    /// This node's **ordinary** interest snapshot for cluster gossip. Shared-group
+    /// filters are gossiped separately (ADR 0015 §2), not folded in here, since
+    /// shared delivery rides the targeted `SharedDeliver` path, not ordinary forward.
     fn local_interest(&self) -> Vec<String> {
-        let mut filters = self.table.filters();
-        for f in self.shared.filters() {
-            if !filters.contains(&f) {
-                filters.push(f);
-            }
-        }
-        filters
+        self.table.filters()
     }
 
-    /// Send this node's current interest snapshot to all connected peers.
+    /// This node's shared-subscription membership snapshot, in the peer wire form.
+    fn shared_snapshot(&self) -> mqtt_cluster::peer::SharedGroupsWire {
+        self.shared
+            .snapshot()
+            .into_iter()
+            .map(|g| {
+                let members = g.members.into_iter().map(|(c, q)| (c.0, q as u8)).collect();
+                (g.group, g.filter, members)
+            })
+            .collect()
+    }
+
+    /// Gossip this node's ordinary interest and shared membership to all peers.
+    /// Called whenever local subscriptions change.
     fn gossip_interest(&self) {
         if self.peers.is_empty() {
             return;
         }
         let filters = self.local_interest();
+        let groups = self.shared_snapshot();
         for peer in self.peers.values() {
             let _ = peer.tx.send(PeerMessage::Interest {
                 filters: filters.clone(),
+            });
+            let _ = peer.tx.send(PeerMessage::SharedInterest {
+                groups: groups.clone(),
+            });
+        }
+    }
+
+    /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
+    fn send_shared_to_peer(
+        &self,
+        node: &NodeId,
+        client: &ClientId,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+    ) {
+        if let Some(peer) = self.peers.get(node) {
+            let _ = peer.tx.send(PeerMessage::SharedDeliver {
+                client: client.0.clone(),
+                topic: topic.to_string(),
+                payload: payload.to_vec(),
+                qos: qos as u8,
             });
         }
     }
@@ -1468,12 +1657,51 @@ mod tests {
         .unwrap();
     }
 
+    /// Announce a peer's shared-group membership (one group, given members).
+    fn remote_shared_interest(tx: &HubTx, node: &str, group: &str, filter: &str, members: &[&str]) {
+        tx.send(HubCommand::RemoteSharedInterest {
+            node: NodeId(node.into()),
+            groups: vec![mqtt_core::SharedGroup {
+                group: group.into(),
+                filter: filter.into(),
+                members: members
+                    .iter()
+                    .map(|c| (ClientId((*c).into()), QoS::AtMostOnce))
+                    .collect(),
+            }],
+        })
+        .unwrap();
+    }
+
+    /// The next `SharedDeliver` from a peer, skipping interest snapshots.
+    async fn next_shared_deliver(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> PeerMessage {
+        loop {
+            let msg = timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .expect("a peer message")
+                .expect("link open");
+            if matches!(msg, PeerMessage::SharedDeliver { .. }) {
+                return msg;
+            }
+        }
+    }
+
     async fn recv_packet(rx: &mut mpsc::UnboundedReceiver<Packet>) -> Option<Packet> {
         timeout(Duration::from_millis(300), rx.recv()).await.ok()?
     }
 
+    /// The next peer message, skipping the `SharedInterest` snapshots that now ride
+    /// alongside every `Interest` gossip (ADR 0015) — these routing tests assert on
+    /// ordinary interest and publishes, not shared membership.
     async fn recv_peer(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> Option<PeerMessage> {
-        timeout(Duration::from_millis(300), rx.recv()).await.ok()?
+        loop {
+            let msg = timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .ok()??;
+            if !matches!(msg, PeerMessage::SharedInterest { .. }) {
+                return Some(msg);
+            }
+        }
     }
 
     fn payload_of(packet: &Packet) -> &[u8] {
@@ -1524,6 +1752,50 @@ mod tests {
             payload_of(&recv_packet(&mut rx2).await.unwrap()),
             b"still-live",
             "a stale detach must not deregister the new connection"
+        );
+    }
+
+    /// Cluster-wide shared selection (ADR 0015): with a local member and a peer
+    /// member in the same group, the round-robin alternates — the local member is
+    /// delivered to directly, and the remote pick goes out as a targeted
+    /// `SharedDeliver` to the peer.
+    #[tokio::test]
+    async fn shared_selection_round_robins_local_and_remote_member() {
+        let tx = start_hub();
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        // A local member, and a member on peer "n", in the same group.
+        let (mut ra, _) = attach(&tx, "ra", 1, true).await;
+        subscribe(&tx, "ra", "$share/g/t");
+        remote_shared_interest(&tx, "n", "g", "t", &["rb"]);
+
+        // First publish: the local member (cursor 0) is delivered to directly.
+        publish(&tx, "t", b"m1");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m1");
+
+        // Second publish: the remote member (cursor 1) goes out as a SharedDeliver.
+        publish(&tx, "t", b"m2");
+        match next_shared_deliver(&mut peer).await {
+            PeerMessage::SharedDeliver {
+                client,
+                topic,
+                payload,
+                ..
+            } => {
+                assert_eq!(client, "rb");
+                assert_eq!(topic, "t");
+                assert_eq!(&payload[..], b"m2");
+            }
+            other => panic!("expected SharedDeliver, got {other:?}"),
+        }
+        // The local member must not also have received the second publish.
+        assert!(
+            recv_packet(&mut ra).await.is_none(),
+            "single delivery per publish"
         );
     }
 

@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 /// Maximum size of a single peer frame body, to bound memory from a bad peer.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Wire form of a shared-subscription membership snapshot (ADR 0015 §2): each entry
+/// is `(ShareName, filter, [(client id, granted QoS u8)])`.
+pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8)>)>;
+
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
@@ -44,6 +48,26 @@ pub enum PeerMessage {
         /// Whether the message was published with the retain flag. Retained
         /// state is not replicated yet (Phase 3); carried for the wire format.
         retain: bool,
+    },
+    /// A full snapshot of the sender's shared-subscription membership (ADR 0015 §2),
+    /// so the receiver can select one member per group across the whole cluster.
+    /// Sent on the same triggers as [`Interest`](PeerMessage::Interest).
+    SharedInterest {
+        /// Each shared group: `(ShareName, filter, [(client id, granted QoS u8)])`.
+        groups: SharedGroupsWire,
+    },
+    /// A targeted shared-subscription delivery (ADR 0015 §1): the sending node chose
+    /// this `client` (a member on the receiver) for a shared group; the receiver
+    /// delivers to exactly that client, with no further selection.
+    SharedDeliver {
+        /// The chosen group member on the receiving node.
+        client: String,
+        /// Destination topic (no wildcards).
+        topic: String,
+        /// Application payload.
+        payload: Vec<u8>,
+        /// Already-downgraded delivery `QoS` as its 2-bit wire value.
+        qos: u8,
     },
     /// First frame of a **session proxy** (ADR 0005): instead of a peer link,
     /// this connection relocates a persistent client session to its placement
@@ -194,6 +218,19 @@ mod tests {
             payload: b"21.5C".to_vec(),
             qos: 1,
             retain: false,
+        });
+        roundtrip(&PeerMessage::SharedInterest {
+            groups: vec![(
+                "grp".into(),
+                "t/+".into(),
+                vec![("c1".into(), 1), ("c2".into(), 0)],
+            )],
+        });
+        roundtrip(&PeerMessage::SharedDeliver {
+            client: "c1".into(),
+            topic: "t/x".into(),
+            payload: b"hi".to_vec(),
+            qos: 2,
         });
         roundtrip(&PeerMessage::ProxyHello {
             identity: Some("device-7".into()),

@@ -56,42 +56,53 @@ async fn qos1_is_delivered_and_acked_across_nodes() {
 }
 
 #[tokio::test]
-async fn shared_subscription_delivers_once_per_node() {
+async fn shared_subscription_delivers_once_cluster_wide() {
     let (a, b) = start_two_node_cluster().await;
-    // One member of the same shared group on each node.
+    // One member of the same shared group on each node. The publisher is on A.
     let mut sub_a = Client::connect_v5_ok(a, "share-a").await;
     sub_a.subscribe(1, "$share/g/t", QoS::AtMostOnce).await;
     let mut sub_b = Client::connect_v5_ok(b, "share-b").await;
     sub_b.subscribe(1, "$share/g/t", QoS::AtMostOnce).await;
-
     let mut pubr = Client::connect_v5_ok(a, "share-pub").await;
 
-    // Publish repeatedly until both members have received at least once. The point
-    // is that the message reaches a member on *each* node (one-per-node), not
-    // exactly one cluster-wide (ADR 0010 §5).
-    let (mut got_a, mut got_b) = (false, false);
+    // Membership is gossiped to A eventually; retry until A has B's member in its
+    // global view, proven by B receiving a publish. Each publish must reach exactly
+    // ONE member cluster-wide (ADR 0015) — never both nodes for the same message.
+    let mut reached_b = false;
     for attempt in 0..50 {
         pubr.publish("t", b"x", QoS::AtMostOnce, None, vec![]).await;
-        if let Some(Packet::Publish(p)) = sub_a.try_recv().await {
-            assert_eq!(&p.payload[..], b"x");
-            got_a = true;
-        }
-        if let Some(Packet::Publish(p)) = sub_b.try_recv().await {
-            assert_eq!(&p.payload[..], b"x");
-            got_b = true;
-        }
-        if got_a && got_b {
+        let got_a = sub_a.try_recv().await.is_some();
+        let got_b = sub_b.try_recv().await.is_some();
+        assert!(
+            !(got_a && got_b),
+            "a single shared publish must not reach members on both nodes"
+        );
+        if got_b {
+            reached_b = true;
             break;
         }
         assert!(
             attempt < 49,
-            "shared members did not both receive (got_a={got_a}, got_b={got_b})"
+            "B's shared member never entered A's global view"
         );
     }
     assert!(
-        got_a && got_b,
-        "a shared publish reaches one member on every node"
+        reached_b,
+        "the global round-robin selected the remote member"
     );
+
+    // And once more, confirm A's local member can also be the sole recipient: keep
+    // publishing until A receives, again never both at once.
+    for attempt in 0..50 {
+        pubr.publish("t", b"y", QoS::AtMostOnce, None, vec![]).await;
+        let got_a = sub_a.try_recv().await.is_some();
+        let got_b = sub_b.try_recv().await.is_some();
+        assert!(!(got_a && got_b), "still at most one recipient per publish");
+        if got_a {
+            return;
+        }
+        assert!(attempt < 49, "A's local member was never selected");
+    }
 }
 
 #[tokio::test]

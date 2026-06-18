@@ -1,11 +1,11 @@
-//! Shared-subscription registry (ADR 0010): named groups of sessions over which
-//! a matching message is delivered to exactly **one** member, round-robin.
+//! Shared-subscription registry (ADR 0010): named groups of sessions over which a
+//! matching message is delivered to exactly **one** member.
 //!
-//! This is a pure, runtime-agnostic structure. It owns group membership and the
-//! round-robin cursor; it does **not** know which members are online — selecting
-//! the actual recipient (online-preference, offline fallback) is the hub's job, so
-//! `rotations` hands back each matching group's members in rotated priority order
-//! and lets the caller pick.
+//! This is a pure, runtime-agnostic structure that owns only this node's group
+//! membership. It does **not** select the recipient or hold a round-robin cursor:
+//! cluster-wide selection (combining this membership with peers', preferring online
+//! members, advancing the cursor) is the hub's job (ADR 0015), so the table just
+//! reports matching groups and their members via [`SharedSubscriptionTable::matching`].
 
 use crate::{topic_matches, ClientId, QoS, TopicFilter};
 use std::collections::HashMap;
@@ -34,18 +34,23 @@ pub fn is_shared_filter(filter: &str) -> bool {
     filter.starts_with("$share/")
 }
 
-/// A single shared group: its members (with granted `QoS`) in insertion order,
-/// plus the round-robin cursor pointing at the next member to prefer.
-#[derive(Debug, Default)]
-struct Group {
-    members: Vec<(ClientId, QoS)>,
-    cursor: usize,
+/// One shared group: its `(ShareName, filter)` and members (with granted `QoS`) in
+/// insertion order. Round-robin selection lives in the hub, which combines this
+/// local membership with members gossiped from peers (ADR 0015).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedGroup {
+    /// The share name.
+    pub group: String,
+    /// The underlying topic filter.
+    pub filter: TopicFilter,
+    /// Members and their granted `QoS`, in insertion order.
+    pub members: Vec<(ClientId, QoS)>,
 }
 
-/// Maps `(ShareName, filter)` to the group of sessions sharing it.
+/// Maps `(ShareName, filter)` to its ordered members.
 #[derive(Debug, Default)]
 pub struct SharedSubscriptionTable {
-    groups: HashMap<(String, TopicFilter), Group>,
+    groups: HashMap<(String, TopicFilter), Vec<(ClientId, QoS)>>,
 }
 
 impl SharedSubscriptionTable {
@@ -57,25 +62,25 @@ impl SharedSubscriptionTable {
 
     /// Add `client` to the `(group, filter)` shared subscription at `max_qos`.
     /// Re-subscribing updates the granted `QoS` in place and keeps the member's
-    /// position (so the rotation is stable).
+    /// insertion position.
     pub fn subscribe(&mut self, client: ClientId, group: &str, filter: &str, max_qos: QoS) {
-        let g = self
+        let members = self
             .groups
             .entry((group.to_string(), filter.to_string()))
             .or_default();
-        if let Some(m) = g.members.iter_mut().find(|(c, _)| *c == client) {
+        if let Some(m) = members.iter_mut().find(|(c, _)| *c == client) {
             m.1 = max_qos;
         } else {
-            g.members.push((client, max_qos));
+            members.push((client, max_qos));
         }
     }
 
     /// Remove `client` from one `(group, filter)` shared subscription.
     pub fn unsubscribe(&mut self, client: &ClientId, group: &str, filter: &str) {
         let key = (group.to_string(), filter.to_string());
-        if let Some(g) = self.groups.get_mut(&key) {
-            remove_member(g, client);
-            if g.members.is_empty() {
+        if let Some(members) = self.groups.get_mut(&key) {
+            members.retain(|(c, _)| c != client);
+            if members.is_empty() {
                 self.groups.remove(&key);
             }
         }
@@ -83,74 +88,45 @@ impl SharedSubscriptionTable {
 
     /// Remove `client` from every shared group (called on disconnect/discard).
     pub fn remove_client(&mut self, client: &ClientId) {
-        self.groups.retain(|_, g| {
-            remove_member(g, client);
-            !g.members.is_empty()
+        self.groups.retain(|_, members| {
+            members.retain(|(c, _)| c != client);
+            !members.is_empty()
         });
     }
 
-    /// For every group whose `{filter}` matches `topic`, advance that group's
-    /// round-robin cursor by one and return its members in rotated priority order
-    /// (the newly-selected member first). The caller picks the first reachable one.
-    ///
-    /// Each returned `Vec` is one group; the outer order is unspecified.
-    pub fn rotations(&mut self, topic: &str) -> Vec<Vec<(ClientId, QoS)>> {
-        let mut out = Vec::new();
-        for ((_, filter), g) in &mut self.groups {
-            if !topic_matches(filter, topic) {
-                continue;
-            }
-            let n = g.members.len();
-            debug_assert!(n > 0, "empty groups are pruned on unsubscribe/remove");
-            let start = g.cursor % n;
-            // Advance for the next match so successive deliveries rotate.
-            g.cursor = (start + 1) % n;
-            let rotated = g
-                .members
-                .iter()
-                .cycle()
-                .skip(start)
-                .take(n)
-                .cloned()
-                .collect();
-            out.push(rotated);
-        }
-        out
+    /// Every group whose `{filter}` matches `topic`, with its members. The hub
+    /// merges these with peer members and selects one per group (ADR 0015).
+    #[must_use]
+    pub fn matching(&self, topic: &str) -> Vec<SharedGroup> {
+        self.groups
+            .iter()
+            .filter(|((_, filter), _)| topic_matches(filter, topic))
+            .map(|((group, filter), members)| SharedGroup {
+                group: group.clone(),
+                filter: filter.clone(),
+                members: members.clone(),
+            })
+            .collect()
     }
 
-    /// The distinct underlying `{filter}` parts across all groups, for the cluster
-    /// interest snapshot — peers route matching publishes to us by topic filter.
+    /// Every shared group with its members — the snapshot gossiped to peers so they
+    /// know this node's shared membership (ADR 0015 §2).
     #[must_use]
-    pub fn filters(&self) -> Vec<TopicFilter> {
-        let mut seen: Vec<TopicFilter> = Vec::new();
-        for (_, filter) in self.groups.keys() {
-            if !seen.contains(filter) {
-                seen.push(filter.clone());
-            }
-        }
-        seen
+    pub fn snapshot(&self) -> Vec<SharedGroup> {
+        self.groups
+            .iter()
+            .map(|((group, filter), members)| SharedGroup {
+                group: group.clone(),
+                filter: filter.clone(),
+                members: members.clone(),
+            })
+            .collect()
     }
 
     /// Number of distinct shared groups currently registered.
     #[must_use]
     pub fn group_count(&self) -> usize {
         self.groups.len()
-    }
-}
-
-/// Remove a member from a group, keeping the cursor pointing at the same logical
-/// position so the rotation does not skip or repeat after a departure.
-fn remove_member(g: &mut Group, client: &ClientId) {
-    if let Some(idx) = g.members.iter().position(|(c, _)| c == client) {
-        g.members.remove(idx);
-        if g.members.is_empty() {
-            g.cursor = 0;
-        } else {
-            if idx < g.cursor {
-                g.cursor -= 1;
-            }
-            g.cursor %= g.members.len();
-        }
     }
 }
 
@@ -163,11 +139,16 @@ mod tests {
         ClientId(s.to_string())
     }
 
-    fn picks(t: &mut SharedSubscriptionTable, topic: &str) -> Vec<String> {
-        t.rotations(topic)
-            .into_iter()
-            .map(|g| g[0].0 .0.clone())
-            .collect()
+    /// Member client ids of the single group matching `topic`, sorted.
+    fn member_ids(t: &SharedSubscriptionTable, topic: &str) -> Vec<String> {
+        let groups = t.matching(topic);
+        assert!(groups.len() <= 1, "tests use one matching group");
+        let mut ids: Vec<String> = groups
+            .first()
+            .map(|g| g.members.iter().map(|(c, _)| c.0.clone()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
     }
 
     #[test]
@@ -191,50 +172,42 @@ mod tests {
     }
 
     #[test]
-    fn delivers_to_one_member_round_robin() {
+    fn matching_reports_group_members_in_order_with_qos() {
         let mut t = SharedSubscriptionTable::new();
-        t.subscribe(cid("a"), "grp", "t/+", QoS::AtMostOnce);
-        t.subscribe(cid("b"), "grp", "t/+", QoS::AtMostOnce);
-        t.subscribe(cid("c"), "grp", "t/+", QoS::AtMostOnce);
+        t.subscribe(cid("a"), "grp", "t/+", QoS::AtLeastOnce);
+        t.subscribe(cid("b"), "grp", "t/+", QoS::AtLeastOnce);
         assert_eq!(t.group_count(), 1);
 
-        // One group matches, so each call yields exactly one rotation, and the
-        // preferred member cycles a -> b -> c -> a.
-        assert_eq!(picks(&mut t, "t/x"), vec!["a"]);
-        assert_eq!(picks(&mut t, "t/x"), vec!["b"]);
-        assert_eq!(picks(&mut t, "t/x"), vec!["c"]);
-        assert_eq!(picks(&mut t, "t/x"), vec!["a"]);
+        let groups = t.matching("t/x");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "grp");
+        assert_eq!(groups[0].filter, "t/+");
+        // Members are reported in insertion order, with granted QoS — the hub does
+        // the round-robin selection over this list (ADR 0015).
+        assert_eq!(groups[0].members[0], (cid("a"), QoS::AtLeastOnce));
+        assert_eq!(groups[0].members[1], (cid("b"), QoS::AtLeastOnce));
     }
 
     #[test]
-    fn rotation_lists_all_members_for_offline_fallback() {
-        let mut t = SharedSubscriptionTable::new();
-        t.subscribe(cid("a"), "grp", "t", QoS::AtLeastOnce);
-        t.subscribe(cid("b"), "grp", "t", QoS::AtLeastOnce);
-        let rot = t.rotations("t");
-        assert_eq!(rot.len(), 1);
-        // The full membership is returned (preferred first) so the hub can fall
-        // back past an offline member; QoS rides along.
-        assert_eq!(rot[0].len(), 2);
-        assert_eq!(rot[0][0], (cid("a"), QoS::AtLeastOnce));
-        assert_eq!(rot[0][1], (cid("b"), QoS::AtLeastOnce));
-    }
-
-    #[test]
-    fn distinct_groups_each_get_one_delivery() {
+    fn distinct_groups_are_reported_separately() {
         let mut t = SharedSubscriptionTable::new();
         t.subscribe(cid("a"), "g1", "t", QoS::AtMostOnce);
         t.subscribe(cid("b"), "g2", "t", QoS::AtMostOnce);
-        let mut chosen = picks(&mut t, "t");
-        chosen.sort();
-        assert_eq!(chosen, vec!["a", "b"], "one per group");
+        let mut ids: Vec<String> = t
+            .matching("t")
+            .iter()
+            .flat_map(|g| g.members.iter().map(|(c, _)| c.0.clone()))
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"], "both groups match");
+        assert_eq!(t.matching("t").len(), 2);
     }
 
     #[test]
     fn non_matching_topic_yields_nothing() {
         let mut t = SharedSubscriptionTable::new();
         t.subscribe(cid("a"), "grp", "t/+", QoS::AtMostOnce);
-        assert!(t.rotations("other").is_empty());
+        assert!(t.matching("other").is_empty());
     }
 
     #[test]
@@ -243,26 +216,10 @@ mod tests {
         t.subscribe(cid("a"), "grp", "t", QoS::AtMostOnce);
         t.subscribe(cid("b"), "grp", "t", QoS::AtMostOnce);
         t.unsubscribe(&cid("a"), "grp", "t");
-        assert_eq!(picks(&mut t, "t"), vec!["b"]);
+        assert_eq!(member_ids(&t, "t"), vec!["b"]);
         t.remove_client(&cid("b"));
         assert_eq!(t.group_count(), 0);
-        assert!(t.rotations("t").is_empty());
-    }
-
-    /// Removing the member the cursor points at (or one before it) must not make
-    /// the rotation skip the survivor.
-    #[test]
-    fn removal_keeps_rotation_stable() {
-        let mut t = SharedSubscriptionTable::new();
-        t.subscribe(cid("a"), "g", "t", QoS::AtMostOnce);
-        t.subscribe(cid("b"), "g", "t", QoS::AtMostOnce);
-        t.subscribe(cid("c"), "g", "t", QoS::AtMostOnce);
-        assert_eq!(picks(&mut t, "t"), vec!["a"]); // cursor now at b
-        t.unsubscribe(&cid("a"), "g", "t"); // remove before cursor
-                                            // b is still next, then c, then b again.
-        assert_eq!(picks(&mut t, "t"), vec!["b"]);
-        assert_eq!(picks(&mut t, "t"), vec!["c"]);
-        assert_eq!(picks(&mut t, "t"), vec!["b"]);
+        assert!(t.matching("t").is_empty());
     }
 
     #[test]
@@ -270,19 +227,23 @@ mod tests {
         let mut t = SharedSubscriptionTable::new();
         t.subscribe(cid("a"), "g", "t", QoS::AtMostOnce);
         t.subscribe(cid("a"), "g", "t", QoS::ExactlyOnce);
-        let rot = t.rotations("t");
-        assert_eq!(rot[0].len(), 1, "still one member");
-        assert_eq!(rot[0][0].1, QoS::ExactlyOnce, "QoS updated");
+        let groups = t.matching("t");
+        assert_eq!(groups[0].members.len(), 1, "still one member");
+        assert_eq!(groups[0].members[0].1, QoS::ExactlyOnce, "QoS updated");
     }
 
     #[test]
-    fn filters_are_distinct_underlying_topics() {
+    fn snapshot_lists_every_group_with_members() {
         let mut t = SharedSubscriptionTable::new();
         t.subscribe(cid("a"), "g1", "t/+", QoS::AtMostOnce);
-        t.subscribe(cid("b"), "g2", "t/+", QoS::AtMostOnce);
-        t.subscribe(cid("c"), "g1", "other", QoS::AtMostOnce);
-        let mut f = t.filters();
-        f.sort();
-        assert_eq!(f, vec!["other".to_string(), "t/+".to_string()]);
+        t.subscribe(cid("b"), "g2", "other", QoS::AtLeastOnce);
+        let mut snap = t.snapshot();
+        snap.sort_by(|x, y| x.group.cmp(&y.group));
+        assert_eq!(snap.len(), 2);
+        assert_eq!(
+            (snap[0].group.as_str(), snap[0].filter.as_str()),
+            ("g1", "t/+")
+        );
+        assert_eq!(snap[1].members, vec![(cid("b"), QoS::AtLeastOnce)]);
     }
 }

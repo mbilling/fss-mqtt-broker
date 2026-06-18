@@ -370,6 +370,41 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 retain,
             });
         }
+        PeerMessage::SharedInterest { groups } => {
+            let groups = groups
+                .into_iter()
+                .map(|(group, filter, members)| mqtt_core::SharedGroup {
+                    group,
+                    filter,
+                    members: members
+                        .into_iter()
+                        .map(|(c, q)| {
+                            (
+                                mqtt_core::ClientId(c),
+                                mqtt_codec::QoS::from_u8(q).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect();
+            let _ = hub.send(HubCommand::RemoteSharedInterest {
+                node: remote.clone(),
+                groups,
+            });
+        }
+        PeerMessage::SharedDeliver {
+            client,
+            topic,
+            payload,
+            qos,
+        } => {
+            let _ = hub.send(HubCommand::RemoteSharedDeliver {
+                client: mqtt_core::ClientId(client),
+                topic,
+                payload: payload.into(),
+                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+            });
+        }
         PeerMessage::Hello { .. } => {
             warn!("unexpected duplicate Hello on established peer link");
         }

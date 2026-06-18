@@ -336,9 +336,9 @@ for completeness and sequencing.
 - **Shared subscriptions** (`$share/<group>/<filter>`) — done (ADR 0010): named
   groups with round-robin, online-preferring single delivery; reuses the QoS,
   persistence, and expiry machinery; retained messages are not replayed to a
-  shared subscription. Carried limitation: cross-node delivery is one-per-node,
-  not cluster-wide — true cluster-wide single delivery is deferred to the
-  placement/ownership work (ADR 0005).
+  shared subscription. **Cluster-wide single delivery** done (ADR 0015): the
+  publishing node selects one member across gossiped global membership and targets
+  it directly, so a shared publish is delivered exactly once across the cluster.
 - **Topic aliases** — done (ADR 0011): negotiated per connection in both
   directions and resolved entirely at the connection edge, so routing, storage,
   and the cluster only ever see full topic names. We advertise an inbound maximum
