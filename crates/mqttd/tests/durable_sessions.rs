@@ -15,15 +15,18 @@
 //!
 //! **Known gap** (see `docs/TEST-PLAN.md`): a *persistent* client reconnecting to the
 //! **new owner after a takeover** stalls ~10s on its CONNACK and comes up with
-//! `session_present=false`. Root cause (diagnosed): the attach recovers the session's
-//! *meta* key (never written by the store-level test) from a quorum, but
-//! `placement.group_replica_set` returns a set that still includes the **dead owner**
-//! (excluding a live survivor), so the recovery read targets the dead node, times out
-//! (`rpc_timeout`), and fails `NoQuorum` — twice (`ensure_session` + `subscriptions`).
-//! The store-level recovery (queue key) succeeds because it recovered while a live
-//! quorum was reachable. Fix belongs in the placement replica-set / membership
-//! convergence, not here; the recovery read was made concurrent (`cluster_store`) so
-//! it no longer *serializes* dead-replica timeouts, but it still needs a live quorum.
+//! `session_present=false`. Root cause (diagnosed end to end): the attach recovers the
+//! session's *meta* key (never written by the store-level test) from a quorum, but the
+//! new owner's `placement.members()` is momentarily **wrong** — it still lists the
+//! killed node (resurrected as Suspect/Alive by stale gossip) and has dropped a live
+//! survivor — so `group_replica_set` yields a set with no live quorum. The recovery
+//! read targets the dead node, times out (`rpc_timeout`), and fails `NoQuorum`. The
+//! placement *logic* is correct; the **membership feeding it flaps** under the heavy
+//! multi-node durable test. The real fix is SWIM membership stability (dead-node
+//! fencing via incarnation, refutation of false suspicion) — a substantial,
+//! higher-risk effort tracked separately, not a placement tweak. (The recovery read
+//! was already made concurrent in `cluster_store`, removing serial dead-replica
+//! timeouts when a live quorum *is* reachable.)
 
 mod common;
 

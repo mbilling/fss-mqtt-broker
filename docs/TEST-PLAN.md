@@ -122,16 +122,19 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ replica serves session after owner dies — quorum-durable message survives at the store layer (`durable_sessions`)
 - ☑ a durable node serves ordinary MQTT clients (clean + persistent) through its hub (`durable_sessions`)
 - ☑ partition + heal → routing reconverges (severed link, delivery resumes) (`cluster_chaos`)
-- 🔴 **Known gap (diagnosed):** client-observable durable failover — a *persistent*
-  client reconnecting to the **new owner after takeover** stalls ~10s on CONNACK and
-  comes up `session_present=false`. Root cause: attach recovers the session's *meta*
-  key from a quorum, but `placement.group_replica_set` returns a set still containing
-  the **dead owner** (excluding a live survivor), so the recovery read targets the
-  dead node, times out (`rpc_timeout` × 2 = ~10s), and fails `NoQuorum`. The
-  store-level queue recovery works because it ran while a live quorum was reachable.
-  **Fix:** correct the placement replica-set / membership convergence so a group's
-  recovery set tracks live members. (The recovery read was made concurrent so it no
-  longer serializes dead-replica timeouts, but it still needs a reachable live quorum.)
+- 🔴 **Known gap (diagnosed to root):** client-observable durable failover — a
+  *persistent* client reconnecting to the **new owner after takeover** stalls ~10s on
+  CONNACK and comes up `session_present=false`. Chased it end to end: attach recovers
+  the session's *meta* key from a quorum, but the new owner's `placement.members()` is
+  momentarily **wrong** — it still lists the killed node (resurrected as Suspect/Alive
+  by stale gossip) and has dropped a live survivor — so the recovery replica set has
+  no live quorum, the read targets the dead node, times out (`rpc_timeout` × 2 = ~10s),
+  and fails `NoQuorum`. The **placement and recovery logic are correct**; the
+  membership feeding them **flaps** under the heavy durable test. **Real fix:** SWIM
+  membership stability — fence a killed node from resurrection (incarnation numbers)
+  and refute false suspicion of live nodes. A substantial, higher-risk membership-
+  protocol effort, deliberately *not* attempted as a reactive change. The recovery
+  read was made concurrent (`cluster_store`) as a related robustness win.
 - ☐ session takeover across nodes (relocation) with messages in flight (blocked by the gap above)
 
 ## Conventions
