@@ -81,12 +81,14 @@ released only at PUBCOMP, matching the spec's "until PUBCOMP" rule.
   honours a client's advertised Receive Maximum; persistent backlog survives
   reconnect via the existing offline queue; reuses the in-flight table and ack paths
   with no new wire state.
-- **Cost / limits:** the backlog is in memory while the client is online (bounded in
-  practice by consumer lag; an explicit cap with an overload policy mirrors the
-  offline queue and can follow); a held backlog entry forwards its Message Expiry
-  Interval as captured at enqueue, so a long hold slightly over-states the remaining
-  lifetime (ADR 0009); the inbound direction is advertised but not strictly enforced
-  (§3), pending the reason-code work.
+- **Cost / limits:** the backlog is held in memory while the client is online, so it
+  is **bounded** by `MAX_BACKLOG` with a drop-oldest overflow policy (mirroring the
+  offline queue, ADR 0001 §6) — a stalled `QoS` > 0 consumer cannot force unbounded
+  memory; the trade is that a consumer lagging past the cap loses its oldest held
+  messages (logged). A held backlog entry forwards its Message Expiry Interval as
+  captured at enqueue, so a long hold slightly over-states the remaining lifetime
+  (ADR 0009); the inbound direction is advertised but not strictly enforced (§3),
+  pending the reason-code work.
 
 ## Alternatives considered
 

@@ -56,6 +56,11 @@ const REPLAY_LIMIT: usize = 10_000;
 /// unlimited (ADR 0012). v3.1.1 sessions always use this.
 const RECEIVE_MAXIMUM_DEFAULT: u16 = u16::MAX;
 
+/// Maximum `QoS` > 0 messages held in a session's flow-control backlog before
+/// drop-oldest evicts (ADR 0012). Bounds broker memory under a stalled consumer,
+/// mirroring the offline-queue cap (ADR 0001 §6).
+const MAX_BACKLOG: usize = 10_000;
+
 /// How often the hub sweeps for sessions whose MQTT 5.0 Session Expiry Interval has
 /// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -167,6 +172,17 @@ impl Inflight {
     /// Whether the `QoS` > 0 in-flight quota is exhausted (ADR 0012).
     fn quota_full(&self) -> bool {
         self.pending.len() >= self.receive_maximum as usize
+    }
+
+    /// Append to the flow-control backlog, evicting the oldest entry when the cap is
+    /// reached (drop-oldest, ADR 0012). Returns `true` if a message was evicted.
+    fn push_backlog(&mut self, entry: Backlog) -> bool {
+        let evicted = self.backlog.len() >= MAX_BACKLOG;
+        if evicted {
+            self.backlog.pop_front();
+        }
+        self.backlog.push_back(entry);
+        evicted
     }
 }
 
@@ -1030,43 +1046,38 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
     ) {
-        match message.qos {
-            QoS::AtMostOnce => {
-                // Ignore send errors: a closed channel means the client is gone
-                // and a Detach is already in flight.
-                let _ = tx.send(publish_packet(
-                    &message.topic,
-                    message.payload.clone(),
-                    QoS::AtMostOnce,
-                    None,
-                    false,
-                    retain,
-                    message_expiry,
-                ));
+        if message.qos == QoS::AtMostOnce {
+            // Ignore send errors: a closed channel means the client is gone and a
+            // Detach is already in flight.
+            let _ = tx.send(publish_packet(
+                &message.topic,
+                message.payload.clone(),
+                QoS::AtMostOnce,
+                None,
+                false,
+                retain,
+                message_expiry,
+            ));
+            return;
+        }
+
+        // QoS > 0: respect the client's Receive Maximum (ADR 0012). If the quota is
+        // full, hold the message until a PUBACK/PUBCOMP drains it; otherwise send now.
+        let inf = self.inflight.entry(client.clone()).or_default();
+        if inf.quota_full() {
+            // The backlog is bounded (ADR 0012); drop-oldest on overflow so a stalled
+            // consumer cannot force unbounded memory.
+            let evicted = inf.push_backlog(Backlog {
+                message: message.clone(),
+                retain,
+                message_expiry,
+            });
+            if evicted {
+                warn!(client = %client.0, cap = MAX_BACKLOG,
+                      "flow-control backlog full: evicted oldest message");
             }
-            _ => {
-                // QoS > 0: respect the client's Receive Maximum (ADR 0012). If the
-                // quota is full, hold the message in the backlog; a PUBACK/PUBCOMP
-                // will drain it later. Otherwise send it now.
-                if self
-                    .inflight
-                    .entry(client.clone())
-                    .or_default()
-                    .quota_full()
-                {
-                    self.inflight
-                        .entry(client.clone())
-                        .or_default()
-                        .backlog
-                        .push_back(Backlog {
-                            message: message.clone(),
-                            retain,
-                            message_expiry,
-                        });
-                } else {
-                    self.send_qos_publish(client, tx, message, retain, message_expiry);
-                }
-            }
+        } else {
+            self.send_qos_publish(client, tx, message, retain, message_expiry);
         }
     }
 
@@ -1493,7 +1504,9 @@ fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hub, HubCommand, Outbound, PeerOutbound, REPLAY_LIMIT};
+    use super::{
+        Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound, MAX_BACKLOG, REPLAY_LIMIT,
+    };
     use bytes::Bytes;
     use mqtt_cluster::peer::PeerMessage;
     use mqtt_cluster::NodeId;
@@ -1929,6 +1942,41 @@ mod tests {
             remaining > 0 && remaining <= 3600,
             "remaining interval within bounds: {remaining}"
         );
+    }
+
+    /// The flow-control backlog is bounded: past the cap it drops the oldest held
+    /// message rather than growing without limit (ADR 0012).
+    #[test]
+    fn flow_control_backlog_is_bounded_drop_oldest() {
+        let mut inf = Inflight::default();
+        let entry = |topic: String| Backlog {
+            message: mqtt_core::Message {
+                topic,
+                payload: Bytes::from_static(b"x"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+            },
+            retain: false,
+            message_expiry: None,
+        };
+        for i in 0..MAX_BACKLOG {
+            assert!(
+                !inf.push_backlog(entry(format!("t{i}"))),
+                "no eviction under the cap"
+            );
+        }
+        // At the cap, the next push evicts the oldest (t0) and stays bounded.
+        assert!(
+            inf.push_backlog(entry("overflow".into())),
+            "eviction at the cap"
+        );
+        assert_eq!(inf.backlog.len(), MAX_BACKLOG, "backlog stays bounded");
+        assert_eq!(
+            inf.backlog.front().unwrap().message.topic,
+            "t1",
+            "oldest was dropped"
+        );
+        assert_eq!(inf.backlog.back().unwrap().message.topic, "overflow");
     }
 
     /// Receive Maximum bounds in-flight `QoS` > 0 deliveries: with a quota of 1, the

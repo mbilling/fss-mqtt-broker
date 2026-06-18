@@ -111,9 +111,9 @@ Legend: ☐ missing · ☑ covered (file).
 
 **Resource / abuse**:
 - ☑ offline-queue overflow → drop-oldest observed downstream (`resource_limits`)
-- ☐ flow-control backlog under a stalled consumer (documents unbounded-in-memory limit)
+- ☑ flow-control backlog is bounded (drop-oldest) under a stalled consumer (`hub` unit, ADR 0012)
 - ☑ idle client reaped by keepalive (3.1.1, `keepalive_lwt`); ☐ same under v5
-- ☐ client connects but never sends CONNECT; dribble/slow-loris bytes
+- ☑ client connects but never sends CONNECT; ☑ half-sent CONNECT stall (`protocol_violations`, connect deadline)
 
 **Process-level**:
 - ☑ the real `mqttd` binary serves a plaintext pub/sub round-trip (`binary_smoke`)
