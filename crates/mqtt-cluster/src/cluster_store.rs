@@ -243,14 +243,27 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries(key)];
-        let mut have = 1;
-        for replica in replica_set.iter().filter(|n| **n != self.local) {
-            if let Some(entries) = self.transport.read_replica(replica, key).await {
-                reads.push(entries);
-                have += 1;
+        // Read peers **concurrently** (like the append fan-out) and stop as soon as a
+        // quorum has responded, so a slow or just-died replica's RPC timeout does not
+        // serialize recovery when quorum is reachable from faster replicas.
+        if reads.len() < quorum {
+            let mut inflight = tokio::task::JoinSet::new();
+            for replica in replica_set.iter().filter(|n| **n != self.local) {
+                let transport = self.transport.clone();
+                let replica = replica.clone();
+                let key = key.to_string();
+                inflight.spawn(async move { transport.read_replica(&replica, &key).await });
+            }
+            while reads.len() < quorum {
+                match inflight.join_next().await {
+                    Some(Ok(Some(entries))) => reads.push(entries),
+                    // A replica that did not respond (or a join error): keep waiting.
+                    Some(Ok(None) | Err(_)) => {}
+                    None => break, // every replica reported; quorum not reached
+                }
             }
         }
-        if have < quorum {
+        if reads.len() < quorum {
             return Err(ReplError::NoQuorum);
         }
         Ok(merge_replica_logs(&reads))

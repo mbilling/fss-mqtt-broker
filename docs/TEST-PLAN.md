@@ -122,11 +122,16 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ replica serves session after owner dies — quorum-durable message survives at the store layer (`durable_sessions`)
 - ☑ a durable node serves ordinary MQTT clients (clean + persistent) through its hub (`durable_sessions`)
 - ☑ partition + heal → routing reconverges (severed link, delivery resumes) (`cluster_chaos`)
-- 🔴 **Known gap:** client-observable durable failover — a *persistent* client
-  reconnecting to the **new owner after takeover** never gets its CONNACK; the
-  attach-path durable session op does not resolve in that post-takeover state. The
-  store-level recovery works (above); wiring the takeover → client-serving path is a
-  durable-plane follow-up, not a test gap.
+- 🔴 **Known gap (diagnosed):** client-observable durable failover — a *persistent*
+  client reconnecting to the **new owner after takeover** stalls ~10s on CONNACK and
+  comes up `session_present=false`. Root cause: attach recovers the session's *meta*
+  key from a quorum, but `placement.group_replica_set` returns a set still containing
+  the **dead owner** (excluding a live survivor), so the recovery read targets the
+  dead node, times out (`rpc_timeout` × 2 = ~10s), and fails `NoQuorum`. The
+  store-level queue recovery works because it ran while a live quorum was reachable.
+  **Fix:** correct the placement replica-set / membership convergence so a group's
+  recovery set tracks live members. (The recovery read was made concurrent so it no
+  longer serializes dead-replica timeouts, but it still needs a reachable live quorum.)
 - ☐ session takeover across nodes (relocation) with messages in flight (blocked by the gap above)
 
 ## Conventions

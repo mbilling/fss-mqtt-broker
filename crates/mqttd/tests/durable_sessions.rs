@@ -11,10 +11,19 @@
 //! loss. (Serving the session *after* the owner dies is takeover, workstream F.)
 //!
 //! These also check that a durable node serves ordinary MQTT clients through its hub
-//! (`a_durable_node_serves_a_client_pubsub`). **Known gap** (see `docs/TEST-PLAN.md`):
-//! a *persistent* client reconnecting to the **new owner after a takeover** does not
-//! get its CONNACK — the attach-path durable session op does not resolve in that
-//! post-takeover state, so client-observable failover is not yet wired end to end.
+//! (`a_durable_node_serves_a_client_pubsub`).
+//!
+//! **Known gap** (see `docs/TEST-PLAN.md`): a *persistent* client reconnecting to the
+//! **new owner after a takeover** stalls ~10s on its CONNACK and comes up with
+//! `session_present=false`. Root cause (diagnosed): the attach recovers the session's
+//! *meta* key (never written by the store-level test) from a quorum, but
+//! `placement.group_replica_set` returns a set that still includes the **dead owner**
+//! (excluding a live survivor), so the recovery read targets the dead node, times out
+//! (`rpc_timeout`), and fails `NoQuorum` — twice (`ensure_session` + `subscriptions`).
+//! The store-level recovery (queue key) succeeds because it recovered while a live
+//! quorum was reachable. Fix belongs in the placement replica-set / membership
+//! convergence, not here; the recovery read was made concurrent (`cluster_store`) so
+//! it no longer *serializes* dead-replica timeouts, but it still needs a live quorum.
 
 mod common;
 
