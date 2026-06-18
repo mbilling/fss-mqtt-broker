@@ -130,11 +130,13 @@ Legend: ☐ missing · ☑ covered (file).
   by stale gossip) and has dropped a live survivor — so the recovery replica set has
   no live quorum, the read targets the dead node, times out (`rpc_timeout` × 2 = ~10s),
   and fails `NoQuorum`. The **placement and recovery logic are correct**; the
-  membership feeding them **flaps** under the heavy durable test. **Real fix:** SWIM
-  membership stability — fence a killed node from resurrection (incarnation numbers)
-  and refute false suspicion of live nodes. A substantial, higher-risk membership-
-  protocol effort, deliberately *not* attempted as a reactive change. The recovery
-  read was made concurrent (`cluster_store`) as a related robustness win.
+  membership feeding them **flaps** under the heavy durable test. **Real fix scoped in
+  [ADR 0016](adr/0016-swim-membership-stability.md):** tombstone `Dead` so a killed
+  node cannot be resurrected by stale gossip (phase 1), plus Lifeguard awareness +
+  multi-source suspicion so live nodes are not falsely evicted (phase 2). A
+  substantial, higher-risk membership-protocol effort, deliberately *not* attempted as
+  a reactive change; once it lands the client-observable failover test passes for free.
+  The recovery read was made concurrent (`cluster_store`) as a related robustness win.
 - ☐ session takeover across nodes (relocation) with messages in flight (blocked by the gap above)
 
 ## Conventions
