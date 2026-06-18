@@ -14,19 +14,25 @@
 //! (`a_durable_node_serves_a_client_pubsub`).
 //!
 //! **Known gap** (see `docs/TEST-PLAN.md`): a *persistent* client reconnecting to the
-//! **new owner after a takeover** stalls ~10s on its CONNACK and comes up with
-//! `session_present=false`. Root cause (diagnosed end to end): the attach recovers the
-//! session's *meta* key (never written by the store-level test) from a quorum, but the
-//! new owner's `placement.members()` is momentarily **wrong** — it still lists the
-//! killed node (resurrected as Suspect/Alive by stale gossip) and has dropped a live
-//! survivor — so `group_replica_set` yields a set with no live quorum. The recovery
-//! read targets the dead node, times out (`rpc_timeout`), and fails `NoQuorum`. The
-//! placement *logic* is correct; the **membership feeding it flaps** under the heavy
-//! multi-node durable test. The real fix is SWIM membership stability (dead-node
-//! fencing via incarnation, refutation of false suspicion) — a substantial,
-//! higher-risk effort tracked separately, not a placement tweak. (The recovery read
-//! was already made concurrent in `cluster_store`, removing serial dead-replica
-//! timeouts when a live quorum *is* reachable.)
+//! **new owner after a takeover** comes up with `session_present=false` instead of
+//! resuming its session. The diagnosis was refined once [ADR 0016](../../docs/adr/0016-swim-membership-stability.md)
+//! phase 1 (tombstone `Dead`) landed:
+//!
+//! 1. **Membership — fixed by phase 1.** Before tombstoning, the new owner's
+//!    `placement.members()` flapped to a wrong set (the killed node resurrected by
+//!    stale gossip, a live survivor dropped), so `group_replica_set` had no live
+//!    quorum and recovery read the dead node. With `Dead` tombstoned this is gone: the
+//!    new owner's replica set is now exactly the live survivors.
+//! 2. **Recovery — already correct.** With the right replica set, the store recovers
+//!    the session (meta + subscriptions) from a quorum of survivors in ~1s.
+//! 3. **Remaining blocker — the attach path, not SWIM.** During the ~1s before the
+//!    group's lease is reassigned to the new owner, `ensure_session` returns a
+//!    transient `NotOwner`, and the hub's attach swallows it
+//!    (`ensure_session(...).unwrap_or(false)`) — so a client reconnecting in that
+//!    window wrongly CONNACKs `session_present=false` (and starts a fresh session)
+//!    rather than waiting for the lease. Closing the client-observable gap needs the
+//!    attach path to treat a transient lease error as "not ready, retry", a separate
+//!    decision (it changes CONNACK latency semantics) tracked as a follow-up.
 
 mod common;
 

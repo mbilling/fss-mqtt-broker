@@ -21,4 +21,4 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0013](0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted (design); implementation phased |
 | [0014](0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted |
 | [0015](0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted |
-| [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted (design); implementation phased |
+| [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted; phase 1 implemented |

@@ -1,6 +1,6 @@
 # ADR 0016 — SWIM membership stability (dead-node fencing + false-positive resistance)
 
-- **Status:** Accepted (design); implementation phased
+- **Status:** Accepted; **phase 1 implemented** (2026-06-18); phase 2 pending
 - **Date:** 2026-06-18
 - **Deciders:** project maintainers
 - **Related:** [ADR 0003](0003-gossip-authentication.md) (SWIM datagram auth),
@@ -118,6 +118,35 @@ the durable failover (and any placement-derived routing) needs.
   (which becomes deterministic). A wrong change here can silently corrupt the
   durability guarantees, so it warrants its own focused workstream — not a reactive
   edit.
+
+## Update — phase 1 implemented (2026-06-18)
+
+Phase 1 (§1, tombstone `Dead`) is implemented in `swim.rs`, developed test-first on
+the pure state machine:
+
+- `Member.tombstone_deadline: Option<u64>`, set to `now + dead_ttl_ms` when a member
+  becomes `Dead`; while set, `apply_update` drops any non-`Dead` gossip about the
+  member regardless of incarnation; `tick` prunes expired tombstones.
+- Unit tests (a) a high-incarnation `Alive` after `Dead` does **not** revive, and
+  (b) a tombstone prunes after `dead_ttl_ms` and the id can rejoin.
+
+**Validated against the durable-failover scenario, and the diagnosis was refined.**
+With tombstoning, the new owner's membership after a takeover is now correct — the
+killed node is no longer resurrected into the replica set, the live survivor is
+present, and the store recovers the session (meta + subscriptions) from a quorum in
+~1s. So the **membership half of the gap is closed**, as designed.
+
+It does **not** make the client-observable failover test pass "for free" as the
+Consequences section optimistically claimed — that revealed a *separate* bug outside
+SWIM: during the ~1s before the group's lease is reassigned to the new owner,
+`ensure_session` returns a transient `NotOwner`, and the hub's attach path swallows it
+(`ensure_session(...).unwrap_or(false)`), so a client reconnecting in that window
+CONNACKs `session_present=false` and starts a fresh session instead of waiting for the
+lease. Closing the client-observable gap therefore needs an **attach-path** change
+(treat a transient lease error as "not ready, retry/wait"), which alters CONNACK
+latency semantics and warrants its own decision — tracked separately, not part of this
+ADR. Phase 2 (§2–§3) remains worthwhile to stop a *live* node being falsely evicted
+under load, but is not what blocks that test now.
 
 ## Alternatives considered
 
