@@ -32,6 +32,8 @@ fn swim_cfg() -> SwimConfig {
         protocol_period_ms: 150,
         ack_timeout_ms: 60,
         suspicion_timeout_ms: 500,
+        suspicion_min_timeout_ms: 200,
+        suspicion_confirmations: 3,
         dead_ttl_ms: 5000,
         indirect_probes: 2,
         gossip_fanout: 8,

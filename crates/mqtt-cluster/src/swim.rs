@@ -22,7 +22,7 @@
 
 use crate::NodeId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A node-controlled version counter used to order conflicting membership claims.
 pub type Incarnation = u64;
@@ -56,8 +56,18 @@ pub struct Config {
     pub protocol_period_ms: u64,
     /// How long to wait for a direct `Ack` before falling back to indirect probes.
     pub ack_timeout_ms: u64,
-    /// How long a member stays `Suspect` before being declared `Dead`.
+    /// How long a member stays `Suspect` before being declared `Dead` when only **one**
+    /// node suspects it (ADR 0016 §3). This is the *maximum* suspicion window; it shrinks
+    /// toward `suspicion_min_timeout_ms` as independent suspicions accumulate.
     pub suspicion_timeout_ms: u64,
+    /// The floor the suspicion window shrinks to once `suspicion_confirmations` distinct
+    /// nodes independently suspect the same peer (ADR 0016 §3). Clamped to be `<=`
+    /// `suspicion_timeout_ms`.
+    pub suspicion_min_timeout_ms: u64,
+    /// Number of **distinct** independent suspecters at which the suspicion window
+    /// reaches its floor (ADR 0016 §3). One prober alone holds the full window; the
+    /// window interpolates from max (1 suspecter) to min (this many). Treated as `>= 2`.
+    pub suspicion_confirmations: u8,
     /// How long a `Dead` member is kept as a tombstone (ADR 0016 phase 1): during this
     /// window no gossip can revive it, after which it is pruned and the id may rejoin.
     /// Set comfortably above the gossip drain time so a stale refutation cannot outlive
@@ -82,6 +92,8 @@ impl Default for Config {
             protocol_period_ms: 1000,
             ack_timeout_ms: 250,
             suspicion_timeout_ms: 4000,
+            suspicion_min_timeout_ms: 1500,
+            suspicion_confirmations: 3,
             dead_ttl_ms: 30_000,
             indirect_probes: 3,
             gossip_fanout: 6,
@@ -110,6 +122,10 @@ pub struct Member {
     /// When this member's `Dead` tombstone is pruned (ADR 0016 phase 1). `Some` iff
     /// the member is `Dead`; while set, gossip cannot revive the member.
     tombstone_deadline: Option<u64>,
+    /// Distinct nodes that independently suspect this member at its current incarnation
+    /// (ADR 0016 §3). Its size shrinks the effective suspicion window; reset whenever the
+    /// member's `(incarnation, state)` identity changes.
+    suspecters: HashSet<NodeId>,
 }
 
 /// A membership update disseminated via gossip.
@@ -125,6 +141,11 @@ pub struct Update {
     pub incarnation: Incarnation,
     /// Claimed state.
     pub state: MemberState,
+    /// For a `Suspect` claim, the id of the node asserting it (ADR 0016 §3), preserved
+    /// through re-broadcast so receivers can count **distinct** independent suspecters
+    /// of the same peer. `None` for `Alive`/`Dead` and for full-state relays.
+    #[serde(default)]
+    pub suspecter: Option<String>,
 }
 
 /// The kind of a SWIM datagram.
@@ -317,10 +338,26 @@ impl Swim {
         self.cfg.ack_timeout_ms * self.health_multiplier()
     }
 
-    /// `suspicion_timeout` scaled by local health: a degraded node holds a `Suspect`
-    /// longer before declaring `Dead`, giving the victim's refutation time to land.
-    fn scaled_suspicion_timeout(&self) -> u64 {
-        self.cfg.suspicion_timeout_ms * self.health_multiplier()
+    /// The effective suspicion window for `m` before it is declared `Dead`, combining
+    /// both Lifeguard mechanisms: it interpolates from `suspicion_timeout_ms` (one
+    /// suspecter) down to `suspicion_min_timeout_ms` as independent suspecters reach
+    /// `suspicion_confirmations` (§3), then is scaled by `(1 + awareness)` for local
+    /// health (§2). A single prober therefore holds the full window; only independent
+    /// confirmation fast-tracks `Dead`.
+    fn effective_suspicion_timeout(&self, m: &Member) -> u64 {
+        let max = self.cfg.suspicion_timeout_ms;
+        let min = self.cfg.suspicion_min_timeout_ms.min(max);
+        let k = u64::from(self.cfg.suspicion_confirmations).max(2);
+        let confirmations = m.suspecters.len() as u64;
+        let base = if confirmations <= 1 {
+            max
+        } else if confirmations >= k {
+            min
+        } else {
+            // Linear from max (1 suspecter) to min (k suspecters).
+            max - (max - min) * (confirmations - 1) / (k - 1)
+        };
+        base * self.health_multiplier()
     }
 
     /// Raise awareness (capped at `awareness_max`): a signal that *we* are the slow one
@@ -386,6 +423,7 @@ impl Swim {
                     peer_addr: self.local_peer_addr.clone(),
                     incarnation: self.incarnation,
                     state: MemberState::Alive,
+                    suspecter: None,
                 };
                 self.enqueue_gossip(refute);
                 // Having to refute ourselves signals we are the slow one (ADR 0016 §2).
@@ -403,18 +441,40 @@ impl Swim {
             if m.tombstone_deadline.is_some() && u.state != MemberState::Dead {
                 return;
             }
+            // Record an independent suspecter of the *current* incarnation even when the
+            // update does not supersede (a second node suspecting an already-`Suspect`
+            // peer) — this is how confirmations accumulate (ADR 0016 §3).
+            if u.state == MemberState::Suspect
+                && m.state == MemberState::Suspect
+                && u.incarnation == m.incarnation
+            {
+                if let Some(sus) = &u.suspecter {
+                    m.suspecters.insert(NodeId(sus.clone()));
+                }
+            }
             let supersedes = u.incarnation > m.incarnation
                 || (u.incarnation == m.incarnation && u.state.precedence() > m.state.precedence());
             if !supersedes {
                 return;
             }
             let changed = m.state != u.state;
+            let inc_advanced = u.incarnation > m.incarnation;
             m.incarnation = u.incarnation;
             m.addr.clone_from(&u.addr);
             // Never let a claimant that hasn't learned the routing address yet
             // erase one we already know.
             if !u.peer_addr.is_empty() {
                 m.peer_addr.clone_from(&u.peer_addr);
+            }
+            // The `(incarnation, state)` identity changed: reset the suspecter set,
+            // seeding it from this update if it is a fresh `Suspect` (ADR 0016 §3).
+            if changed || inc_advanced {
+                m.suspecters.clear();
+                if u.state == MemberState::Suspect {
+                    if let Some(sus) = &u.suspecter {
+                        m.suspecters.insert(NodeId(sus.clone()));
+                    }
+                }
             }
             if changed {
                 m.state = u.state;
@@ -446,6 +506,14 @@ impl Swim {
                     } else {
                         None
                     },
+                    suspecters: match (u.state, &u.suspecter) {
+                        (MemberState::Suspect, Some(sus)) => {
+                            let mut s = HashSet::new();
+                            s.insert(NodeId(sus.clone()));
+                            s
+                        }
+                        _ => HashSet::new(),
+                    },
                 },
             );
             out.push(Action::StateChange {
@@ -469,6 +537,13 @@ impl Swim {
             peer_addr: m.peer_addr.clone(),
             incarnation: m.incarnation,
             state,
+            // Stamp ourselves as the suspecter so independent suspicions are countable
+            // through re-broadcast (ADR 0016 §3).
+            suspecter: if state == MemberState::Suspect {
+                Some(self.local.0.clone())
+            } else {
+                None
+            },
         };
         self.apply_update(&update, now, out);
     }
@@ -550,7 +625,7 @@ impl Swim {
             .values()
             .filter(|m| {
                 m.state == MemberState::Suspect
-                    && now.saturating_sub(m.state_since) >= self.scaled_suspicion_timeout()
+                    && now.saturating_sub(m.state_since) >= self.effective_suspicion_timeout(m)
             })
             .map(|m| m.id.clone())
             .collect();
@@ -631,6 +706,7 @@ impl Swim {
                 peer_addr: msg.from_peer_addr.clone(),
                 incarnation: 0,
                 state: MemberState::Alive,
+                suspecter: None,
             };
             self.apply_update(&update, now, &mut out);
         }
@@ -715,6 +791,7 @@ impl Swim {
             peer_addr: self.local_peer_addr.clone(),
             incarnation: self.incarnation,
             state: MemberState::Alive,
+            suspecter: None,
         }];
         for m in self.members.values() {
             updates.push(Update {
@@ -723,6 +800,9 @@ impl Swim {
                 peer_addr: m.peer_addr.clone(),
                 incarnation: m.incarnation,
                 state: m.state,
+                // A full-state relay does not assert independent suspicion (ADR 0016 §3);
+                // real suspecters propagate via the normal gossip re-broadcast path.
+                suspecter: None,
             });
         }
         for u in updates {
@@ -741,6 +821,8 @@ mod tests {
             protocol_period_ms: 100,
             ack_timeout_ms: 20,
             suspicion_timeout_ms: 200,
+            suspicion_min_timeout_ms: 80,
+            suspicion_confirmations: 3,
             dead_ttl_ms: 2000,
             indirect_probes: 2,
             gossip_fanout: 8,
@@ -771,6 +853,7 @@ mod tests {
             peer_addr: peer_addr_of(addr),
             incarnation: inc,
             state: MemberState::Alive,
+            suspecter: None,
         }
     }
 
@@ -785,6 +868,14 @@ mod tests {
         Update {
             state: MemberState::Suspect,
             ..alive_update(id, addr, inc)
+        }
+    }
+
+    /// A `Suspect` claim about `id` asserted by node `by` (ADR 0016 §3).
+    fn suspect_from(id: &str, addr: &str, inc: u64, by: &str) -> Update {
+        Update {
+            suspecter: Some(by.to_string()),
+            ..suspect_update(id, addr, inc)
         }
     }
 
@@ -840,6 +931,7 @@ mod tests {
                 peer_addr: String::new(),
                 incarnation: 5,
                 state: MemberState::Alive,
+                suspecter: None,
             },
             1,
             &mut out,
@@ -865,6 +957,7 @@ mod tests {
                 peer_addr: peer_addr_of("b:1"),
                 incarnation: 0,
                 state: MemberState::Suspect,
+                suspecter: None,
             },
             1,
             &mut out,
@@ -888,6 +981,7 @@ mod tests {
                 peer_addr: peer_addr_of("a:1"),
                 incarnation: start_inc,
                 state: MemberState::Suspect,
+                suspecter: None,
             },
             0,
             &mut out,
@@ -1079,6 +1173,7 @@ mod tests {
             peer_addr: peer_addr_of("b:1"),
             incarnation: 5,
             state,
+            suspecter: None,
         };
 
         s.apply_update(&claim(MemberState::Alive), 0, &mut out);
@@ -1122,6 +1217,7 @@ mod tests {
                 peer_addr: peer_addr_of("b:1"),
                 incarnation: 0,
                 state: MemberState::Dead,
+                suspecter: None,
             },
             0,
             &mut out,
@@ -1238,6 +1334,94 @@ mod tests {
             s.apply_update(&suspect_update("a", "a:1", inc), 0, &mut out);
         }
         assert_eq!(s.awareness, cap, "awareness saturates at awareness_max");
+    }
+
+    // --- ADR 0016 phase 2 §3: independent-suspicion confirmation ----------------
+
+    /// One prober's suspicion alone holds the **full** suspicion window — a single
+    /// (possibly contended) node cannot unilaterally fast-track a peer to `Dead`.
+    #[test]
+    fn one_probers_suspicion_alone_holds_the_full_window() {
+        let cfg = fast_cfg();
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+
+        // Just before the max window: still Suspect (not fast-tracked to the floor).
+        s.expire_suspects(cfg.suspicion_timeout_ms - 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        // At the max window: Dead.
+        s.expire_suspects(cfg.suspicion_timeout_ms + 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+    }
+
+    /// Independent suspicions from **distinct** nodes shrink the window toward the
+    /// floor, fast-tracking `Dead` once `suspicion_confirmations` is reached.
+    #[test]
+    fn independent_suspicions_shrink_the_window_to_the_floor() {
+        let cfg = fast_cfg();
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        // Three distinct nodes independently suspect b at the same incarnation.
+        s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        s.apply_update(&suspect_from("b", "b:1", 0, "y"), 0, &mut out);
+        s.apply_update(&suspect_from("b", "b:1", 0, "z"), 0, &mut out);
+
+        // At >= the floor it is Dead — much sooner than the single-prober full window.
+        s.expire_suspects(cfg.suspicion_min_timeout_ms - 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        s.expire_suspects(cfg.suspicion_min_timeout_ms + 1, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Dead),
+            "{} independent suspicions reach the floor",
+            cfg.suspicion_confirmations
+        );
+    }
+
+    /// Repeated suspicion from the **same** node counts once — confirmations require
+    /// distinct suspecters, so a single node re-asserting cannot fast-track `Dead`.
+    #[test]
+    fn duplicate_suspicion_from_one_node_does_not_fast_track() {
+        let cfg = fast_cfg();
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        }
+        // Still one distinct suspecter → full window holds past the floor.
+        s.expire_suspects(cfg.suspicion_min_timeout_ms + 1, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Suspect),
+            "duplicate suspicions from one node must not fast-track Dead"
+        );
+    }
+
+    /// A refutation resets accumulated suspicions: after the victim refutes to a higher
+    /// incarnation, a fresh single suspicion holds the full window again (the prior
+    /// confirmations do not carry over).
+    #[test]
+    fn refutation_resets_accumulated_suspicions() {
+        let cfg = fast_cfg();
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        s.apply_update(&suspect_from("b", "b:1", 0, "y"), 0, &mut out);
+
+        // b refutes at a higher incarnation: back to Alive, suspecters cleared.
+        s.apply_update(&alive_update("b", "b:1", 1), 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+
+        // Re-suspected at the new incarnation by a single node: full window again.
+        s.apply_update(&suspect_from("b", "b:1", 1, "x"), 10, &mut out);
+        s.expire_suspects(10 + cfg.suspicion_min_timeout_ms + 1, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Suspect),
+            "after a refutation the window resets to full, not the prior floor"
+        );
     }
 
     // --- helpers ---------------------------------------------------------------

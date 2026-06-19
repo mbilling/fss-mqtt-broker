@@ -1,6 +1,6 @@
 # ADR 0016 — SWIM membership stability (dead-node fencing + false-positive resistance)
 
-- **Status:** Accepted; **phase 1 implemented** (2026-06-18); phase 2 pending
+- **Status:** Accepted; **phases 1 & 2 implemented** (2026-06-18 / 2026-06-19)
 - **Date:** 2026-06-18
 - **Deciders:** project maintainers
 - **Related:** [ADR 0003](0003-gossip-authentication.md) (SWIM datagram auth),
@@ -143,10 +143,40 @@ SWIM: during the ~1s before the group's lease is reassigned to the new owner,
 (`ensure_session(...).unwrap_or(false)`), so a client reconnecting in that window
 CONNACKs `session_present=false` and starts a fresh session instead of waiting for the
 lease. Closing the client-observable gap therefore needs an **attach-path** change
-(treat a transient lease error as "not ready, retry/wait"), which alters CONNACK
-latency semantics and warrants its own decision — tracked separately, not part of this
-ADR. Phase 2 (§2–§3) remains worthwhile to stop a *live* node being falsely evicted
-under load, but is not what blocks that test now.
+(treat a transient lease error as "not ready, retry/wait") — done in
+[ADR 0017](0017-durable-attach-readiness.md). Phase 2 (§2–§3) remains worthwhile to stop
+a *live* node being falsely evicted under load.
+
+## Update — phase 2 implemented (2026-06-19)
+
+Phase 2 (§2 awareness, §3 confirmation) is implemented in `swim.rs`, again test-first on
+the pure state machine.
+
+**§2 Lifeguard awareness.** A per-node `awareness: u8` (capped by `Config.awareness_max`,
+default 8) scales `ack_timeout` and `suspicion_timeout` by `(1 + awareness)`. It decays
+on a clean probe (a direct or indirect ack).
+
+- **Deviation from the implementation note.** The note suggested bumping awareness on a
+  failed *outgoing* probe as well as on self-refutation. We bump **only on
+  self-refutation**. Without NACKs (deliberately out of scope — see the full-Lifeguard
+  alternative) a failed outgoing probe is *ambiguous*: the target may simply be dead, and
+  blaming local health there would wrongly slow detection of genuinely-dead peers (it
+  broke the existing `probe_failure_leads_to_suspect_then_dead` timing, which correctly
+  surfaced the problem). Self-refutation — multiple peers independently failing to reach
+  us — is the unambiguous "we are the slow one" signal, so it alone raises awareness.
+
+**§3 Independent-suspicion confirmation.** `Update` carries an optional `suspecter`; each
+`Member` accumulates a `HashSet` of distinct suspecters at its current incarnation. The
+effective suspicion window interpolates from `suspicion_timeout_ms` (one suspecter) down
+to `suspicion_min_timeout_ms` as distinct suspecters reach `suspicion_confirmations`
+(default 3), then is scaled by the §2 awareness multiplier. The suspecter set resets when
+the member's `(incarnation, state)` identity changes, so a refutation clears it.
+
+Unit tests: awareness scales the suspicion timeout, rises on self-refutation, decays on a
+clean probe, and saturates at the cap; a single prober holds the full window; independent
+suspicions shrink it to the floor; duplicate suspicions from one node do not fast-track;
+a refutation resets accumulated confirmations. The existing SWIM convergence/detection
+integration tests still pass under the new timing.
 
 ## Alternatives considered
 
