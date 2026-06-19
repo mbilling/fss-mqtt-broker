@@ -355,6 +355,121 @@ async fn a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover
     }
 }
 
+/// Client-observable relocation **with a message in flight**: a persistent client
+/// subscribes then goes offline; a message published while it is away is durably
+/// queued; the owner is killed; the client reconnects to the new owner and the queued
+/// message is **replayed** to it. Proves a quorum-durable offline message survives a
+/// cross-node takeover and reaches the client end to end (ADR 0001 §5, ADR 0017).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_queued_message_is_replayed_to_the_client_after_takeover() {
+    let a = start_durable_node("dur-a", vec![]).await; // founder
+    let b = start_durable_node("dur-b", vec![a.swim_addr.clone()]).await;
+    let c = start_durable_node("dur-c", vec![a.swim_addr.clone()]).await;
+    let nodes = [&a, &b, &c];
+
+    wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+
+    let client_id = "failover-queue-1";
+    let owner = a.placement.read().unwrap().owner(client_id);
+    let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
+
+    // The persistent subscriber establishes its session (meta + subscription durable),
+    // then goes offline.
+    {
+        let (mut sub, present) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                owner_node.client_addr,
+                client_id,
+                false,
+                Duration::from_secs(8),
+            )
+            .await
+            {
+                break ok;
+            }
+        };
+        assert!(
+            !present,
+            "a brand-new persistent session has no prior state"
+        );
+        sub.subscribe(1, "t", QoS::AtLeastOnce).await;
+        // Drop the connection: the subscriber is now offline but its session persists.
+    }
+
+    // A message queued for the offline subscriber. The durability-critical enqueue
+    // commits only across a quorum (owner + ≥1 follower), so once it returns Ok the
+    // message is guaranteed to survive the owner's loss. (The hub's publish→offline-
+    // queue path is covered by unit tests; here we drive the durable queue directly so
+    // the failover assertion is deterministic.)
+    let cid = ClientId(client_id.to_string());
+    let msg = Message {
+        topic: "t".to_string(),
+        payload: bytes::Bytes::from_static(b"in-flight"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if owner_node.store.enqueue(&cid, &msg).await.is_ok() {
+            break; // committed across a quorum.
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the offline message never durably committed on the owner"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Kill the owner; the survivors reassign the group to a survivor.
+    owner_node.kill();
+    let survivors: Vec<&&DurableNode> = nodes.iter().filter(|n| n.node_id != owner).collect();
+    wait_until(Duration::from_secs(20), || {
+        survivors
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 2)
+    })
+    .await;
+    let new_owner = survivors[0].placement.read().unwrap().owner(client_id);
+    assert_ne!(new_owner, owner, "a survivor must take over the group");
+    let new_owner_node = survivors.iter().find(|n| n.node_id == new_owner).unwrap();
+
+    // Reconnect to the new owner; on resume the queued message replays to the client.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut sub = loop {
+        if let Some((client, true)) = common::Client::connect_v311_within(
+            new_owner_node.client_addr,
+            client_id,
+            false,
+            Duration::from_secs(8),
+        )
+        .await
+        {
+            break client; // resumed the session; the replay follows the CONNACK.
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new owner never resumed the persistent session after takeover"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let replayed = sub.expect_publish().await;
+    assert_eq!(
+        &replayed.payload[..],
+        b"in-flight",
+        "the queued message must replay to the client through the new owner"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_replica_serves_the_session_after_the_owner_dies() {
     let a = start_durable_node("dur-a", vec![]).await; // founder

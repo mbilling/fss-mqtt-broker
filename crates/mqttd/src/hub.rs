@@ -1759,6 +1759,11 @@ async fn recover_once(
 ) -> Result<SessionRecovery, StorageError> {
     let present = store.ensure_session(client).await?;
     let subscriptions = store.subscriptions(client).await?;
+    // Warm (and confirm the availability of) the offline-queue key as well, so the
+    // inline replay in `finish_attach` reads a recovered queue and is never silently
+    // skipped on a transient lease error — a resumed session must deliver its queued
+    // messages on this connect, not only on a later reconnect (ADR 0017).
+    let _ = store.pending(client, 0, 1).await?;
     Ok(SessionRecovery::Ready {
         present,
         subscriptions,

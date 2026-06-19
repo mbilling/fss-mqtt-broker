@@ -138,9 +138,13 @@ Legend: ☐ missing · ☑ covered (file).
   - (ADR 0016 phase 2 — Lifeguard awareness + multi-source suspicion — remains a
     worthwhile follow-up to keep a *live* node from being falsely evicted under load,
     but is not required for this scenario.)
-- ☐ session takeover across nodes (relocation) with messages in flight (now unblocked —
-  the client-observable failover above resumes the session; the in-flight-message
-  variant is the remaining extension)
+- ☑ session takeover across nodes (relocation) **with a message in flight**: a queued
+  message durably committed before the owner dies is **replayed to the client** when it
+  reconnects to the new owner
+  (`durable_sessions::a_queued_message_is_replayed_to_the_client_after_takeover`,
+  deterministic). Surfaced and fixed a real gap — the new owner's *queue-key* recovery
+  was not warmed before the inline replay, so a resumed session could skip delivering its
+  queued messages until a later reconnect; the off-loop recovery now warms it (ADR 0017).
 
 ## Conventions
 

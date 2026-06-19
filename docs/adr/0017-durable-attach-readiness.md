@@ -61,8 +61,10 @@ A new typed transient error, `StorageError::Unavailable`, is introduced (the clu
 store maps `ReplError::{NotOwner, NoQuorum}` to it; `Backend`/`NotFound` stay terminal).
 The hub's `attach`, for a persistent session, **spawns** a recovery task holding a
 cloned `Arc<dyn SessionStore>` handle. That task does the bounded retry —
-`ensure_session` (+ `subscriptions`) with backoff until an authoritative result or the
-deadline — **without holding the hub loop**. It then sends the result back as a new
+`ensure_session`, `subscriptions`, and a `pending` probe (warming the offline-queue key
+too, so the inline replay is reliable and never silently skipped) with backoff until an
+authoritative result or the deadline — **without holding the hub loop**. It then sends
+the result back as a new
 `HubCommand::SessionRecovered`, whose handler runs the *fast, in-memory* registration
 on the loop (reconcile subscriptions into routing, register `online`, fire any
 takeover will, reply, resume in-flight QoS, replay the now-warm queue). The only work
