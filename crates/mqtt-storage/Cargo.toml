@@ -11,9 +11,12 @@ mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
 thiserror.workspace = true
 async-trait = "0.1"
 bytes = { workspace = true }
+# Embedded, pure-Rust ACID engine backing the on-disk durable log (ADR 0018).
+redb = "2"
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -23,6 +23,6 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0015](0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted |
 | [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted; implemented |
 | [0017](0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted |
-| [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Proposed |
+| [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Accepted; phase 1 implemented |
 | [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Proposed |
 | [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed |

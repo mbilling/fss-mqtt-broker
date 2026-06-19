@@ -19,6 +19,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
 pub mod logged;
+pub mod persistent_log;
 pub mod repl;
 
 /// A monotonically increasing position within a single session's queue log.

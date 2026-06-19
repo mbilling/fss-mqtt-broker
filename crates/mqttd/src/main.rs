@@ -17,6 +17,10 @@
 //!   session store (ADR 0006/0007); persistent sessions replicate across the peer
 //!   mesh. Default-off (the in-memory store). A node with no `MQTTD_SWIM_SEEDS` is
 //!   the cluster founder that bootstraps the lease group (exactly one per cluster).
+//! - `MQTTD_DATA_DIR`        — directory for on-disk session persistence (ADR 0018).
+//!   When set (and `MQTTD_DURABLE_SESSIONS` is off), single-node sessions are stored in
+//!   `<dir>/sessions.redb` and survive a restart (not replicated). Default-off
+//!   (in-memory, lost on restart). Ignored when `MQTTD_DURABLE_SESSIONS` is on.
 //! - `MQTTD_TLS_BIND`       — TLS client listener bind, e.g. `0.0.0.0:8883`
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
@@ -56,6 +60,8 @@ use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_config::Config;
 use mqtt_net::tls;
 use mqtt_observability::AuditLog;
+use mqtt_storage::logged::ReplicatedSessionStore;
+use mqtt_storage::persistent_log::PersistentLog;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
 use mqttd::{cluster, conn, hub, peer};
 use std::path::Path;
@@ -324,6 +330,28 @@ async fn start_hub(
         hub.attach_durable_plane(plane);
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(plane_for_health)))
+    } else if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
+        // Single-node **persistent** sessions (ADR 0018 phase 1): the session log is
+        // backed by an on-disk redb database, so sessions, subscriptions, the QoS-2
+        // dedup window and offline queues survive a restart. Not replicated — use
+        // MQTTD_DURABLE_SESSIONS for cluster (quorum) durability.
+        let path = std::path::Path::new(&dir).join("sessions.redb");
+        info!(
+            path = %path.display(),
+            "PERSISTENT sessions: on-disk durable store (ADR 0018; single-node, not replicated)"
+        );
+        let log = PersistentLog::open(&path)?;
+        let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::with_limits(
+            log,
+            queue_limits_from_env()?,
+        ));
+        let (hub, hub_tx) = hub::Hub::with_config_and_placement(
+            node_id.clone(),
+            store.clone(),
+            Some(placement.clone()),
+        );
+        tokio::spawn(hub.run());
+        Ok((hub_tx, store, None))
     } else {
         let store: Arc<dyn SessionStore> =
             Arc::new(MemorySessionStore::with_limits(queue_limits_from_env()?));

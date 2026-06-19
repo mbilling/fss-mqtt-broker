@@ -1,6 +1,6 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Proposed (awaiting ratification); implementation phased
+- **Status:** Accepted; **phase 1 implemented** (2026-06-19); phases 2–5 pending
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -135,6 +135,24 @@ directory; a startup check refuses to open a data dir stamped with a *different*
 - Testing: a crash-injection harness (drop the process / the `redb` handle mid-write and
   reopen) asserting no torn reads and that a fsynced append survives. This is the
   correctness bar before any phase is "done" — same rigor as the SWIM/consensus work.
+
+## Update — phase 1 implemented (2026-06-19)
+
+`PersistentLog` (`crates/mqtt-storage/src/persistent_log.rs`) implements `ReplicatedLog`
+over `redb` with `Durability::Immediate` (fsync) on every mutating commit. Synchronous
+`redb` work runs on `spawn_blocking` so the fsync never stalls an async worker. The
+on-disk layout is the two tables described in the implementation notes; the per-key
+offset counter is persisted independently so it stays monotonic across `truncate` and
+resets only on `remove` — matching `InMemoryReplicatedLog` exactly. Wired into `mqttd`
+via `MQTTD_DATA_DIR`: a single-node broker now stores sessions in `<dir>/sessions.redb`
+and survives a restart. `redb` (pure-Rust) resolves to a 1.75-MSRV-compatible version and
+passes `cargo deny` (advisories/bans/licenses/sources). Tests cover the in-memory
+backend's contract plus a **survives-reopen** durability proof (committed state and the
+offset counter are recovered after the database is closed and reopened).
+
+Still pending: phase 2 (disk-backed openraft lease store — the Raft-safety fix), phase 3
+(disk-backed *replicated* session log for cluster restart survival), phase 4 (retained),
+phase 5 (compaction, data-dir node-id guard, process-kill crash test).
 
 ## Consequences
 
