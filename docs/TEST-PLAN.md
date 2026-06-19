@@ -122,29 +122,25 @@ Legend: ☐ missing · ☑ covered (file).
 - ☑ replica serves session after owner dies — quorum-durable message survives at the store layer (`durable_sessions`)
 - ☑ a durable node serves ordinary MQTT clients (clean + persistent) through its hub (`durable_sessions`)
 - ☑ partition + heal → routing reconverges (severed link, delivery resumes) (`cluster_chaos`)
-- 🟡 **Known gap (root cause narrowed; one half fixed):** client-observable durable
-  failover — a *persistent* client reconnecting to the **new owner after takeover**
-  comes up `session_present=false` instead of resuming. Originally this stalled ~10s
-  and was traced to **membership flapping**: the new owner's `placement.members()`
-  listed the killed node (resurrected by stale gossip) and dropped a live survivor, so
-  the recovery replica set had no live quorum and the read timed out on the dead node.
-  - ✅ **Membership — fixed** by [ADR 0016](adr/0016-swim-membership-stability.md)
-    phase 1 (tombstone `Dead`, implemented). Verified end to end against this scenario:
-    after the owner is killed, the new owner's replica set is now exactly the live
-    survivors (no resurrected corpse), and the store recovers the session — meta **and**
-    subscriptions — from a quorum in ~1s. The recovery read is also concurrent
-    (`cluster_store`).
-  - 🔴 **Attach path — remaining.** During the ~1s before the group's lease is
-    reassigned to the new owner, `ensure_session` returns a transient `NotOwner`, and
-    the hub swallows it (`ensure_session(...).unwrap_or(false)`), so a client
-    reconnecting in that window wrongly CONNACKs `session_present=false` and starts a
-    fresh session. Closing the gap needs the attach path to treat a transient lease
-    error as "not ready, retry/wait" — a separate change that alters CONNACK latency
-    semantics (block briefly vs. fail fast), so it warrants its own decision. **This is
-    no longer a SWIM/membership problem.** (ADR 0016 phase 2 — Lifeguard awareness +
-    multi-source suspicion — remains worthwhile to keep a *live* node from being
-    falsely evicted under load, but is not what blocks this test now.)
-- ☐ session takeover across nodes (relocation) with messages in flight (blocked by the gap above)
+- ☑ **client-observable durable failover** — a *persistent* client reconnecting to the
+  **new owner after takeover** resumes its session (`session_present=true`)
+  (`durable_sessions::a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover`,
+  deterministic). This was a diagnosed-to-root gap that took two fixes:
+  - ✅ **Membership** ([ADR 0016](adr/0016-swim-membership-stability.md) phase 1,
+    tombstone `Dead`): the new owner's replica set is now exactly the live survivors
+    (no resurrected corpse, no dropped survivor), so recovery sees a live quorum and
+    never reads the dead node. The recovery read is also concurrent (`cluster_store`).
+  - ✅ **Attach path** ([ADR 0017](adr/0017-durable-attach-readiness.md)): the persistent
+    attach **waits** (off the hub loop) for the durable store to answer authoritatively
+    while the group's lease reassigns, then resumes the session — or rejects with
+    Server-unavailable so the client retries. It never silently downgrades a recoverable
+    session to a fresh one, and the wait does not freeze the hub.
+  - (ADR 0016 phase 2 — Lifeguard awareness + multi-source suspicion — remains a
+    worthwhile follow-up to keep a *live* node from being falsely evicted under load,
+    but is not required for this scenario.)
+- ☐ session takeover across nodes (relocation) with messages in flight (now unblocked —
+  the client-observable failover above resumes the session; the in-flight-message
+  variant is the remaining extension)
 
 ## Conventions
 

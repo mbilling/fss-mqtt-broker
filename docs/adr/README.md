@@ -22,3 +22,4 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0014](0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted |
 | [0015](0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted |
 | [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted; phase 1 implemented |
+| [0017](0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted |

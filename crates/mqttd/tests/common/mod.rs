@@ -300,6 +300,38 @@ impl Client {
         (c, present)
     }
 
+    /// Connect as v3.1.1, waiting up to `wait` for the CONNACK instead of the default
+    /// 2s recv bound. Returns `None` — dropping the half-open connection so the caller
+    /// can retry a fresh connect — if the CONNACK does not arrive in time, the peer
+    /// closes, or the broker refuses with a non-success code (e.g. Server-unavailable
+    /// while a durable session's lease is still reassigning, ADR 0017). A successful
+    /// CONNACK yields the client and its `session_present` flag.
+    pub async fn connect_v311_within(
+        addr: SocketAddr,
+        client_id: &str,
+        clean: bool,
+        wait: Duration,
+    ) -> Option<(Self, bool)> {
+        let mut c = Self::open(addr, V4).await;
+        c.send(&Packet::Connect(Connect {
+            properties: Properties::new(),
+            protocol: V4,
+            clean_session: clean,
+            keep_alive: 30,
+            client_id: client_id.to_string(),
+            last_will: None,
+            username: None,
+            password: None,
+        }))
+        .await;
+        match timeout(wait, c.reader.next_packet()).await {
+            Ok(Ok(Some(Packet::ConnAck(a)))) if a.code == 0 => Some((c, a.session_present)),
+            // Refused (transient Server-unavailable), timed out, errored, or closed:
+            // the caller retries a fresh connect.
+            _ => None,
+        }
+    }
+
     /// Connect as v5 with the given CONNECT properties; returns the client and the
     /// full CONNACK (so the caller can assert negotiated properties or a reason code).
     pub async fn connect_v5(

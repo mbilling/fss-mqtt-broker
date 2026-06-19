@@ -13,26 +13,20 @@
 //! These also check that a durable node serves ordinary MQTT clients through its hub
 //! (`a_durable_node_serves_a_client_pubsub`).
 //!
-//! **Known gap** (see `docs/TEST-PLAN.md`): a *persistent* client reconnecting to the
-//! **new owner after a takeover** comes up with `session_present=false` instead of
-//! resuming its session. The diagnosis was refined once [ADR 0016](../../docs/adr/0016-swim-membership-stability.md)
-//! phase 1 (tombstone `Dead`) landed:
+//! **Client-observable durable failover** (`a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover`)
+//! — a *persistent* client whose owner is killed reconnects to the **new owner** and
+//! resumes its session. This took two fixes, now both landed:
 //!
-//! 1. **Membership — fixed by phase 1.** Before tombstoning, the new owner's
-//!    `placement.members()` flapped to a wrong set (the killed node resurrected by
-//!    stale gossip, a live survivor dropped), so `group_replica_set` had no live
-//!    quorum and recovery read the dead node. With `Dead` tombstoned this is gone: the
-//!    new owner's replica set is now exactly the live survivors.
-//! 2. **Recovery — already correct.** With the right replica set, the store recovers
-//!    the session (meta + subscriptions) from a quorum of survivors in ~1s.
-//! 3. **Remaining blocker — the attach path, not SWIM.** During the ~1s before the
-//!    group's lease is reassigned to the new owner, `ensure_session` returns a
-//!    transient `NotOwner`, and the hub's attach swallows it
-//!    (`ensure_session(...).unwrap_or(false)`) — so a client reconnecting in that
-//!    window wrongly CONNACKs `session_present=false` (and starts a fresh session)
-//!    rather than waiting for the lease. Closing the client-observable gap needs the
-//!    attach path to treat a transient lease error as "not ready, retry", a separate
-//!    decision (it changes CONNACK latency semantics) tracked as a follow-up.
+//! 1. **Membership** ([ADR 0016](../../docs/adr/0016-swim-membership-stability.md)
+//!    phase 1, tombstone `Dead`): the new owner's `placement.members()` no longer flaps
+//!    to a wrong set (killed node resurrected, live survivor dropped), so
+//!    `group_replica_set` has a live quorum and recovery does not read the dead node.
+//! 2. **Attach path** ([ADR 0017](../../docs/adr/0017-durable-attach-readiness.md)):
+//!    during the ~1s before the group's lease reassigns to the new owner the durable
+//!    reads return a transient `Unavailable`; the attach now **waits** for an
+//!    authoritative answer off the hub loop and resumes the session, or rejects with
+//!    Server-unavailable so the client retries — it never silently downgrades a
+//!    recoverable session to a fresh one.
 
 mod common;
 
@@ -267,6 +261,95 @@ async fn a_durable_node_serves_a_client_pubsub() {
     let (mut persistent, _present) =
         common::Client::connect_v311(a.client_addr, "dur-persistent", false).await;
     persistent.subscribe(2, "p", QoS::AtMostOnce).await;
+}
+
+/// Client-observable durable failover (ADR 0016 phase 1 + ADR 0017): a **persistent**
+/// client whose owner is killed reconnects to the **new owner** and resumes its session
+/// (`session_present=true`). Phase 1 keeps the new owner's replica set correct (no
+/// resurrected corpse); ADR 0017 makes the attach **wait** for the group's lease to
+/// reassign rather than reporting the recoverable session as absent. The CONNACK is
+/// either a resumed session or a Server-unavailable retry — never a silent fresh session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover() {
+    let a = start_durable_node("dur-a", vec![]).await; // founder
+    let b = start_durable_node("dur-b", vec![a.swim_addr.clone()]).await;
+    let c = start_durable_node("dur-c", vec![a.swim_addr.clone()]).await;
+    let nodes = [&a, &b, &c];
+
+    wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+
+    // A persistent client establishes a session on its owner: clean_session=false + a
+    // subscription writes the session meta + subscription durably (quorum-replicated).
+    // The attach waits for the lease (ADR 0017), so the first cold connect may take a
+    // moment — allow more than the harness's 2s default for the CONNACK.
+    let client_id = "failover-resume-1";
+    let owner = a.placement.read().unwrap().owner(client_id);
+    let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
+    {
+        let (mut persistent, present) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                owner_node.client_addr,
+                client_id,
+                false,
+                Duration::from_secs(8),
+            )
+            .await
+            {
+                break ok;
+            }
+        };
+        assert!(
+            !present,
+            "a brand-new persistent session has no prior state"
+        );
+        persistent.subscribe(1, "t", QoS::AtLeastOnce).await;
+        // Drop the connection (client goes offline); the durable session remains.
+    }
+
+    // Kill the owner; the survivors drop it and reassign the group to a survivor.
+    owner_node.kill();
+    let survivors: Vec<&&DurableNode> = nodes.iter().filter(|n| n.node_id != owner).collect();
+    wait_until(Duration::from_secs(20), || {
+        survivors
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 2)
+    })
+    .await;
+    let new_owner = survivors[0].placement.read().unwrap().owner(client_id);
+    assert_ne!(new_owner, owner, "a survivor must take over the group");
+    let new_owner_node = survivors.iter().find(|n| n.node_id == new_owner).unwrap();
+
+    // Reconnect to the new owner. Its attach waits for the lease to reassign and then
+    // recovers the session from a quorum of the surviving replicas — resuming it
+    // (session_present=true), never silently resetting it. We retry the connect to ride
+    // out the brief lease handoff (a refused attempt comes back as `None`).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((_client, true)) = common::Client::connect_v311_within(
+            new_owner_node.client_addr,
+            client_id,
+            false,
+            Duration::from_secs(8),
+        )
+        .await
+        {
+            break; // the new owner recovered and resumed the durable session.
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new owner never resumed the persistent session after takeover"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
