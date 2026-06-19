@@ -226,6 +226,9 @@ pub enum SessionRecovery {
         /// Persisted subscriptions to reconcile into routing.
         subscriptions: Vec<Subscription>,
     },
+    /// A clean-start attach finished discarding the prior durable state (ADR 0017);
+    /// register a fresh session (`session_present = false`, no replay).
+    Cleaned,
     /// The store could not give an authoritative answer within the deadline.
     Unavailable,
 }
@@ -607,8 +610,7 @@ impl Hub {
                         reply,
                     },
                     clean_start,
-                )
-                .await;
+                );
             }
             HubCommand::SessionRecovered { pending, recovery } => {
                 self.session_recovered(pending, recovery).await;
@@ -784,14 +786,25 @@ impl Hub {
     /// persistent session first recovers its durable state **off the hub command loop**
     /// (ADR 0017) so the possibly-seconds-long lease/quorum wait cannot freeze the
     /// single-threaded hub. Recovery completes back on the loop via `SessionRecovered`.
-    async fn attach(&mut self, pending: PendingAttach, clean_start: bool) {
+    fn attach(&mut self, pending: PendingAttach, clean_start: bool) {
         // A reconnect cancels any pending expiry for this session (ADR 0009).
         self.expiring.remove(&pending.client);
 
         if clean_start {
-            // Clean Start: discard any prior session state; there is nothing to wait on.
-            self.discard_session(&pending.client).await;
-            self.finish_attach(pending, true, false, Vec::new()).await;
+            // Clean Start: wipe the in-memory session immediately (fast), then discard
+            // the *durable* prior state **off the loop** (ADR 0017). The durable
+            // `remove` can trigger a first-touch group recovery on the owner of a cold
+            // group, which inline would freeze the hub and stall this CONNACK; the
+            // CONNACK is still gated on the discard (via `SessionRecovered`) so the
+            // clean-session wipe is observed before the client proceeds.
+            self.discard_session_local(&pending.client);
+            self.connecting
+                .insert(pending.client.clone(), pending.conn_id);
+            tokio::spawn(discard_session(
+                self.store.clone(),
+                self.self_tx.clone(),
+                pending,
+            ));
             return;
         }
 
@@ -829,6 +842,9 @@ impl Hub {
             } => {
                 self.finish_attach(pending, false, present, subscriptions)
                     .await;
+            }
+            SessionRecovery::Cleaned => {
+                self.finish_attach(pending, true, false, Vec::new()).await;
             }
             SessionRecovery::Unavailable => {
                 warn!(
@@ -1435,11 +1451,18 @@ impl Hub {
     /// queue/metadata, and all expiry bookkeeping. Used by Clean Start, a zero-expiry
     /// disconnect, and the expiry sweep.
     async fn discard_session(&mut self, client: &ClientId) {
+        self.discard_session_local(client);
+        let _ = self.store.remove(client).await;
+    }
+
+    /// The in-memory half of discarding a session (routing, in-flight, expiry state).
+    /// Fast and loop-safe; the durable `remove` is done separately (off-loop for a
+    /// clean-start attach, ADR 0017).
+    fn discard_session_local(&mut self, client: &ClientId) {
         self.drop_subscriptions(client);
         self.inflight.remove(client);
         self.session_expiry.remove(client);
         self.expiring.remove(client);
-        let _ = self.store.remove(client).await;
     }
 
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
@@ -1727,6 +1750,24 @@ async fn recover_session(
 ) {
     let recovery = recover_until_ready(&store, &pending.client).await;
     let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
+}
+
+/// Discard a clean-start client's prior **durable** state off the hub command loop, then
+/// post `SessionRecovered::Cleaned` so the fresh session registers on the loop (ADR
+/// 0017). The `remove` can do a first-touch group recovery on a cold owner; running it
+/// here keeps that off the single-threaded hub. It is best-effort — a transient lease
+/// error leaves any prior durable state to be reaped by a later discard/sweep — but the
+/// in-memory wipe has already happened, so this session starts fresh regardless.
+async fn discard_session(
+    store: Arc<dyn SessionStore>,
+    self_tx: mpsc::UnboundedSender<HubCommand>,
+    pending: PendingAttach,
+) {
+    let _ = store.remove(&pending.client).await;
+    let _ = self_tx.send(HubCommand::SessionRecovered {
+        pending,
+        recovery: SessionRecovery::Cleaned,
+    });
 }
 
 /// Retry the durable session read until it answers authoritatively or the recovery

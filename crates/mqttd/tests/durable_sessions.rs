@@ -266,6 +266,58 @@ async fn a_durable_node_serves_a_client_pubsub() {
     persistent.subscribe(2, "p", QoS::AtMostOnce).await;
 }
 
+/// A **clean-session** connect to the durable owner of a *cold* group must not stall
+/// (ADR 0017): the clean-start discard does a durable `remove` that can trigger a
+/// first-touch group recovery on the owner; doing it inline would freeze the hub and
+/// delay the CONNACK. With the discard off the hub loop, a fresh clean client connects
+/// and round-trips promptly on a three-node cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_clean_session_client_connects_promptly_on_the_group_owner() {
+    let a = start_durable_node("dur-a", vec![]).await; // founder
+    let b = start_durable_node("dur-b", vec![a.swim_addr.clone()]).await;
+    let c = start_durable_node("dur-c", vec![a.swim_addr.clone()]).await;
+    let nodes = [&a, &b, &c];
+
+    wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+
+    // Connect a clean subscriber to the **owner** of its group, so its clean-start
+    // discard hits the cold-group durable `remove` path that used to stall inline.
+    let sub_id = "clean-sub";
+    let sub_owner = a.placement.read().unwrap().owner(sub_id);
+    let node = nodes.iter().find(|n| n.node_id == sub_owner).unwrap();
+
+    let (mut sub, present) =
+        common::Client::connect_v311_within(node.client_addr, sub_id, true, Duration::from_secs(8))
+            .await
+            .expect("a clean CONNACK must not stall on the cold group owner");
+    assert!(!present, "a clean session reports no prior state");
+    sub.subscribe(1, "ct", QoS::AtMostOnce).await;
+
+    // A clean publisher on the same node; the QoS-0 message routes locally to the sub.
+    let (mut pubr, _) = common::Client::connect_v311_within(
+        node.client_addr,
+        "clean-pub",
+        true,
+        Duration::from_secs(8),
+    )
+    .await
+    .expect("a clean CONNACK must not stall");
+    pubr.publish("ct", b"hello", QoS::AtMostOnce, None, vec![])
+        .await;
+
+    let p = sub.expect_publish().await;
+    assert_eq!(&p.payload[..], b"hello");
+}
+
 /// Client-observable durable failover (ADR 0016 phase 1 + ADR 0017): a **persistent**
 /// client whose owner is killed reconnects to the **new owner** and resumes its session
 /// (`session_present=true`). Phase 1 keeps the new owner's replica set correct (no
