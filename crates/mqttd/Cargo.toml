@@ -27,6 +27,8 @@ bytes.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# fault-injecting SessionStore double for the durable-attach readiness tests (ADR 0017)
+async-trait = "0.1"
 rcgen.workspace = true
 ring = { workspace = true }
 rustls.workspace = true

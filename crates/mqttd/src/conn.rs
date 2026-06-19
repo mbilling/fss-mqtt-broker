@@ -9,7 +9,7 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{HubCommand, Outbound};
+use crate::hub::{AttachOutcome, HubCommand, Outbound};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, AllowAll, AuthSession, AuthStep, Authenticator, Authorizer,
@@ -44,6 +44,10 @@ const KEEPALIVE_GRACE_DEN: u64 = 2;
 const CONNACK_UNACCEPTABLE_PROTOCOL: u8 = 0x01;
 /// CONNACK reason: identifier rejected (MQTT 3.1.1 return code 2).
 const CONNACK_IDENTIFIER_REJECTED: u8 = 0x02;
+/// CONNACK reason: the server is temporarily unavailable (MQTT 3.1.1 return code 3) —
+/// used when a durable session cannot be recovered yet (lease handoff / no quorum) so
+/// the client retries rather than starting clean (ADR 0017).
+const CONNACK_SERVER_UNAVAILABLE: u8 = 0x03;
 /// CONNACK reason: bad user name or password (MQTT 3.1.1 return code 4).
 const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
 /// CONNACK reason: not authorized (MQTT 3.1.1 return code 5).
@@ -404,8 +408,17 @@ where
     {
         return Ok(()); // hub shut down
     }
-    let Ok(session_present) = reply_rx.await else {
-        return Ok(()); // hub dropped the reply
+    let session_present = match reply_rx.await {
+        Ok(AttachOutcome::Present(present)) => present,
+        Ok(AttachOutcome::Unavailable) => {
+            // Durable session not recoverable yet (lease handoff / no quorum): reject
+            // with Server unavailable so the client retries, rather than fabricate a
+            // clean session over a recoverable one (ADR 0017).
+            info!(client = %client.0, "rejecting CONNECT: durable session unavailable, retry");
+            let code = connack_code(CONNACK_SERVER_UNAVAILABLE, connect.protocol);
+            return reject_connack(&mut writer, code).await;
+        }
+        Err(_) => return Ok(()), // hub dropped the reply (shutdown or superseded)
     };
     // Build the v5 CONNACK properties (Topic Alias Maximum, Receive Maximum) and the
     // per-connection alias maps (ADR 0011, ADR 0012).
@@ -568,6 +581,7 @@ fn connack_code(v3: u8, version: ProtocolVersion) -> u8 {
     }
     match v3 {
         CONNACK_UNACCEPTABLE_PROTOCOL => 0x84, // Unsupported Protocol Version
+        CONNACK_SERVER_UNAVAILABLE => 0x88,    // Server unavailable
         CONNACK_IDENTIFIER_REJECTED => 0x85,   // Client Identifier not valid
         CONNACK_BAD_CREDENTIALS => 0x86,       // Bad User Name or Password
         CONNACK_NOT_AUTHORIZED => 0x87,        // Not authorized
@@ -1274,7 +1288,7 @@ mod tests {
         handle_stream, ConnPolicy, DEFAULT_CONNECT_TIMEOUT, SERVER_RECEIVE_MAXIMUM,
         SERVER_TOPIC_ALIAS_MAX,
     };
-    use crate::hub::{HubCommand, Outbound};
+    use crate::hub::{AttachOutcome, HubCommand, Outbound};
     use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
     use mqtt_codec::{
@@ -1339,7 +1353,7 @@ mod tests {
                 {
                     record.lock().unwrap().push(client.0.clone());
                     keep_alive.push(outbound);
-                    let _ = reply.send(false);
+                    let _ = reply.send(AttachOutcome::Present(false));
                 }
             }
         });
@@ -1463,7 +1477,7 @@ mod tests {
                         outbound, reply, ..
                     } => {
                         keep_alive.push(outbound);
-                        let _ = reply.send(false);
+                        let _ = reply.send(AttachOutcome::Present(false));
                     }
                     HubCommand::Publish { topic, .. } => {
                         let _ = tx.send(topic);
@@ -1489,7 +1503,7 @@ mod tests {
                     outbound, reply, ..
                 } = cmd
                 {
-                    let _ = reply.send(false);
+                    let _ = reply.send(AttachOutcome::Present(false));
                     if let Some(s) = sender.take() {
                         let _ = s.send(outbound.clone());
                     }
@@ -1517,7 +1531,7 @@ mod tests {
                     ..
                 } = cmd
                 {
-                    let _ = reply.send(false);
+                    let _ = reply.send(AttachOutcome::Present(false));
                     if let Some(s) = sender.take() {
                         let _ = s.send(receive_maximum);
                     }

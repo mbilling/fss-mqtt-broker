@@ -37,10 +37,10 @@ use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{
     parse_shared, topic_matches, ClientId, Message, SharedGroup, SharedSubscriptionTable,
-    SubscriptionTable,
+    Subscription, SubscriptionTable,
 };
 use mqtt_storage::{
-    Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore,
+    Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore, StorageError,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -68,6 +68,19 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// MQTT 5.0 Session Expiry Interval meaning "never expire" (0xFFFFFFFF). v3.1.1
 /// `clean_session=0` maps to this.
 const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
+
+/// How long a persistent attach waits for the durable store to give an *authoritative*
+/// session answer before rejecting the CONNECT with Server-unavailable (ADR 0017).
+/// Comfortably above the observed lease-handoff (~1s) after a takeover, below a typical
+/// client connect timeout. The wait runs off the hub command loop, so it never freezes
+/// the hub.
+const ATTACH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Initial / maximum backoff between durable-recovery retries during an attach (ADR
+/// 0017). Short enough to resume promptly once the lease lands, capped so a long
+/// outage does not busy-loop.
+const ATTACH_RECOVERY_BACKOFF_START: Duration = Duration::from_millis(50);
+const ATTACH_RECOVERY_BACKOFF_MAX: Duration = Duration::from_millis(250);
 
 /// A shared subscription's identity: `(ShareName, filter)` (ADR 0015).
 type SharedKey = (String, String);
@@ -186,6 +199,59 @@ impl Inflight {
     }
 }
 
+/// The result the hub returns to a connection so it can send (or refuse) its CONNACK.
+///
+/// For a persistent session this is decided only once the durable store gives an
+/// *authoritative* answer; a transient lease/quorum condition that never resolves
+/// within the recovery deadline yields [`Self::Unavailable`] — never a false
+/// `Present(false)` that would silently reset a recoverable session (ADR 0017).
+#[derive(Debug)]
+pub enum AttachOutcome {
+    /// The session was resolved; the flag is MQTT `session_present`.
+    Present(bool),
+    /// The durable store stayed transiently unavailable (lease reassigning / quorum
+    /// unreachable) past the recovery deadline. The connection must reject the CONNECT
+    /// with Server-unavailable and let the client retry; the session is left intact.
+    Unavailable,
+}
+
+/// The outcome of the off-loop durable recovery for a persistent attach (ADR 0017).
+#[derive(Debug)]
+pub enum SessionRecovery {
+    /// An authoritative answer: whether the session already existed, and its persisted
+    /// subscriptions (fetched off-loop so on-loop registration does no durable read).
+    Ready {
+        /// MQTT `session_present`.
+        present: bool,
+        /// Persisted subscriptions to reconcile into routing.
+        subscriptions: Vec<Subscription>,
+    },
+    /// The store could not give an authoritative answer within the deadline.
+    Unavailable,
+}
+
+/// The connection context carried across the off-loop session-recovery wait so the hub
+/// can finish registration when [`HubCommand::SessionRecovered`] arrives (ADR 0017).
+/// Only the hub constructs one (all fields private), so the `pub` variant cannot be
+/// forged by other code.
+#[derive(Debug)]
+pub struct PendingAttach {
+    /// The client identifier.
+    client: ClientId,
+    /// Unique id for this physical connection (guards last-writer-wins on overlap).
+    conn_id: u64,
+    /// MQTT 5.0 Session Expiry Interval (seconds).
+    session_expiry: u32,
+    /// MQTT 5.0 Receive Maximum for this connection (ADR 0012).
+    receive_maximum: u16,
+    /// Will message to publish if the connection ends ungracefully.
+    will: Option<Message>,
+    /// Channel the hub uses to deliver packets to this client.
+    outbound: Outbound,
+    /// Reply channel the connection awaits before its CONNACK.
+    reply: oneshot::Sender<AttachOutcome>,
+}
+
 /// A message from a connection task to the hub.
 #[derive(Debug)]
 pub enum HubCommand {
@@ -209,8 +275,17 @@ pub enum HubCommand {
         will: Option<Message>,
         /// Channel the hub uses to deliver packets to this client.
         outbound: Outbound,
-        /// Reply with `session_present` so the connection can send CONNACK.
-        reply: oneshot::Sender<bool>,
+        /// Reply with the [`AttachOutcome`] so the connection can CONNACK (or reject).
+        reply: oneshot::Sender<AttachOutcome>,
+    },
+    /// Internal: the off-loop durable recovery for a persistent [`Attach`](Self::Attach)
+    /// finished; finish registration on the hub loop (ADR 0017). Not sent by
+    /// connections — the hub posts it to itself.
+    SessionRecovered {
+        /// The connection context carried across the wait.
+        pending: PendingAttach,
+        /// The authoritative recovery result (or `Unavailable`).
+        recovery: SessionRecovery,
     },
     /// Add subscriptions (filter + granted `QoS`) for a client.
     Subscribe {
@@ -418,6 +493,13 @@ pub struct Hub {
     /// Live session-placement ring (ADR 0005). `None` outside a cluster. Read at
     /// persistent CONNECT to identify the session's owner.
     placement: Option<Arc<RwLock<Placement>>>,
+    /// A clone of the hub's own command sender, so an off-loop session-recovery task
+    /// can post [`HubCommand::SessionRecovered`] back to the loop (ADR 0017).
+    self_tx: mpsc::UnboundedSender<HubCommand>,
+    /// Persistent connections whose durable session is being recovered off-loop, mapped
+    /// to the latest `conn_id` (ADR 0017). A `SessionRecovered` whose `conn_id` no longer
+    /// matches was superseded by a newer connect and is dropped (last-writer-wins).
+    connecting: HashMap<ClientId, u64>,
 }
 
 impl Hub {
@@ -455,6 +537,8 @@ impl Hub {
         (
             Self {
                 rx,
+                self_tx: tx.clone(),
+                connecting: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
                 session_expiry: HashMap::new(),
@@ -513,16 +597,21 @@ impl Hub {
                 reply,
             } => {
                 self.attach(
-                    client,
-                    conn_id,
+                    PendingAttach {
+                        client,
+                        conn_id,
+                        session_expiry,
+                        receive_maximum,
+                        will,
+                        outbound,
+                        reply,
+                    },
                     clean_start,
-                    session_expiry,
-                    receive_maximum,
-                    will,
-                    outbound,
-                    reply,
                 )
                 .await;
+            }
+            HubCommand::SessionRecovered { pending, recovery } => {
+                self.session_recovered(pending, recovery).await;
             }
             HubCommand::Subscribe { client, filters } => {
                 self.subscribe(&client, filters).await;
@@ -543,6 +632,23 @@ impl Hub {
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
             HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid),
+            HubCommand::Detach {
+                client,
+                conn_id,
+                graceful,
+            } => {
+                self.detach(&client, conn_id, graceful).await;
+            }
+            // Peer- and cluster-facing commands.
+            other => self.dispatch_cluster(other).await,
+        }
+    }
+
+    /// Dispatch a peer-/cluster-facing command (forwarded publishes, peer link
+    /// (de)registration, gossiped interest, durable frames). Split from
+    /// [`dispatch`](Self::dispatch) to keep each handler focused.
+    async fn dispatch_cluster(&mut self, cmd: HubCommand) {
+        match cmd {
             HubCommand::RemotePublish {
                 topic,
                 payload,
@@ -555,13 +661,6 @@ impl Hub {
                 // yet carry the message-expiry interval, so a cross-node delivery has
                 // no deadline (carried limitation).
                 self.deliver(&topic, &payload, qos, retain, None).await;
-            }
-            HubCommand::Detach {
-                client,
-                conn_id,
-                graceful,
-            } => {
-                self.detach(&client, conn_id, graceful).await;
             }
             HubCommand::PeerConnected { node, conn_id, tx } => {
                 self.peer_connected(node.clone(), conn_id, tx);
@@ -606,6 +705,8 @@ impl Hub {
                 self.deliver_to_client(&client, &topic, &payload, qos, None)
                     .await;
             }
+            // Client/session commands are handled in `dispatch`; they never route here.
+            _ => {}
         }
     }
 
@@ -679,48 +780,100 @@ impl Hub {
         }
     }
 
-    // The parameters mirror the `Attach` command's fields one-for-one; bundling them
-    // into a struct would only move the destructuring, not remove it.
-    #[allow(clippy::too_many_arguments)]
-    async fn attach(
-        &mut self,
-        client: ClientId,
-        conn_id: u64,
-        clean_start: bool,
-        session_expiry: u32,
-        receive_maximum: u16,
-        will: Option<Message>,
-        outbound: Outbound,
-        reply: oneshot::Sender<bool>,
-    ) {
+    /// Begin attaching a connection. A clean-start session registers immediately; a
+    /// persistent session first recovers its durable state **off the hub command loop**
+    /// (ADR 0017) so the possibly-seconds-long lease/quorum wait cannot freeze the
+    /// single-threaded hub. Recovery completes back on the loop via `SessionRecovered`.
+    async fn attach(&mut self, pending: PendingAttach, clean_start: bool) {
         // A reconnect cancels any pending expiry for this session (ADR 0009).
-        self.expiring.remove(&client);
+        self.expiring.remove(&pending.client);
 
-        let session_present = if clean_start {
-            // Clean Start: discard any prior session state for this client.
-            self.discard_session(&client).await;
-            false
-        } else {
-            self.note_session_ownership(&client);
-            let existed = self.store.ensure_session(&client).await.unwrap_or(false);
-            // Reconcile the routing table with persisted subscriptions (needed
-            // after a broker restart; idempotent otherwise).
-            if let Ok(subs) = self.store.subscriptions(&client).await {
-                for s in subs {
-                    if let Some((group, filter)) = parse_shared(&s.filter) {
-                        self.shared
-                            .subscribe(client.clone(), group, filter, s.max_qos);
-                    } else {
-                        self.table.subscribe(client.clone(), s.filter.clone());
-                    }
-                    self.subs_by_client
-                        .entry(client.clone())
-                        .or_default()
-                        .insert(s.filter, s.max_qos);
-                }
+        if clean_start {
+            // Clean Start: discard any prior session state; there is nothing to wait on.
+            self.discard_session(&pending.client).await;
+            self.finish_attach(pending, true, false, Vec::new()).await;
+            return;
+        }
+
+        // Persistent: the durable store must answer authoritatively whether this session
+        // exists. During a lease handoff that answer is momentarily `Unavailable`; we
+        // must wait for it (never downgrade to "no session") and do so off-loop so the
+        // wait does not stall every other client on this node.
+        self.note_session_ownership(&pending.client);
+        self.connecting
+            .insert(pending.client.clone(), pending.conn_id);
+        tokio::spawn(recover_session(
+            self.store.clone(),
+            self.self_tx.clone(),
+            pending,
+        ));
+    }
+
+    /// Handle the off-loop recovery result for a persistent attach (ADR 0017). Drops a
+    /// superseded recovery (a newer connect won the id during the wait), rejects on
+    /// `Unavailable` (never a false "no session"), otherwise finishes registration.
+    async fn session_recovered(&mut self, pending: PendingAttach, recovery: SessionRecovery) {
+        // Last-writer-wins: if a newer connect for this id arrived during the wait, this
+        // recovery is stale — drop it (its reply is dropped, which closes that
+        // connection). The newer connect's own recovery will register it.
+        if self.connecting.get(&pending.client) != Some(&pending.conn_id) {
+            debug!(client = %pending.client.0, "dropping superseded session recovery");
+            return;
+        }
+        self.connecting.remove(&pending.client);
+
+        match recovery {
+            SessionRecovery::Ready {
+                present,
+                subscriptions,
+            } => {
+                self.finish_attach(pending, false, present, subscriptions)
+                    .await;
             }
-            existed
-        };
+            SessionRecovery::Unavailable => {
+                warn!(
+                    client = %pending.client.0,
+                    "durable session recovery stayed unavailable past deadline; rejecting CONNECT (ADR 0017)"
+                );
+                let _ = pending.reply.send(AttachOutcome::Unavailable);
+            }
+        }
+    }
+
+    /// Finish a recovered (or clean-start) attach on the hub loop: reconcile
+    /// subscriptions, register the connection (honoring takeover), reply so the
+    /// connection can CONNACK, then resume in-flight `QoS` and replay queued messages.
+    async fn finish_attach(
+        &mut self,
+        pending: PendingAttach,
+        clean_start: bool,
+        session_present: bool,
+        subscriptions: Vec<Subscription>,
+    ) {
+        let PendingAttach {
+            client,
+            conn_id,
+            session_expiry,
+            receive_maximum,
+            will,
+            outbound,
+            reply,
+        } = pending;
+
+        // Reconcile the routing table with persisted subscriptions (idempotent; empty
+        // for a clean start).
+        for s in subscriptions {
+            if let Some((group, filter)) = parse_shared(&s.filter) {
+                self.shared
+                    .subscribe(client.clone(), group, filter, s.max_qos);
+            } else {
+                self.table.subscribe(client.clone(), s.filter.clone());
+            }
+            self.subs_by_client
+                .entry(client.clone())
+                .or_default()
+                .insert(s.filter, s.max_qos);
+        }
 
         // Record this session's retention: it survives disconnect iff the expiry
         // interval is non-zero. A zero interval (or v3.1.1 clean_session=1) means the
@@ -759,7 +912,7 @@ impl Hub {
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
 
         // Tell the connection the result so it can CONNACK before any replay.
-        let _ = reply.send(session_present);
+        let _ = reply.send(AttachOutcome::Present(session_present));
 
         // Resume in-flight QoS state: unacked PUBLISHes go out again with DUP
         // [MQTT-4.4.0-1]; half-completed QoS 2 deliveries resume at PUBREL.
@@ -781,7 +934,8 @@ impl Hub {
             }
         }
 
-        // Replay queued messages (they land in the channel after CONNACK). A message
+        // Replay queued messages (they land in the channel after CONNACK). The lease is
+        // warm (recovery just succeeded), so these reads are fast and local. A message
         // whose MQTT 5.0 expiry deadline has passed is dropped, not delivered, and the
         // remaining interval is forwarded on the rest (ADR 0009 §3).
         if !clean_start {
@@ -1563,10 +1717,59 @@ fn now_epoch_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Recover a persistent session off the hub command loop and post the result back as
+/// [`HubCommand::SessionRecovered`] (ADR 0017). Run in a spawned task so the bounded
+/// lease/quorum wait never blocks the single-threaded hub.
+async fn recover_session(
+    store: Arc<dyn SessionStore>,
+    self_tx: mpsc::UnboundedSender<HubCommand>,
+    pending: PendingAttach,
+) {
+    let recovery = recover_until_ready(&store, &pending.client).await;
+    let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
+}
+
+/// Retry the durable session read until it answers authoritatively or the recovery
+/// deadline elapses (ADR 0017). A transient `Unavailable` (lease reassigning / quorum
+/// momentarily unreachable) is retried with capped backoff; a terminal error, or the
+/// deadline, yields `Unavailable` so the attach rejects the CONNECT rather than
+/// fabricate a clean session over a recoverable one.
+async fn recover_until_ready(store: &Arc<dyn SessionStore>, client: &ClientId) -> SessionRecovery {
+    let deadline = Instant::now() + ATTACH_RECOVERY_TIMEOUT;
+    let mut backoff = ATTACH_RECOVERY_BACKOFF_START;
+    loop {
+        match recover_once(store, client).await {
+            Ok(ready) => return ready,
+            // Transient and time remaining: back off and retry.
+            Err(e) if e.is_transient() && Instant::now() < deadline => {}
+            // Terminal failure, or the deadline passed: reject (never downgrade).
+            Err(_) => return SessionRecovery::Unavailable,
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(ATTACH_RECOVERY_BACKOFF_MAX);
+    }
+}
+
+/// One recovery attempt: `ensure_session` then `subscriptions`, both authoritative
+/// durable reads. Surfaces the [`StorageError`] so the caller can distinguish a
+/// transient condition from a terminal one.
+async fn recover_once(
+    store: &Arc<dyn SessionStore>,
+    client: &ClientId,
+) -> Result<SessionRecovery, StorageError> {
+    let present = store.ensure_session(client).await?;
+    let subscriptions = store.subscriptions(client).await?;
+    Ok(SessionRecovery::Ready {
+        present,
+        subscriptions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound, MAX_BACKLOG, REPLAY_LIMIT,
+        AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound, MAX_BACKLOG,
+        REPLAY_LIMIT,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::PeerMessage;
@@ -1588,6 +1791,147 @@ mod tests {
         let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), std::sync::Arc::new(store));
         tokio::spawn(hub.run());
         tx
+    }
+
+    fn start_hub_with_arc(store: std::sync::Arc<dyn mqtt_storage::SessionStore>) -> HubTx {
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), store);
+        tokio::spawn(hub.run());
+        tx
+    }
+
+    /// Send a persistent (resume) `Attach` and return the raw [`AttachOutcome`] so a
+    /// test can assert a reject (`Unavailable`) as well as a present/absent session.
+    async fn attach_outcome(tx: &HubTx, client: &str, conn_id: u64) -> AttachOutcome {
+        let (out_tx, _out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.into()),
+            conn_id,
+            clean_start: false,
+            session_expiry: u32::MAX,
+            receive_maximum: u16::MAX,
+            will: None,
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        reply_rx.await.unwrap()
+    }
+
+    /// A `SessionStore` that fails the first `fail_ensure` `ensure_session` calls with
+    /// the transient `Unavailable` error (modelling a lease handoff), then delegates to
+    /// an in-memory store. The fault injection for the ADR 0017 readiness tests.
+    #[derive(Debug)]
+    struct FlakyStore {
+        inner: MemorySessionStore,
+        fail_remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyStore {
+        fn new(fail_ensure: usize) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: MemorySessionStore::new(),
+                fail_remaining: std::sync::atomic::AtomicUsize::new(fail_ensure),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::SessionStore for FlakyStore {
+        async fn ensure_session(
+            &self,
+            client: &ClientId,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            use std::sync::atomic::Ordering;
+            // Fail the first `fail_remaining` calls with the transient condition.
+            if self
+                .fail_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(mqtt_storage::StorageError::Unavailable(
+                    "lease handing off".into(),
+                ));
+            }
+            self.inner.ensure_session(client).await
+        }
+
+        async fn set_subscriptions(
+            &self,
+            client: &ClientId,
+            subscriptions: &[mqtt_core::Subscription],
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_subscriptions(client, subscriptions).await
+        }
+
+        async fn subscriptions(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_core::Subscription>, mqtt_storage::StorageError> {
+            self.inner.subscriptions(client).await
+        }
+
+        async fn enqueue_with_expiry(
+            &self,
+            client: &ClientId,
+            message: &mqtt_core::Message,
+            expiry_at: Option<u64>,
+        ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+            self.inner
+                .enqueue_with_expiry(client, message, expiry_at)
+                .await
+        }
+
+        async fn pending(
+            &self,
+            client: &ClientId,
+            after: mqtt_storage::Offset,
+            limit: usize,
+        ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+            self.inner.pending(client, after, limit).await
+        }
+
+        async fn ack(
+            &self,
+            client: &ClientId,
+            up_to: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack(client, up_to).await
+        }
+
+        async fn record_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            self.inner.record_received(client, packet_id).await
+        }
+
+        async fn clear_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_received(client, packet_id).await
+        }
+
+        async fn received(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<u16>, mqtt_storage::StorageError> {
+            self.inner.received(client).await
+        }
+
+        async fn next_packet_id(
+            &self,
+            client: &ClientId,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.next_packet_id(client).await
+        }
+
+        async fn remove(&self, client: &ClientId) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.remove(client).await
+        }
     }
 
     /// Attach with the v3.1.1 `clean_session` semantics (the common test case):
@@ -1637,7 +1981,12 @@ mod tests {
             reply: reply_tx,
         })
         .unwrap();
-        let session_present = reply_rx.await.unwrap();
+        let session_present = match reply_rx.await.unwrap() {
+            AttachOutcome::Present(present) => present,
+            AttachOutcome::Unavailable => {
+                panic!("in-memory store attach is never Unavailable")
+            }
+        };
         (out_rx, session_present)
     }
 
@@ -2486,6 +2835,107 @@ mod tests {
             got,
             vec![b"m3".to_vec(), b"m4".to_vec(), b"m5".to_vec()],
             "only the newest cap-many messages survive the offline window"
+        );
+    }
+
+    // --- ADR 0017: durable attach readiness ----------------------------------
+
+    /// A transient store condition (lease handoff) during a persistent attach must be
+    /// *waited out*, never downgraded to a clean session: the attach resolves to a real
+    /// `Present(_)` once the store recovers, and the session it creates is reported
+    /// `present=true` on the next reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn transient_lease_does_not_downgrade_a_persistent_attach() {
+        let store = FlakyStore::new(3); // first 3 ensure_session calls fail transiently
+        let tx = start_hub_with_arc(store);
+
+        // First attach rides out the transient failures and resolves authoritatively
+        // (a brand-new session, so present=false) — crucially NOT a reject.
+        let outcome = attach_outcome(&tx, "c", 1).await;
+        assert!(
+            matches!(outcome, AttachOutcome::Present(false)),
+            "transient errors must be waited out, not rejected/downgraded; got {outcome:?}"
+        );
+        detach(&tx, "c", 1);
+
+        // The session was durably created; reconnecting reports it present.
+        let outcome = attach_outcome(&tx, "c", 2).await;
+        assert!(
+            matches!(outcome, AttachOutcome::Present(true)),
+            "the recovered persistent session must come up present; got {outcome:?}"
+        );
+    }
+
+    /// A store that never becomes available within the recovery deadline must make the
+    /// attach *reject* (so the client retries), never report a false `Present(false)`
+    /// that would silently reset a recoverable session.
+    #[tokio::test(start_paused = true)]
+    async fn permanently_unavailable_store_rejects_rather_than_downgrades() {
+        let store = FlakyStore::new(usize::MAX); // every ensure_session fails transiently
+        let tx = start_hub_with_arc(store);
+
+        let outcome = attach_outcome(&tx, "c", 1).await;
+        assert!(
+            matches!(outcome, AttachOutcome::Unavailable),
+            "a never-ready store must reject the CONNECT, not downgrade; got {outcome:?}"
+        );
+    }
+
+    /// The recovery wait runs off the hub command loop: while one client's persistent
+    /// attach is still recovering, the hub keeps serving other commands (here, a second
+    /// client's clean attach completes promptly).
+    #[tokio::test(start_paused = true)]
+    async fn recovery_wait_does_not_block_the_hub_loop() {
+        let store = FlakyStore::new(usize::MAX); // "a" will recover forever
+        let tx = start_hub_with_arc(store);
+
+        // Kick off a persistent attach for "a" that will not resolve.
+        let (out_tx, _out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (reply_tx, mut a_reply) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId("a".into()),
+            conn_id: 1,
+            clean_start: false,
+            session_expiry: u32::MAX,
+            receive_maximum: u16::MAX,
+            will: None,
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+
+        // While "a" is mid-recovery, a clean attach for "b" must still complete quickly.
+        let b = timeout(Duration::from_secs(1), attach(&tx, "b", 2, true)).await;
+        let (_rx, present) = b.expect("the hub stayed responsive during a recovery wait");
+        assert!(!present, "clean attach has no prior session");
+
+        // "a" is still waiting (not yet resolved) — the loop was never blocked on it.
+        assert!(
+            a_reply.try_recv().is_err(),
+            "the unresolved recovery must still be pending"
+        );
+    }
+
+    /// Overlapping persistent connects for the same id: the newer one wins. The older
+    /// recovery, if it lands late, is dropped rather than registering a stale session.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_connects_are_last_writer_wins() {
+        let store = FlakyStore::new(0); // recovers immediately
+        let tx = start_hub_with_arc(store);
+
+        // Two connects for "c" in quick succession; conn 2 supersedes conn 1.
+        let o1 = attach_outcome(&tx, "c", 1).await;
+        let o2 = attach_outcome(&tx, "c", 2).await;
+        assert!(matches!(o1, AttachOutcome::Present(_)));
+        assert!(matches!(o2, AttachOutcome::Present(_)));
+
+        // The live connection is conn 2: a detach of the stale conn 1 is ignored, while
+        // a detach of conn 2 actually tears the session down (proving 2 is registered).
+        detach(&tx, "c", 1);
+        let still_present = attach_outcome(&tx, "c", 3).await;
+        assert!(
+            matches!(still_present, AttachOutcome::Present(true)),
+            "the session survives a stale connection's detach; got {still_present:?}"
         );
     }
 }

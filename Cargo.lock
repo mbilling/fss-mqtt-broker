@@ -866,6 +866,7 @@ dependencies = [
 name = "mqttd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "mqtt-auth",
  "mqtt-cluster",
