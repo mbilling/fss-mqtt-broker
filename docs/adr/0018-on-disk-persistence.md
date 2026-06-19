@@ -1,6 +1,6 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–3 (incl. 3b) implemented** (2026-06-19); phases 4–5 pending
+- **Status:** Accepted; **phases 1–4 (incl. 3b) implemented** (2026-06-19); phase 5 pending
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -199,10 +199,22 @@ since truncation propagates to all live followers — the watermark can't be obs
 impact is bounded redelivery, not loss.) Unit-tested: the merge does not resurrect a stale
 replica's truncated prefix (in either read order), and the watermark survives reopen.
 
-Still pending: phase 4 (retained on disk), phase 5 (compaction, data-dir node-id guard,
-process-kill crash test, and the **full-cluster-restart integration test** covering
-sessions + retained + leases end to end — deferred until retained persistence lands so it
-covers all three).
+### Phase 4 (2026-06-19): retained store on disk
+
+`PersistentRetainedStore` (`crates/mqtt-storage/src/persistent_retained.rs`) implements
+`RetainedStore` over `redb`: an in-memory topic → message map serves the hot reads
+(`matching`/`all` on subscribe), and every `set` is **write-through fsync'd** before it
+returns (an empty-payload set durably clears the topic, per MQTT). `open` reloads the map
+from disk; cross-node back-fill (ADR 0014 §3) reconciles divergence afterwards. Wired via
+`Hub::attach_retained_store`: whenever `MQTTD_DATA_DIR` is set (single-node-persistent or
+durable-cluster), the hub uses `<dir>/retained.redb`. Unit-tested: retained messages and
+an empty-payload clear survive close/reopen, and wildcard matching + payload/QoS fidelity
+hold after reopen.
+
+Still pending: **phase 5** — snapshot/compaction policy for the redb stores, a data-dir
+node-id guard (refuse a dir stamped by a different node), a process-kill **crash test**
+(vs. the reopen tests), and the end-to-end **full-cluster-restart integration test** now
+that all three layers (sessions, retained, leases) persist.
 
 ## Consequences
 

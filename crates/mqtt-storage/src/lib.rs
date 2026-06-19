@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 pub mod logged;
 pub mod persistent_log;
+pub mod persistent_retained;
 pub mod repl;
 
 /// A monotonically increasing position within a single session's queue log.

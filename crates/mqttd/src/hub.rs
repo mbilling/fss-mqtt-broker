@@ -570,6 +570,13 @@ impl Hub {
         self.durable_plane = Some(plane);
     }
 
+    /// Replace the retained-message store before [`run`](Self::run) — used to swap the
+    /// in-memory default for the on-disk store when persistence is enabled (ADR 0018
+    /// phase 4).
+    pub fn attach_retained_store(&mut self, retained: Box<dyn RetainedStore>) {
+        self.retained = retained;
+    }
+
     /// Run the hub event loop: dispatch commands and periodically sweep expired
     /// sessions (ADR 0009), until all command senders are dropped.
     pub async fn run(mut self) {

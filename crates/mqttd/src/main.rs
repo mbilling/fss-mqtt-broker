@@ -62,7 +62,8 @@ use mqtt_net::tls;
 use mqtt_observability::AuditLog;
 use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::persistent_log::PersistentLog;
-use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
+use mqtt_storage::persistent_retained::PersistentRetainedStore;
+use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
 use mqttd::{cluster, conn, hub, peer};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -335,6 +336,9 @@ async fn start_hub(
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
         hub.attach_durable_plane(plane);
+        if let Some(dir) = &data_dir {
+            hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
+        }
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(plane_for_health)))
     } else if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
@@ -352,11 +356,12 @@ async fn start_hub(
             log,
             queue_limits_from_env()?,
         ));
-        let (hub, hub_tx) = hub::Hub::with_config_and_placement(
+        let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
             node_id.clone(),
             store.clone(),
             Some(placement.clone()),
         );
+        hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None))
     } else {
@@ -370,6 +375,13 @@ async fn start_hub(
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None))
     }
+}
+
+/// Build the on-disk retained-message store at `<dir>/retained.redb` (ADR 0018 phase 4),
+/// so retained messages survive a restart.
+fn persistent_retained(dir: &str) -> Result<Box<dyn RetainedStore>, Box<dyn std::error::Error>> {
+    let path = Path::new(dir).join("retained.redb");
+    Ok(Box::new(PersistentRetainedStore::open(path)?))
 }
 
 /// Start the health endpoint server from `MQTTD_HEALTH_BIND` (no-op when unset).
