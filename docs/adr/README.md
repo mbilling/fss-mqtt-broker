@@ -26,3 +26,4 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Accepted; phases 1–2 implemented |
 | [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Proposed |
 | [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed |
+| [0021](0021-bounded-lease-voters.md) | Bounded lease-consensus voter set (small fixed quorum + learners) | Proposed |
