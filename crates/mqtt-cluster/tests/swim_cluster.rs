@@ -24,6 +24,7 @@ fn cfg() -> Config {
         indirect_probes: 2,
         gossip_fanout: 8,
         gossip_multiplier: 4,
+        awareness_max: 8,
     }
 }
 

@@ -69,6 +69,11 @@ pub struct Config {
     pub gossip_fanout: usize,
     /// Multiplier on the `~log2(N)` re-broadcast count for each update.
     pub gossip_multiplier: u32,
+    /// Upper bound on the Lifeguard local-health awareness score (ADR 0016 §2). The
+    /// `ack`/`suspicion` timeouts are scaled by `(1 + awareness)`, so this caps how much
+    /// a locally-degraded node slows its own failure detection. `0` disables awareness
+    /// (timeouts never scale).
+    pub awareness_max: u8,
 }
 
 impl Default for Config {
@@ -81,6 +86,7 @@ impl Default for Config {
             indirect_probes: 3,
             gossip_fanout: 6,
             gossip_multiplier: 3,
+            awareness_max: 8,
         }
     }
 }
@@ -223,6 +229,11 @@ pub struct Swim {
     probe_idx: usize,
     rng: u64,
     bootstrapped: bool,
+    /// Lifeguard local-health awareness (ADR 0016 §2): rises when our *own* probes go
+    /// unanswered or we must refute ourselves (signals we are the slow one), decays on a
+    /// clean probe. Scales our `ack`/`suspicion` timeouts by `(1 + awareness)` so a
+    /// degraded node stops blaming healthy peers. `0` ⇒ today's timeouts.
+    awareness: u8,
 }
 
 impl Swim {
@@ -260,6 +271,7 @@ impl Swim {
             probe_idx: 0,
             rng: rng | 1,
             bootstrapped: false,
+            awareness: 0,
         }
     }
 
@@ -292,6 +304,34 @@ impl Swim {
         x ^= x << 17;
         self.rng = x;
         x
+    }
+
+    /// The Lifeguard local-health multiplier `(1 + awareness)` (ADR 0016 §2).
+    fn health_multiplier(&self) -> u64 {
+        1 + u64::from(self.awareness)
+    }
+
+    /// `ack_timeout` scaled by local health: a degraded node waits longer for acks
+    /// before escalating, so it stops mistaking its own slowness for a peer's.
+    fn scaled_ack_timeout(&self) -> u64 {
+        self.cfg.ack_timeout_ms * self.health_multiplier()
+    }
+
+    /// `suspicion_timeout` scaled by local health: a degraded node holds a `Suspect`
+    /// longer before declaring `Dead`, giving the victim's refutation time to land.
+    fn scaled_suspicion_timeout(&self) -> u64 {
+        self.cfg.suspicion_timeout_ms * self.health_multiplier()
+    }
+
+    /// Raise awareness (capped at `awareness_max`): a signal that *we* are the slow one
+    /// — an unanswered probe of ours, or having to refute a suspicion about ourselves.
+    fn raise_awareness(&mut self) {
+        self.awareness = (self.awareness + 1).min(self.cfg.awareness_max);
+    }
+
+    /// Lower awareness on a clean round (a probe of ours was acked).
+    fn lower_awareness(&mut self) {
+        self.awareness = self.awareness.saturating_sub(1);
     }
 
     /// `~log2(N)` re-broadcasts, scaled by the configured multiplier.
@@ -348,6 +388,8 @@ impl Swim {
                     state: MemberState::Alive,
                 };
                 self.enqueue_gossip(refute);
+                // Having to refute ourselves signals we are the slow one (ADR 0016 §2).
+                self.raise_awareness();
             }
             return;
         }
@@ -476,12 +518,17 @@ impl Swim {
                 });
                 out.push(Action::Send { to: addr, msg });
             }
+            let indirect_deadline = now + self.scaled_ack_timeout();
             if let Some(p) = &mut self.probe {
-                p.indirect_deadline = Some(now + self.cfg.ack_timeout_ms);
+                p.indirect_deadline = Some(indirect_deadline);
             }
         } else if let Some(idl) = p.indirect_deadline {
             if now >= idl {
-                // Indirect probing also failed: suspect the target.
+                // Indirect probing also failed: suspect the target. We do NOT raise our
+                // own awareness here — without NACKs an unanswered probe is ambiguous
+                // (the target may simply be dead), so blaming our local health would
+                // wrongly slow detection of genuinely-dead peers (ADR 0016 §2). Only
+                // self-refutation, an unambiguous "others cannot reach us", raises it.
                 let target = p.target.clone();
                 self.probe = None;
                 self.declare(&target, MemberState::Suspect, now, out);
@@ -503,7 +550,7 @@ impl Swim {
             .values()
             .filter(|m| {
                 m.state == MemberState::Suspect
-                    && now.saturating_sub(m.state_since) >= self.cfg.suspicion_timeout_ms
+                    && now.saturating_sub(m.state_since) >= self.scaled_suspicion_timeout()
             })
             .map(|m| m.id.clone())
             .collect();
@@ -523,10 +570,11 @@ impl Swim {
         let seq = self.seq;
         let msg = self.message(Kind::Ping { seq });
         out.push(Action::Send { to: addr, msg });
+        let ack_deadline = now + self.scaled_ack_timeout();
         self.probe = Some(Probe {
             target,
             seq,
-            ack_deadline: now + self.cfg.ack_timeout_ms,
+            ack_deadline,
             indirect_deadline: None,
         });
     }
@@ -620,6 +668,7 @@ impl Swim {
                 if let Some(p) = &self.probe {
                     if p.target.0 == target {
                         self.probe = None;
+                        self.lower_awareness(); // an indirect probe still succeeded
                     }
                 }
             }
@@ -642,6 +691,7 @@ impl Swim {
         if let Some(p) = &self.probe {
             if p.seq == seq {
                 self.probe = None;
+                self.lower_awareness(); // a clean round (ADR 0016 §2)
                 return;
             }
         }
@@ -695,6 +745,7 @@ mod tests {
             indirect_probes: 2,
             gossip_fanout: 8,
             gossip_multiplier: 3,
+            awareness_max: 8,
         }
     }
 
@@ -726,6 +777,13 @@ mod tests {
     fn dead_update(id: &str, addr: &str, inc: u64) -> Update {
         Update {
             state: MemberState::Dead,
+            ..alive_update(id, addr, inc)
+        }
+    }
+
+    fn suspect_update(id: &str, addr: &str, inc: u64) -> Update {
+        Update {
+            state: MemberState::Suspect,
             ..alive_update(id, addr, inc)
         }
     }
@@ -1111,6 +1169,75 @@ mod tests {
         let sync = sync.expect("a Sync reply");
         assert!(sync.gossip.iter().any(|u| u.id == "a"));
         assert!(sync.gossip.iter().any(|u| u.id == "c"));
+    }
+
+    // --- ADR 0016 phase 2 §2: Lifeguard local-health awareness -----------------
+
+    /// A locally-degraded node (raised awareness) holds a `Suspect` peer longer before
+    /// declaring it `Dead` — its `suspicion_timeout` is scaled by `(1 + awareness)` —
+    /// so a healthy peer whose refutation is merely slow is not falsely evicted.
+    #[test]
+    fn awareness_scales_the_suspicion_timeout() {
+        let base = fast_cfg().suspicion_timeout_ms; // 200
+
+        // Healthy node (awareness 0): Dead right after the base timeout.
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&suspect_update("b", "b:1", 0), 0, &mut out);
+        s.expire_suspects(base + 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        // Degraded node (awareness 2): timeout scaled to 3× base.
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&suspect_update("b", "b:1", 0), 0, &mut out);
+        s.awareness = 2;
+        // Past the base timeout but within the scaled window: still Suspect.
+        s.expire_suspects(base * 2, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Suspect),
+            "a degraded node must wait longer before declaring Dead"
+        );
+        // Past the scaled window (3×): Dead.
+        s.expire_suspects(base * 3 + 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+    }
+
+    /// Awareness rises when we must refute a suspicion about ourselves (an unambiguous
+    /// "peers cannot reach us" signal) and decays on a clean probe round.
+    #[test]
+    fn awareness_rises_on_self_refutation_and_decays_on_a_clean_probe() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        assert_eq!(s.awareness, 0);
+
+        // A suspicion about ourselves forces a refutation and raises awareness.
+        let inc = current_incarnation(&s);
+        s.apply_update(&suspect_update("a", "a:1", inc), 0, &mut out);
+        assert_eq!(s.awareness, 1, "self-refutation raises awareness");
+
+        // A successful probe round (direct ack) decays it back.
+        s.tick(0); // bootstrap
+        let actions = s.tick(100); // Ping b
+        let seq = ping_seq(&actions).expect("a ping was sent");
+        s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 110);
+        assert_eq!(s.awareness, 0, "a clean probe decays awareness");
+    }
+
+    /// Awareness is capped at `awareness_max`, bounding how slow a degraded node gets.
+    #[test]
+    fn awareness_is_capped_at_awareness_max() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        let cap = fast_cfg().awareness_max;
+        // Force many self-refutations; each must raise incarnation so the next applies.
+        for _ in 0..(u32::from(cap) + 5) {
+            let inc = current_incarnation(&s);
+            s.apply_update(&suspect_update("a", "a:1", inc), 0, &mut out);
+        }
+        assert_eq!(s.awareness, cap, "awareness saturates at awareness_max");
     }
 
     // --- helpers ---------------------------------------------------------------
