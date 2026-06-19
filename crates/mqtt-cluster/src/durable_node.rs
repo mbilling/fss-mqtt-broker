@@ -62,16 +62,17 @@ pub async fn build_durable_node(
     node_id: NodeId,
     placement: Arc<RwLock<Placement>>,
     can_bootstrap: bool,
-    lease_path: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
 ) -> (Arc<dyn SessionStore>, DurablePlane) {
     let local = raft_id(&node_id);
 
     // --- lease consensus group + durable-plane endpoint ---
     let network = MeshRaftNetwork::new();
-    // A persistent lease store (ADR 0018 phase 2) when a path is given — restoring Raft
-    // safety (the persisted vote) and lease recovery across restart; otherwise in-memory.
-    let lease_store = match lease_path {
-        Some(path) => LeaseStore::open(path).expect("open the lease store"),
+    // On-disk persistence when a data dir is given (ADR 0018): the lease store (phase 2 —
+    // restoring Raft safety via the persisted vote) and the follower replica copy (phase
+    // 3 — clustered sessions survive a full-cluster restart); otherwise both in-memory.
+    let lease_store = match data_dir {
+        Some(dir) => LeaseStore::open(dir.join("lease.redb")).expect("open the lease store"),
         None => LeaseStore::new(),
     };
     let (log_store, state_machine) = Adaptor::new(lease_store.clone());
@@ -87,7 +88,12 @@ pub async fn build_durable_node(
     let transport = Arc::new(PeerReplicaTransport::new());
     // One follower-copy `ReplicaState`, shared: the plane applies inbound Replicates
     // into it, and the store reads it back for takeover recovery (workstream F).
-    let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+    // Persistent (ADR 0018 phase 3) when a data dir is given, so the committed copy
+    // survives a restart.
+    let replicas = Arc::new(Mutex::new(match data_dir {
+        Some(dir) => ReplicaState::open(dir.join("replicas.redb")).expect("open the replica store"),
+        None => ReplicaState::new(),
+    }));
     let plane = DurablePlane::new(raft.clone(), network, transport.clone(), replicas.clone());
 
     // --- durable store over the shared transport ---

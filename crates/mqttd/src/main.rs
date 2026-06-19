@@ -310,20 +310,21 @@ async fn start_hub(
         // A node started with no SWIM seeds is the cluster founder — only it
         // bootstraps the lease group (ADR 0007 §2). Exactly one founder per cluster.
         let founder = non_empty_env("MQTTD_SWIM_SEEDS").is_none();
-        // Persist the lease consensus store on disk when MQTTD_DATA_DIR is set (ADR 0018
-        // phase 2): the vote and lease assignments survive a restart, restoring Raft
-        // safety. Without it the lease group is in-memory (rebuilds from peers).
-        let lease_path = non_empty_env("MQTTD_DATA_DIR").map(|d| Path::new(&d).join("lease.redb"));
+        // Persist the lease store and follower replica copy on disk when MQTTD_DATA_DIR
+        // is set (ADR 0018 phases 2–3): the lease vote/assignments and the replicated
+        // session log survive a restart (restoring Raft safety and full-cluster-restart
+        // durability). Without it the durable plane is in-memory (rebuilds from peers).
+        let data_dir = non_empty_env("MQTTD_DATA_DIR");
         info!(
             founder,
-            persistent_lease = lease_path.is_some(),
+            persistent = data_dir.is_some(),
             "DURABLE sessions enabled: consensus-backed replicated store"
         );
         let (store, plane) = mqtt_cluster::durable_node::build_durable_node(
             node_id.clone(),
             placement.clone(),
             founder,
-            lease_path.as_deref(),
+            data_dir.as_deref().map(Path::new),
         )
         .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(

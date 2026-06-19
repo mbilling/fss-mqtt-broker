@@ -34,8 +34,11 @@ use crate::NodeId;
 use async_trait::async_trait;
 use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
+use redb::{Database, Durability, ReadableTable, TableDefinition};
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
+use std::path::Path;
+use std::sync::Arc;
 
 /// A replication operation the lease-holder ships to a replica. Carried with the
 /// holder's [`Epoch`] so the replica can fence a stale holder.
@@ -64,22 +67,155 @@ pub enum ReplOp {
     },
 }
 
+const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
+const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
+const R_FENCE: &str = "fence";
+
+/// A replica's stored entries: per logical key, an offset → record map.
+type ReplicaLogs = BTreeMap<String, BTreeMap<Offset, Vec<u8>>>;
+
+/// Map a `redb` error into the storage backend error.
+fn rdb<E: std::fmt::Display>(e: E) -> ReplError {
+    ReplError::Backend(e.to_string())
+}
+
+/// Encode a replica entry key: `len(key) ++ key ++ offset_be` (range-scannable per key).
+fn r_entry_key(key: &str, offset: Offset) -> Vec<u8> {
+    let kb = key.as_bytes();
+    let mut out = Vec::with_capacity(4 + kb.len() + 8);
+    out.extend_from_slice(&(u32::try_from(kb.len()).unwrap_or(u32::MAX)).to_be_bytes());
+    out.extend_from_slice(kb);
+    out.extend_from_slice(&offset.to_be_bytes());
+    out
+}
+
+/// Delete a logical key's entries in the inclusive offset range `[lo, hi]`.
+fn delete_entry_range(
+    entries: &mut redb::Table<'_, &[u8], &[u8]>,
+    key: &str,
+    lo: Offset,
+    hi: Offset,
+) -> Result<(), ReplError> {
+    let lo_k = r_entry_key(key, lo);
+    let hi_k = r_entry_key(key, hi);
+    let doomed: Vec<Vec<u8>> = entries
+        .range(lo_k.as_slice()..=hi_k.as_slice())
+        .map_err(rdb)?
+        .map(|item| item.map(|(k, _)| k.value().to_vec()))
+        .collect::<Result<_, _>>()
+        .map_err(rdb)?;
+    for k in doomed {
+        entries.remove(k.as_slice()).map_err(rdb)?;
+    }
+    Ok(())
+}
+
+/// Decode `(key, offset)` from a replica entry key.
+fn r_decode_key(bytes: &[u8]) -> (String, Offset) {
+    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let key = String::from_utf8_lossy(&bytes[4..4 + len]).into_owned();
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&bytes[4 + len..]);
+    (key, Offset::from_be_bytes(o))
+}
+
 /// The follower side of replication: a replica's stored copy plus its fence epoch.
 ///
-/// Pure — [`apply`](ReplicaState::apply) is the entire follower protocol. The real
-/// transport (step 3b) calls it on the receiving node; the test transport calls it
-/// in-process.
+/// [`apply`](ReplicaState::apply) is the entire follower protocol. The in-memory `logs`
+/// map and `fence` are the source of truth for reads; when opened with
+/// [`open`](ReplicaState::open) (ADR 0018 phase 3) every accepted `apply` is also
+/// **write-through fsync'd** to a `redb` database (persist-before-mutate), so the
+/// follower's committed copy survives a restart — what a clustered durable session needs
+/// to survive a *full-cluster* restart, not only a single-node failure.
 #[derive(Debug, Default)]
 pub struct ReplicaState {
     fence: Epoch,
-    logs: BTreeMap<String, BTreeMap<Offset, Vec<u8>>>,
+    logs: ReplicaLogs,
+    /// `Some` when persisting to disk; `None` for the in-memory default.
+    db: Option<Arc<Database>>,
 }
 
 impl ReplicaState {
-    /// A fresh, empty replica.
+    /// A fresh, empty **in-memory** replica (non-persistent).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open (creating if absent) a **persistent** replica at `path`, recovering its
+    /// fence and stored entries from disk.
+    ///
+    /// # Errors
+    /// [`ReplError::Backend`] if the database cannot be opened or its contents decoded.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
+        let db = Database::create(path).map_err(rdb)?;
+        let txn = db.begin_write().map_err(rdb)?;
+        {
+            let _ = txn.open_table(R_ENTRIES).map_err(rdb)?;
+            let _ = txn.open_table(R_META).map_err(rdb)?;
+        }
+        txn.commit().map_err(rdb)?;
+        let (fence, logs) = Self::load(&db)?;
+        Ok(Self {
+            fence,
+            logs,
+            db: Some(Arc::new(db)),
+        })
+    }
+
+    /// Reconstruct the in-memory cache from the on-disk tables.
+    fn load(db: &Database) -> Result<(Epoch, ReplicaLogs), ReplError> {
+        let txn = db.begin_read().map_err(rdb)?;
+        let fence = txn
+            .open_table(R_META)
+            .map_err(rdb)?
+            .get(R_FENCE)
+            .map_err(rdb)?
+            .map_or(0, |g| g.value());
+        let mut logs: ReplicaLogs = BTreeMap::new();
+        let entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
+        for item in entries.range::<&[u8]>(..).map_err(rdb)? {
+            let (k, v) = item.map_err(rdb)?;
+            let (key, offset) = r_decode_key(k.value());
+            logs.entry(key)
+                .or_default()
+                .insert(offset, v.value().to_vec());
+        }
+        Ok((fence, logs))
+    }
+
+    /// Durably apply `op` at `fence = epoch` in one fsync'd transaction (the on-disk
+    /// mirror of the in-memory mutation). No-op when in-memory.
+    fn persist(&self, epoch: Epoch, op: &ReplOp) -> Result<(), ReplError> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        let mut txn = db.begin_write().map_err(rdb)?;
+        txn.set_durability(Durability::Immediate); // fsync on commit (ADR 0018)
+        {
+            let mut meta = txn.open_table(R_META).map_err(rdb)?;
+            meta.insert(R_FENCE, epoch).map_err(rdb)?;
+            let mut entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
+            match op {
+                ReplOp::Append {
+                    key,
+                    offset,
+                    record,
+                } => {
+                    entries
+                        .insert(r_entry_key(key, *offset).as_slice(), record.as_slice())
+                        .map_err(rdb)?;
+                }
+                ReplOp::Truncate { key, up_to } => {
+                    delete_entry_range(&mut entries, key, 0, *up_to)?;
+                }
+                ReplOp::Remove { key } => {
+                    delete_entry_range(&mut entries, key, 0, Offset::MAX)?;
+                }
+            }
+        }
+        txn.commit().map_err(rdb)?;
+        Ok(())
     }
 
     /// The highest leadership epoch this replica has acknowledged.
@@ -91,10 +227,17 @@ impl ReplicaState {
     /// Apply a lease-holder's `op` sent at `epoch`.
     ///
     /// Returns `false` (fenced) without mutating if `epoch` is stale (`<` the
-    /// replica's acknowledged epoch). Otherwise the replica learns `epoch`
-    /// (monotonically) and applies the op, returning `true`.
+    /// replica's acknowledged epoch). Otherwise it durably persists the op (when
+    /// persistent, **before** mutating the in-memory copy), learns `epoch`
+    /// (monotonically), applies the op, and returns `true`. A persist failure also
+    /// returns `false` (the op was not durably stored, so the follower must not ack it).
     pub fn apply(&mut self, epoch: Epoch, op: &ReplOp) -> bool {
         if epoch < self.fence {
+            return false;
+        }
+        // Persist-before-mutate: a `true` ack means the op is on disk (ADR 0018 phase 3).
+        if let Err(e) = self.persist(epoch, op) {
+            tracing::warn!(error = %e, "replica persist failed; not acking the replication op");
             return false;
         }
         self.fence = epoch;
@@ -507,6 +650,46 @@ mod tests {
 
     fn n(s: &str) -> NodeId {
         NodeId(s.to_string())
+    }
+
+    /// ADR 0018 phase 3: a persistent replica's stored entries and fence epoch survive
+    /// the database being closed and reopened — what lets a clustered durable session
+    /// be recovered after a *full-cluster* restart, not only a single-node failure.
+    #[test]
+    fn replica_state_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.redb");
+        let ap = |key: &str, offset, rec: &[u8]| ReplOp::Append {
+            key: key.to_string(),
+            offset,
+            record: rec.to_vec(),
+        };
+        {
+            let mut r = ReplicaState::open(&path).unwrap();
+            assert!(r.apply(2, &ap("q/c", 1, b"a")));
+            assert!(r.apply(2, &ap("q/c", 2, b"b")));
+            assert!(r.apply(
+                2,
+                &ReplOp::Truncate {
+                    key: "q/c".into(),
+                    up_to: 1
+                }
+            )); // drop offset 1, keep 2
+            assert_eq!(r.fence(), 2);
+            // drop closes the database
+        }
+
+        let mut r = ReplicaState::open(&path).unwrap();
+        // The fence persisted: a stale-epoch op is still fenced after reopen.
+        assert!(
+            !r.apply(1, &ap("q/c", 9, b"stale")),
+            "fence survived reopen"
+        );
+        // The surviving entry (offset 2) is recovered.
+        let entries = r.entries("q/c");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].offset, 2);
+        assert_eq!(&entries[0].record, b"b");
     }
 
     /// Deterministic in-process transport holding the follower replicas, with an

@@ -1,6 +1,6 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–2 implemented** (2026-06-19); phases 3–5 pending
+- **Status:** Accepted; **phases 1–3 implemented** (2026-06-19); phases 4–5 pending
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -167,9 +167,38 @@ Validated by running openraft's full conformance `Suite` against the **persisten
 (every `RaftStorage` method through the disk paths) *and* the in-memory store, plus a
 restart-recovery test (vote + assigned lease survive close/reopen).
 
-Still pending: phase 3 (disk-backed *replicated* session log for cluster restart
-survival — the per-node committed replica state), phase 4 (retained), phase 5
-(compaction, data-dir node-id guard, process-kill crash test).
+### Phase 3 (2026-06-19): replicated session log on disk
+
+`ReplicaState` (`crates/mqtt-cluster/src/cluster_log.rs`) — the follower's committed copy
+of the replicated session log — gained an optional `redb` backend. `ReplicaState::open(path)`
+recovers its fence epoch and stored entries from disk; `new()` stays in-memory. Each
+accepted `apply` is **write-through fsync'd** (persist-before-mutate) before the follower
+acks, so a `ReplicateAck` means the op is on disk — giving the cluster's session log the
+same fsync-on-quorum durability as the lease store. The follower `apply` runs on
+`spawn_blocking` (durable plane) so the fsync never stalls the frame loop. Wired via
+`build_durable_node(.., data_dir)` → `<dir>/replicas.redb` (alongside `lease.redb`).
+Unit-tested: a persistent replica's entries and fence survive close/reopen, and a stale
+op is still fenced after reopen.
+
+With phases 1–3, a **clean full-cluster restart** (all nodes stop and restart from their
+data dirs) recovers leases, the replicated session log, and single-node session state —
+the headline durability claim. Two items remain to *complete* it:
+
+- **Asymmetric stale-replica safety (follow-up).** Persisting the replica introduces a
+  case the in-memory design could not have: a node down long enough to *miss a truncation*
+  returns with a stale prefix on disk. `merge_replica_logs` unions entries and takes the
+  contiguous run from the lowest offset, so a stale prefix read during a later recovery
+  could **resurrect already-acked entries** (QoS 1: spec-legal redelivery; QoS 2:
+  incorrect). A *clean full-cluster restart is unaffected* (all replicas are consistent —
+  no one missed a truncation). The fix is to persist a per-key truncation low-water,
+  propagate it on the recovery read, and have the merge drop entries below the max
+  watermark — a `ReplicaReadReply` wire change plus a merge change. Tracked as a Phase 3b
+  hardening item.
+
+Still pending: **phase 3b** (asymmetric stale-replica watermark, above), phase 4 (retained
+on disk), phase 5 (compaction, data-dir node-id guard, process-kill crash test, and the
+**full-cluster-restart integration test** covering sessions + retained + leases end to
+end — deferred until retained persistence lands so it covers all three).
 
 ## Consequences
 

@@ -138,9 +138,19 @@ impl DurablePlane {
                 self.network.complete_reply(req_id, payload);
                 None
             }
-            // Replication append → apply to our follower copy, ack accept/fence.
+            // Replication append → apply to our follower copy, ack accept/fence. Run the
+            // apply (which, when persistent, fsyncs before acking — ADR 0018 phase 3) off
+            // the async worker so a durable write never stalls the plane's frame loop.
             PeerMessage::Replicate { req_id, epoch, op } => {
-                let accepted = self.lock_replicas().apply(epoch, &op);
+                let replicas = self.replicas.clone();
+                let accepted = tokio::task::spawn_blocking(move || {
+                    replicas
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .apply(epoch, &op)
+                })
+                .await
+                .unwrap_or(false);
                 Some(PeerMessage::ReplicateAck { req_id, accepted })
             }
             // Replication ack → wake the waiting append.
