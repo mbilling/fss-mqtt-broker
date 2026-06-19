@@ -143,10 +143,14 @@ pub enum PeerMessage {
     },
     /// The reply to a [`ReplicaRead`](PeerMessage::ReplicaRead): the replica's stored
     /// entries for the key, as `(offset, record)` pairs (kept as tuples so the
-    /// storage crate's `LogEntry` need not be serde-wire-encodable).
+    /// storage crate's `LogEntry` need not be serde-wire-encodable), plus its truncation
+    /// low-water so a recovery cannot resurrect an already-acked prefix (ADR 0018 §3b).
     ReplicaReadReply {
         /// The `req_id` of the [`ReplicaRead`](PeerMessage::ReplicaRead) answered.
         req_id: u64,
+        /// The replica's truncation low-water for the key.
+        #[serde(default)]
+        watermark: u64,
         /// The stored entries, in offset order.
         entries: Vec<(u64, Vec<u8>)>,
     },
@@ -280,6 +284,7 @@ mod tests {
         });
         roundtrip(&PeerMessage::ReplicaReadReply {
             req_id: 3,
+            watermark: 4,
             entries: vec![(1, vec![1, 2]), (2, vec![3, 4])],
         });
     }

@@ -1,6 +1,6 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–3 implemented** (2026-06-19); phases 4–5 pending
+- **Status:** Accepted; **phases 1–3 (incl. 3b) implemented** (2026-06-19); phases 4–5 pending
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -184,21 +184,25 @@ With phases 1–3, a **clean full-cluster restart** (all nodes stop and restart 
 data dirs) recovers leases, the replicated session log, and single-node session state —
 the headline durability claim. Two items remain to *complete* it:
 
-- **Asymmetric stale-replica safety (follow-up).** Persisting the replica introduces a
-  case the in-memory design could not have: a node down long enough to *miss a truncation*
-  returns with a stale prefix on disk. `merge_replica_logs` unions entries and takes the
-  contiguous run from the lowest offset, so a stale prefix read during a later recovery
-  could **resurrect already-acked entries** (QoS 1: spec-legal redelivery; QoS 2:
-  incorrect). A *clean full-cluster restart is unaffected* (all replicas are consistent —
-  no one missed a truncation). The fix is to persist a per-key truncation low-water,
-  propagate it on the recovery read, and have the merge drop entries below the max
-  watermark — a `ReplicaReadReply` wire change plus a merge change. Tracked as a Phase 3b
-  hardening item.
+**Phase 3b (2026-06-19): asymmetric stale-replica safety.** Persisting the replica
+introduced a case the in-memory design could not have: a node down long enough to *miss a
+truncation* returns with a stale prefix on disk, which the union-merge could
+**resurrect** as already-acked entries (QoS 1: spec-legal redelivery; QoS 2: incorrect).
+Fixed: `ReplicaState` now tracks a **per-key truncation low-water** (persisted in a
+`replica_trunc` table, recovered on reopen); the recovery read carries it
+(`ReplicaReadReply.watermark`, `ReplicaTransport::read_replica` → `ReplicaRead`); and
+`merge_replica_logs` **drops every entry at or below the highest watermark seen** across
+the quorum before taking the contiguous run. The recovering owner's own current watermark
+is among the reads, so a truncated offset is excluded even if a stale replica still holds
+it. (Limit: if a *majority* of a group's replicas missed the same truncation — rare,
+since truncation propagates to all live followers — the watermark can't be observed;
+impact is bounded redelivery, not loss.) Unit-tested: the merge does not resurrect a stale
+replica's truncated prefix (in either read order), and the watermark survives reopen.
 
-Still pending: **phase 3b** (asymmetric stale-replica watermark, above), phase 4 (retained
-on disk), phase 5 (compaction, data-dir node-id guard, process-kill crash test, and the
-**full-cluster-restart integration test** covering sessions + retained + leases end to
-end — deferred until retained persistence lands so it covers all three).
+Still pending: phase 4 (retained on disk), phase 5 (compaction, data-dir node-id guard,
+process-kill crash test, and the **full-cluster-restart integration test** covering
+sessions + retained + leases end to end — deferred until retained persistence lands so it
+covers all three).
 
 ## Consequences
 

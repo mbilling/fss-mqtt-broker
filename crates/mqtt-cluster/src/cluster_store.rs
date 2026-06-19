@@ -237,12 +237,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         replica_set: &[NodeId],
     ) -> Result<Vec<LogEntry>, ReplError> {
         let quorum = replica_set.len() / 2 + 1;
-        // Local copy first (sync; the guard is dropped before any await).
-        let mut reads = vec![self
-            .local_replicas
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries(key)];
+        // Local copy first (sync; the guard is dropped before any await). Each read
+        // carries the replica's truncation low-water so the merge cannot resurrect an
+        // already-acked prefix from a stale replica (ADR 0018 §3b).
+        let mut reads = vec![{
+            let r = self
+                .local_replicas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::cluster_log::ReplicaRead {
+                watermark: r.watermark(key),
+                entries: r.entries(key),
+            }
+        }];
         // Read peers **concurrently** (like the append fan-out) and stop as soon as a
         // quorum has responded, so a slow or just-died replica's RPC timeout does not
         // serialize recovery when quorum is reachable from faster replicas.
@@ -256,7 +263,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             }
             while reads.len() < quorum {
                 match inflight.join_next().await {
-                    Some(Ok(Some(entries))) => reads.push(entries),
+                    Some(Ok(Some(read))) => reads.push(read),
                     // A replica that did not respond (or a join error): keep waiting.
                     Some(Ok(None) | Err(_)) => {}
                     None => break, // every replica reported; quorum not reached
@@ -351,14 +358,17 @@ mod tests {
                         transport.complete_ack(req_id, accepted);
                     }
                     PeerMessage::ReplicaRead { req_id, key } => {
-                        let entries = state
-                            .lock()
-                            .unwrap()
-                            .entries(&key)
-                            .into_iter()
-                            .map(|e| (e.offset, e.record))
-                            .collect();
-                        transport.complete_read(req_id, entries);
+                        let (watermark, entries) = {
+                            let s = state.lock().unwrap();
+                            (
+                                s.watermark(&key),
+                                s.entries(&key)
+                                    .into_iter()
+                                    .map(|e| (e.offset, e.record))
+                                    .collect(),
+                            )
+                        };
+                        transport.complete_read(req_id, watermark, entries);
                     }
                     _ => {}
                 }

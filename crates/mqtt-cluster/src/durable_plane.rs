@@ -158,19 +158,33 @@ impl DurablePlane {
                 self.transport.complete_ack(req_id, accepted);
                 None
             }
-            // Recovery-read (workstream F): answer from our follower copy of the key.
+            // Recovery-read (workstream F): answer from our follower copy of the key,
+            // with its truncation low-water so the recovering owner cannot resurrect an
+            // already-acked prefix from a stale replica (ADR 0018 §3b).
             PeerMessage::ReplicaRead { req_id, key } => {
-                let entries = self
-                    .lock_replicas()
-                    .entries(&key)
-                    .into_iter()
-                    .map(|e| (e.offset, e.record))
-                    .collect();
-                Some(PeerMessage::ReplicaReadReply { req_id, entries })
+                let (watermark, entries) = {
+                    let r = self.lock_replicas();
+                    (
+                        r.watermark(&key),
+                        r.entries(&key)
+                            .into_iter()
+                            .map(|e| (e.offset, e.record))
+                            .collect(),
+                    )
+                };
+                Some(PeerMessage::ReplicaReadReply {
+                    req_id,
+                    watermark,
+                    entries,
+                })
             }
             // Recovery-read reply → wake the waiting read.
-            PeerMessage::ReplicaReadReply { req_id, entries } => {
-                self.transport.complete_read(req_id, entries);
+            PeerMessage::ReplicaReadReply {
+                req_id,
+                watermark,
+                entries,
+            } => {
+                self.transport.complete_read(req_id, watermark, entries);
                 None
             }
             // Not a durable-plane frame (Hello / Interest / Publish / ProxyHello):
@@ -395,16 +409,16 @@ mod tests {
         }
 
         // node-1 recovery-reads node-2's log for the key.
-        let entries = p1
+        let read = p1
             .transport()
             .read_replica(&n("node-2"), "q/c")
             .await
             .expect("reachable replica");
         assert_eq!(
-            entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            read.entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert_eq!(&entries[1].record, b"m2");
+        assert_eq!(&read.entries[1].record, b"m2");
 
         // An unreachable peer reads None.
         assert!(p1

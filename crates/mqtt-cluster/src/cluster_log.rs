@@ -69,10 +69,21 @@ pub enum ReplOp {
 
 const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
 const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
+/// Per logical key, the highest truncation low-water this replica has applied (ADR 0018
+/// phase 3b): entries at or below it are already-acked, so a recovery must not resurrect
+/// them from a stale replica that missed the truncation.
+const R_TRUNC: TableDefinition<&str, u64> = TableDefinition::new("replica_trunc");
 const R_FENCE: &str = "fence";
 
 /// A replica's stored entries: per logical key, an offset → record map.
 type ReplicaLogs = BTreeMap<String, BTreeMap<Offset, Vec<u8>>>;
+
+/// The state recovered from a persistent replica's tables.
+struct Loaded {
+    fence: Epoch,
+    logs: ReplicaLogs,
+    truncated: BTreeMap<String, Offset>,
+}
 
 /// Map a `redb` error into the storage backend error.
 fn rdb<E: std::fmt::Display>(e: E) -> ReplError {
@@ -131,6 +142,10 @@ fn r_decode_key(bytes: &[u8]) -> (String, Offset) {
 pub struct ReplicaState {
     fence: Epoch,
     logs: ReplicaLogs,
+    /// Per-key truncation low-water (ADR 0018 phase 3b): the highest acked offset this
+    /// replica knows was dropped. Propagated on recovery so a stale replica cannot
+    /// resurrect a truncated prefix.
+    truncated: BTreeMap<String, Offset>,
     /// `Some` when persisting to disk; `None` for the in-memory default.
     db: Option<Arc<Database>>,
 }
@@ -153,18 +168,24 @@ impl ReplicaState {
         {
             let _ = txn.open_table(R_ENTRIES).map_err(rdb)?;
             let _ = txn.open_table(R_META).map_err(rdb)?;
+            let _ = txn.open_table(R_TRUNC).map_err(rdb)?;
         }
         txn.commit().map_err(rdb)?;
-        let (fence, logs) = Self::load(&db)?;
+        let Loaded {
+            fence,
+            logs,
+            truncated,
+        } = Self::load(&db)?;
         Ok(Self {
             fence,
             logs,
+            truncated,
             db: Some(Arc::new(db)),
         })
     }
 
     /// Reconstruct the in-memory cache from the on-disk tables.
-    fn load(db: &Database) -> Result<(Epoch, ReplicaLogs), ReplError> {
+    fn load(db: &Database) -> Result<Loaded, ReplError> {
         let txn = db.begin_read().map_err(rdb)?;
         let fence = txn
             .open_table(R_META)
@@ -181,7 +202,17 @@ impl ReplicaState {
                 .or_default()
                 .insert(offset, v.value().to_vec());
         }
-        Ok((fence, logs))
+        let mut truncated = BTreeMap::new();
+        let trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
+        for item in trunc.range::<&str>(..).map_err(rdb)? {
+            let (k, v) = item.map_err(rdb)?;
+            truncated.insert(k.value().to_string(), v.value());
+        }
+        Ok(Loaded {
+            fence,
+            logs,
+            truncated,
+        })
     }
 
     /// Durably apply `op` at `fence = epoch` in one fsync'd transaction (the on-disk
@@ -196,6 +227,7 @@ impl ReplicaState {
             let mut meta = txn.open_table(R_META).map_err(rdb)?;
             meta.insert(R_FENCE, epoch).map_err(rdb)?;
             let mut entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
+            let mut trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
             match op {
                 ReplOp::Append {
                     key,
@@ -208,9 +240,13 @@ impl ReplicaState {
                 }
                 ReplOp::Truncate { key, up_to } => {
                     delete_entry_range(&mut entries, key, 0, *up_to)?;
+                    // Persist the monotonic per-key truncation low-water (phase 3b).
+                    let wm = self.watermark(key).max(*up_to);
+                    trunc.insert(key.as_str(), wm).map_err(rdb)?;
                 }
                 ReplOp::Remove { key } => {
                     delete_entry_range(&mut entries, key, 0, Offset::MAX)?;
+                    trunc.remove(key.as_str()).map_err(rdb)?;
                 }
             }
         }
@@ -256,12 +292,22 @@ impl ReplicaState {
                 if let Some(log) = self.logs.get_mut(key) {
                     log.retain(|o, _| o > up_to);
                 }
+                let wm = self.truncated.entry(key.clone()).or_default();
+                *wm = (*wm).max(*up_to);
             }
             ReplOp::Remove { key } => {
                 self.logs.remove(key);
+                self.truncated.remove(key);
             }
         }
         true
+    }
+
+    /// The truncation low-water for `key`: the highest acked offset this replica knows
+    /// was dropped (ADR 0018 phase 3b). `0` if it has applied no truncation for the key.
+    #[must_use]
+    pub fn watermark(&self, key: &str) -> Offset {
+        self.truncated.get(key).copied().unwrap_or(0)
     }
 
     /// This replica's stored entries for `key`, in offset order (for takeover /
@@ -293,10 +339,11 @@ pub trait ReplicaTransport: Send + Sync {
     /// Deliver `op` to `replica` at `epoch`; return whether it accepted.
     async fn deliver(&self, replica: &NodeId, epoch: Epoch, op: &ReplOp) -> bool;
 
-    /// Read `replica`'s stored log for `key`, for a new owner to rebuild the
-    /// committed log on takeover (workstream F). Returns `None` if the replica is
-    /// unreachable. The default supports no recovery-reads (single-node transports).
-    async fn read_replica(&self, _replica: &NodeId, _key: &str) -> Option<Vec<LogEntry>> {
+    /// Read `replica`'s stored log for `key` (with its truncation low-water), for a new
+    /// owner to rebuild the committed log on takeover (workstream F). Returns `None` if
+    /// the replica is unreachable. The default supports no recovery-reads (single-node
+    /// transports).
+    async fn read_replica(&self, _replica: &NodeId, _key: &str) -> Option<ReplicaRead> {
         None
     }
 }
@@ -309,7 +356,7 @@ impl<T: ReplicaTransport + ?Sized> ReplicaTransport for std::sync::Arc<T> {
         (**self).deliver(replica, epoch, op).await
     }
 
-    async fn read_replica(&self, replica: &NodeId, key: &str) -> Option<Vec<LogEntry>> {
+    async fn read_replica(&self, replica: &NodeId, key: &str) -> Option<ReplicaRead> {
         (**self).read_replica(replica, key).await
     }
 }
@@ -472,23 +519,38 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     }
 }
 
-/// Merge per-replica reads of one key's log into its recovered committed log: the
-/// union of entries by offset, then the contiguous run from the lowest offset
-/// present, stopping at the first gap.
+/// One replica's read for recovery: its truncation low-water and its stored entries.
+#[derive(Debug, Clone, Default)]
+pub struct ReplicaRead {
+    /// The replica's truncation low-water for the key (ADR 0018 phase 3b).
+    pub watermark: Offset,
+    /// The replica's stored entries for the key, in offset order.
+    pub entries: Vec<LogEntry>,
+}
+
+/// Merge per-replica reads of one key's log into its recovered committed log: drop any
+/// entry at or below the **highest truncation low-water** seen, then take the union of
+/// the rest by offset and the contiguous run from the lowest present, stopping at the
+/// first gap.
 ///
 /// A gap marks an uncommitted tail: the owner commits offsets in order, so it cannot
-/// have committed past a missing offset; and reading from a **quorum** guarantees
-/// every committed entry is seen (any committed entry is on ≥ quorum replicas, which
-/// intersect any quorum read). A truncated prefix (acked, dropped) simply means the
-/// run starts above 1.
+/// have committed past a missing offset; reading from a **quorum** guarantees every
+/// committed entry is seen (any committed entry is on ≥ quorum replicas, which intersect
+/// any quorum read). The low-water filter is what stops a **stale replica** — one that
+/// was down and missed a truncation — from resurrecting an already-acked prefix: the
+/// recovering owner's own (current) watermark is among the reads, so a truncated offset
+/// is excluded even if the stale replica still holds it (ADR 0018 phase 3b).
 #[must_use]
-pub fn merge_replica_logs(reads: &[Vec<LogEntry>]) -> Vec<LogEntry> {
+pub fn merge_replica_logs(reads: &[ReplicaRead]) -> Vec<LogEntry> {
+    let low_water = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
     let mut by_offset: BTreeMap<Offset, Vec<u8>> = BTreeMap::new();
-    for read in reads {
-        for entry in read {
-            by_offset
-                .entry(entry.offset)
-                .or_insert_with(|| entry.record.clone());
+    for r in reads {
+        for entry in &r.entries {
+            if entry.offset > low_water {
+                by_offset
+                    .entry(entry.offset)
+                    .or_insert_with(|| entry.record.clone());
+            }
         }
     }
     let mut out = Vec::new();
@@ -638,7 +700,9 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_replica_logs, ClusterLog, ReplOp, ReplicaState, ReplicaTransport};
+    use super::{
+        merge_replica_logs, ClusterLog, ReplOp, ReplicaRead, ReplicaState, ReplicaTransport,
+    };
     use crate::lease::{Epoch, OwnershipLease};
     use crate::NodeId;
     use async_trait::async_trait;
@@ -690,6 +754,9 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].offset, 2);
         assert_eq!(&entries[0].record, b"b");
+        // The truncation low-water persisted too (ADR 0018 §3b), so recovery still
+        // fences the acked prefix after a restart.
+        assert_eq!(r.watermark("q/c"), 1);
     }
 
     /// Deterministic in-process transport holding the follower replicas, with an
@@ -978,18 +1045,27 @@ mod tests {
         }
     }
 
+    /// A replica read with no truncation (`watermark = 0`).
+    fn rd(entries: Vec<super::LogEntry>) -> ReplicaRead {
+        ReplicaRead {
+            watermark: 0,
+            entries,
+        }
+    }
+
+    fn offsets(entries: &[super::LogEntry]) -> Vec<u64> {
+        entries.iter().map(|e| e.offset).collect()
+    }
+
     /// The quorum-recovery merge takes the contiguous run from the union of reads.
     #[test]
     fn merge_takes_the_contiguous_run_from_a_quorum() {
         // Two overlapping replica reads; their union is contiguous 1..=4.
         let merged = merge_replica_logs(&[
-            vec![entry(1, b"a"), entry(2, b"b"), entry(3, b"c")],
-            vec![entry(2, b"b"), entry(3, b"c"), entry(4, b"d")],
+            rd(vec![entry(1, b"a"), entry(2, b"b"), entry(3, b"c")]),
+            rd(vec![entry(2, b"b"), entry(3, b"c"), entry(4, b"d")]),
         ]);
-        assert_eq!(
-            merged.iter().map(|e| e.offset).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
+        assert_eq!(offsets(&merged), vec![1, 2, 3, 4]);
     }
 
     /// A gap drops the uncommitted tail beyond it; a truncated prefix starts above
@@ -998,22 +1074,56 @@ mod tests {
     fn merge_stops_at_gaps_and_handles_truncation() {
         // 1,2 then a gap at 3 with an uncommitted 4 → recovered [1,2].
         assert_eq!(
-            merge_replica_logs(&[vec![entry(1, b"a"), entry(2, b"b"), entry(4, b"d")]])
-                .iter()
-                .map(|e| e.offset)
-                .collect::<Vec<_>>(),
+            offsets(&merge_replica_logs(&[rd(vec![
+                entry(1, b"a"),
+                entry(2, b"b"),
+                entry(4, b"d")
+            ])])),
             vec![1, 2],
         );
         // Truncated to start at 5 (acked) → recovered [5,6].
         assert_eq!(
-            merge_replica_logs(&[vec![entry(5, b"e"), entry(6, b"f")]])
-                .iter()
-                .map(|e| e.offset)
-                .collect::<Vec<_>>(),
+            offsets(&merge_replica_logs(&[rd(vec![
+                entry(5, b"e"),
+                entry(6, b"f")
+            ])])),
             vec![5, 6],
         );
         assert!(merge_replica_logs(&[]).is_empty());
-        assert!(merge_replica_logs(&[vec![]]).is_empty());
+        assert!(merge_replica_logs(&[rd(vec![])]).is_empty());
+    }
+
+    /// ADR 0018 phase 3b: a stale replica that missed a truncation must not resurrect
+    /// the already-acked prefix. The recovery merge drops every entry at or below the
+    /// highest truncation low-water seen across the quorum.
+    #[test]
+    fn merge_does_not_resurrect_a_stale_replicas_truncated_prefix() {
+        // A live replica truncated up to 5 (watermark 5) holding [6,7]; a stale replica
+        // (down through the truncation, watermark 0) still holds [1..7].
+        let live = ReplicaRead {
+            watermark: 5,
+            entries: vec![entry(6, b"f"), entry(7, b"g")],
+        };
+        let stale = ReplicaRead {
+            watermark: 0,
+            entries: vec![
+                entry(1, b"a"),
+                entry(2, b"b"),
+                entry(3, b"c"),
+                entry(4, b"d"),
+                entry(5, b"e"),
+                entry(6, b"f"),
+                entry(7, b"g"),
+            ],
+        };
+        // Whatever order the quorum read returns them, the acked prefix [1..5] is gone.
+        let merged = merge_replica_logs(&[stale.clone(), live.clone()]);
+        assert_eq!(
+            offsets(&merged),
+            vec![6, 7],
+            "the truncated prefix must not be resurrected"
+        );
+        assert_eq!(offsets(&merge_replica_logs(&[live, stale])), vec![6, 7]);
     }
 
     /// A recovered `ClusterLog` serves its seeded committed entries and continues

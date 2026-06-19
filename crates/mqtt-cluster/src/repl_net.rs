@@ -84,10 +84,14 @@ struct Pending {
     ack: oneshot::Sender<bool>,
 }
 
+/// A recovery-read reply: the replica's truncation `(watermark, entries)` (ADR 0018 §3b).
+type ReadReply = (u64, Vec<(u64, Vec<u8>)>);
+
 #[derive(Debug)]
 struct PendingRead {
     node: NodeId,
-    reply: oneshot::Sender<Vec<(u64, Vec<u8>)>>,
+    /// Resolves with the replica's `(watermark, entries)`.
+    reply: oneshot::Sender<ReadReply>,
 }
 
 impl PeerReplicaTransport {
@@ -159,12 +163,12 @@ impl PeerReplicaTransport {
         }
     }
 
-    /// Resolve a pending recovery-read with the replica's entries.
+    /// Resolve a pending recovery-read with the replica's watermark and entries.
     ///
     /// Called by the link handler when a [`PeerMessage::ReplicaReadReply`] arrives.
-    pub fn complete_read(&self, req_id: u64, entries: Vec<(u64, Vec<u8>)>) {
+    pub fn complete_read(&self, req_id: u64, watermark: u64, entries: Vec<(u64, Vec<u8>)>) {
         if let Some(p) = self.lock().pending_reads.remove(&req_id) {
-            let _ = p.reply.send(entries);
+            let _ = p.reply.send((watermark, entries));
         }
     }
 
@@ -223,7 +227,7 @@ impl ReplicaTransport for PeerReplicaTransport {
         &self,
         replica: &NodeId,
         key: &str,
-    ) -> Option<Vec<mqtt_storage::repl::LogEntry>> {
+    ) -> Option<crate::cluster_log::ReplicaRead> {
         let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
@@ -252,13 +256,14 @@ impl ReplicaTransport for PeerReplicaTransport {
             self.lock().pending_reads.remove(&req_id);
             return None;
         };
-        let entries = res.ok()?;
-        Some(
-            entries
+        let (watermark, entries) = res.ok()?;
+        Some(crate::cluster_log::ReplicaRead {
+            watermark,
+            entries: entries
                 .into_iter()
                 .map(|(offset, record)| mqtt_storage::repl::LogEntry { offset, record })
                 .collect(),
-        )
+        })
     }
 }
 
