@@ -1,6 +1,6 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phase 1 implemented** (2026-06-19); phases 2–5 pending
+- **Status:** Accepted; **phases 1–2 implemented** (2026-06-19); phases 3–5 pending
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -150,9 +150,26 @@ passes `cargo deny` (advisories/bans/licenses/sources). Tests cover the in-memor
 backend's contract plus a **survives-reopen** durability proof (committed state and the
 offset counter are recovered after the database is closed and reopened).
 
-Still pending: phase 2 (disk-backed openraft lease store — the Raft-safety fix), phase 3
-(disk-backed *replicated* session log for cluster restart survival), phase 4 (retained),
-phase 5 (compaction, data-dir node-id guard, process-kill crash test).
+### Phase 2 (2026-06-19): lease store on disk
+
+`LeaseStore` (`crates/mqtt-cluster/src/lease_store.rs`) gained an optional `redb` backend
+behind the same openraft `RaftStorage`. `LeaseStore::open(path)` recovers the prior vote,
+log, applied state machine, and snapshot from disk; `LeaseStore::new()` remains the
+in-memory variant for tests/ephemeral clusters. Writes are **persist-before-acknowledge**
+(each mutation fsync-commits to disk via one batched redb transaction *before* the
+in-memory cache is updated and `Ok` returns), so disk and cache never diverge. The
+blocking redb work runs on `spawn_blocking`. This **restores Raft safety** — the persisted
+vote stops a crashed-and-restarted voter from voting twice in a term — and lets the lease
+group recover from a full-cluster restart. Wired into `mqttd`: with `MQTTD_DATA_DIR` and
+`MQTTD_DURABLE_SESSIONS`, the lease store persists to `<dir>/lease.redb`.
+
+Validated by running openraft's full conformance `Suite` against the **persistent** store
+(every `RaftStorage` method through the disk paths) *and* the in-memory store, plus a
+restart-recovery test (vote + assigned lease survive close/reopen).
+
+Still pending: phase 3 (disk-backed *replicated* session log for cluster restart
+survival — the per-node committed replica state), phase 4 (retained), phase 5
+(compaction, data-dir node-id guard, process-kill crash test).
 
 ## Consequences
 

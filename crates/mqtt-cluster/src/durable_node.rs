@@ -62,12 +62,18 @@ pub async fn build_durable_node(
     node_id: NodeId,
     placement: Arc<RwLock<Placement>>,
     can_bootstrap: bool,
+    lease_path: Option<&std::path::Path>,
 ) -> (Arc<dyn SessionStore>, DurablePlane) {
     let local = raft_id(&node_id);
 
     // --- lease consensus group + durable-plane endpoint ---
     let network = MeshRaftNetwork::new();
-    let lease_store = LeaseStore::new();
+    // A persistent lease store (ADR 0018 phase 2) when a path is given — restoring Raft
+    // safety (the persisted vote) and lease recovery across restart; otherwise in-memory.
+    let lease_store = match lease_path {
+        Some(path) => LeaseStore::open(path).expect("open the lease store"),
+        None => LeaseStore::new(),
+    };
     let (log_store, state_machine) = Adaptor::new(lease_store.clone());
     let raft: LeaseRaft = Raft::new(
         local,
@@ -160,7 +166,7 @@ mod tests {
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, _plane) = build_durable_node(node, placement, true).await;
+        let (store, _plane) = build_durable_node(node, placement, true, None).await;
 
         let client = ClientId("c".to_string());
         let msg = Message {

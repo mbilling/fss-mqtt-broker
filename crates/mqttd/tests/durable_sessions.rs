@@ -100,7 +100,7 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
     )));
 
     let (store, plane) =
-        build_durable_node(node_id.clone(), placement.clone(), can_bootstrap).await;
+        build_durable_node(node_id.clone(), placement.clone(), can_bootstrap, None).await;
     let plane_observer = plane.clone();
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()));
