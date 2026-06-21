@@ -148,6 +148,11 @@ pub struct ConnPolicy {
     /// the keepalive timer only starts after CONNECT, so without this a client that
     /// connects and stalls would hold a connection task indefinitely.
     pub connect_timeout: Duration,
+    /// Graceful-shutdown signal (ADR 0019). When set and cancelled, an established
+    /// connection finishes its current packet, then closes **without firing the will**
+    /// (the server is going away, the client is not — its session is retained for
+    /// reconnect). `None` disables draining (tests, and the in-process test harness).
+    pub shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Default [`ConnPolicy::connect_timeout`]: generous for a real handshake on a slow
@@ -177,6 +182,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         store: None,
         connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
+        shutdown: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -1076,7 +1082,22 @@ where
                 debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
                 return Ok(false);
             }
+            () = drain_signal(policy) => {
+                // Graceful shutdown (ADR 0019): close cleanly without firing the will —
+                // the server is going away, not the client; its session is retained.
+                debug!(client = %client.0, "draining connection for shutdown");
+                return Ok(true);
+            }
         }
+    }
+}
+
+/// Resolve to ready once the policy's shutdown token is cancelled; pends forever when no
+/// token is set (so the `select!` arm is a no-op outside graceful shutdown).
+async fn drain_signal(policy: &ConnPolicy) {
+    match &policy.shutdown {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1322,6 +1343,7 @@ mod tests {
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
+            shutdown: None,
         })
     }
 
@@ -1333,6 +1355,51 @@ mod tests {
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
+    }
+
+    /// Like [`start_conn`], but the policy carries a graceful-shutdown token (ADR 0019).
+    fn start_conn_with_shutdown(
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: Some(shutdown),
+        });
+        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
+    }
+
+    /// ADR 0019: cancelling the shutdown token drains an established connection — the
+    /// broker closes it cleanly rather than holding it until a kill or the keepalive.
+    #[tokio::test]
+    async fn graceful_shutdown_drains_an_established_connection() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut reader, mut writer, hub_rx) = start_conn_with_shutdown(shutdown.clone());
+        stub_hub(hub_rx);
+
+        writer
+            .send(&connect_packet("drain-me", true))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // The shutdown signal closes the connection promptly (EOF, no further packets).
+        shutdown.cancel();
+        assert!(
+            recv(&mut reader).await.is_none(),
+            "the connection drained and closed on shutdown"
+        );
     }
 
     /// Minimal hub stub: accepts every Attach with `session_present = false`,
@@ -1389,6 +1456,7 @@ mod tests {
             proxy: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            shutdown: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -1627,6 +1695,7 @@ mod tests {
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
+            shutdown: None,
         });
 
         let (client, owner_side) = tokio::io::duplex(4096);
@@ -2243,6 +2312,7 @@ mod tests {
             store: Some(store),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
+            shutdown: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);

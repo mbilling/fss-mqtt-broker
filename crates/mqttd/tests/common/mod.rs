@@ -227,6 +227,7 @@ pub fn permissive_policy(connect_timeout: Duration) -> Arc<ConnPolicy> {
         proxy: None,
         store: None,
         connect_timeout,
+        shutdown: None,
     })
 }
 
@@ -526,6 +527,7 @@ pub mod enhanced {
             proxy: None,
             store: None,
             connect_timeout: std::time::Duration::from_secs(10),
+            shutdown: None,
         })
     }
 

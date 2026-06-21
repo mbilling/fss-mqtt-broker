@@ -1,6 +1,6 @@
 # ADR 0019 — Graceful shutdown and connection draining
 
-- **Status:** Proposed (awaiting ratification)
+- **Status:** Accepted — core implemented 2026-06-21 (cluster-leave + v5 DISCONNECT deferred; see Implementation status)
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement/relocation),
@@ -100,6 +100,50 @@ drain — the standard "fail readiness, keep liveness during drain" pattern.
   refused, existing clients get a Server DISCONNECT, in-flight settles or is persisted
   (ADR 0018), and the process returns within the grace bound. A cluster test that a
   graceful leave triggers immediate lease re-ownership (no suspicion wait).
+
+## Implementation status (2026-06-21)
+
+**Landed:**
+
+- **Signal handling** — `wait_for_shutdown_signal()` awaits `SIGTERM` *or* `SIGINT`
+  (`signal(SignalKind::terminate())` + `ctrl_c()` on unix; `ctrl_c()` elsewhere). The first
+  signal begins drain; a **second** signal during the grace window escalates to immediate
+  exit (`graceful_shutdown` selects on a second `wait_for_shutdown_signal()`).
+- **Single cancellation signal** — one `tokio_util::sync::CancellationToken` created in
+  `main`, carried into the accept loops (`serve_tls_clients`/`serve_plaintext_clients`
+  select on `shutdown.cancelled()` vs `listener.accept()`) and into every connection via
+  `ConnPolicy.shutdown`. A live connection's `serve()` loop has a drain arm that finishes
+  the current packet, then closes **without firing the will and retaining the session**
+  (graceful close, not a crash).
+- **Connection tracking + bounded drain** — a `tokio_util::task::TaskTracker` owns the
+  per-connection tasks; `graceful_shutdown` closes the tracker, cancels the token, then
+  waits on `connections.wait()` bounded by `MQTTD_SHUTDOWN_GRACE` (default 30s). Deadline
+  elapse logs loudly and forces exit.
+- **Readiness flips first** — a shared `draining: Arc<AtomicBool>` (from
+  `HealthState::draining_handle`) is set **before** the token is cancelled, so `/readyz`
+  reports not-ready while live connections drain (`readiness()` ANDs `!draining`).
+- **Clean openraft stop** — `DurablePlane::raft().shutdown()` is called after connections
+  drain, flushing/stopping the consensus tasks (this also releases the redb lock that
+  previously blocked the ADR 0018 node-level restart test).
+- **Config** — `MQTTD_SHUTDOWN_GRACE` (seconds, default 30).
+- **Test** — `graceful_shutdown_drains_an_established_connection`: an established
+  connection closes cleanly once the token is cancelled.
+
+**Deferred (follow-ups, tracked here so the gap is explicit):**
+
+- **v5 Server DISCONNECT `0x8B`** on drain — v5 clients are currently closed at the socket
+  like v3.1.1 rather than receiving a reason-coded DISCONNECT. The drain arm is the hook
+  point; needs the v5 outbound-DISCONNECT path.
+- **Graceful cluster-leave** — no SWIM `Leave`/`Dead(self)` gossip and no lease
+  `relinquish` yet, so peers still wait out suspicion → dead and a lease re-election on a
+  routine restart. This touches correctness-critical membership/consensus code (ADR 0016)
+  and is held to the same test-first bar; tackled as its own unit.
+- **In-flight QoS settle / hub `Drain` command** — the drain closes the connection after
+  the current packet rather than actively completing outstanding QoS 2 handshakes; durable
+  state is protected by ADR 0018 persistence + `raft().shutdown()`, but the
+  best-effort-settle-in-grace-window behaviour is not yet implemented.
+- **Node-level restart integration test** (ADR 0018 Phase 5) — now unblocked by
+  `raft().shutdown()` releasing the redb lock; to be re-added.
 
 ## Consequences
 

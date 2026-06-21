@@ -46,6 +46,10 @@ pub struct HealthState {
     placement: Option<Arc<RwLock<Placement>>>,
     durable: Option<DurablePlane>,
     min_members: usize,
+    /// Set on graceful shutdown (ADR 0019): `/readyz` reports not-ready while draining
+    /// so orchestrators stop routing new traffic, but `/livez` stays up so we are not
+    /// killed mid-drain.
+    draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -101,7 +105,15 @@ impl HealthState {
             placement,
             durable,
             min_members,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// A handle to this state's draining flag (ADR 0019). Setting it makes `/readyz`
+    /// report not-ready (while `/livez` stays up), so an orchestrator drains traffic.
+    #[must_use]
+    pub fn draining_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.draining.clone()
     }
 
     /// Whether the hub actor loop is draining: it answers a ping within
@@ -129,7 +141,9 @@ impl HealthState {
         let live = self.live().await;
         let members = self.member_count();
         let lease_group_ready = self.durable.as_ref().map(DurablePlane::lease_group_ready);
-        let ready = live
+        let draining = self.draining.load(std::sync::atomic::Ordering::Acquire);
+        let ready = !draining
+            && live
             && members.map_or(true, |n| n >= self.min_members)
             && lease_group_ready.unwrap_or(true);
         Report {

@@ -50,6 +50,9 @@
 //!   (mesh + durable-store ready). Unset = no health server.
 //! - `MQTTD_READY_MIN_MEMBERS` — smallest mesh size `/readyz` accepts (default 1;
 //!   raise it to hold a node out of rotation until it has joined its peers)
+//! - `MQTTD_SHUTDOWN_GRACE` — seconds to drain live client connections after a
+//!   `SIGTERM`/`SIGINT` before forcing shutdown (ADR 0019; default 30). `/readyz`
+//!   flips to draining immediately so orchestrators stop routing new connections.
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
@@ -102,14 +105,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement::DEFAULT_REPLICAS,
     )));
 
+    // Graceful-shutdown plumbing (ADR 0019): a cancellation token that stops the accept
+    // loops and drains live connections, and a tracker that lets us wait for them.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let connections = tokio_util::task::TaskTracker::new();
+
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
     // QoS-2 dedup window (ADR 0007 §5).
     let (hub_tx, store, durable_plane) = start_hub(&node_id, &placement).await?;
 
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
-    // /livez (hub responsive) and /readyz (mesh + durable-store ready).
-    start_health_from_env(&hub_tx, &placement, durable_plane).await?;
+    // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
+    // handle to stop openraft cleanly on shutdown.
+    let plane_for_shutdown = durable_plane.clone();
+    let draining = start_health_from_env(&hub_tx, &placement, durable_plane).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -123,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let policy = client_policy_from_env(Some(proxy), store)?;
+    let policy = client_policy_from_env(Some(proxy), store, shutdown.clone())?;
 
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
@@ -158,8 +168,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref(), placement).await?;
 
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
-    // local-testing escape hatch.
-    let mut listeners = Vec::new();
+    // local-testing escape hatch. The serve loops stop themselves on `shutdown`.
+    start_client_listeners(hub_tx, policy, &shutdown, &connections).await?;
+
+    // Run until a shutdown signal, then drain gracefully (ADR 0019).
+    graceful_shutdown(&shutdown, &connections, &draining, plane_for_shutdown).await;
+    Ok(())
+}
+
+/// Bind and spawn the MQTT client listeners (TLS and/or plaintext) selected by
+/// the `MQTTD_*_BIND` shims. Each accept loop owns its `shutdown` clone and stops
+/// itself when the token fires, so the join handles are intentionally dropped.
+async fn start_client_listeners(
+    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    policy: Arc<conn::ConnPolicy>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    connections: &tokio_util::task::TaskTracker,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut any = false;
     if let Some(bind) = non_empty_env("MQTTD_TLS_BIND") {
         let (Some(cert), Some(key)) = (
             non_empty_env("MQTTD_TLS_CERT"),
@@ -175,30 +201,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let listener = TcpListener::bind(&bind).await?;
         info!(%bind, mtls = client_ca.is_some(), "accepting MQTT 3.1.1 clients over TLS 1.3");
-        listeners.push(tokio::spawn(serve_tls_clients(
+        tokio::spawn(serve_tls_clients(
             listener,
             acceptor,
             hub_tx.clone(),
             policy.clone(),
-        )));
+            shutdown.clone(),
+            connections.clone(),
+        ));
+        any = true;
     }
     if let Some(addr) = non_empty_env("MQTTD_PLAINTEXT_BIND") {
         warn!(%addr, "INSECURE: starting PLAINTEXT MQTT listener (no TLS) — testing use only");
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT 3.1.1 clients");
-        listeners.push(tokio::spawn(serve_plaintext_clients(
-            listener, hub_tx, policy,
-        )));
+        tokio::spawn(serve_plaintext_clients(
+            listener,
+            hub_tx,
+            policy,
+            shutdown.clone(),
+            connections.clone(),
+        ));
+        any = true;
     }
-    if listeners.is_empty() {
+    if !any {
         warn!(
             "No client listener active. Set MQTTD_TLS_BIND (with MQTTD_TLS_CERT \
              and MQTTD_TLS_KEY) for the TLS listener, or MQTTD_PLAINTEXT_BIND for \
              insecure local testing."
         );
-    }
-    for l in listeners {
-        let _ = l.await;
     }
     Ok(())
 }
@@ -209,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn client_policy_from_env(
     proxy: Option<conn::ProxyContext>,
     store: Arc<dyn SessionStore>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error::Error>> {
     let auth = authenticator_from_env()?;
 
@@ -236,6 +268,7 @@ fn client_policy_from_env(
         store: Some(store),
         connect_timeout: conn::DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
+        shutdown: Some(shutdown),
     }))
 }
 
@@ -397,9 +430,11 @@ async fn start_health_from_env(
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
     placement: &Arc<RwLock<Placement>>,
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Arc<std::sync::atomic::AtomicBool>, Box<dyn std::error::Error>> {
     let Some(bind) = non_empty_env("MQTTD_HEALTH_BIND") else {
-        return Ok(());
+        // No health server: hand back a standalone flag so the caller's shutdown path is
+        // uniform (nothing reads it).
+        return Ok(Arc::new(std::sync::atomic::AtomicBool::new(false)));
     };
     let min_members = match non_empty_env("MQTTD_READY_MIN_MEMBERS") {
         Some(raw) => raw
@@ -415,8 +450,9 @@ async fn start_health_from_env(
         durable_plane,
         min_members,
     );
+    let draining = state.draining_handle();
     tokio::spawn(mqttd::health::serve(listener, state));
-    Ok(())
+    Ok(draining)
 }
 
 fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
@@ -536,20 +572,26 @@ async fn serve_tls_clients(
     acceptor: TlsAcceptor,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
+    shutdown: tokio_util::sync::CancellationToken,
+    connections: tokio_util::task::TaskTracker,
 ) {
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                warn!(error = %e, "TLS listener accept failed");
-                return;
-            }
+        let (stream, peer) = tokio::select! {
+            // Graceful shutdown (ADR 0019): stop accepting; refuse new connections fast.
+            () = shutdown.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, "TLS listener accept failed");
+                    return;
+                }
+            },
         };
         debug!(%peer, "accepted TLS connection");
         let acceptor = acceptor.clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
@@ -568,18 +610,23 @@ async fn serve_plaintext_clients(
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
+    shutdown: tokio_util::sync::CancellationToken,
+    connections: tokio_util::task::TaskTracker,
 ) {
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                warn!(error = %e, "plaintext listener accept failed");
-                return;
-            }
+        let (stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, "plaintext listener accept failed");
+                    return;
+                }
+            },
         };
         debug!(%peer, "accepted connection");
         let _ = stream.set_nodelay(true);
-        tokio::spawn(conn::handle_stream(
+        connections.spawn(conn::handle_stream(
             stream,
             Some(peer),
             None,
@@ -592,4 +639,79 @@ async fn serve_plaintext_clients(
 /// Read an environment variable, treating unset or empty as absent.
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Default graceful-shutdown drain deadline (ADR 0019), aligned with a typical
+/// Kubernetes `terminationGracePeriodSeconds`.
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// The graceful-shutdown drain deadline from `MQTTD_SHUTDOWN_GRACE` (seconds).
+fn shutdown_grace_from_env() -> Duration {
+    non_empty_env("MQTTD_SHUTDOWN_GRACE")
+        .and_then(|v| v.parse().ok())
+        .map_or(DEFAULT_SHUTDOWN_GRACE, Duration::from_secs)
+}
+
+/// Run until a shutdown signal, then drain gracefully (ADR 0019): fail readiness, stop
+/// accepting and drain live connections, all bounded by the grace deadline (or a second
+/// signal), then stop the lease consensus core cleanly.
+async fn graceful_shutdown(
+    shutdown: &tokio_util::sync::CancellationToken,
+    connections: &tokio_util::task::TaskTracker,
+    draining: &std::sync::atomic::AtomicBool,
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+) {
+    connections.close(); // no more spawns once the accept loops stop
+    wait_for_shutdown_signal().await;
+    let grace = shutdown_grace_from_env();
+    warn!(
+        grace_secs = grace.as_secs(),
+        "shutdown signal received; draining"
+    );
+
+    // 1. Fail readiness so orchestrators stop routing new traffic (liveness stays up).
+    draining.store(true, std::sync::atomic::Ordering::Release);
+    // 2. Stop accepting and tell live connections to finish their current packet and
+    //    close (without firing wills — the client is not gone, its session is retained).
+    shutdown.cancel();
+    // 3. Wait for connections to drain, bounded by the grace deadline; a second signal
+    //    escalates to immediate exit.
+    tokio::select! {
+        () = connections.wait() => info!("all client connections drained"),
+        () = tokio::time::sleep(grace) => {
+            warn!("drain grace elapsed; forcing shutdown with connections still open");
+        }
+        () = wait_for_shutdown_signal() => warn!("second signal; forcing immediate shutdown"),
+    }
+    // 4. Stop the lease consensus core cleanly (flushes; in-flight is already fsync'd).
+    if let Some(plane) = plane {
+        let _ = plane.raft().shutdown().await;
+    }
+    info!("shutdown complete");
+}
+
+/// Resolve once a shutdown signal arrives: `SIGTERM` (the orchestrator stop signal) or
+/// `SIGINT` (Ctrl-C). Called again during drain so a *second* signal can escalate to an
+/// immediate exit.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "cannot install SIGTERM handler; only Ctrl-C stops the broker");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
