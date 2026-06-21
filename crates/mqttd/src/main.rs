@@ -305,6 +305,11 @@ async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
 ) -> Result<HubHandle, Box<dyn std::error::Error>> {
+    // Claim the data directory for this node (ADR 0018 phase 5): refuse to open another
+    // node's persistent state, before any store touches disk.
+    if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
+        mqtt_storage::data_dir::guard_data_dir(&dir, &node_id.0)?;
+    }
     let durable = non_empty_env("MQTTD_DURABLE_SESSIONS")
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if durable {

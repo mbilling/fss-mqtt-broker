@@ -18,6 +18,7 @@ use mqtt_core::{topic_matches, ClientId, Message, Subscription};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
+pub mod data_dir;
 pub mod logged;
 pub mod persistent_log;
 pub mod persistent_retained;

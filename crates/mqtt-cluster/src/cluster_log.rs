@@ -1150,4 +1150,73 @@ mod tests {
         assert_eq!(log.append(&k, b"m3".to_vec()).await.unwrap(), 3);
         assert_eq!(log.read(&k, 0, 100).await.unwrap().len(), 3);
     }
+
+    /// ADR 0018 phase 5: a durable session's log survives a **full-cluster restart**.
+    /// Committed entries replicated to a quorum of *persistent* replicas are recovered
+    /// from disk after every node restarts, and a new owner serves them. (Restart
+    /// durability needs R≥2 — a 1-node group keeps committed data in the leader's
+    /// in-memory log until a follower has it; this is exactly why followers persist.)
+    #[tokio::test]
+    async fn a_durable_session_log_survives_a_full_restart_via_persisted_replicas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pb, pc) = (tmp.path().join("b.redb"), tmp.path().join("c.redb"));
+        let k = "q/client".to_string();
+        let ap = |offset, rec: &[u8]| ReplOp::Append {
+            key: k.clone(),
+            offset,
+            record: rec.to_vec(),
+        };
+
+        // The owner replicated two committed entries (epoch 7) to a quorum of persistent
+        // followers; their on-disk replica copies fsync'd before the ack.
+        {
+            let mut b = ReplicaState::open(&pb).unwrap();
+            let mut c = ReplicaState::open(&pc).unwrap();
+            for (off, rec) in [(1u64, b"m1".as_slice()), (2, b"m2")] {
+                assert!(b.apply(7, &ap(off, rec)));
+                assert!(c.apply(7, &ap(off, rec)));
+            }
+            // drop → close the databases (every node is now "down")
+        }
+
+        // --- full-cluster restart: reopen the persisted replicas from disk ---
+        let b = ReplicaState::open(&pb).unwrap();
+        let c = ReplicaState::open(&pc).unwrap();
+
+        // A surviving node takes over and recovers the group from a quorum of the
+        // reopened replicas...
+        let recovered = merge_replica_logs(&[
+            ReplicaRead {
+                watermark: b.watermark(&k),
+                entries: b.entries(&k),
+            },
+            ReplicaRead {
+                watermark: c.watermark(&k),
+                entries: c.entries(&k),
+            },
+        ]);
+        assert_eq!(
+            recovered.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the committed log is recovered from the persisted replicas"
+        );
+
+        // ...and serves it through a recovered ClusterLog, continuing to append.
+        let owner = n("d");
+        let set = vec![n("d"), n("b"), n("c")];
+        let lease = OwnershipLease {
+            holder: owner.clone(),
+            epoch: 8, // a fresh epoch fences the old owner
+        };
+        let mut logs = BTreeMap::new();
+        logs.insert(k.clone(), recovered);
+        let log =
+            ClusterLog::recovered(owner, lease, &set, SimCluster::new(&[n("b"), n("c")]), logs);
+        let served = log.read(&k, 0, 100).await.unwrap();
+        assert_eq!(
+            served.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(&served[1].record, b"m2");
+    }
 }

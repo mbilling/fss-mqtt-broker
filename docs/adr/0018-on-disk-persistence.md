@@ -1,6 +1,7 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–4 (incl. 3b) implemented** (2026-06-19); phase 5 pending
+- **Status:** Accepted; **phases 1–5 implemented** (2026-06-19/21); two phase-5 validation
+  items gated (see Phase 5 note)
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -211,10 +212,38 @@ durable-cluster), the hub uses `<dir>/retained.redb`. Unit-tested: retained mess
 an empty-payload clear survive close/reopen, and wildcard matching + payload/QoS fidelity
 hold after reopen.
 
-Still pending: **phase 5** — snapshot/compaction policy for the redb stores, a data-dir
-node-id guard (refuse a dir stamped by a different node), a process-kill **crash test**
-(vs. the reopen tests), and the end-to-end **full-cluster-restart integration test** now
-that all three layers (sessions, retained, leases) persist.
+### Phase 5 (2026-06-21): hardening & restart validation
+
+- **Data-dir node-id guard** (`crates/mqtt-storage/src/data_dir.rs`,
+  `guard_data_dir`): on startup `mqttd` stamps `<MQTTD_DATA_DIR>/node-id` with its node id
+  and refuses to open a directory stamped by a *different* node — turning a mis-templated
+  shared volume (which would corrupt consensus and mix sessions) into a loud error. Tested.
+- **Compaction:** no new code needed. The lease Raft log is bounded by openraft's snapshot
+  policy (default: snapshot every 5000 entries → purge, which we persist as a range
+  delete); the session/replica logs are bounded by truncation (acked entries deleted from
+  redb); and `redb` reuses freed pages, so each file is bounded by its live high-water. A
+  periodic `Database::compact` to shrink a file after a large truncation is a future option.
+- **Full-cluster-restart proof (store level):** a deterministic test
+  (`cluster_log::a_durable_session_log_survives_a_full_restart_via_persisted_replicas`)
+  replicates committed entries to a quorum of **persistent** replicas, reopens them from
+  disk ("every node restarted"), and shows a new owner recovers and serves the log. Note
+  the architectural fact it documents: **restart durability needs R≥2** — a single-node
+  durable group keeps committed data in the leader's *in-memory* log until a follower has
+  it, which is exactly why followers persist. Together with the per-layer reopen tests
+  (lease vote+log, replica entries+watermark, retained), this pins the durability chain.
+
+**Gated follow-ups (not blockers for the persistence mechanism):**
+
+- **Node-level (process + network) restart integration test.** Restarting a whole node
+  in-process is blocked by the lack of **graceful shutdown** ([ADR 0019](0019-graceful-shutdown.md)):
+  the lease-group driver loop and openraft's internal core are not abortable through the
+  test harness, so they keep `redb` file-locked and the restarted node cannot reopen the
+  stores. This wants ADR 0019 (or a binary-level restart test with stable addressing) and
+  is tracked there.
+- **Process-kill crash-consistency test.** The reopen tests prove clean-shutdown recovery;
+  a kill-`9`-mid-write test would prove torn-write rollback. That correctness rests on
+  `redb`'s ACID guarantees (`Durability::Immediate` = fsync on commit) plus its own
+  crash-test suite; a dedicated in-repo kill test (a subprocess writer) is a follow-up.
 
 ## Consequences
 
