@@ -201,6 +201,134 @@ pub async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
     (caddr_a, caddr_b)
 }
 
+/// A self-removing, uniquely-named temporary directory for on-disk persistence
+/// tests. Avoids a `tempfile` dependency (kept out to keep `cargo deny` lean); the
+/// name is unique per process + monotonic counter so parallel tests never collide.
+pub struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    #[must_use]
+    pub fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("mqttd-it-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir { path }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Default for TempDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// An in-process broker backed by the **on-disk** persistent session store (ADR 0018
+/// phase 1): a `PersistentLog` (redb) under a `ReplicatedSessionStore`. Unlike
+/// [`start_broker`], its state lives in a data directory and survives a
+/// [`shutdown`](PersistentNode::shutdown) + restart from that same directory — the
+/// node-level proof of the headline durability promise.
+pub struct PersistentNode {
+    /// Address clients connect to.
+    pub client_addr: SocketAddr,
+    shutdown: tokio_util::sync::CancellationToken,
+    accept: tokio::task::JoinHandle<()>,
+    hub: tokio::task::JoinHandle<()>,
+}
+
+/// Start a persistent node whose `sessions.redb` lives under `data_dir`. Reopening
+/// the same directory after [`shutdown`](PersistentNode::shutdown) recovers the
+/// sessions, subscriptions, and offline queues persisted there.
+///
+/// `open` is retried briefly: redb takes an advisory file lock, and on a same-process
+/// restart the previous node's lock can take a moment to release after its last
+/// `Database` handle drops. A genuine leak still fails (the retry budget is tight).
+pub async fn start_persistent_node(data_dir: &std::path::Path) -> PersistentNode {
+    use mqtt_cluster::NodeId;
+    use mqtt_storage::logged::ReplicatedSessionStore;
+    use mqtt_storage::persistent_log::PersistentLog;
+    use mqtt_storage::{QueueLimits, SessionStore};
+
+    let path = data_dir.join("sessions.redb");
+    let mut attempt = 0;
+    let log = loop {
+        match PersistentLog::open(&path) {
+            Ok(log) => break log,
+            Err(e) if attempt < 40 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let _ = e;
+            }
+            Err(e) => panic!("open persistent session log at {}: {e}", path.display()),
+        }
+    };
+    let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::with_limits(
+        log,
+        QueueLimits::default(),
+    ));
+    // The hub holds the only lasting `store` clone, so aborting it on shutdown drops
+    // the last redb handle and releases the file lock.
+    let (hub, hub_tx) = Hub::with_config(NodeId("node-persist".into()), store);
+    let hub = tokio::spawn(hub.run());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = listener.local_addr().unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let accept = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        tokio::spawn(mqttd::conn::handle(stream, hub_tx.clone()));
+                    }
+                }
+            }
+        })
+    };
+    PersistentNode {
+        client_addr,
+        shutdown,
+        accept,
+        hub,
+    }
+}
+
+impl PersistentNode {
+    /// Stop the node and **release the redb file lock** so the same data directory can
+    /// be reopened. Stops the accept loop, then aborts the hub (which holds the only
+    /// store handle) and awaits it so its `Database` is fully dropped before returning.
+    ///
+    /// Disconnect any live clients first: connection tasks are not force-closed here, so
+    /// a still-attached client would keep its session "online". (Restart durability is
+    /// about *retained* sessions, so tests detach cleanly before calling this.)
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        let _ = self.accept.await;
+        self.hub.abort();
+        let _ = self.hub.await;
+        // Let any blocking redb Drop (file-lock release) settle before the caller
+        // reopens the same directory.
+        tokio::task::yield_now().await;
+    }
+}
+
 fn spawn_client_loop(
     listener: TcpListener,
     tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,

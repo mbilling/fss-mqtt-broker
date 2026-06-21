@@ -142,8 +142,13 @@ drain — the standard "fail readiness, keep liveness during drain" pattern.
   the current packet rather than actively completing outstanding QoS 2 handshakes; durable
   state is protected by ADR 0018 persistence + `raft().shutdown()`, but the
   best-effort-settle-in-grace-window behaviour is not yet implemented.
-- **Node-level restart integration test** (ADR 0018 Phase 5) — now unblocked by
-  `raft().shutdown()` releasing the redb lock; to be re-added.
+- **Node-level restart test** (ADR 0018 Phase 5) — the **single-node persistent** path
+  now has one (`crates/mqttd/tests/persistence.rs`): a real broker establishes a persistent
+  session + offline queue, shuts down (releasing the redb lock), and recovers it from the
+  same data dir on restart. The **durable-cluster (lease-group)** variant is still pending:
+  `raft().shutdown()` stops openraft, but releasing `lease.redb` also needs the lease-group
+  driver task stopped and every `LeaseStore`/store/plane Arc clone dropped — so it needs
+  harness lifecycle handles, not just the raft shutdown call.
 
 ## Consequences
 

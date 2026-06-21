@@ -1,7 +1,8 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–5 implemented** (2026-06-19/21); two phase-5 validation
-  items gated (see Phase 5 note)
+- **Status:** Accepted; **phases 1–5 implemented** (2026-06-19/21); single-node node-level
+  restart proof landed; cluster-path node-level restart + process-kill crash test remain
+  follow-ups (see Phase 5 note)
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -232,14 +233,28 @@ hold after reopen.
   it, which is exactly why followers persist. Together with the per-layer reopen tests
   (lease vote+log, replica entries+watermark, retained), this pins the durability chain.
 
+- **Node-level (client + network) restart proof — single-node persistent path (landed
+  2026-06-21).** `crates/mqttd/tests/persistence.rs`
+  (`persistent_session_and_offline_queue_survive_a_node_restart`) brings up a real
+  in-process broker over TCP backed by the on-disk `PersistentLog`, establishes a
+  persistent session and a message queued for it while offline, **shuts the node down**
+  (releasing the `redb` file lock), restarts a fresh node over the *same* data directory,
+  and observes — as a client — `session_present=true` and the queued message replayed. A
+  companion test asserts a clean session does *not* survive. The harness's
+  `PersistentNode::shutdown` is itself the lock-release proof: the reopen fails ("Database
+  already open") if any database handle leaked. This is the headline phase-1 promise
+  validated end to end.
+
 **Gated follow-ups (not blockers for the persistence mechanism):**
 
-- **Node-level (process + network) restart integration test.** Restarting a whole node
-  in-process is blocked by the lack of **graceful shutdown** ([ADR 0019](0019-graceful-shutdown.md)):
-  the lease-group driver loop and openraft's internal core are not abortable through the
-  test harness, so they keep `redb` file-locked and the restarted node cannot reopen the
-  stores. This wants ADR 0019 (or a binary-level restart test with stable addressing) and
-  is tracked there.
+- **Node-level restart test for the durable *cluster* (lease-group) path.** The
+  single-node persistent path above has no openraft, so its lock releases cleanly on hub
+  shutdown. The clustered path additionally runs the lease-group driver loop and openraft's
+  internal core; cleanly stopping *those* to release `lease.redb`/`replicas.redb` needs
+  graceful shutdown ([ADR 0019](0019-graceful-shutdown.md), now landed:
+  `DurablePlane::raft().shutdown()`) **plus** harness handles to stop the driver task and
+  drop the store/plane Arc clones. Worth doing now that the lock-release path exists; tracked
+  in ADR 0019's deferred list.
 - **Process-kill crash-consistency test.** The reopen tests prove clean-shutdown recovery;
   a kill-`9`-mid-write test would prove torn-write rollback. That correctness rests on
   `redb`'s ACID guarantees (`Durability::Immediate` = fsync on commit) plus its own
