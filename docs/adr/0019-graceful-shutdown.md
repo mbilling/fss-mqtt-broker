@@ -1,6 +1,6 @@
 # ADR 0019 — Graceful shutdown and connection draining
 
-- **Status:** Accepted — core implemented 2026-06-21 (cluster-leave + v5 DISCONNECT deferred; see Implementation status)
+- **Status:** Accepted — implemented 2026-06-21 (incl. v5 DISCONNECT 0x8B + node-level restart proofs; graceful cluster-leave + in-flight QoS settle deferred — see Implementation status)
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement/relocation),
@@ -122,33 +122,43 @@ drain — the standard "fail readiness, keep liveness during drain" pattern.
 - **Readiness flips first** — a shared `draining: Arc<AtomicBool>` (from
   `HealthState::draining_handle`) is set **before** the token is cancelled, so `/readyz`
   reports not-ready while live connections drain (`readiness()` ANDs `!draining`).
-- **Clean openraft stop** — `DurablePlane::raft().shutdown()` is called after connections
-  drain, flushing/stopping the consensus tasks (this also releases the redb lock that
-  previously blocked the ADR 0018 node-level restart test).
+- **v5 Server DISCONNECT `0x8B`** — a draining v5 connection is sent a DISCONNECT with
+  reason `0x8B Server shutting down` before the socket closes, so the client reconnects
+  promptly instead of waiting out a keepalive; v3.1.1 (which has no server-sent DISCONNECT)
+  is simply closed. In the `serve()` drain arm, gated on `FrameWriter::version()`. Tested by
+  `graceful_shutdown_sends_v5_server_shutting_down_disconnect`.
+- **Lease-group driver stop** — `build_durable_node` now returns the driver task handle;
+  `graceful_shutdown` aborts it **before** stopping the raft, so the reconcile loop no
+  longer outlives consensus issuing lease RPCs against a shutting-down raft.
+- **Clean openraft stop** — `DurablePlane::raft().shutdown()` is called after the driver
+  stops, flushing/stopping the consensus tasks (this, plus dropping the store/plane Arc
+  clones, releases the redb locks — the basis of the cluster-path restart test below).
 - **Config** — `MQTTD_SHUTDOWN_GRACE` (seconds, default 30).
-- **Test** — `graceful_shutdown_drains_an_established_connection`: an established
-  connection closes cleanly once the token is cancelled.
+- **Tests** — `graceful_shutdown_drains_an_established_connection` (clean close on the
+  token), the v5 DISCONNECT test above, and the restart tests under **Node-level restart**.
+
+**Node-level restart (ADR 0018 phase 5), landed:**
+
+- **Single-node persistent path** — `crates/mqttd/tests/persistence.rs`: a real broker
+  establishes a persistent session + offline queue, shuts down (releasing the redb lock),
+  and recovers it from the same data dir on restart.
+- **Durable-cluster (lease-group) path** — `durable_node::a_persistent_durable_node_restarts_from_its_data_dir`:
+  a founder bootstraps its lease group on disk, is fully torn down (driver aborted, raft
+  shut down, store + plane dropped — releasing `lease.redb`/`replicas.redb`), and is rebuilt
+  from the same directory, reopening its persisted lease state without a double-init and
+  re-leading. (Session *content* restart-durability still needs R≥2 — proven at store level
+  in `cluster_log`; a single node keeps committed entries in the leader's in-memory log.)
 
 **Deferred (follow-ups, tracked here so the gap is explicit):**
 
-- **v5 Server DISCONNECT `0x8B`** on drain — v5 clients are currently closed at the socket
-  like v3.1.1 rather than receiving a reason-coded DISCONNECT. The drain arm is the hook
-  point; needs the v5 outbound-DISCONNECT path.
 - **Graceful cluster-leave** — no SWIM `Leave`/`Dead(self)` gossip and no lease
   `relinquish` yet, so peers still wait out suspicion → dead and a lease re-election on a
   routine restart. This touches correctness-critical membership/consensus code (ADR 0016)
-  and is held to the same test-first bar; tackled as its own unit.
+  and is held to the same test-first bar; tackled as its own unit, **not** rushed in here.
 - **In-flight QoS settle / hub `Drain` command** — the drain closes the connection after
   the current packet rather than actively completing outstanding QoS 2 handshakes; durable
   state is protected by ADR 0018 persistence + `raft().shutdown()`, but the
   best-effort-settle-in-grace-window behaviour is not yet implemented.
-- **Node-level restart test** (ADR 0018 Phase 5) — the **single-node persistent** path
-  now has one (`crates/mqttd/tests/persistence.rs`): a real broker establishes a persistent
-  session + offline queue, shuts down (releasing the redb lock), and recovers it from the
-  same data dir on restart. The **durable-cluster (lease-group)** variant is still pending:
-  `raft().shutdown()` stops openraft, but releasing `lease.redb` also needs the lease-group
-  driver task stopped and every `LeaseStore`/store/plane Arc clone dropped — so it needs
-  harness lifecycle handles, not just the raft shutdown call.
 
 ## Consequences
 

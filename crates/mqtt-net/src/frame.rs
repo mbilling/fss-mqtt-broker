@@ -106,6 +106,12 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.version = version;
     }
 
+    /// The protocol version this writer encodes at (negotiated from the CONNECT).
+    #[must_use]
+    pub fn version(&self) -> ProtocolVersion {
+        self.version
+    }
+
     /// Recover the underlying writer (e.g. to resume raw I/O when splicing a
     /// proxied session, ADR 0005).
     pub fn into_inner(self) -> W {

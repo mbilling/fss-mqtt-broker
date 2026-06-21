@@ -68,6 +68,8 @@ const CONNACK_V5_BAD_AUTH_METHOD: u8 = 0x8C;
 const DISCONNECT_PROTOCOL_ERROR: u8 = 0x82;
 /// DISCONNECT reason (v5): not authorized (a failed re-authentication, ADR 0013 §4).
 const DISCONNECT_NOT_AUTHORIZED: u8 = 0x87;
+/// DISCONNECT reason (v5): the server is shutting down (graceful drain, ADR 0019).
+const DISCONNECT_SERVER_SHUTTING_DOWN: u8 = 0x8B;
 /// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
 /// topic alias the server will accept on a connection.
 const SERVER_TOPIC_ALIAS_MAX: u16 = 16;
@@ -1085,7 +1087,15 @@ where
             () = drain_signal(policy) => {
                 // Graceful shutdown (ADR 0019): close cleanly without firing the will —
                 // the server is going away, not the client; its session is retained.
+                // v5 clients are told *why* with a Server-shutting-down DISCONNECT so they
+                // reconnect promptly rather than waiting out a keepalive; v3.1.1 has no
+                // server-sent DISCONNECT, so we just close the socket.
                 debug!(client = %client.0, "draining connection for shutdown");
+                if writer.version() == ProtocolVersion::V5 {
+                    // Best-effort: a write failure here just means the client is already
+                    // gone, which the graceful close handles anyway.
+                    let _ = disconnect(writer, DISCONNECT_SERVER_SHUTTING_DOWN).await;
+                }
                 return Ok(true);
             }
         }
@@ -1357,9 +1367,11 @@ mod tests {
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
     }
 
-    /// Like [`start_conn`], but the policy carries a graceful-shutdown token (ADR 0019).
+    /// Like [`start_conn`], but the policy carries a graceful-shutdown token (ADR 0019),
+    /// framed at `version` so both the v3.1.1 and v5 drain behaviours can be exercised.
     fn start_conn_with_shutdown(
         shutdown: tokio_util::sync::CancellationToken,
+        version: ProtocolVersion,
     ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
@@ -1377,7 +1389,11 @@ mod tests {
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
-        (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
+        (
+            FrameReader::new(rh, version),
+            FrameWriter::new(wh, version),
+            hub_rx,
+        )
     }
 
     /// ADR 0019: cancelling the shutdown token drains an established connection — the
@@ -1385,7 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn graceful_shutdown_drains_an_established_connection() {
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (mut reader, mut writer, hub_rx) = start_conn_with_shutdown(shutdown.clone());
+        let (mut reader, mut writer, hub_rx) = start_conn_with_shutdown(shutdown.clone(), V4);
         stub_hub(hub_rx);
 
         writer
@@ -1399,6 +1415,33 @@ mod tests {
         assert!(
             recv(&mut reader).await.is_none(),
             "the connection drained and closed on shutdown"
+        );
+    }
+
+    /// ADR 0019: a draining v5 connection is told *why* — a Server-shutting-down (0x8B)
+    /// DISCONNECT — before the socket closes, so the client reconnects promptly.
+    #[tokio::test]
+    async fn graceful_shutdown_sends_v5_server_shutting_down_disconnect() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut reader, mut writer, hub_rx) = start_conn_with_shutdown(shutdown.clone(), V5);
+        stub_hub(hub_rx);
+
+        writer.send(&connect_v5("drain-v5", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        shutdown.cancel();
+        match recv(&mut reader).await {
+            Some(Packet::Disconnect(d)) => assert_eq!(
+                d.reason,
+                super::DISCONNECT_SERVER_SHUTTING_DOWN,
+                "v5 drain must use reason 0x8B (Server shutting down)"
+            ),
+            other => panic!("expected a v5 DISCONNECT on drain, got {other:?}"),
+        }
+        // ...then the socket closes.
+        assert!(
+            recv(&mut reader).await.is_none(),
+            "the connection closes after the DISCONNECT"
         );
     }
 

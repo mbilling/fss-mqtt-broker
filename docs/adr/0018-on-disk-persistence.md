@@ -1,8 +1,8 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–5 implemented** (2026-06-19/21); single-node node-level
-  restart proof landed; cluster-path node-level restart + process-kill crash test remain
-  follow-ups (see Phase 5 note)
+- **Status:** Accepted; **phases 1–5 implemented** (2026-06-19/21); node-level restart proofs
+  landed (single-node persistent **and** durable-cluster paths); process-kill crash test
+  remains a follow-up (rests on redb's own crash suite — see Phase 5 note)
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
@@ -245,16 +245,18 @@ hold after reopen.
   already open") if any database handle leaked. This is the headline phase-1 promise
   validated end to end.
 
-**Gated follow-ups (not blockers for the persistence mechanism):**
+- **Node-level restart proof — durable *cluster* (lease-group) path (landed 2026-06-21).**
+  `durable_node::a_persistent_durable_node_restarts_from_its_data_dir`: a founder bootstraps
+  its lease group on disk and becomes writable, is then **fully torn down** — the
+  lease-group driver aborted (its handle is now returned from `build_durable_node`), the raft
+  shut down, and the store + plane dropped, which releases the `lease.redb`/`replicas.redb`
+  file locks — and is **rebuilt from the same directory**, reopening its persisted lease
+  state without a double-init and re-leading until writable again. The same driver handle is
+  now stopped in `mqttd`'s graceful shutdown ([ADR 0019](0019-graceful-shutdown.md)) so the
+  reconcile loop no longer outlives the raft. (As above, *session content* restart-durability
+  needs R≥2; the single-node test asserts the **lease** state survives, not the queue.)
 
-- **Node-level restart test for the durable *cluster* (lease-group) path.** The
-  single-node persistent path above has no openraft, so its lock releases cleanly on hub
-  shutdown. The clustered path additionally runs the lease-group driver loop and openraft's
-  internal core; cleanly stopping *those* to release `lease.redb`/`replicas.redb` needs
-  graceful shutdown ([ADR 0019](0019-graceful-shutdown.md), now landed:
-  `DurablePlane::raft().shutdown()`) **plus** harness handles to stop the driver task and
-  drop the store/plane Arc clones. Worth doing now that the lock-release path exists; tracked
-  in ADR 0019's deferred list.
+**Gated follow-ups (not blockers for the persistence mechanism):**
 - **Process-kill crash-consistency test.** The reopen tests prove clean-shutdown recovery;
   a kill-`9`-mid-write test would prove torn-write rollback. That correctness rests on
   `redb`'s ACID guarantees (`Durability::Immediate` = fsync on commit) plus its own

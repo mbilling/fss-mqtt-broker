@@ -63,7 +63,11 @@ pub async fn build_durable_node(
     placement: Arc<RwLock<Placement>>,
     can_bootstrap: bool,
     data_dir: Option<&std::path::Path>,
-) -> (Arc<dyn SessionStore>, DurablePlane) {
+) -> (
+    Arc<dyn SessionStore>,
+    DurablePlane,
+    tokio::task::JoinHandle<()>,
+) {
     let local = raft_id(&node_id);
 
     // --- lease consensus group + durable-plane endpoint ---
@@ -108,7 +112,10 @@ pub async fn build_durable_node(
     let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::new(group_log));
 
     // --- driver: membership + lease assignment over the live placement ---
-    tokio::spawn(run_driver(
+    // The handle is returned so the caller can stop the driver on shutdown (otherwise
+    // the loop outlives `raft`, spinning against a shut-down consensus handle) and so a
+    // restart can release the on-disk lease/replica locks (ADR 0018 phase 5).
+    let driver = tokio::spawn(run_driver(
         raft,
         lease_store,
         placement.clone(),
@@ -116,7 +123,7 @@ pub async fn build_durable_node(
         LeaseAssigner::new(placement),
     ));
 
-    (store, plane)
+    (store, plane, driver)
 }
 
 /// The lease-group control loop: on each tick, reconcile the voter set toward the
@@ -162,6 +169,7 @@ mod tests {
     use crate::placement::{Placement, DEFAULT_REPLICAS};
     use crate::NodeId;
     use mqtt_core::{ClientId, Message, QoS};
+    use mqtt_storage::SessionStore;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
 
@@ -172,7 +180,7 @@ mod tests {
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, _plane) = build_durable_node(node, placement, true, None).await;
+        let (store, _plane, _driver) = build_durable_node(node, placement, true, None).await;
 
         let client = ClientId("c".to_string());
         let msg = Message {
@@ -184,10 +192,21 @@ mod tests {
 
         // Poll until the driver has bootstrapped the lease group and assigned this
         // node its groups' leases, at which point the enqueue commits.
+        wait_writable(&store, &client, &msg).await;
+
+        // The committed message replays.
+        let pending = store.pending(&client, 0, 100).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(&pending[0].message.payload[..], b"durable");
+    }
+
+    /// Poll an enqueue until the durable store is writable (lease bootstrapped and
+    /// assigned to this node), or fail after a generous deadline.
+    async fn wait_writable(store: &Arc<dyn SessionStore>, client: &ClientId, msg: &Message) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if store.enqueue(&client, &msg).await.is_ok() {
-                break;
+            if store.enqueue(client, msg).await.is_ok() {
+                return;
             }
             assert!(
                 Instant::now() < deadline,
@@ -195,10 +214,58 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
 
-        // The committed message replays.
-        let pending = store.pending(&client, 0, 100).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(&pending[0].message.payload[..], b"durable");
+    /// ADR 0018 phase 5 (cluster-path node-level restart). A persistent durable node
+    /// bootstraps its lease group on disk, is **fully torn down** (driver aborted, raft
+    /// shut down, store + plane dropped — which releases the `lease.redb`/`replicas.redb`
+    /// file locks), and is then **rebuilt from the same data directory**: it reopens its
+    /// persisted lease state without a double-init, re-leads, and becomes writable again.
+    ///
+    /// This is the assembly-level proof that graceful shutdown (ADR 0019) makes the
+    /// durable plane cleanly restartable. It deliberately does **not** assert the
+    /// pre-restart message survives: a *single* durable node holds committed session
+    /// entries in the leader's in-memory log until a follower has them, so session
+    /// restart-durability needs R≥2 (proven at the store level in `cluster_log`); here
+    /// the persistent state that must survive is the **lease vote/membership**.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_persistent_durable_node_restarts_from_its_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeId("durable-restart".to_string());
+        let client = ClientId("c".to_string());
+        let msg = Message {
+            topic: "t".to_string(),
+            payload: bytes::Bytes::from_static(b"durable"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+        };
+
+        // --- lifetime #1: bootstrap on disk, become writable ---
+        let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
+        let (store, plane, driver) =
+            build_durable_node(node.clone(), placement, true, Some(dir.path())).await;
+        wait_writable(&store, &client, &msg).await;
+
+        // --- teardown: release the on-disk locks (the part ADR 0019 unblocks) ---
+        driver.abort();
+        let _ = driver.await;
+        plane.raft().shutdown().await.unwrap();
+        drop(store);
+        drop(plane);
+        // The last `Database` handle drops synchronously above; give any in-flight
+        // blocking apply a moment to release before reopening the same files.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // --- lifetime #2: a fresh node over the SAME directory recovers and re-leads ---
+        let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
+        let (store, plane, driver) =
+            build_durable_node(node, placement, true, Some(dir.path())).await;
+        // Becoming writable again proves the persisted lease store reopened (no
+        // "Database already open" lock, no double-init panic) and the node re-led.
+        wait_writable(&store, &client, &msg).await;
+
+        driver.abort();
+        let _ = driver.await;
+        plane.raft().shutdown().await.unwrap();
     }
 }

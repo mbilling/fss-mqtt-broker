@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
     // QoS-2 dedup window (ADR 0007 §5).
-    let (hub_tx, store, durable_plane) = start_hub(&node_id, &placement).await?;
+    let (hub_tx, store, durable_plane, lease_driver) = start_hub(&node_id, &placement).await?;
 
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
@@ -172,7 +172,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_client_listeners(hub_tx, policy, &shutdown, &connections).await?;
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
-    graceful_shutdown(&shutdown, &connections, &draining, plane_for_shutdown).await;
+    graceful_shutdown(
+        &shutdown,
+        &connections,
+        &draining,
+        plane_for_shutdown,
+        lease_driver,
+    )
+    .await;
     Ok(())
 }
 
@@ -332,6 +339,9 @@ type HubHandle = (
     mpsc::UnboundedSender<hub::HubCommand>,
     Arc<dyn SessionStore>,
     Option<mqtt_cluster::durable_plane::DurablePlane>,
+    // The lease-group driver task (durable mode only), so graceful shutdown can stop it
+    // rather than leave it spinning against a shut-down raft (ADR 0019).
+    Option<tokio::task::JoinHandle<()>>,
 );
 
 async fn start_hub(
@@ -359,7 +369,7 @@ async fn start_hub(
             persistent = data_dir.is_some(),
             "DURABLE sessions enabled: consensus-backed replicated store"
         );
-        let (store, plane) = mqtt_cluster::durable_node::build_durable_node(
+        let (store, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
             node_id.clone(),
             placement.clone(),
             founder,
@@ -378,7 +388,7 @@ async fn start_hub(
             hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
         }
         tokio::spawn(hub.run());
-        Ok((hub_tx, store, Some(plane_for_health)))
+        Ok((hub_tx, store, Some(plane_for_health), Some(driver)))
     } else if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
         // Single-node **persistent** sessions (ADR 0018 phase 1): the session log is
         // backed by an on-disk redb database, so sessions, subscriptions, the QoS-2
@@ -401,7 +411,7 @@ async fn start_hub(
         );
         hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
         tokio::spawn(hub.run());
-        Ok((hub_tx, store, None))
+        Ok((hub_tx, store, None, None))
     } else {
         let store: Arc<dyn SessionStore> =
             Arc::new(MemorySessionStore::with_limits(queue_limits_from_env()?));
@@ -411,7 +421,7 @@ async fn start_hub(
             Some(placement.clone()),
         );
         tokio::spawn(hub.run());
-        Ok((hub_tx, store, None))
+        Ok((hub_tx, store, None, None))
     }
 }
 
@@ -660,6 +670,7 @@ async fn graceful_shutdown(
     connections: &tokio_util::task::TaskTracker,
     draining: &std::sync::atomic::AtomicBool,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    lease_driver: Option<tokio::task::JoinHandle<()>>,
 ) {
     connections.close(); // no more spawns once the accept loops stop
     wait_for_shutdown_signal().await;
@@ -683,7 +694,13 @@ async fn graceful_shutdown(
         }
         () = wait_for_shutdown_signal() => warn!("second signal; forcing immediate shutdown"),
     }
-    // 4. Stop the lease consensus core cleanly (flushes; in-flight is already fsync'd).
+    // 4. Stop the lease-group driver loop, then the consensus core, cleanly (in-flight
+    //    durable writes are already fsync'd). Stopping the driver first avoids it issuing
+    //    lease RPCs against a raft that is shutting down.
+    if let Some(driver) = lease_driver {
+        driver.abort();
+        let _ = driver.await;
+    }
     if let Some(plane) = plane {
         let _ = plane.raft().shutdown().await;
     }

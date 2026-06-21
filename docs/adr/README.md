@@ -23,7 +23,7 @@ kept (marked `Superseded by NNNN`) rather than deleted.
 | [0015](0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted |
 | [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted; implemented |
 | [0017](0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted |
-| [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Accepted; implemented; single-node restart proof landed (cluster-path restart + crash test follow-ups) |
-| [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted; core implemented (cluster-leave + v5 DISCONNECT deferred) |
+| [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Accepted; implemented; node-level restart proofs landed (process-kill crash test follow-up) |
+| [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted; implemented (v5 DISCONNECT + restart proofs; graceful cluster-leave deferred) |
 | [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed |
 | [0021](0021-bounded-lease-voters.md) | Bounded lease-consensus voter set (small fixed quorum + learners) | Proposed |

@@ -99,13 +99,17 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
         DEFAULT_REPLICAS,
     )));
 
-    let (store, plane) =
+    let (store, plane, driver) =
         build_durable_node(node_id.clone(), placement.clone(), can_bootstrap, None).await;
     let plane_observer = plane.clone();
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()));
     hub.attach_durable_plane(plane);
-    let mut aborts = vec![tokio::spawn(hub.run()).abort_handle()];
+    // Killing a node aborts its hub, accept loop, and lease-group driver together.
+    let mut aborts = vec![
+        tokio::spawn(hub.run()).abort_handle(),
+        driver.abort_handle(),
+    ];
 
     // MQTT client listener (permissive, served by this node's hub). Clients connect
     // here directly; for the failover test a client reconnects to the new owner.
