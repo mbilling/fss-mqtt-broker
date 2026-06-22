@@ -38,8 +38,9 @@ tasks:
     notes: deferred until operational experience shows the transient-refutation cost matters; no nonce/window logic in swim_auth/swim_driver
   - id: 0003-T8
     title: Zero-downtime key rotation (dual-key acceptance window)
-    status: deferred
-    notes: SwimAuth holds a single key; rotation requires a cluster restart until a dual-key window is added
+    status: done
+    date: 2026-06-22
+    evidence: SwimAuth keyring (accept_also/accept_also_hex), seal uses primary, open tries the ring; MQTTD_SWIM_KEY_ACCEPT; a_datagram_sealed_with_an_accepted_secondary_key_opens; a_dual_key_window_lets_nodes_on_different_primaries_converge
   - id: 0003-T9
     title: Derive the gossip key from cluster-CA material instead of a second secret
     status: cut
@@ -80,12 +81,17 @@ and the dashboard.
 | 0003-T5 | ✅ done | 2026-06-11 | swim.rs self-refutation (incarnation bump + Alive); refutes_suspicion_about_self; a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip |
 | 0003-T6 | 💤 deferred | — | drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability) |
 | 0003-T7 | 💤 deferred | — | deferred until operational experience shows the transient-refutation cost matters; no nonce/window logic in swim_auth/swim_driver |
-| 0003-T8 | 💤 deferred | — | SwimAuth holds a single key; rotation requires a cluster restart until a dual-key window is added |
+| 0003-T8 | ✅ done | 2026-06-22 | SwimAuth keyring (accept_also/accept_also_hex), seal uses primary, open tries the ring; MQTTD_SWIM_KEY_ACCEPT; a_datagram_sealed_with_an_accepted_secondary_key_opens; a_dual_key_window_lets_nodes_on_different_primaries_converge |
 | 0003-T9 | ✂️ cut | — | cryptographically unsound — the CA cert is public, so a key derived from it is not secret; the secure realisation (per-node signatures over the PKI) moved to ADR 0022 |
 <!-- /status-table:0003 -->
 
 ## Changelog
 
+- **2026-06-22** — T8 zero-downtime key rotation landed: `SwimAuth` became a keyring
+  (`accept_also`/`accept_also_hex`), sealing with the primary and opening against any
+  accepted key; `MQTTD_SWIM_KEY_ACCEPT` stages rotation keys. Test-first, incl. an over-UDP
+  test that two nodes on *different* primary keys still converge. (T9 was cut; the secure
+  realisation of "use the PKI" is ADR 0022.)
 - **2026-06-11** — Gossip authentication landed: HMAC-SHA256 seal/open at the I/O boundary
   with verify-before-decode (T1), the crypto-free pure `swim` module (T2), `ring` reused
   from the rustls tree (T3), and `MQTTD_SWIM_KEY` provisioning with startup validation and

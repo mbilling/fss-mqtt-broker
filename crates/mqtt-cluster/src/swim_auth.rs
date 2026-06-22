@@ -58,7 +58,10 @@ pub struct Opened<'a> {
 /// Seals and opens SWIM datagrams: always a cluster-shared-key HMAC (ADR 0003), and — when
 /// a signer/verifier is configured — an additional per-node signature layer (ADR 0022).
 pub struct SwimAuth {
-    key: hmac::Key,
+    /// Shared HMAC keys: `keys[0]` is the primary (used to seal), and any further keys are
+    /// additional keys an incoming datagram may have been sealed with — the dual-key window
+    /// that rotates the gossip key without downtime (ADR 0003).
+    keys: Vec<hmac::Key>,
     /// When set, outgoing datagrams are signed (v2).
     signer: Option<Arc<dyn GossipSign>>,
     /// When set, an incoming v2 datagram's signature is verified and its identity returned.
@@ -82,11 +85,33 @@ impl SwimAuth {
     #[must_use]
     pub fn new(key: &[u8; KEY_LEN]) -> Self {
         Self {
-            key: hmac::Key::new(hmac::HMAC_SHA256, key),
+            keys: vec![hmac::Key::new(hmac::HMAC_SHA256, key)],
             signer: None,
             verifier: None,
             require_signed: false,
         }
+    }
+
+    /// Also accept datagrams sealed with `key`, without using it to seal. This is the
+    /// rotation window: stage the new key as an additional accepted key on every node
+    /// first, then promote it to primary, then drop the old one — no node ever rejects a
+    /// peer mid-rotation (ADR 0003). Outgoing datagrams always use the primary key.
+    #[must_use]
+    pub fn accept_also(mut self, key: &[u8; KEY_LEN]) -> Self {
+        self.keys.push(hmac::Key::new(hmac::HMAC_SHA256, key));
+        self
+    }
+
+    /// Like [`accept_also`](Self::accept_also), from a 64-hex-character key string.
+    ///
+    /// # Errors
+    /// [`InvalidKey`] if the string is not exactly [`KEY_LEN`] bytes of hex.
+    pub fn accept_also_hex(self, hex: &str) -> Result<Self, InvalidKey> {
+        let bytes = decode_hex(hex.trim()).ok_or(InvalidKey("not valid hexadecimal"))?;
+        let key: [u8; KEY_LEN] = bytes
+            .try_into()
+            .map_err(|_| InvalidKey("must be exactly 32 bytes (64 hex characters)"))?;
+        Ok(self.accept_also(&key))
     }
 
     /// Create from a 64-hex-character key string (e.g. `openssl rand -hex 32`).
@@ -144,9 +169,9 @@ impl SwimAuth {
         self.frame(VERSION_V2, &body)
     }
 
-    /// `[version][HMAC(body)][body]`.
+    /// `[version][HMAC(body)][body]`, sealed with the primary key.
     fn frame(&self, version: u8, body: &[u8]) -> Vec<u8> {
-        let tag = hmac::sign(&self.key, body);
+        let tag = hmac::sign(&self.keys[0], body);
         let mut out = Vec::with_capacity(1 + TAG_LEN + body.len());
         out.push(version);
         out.extend_from_slice(tag.as_ref());
@@ -165,8 +190,11 @@ impl SwimAuth {
         }
         let version = datagram[0];
         let (tag, body) = datagram[1..].split_at(TAG_LEN);
-        // Shared-key gate + whole-datagram integrity (constant-time), before any parsing.
-        hmac::verify(&self.key, body, tag).ok()?;
+        // Shared-key gate + whole-datagram integrity (each verify constant-time), before any
+        // parsing. Any key in the ring may have sealed it (the rotation window, ADR 0003).
+        if !self.keys.iter().any(|k| hmac::verify(k, body, tag).is_ok()) {
+            return None;
+        }
 
         match version {
             VERSION_V1 => {
@@ -455,5 +483,65 @@ mod tests {
         let opened = off.open(&signed).expect("off mode opens v2 via the HMAC");
         assert_eq!(opened.payload, b"hello");
         assert_eq!(opened.identity, None);
+    }
+
+    // --- ADR 0003: dual-key rotation window ---
+
+    #[test]
+    fn a_datagram_sealed_with_an_accepted_secondary_key_opens() {
+        // Receiver: primary A, also accepts B (the old key being rotated out).
+        let receiver = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
+        let sealed_with_b = SwimAuth::new(&[0xBB; KEY_LEN]).seal(b"rolling");
+        assert_eq!(
+            receiver.open(&sealed_with_b).expect("opens").payload,
+            b"rolling"
+        );
+        // ...and the primary still opens during the window.
+        let sealed_with_a = SwimAuth::new(&[0xAA; KEY_LEN]).seal(b"primary");
+        assert_eq!(
+            receiver.open(&sealed_with_a).expect("opens").payload,
+            b"primary"
+        );
+    }
+
+    #[test]
+    fn a_key_outside_the_ring_is_rejected() {
+        let receiver = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
+        let sealed_with_c = SwimAuth::new(&[0xCC; KEY_LEN]).seal(b"intruder");
+        assert!(receiver.open(&sealed_with_c).is_none());
+    }
+
+    #[test]
+    fn seal_always_uses_the_primary_key_not_a_secondary() {
+        let node = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
+        let sealed = node.seal(b"x");
+        // A peer holding only the secondary must not open it; the primary must.
+        assert!(SwimAuth::new(&[0xBB; KEY_LEN]).open(&sealed).is_none());
+        assert!(SwimAuth::new(&[0xAA; KEY_LEN]).open(&sealed).is_some());
+    }
+
+    #[test]
+    fn accept_also_hex_parses_and_accepts_the_key() {
+        let receiver = SwimAuth::from_hex_key(&"ab".repeat(KEY_LEN))
+            .unwrap()
+            .accept_also_hex(&"cd".repeat(KEY_LEN))
+            .unwrap();
+        let sealed = SwimAuth::new(&[0xCD; KEY_LEN]).seal(b"hi");
+        assert_eq!(receiver.open(&sealed).expect("opens").payload, b"hi");
+        assert!(SwimAuth::from_hex_key(&"ab".repeat(KEY_LEN))
+            .unwrap()
+            .accept_also_hex("nothex")
+            .is_err());
+    }
+
+    #[test]
+    fn a_signed_v2_datagram_sealed_with_a_secondary_key_opens() {
+        // The rotation window covers signed datagrams too: the HMAC tries the ring, then
+        // the (key-independent) signature is verified.
+        let sealed = signing_auth(0xBB, "node-a", false).seal(b"signed-roll");
+        let receiver = signing_auth(0xAA, "node-a", true).accept_also(&[0xBB; KEY_LEN]);
+        let opened = receiver.open(&sealed).expect("opens");
+        assert_eq!(opened.payload, b"signed-roll");
+        assert_eq!(opened.identity.as_deref(), Some("node-a"));
     }
 }

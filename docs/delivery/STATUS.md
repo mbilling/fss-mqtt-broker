@@ -10,7 +10,7 @@
 |-----|-------|----------|-------|-----------------|
 | 0001 | Session durability in a horizontally-scalable cluster | Accepted | 8/11 done | 3 deferred |
 | 0002 | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | 7/10 done | 3 deferred |
-| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 5/9 done | 3 deferred |
+| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 6/9 done | 2 deferred |
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
 | 0006 | Consensus & replication for durable sessions | Accepted | 10/11 done | 1 deferred |
@@ -49,7 +49,6 @@
 
 - `0003-T6` 💤 deferred: Rejected-datagram metrics counter (operator signal for dropped gossip) — drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability)
 - `0003-T7` 💤 deferred: Anti-replay window / per-peer nonces — deferred until operational experience shows the transient-refutation cost matters; no nonce/window logic in swim_auth/swim_driver
-- `0003-T8` 💤 deferred: Zero-downtime key rotation (dual-key acceptance window) — SwimAuth holds a single key; rotation requires a cluster restart until a dual-key window is added
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 

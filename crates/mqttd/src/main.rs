@@ -45,6 +45,11 @@
 //! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), e.g.
 //!   from `openssl rand -hex 32`; without it gossip is unauthenticated and
 //!   loudly logged
+//! - `MQTTD_SWIM_KEY_ACCEPT` — comma-separated extra 64-hex keys that incoming
+//!   gossip may also be sealed with (ADR 0003 zero-downtime rotation): datagrams
+//!   are sealed with `MQTTD_SWIM_KEY` but opened with it *or* any of these. Rotate
+//!   by staging the new key here cluster-wide, promoting it to `MQTTD_SWIM_KEY`,
+//!   then dropping the old one. Requires `MQTTD_SWIM_KEY`.
 //! - `MQTTD_SWIM_SIGNED`    — per-node gossip signatures (ADR 0022): `require`
 //!   (sign + reject unsigned), `prefer` (sign + still accept unsigned, for rollout),
 //!   or `off`. Defaults to `prefer` when both `MQTTD_SWIM_KEY` and the peer-TLS
@@ -658,8 +663,39 @@ async fn start_swim_from_env(
     // Gossip authentication (ADR 0003): keyed = membership claims require the
     // cluster key; unkeyed is possible but loudly insecure.
     let auth = if let Some(hex) = non_empty_env("MQTTD_SWIM_KEY") {
-        Some(SwimAuth::from_hex_key(&hex)?)
+        let mut auth = SwimAuth::from_hex_key(&hex)?;
+        // Additional keys accepted (but not used to seal) during a rotation window (ADR
+        // 0003): an old key still opens peers' datagrams while the cluster migrates to the
+        // new primary, so the gossip key rotates without downtime.
+        let mut rotation = 0;
+        for k in non_empty_env("MQTTD_SWIM_KEY_ACCEPT")
+            .iter()
+            .flat_map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|k| !k.is_empty())
+        {
+            auth = auth.accept_also_hex(&k)?;
+            rotation += 1;
+        }
+        if rotation > 0 {
+            info!(
+                rotation_keys = rotation,
+                "SWIM gossip accepts additional rotation keys (ADR 0003)"
+            );
+        }
+        Some(auth)
     } else {
+        if non_empty_env("MQTTD_SWIM_KEY_ACCEPT").is_some() {
+            return Err(
+                "MQTTD_SWIM_KEY_ACCEPT requires MQTTD_SWIM_KEY: rotation keys are \
+                        accepted in addition to a primary key, not on their own"
+                    .into(),
+            );
+        }
         warn!(
             "INSECURE: SWIM gossip is UNAUTHENTICATED (no MQTTD_SWIM_KEY) — \
              anyone reaching the gossip port can inject membership claims, \

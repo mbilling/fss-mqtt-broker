@@ -364,3 +364,30 @@ async fn a_forged_sender_identity_is_rejected() {
 
     victim.handle.abort();
 }
+
+/// ADR 0003 (T8) zero-downtime key rotation: mid-rotation, one node still seals with the
+/// old key A (and accepts B) while another already seals with the new key B (and accepts
+/// A). Both keys are in every node's ring, so the cluster converges across the rotation
+/// rather than partitioning — the property that makes a no-downtime key change possible.
+#[tokio::test]
+async fn a_dual_key_window_lets_nodes_on_different_primaries_converge() {
+    let a = [0x11; KEY_LEN];
+    let b = [0x22; KEY_LEN];
+    let auth_old = SwimAuth::new(&a).accept_also(&b); // seals A, accepts A+B
+    let auth_new = SwimAuth::new(&b).accept_also(&a); // seals B, accepts A+B
+
+    let (addr1, n1) = spawn_node("rot-old", vec![], Some(auth_old)).await;
+    let (_addr2, n2) = spawn_node("rot-new", vec![addr1.clone()], Some(auth_new)).await;
+
+    let ok = wait_for(Duration::from_secs(5), || {
+        sees(&n1, "rot-new", MemberState::Alive) && sees(&n2, "rot-old", MemberState::Alive)
+    })
+    .await;
+    assert!(
+        ok,
+        "nodes on different primary keys (rotation window) failed to converge"
+    );
+
+    n1.handle.abort();
+    n2.handle.abort();
+}
