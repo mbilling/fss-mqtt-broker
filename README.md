@@ -222,16 +222,9 @@ plain HTTP (no framework — a minimal hand-rolled server):
 
 ## Architecture decisions
 
-| # | Decision |
-|---|---|
-| [0001](docs/adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster |
-| [0002](docs/adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus |
-| [0003](docs/adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams |
-| [0004](docs/adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default |
-| [0005](docs/adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner |
-| [0006](docs/adr/0006-consensus-and-replication.md) | Consensus & replication: lease-scoped consensus, a proven engine, the `ReplicatedLog` seam |
-| [0007](docs/adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker (placement groups, lease group, hub RPC, store swap) |
-| [0008](docs/adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec: properties model, version-tagged packets, reason codes, phased rollout |
+Every significant decision is recorded as an ADR. See the
+[**ADR index**](docs/adr/README.md) for the full catalogue and
+[`docs/delivery/STATUS.md`](docs/delivery/STATUS.md) for live build status.
 
 ## License
 
