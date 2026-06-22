@@ -4,37 +4,40 @@ Each ADR captures one significant, hard-to-reverse decision: its context, the
 choice, and the trade-offs accepted. Numbered sequentially; superseded ADRs are
 kept (marked `Superseded by NNNN`) rather than deleted.
 
-An ADR records **the decision only** and its `Status` is just the lifecycle
+An ADR records **the decision only**, and its `Status` is just the lifecycle
 (`Proposed | Accepted | Superseded | Deprecated`). **How** a decision is being built
 and **how far along** it is live in its delivery doc under
-[`docs/delivery/`](../delivery/) — see the
-[**delivery dashboard**](../delivery/STATUS.md) for the at-a-glance overview, and
-[`docs/delivery/README.md`](../delivery/README.md) for the model and conventions.
+[`docs/delivery/`](../delivery/) — start with the
+[**delivery dashboard**](../delivery/STATUS.md) for the at-a-glance, whole-project
+overview, and see [`docs/delivery/README.md`](../delivery/README.md) for the model and
+conventions.
 
-> Migration in progress: 0016, 0018, and 0019 have been split into
-> decision + [delivery doc](../delivery/). The remaining ADRs still carry their
-> implementation notes inline (their `Status` text below) until they are migrated.
+> Every ADR now has a delivery doc, so the dashboard is the single source of truth for
+> build status. The decision/plan/progress split has been applied to 0016, 0018, and
+> 0019; the remaining ADR *bodies* still carry their original inline implementation
+> prose pending a freeze-to-decision-only pass — but their **status** lives in the
+> delivery docs regardless.
 
-| # | Title | Status (lifecycle) | Delivery |
-|---|-------|--------------------|----------|
-| [0001](0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | inline (not migrated) |
-| [0002](0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | inline |
-| [0003](0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | inline |
-| [0004](0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | inline |
-| [0005](0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | inline |
-| [0006](0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | inline |
-| [0007](0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | inline |
-| [0008](0008-mqtt-5-codec.md) | MQTT 5.0 wire codec | Accepted | inline |
-| [0009](0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | inline |
-| [0010](0010-shared-subscriptions.md) | Shared subscriptions | Accepted | inline |
-| [0011](0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted | inline |
-| [0012](0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | inline |
-| [0013](0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | inline |
-| [0014](0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | inline |
-| [0015](0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | inline |
-| [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [0016](../delivery/0016-swim-membership-stability.md) |
-| [0017](0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | inline |
-| [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Accepted | [0018](../delivery/0018-on-disk-persistence.md) |
-| [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [0019](../delivery/0019-graceful-shutdown.md) |
-| [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed | inline |
-| [0021](0021-bounded-lease-voters.md) | Bounded lease-consensus voter set (small fixed quorum + learners) | Proposed | inline |
+| # | Title | Status | Delivery |
+|---|-------|--------|----------|
+| [0001](0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [delivery](../delivery/0001-session-durability.md) |
+| [0002](0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [delivery](../delivery/0002-transport-security.md) |
+| [0003](0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [delivery](../delivery/0003-gossip-authentication.md) |
+| [0004](0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [delivery](../delivery/0004-identity-and-authentication.md) |
+| [0005](0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [delivery](../delivery/0005-session-affinity.md) |
+| [0006](0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [delivery](../delivery/0006-consensus-and-replication.md) |
+| [0007](0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [delivery](../delivery/0007-durable-store-integration.md) |
+| [0008](0008-mqtt-5-codec.md) | MQTT 5.0 wire codec | Accepted | [delivery](../delivery/0008-mqtt-5-codec.md) |
+| [0009](0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [delivery](../delivery/0009-mqtt5-expiry.md) |
+| [0010](0010-shared-subscriptions.md) | Shared subscriptions | Accepted | [delivery](../delivery/0010-shared-subscriptions.md) |
+| [0011](0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted | [delivery](../delivery/0011-topic-aliases.md) |
+| [0012](0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | [delivery](../delivery/0012-flow-control.md) |
+| [0013](0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [delivery](../delivery/0013-enhanced-authentication.md) |
+| [0014](0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [delivery](../delivery/0014-cross-node-retained.md) |
+| [0015](0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [delivery](../delivery/0015-cluster-shared-subscriptions.md) |
+| [0016](0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [delivery](../delivery/0016-swim-membership-stability.md) |
+| [0017](0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [delivery](../delivery/0017-durable-attach-readiness.md) |
+| [0018](0018-on-disk-persistence.md) | On-disk persistence for durable state (Raft log, session log, retained) | Accepted | [delivery](../delivery/0018-on-disk-persistence.md) |
+| [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [delivery](../delivery/0019-graceful-shutdown.md) |
+| [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed | [delivery](../delivery/0020-metrics-and-observability.md) |
+| [0021](0021-bounded-lease-voters.md) | Bounded lease-consensus voter set (small fixed quorum + learners) | Proposed | [delivery](../delivery/0021-bounded-lease-voters.md) |
