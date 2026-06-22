@@ -50,7 +50,7 @@ tasks:
   - id: 0001-T10
     title: Durable session-expiry deadline across takeover (ADR 0009 phase 3)
     status: deferred
-    notes: message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the only open item in CLUSTER-DURABILITY-PLAN workstream G
+    notes: message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3)
   - id: 0001-T11
     title: Client-facing reconnect during promotion + spec-legal QoS-1 redelivery bounds (takeover hardening)
     status: deferred
@@ -61,11 +61,10 @@ tasks:
 
 Decision: [docs/adr/0001-session-durability.md](../adr/0001-session-durability.md).
 
-This is the foundational durability design. Most of its decisions are realized through the
-dependency-sequenced workstreams in
-[Cluster Durability — Implementation Plan](../CLUSTER-DURABILITY-PLAN.md) and through later
-ADRs — session affinity (0005), consensus/replication (0006), the storage-error contract
-(0017), and on-disk persistence (0018). Each task below points at the concrete code/test
+This is the foundational durability design. Most of its decisions are realized through later
+ADRs — session affinity (0005), consensus/replication (0006), durable-store integration
+(0007), the storage-error contract (0017), and on-disk persistence (0018). Each task below
+points at the concrete code/test
 that realizes its slice.
 
 ## Plan
@@ -103,7 +102,7 @@ tests, and the dashboard.
 | 0001-T7 | ✅ done | 2026-06-22 | mqtt-storage/src/lib.rs SessionStore trait + MemorySessionStore; logged.rs ReplicatedSessionStore over InMemoryReplicatedLog (q/{client}, m/{client}) |
 | 0001-T8 | ✅ done | 2026-06-22 | persistent_log.rs PersistentLog (state_survives_reopen); durable_node a_persistent_durable_node_restarts_from_its_data_dir; realized by ADR 0017/0018 |
 | 0001-T9 | 💤 deferred | — | MQTTD_DURABLE_SESSIONS is off by default, so the shipping default is ephemeral mode — an owner's death drops its queues; durability requires enabling the durable store (R>=2 / quorum) |
-| 0001-T10 | 💤 deferred | — | message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the only open item in CLUSTER-DURABILITY-PLAN workstream G |
+| 0001-T10 | 💤 deferred | — | message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3) |
 | 0001-T11 | 💤 deferred | — | takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass |
 <!-- /status-table:0001 -->
 

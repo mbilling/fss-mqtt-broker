@@ -133,44 +133,18 @@ All cross-cutting state (sessions, retained, subs, cluster transport) sits behin
 
 ## 6. Phased roadmap
 
-### Phase 0 — Infrastructure (this milestone)
-- Cargo workspace + crate skeletons
-- Secure-by-default lints (`forbid(unsafe_code)`, clippy pedantic)
-- CI: build, test, clippy, `cargo-deny`, `cargo-audit`, fmt
-- Config loading with secure defaults
-- Basic tracing/metrics scaffolding
+The original Phase 0–5 milestone plan (infrastructure → single-node core → security
+depth → cluster → persistence & ops → compliance & hardening) has been delivered through
+the **cluster + persistence** stage: the MQTT 3.1.1 + 5.0 core, the security depth, the
+cluster (SWIM, routing, shared subscriptions, takeover, retained replication), and on-disk
+persistence are all built. The remaining frontier is compliance & hardening (a formal
+conformance suite, continuous fuzzing, signed/reproducible releases, scale benchmarking)
+plus operational surface (metrics — [ADR 0020](adr/0020-metrics-and-observability.md), a
+WebSocket listener, an admin API).
 
-### Phase 1 — Single-node MQTT core
-- Codec for 3.1.1 + 5.0 (+ fuzz targets)
-- TCP + TLS 1.3 listeners (rustls)
-- CONNECT/PUBLISH/SUBSCRIBE/PING/DISCONNECT, QoS 0/1/2
-- In-memory sessions, subscriptions, retained messages
-- Keepalive, LWT
-
-### Phase 2 — Security depth
-- mTLS, Argon2id password auth, JWT/OIDC
-- Topic ACL engine, deny-by-default
-- Hash-chained audit log
-- Rate limits, quotas, packet-size caps
-
-### Phase 3 — Cluster
-- SWIM gossip membership
-- Subscription digest propagation + cross-node PUBLISH routing
-- Shared subscriptions across nodes
-- Session takeover / migration
-- Retained-state replication
-
-### Phase 4 — Persistence & ops
-- Durable `SessionStore` / `RetainedStore` backends
-- WebSocket listener
-- Admin/management API + dashboard hooks
-- Backpressure & overload protection tuning
-
-### Phase 5 — Compliance & hardening
-- Automated MQTT conformance suite (3.1.1 + 5.0)
-- Continuous fuzzing
-- SBOM + signed reproducible releases
-- Performance/scale benchmarking harness (linear-scale validation)
+This roadmap is no longer tracked here. Live, per-decision build status is the
+[**delivery dashboard**](delivery/STATUS.md), derived from the delivery docs under
+[`docs/delivery/`](delivery/); the decisions themselves are in [`docs/adr/`](adr/).
 
 ---
 

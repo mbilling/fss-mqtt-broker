@@ -14,8 +14,9 @@ epoch-fenced quorum replication, opt-in via `MQTTD_DURABLE_SESSIONS`) is built a
 proven over a real cluster, with **cross-node takeover** (a replica serves a session
 after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 **negotiates v5 at CONNECT**; the v5 *semantics* are the next milestone. See
-[`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the full roadmap and
-[`docs/adr/`](docs/adr/) for the decisions behind it.
+[`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
+[`docs/adr/`](docs/adr/) for the decisions behind it, and the
+[**delivery dashboard**](docs/delivery/STATUS.md) for live build status.
 
 ## Principles
 
@@ -85,8 +86,7 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 
 - **Durable, replicated session storage** ([ADR 0001](docs/adr/0001-session-durability.md),
   [0006](docs/adr/0006-consensus-and-replication.md),
-  [0007](docs/adr/0007-durable-store-integration.md);
-  [implementation plan](docs/CLUSTER-DURABILITY-PLAN.md)). Opt-in via
+  [0007](docs/adr/0007-durable-store-integration.md)). Opt-in via
   `MQTTD_DURABLE_SESSIONS`: an openraft lease group (per placement group, leader-
   assigned) mints an epoch, and each persistent session's append-log is
   quorum-replicated across its replica set, epoch-fenced against a stale owner. The
@@ -224,7 +224,7 @@ plain HTTP (no framework — a minimal hand-rolled server):
 
 | # | Decision |
 |---|---|
-| [0001](docs/adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster (design; [plan](docs/CLUSTER-DURABILITY-PLAN.md)) |
+| [0001](docs/adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster |
 | [0002](docs/adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus |
 | [0003](docs/adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams |
 | [0004](docs/adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default |

@@ -35,7 +35,7 @@
 **0001 — Session durability in a horizontally-scalable cluster**
 
 - `0001-T9` 💤 deferred: Default-on durable sessions (retire the ephemeral default) — MQTTD_DURABLE_SESSIONS is off by default, so the shipping default is ephemeral mode — an owner's death drops its queues; durability requires enabling the durable store (R>=2 / quorum)
-- `0001-T10` 💤 deferred: Durable session-expiry deadline across takeover (ADR 0009 phase 3) — message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the only open item in CLUSTER-DURABILITY-PLAN workstream G
+- `0001-T10` 💤 deferred: Durable session-expiry deadline across takeover (ADR 0009 phase 3) — message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3)
 - `0001-T11` 💤 deferred: Client-facing reconnect during promotion + spec-legal QoS-1 redelivery bounds (takeover hardening) — takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass
 
 **0002 — Transport security: TLS 1.3 everywhere, mTLS on the cluster bus**
