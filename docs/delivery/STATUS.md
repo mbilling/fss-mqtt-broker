@@ -160,6 +160,6 @@
 
 **0023 — Gossip anti-replay: persisted monotonic sequence + sliding window**
 
-- `0023-P4` ⬜ planned: Driver integration — per-sender windows keyed by the authenticated CN; reject replays
+- `0023-P4` 🚧 in-progress: Driver integration — per-sender windows keyed by the authenticated CN; reject replays — swim_driver holds per-sender ReplayWindows + an optional SeqAlloc; sequenced sends via seal_sequenced, inbound replays dropped by window. End-to-end forged-replay proof lands with P6
 - `0023-P5` ⬜ planned: mqttd wiring — MQTTD_SWIM_REPLAY require/prefer/off, data-dir + signed require guards
 - `0023-P6` ⬜ planned: Over-UDP integration test — a replayed datagram is rejected; live traffic flows; prefer accepts v2

@@ -144,6 +144,7 @@ async fn spawn_node_inner(
         Duration::from_millis(20),
         tx,
         auth,
+        None, // seq allocator wired per-test below where anti-replay is exercised
         shutdown,
     ));
     (addr, Node { handle, view })

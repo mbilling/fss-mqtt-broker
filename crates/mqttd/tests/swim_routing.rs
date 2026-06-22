@@ -100,6 +100,7 @@ async fn start_node(
         Duration::from_millis(20),
         event_tx,
         Some(auth),
+        None, // no anti-replay sequencing in this test
         std::future::pending(),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(
@@ -344,6 +345,7 @@ async fn start_proxy_node(
         Duration::from_millis(20),
         event_tx,
         Some(auth),
+        None, // no anti-replay sequencing in this test
         std::future::pending(),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(

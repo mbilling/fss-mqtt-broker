@@ -9,13 +9,19 @@
 //! one is verified **before** deserialization (ADR 0003) — unauthenticated bytes
 //! never reach the protocol state machine.
 
+use crate::replay::{ReplayWindow, SeqStore, SequenceAllocator};
 use crate::swim::{Action, MemberState, Message, Swim};
 use crate::swim_auth::{Opened, SwimAuth};
 use crate::NodeId;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
+
+/// The per-node monotonic sequence source for outgoing v3 datagrams (ADR 0023). The driver
+/// holds it behind a boxed [`SeqStore`] so the broker can inject the file-backed persistence.
+pub type SeqAlloc = SequenceAllocator<Box<dyn SeqStore>>;
 
 /// Maximum SWIM datagram size we are willing to receive.
 const RECV_BUF: usize = 64 * 1024;
@@ -53,11 +59,14 @@ pub async fn run(
     tick_interval: Duration,
     events: mpsc::UnboundedSender<MembershipEvent>,
     auth: Option<SwimAuth>,
+    mut seq_alloc: Option<SeqAlloc>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     let start = Instant::now();
     let mut ticker = tokio::time::interval(tick_interval);
     let mut buf = vec![0u8; RECV_BUF];
+    // Per-sender replay windows, keyed by the authenticated sender id (ADR 0023).
+    let mut windows: HashMap<String, ReplayWindow> = HashMap::new();
     tokio::pin!(shutdown);
 
     loop {
@@ -65,7 +74,7 @@ pub async fn run(
             () = &mut shutdown => {
                 // Graceful leave: announce our departure, flush it, and stop driving.
                 for action in swim.leave() {
-                    apply(&socket, action, &events, auth.as_ref()).await;
+                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;
                 }
                 debug!("SWIM graceful leave announced; stopping driver");
                 return;
@@ -73,7 +82,7 @@ pub async fn run(
             _ = ticker.tick() => {
                 let now = elapsed_ms(start);
                 for action in swim.tick(now) {
-                    apply(&socket, action, &events, auth.as_ref()).await;
+                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;
                 }
             }
             recv = socket.recv_from(&mut buf) => {
@@ -102,9 +111,19 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Anti-replay (ADR 0023): a sequenced datagram (always authenticated, so the
+                // window cannot be poisoned) is dropped if its sequence is a replay for that
+                // sender. The first sequence per sender seeds the window.
+                if let Some(seq) = opened.seq {
+                    let fresh = windows.entry(msg.from.clone()).or_default().check_and_set(seq);
+                    if !fresh {
+                        debug!(%src, from = %msg.from, seq, "dropping replayed SWIM datagram");
+                        continue;
+                    }
+                }
                 let now = elapsed_ms(start);
                 for action in swim.handle(msg, now) {
-                    apply(&socket, action, &events, auth.as_ref()).await;
+                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;
                 }
             }
         }
@@ -120,13 +139,17 @@ async fn apply(
     action: Action,
     events: &mpsc::UnboundedSender<MembershipEvent>,
     auth: Option<&SwimAuth>,
+    seq_alloc: &mut Option<SeqAlloc>,
 ) {
     match action {
         Action::Send { to, msg } => {
             if let Ok(bytes) = bincode::serialize(&msg) {
-                let datagram = match auth {
-                    Some(a) => a.seal(&bytes),
-                    None => bytes,
+                // With a sequence allocator configured, seal a signed+sequenced v3 datagram
+                // (ADR 0023); otherwise the signed/plain seal (ADR 0022/0003).
+                let datagram = match (auth, seq_alloc.as_mut()) {
+                    (Some(a), Some(alloc)) => a.seal_sequenced(&bytes, alloc.allocate()),
+                    (Some(a), None) => a.seal(&bytes),
+                    (None, _) => bytes,
                 };
                 let _ = socket.send_to(&datagram, &to).await;
             }

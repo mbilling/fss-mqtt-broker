@@ -20,7 +20,8 @@ tasks:
     evidence: swim_auth.rs seal_sequenced/parse_v3/with_sequencing; Opened.seq; sequenced_seal_open_roundtrips_with_seq_and_identity; v3_body_framing_is_pinned; require_sequenced_rejects_v1_and_v2_but_accepts_v3; tampering_any_v3_byte_is_rejected_by_the_hmac
   - id: 0023-P4
     title: Driver integration — per-sender windows keyed by the authenticated CN; reject replays
-    status: planned
+    status: in-progress
+    notes: swim_driver holds per-sender ReplayWindows + an optional SeqAlloc; sequenced sends via seal_sequenced, inbound replays dropped by window. End-to-end forged-replay proof lands with P6
   - id: 0023-P5
     title: mqttd wiring — MQTTD_SWIM_REPLAY require/prefer/off, data-dir + signed require guards
     status: planned
@@ -56,7 +57,7 @@ any wire/IO work builds on them.
 | 0023-P1 | ✅ done | 2026-06-22 | replay.rs ReplayWindow; an_exact_duplicate_is_rejected; out_of_order_within_the_window_is_accepted_once_then_rejected; a_sequence_below_the_window_is_rejected; a_large_forward_gap_slides_the_window_and_accepts |
 | 0023-P2 | ✅ done | 2026-06-22 | replay.rs SequenceAllocator/SeqStore; reserves_one_block_per_block_of_numbers; reopening_resumes_above_the_last_reserved_block_never_reusing |
 | 0023-P3 | ✅ done | 2026-06-22 | swim_auth.rs seal_sequenced/parse_v3/with_sequencing; Opened.seq; sequenced_seal_open_roundtrips_with_seq_and_identity; v3_body_framing_is_pinned; require_sequenced_rejects_v1_and_v2_but_accepts_v3; tampering_any_v3_byte_is_rejected_by_the_hmac |
-| 0023-P4 | ⬜ planned | — |  |
+| 0023-P4 | 🚧 in-progress | — | swim_driver holds per-sender ReplayWindows + an optional SeqAlloc; sequenced sends via seal_sequenced, inbound replays dropped by window. End-to-end forged-replay proof lands with P6 |
 | 0023-P5 | ⬜ planned | — |  |
 | 0023-P6 | ⬜ planned | — |  |
 <!-- /status-table:0023 -->

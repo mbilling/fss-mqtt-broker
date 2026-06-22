@@ -66,11 +66,22 @@ impl ReplayWindow {
 /// bound of the block it has reserved; on reopen it resumes from there, so a sequence is
 /// never reused across restarts. One [`persist`](SeqStore::persist) is a durable (fsync'd)
 /// write in the real implementation.
-pub trait SeqStore {
+pub trait SeqStore: Send {
     /// The last persisted reserved-upper-bound, or `0` if none has ever been written.
     fn reserved(&self) -> u64;
     /// Durably record a new reserved-upper-bound.
     fn persist(&mut self, reserved_until: u64);
+}
+
+/// Forwarding impl so the driver can hold a `SequenceAllocator<Box<dyn SeqStore>>` (the
+/// concrete file store is injected by the broker).
+impl SeqStore for Box<dyn SeqStore> {
+    fn reserved(&self) -> u64 {
+        (**self).reserved()
+    }
+    fn persist(&mut self, reserved_until: u64) {
+        (**self).persist(reserved_until);
+    }
 }
 
 /// Hands out strictly increasing 64-bit sequence numbers, persisting in blocks so that across
@@ -170,28 +181,24 @@ mod tests {
 
     // --- P2: persisted monotonic sequence allocator ---
 
-    /// An in-memory `SeqStore` that records every persist, to simulate a restart by reopening
-    /// over the same backing value and to assert the fsync (persist) frequency.
-    #[derive(Default)]
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// An in-memory `SeqStore` (Send, since `SeqStore: Send`) that records every persist, so a
+    /// test can simulate a restart by reopening over the same backing value and assert the
+    /// fsync (persist) frequency.
+    #[derive(Default, Clone)]
     struct MemStore {
-        reserved: std::rc::Rc<std::cell::Cell<u64>>,
-        persists: std::rc::Rc<std::cell::Cell<u32>>,
-    }
-    impl Clone for MemStore {
-        fn clone(&self) -> Self {
-            Self {
-                reserved: self.reserved.clone(),
-                persists: self.persists.clone(),
-            }
-        }
+        reserved: Arc<AtomicU64>,
+        persists: Arc<AtomicU32>,
     }
     impl SeqStore for MemStore {
         fn reserved(&self) -> u64 {
-            self.reserved.get()
+            self.reserved.load(Ordering::Relaxed)
         }
         fn persist(&mut self, reserved_until: u64) {
-            self.reserved.set(reserved_until);
-            self.persists.set(self.persists.get() + 1);
+            self.reserved.store(reserved_until, Ordering::Relaxed);
+            self.persists.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -211,7 +218,7 @@ mod tests {
             a.allocate();
         }
         // 8 numbers, block of 4 → exactly two reservations (fsyncs).
-        assert_eq!(persists.get(), 2);
+        assert_eq!(persists.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -732,6 +732,7 @@ async fn start_swim_from_env(
         SWIM_TICK,
         event_tx,
         auth,
+        None, // anti-replay sequencing wired in a later step
         shutdown.clone().cancelled_owned(),
     ));
     tokio::spawn(cluster::maintain_peer_links(
