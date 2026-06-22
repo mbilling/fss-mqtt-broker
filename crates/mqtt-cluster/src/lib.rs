@@ -27,6 +27,7 @@ pub mod peer;
 pub mod placement;
 pub mod raft_mesh;
 pub mod repl_net;
+pub mod replay;
 pub mod swim;
 pub mod swim_auth;
 pub mod swim_driver;

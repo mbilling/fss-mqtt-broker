@@ -5,10 +5,14 @@ adr_status: Accepted
 tasks:
   - id: 0023-P1
     title: Sliding replay window (RFC 6479 bitmap) — pure, accept/reject by sequence
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: replay.rs ReplayWindow; an_exact_duplicate_is_rejected; out_of_order_within_the_window_is_accepted_once_then_rejected; a_sequence_below_the_window_is_rejected; a_large_forward_gap_slides_the_window_and_accepts
   - id: 0023-P2
     title: Persisted monotonic sequence allocator (block reservation + fsync; resumes above last block on restart)
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: replay.rs SequenceAllocator/SeqStore; reserves_one_block_per_block_of_numbers; reopening_resumes_above_the_last_reserved_block_never_reusing
   - id: 0023-P3
     title: Wire format v3 in swim_auth (seq + signature; v1/v2 still understood; require/prefer/off)
     status: planned
@@ -47,8 +51,8 @@ any wire/IO work builds on them.
 <!-- status-table:0023 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0023-P1 | ⬜ planned | — |  |
-| 0023-P2 | ⬜ planned | — |  |
+| 0023-P1 | ✅ done | 2026-06-22 | replay.rs ReplayWindow; an_exact_duplicate_is_rejected; out_of_order_within_the_window_is_accepted_once_then_rejected; a_sequence_below_the_window_is_rejected; a_large_forward_gap_slides_the_window_and_accepts |
+| 0023-P2 | ✅ done | 2026-06-22 | replay.rs SequenceAllocator/SeqStore; reserves_one_block_per_block_of_numbers; reopening_resumes_above_the_last_reserved_block_never_reusing |
 | 0023-P3 | ⬜ planned | — |  |
 | 0023-P4 | ⬜ planned | — |  |
 | 0023-P5 | ⬜ planned | — |  |
