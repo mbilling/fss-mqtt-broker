@@ -42,3 +42,4 @@ conventions.
 | [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed | [delivery](../delivery/0020-metrics-and-observability.md) |
 | [0021](0021-bounded-lease-voters.md) | Bounded lease-consensus voter set (small fixed quorum + learners) | Proposed | [delivery](../delivery/0021-bounded-lease-voters.md) |
 | [0022](0022-signed-gossip.md) | Per-node signed gossip (authenticated SWIM identity) | Accepted | [delivery](../delivery/0022-signed-gossip.md) |
+| [0023](0023-gossip-anti-replay.md) | Gossip anti-replay (persisted monotonic sequence + sliding window) | Accepted | [delivery](../delivery/0023-gossip-anti-replay.md) |
