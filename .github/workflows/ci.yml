@@ -26,6 +26,14 @@ jobs:
       - name: Test
         run: cargo test --all
 
+  docs:
+    name: delivery dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Status dashboard is up to date
+        run: python3 scripts/gen-status.py --check
+
   supply-chain:
     name: supply-chain audit
     runs-on: ubuntu-latest

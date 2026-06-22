@@ -1,87 +1,79 @@
 # ADR 0016 — SWIM membership stability (dead-node fencing + false-positive resistance)
 
-- **Status:** Accepted; **phases 1 & 2 implemented** (2026-06-18 / 2026-06-19)
+- **Status:** Accepted
 - **Date:** 2026-06-18
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0016-swim-membership-stability.md](../delivery/0016-swim-membership-stability.md) — phases, progress, and changelog
 - **Related:** [ADR 0003](0003-gossip-authentication.md) (SWIM datagram auth),
   [ADR 0005](0005-session-affinity.md) (placement owns relocation),
   [ADR 0006](0006-consensus-and-replication.md) / [ADR 0007](0007-durable-store-integration.md)
   (durable sessions whose recovery depends on a correct replica set),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md)
+  [ADR 0017](0017-durable-attach-readiness.md) (the attach-path half of the failover gap)
+
+> This record states the decision only. The phased rollout and how far along it is live
+> in the [delivery doc](../delivery/0016-swim-membership-stability.md).
 
 ## Context
 
-Placement (and therefore the durable session store's replica sets) is derived
-directly from SWIM membership. A diagnosed failure (`docs/TEST-PLAN.md`, the
-durable client-observable-failover gap) traced to **membership instability**, not to
-placement or recovery logic: after a node is killed, a survivor's `members()` flaps
-to a *wrong* set that **still lists the killed node** (resurrected) and has **dropped
+Placement (and therefore the durable session store's replica sets) is derived directly
+from SWIM membership. A diagnosed failure (the durable client-observable-failover gap)
+traced to **membership instability**: after a node is killed, a survivor's `members()`
+flaps to a *wrong* set that **still lists the killed node** (resurrected) and has **dropped
 a live survivor** (falsely evicted). The resulting replica set has no live quorum, so
-session recovery reads the dead node, times out, and fails — stalling the first
-client reconnect ~10s with `session_present=false`.
+session recovery reads the dead node, times out, and fails — stalling the first client
+reconnect ~10s with `session_present=false`.
 
-The SWIM implementation already has the core mechanisms (`swim.rs`): per-node
-**incarnation** numbers, **suspicion** (a probe failure marks `Suspect`, not `Dead`),
-and **self-refutation** (a node hearing itself suspected bumps its incarnation and
-re-asserts `Alive`). Two specific gaps remain, and they are exactly the two halves of
-the diagnosed bug:
+The SWIM implementation already had the core mechanisms (`swim.rs`): per-node
+**incarnation** numbers, **suspicion** (a probe failure marks `Suspect`, not `Dead`), and
+**self-refutation** (a node hearing itself suspected bumps its incarnation and re-asserts
+`Alive`). Two specific gaps remained — exactly the two halves of the diagnosed bug:
 
-1. **`Dead` is not terminal.** A `Dead` member stays in the map and is *resurrected*
-   by any later update with a higher incarnation (`apply_update`'s `supersedes` rule).
-   A node that refuted to a high incarnation just before dying leaves that
-   `Alive(high)` gossip in flight; it arrives after the `Dead` declaration and revives
-   the corpse. There is no tombstone and no pruning of `Dead`.
-2. **Suspicion → `Dead` is single-source with fixed timeouts.** One prober's timeout
-   (`ack_timeout_ms`, then `suspicion_timeout_ms`) is enough to drive a peer to
-   `Dead`. A prober that is itself CPU-starved declares healthy peers dead, and a
-   victim that is starved cannot refute within the fixed window. Nothing adapts the
-   timeouts to local health or requires independent confirmation.
+1. **`Dead` is not terminal.** A `Dead` member stayed in the map and was *resurrected* by
+   any later higher-incarnation update. A node that refuted to a high incarnation just
+   before dying left that `Alive(high)` gossip in flight; it arrived after the `Dead`
+   declaration and revived the corpse. No tombstone, no pruning.
+2. **Suspicion → `Dead` is single-source with fixed timeouts.** One prober's timeout was
+   enough to drive a peer to `Dead`. A CPU-starved prober declares healthy peers dead, and
+   a starved victim cannot refute within the fixed window. Nothing adapted timeouts to
+   local health or required independent confirmation.
 
-These are well-understood problems with well-understood fixes (the SWIM paper's
-terminal `Dead`/tombstone, and the **Lifeguard** extensions to SWIM). This ADR adopts
-them, scoped to what closes the gap.
+These are well-understood problems with well-understood fixes (the SWIM paper's terminal
+`Dead`/tombstone, and the **Lifeguard** extensions). This ADR adopts them, scoped to what
+closes the gap.
 
 ## Decision
 
 ### 1. `Dead` is a tombstoned terminal state (fixes resurrection)
 
-When a member reaches `Dead`, it becomes a **tombstone**: kept with a
-`tombstone_deadline = now + DEAD_TTL`, and during that window **no gossiped update can
-revive it** — `Alive`/`Suspect` updates *about a tombstoned node* are dropped
-regardless of incarnation. After `DEAD_TTL` the tombstone is **pruned** from the map.
+When a member reaches `Dead` it becomes a **tombstone**: kept with a `tombstone_deadline =
+now + DEAD_TTL`, and during that window **no gossiped update can revive it** —
+`Alive`/`Suspect` updates *about a tombstoned node* are dropped regardless of incarnation.
+After `DEAD_TTL` the tombstone is **pruned**.
 
-`DEAD_TTL` is set comfortably above the gossip drain time (several protocol periods),
-so a stale pre-death refutation cannot outlive the tombstone — the `dur-c`
-resurrection is impossible. A node that genuinely restarts rejoins **after** the
-tombstone is pruned, or under a fresh node id; it does not need to out-race stale
-gossip. (Self-refutation for the *local* node is unaffected — a node always defends
-its own liveness; the tombstone governs only third-party claims about *others*.)
-
-This mirrors the dead-node interval in mature gossip stacks (memberlist/Serf).
+`DEAD_TTL` is set comfortably above the gossip drain time, so a stale pre-death refutation
+cannot outlive the tombstone — the resurrection is impossible. A node that genuinely
+restarts rejoins **after** the tombstone is pruned, or under a fresh id; it does not need
+to out-race stale gossip. (Self-refutation for the *local* node is unaffected — a node
+always defends its own liveness; the tombstone governs only third-party claims about
+*others*.) This mirrors the dead-node interval in mature gossip stacks (memberlist/Serf).
 
 ### 2. Lifeguard local-health awareness (reduces false positives)
 
-Adopt Lifeguard's **self-awareness multiplier**: the local node tracks a small
-`awareness` score that rises when its *own* probes go unanswered or it has to refute
-itself (signals that *it* is the slow one) and decays back down on healthy rounds.
-Both `ack_timeout` and `suspicion_timeout` are scaled by `(1 + awareness)`, so a
-locally-degraded node:
+Adopt Lifeguard's **self-awareness multiplier**: the local node tracks a small `awareness`
+score that rises when its *own* probes go unanswered or it has to refute itself (signals
+that *it* is the slow one) and decays on healthy rounds. Both `ack_timeout` and
+`suspicion_timeout` scale by `(1 + awareness)`, so a locally-degraded node waits **longer**
+before suspecting peers, and as a victim benefits from peers' longer suspicion windows.
+This attacks false-eviction without weakening detection on a healthy node (awareness = 0 ⇒
+unchanged timeouts).
 
-- waits **longer** before suspecting peers (it stops blaming others for its own
-  slowness), and
-- as a victim, benefits from peers' longer suspicion windows, giving its refutation
-  time to land.
+### 3. Independent-suspicion confirmation before `Dead`
 
-This directly attacks the `dur-a` false-eviction without weakening detection on a
-healthy node (awareness = 0 ⇒ today's timeouts).
-
-### 3. Independent-suspicion confirmation before `Dead` (phase 2)
-
-Also from Lifeguard: a node's **suspicion timeout shrinks as independent suspicions of
-it accumulate** (and starts long). A single prober's suspicion holds the full window;
-only when multiple distinct nodes independently suspect the same peer does it
-fast-track to `Dead`. One contended prober can no longer unilaterally kill a healthy
-peer. (Refutation, §SWIM, still overrides a false suspicion outright.)
+Also from Lifeguard: a node's **suspicion timeout shrinks as independent suspicions
+accumulate** (and starts long). A single prober's suspicion holds the full window; only
+when multiple distinct nodes independently suspect the same peer does it fast-track to
+`Dead`. One contended prober can no longer unilaterally kill a healthy peer. (Refutation
+still overrides a false suspicion outright.)
 
 ### 4. Keep the existing incarnation/refutation core
 
@@ -89,121 +81,31 @@ Incarnation precedence and self-refutation are correct and stay. The changes are
 *additive*: a terminal/tombstoned `Dead`, awareness-scaled timeouts, and
 confirmation-scaled suspicion.
 
-### Phasing
-
-- **Phase 1 — tombstone `Dead` (§1).** Smallest change; on its own it removes the
-  *resurrection* half (a dead node stays dead), which is the harder-to-mitigate half.
-- **Phase 2 — Lifeguard awareness + confirmation (§2, §3).** Reduces *false-positive*
-  Dead declarations so tombstoning a live node is rare.
-
-Together they make membership converge to the live set and stay there, which is what
-the durable failover (and any placement-derived routing) needs.
-
 ## Consequences
 
-- **Good:** closes the durable client-observable-failover gap (recovery sees a live
-  quorum); placement/replica-set correctness no longer depends on perfectly-timed
-  gossip; fewer spurious ownership churns cluster-wide; grounded in published,
-  battle-tested algorithms.
+- **Good:** closes the membership half of the durable failover gap (recovery sees a live
+  quorum); placement/replica-set correctness no longer depends on perfectly-timed gossip;
+  fewer spurious ownership churns; grounded in published, battle-tested algorithms.
 - **Cost / limits:** a node that is **genuinely** restarted (same id) must wait out
-  `DEAD_TTL` before rejoining, or use a fresh id — acceptable and standard. A node
-  *falsely* declared `Dead` is tombstoned for `DEAD_TTL` too; phase 2 makes that rare
-  but not impossible, so `DEAD_TTL` is a bounded, tuned value, not infinite. Awareness
-  adds a little per-node state and a multiplier on timeouts (slower detection on a
-  degraded node — by design).
-- **Risk:** this is correctness-critical membership code feeding durability. It must
-  be developed **test-first against the pure `Swim` state machine** (no network),
-  reproducing the resurrection and false-eviction scenarios as deterministic unit
-  tests *before* any wiring, then validated by the durable failover integration test
-  (which becomes deterministic). A wrong change here can silently corrupt the
-  durability guarantees, so it warrants its own focused workstream — not a reactive
-  edit.
-
-## Update — phase 1 implemented (2026-06-18)
-
-Phase 1 (§1, tombstone `Dead`) is implemented in `swim.rs`, developed test-first on
-the pure state machine:
-
-- `Member.tombstone_deadline: Option<u64>`, set to `now + dead_ttl_ms` when a member
-  becomes `Dead`; while set, `apply_update` drops any non-`Dead` gossip about the
-  member regardless of incarnation; `tick` prunes expired tombstones.
-- Unit tests (a) a high-incarnation `Alive` after `Dead` does **not** revive, and
-  (b) a tombstone prunes after `dead_ttl_ms` and the id can rejoin.
-
-**Validated against the durable-failover scenario, and the diagnosis was refined.**
-With tombstoning, the new owner's membership after a takeover is now correct — the
-killed node is no longer resurrected into the replica set, the live survivor is
-present, and the store recovers the session (meta + subscriptions) from a quorum in
-~1s. So the **membership half of the gap is closed**, as designed.
-
-It does **not** make the client-observable failover test pass "for free" as the
-Consequences section optimistically claimed — that revealed a *separate* bug outside
-SWIM: during the ~1s before the group's lease is reassigned to the new owner,
-`ensure_session` returns a transient `NotOwner`, and the hub's attach path swallows it
-(`ensure_session(...).unwrap_or(false)`), so a client reconnecting in that window
-CONNACKs `session_present=false` and starts a fresh session instead of waiting for the
-lease. Closing the client-observable gap therefore needs an **attach-path** change
-(treat a transient lease error as "not ready, retry/wait") — done in
-[ADR 0017](0017-durable-attach-readiness.md). Phase 2 (§2–§3) remains worthwhile to stop
-a *live* node being falsely evicted under load.
-
-## Update — phase 2 implemented (2026-06-19)
-
-Phase 2 (§2 awareness, §3 confirmation) is implemented in `swim.rs`, again test-first on
-the pure state machine.
-
-**§2 Lifeguard awareness.** A per-node `awareness: u8` (capped by `Config.awareness_max`,
-default 8) scales `ack_timeout` and `suspicion_timeout` by `(1 + awareness)`. It decays
-on a clean probe (a direct or indirect ack).
-
-- **Deviation from the implementation note.** The note suggested bumping awareness on a
-  failed *outgoing* probe as well as on self-refutation. We bump **only on
-  self-refutation**. Without NACKs (deliberately out of scope — see the full-Lifeguard
-  alternative) a failed outgoing probe is *ambiguous*: the target may simply be dead, and
-  blaming local health there would wrongly slow detection of genuinely-dead peers (it
-  broke the existing `probe_failure_leads_to_suspect_then_dead` timing, which correctly
-  surfaced the problem). Self-refutation — multiple peers independently failing to reach
-  us — is the unambiguous "we are the slow one" signal, so it alone raises awareness.
-
-**§3 Independent-suspicion confirmation.** `Update` carries an optional `suspecter`; each
-`Member` accumulates a `HashSet` of distinct suspecters at its current incarnation. The
-effective suspicion window interpolates from `suspicion_timeout_ms` (one suspecter) down
-to `suspicion_min_timeout_ms` as distinct suspecters reach `suspicion_confirmations`
-(default 3), then is scaled by the §2 awareness multiplier. The suspecter set resets when
-the member's `(incarnation, state)` identity changes, so a refutation clears it.
-
-Unit tests: awareness scales the suspicion timeout, rises on self-refutation, decays on a
-clean probe, and saturates at the cap; a single prober holds the full window; independent
-suspicions shrink it to the floor; duplicate suspicions from one node do not fast-track;
-a refutation resets accumulated confirmations. The existing SWIM convergence/detection
-integration tests still pass under the new timing.
+  `DEAD_TTL` before rejoining, or use a fresh id. A node *falsely* declared `Dead` is
+  tombstoned for `DEAD_TTL` too; §3 makes that rare but not impossible, so `DEAD_TTL` is a
+  bounded, tuned value. Awareness adds a little per-node state and slows detection on a
+  degraded node (by design).
+- **Risk:** this is correctness-critical membership code feeding durability. It must be
+  developed **test-first against the pure `Swim` state machine** (no network), reproducing
+  resurrection and false-eviction as deterministic unit tests *before* any wiring. A wrong
+  change here can silently corrupt the durability guarantees, so it warrants its own focused
+  workstream — not a reactive edit.
 
 ## Alternatives considered
 
-- **Just loosen the test's SWIM timings.** Rejected as the fix: it reduces the
-  *false-eviction* rate but does nothing about *resurrection* (a stale high-incarnation
-  `Alive` still revives a dead node), and it papers over a real production fragility.
-- **Prune `Dead` immediately (no tombstone).** This is essentially today's behaviour
-  (a `Dead` member lingering and revivable); removing it without a tombstone still
-  lets a re-learned `Alive` re-insert the node. The tombstone is what makes `Dead`
-  stick.
+- **Just loosen the test's SWIM timings.** Reduces the *false-eviction* rate but does
+  nothing about *resurrection*, and papers over a real production fragility. Rejected.
+- **Prune `Dead` immediately (no tombstone).** A re-learned `Alive` still re-inserts the
+  node. The tombstone is what makes `Dead` stick.
 - **Full Lifeguard (buddy-system probing, NACK-aware, all knobs).** More than this gap
-  needs now; §2–§3 take the parts that address the observed failures and leave the rest
-  as a later option.
-- **Make recovery tolerate a bad replica set (retry / shrink quorum).** Rejected:
-  retrying against a set that lacks a live quorum cannot succeed, and shrinking the
-  quorum would break the safety (intersection) property the durable log relies on. The
-  membership must be correct; recovery must not paper over it.
-
-## Implementation notes (for the workstream, not this ADR)
-
-- New per-member `tombstone_deadline: Option<u64>`; `apply_update` drops third-party
-  reviving updates while tombstoned; a prune pass in `tick` removes expired tombstones.
-- `awareness: u8` on `Swim`; bump on self-probe failure / self-refutation, decay on a
-  clean round; scale `ack_timeout`/`suspicion_timeout` by `(1 + awareness)`.
-- Track per-suspect independent-suspicion count; scale the effective suspicion timeout
-  down toward a floor as it grows.
-- Unit tests on `Swim` directly: (a) a high-incarnation `Alive` after `Dead` does **not**
-  revive; (b) a tombstone prunes after `DEAD_TTL` and the id can rejoin; (c) a slow
-  local node (forced awareness) does not declare a healthy peer dead; (d) one prober's
-  suspicion alone does not fast-track `Dead`.
+  needs; §2–§3 take the parts that address the observed failures and leave the rest as a
+  later option.
+- **Make recovery tolerate a bad replica set (retry / shrink quorum).** Retrying against a
+  set with no live quorum cannot succeed, and shrinking the quorum breaks the safety
+  (intersection) property. Membership must be correct; recovery must not paper over it.

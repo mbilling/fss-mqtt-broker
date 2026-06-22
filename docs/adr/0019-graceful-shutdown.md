@@ -1,26 +1,25 @@
 # ADR 0019 — Graceful shutdown and connection draining
 
-- **Status:** Accepted — implemented 2026-06-21/22 (incl. v5 DISCONNECT 0x8B, node-level restart proofs, SWIM graceful leave; lease-leadership transfer + in-flight QoS settle deferred — see Implementation status)
+- **Status:** Accepted
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0019-graceful-shutdown.md](../delivery/0019-graceful-shutdown.md) — plan, progress, and changelog
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement/relocation),
   [ADR 0006](0006-consensus-and-replication.md) (lease group),
   [ADR 0016](0016-swim-membership-stability.md) (membership),
   [ADR 0017](0017-durable-attach-readiness.md) (attach lifecycle),
   [ADR 0018](0018-on-disk-persistence.md) (durable writes to flush)
 
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0019-graceful-shutdown.md).
+
 ## Context
 
-`mqttd` has **no shutdown handling**. `main.rs` spawns each listener into a `Vec` of
-join handles and then blocks forever:
-
-```rust
-for l in listeners { let _ = l.await; }
-```
-
-There is no `SIGTERM`/`SIGINT` handler, no stop signal to the accept loops or the hub,
-and no draining. On `SIGTERM` (the normal Kubernetes/systemd stop signal) the kernel
-terminates the process immediately. The consequences:
+`mqttd` originally had **no shutdown handling**: `main` spawned each listener and blocked
+forever (`for l in listeners { let _ = l.await; }`). There was no `SIGTERM`/`SIGINT`
+handler, no stop signal to the accept loops or the hub, and no draining. On `SIGTERM`
+(the normal Kubernetes/systemd stop signal) the kernel terminated the process
+immediately. The consequences:
 
 - **In-flight QoS 1/2 messages are lost** — unacked PUBLISH/PUBREL state in the hub never
   completes, and (until ADR 0018) was never persisted.
@@ -48,17 +47,17 @@ immediate exit (operator override for a hung drain).
 
 ### 2. A single shutdown signal threaded through the runtime
 
-Introduce one `tokio_util::sync::CancellationToken` (or a `watch` channel) created in
-`main` and passed to: the accept loops, `conn::handle` per connection, the hub, the SWIM
-driver, and the cluster tasks. Shutdown proceeds in ordered stages:
+One cancellation signal created in `main` and passed to the accept loops, each
+connection, the hub, the SWIM driver, and the cluster tasks. Shutdown proceeds in
+ordered stages:
 
-1. **Stop accepting.** Accept loops select on the token and stop taking new connections
+1. **Stop accepting.** Accept loops select on the signal and stop taking new connections
    immediately; the TLS/health listeners close. New connects are refused fast (so a load
    balancer drains us).
-2. **Leave the cluster cleanly.** Announce departure on SWIM (a graceful "leaving"
-   so peers mark us gone without waiting out suspicion) and **relinquish owned leases**
-   so a survivor re-owns those groups promptly (ADR 0005/0006). Persistent-session owners
-   hand off rather than being failure-detected.
+2. **Leave the cluster cleanly.** Announce departure on SWIM (a graceful "leaving" so
+   peers mark us gone without waiting out suspicion) so a survivor re-owns those groups
+   promptly (ADR 0005/0006). Persistent-session owners hand off rather than being
+   failure-detected.
 3. **Drain client connections.** Each live connection is asked to finish: complete
    in-flight QoS handshakes where possible, then send a v5 **Server DISCONNECT** with
    reason `0x8B Server shutting down` (v3.1.1 clients are simply closed after their
@@ -67,7 +66,7 @@ driver, and the cluster tasks. Shutdown proceeds in ordered stages:
 4. **Flush durable state.** Once connections are drained (or the deadline hits), flush /
    checkpoint the persistent stores (ADR 0018) and stop the hub.
 5. **Exit.** Clean exit code on success; log loudly if the grace deadline forced an
-   ungraceful drain (named connections still in flight).
+   ungraceful drain (connections still in flight).
 
 ### 3. Bounded, observable
 
@@ -81,105 +80,6 @@ On receiving the signal, `/readyz` immediately reports **not ready** (before sta
 completes) so orchestrators stop routing new traffic to us while existing connections
 drain — the standard "fail readiness, keep liveness during drain" pattern.
 
-## Implementation notes (for the workstream)
-
-- Add `tokio-util` (pure-Rust, already common) for `CancellationToken`; thread a clone
-  into `serve_plaintext_clients` / `serve_tls_clients` (select! on `token.cancelled()` vs
-  `listener.accept()`), into `conn::handle`/`run_framed` (select against the read loop so
-  a draining connection can be told to finish and DISCONNECT), and into `Hub::run`.
-- New `HubCommand::Drain { reply }` (or reuse a shutdown token in the hub loop): on drain,
-  stop accepting new attaches, optionally fire wills for clients that won't reconnect, and
-  flush. The hub already serializes state, so a drain step is a natural final command.
-- `health.rs`: a shared `AtomicBool`/watch `draining` flag that `/readyz` consults.
-- Cluster leave: a SWIM `Leave`/`Dead(self)` gossip plus a lease `relinquish` call on
-  owned groups; peers already handle membership changes (ADR 0016) and lease re-election
-  (ADR 0006).
-- Config: `MQTTD_SHUTDOWN_GRACE` (seconds, default 30).
-- Testing: integration test that connects clients (incl. an in-flight QoS 2), sends the
-  shutdown signal to an in-process node, and asserts: readiness flips, new connects are
-  refused, existing clients get a Server DISCONNECT, in-flight settles or is persisted
-  (ADR 0018), and the process returns within the grace bound. A cluster test that a
-  graceful leave triggers immediate lease re-ownership (no suspicion wait).
-
-## Implementation status (2026-06-21)
-
-**Landed:**
-
-- **Signal handling** — `wait_for_shutdown_signal()` awaits `SIGTERM` *or* `SIGINT`
-  (`signal(SignalKind::terminate())` + `ctrl_c()` on unix; `ctrl_c()` elsewhere). The first
-  signal begins drain; a **second** signal during the grace window escalates to immediate
-  exit (`graceful_shutdown` selects on a second `wait_for_shutdown_signal()`).
-- **Single cancellation signal** — one `tokio_util::sync::CancellationToken` created in
-  `main`, carried into the accept loops (`serve_tls_clients`/`serve_plaintext_clients`
-  select on `shutdown.cancelled()` vs `listener.accept()`) and into every connection via
-  `ConnPolicy.shutdown`. A live connection's `serve()` loop has a drain arm that finishes
-  the current packet, then closes **without firing the will and retaining the session**
-  (graceful close, not a crash).
-- **Connection tracking + bounded drain** — a `tokio_util::task::TaskTracker` owns the
-  per-connection tasks; `graceful_shutdown` closes the tracker, cancels the token, then
-  waits on `connections.wait()` bounded by `MQTTD_SHUTDOWN_GRACE` (default 30s). Deadline
-  elapse logs loudly and forces exit.
-- **Readiness flips first** — a shared `draining: Arc<AtomicBool>` (from
-  `HealthState::draining_handle`) is set **before** the token is cancelled, so `/readyz`
-  reports not-ready while live connections drain (`readiness()` ANDs `!draining`).
-- **v5 Server DISCONNECT `0x8B`** — a draining v5 connection is sent a DISCONNECT with
-  reason `0x8B Server shutting down` before the socket closes, so the client reconnects
-  promptly instead of waiting out a keepalive; v3.1.1 (which has no server-sent DISCONNECT)
-  is simply closed. In the `serve()` drain arm, gated on `FrameWriter::version()`. Tested by
-  `graceful_shutdown_sends_v5_server_shutting_down_disconnect`.
-- **Lease-group driver stop** — `build_durable_node` now returns the driver task handle;
-  `graceful_shutdown` aborts it **before** stopping the raft, so the reconcile loop no
-  longer outlives consensus issuing lease RPCs against a shutting-down raft.
-- **Clean openraft stop** — `DurablePlane::raft().shutdown()` is called after the driver
-  stops, flushing/stopping the consensus tasks (this, plus dropping the store/plane Arc
-  clones, releases the redb locks — the basis of the cluster-path restart test below).
-- **SWIM graceful leave** — on shutdown the SWIM driver announces a voluntary departure
-  (`Swim::leave`): it gossips itself `Dead` at its current incarnation **directly to every
-  known peer**, so survivors drop it from the placement ring at once instead of waiting out
-  failure detection (probe → suspicion → dead). Modelled as a self-declared `Dead` rather
-  than a new member state, which reuses the entire `Dead` path — placement removal, the
-  `PeerDead` hub command that tears down its links, and the tombstone fence that suppresses
-  the leaver's own in-flight `Alive` gossip. A `leaving` flag stops the node refuting `Dead`
-  about itself so the departure sticks. The driver takes its shutdown signal as a generic
-  `Future` (no `tokio-util` dependency added to `mqtt-cluster`); `mqttd` passes the shared
-  `CancellationToken`. **Lease handoff falls out of this**: once the leaver leaves the ring,
-  each survivor's existing reconcile/assign driver removes it as a lease voter and reassigns
-  the groups it owned (HRW recomputes the owner) — no separate relinquish protocol needed.
-- **Config** — `MQTTD_SHUTDOWN_GRACE` (seconds, default 30).
-- **Tests** — `graceful_shutdown_drains_an_established_connection` (clean close on the
-  token), the v5 DISCONNECT test above, SWIM-leave unit tests in `swim.rs`
-  (`leave_announces_self_as_dead_to_every_known_peer`,
-  `a_peer_marks_a_leaving_node_dead_immediately`,
-  `a_leaving_node_does_not_refute_its_own_dead`), an over-UDP integration test
-  (`a_graceful_leave_is_seen_dead_faster_than_failure_detection`), and the restart tests
-  under **Node-level restart**.
-
-**Node-level restart (ADR 0018 phase 5), landed:**
-
-- **Single-node persistent path** — `crates/mqttd/tests/persistence.rs`: a real broker
-  establishes a persistent session + offline queue, shuts down (releasing the redb lock),
-  and recovers it from the same data dir on restart.
-- **Durable-cluster (lease-group) path** — `durable_node::a_persistent_durable_node_restarts_from_its_data_dir`:
-  a founder bootstraps its lease group on disk, is fully torn down (driver aborted, raft
-  shut down, store + plane dropped — releasing `lease.redb`/`replicas.redb`), and is rebuilt
-  from the same directory, reopening its persisted lease state without a double-init and
-  re-leading. (Session *content* restart-durability still needs R≥2 — proven at store level
-  in `cluster_log`; a single node keeps committed entries in the leader's in-memory log.)
-
-**Deferred (follow-ups, tracked here so the gap is explicit):**
-
-- **Lease-leadership transfer on a leaving *leader*.** SWIM-leave + survivor reassignment
-  handle a leaving follower (and the leases it owned) promptly. If the leaving node is the
-  lease-group *Raft leader*, the group still elects a new leader the ordinary way (one
-  election timeout, ~300–600ms) before reassignment can proceed — better than today (which
-  also paid failure detection) but not zero. A proactive openraft leadership transfer before
-  departure would remove that last gap; deferred as a focused optimisation (openraft 0.9's
-  transfer support needs evaluation first).
-- **In-flight QoS settle / hub `Drain` command** — the drain closes the connection after
-  the current packet rather than actively completing outstanding QoS 2 handshakes; durable
-  state is protected by ADR 0018 persistence + `raft().shutdown()`, but the
-  best-effort-settle-in-grace-window behaviour is not yet implemented.
-
 ## Consequences
 
 - **Good:** rolling upgrades and orchestrated restarts stop dropping in-flight messages
@@ -190,14 +90,14 @@ drain — the standard "fail readiness, keep liveness during drain" pattern.
   mechanical). A misbehaving client cannot delay shutdown beyond the grace bound by
   design.
 - **Risk:** low. The main subtlety is ordering (stop-accept → leave-cluster → drain →
-  flush → exit) and ensuring the grace deadline always wins; covered by the integration
-  test. Graceful cluster-leave interacts with membership/lease code, so it is gated behind
-  the same care as ADR 0016 (test-first on the leave/relinquish path).
+  flush → exit) and ensuring the grace deadline always wins. Graceful cluster-leave
+  interacts with membership/lease code, so it is gated behind the same care as ADR 0016
+  (test-first on the leave path).
 
 ## Alternatives considered
 
-- **Rely on the OS / orchestrator to just kill us.** This is today's behaviour; it loses
-  in-flight work and pays a failure-detection outage on every restart. Rejected.
+- **Rely on the OS / orchestrator to just kill us.** This was the original behaviour; it
+  loses in-flight work and pays a failure-detection outage on every restart. Rejected.
 - **Drain without a deadline.** A single stuck client would hang termination; orchestrators
   would then `SIGKILL` anyway, losing the orderly flush. The bounded grace is required.
 - **Persist-and-die (lean on ADR 0018, skip draining).** Persistence protects committed

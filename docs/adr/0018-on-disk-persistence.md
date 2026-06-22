@@ -1,293 +1,131 @@
 # ADR 0018 — On-disk persistence for durable state
 
-- **Status:** Accepted; **phases 1–5 implemented** (2026-06-19/21); node-level restart proofs
-  landed (single-node persistent **and** durable-cluster paths); process-kill crash test
-  remains a follow-up (rests on redb's own crash suite — see Phase 5 note)
+- **Status:** Accepted
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0018-on-disk-persistence.md](../delivery/0018-on-disk-persistence.md) — phases, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (session durability),
   [ADR 0006](0006-consensus-and-replication.md) / [ADR 0007](0007-durable-store-integration.md)
   (consensus + durable store), [ADR 0014](0014-cross-node-retained.md) (retained replication)
 
+> This record states the decision only. The phased rollout and how far along it is live
+> in the [delivery doc](../delivery/0018-on-disk-persistence.md).
+
 ## Context
 
-Every durable store in the broker is **in-memory**. "Durable sessions" today means
+Originally every durable store in the broker was **in-memory**. "Durable sessions" meant
 *highly available across a single node failure* (quorum replication + takeover, ADR
-0006/0016/0017) — **not** *persistent across restarts*. Three stores hold the state and
-all lose it when their process exits:
+0006/0016/0017) — **not** *persistent across restarts*. Three stores held the state and
+all lost it when their process exited:
 
-1. **The lease consensus log** — `LeaseStore` (`crates/mqtt-cluster/src/lease_store.rs`)
-   implements openraft's `RaftStorage` over an `Arc<Mutex<Inner>>`: the Raft log, the
-   persisted **vote**, the applied state machine, and snapshots are all `BTreeMap`/`Vec`
-   in memory. Its own module doc says "a node rebuilds its lease view from peers on
-   restart" — which only works while a quorum stays up.
+1. **The lease consensus log** — `LeaseStore` implements openraft's `RaftStorage` over an
+   `Arc<Mutex<Inner>>`: the Raft log, the persisted **vote**, the applied state machine,
+   and snapshots were all `BTreeMap`/`Vec` in memory ("a node rebuilds its lease view from
+   peers on restart" — which only works while a quorum stays up).
 2. **The replicated session log** — session metadata + offline queues live in a
-   `ReplicatedLog` (`crates/mqtt-storage/src/repl.rs`). The clustered backend keeps each
-   node's committed copy in an in-memory replica state; the single-node backend is
-   `InMemoryReplicatedLog` ("all state is lost when the process exits").
+   `ReplicatedLog`; the single-node backend is `InMemoryReplicatedLog` ("all state is lost
+   when the process exits").
 3. **Retained messages** — `MemoryRetainedStore` is a `Mutex<HashMap<String, Message>>`.
 
 Consequences:
 
-- **Full-cluster restart = total data loss.** Every node's log is freshly empty; there
-  is nothing to recover from (peers are equally empty). Sessions, subscriptions, QoS-2
-  dedup windows, offline queues, and retained messages are all gone.
+- **Full-cluster restart = total data loss.** Every node's log is freshly empty; there is
+  nothing to recover from (peers are equally empty).
 - **Raft safety depends on a persisted vote.** openraft requires the vote and log to
   survive a crash so a node cannot vote twice in a term. The in-memory store passes
   openraft's conformance suite (which does not require disk) but **violates the real
-  safety precondition on restart** — a crashed-and-restarted lease voter could
-  participate in a way that risks split-brain on the lease group.
-- A "durable" broker that cannot survive a rolling restart, a datacenter power event, or
-  a simultaneous-quorum-loss is not durable in the sense operators expect.
+  safety precondition on restart** — a crashed-and-restarted lease voter could risk
+  split-brain on the lease group.
+- A "durable" broker that cannot survive a rolling restart, a datacenter power event, or a
+  simultaneous-quorum-loss is not durable in the sense operators expect.
 
 The good news: all three stores sit behind clean trait seams (`ReplicatedLog`,
-`RaftStorage` via `LeaseStore`, `RetainedStore`). Adding persistence is a matter of new
-backends behind existing interfaces, not a rearchitecture.
+`RaftStorage` via `LeaseStore`, `RetainedStore`). Adding persistence is new backends
+behind existing interfaces, not a rearchitecture.
 
 ## Decision
 
-Adopt an **embedded, pure-Rust, ACID storage engine** and implement a disk-backed
-backend behind each of the three seams. Persist with crash-consistent semantics tied to
-the existing durability guarantee.
+Adopt an **embedded, pure-Rust, ACID storage engine** and implement a disk-backed backend
+behind each of the three seams, with crash-consistent semantics tied to the existing
+durability guarantee.
 
 ### 1. Storage engine: `redb` (pure-Rust, ACID, single-file)
 
-Use [`redb`](https://crates.io/crates/redb) as the embedded engine for all three stores.
-Rationale, in priority order for a security-first broker:
+Use [`redb`](https://crates.io/crates/redb) as the embedded engine for all three stores:
 
-- **Pure Rust, no C/C++ toolchain.** Keeps the `cargo deny` supply-chain surface small
-  and auditable — the dominant concern (ADR 0002/0003 ethos). RocksDB (`rust-rocksdb`)
-  drags a large C++ build and transitive surface; `sled` is pure-Rust but its on-disk
-  format is still beta and effectively unmaintained.
-- **ACID with explicit durability.** `redb` is a copy-on-write B-tree with MVCC and a
-  configurable `Durability` (incl. `Immediate` = fsync on commit) — exactly what a
+- **Pure Rust, no C/C++ toolchain.** Keeps the `cargo deny` supply-chain surface small and
+  auditable (ADR 0002/0003 ethos). RocksDB drags a large C++ build; `sled` is pure-Rust but
+  its on-disk format is beta and effectively unmaintained.
+- **ACID with explicit durability.** A copy-on-write B-tree with MVCC and a configurable
+  `Durability` (incl. `Immediate` = fsync on commit) — exactly what a
   quorum-fsync-before-PUBACK guarantee needs.
 - **Single file per store, actively maintained, MIT/Apache.**
 
-One engine for all three stores means **one dependency to review** and one set of
-crash-consistency tests. (A dedicated segmented-WAL for the high-volume *session message
-log* is a possible later optimization if throughput demands it — see Consequences — but
-is not needed to ship persistence.)
+One engine for all three means **one dependency to review** and one set of
+crash-consistency tests. (A dedicated segmented-WAL for the high-volume session message
+log is a possible later optimization — see Consequences — but is not needed to ship.)
 
 ### 2. Durability semantics tied to the PUBACK guarantee
 
-The contract in `ReplicatedLog::append` is *"return only once the record is epoch-fenced
-and quorum-durable; until then the caller must not release a QoS≥1 PUBACK."* Persistence
-makes "durable" mean **fsynced**:
+The `ReplicatedLog::append` contract is *"return only once the record is epoch-fenced and
+quorum-durable; until then the caller must not release a QoS≥1 PUBACK."* Persistence makes
+"durable" mean **fsynced**:
 
-- A node's local `append` **fsyncs to disk** (`Durability::Immediate`) before that node
-  counts toward the quorum ack. So a committed (quorum) append is fsynced on a majority —
-  it survives a simultaneous crash of the whole majority.
+- A node's local `append` **fsyncs to disk** (`Durability::Immediate`) before it counts
+  toward the quorum ack, so a committed append is fsynced on a majority — it survives a
+  simultaneous crash of the whole majority.
 - The openraft lease store fsyncs the **vote** and **log entries** before acknowledging,
   per Raft's storage contract (this is what makes restart safe).
 - Retained-store writes fsync before the PUBLISH is acknowledged at the configured QoS.
 
 This trades latency for correctness (see Consequences). An explicit, documented relaxed
-mode (group-commit / periodic fsync) MAY be offered later as an opt-in for throughput,
-loudly logged like every other insecure/relaxed mode.
+mode (group-commit / periodic fsync) MAY be offered later as an opt-in, loudly logged like
+every other relaxed mode.
 
 ### 3. Restart recovery
 
 - **Lease group:** on start, `LeaseStore` loads its persisted vote, log, and latest
-  snapshot from disk; openraft replays to the last applied index. A restarted node
-  rejoins the group with its real Raft identity — no double-voting, and the group can
-  recover from a full restart as long as a quorum of *persisted* nodes returns.
-- **Session log:** each node loads its persisted committed log on start; takeover
-  recovery (ADR 0017) reads a quorum of *persisted* replicas, so a session survives full
-  restart, not just single-node failure.
-- **Retained:** loaded from disk on start; cross-node back-fill (ADR 0014) still
-  reconciles divergence.
+  snapshot; openraft replays to the last applied index. A restarted node rejoins with its
+  real Raft identity — no double-voting — and the group recovers from a full restart as
+  long as a quorum of *persisted* nodes returns.
+- **Session log:** each node loads its persisted committed log on start; takeover recovery
+  (ADR 0017) reads a quorum of *persisted* replicas, so a session survives full restart,
+  not just single-node failure.
+- **Retained:** loaded from disk on start; cross-node back-fill (ADR 0014) still reconciles
+  divergence.
 
 ### 4. Data location & layout
 
-A single configurable data directory (`MQTTD_DATA_DIR`, default e.g.
-`/var/lib/mqttd`), with one `redb` file per store (`lease.redb`, `sessions.redb`,
-`retained.redb`). Node identity (ADR 0004, the cert CN) is the implicit owner of the
-directory; a startup check refuses to open a data dir stamped with a *different* node id
-(prevents two nodes sharing a volume).
-
-### Phasing
-
-- **Phase 1 — single-node session persistence.** A `redb`-backed `ReplicatedLog`
-  (`PersistentLog`) behind the existing trait. Smallest change; proves the engine,
-  the fsync semantics, and crash-consistency testing. A single-node broker becomes
-  truly durable. No cluster code touched.
-- **Phase 2 — lease store on disk.** Replace `LeaseStore`'s `Inner` with a `redb`-backed
-  implementation of the same `RaftStorage`. Restores Raft safety across restart; the
-  lease group survives full restart. Validate against openraft's conformance suite **and**
-  a crash-injection test.
-- **Phase 3 — replicated session log on disk.** Persist each node's committed replica
-  state so cluster session recovery survives full restart (not just single failure).
-- **Phase 4 — retained store on disk.** `redb`-backed `RetainedStore`.
-- **Phase 5 — operational:** compaction/snapshot policy, data-dir node-id guard, restart
-  integration test (kill all nodes, restart, assert sessions + retained + leases recover).
-
-## Implementation notes (for the workstream)
-
-- New crate-internal modules: `mqtt-storage/src/persistent_log.rs` (`PersistentLog:
-  ReplicatedLog`), `mqtt-storage/src/persistent_retained.rs`, and a redb-backed `Inner`
-  for `mqtt-cluster/src/lease_store.rs`. A small shared `mqtt-storage/src/redb_util.rs`
-  for table/codec helpers.
-- Keys: session log is keyed `q/<client>` / `m/<client>` (already); map each to a redb
-  table keyed by `(client, offset)` so `read`/`truncate`/`live_range` are range scans and
-  the O(1) `live_range` watermark is a per-key min/max kept in a side table.
-- `main.rs`: when `MQTTD_DATA_DIR` is set, build the persistent backends; otherwise keep
-  the in-memory backends (single-node ephemeral stays the zero-config default, loudly
-  logged as non-durable — consistent with the project's opt-in posture).
-- Testing: a crash-injection harness (drop the process / the `redb` handle mid-write and
-  reopen) asserting no torn reads and that a fsynced append survives. This is the
-  correctness bar before any phase is "done" — same rigor as the SWIM/consensus work.
-
-## Update — phase 1 implemented (2026-06-19)
-
-`PersistentLog` (`crates/mqtt-storage/src/persistent_log.rs`) implements `ReplicatedLog`
-over `redb` with `Durability::Immediate` (fsync) on every mutating commit. Synchronous
-`redb` work runs on `spawn_blocking` so the fsync never stalls an async worker. The
-on-disk layout is the two tables described in the implementation notes; the per-key
-offset counter is persisted independently so it stays monotonic across `truncate` and
-resets only on `remove` — matching `InMemoryReplicatedLog` exactly. Wired into `mqttd`
-via `MQTTD_DATA_DIR`: a single-node broker now stores sessions in `<dir>/sessions.redb`
-and survives a restart. `redb` (pure-Rust) resolves to a 1.75-MSRV-compatible version and
-passes `cargo deny` (advisories/bans/licenses/sources). Tests cover the in-memory
-backend's contract plus a **survives-reopen** durability proof (committed state and the
-offset counter are recovered after the database is closed and reopened).
-
-### Phase 2 (2026-06-19): lease store on disk
-
-`LeaseStore` (`crates/mqtt-cluster/src/lease_store.rs`) gained an optional `redb` backend
-behind the same openraft `RaftStorage`. `LeaseStore::open(path)` recovers the prior vote,
-log, applied state machine, and snapshot from disk; `LeaseStore::new()` remains the
-in-memory variant for tests/ephemeral clusters. Writes are **persist-before-acknowledge**
-(each mutation fsync-commits to disk via one batched redb transaction *before* the
-in-memory cache is updated and `Ok` returns), so disk and cache never diverge. The
-blocking redb work runs on `spawn_blocking`. This **restores Raft safety** — the persisted
-vote stops a crashed-and-restarted voter from voting twice in a term — and lets the lease
-group recover from a full-cluster restart. Wired into `mqttd`: with `MQTTD_DATA_DIR` and
-`MQTTD_DURABLE_SESSIONS`, the lease store persists to `<dir>/lease.redb`.
-
-Validated by running openraft's full conformance `Suite` against the **persistent** store
-(every `RaftStorage` method through the disk paths) *and* the in-memory store, plus a
-restart-recovery test (vote + assigned lease survive close/reopen).
-
-### Phase 3 (2026-06-19): replicated session log on disk
-
-`ReplicaState` (`crates/mqtt-cluster/src/cluster_log.rs`) — the follower's committed copy
-of the replicated session log — gained an optional `redb` backend. `ReplicaState::open(path)`
-recovers its fence epoch and stored entries from disk; `new()` stays in-memory. Each
-accepted `apply` is **write-through fsync'd** (persist-before-mutate) before the follower
-acks, so a `ReplicateAck` means the op is on disk — giving the cluster's session log the
-same fsync-on-quorum durability as the lease store. The follower `apply` runs on
-`spawn_blocking` (durable plane) so the fsync never stalls the frame loop. Wired via
-`build_durable_node(.., data_dir)` → `<dir>/replicas.redb` (alongside `lease.redb`).
-Unit-tested: a persistent replica's entries and fence survive close/reopen, and a stale
-op is still fenced after reopen.
-
-With phases 1–3, a **clean full-cluster restart** (all nodes stop and restart from their
-data dirs) recovers leases, the replicated session log, and single-node session state —
-the headline durability claim. Two items remain to *complete* it:
-
-**Phase 3b (2026-06-19): asymmetric stale-replica safety.** Persisting the replica
-introduced a case the in-memory design could not have: a node down long enough to *miss a
-truncation* returns with a stale prefix on disk, which the union-merge could
-**resurrect** as already-acked entries (QoS 1: spec-legal redelivery; QoS 2: incorrect).
-Fixed: `ReplicaState` now tracks a **per-key truncation low-water** (persisted in a
-`replica_trunc` table, recovered on reopen); the recovery read carries it
-(`ReplicaReadReply.watermark`, `ReplicaTransport::read_replica` → `ReplicaRead`); and
-`merge_replica_logs` **drops every entry at or below the highest watermark seen** across
-the quorum before taking the contiguous run. The recovering owner's own current watermark
-is among the reads, so a truncated offset is excluded even if a stale replica still holds
-it. (Limit: if a *majority* of a group's replicas missed the same truncation — rare,
-since truncation propagates to all live followers — the watermark can't be observed;
-impact is bounded redelivery, not loss.) Unit-tested: the merge does not resurrect a stale
-replica's truncated prefix (in either read order), and the watermark survives reopen.
-
-### Phase 4 (2026-06-19): retained store on disk
-
-`PersistentRetainedStore` (`crates/mqtt-storage/src/persistent_retained.rs`) implements
-`RetainedStore` over `redb`: an in-memory topic → message map serves the hot reads
-(`matching`/`all` on subscribe), and every `set` is **write-through fsync'd** before it
-returns (an empty-payload set durably clears the topic, per MQTT). `open` reloads the map
-from disk; cross-node back-fill (ADR 0014 §3) reconciles divergence afterwards. Wired via
-`Hub::attach_retained_store`: whenever `MQTTD_DATA_DIR` is set (single-node-persistent or
-durable-cluster), the hub uses `<dir>/retained.redb`. Unit-tested: retained messages and
-an empty-payload clear survive close/reopen, and wildcard matching + payload/QoS fidelity
-hold after reopen.
-
-### Phase 5 (2026-06-21): hardening & restart validation
-
-- **Data-dir node-id guard** (`crates/mqtt-storage/src/data_dir.rs`,
-  `guard_data_dir`): on startup `mqttd` stamps `<MQTTD_DATA_DIR>/node-id` with its node id
-  and refuses to open a directory stamped by a *different* node — turning a mis-templated
-  shared volume (which would corrupt consensus and mix sessions) into a loud error. Tested.
-- **Compaction:** no new code needed. The lease Raft log is bounded by openraft's snapshot
-  policy (default: snapshot every 5000 entries → purge, which we persist as a range
-  delete); the session/replica logs are bounded by truncation (acked entries deleted from
-  redb); and `redb` reuses freed pages, so each file is bounded by its live high-water. A
-  periodic `Database::compact` to shrink a file after a large truncation is a future option.
-- **Full-cluster-restart proof (store level):** a deterministic test
-  (`cluster_log::a_durable_session_log_survives_a_full_restart_via_persisted_replicas`)
-  replicates committed entries to a quorum of **persistent** replicas, reopens them from
-  disk ("every node restarted"), and shows a new owner recovers and serves the log. Note
-  the architectural fact it documents: **restart durability needs R≥2** — a single-node
-  durable group keeps committed data in the leader's *in-memory* log until a follower has
-  it, which is exactly why followers persist. Together with the per-layer reopen tests
-  (lease vote+log, replica entries+watermark, retained), this pins the durability chain.
-
-- **Node-level (client + network) restart proof — single-node persistent path (landed
-  2026-06-21).** `crates/mqttd/tests/persistence.rs`
-  (`persistent_session_and_offline_queue_survive_a_node_restart`) brings up a real
-  in-process broker over TCP backed by the on-disk `PersistentLog`, establishes a
-  persistent session and a message queued for it while offline, **shuts the node down**
-  (releasing the `redb` file lock), restarts a fresh node over the *same* data directory,
-  and observes — as a client — `session_present=true` and the queued message replayed. A
-  companion test asserts a clean session does *not* survive. The harness's
-  `PersistentNode::shutdown` is itself the lock-release proof: the reopen fails ("Database
-  already open") if any database handle leaked. This is the headline phase-1 promise
-  validated end to end.
-
-- **Node-level restart proof — durable *cluster* (lease-group) path (landed 2026-06-21).**
-  `durable_node::a_persistent_durable_node_restarts_from_its_data_dir`: a founder bootstraps
-  its lease group on disk and becomes writable, is then **fully torn down** — the
-  lease-group driver aborted (its handle is now returned from `build_durable_node`), the raft
-  shut down, and the store + plane dropped, which releases the `lease.redb`/`replicas.redb`
-  file locks — and is **rebuilt from the same directory**, reopening its persisted lease
-  state without a double-init and re-leading until writable again. The same driver handle is
-  now stopped in `mqttd`'s graceful shutdown ([ADR 0019](0019-graceful-shutdown.md)) so the
-  reconcile loop no longer outlives the raft. (As above, *session content* restart-durability
-  needs R≥2; the single-node test asserts the **lease** state survives, not the queue.)
-
-**Gated follow-ups (not blockers for the persistence mechanism):**
-- **Process-kill crash-consistency test.** The reopen tests prove clean-shutdown recovery;
-  a kill-`9`-mid-write test would prove torn-write rollback. That correctness rests on
-  `redb`'s ACID guarantees (`Durability::Immediate` = fsync on commit) plus its own
-  crash-test suite; a dedicated in-repo kill test (a subprocess writer) is a follow-up.
+A single configurable data directory (`MQTTD_DATA_DIR`, e.g. `/var/lib/mqttd`), one `redb`
+file per store (`lease.redb`, `sessions.redb`, `retained.redb`, `replicas.redb`). Node
+identity (ADR 0004, the cert CN) is the implicit owner of the directory; a startup check
+refuses to open a data dir stamped with a *different* node id (prevents two nodes sharing a
+volume).
 
 ## Consequences
 
-- **Good:** real durability — sessions, subscriptions, QoS-2 exactly-once windows,
-  offline queues, retained messages, and lease consensus survive process restart, rolling
-  upgrades, and full-cluster restart. Raft safety is restored (persisted vote). The
-  trait seams mean the change is additive and backend-selectable.
-- **Cost:** fsync-on-commit adds write latency (single-digit-ms on SSD, much worse on
-  spinning disks / networked block storage); QoS≥1 publish throughput is now disk-bound.
-  Group-commit batching mitigates this and is the standard answer. A new (pure-Rust)
-  dependency to vet. Disk capacity planning and compaction become operational concerns.
+- **Good:** real durability — sessions, subscriptions, QoS-2 exactly-once windows, offline
+  queues, retained messages, and lease consensus survive process restart, rolling upgrades,
+  and full-cluster restart. Raft safety is restored (persisted vote). The trait seams mean
+  the change is additive and backend-selectable.
+- **Cost:** fsync-on-commit adds write latency (single-digit-ms on SSD, worse on spinning
+  disks / networked block storage); QoS≥1 publish throughput is now disk-bound. Group-commit
+  batching mitigates this. A new (pure-Rust) dependency to vet. Disk capacity planning and
+  compaction become operational concerns.
 - **Risk:** storage code is correctness-critical and crash-consistency bugs are subtle —
-  hence the explicit crash-injection testing and the choice of an ACID engine over a
-  hand-rolled file format. fsync semantics on some filesystems/cloud volumes lie; document
-  the supported storage classes.
+  hence crash-injection testing and the choice of an ACID engine over a hand-rolled format.
+  fsync semantics on some filesystems/cloud volumes lie; document the supported storage
+  classes.
 
 ## Alternatives considered
 
-- **RocksDB.** The battle-tested choice for Raft logs, but a heavy C++ dependency that
-  cuts against the pure-Rust, minimal-supply-chain posture. Reconsider only if redb's
-  write throughput proves inadequate for the session message log.
-- **`sled`.** Pure-Rust, but a beta on-disk format and stalled maintenance — unacceptable
-  for the durability foundation.
+- **RocksDB.** Battle-tested for Raft logs, but a heavy C++ dependency that cuts against the
+  pure-Rust, minimal-supply-chain posture. Reconsider only if redb's write throughput proves
+  inadequate for the session message log.
+- **`sled`.** Pure-Rust, but a beta on-disk format and stalled maintenance — unacceptable for
+  the durability foundation.
 - **Hand-rolled segmented WAL.** Best raw throughput for the append-only session log, but
-  re-implementing crash-consistent storage is exactly the kind of correctness-critical
-  wheel an ACID engine exists to avoid. Keep as a targeted later optimization for the one
-  high-volume store, not the foundation.
-- **Stay in-memory, document the limitation.** Honest, and fine for an HA-not-persistent
-  posture — but it caps the product below what the consensus investment promises and what
-  operators expect from "durable."
+  re-implementing crash-consistent storage is exactly the wheel an ACID engine exists to
+  avoid. Keep as a targeted later optimization for the one high-volume store.
+- **Stay in-memory, document the limitation.** Honest, fine for an HA-not-persistent posture
+  — but it caps the product below what the consensus investment promises.
