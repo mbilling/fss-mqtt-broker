@@ -9,7 +9,9 @@ license.workspace = true
 [dependencies]
 mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
 thiserror.workspace = true
-x509-parser.workspace = true
+# `verify` enables x509 signature verification (the chain-check for signed gossip,
+# ADR 0022); it uses `ring`, already in the tree — no new dependency.
+x509-parser = { workspace = true, features = ["verify"] }
 serde.workspace = true
 toml.workspace = true
 argon2.workspace = true

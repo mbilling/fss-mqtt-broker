@@ -5,7 +5,9 @@ adr_status: Accepted
 tasks:
   - id: 0022-P1
     title: Crypto core — load node signing key; sign payload; verify cert chains to CA + extract CN + verify signature
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: mqtt-auth/src/signed_gossip.rs; ecdsa_p256_sign_then_verify_returns_the_cn; ed25519_sign_then_verify_roundtrips; a_signature_from_another_key_is_rejected; a_cert_not_chaining_to_the_ca_is_rejected
   - id: 0022-P2
     title: Wire format v2 in swim_auth — optional signer/verifier, seal/open, KAT pinning, v1 still understood
     status: planned
@@ -53,7 +55,7 @@ adversarial tests for each forgery vector.
 <!-- status-table:0022 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0022-P1 | ⬜ planned | — |  |
+| 0022-P1 | ✅ done | 2026-06-22 | mqtt-auth/src/signed_gossip.rs; ecdsa_p256_sign_then_verify_returns_the_cn; ed25519_sign_then_verify_roundtrips; a_signature_from_another_key_is_rejected; a_cert_not_chaining_to_the_ca_is_rejected |
 | 0022-P2 | ⬜ planned | — |  |
 | 0022-P3 | ⬜ planned | — |  |
 | 0022-P4 | ⬜ planned | — |  |

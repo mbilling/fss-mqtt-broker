@@ -10,6 +10,7 @@ pub mod chain;
 pub mod enhanced;
 pub mod mtls;
 pub mod password;
+pub mod signed_gossip;
 pub mod token;
 
 pub use enhanced::{AuthSession, AuthStep, EnhancedAuthenticator, HmacChallengeAuthenticator};
