@@ -52,6 +52,10 @@ pub struct Metrics {
     publish_delivered_total: Family<QosLabel, Counter>,
     publish_dropped_total: Family<ReasonLabel, Counter>,
     deliver_latency_seconds: Histogram,
+    sessions: Gauge,
+    subscriptions: Gauge,
+    retained_messages: Gauge,
+    inflight_messages: Gauge,
 }
 
 impl Metrics {
@@ -110,6 +114,34 @@ impl Metrics {
             deliver_latency_seconds.clone(),
         );
 
+        let sessions = Gauge::default();
+        registry.register(
+            "sessions",
+            "Known client sessions (connected or retained)",
+            sessions.clone(),
+        );
+
+        let subscriptions = Gauge::default();
+        registry.register(
+            "subscriptions",
+            "Active topic-filter subscriptions across all sessions",
+            subscriptions.clone(),
+        );
+
+        let retained_messages = Gauge::default();
+        registry.register(
+            "retained_messages",
+            "Retained messages held by the broker",
+            retained_messages.clone(),
+        );
+
+        let inflight_messages = Gauge::default();
+        registry.register(
+            "inflight_messages",
+            "Unacknowledged QoS>0 messages outstanding to clients",
+            inflight_messages.clone(),
+        );
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         build_info
@@ -127,6 +159,10 @@ impl Metrics {
             publish_delivered_total,
             publish_dropped_total,
             deliver_latency_seconds,
+            sessions,
+            subscriptions,
+            retained_messages,
+            inflight_messages,
         }
     }
 
@@ -198,6 +234,32 @@ impl Metrics {
     pub fn observe_deliver_latency(&self, seconds: f64) {
         self.deliver_latency_seconds.observe(seconds);
     }
+
+    /// Set the current session count (snapshot of an in-memory map; ADR 0020).
+    pub fn set_sessions(&self, n: usize) {
+        self.sessions.set(clamp_gauge(n));
+    }
+
+    /// Set the current active-subscription count.
+    pub fn set_subscriptions(&self, n: usize) {
+        self.subscriptions.set(clamp_gauge(n));
+    }
+
+    /// Set the current retained-message count.
+    pub fn set_retained_messages(&self, n: usize) {
+        self.retained_messages.set(clamp_gauge(n));
+    }
+
+    /// Set the current count of unacknowledged QoS>0 messages outstanding to clients.
+    pub fn set_inflight_messages(&self, n: usize) {
+        self.inflight_messages.set(clamp_gauge(n));
+    }
+}
+
+/// Cast an in-memory map length to the gauge's signed counter, saturating rather
+/// than wrapping for the (unreachable) case of a count beyond `i64::MAX`.
+fn clamp_gauge(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

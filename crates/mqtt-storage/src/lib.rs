@@ -232,6 +232,13 @@ pub trait RetainedStore: Send + Sync + std::fmt::Debug {
     /// Return every retained message (including `$`-rooted topics), for the
     /// cross-node retained snapshot a peer sends on link-up (ADR 0014 §3).
     async fn all(&self) -> Result<Vec<Message>, StorageError>;
+
+    /// The number of retained messages currently held, for the retained-message
+    /// gauge (ADR 0020). The default materializes [`all`](Self::all); stores that
+    /// can count without cloning every message should override it.
+    async fn count(&self) -> Result<usize, StorageError> {
+        Ok(self.all().await?.len())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +480,14 @@ impl RetainedStore for MemoryRetainedStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(map.values().cloned().collect())
+    }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        Ok(self
+            .by_topic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len())
     }
 }
 

@@ -606,7 +606,10 @@ impl Hub {
                     Some(cmd) => self.dispatch(cmd).await,
                     None => break,
                 },
-                _ = sweep.tick() => self.sweep_expired_sessions().await,
+                _ = sweep.tick() => {
+                    self.sweep_expired_sessions().await;
+                    self.refresh_gauges().await;
+                }
             }
         }
     }
@@ -656,8 +659,14 @@ impl Hub {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
                 }
+                // Time the synchronous on-loop fan-out (local deliver + offline enqueue
+                // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
+                let started = Instant::now();
                 self.publish(&topic, &payload, qos, retain, message_expiry)
                     .await;
+                if let Some(m) = &self.metrics {
+                    m.observe_deliver_latency(started.elapsed().as_secs_f64());
+                }
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
@@ -1523,6 +1532,25 @@ impl Hub {
         self.gossip_interest();
     }
 
+    /// Refresh the broker state gauges (sessions, subscriptions, retained, inflight)
+    /// from the in-memory maps. Run on the session sweep tick so the gauges track
+    /// state cheaply without recomputing on every command (ADR 0020-T4).
+    async fn refresh_gauges(&self) {
+        let Some(m) = &self.metrics else { return };
+        // Distinct sessions = connected clients plus offline persistent ones.
+        let offline_persistent = self
+            .session_expiry
+            .keys()
+            .filter(|c| !self.online.contains_key(*c))
+            .count();
+        m.set_sessions(self.online.len() + offline_persistent);
+        m.set_subscriptions(self.subs_by_client.values().map(HashMap::len).sum());
+        m.set_inflight_messages(self.inflight.values().map(|i| i.pending.len()).sum());
+        if let Ok(n) = self.retained.count().await {
+            m.set_retained_messages(n);
+        }
+    }
+
     /// Persist the current subscription set for a client if its session is durable.
     async fn persist_subscriptions(&mut self, client: &ClientId) {
         if !self.is_persistent(client) {
@@ -2150,9 +2178,48 @@ mod tests {
             out.contains("mqttd_publish_delivered_total{qos=\"0\"} 1"),
             "{out}"
         );
+        // The publish path observed one deliver-latency sample (ADR 0020-T4).
+        assert!(
+            out.contains("mqttd_deliver_latency_seconds_count 1"),
+            "{out}"
+        );
         // No per-client/per-topic label leaked onto the message metrics.
         assert!(!out.contains("client="), "{out}");
         assert!(!out.contains("topic="), "{out}");
+    }
+
+    /// ADR 0020-T4: the periodic gauge refresh snapshots the in-memory maps onto the
+    /// broker state gauges — a persistent session with two filters reads back as one
+    /// session and two subscriptions in the rendered exposition. The hub runs its
+    /// normal loop (the sweep tick drives the refresh, every `SESSION_SWEEP_INTERVAL`).
+    #[tokio::test]
+    async fn gauge_refresh_snapshots_sessions_and_subscriptions() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("gauge-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        // A persistent session (clean_start=false, never-expire) with two filters.
+        let (_out_rx, _) = attach_v5(&tx, "c1", 1, false, u32::MAX).await;
+        subscribe(&tx, "c1", "a/b");
+        subscribe(&tx, "c1", "c/d");
+
+        // The sweep tick (1s) refreshes the gauges; poll the exposition until it lands.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = metrics.render();
+            if out.contains("mqttd_sessions 1") && out.contains("mqttd_subscriptions 2") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "gauges never refreshed:\n{out}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn publish_qos1(tx: &HubTx, topic: &str, payload: &'static [u8]) {

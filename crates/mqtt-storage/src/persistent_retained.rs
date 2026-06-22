@@ -151,6 +151,10 @@ impl RetainedStore for PersistentRetainedStore {
     async fn all(&self) -> Result<Vec<Message>, StorageError> {
         Ok(self.lock().values().cloned().collect())
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        Ok(self.lock().len())
+    }
 }
 
 #[cfg(test)]
