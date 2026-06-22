@@ -1,6 +1,6 @@
 # ADR 0020 — Metrics and runtime observability
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0020-metrics-and-observability.md](../delivery/0020-metrics-and-observability.md) — plan, progress, and changelog

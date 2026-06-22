@@ -5,7 +5,9 @@ adr_status: Proposed
 tasks:
   - id: 0020-T1
     title: Add prometheus-client to mqtt-observability; Metrics registry + typed handles + render()
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: mqtt-observability/src/metrics.rs Metrics (prometheus-client 0.22, registry with_prefix mqttd) + render(); render_produces_valid_openmetrics_exposition; counters_and_gauges_move_and_render; no_unbounded_label_keys_are_used; cargo deny clean
   - id: 0020-T2
     title: Serve GET /metrics from health.rs (replace the 404 + its test); MQTTD_METRICS_BIND option
     status: planned
@@ -60,7 +62,7 @@ ratification), so all tasks are `planned`.
 <!-- status-table:0020 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0020-T1 | ⬜ planned | — |  |
+| 0020-T1 | ✅ done | 2026-06-22 | mqtt-observability/src/metrics.rs Metrics (prometheus-client 0.22, registry with_prefix mqttd) + render(); render_produces_valid_openmetrics_exposition; counters_and_gauges_move_and_render; no_unbounded_label_keys_are_used; cargo deny clean |
 | 0020-T2 | ⬜ planned | — |  |
 | 0020-T3 | ⬜ planned | — |  |
 | 0020-T4 | ⬜ planned | — |  |

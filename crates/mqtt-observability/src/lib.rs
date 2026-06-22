@@ -4,6 +4,8 @@
 //! flow into a **hash-chained** audit log so that any after-the-fact tampering
 //! with the record is detectable.
 
+pub mod metrics;
+
 /// A single audit record describing a security-relevant event.
 #[derive(Debug, Clone)]
 pub struct AuditEvent {

@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+prometheus-client = "0.22"
 tracing.workspace = true
 
 [lints]
