@@ -14,7 +14,7 @@ jobs:
     name: build, test, lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -30,7 +30,7 @@ jobs:
     name: delivery dashboard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Status dashboard is up to date
         run: python3 scripts/gen-status.py --check
 
@@ -38,7 +38,7 @@ jobs:
     name: supply-chain audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
