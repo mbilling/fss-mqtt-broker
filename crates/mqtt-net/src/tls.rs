@@ -113,6 +113,24 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, NetError> {
     PrivateKeyDer::from_pem_file(path).map_err(|e| tls_err("private key PEM", path, &e))
 }
 
+/// The first certificate in a PEM file as raw DER — the cluster CA or a node leaf, used to
+/// build the signed-gossip signer/verifier (ADR 0022).
+///
+/// # Errors
+/// [`NetError::Tls`] if the file cannot be read or contains no certificate.
+pub fn first_cert_der(path: &Path) -> Result<Vec<u8>, NetError> {
+    Ok(load_certs(path)?[0].as_ref().to_vec())
+}
+
+/// A private key from a PEM file as raw DER (PKCS#8 / SEC1 as stored), for the signed-gossip
+/// signing key (ADR 0022).
+///
+/// # Errors
+/// [`NetError::Tls`] if the file cannot be read or parsed as a private key.
+pub fn private_key_der(path: &Path) -> Result<Vec<u8>, NetError> {
+    Ok(load_key(path)?.secret_der().to_vec())
+}
+
 fn load_roots(path: &Path) -> Result<RootCertStore, NetError> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(path)? {

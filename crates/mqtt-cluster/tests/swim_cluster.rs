@@ -6,13 +6,58 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mqtt_cluster::swim::{Config, MemberState, Swim};
-use mqtt_cluster::swim_auth::{SwimAuth, KEY_LEN};
+use mqtt_cluster::swim::{Config, Kind, MemberState, Message, Swim};
+use mqtt_cluster::swim_auth::{GossipSign, GossipVerify, SwimAuth, KEY_LEN};
 use mqtt_cluster::swim_driver::{run, MembershipEvent};
 use mqtt_cluster::NodeId;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// A deterministic stand-in for the real PKI signer (ADR 0022): its certificate encodes its
+/// CN as `cert:<cn>` and its signature as `sig:<cn>:<payload>`, so the verifier can recover
+/// the signer's identity. The real crypto is exercised in `mqtt-auth`; here we test the
+/// driver's identity binding (a datagram's authenticated CN must equal its SWIM `from`).
+struct StubSigner {
+    cn: String,
+    cert: Vec<u8>,
+}
+impl StubSigner {
+    fn new(cn: &str) -> Self {
+        Self {
+            cn: cn.to_string(),
+            cert: format!("cert:{cn}").into_bytes(),
+        }
+    }
+}
+impl GossipSign for StubSigner {
+    fn cert_der(&self) -> &[u8] {
+        &self.cert
+    }
+    fn sign(&self, payload: &[u8]) -> Vec<u8> {
+        let mut s = format!("sig:{}:", self.cn).into_bytes();
+        s.extend_from_slice(payload);
+        s
+    }
+}
+
+struct StubVerifier;
+impl GossipVerify for StubVerifier {
+    fn verify(&self, cert_der: &[u8], payload: &[u8], sig: &[u8]) -> Option<String> {
+        let cn = std::str::from_utf8(cert_der).ok()?.strip_prefix("cert:")?;
+        let expected: Vec<u8> = [format!("sig:{cn}:").as_bytes(), payload].concat();
+        (sig == expected).then(|| cn.to_string())
+    }
+}
+
+/// A signing `SwimAuth` (require mode) for node `cn`, on the shared key `key`.
+fn signed_auth(key: u8, cn: &str) -> SwimAuth {
+    SwimAuth::new(&[key; KEY_LEN]).with_signing(
+        Arc::new(StubSigner::new(cn)),
+        Arc::new(StubVerifier),
+        true,
+    )
+}
 
 /// Tight timings so the test converges and detects failure in ~2s.
 fn cfg() -> Config {
@@ -52,6 +97,17 @@ async fn spawn_leavable_node(
 
 async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (String, Node) {
     spawn_node_inner(id, seeds, auth, std::future::pending()).await
+}
+
+/// Spawn a node that signs its gossip as itself (ADR 0022, require mode).
+async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, Node) {
+    spawn_node_inner(
+        id,
+        seeds,
+        Some(signed_auth(key, id)),
+        std::future::pending(),
+    )
+    .await
 }
 
 async fn spawn_node_inner(
@@ -244,4 +300,67 @@ async fn keyed_cluster_ignores_nodes_without_the_key() {
     for n in [n1, n2, wrong, unkeyed] {
         n.handle.abort();
     }
+}
+
+/// ADR 0022: two nodes that sign as themselves (require mode) converge — each signature
+/// verifies and its authenticated certificate CN matches the sender's id.
+#[tokio::test]
+async fn signed_gossip_converges() {
+    let key = 0x33;
+    let (addr1, n1) = spawn_signed_node("sg1", vec![], key).await;
+    let (_addr2, n2) = spawn_signed_node("sg2", vec![addr1.clone()], key).await;
+
+    let ok = wait_for(Duration::from_secs(5), || {
+        sees(&n1, "sg2", MemberState::Alive) && sees(&n2, "sg1", MemberState::Alive)
+    })
+    .await;
+    assert!(ok, "signed nodes failed to converge");
+
+    n1.handle.abort();
+    n2.handle.abort();
+}
+
+/// ADR 0022: a datagram whose authenticated identity (certificate CN) does not match its
+/// claimed SWIM `from` is dropped — a node holding the shared key cannot impersonate
+/// another. We forge a Join "from ghost" that is validly signed by "evil" (a key holder),
+/// and confirm the victim never learns "ghost"; a correctly-attributed Join from "evil"
+/// IS learned, proving it is specifically the identity mismatch that is rejected.
+#[tokio::test]
+async fn a_forged_sender_identity_is_rejected() {
+    let key = 0x44;
+    let (victim_addr, victim) = spawn_signed_node("victim", vec![], key).await;
+    let evil = signed_auth(key, "evil");
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let seal = |m: &Message| evil.seal(&bincode::serialize(m).unwrap());
+
+    // Control: a Join honestly attributed to "evil" is accepted (the victim learns it).
+    let honest = Message {
+        from: "evil".into(),
+        from_addr: sock.local_addr().unwrap().to_string(),
+        from_peer_addr: String::new(),
+        kind: Kind::Join,
+        gossip: vec![],
+    };
+    sock.send_to(&seal(&honest), &victim_addr).await.unwrap();
+    assert!(
+        wait_for(Duration::from_secs(3), || knows(&victim, "evil")).await,
+        "an honestly-signed Join should be learned"
+    );
+
+    // Forge: "evil" signs a Join claiming to be "ghost". CN(evil) != from(ghost) → dropped.
+    let forged = Message {
+        from: "ghost".into(),
+        from_addr: "10.0.0.9:1".into(),
+        from_peer_addr: String::new(),
+        kind: Kind::Join,
+        gossip: vec![],
+    };
+    sock.send_to(&seal(&forged), &victim_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !knows(&victim, "ghost"),
+        "a forged sender identity must be rejected"
+    );
+
+    victim.handle.abort();
 }

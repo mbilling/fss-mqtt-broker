@@ -57,6 +57,12 @@ pub struct PeerTls {
     pub acceptor: TlsAcceptor,
     /// Dials outbound links, presenting our certificate and verifying the peer's.
     pub connector: TlsConnector,
+    /// Cluster CA certificate (DER) — verifies inbound signed-gossip certs (ADR 0022).
+    pub ca_der: Vec<u8>,
+    /// This node's leaf certificate (DER) — embedded inline in signed gossip.
+    pub cert_der: Vec<u8>,
+    /// This node's private key (DER) — signs outgoing gossip.
+    pub key_der: Vec<u8>,
 }
 
 impl std::fmt::Debug for PeerTls {

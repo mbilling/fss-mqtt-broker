@@ -15,14 +15,19 @@ tasks:
     evidence: swim_auth.rs v2 seal/open + GossipSign/GossipVerify; signed_seal_open_roundtrips_and_returns_the_identity; v2_body_framing_is_pinned; require_signed_rejects_an_unsigned_v1_datagram; tampering_any_v2_byte_is_rejected_by_the_hmac; v1 sealed_wire_format_matches_known_answer still passes
   - id: 0022-P3
     title: Driver binds identity — open returns authenticated CN; swim_driver enforces CN == SWIM from
-    status: in-progress
-    notes: swim_driver drops a datagram whose authenticated CN != msg.from; end-to-end forged-from proof lands with P5
+    status: done
+    date: 2026-06-22
+    evidence: swim_driver.rs drops authenticated CN != msg.from; proven end-to-end by a_forged_sender_identity_is_rejected
   - id: 0022-P4
     title: mqttd wiring — retain CA/cert/key material, build signer/verifier, MQTTD_SWIM_SIGNED mode + startup guards
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: main.rs apply_signed_gossip + NodeGossipSigner/CaGossipVerifier; PeerTls ca_der/cert_der/key_der; tls::first_cert_der/private_key_der; MQTTD_SWIM_SIGNED require/prefer/off with startup guards
   - id: 0022-P5
     title: Over-the-wire integration test — signed gossip accepted; forged from rejected; prefer-mode accepts v1
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: swim_cluster.rs signed_gossip_converges; a_forged_sender_identity_is_rejected (forged-from over real UDP); swim_auth prefer_mode_still_accepts_a_v1_datagram_during_rollout
   - id: 0022-T6
     title: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams
     status: deferred
@@ -60,9 +65,9 @@ adversarial tests for each forgery vector.
 |------|--------|------|------------------|
 | 0022-P1 | ✅ done | 2026-06-22 | mqtt-auth/src/signed_gossip.rs; ecdsa_p256_sign_then_verify_returns_the_cn; ed25519_sign_then_verify_roundtrips; a_signature_from_another_key_is_rejected; a_cert_not_chaining_to_the_ca_is_rejected |
 | 0022-P2 | ✅ done | 2026-06-22 | swim_auth.rs v2 seal/open + GossipSign/GossipVerify; signed_seal_open_roundtrips_and_returns_the_identity; v2_body_framing_is_pinned; require_signed_rejects_an_unsigned_v1_datagram; tampering_any_v2_byte_is_rejected_by_the_hmac; v1 sealed_wire_format_matches_known_answer still passes |
-| 0022-P3 | 🚧 in-progress | — | swim_driver drops a datagram whose authenticated CN != msg.from; end-to-end forged-from proof lands with P5 |
-| 0022-P4 | ⬜ planned | — |  |
-| 0022-P5 | ⬜ planned | — |  |
+| 0022-P3 | ✅ done | 2026-06-22 | swim_driver.rs drops authenticated CN != msg.from; proven end-to-end by a_forged_sender_identity_is_rejected |
+| 0022-P4 | ✅ done | 2026-06-22 | main.rs apply_signed_gossip + NodeGossipSigner/CaGossipVerifier; PeerTls ca_der/cert_der/key_der; tls::first_cert_der/private_key_der; MQTTD_SWIM_SIGNED require/prefer/off with startup guards |
+| 0022-P5 | ✅ done | 2026-06-22 | swim_cluster.rs signed_gossip_converges; a_forged_sender_identity_is_rejected (forged-from over real UDP); swim_auth prefer_mode_still_accepts_a_v1_datagram_during_rollout |
 | 0022-T6 | 💤 deferred | — | size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger |
 | 0022-T7 | 💤 deferred | — | same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide |
 <!-- /status-table:0022 -->

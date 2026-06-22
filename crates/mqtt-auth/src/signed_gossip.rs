@@ -118,7 +118,12 @@ impl GossipSigner {
 ///
 /// # Errors
 /// A [`VerifyError`] variant for each failure mode (parse, chain, key type, signature, CN).
-pub fn verify(ca_der: &[u8], cert_der: &[u8], msg: &[u8], sig: &[u8]) -> Result<String, VerifyError> {
+pub fn verify(
+    ca_der: &[u8],
+    cert_der: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<String, VerifyError> {
     let (_, leaf) = X509Certificate::from_der(cert_der).map_err(|_| VerifyError::Parse)?;
     let (_, ca) = X509Certificate::from_der(ca_der).map_err(|_| VerifyError::Parse)?;
 

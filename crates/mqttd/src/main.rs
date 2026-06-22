@@ -45,6 +45,11 @@
 //! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), e.g.
 //!   from `openssl rand -hex 32`; without it gossip is unauthenticated and
 //!   loudly logged
+//! - `MQTTD_SWIM_SIGNED`    — per-node gossip signatures (ADR 0022): `require`
+//!   (sign + reject unsigned), `prefer` (sign + still accept unsigned, for rollout),
+//!   or `off`. Defaults to `prefer` when both `MQTTD_SWIM_KEY` and the peer-TLS
+//!   material are present, else `off`. `require`/`prefer` need both; otherwise a
+//!   startup error. Signs with the cluster-bus leaf key, verified against the CA.
 //! - `MQTTD_HEALTH_BIND`    — HTTP health-probe bind for orchestrators, e.g.
 //!   `0.0.0.0:8080`; serves `GET /livez` (hub responsive) and `GET /readyz`
 //!   (mesh + durable-store ready). Unset = no health server.
@@ -513,6 +518,11 @@ fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Erro
             Ok(Some(peer::PeerTls {
                 acceptor: tls::server_acceptor(cert, key, Some(ca))?,
                 connector: tls::client_connector(ca, cert, key)?,
+                // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound certs,
+                // and our leaf + key sign outbound datagrams.
+                ca_der: tls::first_cert_der(ca)?,
+                cert_der: tls::first_cert_der(cert)?,
+                key_der: tls::private_key_der(key)?,
             }))
         }
         (None, None, None) => Ok(None),
@@ -522,6 +532,109 @@ fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Erro
                 .into(),
         ),
     }
+}
+
+/// Signs outgoing gossip with this node's cluster-bus key, embedding its leaf cert so
+/// receivers can chain-verify it (ADR 0022).
+struct NodeGossipSigner {
+    cert_der: Vec<u8>,
+    signer: mqtt_auth::signed_gossip::GossipSigner,
+}
+
+impl mqtt_cluster::swim_auth::GossipSign for NodeGossipSigner {
+    fn cert_der(&self) -> &[u8] {
+        &self.cert_der
+    }
+    fn sign(&self, payload: &[u8]) -> Vec<u8> {
+        self.signer.sign(payload)
+    }
+}
+
+/// Verifies an inbound gossip cert chains to the cluster CA and its signature is valid,
+/// returning the authenticated Common Name (ADR 0022).
+struct CaGossipVerifier {
+    ca_der: Vec<u8>,
+}
+
+impl mqtt_cluster::swim_auth::GossipVerify for CaGossipVerifier {
+    fn verify(&self, cert_der: &[u8], payload: &[u8], sig: &[u8]) -> Option<String> {
+        mqtt_auth::signed_gossip::verify(&self.ca_der, cert_der, payload, sig).ok()
+    }
+}
+
+/// Signed-gossip posture (ADR 0022), from `MQTTD_SWIM_SIGNED`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignedGossip {
+    /// Shared-key MAC only (ADR 0003).
+    Off,
+    /// Sign outgoing and verify signatures, but still accept unsigned v1 (rollout).
+    Prefer,
+    /// Sign outgoing and reject any unsigned v1 datagram (strict end state).
+    Require,
+}
+
+/// Resolve the signed-gossip mode. Defaults to `Prefer` when both the shared key and the
+/// cluster-bus TLS material are present (the security win, with a safe rollout), else `Off`.
+fn signed_gossip_from_env(
+    has_tls: bool,
+    has_key: bool,
+) -> Result<SignedGossip, Box<dyn std::error::Error>> {
+    Ok(match non_empty_env("MQTTD_SWIM_SIGNED").as_deref() {
+        Some("require") => SignedGossip::Require,
+        Some("prefer") => SignedGossip::Prefer,
+        Some("off") => SignedGossip::Off,
+        Some(other) => {
+            return Err(format!(
+                "MQTTD_SWIM_SIGNED must be one of require|prefer|off (got {other:?})"
+            )
+            .into());
+        }
+        None if has_tls && has_key => SignedGossip::Prefer,
+        None => SignedGossip::Off,
+    })
+}
+
+/// Layer per-node signatures (ADR 0022) onto the shared-key `auth` when configured. Signed
+/// gossip needs both the shared key (the HMAC base) and cluster-bus TLS material (to sign
+/// and verify); a requested mode without them is a startup error, not a silent downgrade.
+fn apply_signed_gossip(
+    auth: Option<SwimAuth>,
+    peer_tls: Option<&peer::PeerTls>,
+) -> Result<Option<SwimAuth>, Box<dyn std::error::Error>> {
+    let mode = signed_gossip_from_env(peer_tls.is_some(), auth.is_some())?;
+    if mode == SignedGossip::Off {
+        return Ok(auth);
+    }
+    let Some(base) = auth else {
+        return Err(
+            "MQTTD_SWIM_SIGNED requires MQTTD_SWIM_KEY: signed gossip layers a \
+                    per-node signature on top of the shared-key MAC"
+                .into(),
+        );
+    };
+    let Some(tls) = peer_tls else {
+        return Err("MQTTD_SWIM_SIGNED requires cluster-bus TLS material \
+                    (MQTTD_PEER_TLS_CA/CERT/KEY) to sign and verify gossip"
+            .into());
+    };
+    let signer = mqtt_auth::signed_gossip::GossipSigner::from_pkcs8_der(&tls.key_der)
+        .map_err(|e| format!("signed gossip signing key: {e}"))?;
+    let signer = Arc::new(NodeGossipSigner {
+        cert_der: tls.cert_der.clone(),
+        signer,
+    });
+    let verifier = Arc::new(CaGossipVerifier {
+        ca_der: tls.ca_der.clone(),
+    });
+    let require = mode == SignedGossip::Require;
+    if mode == SignedGossip::Prefer {
+        warn!(
+            "SWIM gossip signing is in PREFER mode (transitional): unsigned v1 datagrams \
+             are still accepted for rollout — set MQTTD_SWIM_SIGNED=require once every node signs"
+        );
+    }
+    info!(require, "SWIM gossip is SIGNED per-node (ADR 0022)");
+    Ok(Some(base.with_signing(signer, verifier, require)))
 }
 
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and
@@ -554,6 +667,8 @@ async fn start_swim_from_env(
         );
         None
     };
+    // Layer per-node signatures on top of the shared-key MAC when configured (ADR 0022).
+    let auth = apply_signed_gossip(auth, peer_tls)?;
     let socket = UdpSocket::bind(&bind).await?;
     let seeds: Vec<String> = non_empty_env("MQTTD_SWIM_SEEDS")
         .map(|s| {

@@ -96,6 +96,9 @@ impl ClusterPki {
         PeerTls {
             acceptor: mqtt_net::tls::server_acceptor(&cert, &key, Some(&self.ca_path)).unwrap(),
             connector: mqtt_net::tls::client_connector(&self.ca_path, &cert, &key).unwrap(),
+            ca_der: mqtt_net::tls::first_cert_der(&self.ca_path).unwrap(),
+            cert_der: mqtt_net::tls::first_cert_der(&cert).unwrap(),
+            key_der: mqtt_net::tls::private_key_der(&key).unwrap(),
         }
     }
 }
