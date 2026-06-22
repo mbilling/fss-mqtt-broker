@@ -255,6 +255,10 @@ pub struct Swim {
     /// clean probe. Scales our `ack`/`suspicion` timeouts by `(1 + awareness)` so a
     /// degraded node stops blaming healthy peers. `0` ⇒ today's timeouts.
     awareness: u8,
+    /// Set once this node begins a voluntary, graceful departure ([`leave`](Self::leave),
+    /// ADR 0019 §2). While leaving we stop refuting `Dead` claims about ourselves so the
+    /// announced departure sticks rather than being overridden by self-refutation.
+    leaving: bool,
 }
 
 impl Swim {
@@ -293,6 +297,7 @@ impl Swim {
             rng: rng | 1,
             bootstrapped: false,
             awareness: 0,
+            leaving: false,
         }
     }
 
@@ -415,7 +420,9 @@ impl Swim {
     /// `>=` ours triggers a bump-and-`Alive` to override it everywhere.
     fn apply_update(&mut self, u: &Update, now: u64, out: &mut Vec<Action>) {
         if u.id == self.local.0 {
-            if u.state != MemberState::Alive && u.incarnation >= self.incarnation {
+            // Once we have announced a graceful leave we do not refute `Dead` about
+            // ourselves — including our own departure gossip echoed back (ADR 0019 §2).
+            if u.state != MemberState::Alive && u.incarnation >= self.incarnation && !self.leaving {
                 self.incarnation = u.incarnation + 1;
                 let refute = Update {
                     id: self.local.0.clone(),
@@ -546,6 +553,54 @@ impl Swim {
             },
         };
         self.apply_update(&update, now, out);
+    }
+
+    /// Begin a voluntary, graceful departure (ADR 0019 §2): announce ourselves `Dead`
+    /// directly to every known peer so they remove us from the ring **immediately**,
+    /// rather than waiting out failure detection (suspicion → dead). Returns the
+    /// datagrams to send; the announcement is also queued as gossip so a final probe
+    /// re-broadcasts it.
+    ///
+    /// We gossip `Dead` at our *current* incarnation (not a bumped one): a peer holding
+    /// us `Alive` at that incarnation is superseded by `Dead`'s higher precedence, and
+    /// the resulting tombstone fences any of our own in-flight `Alive` gossip — the same
+    /// mechanism that protects a crashed node's last refutation. Delivery is best-effort
+    /// over UDP; a lost announcement simply falls back to ordinary failure detection.
+    ///
+    /// Sets the leaving flag so we stop refuting `Dead` about ourselves (see
+    /// `apply_update`). Idempotent: calling it again just re-announces.
+    pub fn leave(&mut self) -> Vec<Action> {
+        self.leaving = true;
+        let departure = Update {
+            id: self.local.0.clone(),
+            addr: self.local_addr.clone(),
+            peer_addr: self.local_peer_addr.clone(),
+            incarnation: self.incarnation,
+            state: MemberState::Dead,
+            suspecter: None,
+        };
+        // Announce directly to every peer we are not already treating as gone, carrying
+        // the departure as the message's gossip (a `Sync` is a pure state-merge on the
+        // receiver, so it has no other side effect).
+        let mut out = Vec::new();
+        for m in self.members.values() {
+            if m.state == MemberState::Dead {
+                continue;
+            }
+            out.push(Action::Send {
+                to: m.addr.clone(),
+                msg: Message {
+                    from: self.local.0.clone(),
+                    from_addr: self.local_addr.clone(),
+                    from_peer_addr: self.local_peer_addr.clone(),
+                    kind: Kind::Sync,
+                    gossip: vec![departure.clone()],
+                },
+            });
+        }
+        // Also queue it for the normal re-broadcast path (a final tick piggybacks it).
+        self.enqueue_gossip(departure);
+        out
     }
 
     /// Advance the protocol clock to `now`, returning datagrams to send and
@@ -992,6 +1047,97 @@ mod tests {
         assert!(gossiped
             .iter()
             .any(|u| u.id == "a" && u.state == MemberState::Alive));
+    }
+
+    /// ADR 0019 §2: a graceful leave announces ourselves `Dead` directly to every known
+    /// (non-dead) peer, carrying the departure as gossip, and queues it for re-broadcast.
+    #[test]
+    fn leave_announces_self_as_dead_to_every_known_peer() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&alive_update("c", "c:1", 0), 0, &mut out);
+        let inc = current_incarnation(&s);
+
+        let actions = s.leave();
+
+        // One direct announcement to each peer, each carrying our `Dead` at our
+        // current incarnation (no bump).
+        let mut targets: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send { to, msg } => {
+                    assert!(
+                        msg.gossip.iter().any(|u| u.id == "a"
+                            && u.state == MemberState::Dead
+                            && u.incarnation == inc),
+                        "each leave datagram carries our Dead departure"
+                    );
+                    Some(to.clone())
+                }
+                Action::StateChange { .. } => None,
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec!["b:1".to_string(), "c:1".to_string()]);
+        // We did not bump our own incarnation to leave.
+        assert_eq!(current_incarnation(&s), inc);
+    }
+
+    /// A peer that receives a graceful-leave announcement marks the leaver `Dead`
+    /// **immediately** — no suspicion window — so placement drops it at once.
+    #[test]
+    fn a_peer_marks_a_leaving_node_dead_immediately() {
+        let mut leaver = node("a", "a:1", &[]);
+        let mut peer = node("b", "b:1", &[]);
+        // Each knows the other as alive.
+        let mut out = Vec::new();
+        leaver.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        peer.apply_update(&alive_update("a", "a:1", 0), 0, &mut out);
+
+        // The leaver announces departure; deliver its datagram to the peer.
+        let actions = leaver.leave();
+        let leave_msg = actions
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Send { to, msg } if to == "b:1" => Some(msg),
+                _ => None,
+            })
+            .expect("a leave datagram addressed to b");
+        let observed = peer.handle(leave_msg, 0);
+
+        assert_eq!(member_state(&peer, "a"), Some(MemberState::Dead));
+        assert!(
+            observed
+                .iter()
+                .any(|a| matches!(a, Action::StateChange { id, state, .. }
+                    if id.0 == "a" && *state == MemberState::Dead)),
+            "the peer emits a Dead state change for the leaver"
+        );
+    }
+
+    /// Once leaving, a node does **not** refute `Dead` about itself — even its own
+    /// departure gossip echoed back by a peer — so the leave is not undone.
+    #[test]
+    fn a_leaving_node_does_not_refute_its_own_dead() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        let inc = current_incarnation(&s);
+        let _ = s.leave();
+        let _ = s.take_gossip(); // drain the queued departure so we inspect only the echo
+
+        // A peer re-gossips our Dead back to us.
+        s.apply_update(&dead_update("a", "a:1", inc), 1, &mut out);
+
+        // No self-refutation: incarnation unchanged and no Alive-about-self queued.
+        assert_eq!(current_incarnation(&s), inc, "leaving suppresses the bump");
+        assert!(
+            !s.take_gossip()
+                .iter()
+                .any(|u| u.id == "a" && u.state == MemberState::Alive),
+            "a leaving node does not queue an Alive refutation about itself"
+        );
     }
 
     #[test]

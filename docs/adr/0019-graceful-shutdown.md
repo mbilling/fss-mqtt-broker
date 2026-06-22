@@ -1,6 +1,6 @@
 # ADR 0019 — Graceful shutdown and connection draining
 
-- **Status:** Accepted — implemented 2026-06-21 (incl. v5 DISCONNECT 0x8B + node-level restart proofs; graceful cluster-leave + in-flight QoS settle deferred — see Implementation status)
+- **Status:** Accepted — implemented 2026-06-21/22 (incl. v5 DISCONNECT 0x8B, node-level restart proofs, SWIM graceful leave; lease-leadership transfer + in-flight QoS settle deferred — see Implementation status)
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement/relocation),
@@ -133,9 +133,26 @@ drain — the standard "fail readiness, keep liveness during drain" pattern.
 - **Clean openraft stop** — `DurablePlane::raft().shutdown()` is called after the driver
   stops, flushing/stopping the consensus tasks (this, plus dropping the store/plane Arc
   clones, releases the redb locks — the basis of the cluster-path restart test below).
+- **SWIM graceful leave** — on shutdown the SWIM driver announces a voluntary departure
+  (`Swim::leave`): it gossips itself `Dead` at its current incarnation **directly to every
+  known peer**, so survivors drop it from the placement ring at once instead of waiting out
+  failure detection (probe → suspicion → dead). Modelled as a self-declared `Dead` rather
+  than a new member state, which reuses the entire `Dead` path — placement removal, the
+  `PeerDead` hub command that tears down its links, and the tombstone fence that suppresses
+  the leaver's own in-flight `Alive` gossip. A `leaving` flag stops the node refuting `Dead`
+  about itself so the departure sticks. The driver takes its shutdown signal as a generic
+  `Future` (no `tokio-util` dependency added to `mqtt-cluster`); `mqttd` passes the shared
+  `CancellationToken`. **Lease handoff falls out of this**: once the leaver leaves the ring,
+  each survivor's existing reconcile/assign driver removes it as a lease voter and reassigns
+  the groups it owned (HRW recomputes the owner) — no separate relinquish protocol needed.
 - **Config** — `MQTTD_SHUTDOWN_GRACE` (seconds, default 30).
 - **Tests** — `graceful_shutdown_drains_an_established_connection` (clean close on the
-  token), the v5 DISCONNECT test above, and the restart tests under **Node-level restart**.
+  token), the v5 DISCONNECT test above, SWIM-leave unit tests in `swim.rs`
+  (`leave_announces_self_as_dead_to_every_known_peer`,
+  `a_peer_marks_a_leaving_node_dead_immediately`,
+  `a_leaving_node_does_not_refute_its_own_dead`), an over-UDP integration test
+  (`a_graceful_leave_is_seen_dead_faster_than_failure_detection`), and the restart tests
+  under **Node-level restart**.
 
 **Node-level restart (ADR 0018 phase 5), landed:**
 
@@ -151,10 +168,13 @@ drain — the standard "fail readiness, keep liveness during drain" pattern.
 
 **Deferred (follow-ups, tracked here so the gap is explicit):**
 
-- **Graceful cluster-leave** — no SWIM `Leave`/`Dead(self)` gossip and no lease
-  `relinquish` yet, so peers still wait out suspicion → dead and a lease re-election on a
-  routine restart. This touches correctness-critical membership/consensus code (ADR 0016)
-  and is held to the same test-first bar; tackled as its own unit, **not** rushed in here.
+- **Lease-leadership transfer on a leaving *leader*.** SWIM-leave + survivor reassignment
+  handle a leaving follower (and the leases it owned) promptly. If the leaving node is the
+  lease-group *Raft leader*, the group still elects a new leader the ordinary way (one
+  election timeout, ~300–600ms) before reassignment can proceed — better than today (which
+  also paid failure detection) but not zero. A proactive openraft leadership transfer before
+  departure would remove that last gap; deferred as a focused optimisation (openraft 0.9's
+  transfer support needs evaluation first).
 - **In-flight QoS settle / hub `Drain` command** — the drain closes the connection after
   the current packet rather than actively completing outstanding QoS 2 handshakes; durable
   state is protected by ADR 0018 persistence + `raft().shutdown()`, but the

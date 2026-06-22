@@ -161,6 +161,7 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
             Duration::from_millis(20),
             event_tx,
             Some(auth),
+            std::future::pending(),
         ))
         .abort_handle(),
     );

@@ -100,6 +100,7 @@ async fn start_node(
         Duration::from_millis(20),
         event_tx,
         Some(auth),
+        std::future::pending(),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(
         event_rx,
@@ -343,6 +344,7 @@ async fn start_proxy_node(
         Duration::from_millis(20),
         event_tx,
         Some(auth),
+        std::future::pending(),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(
         event_rx,

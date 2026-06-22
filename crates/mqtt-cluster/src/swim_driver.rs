@@ -33,7 +33,7 @@ pub struct MembershipEvent {
     pub state: MemberState,
 }
 
-/// Drive SWIM over `socket` until the task is cancelled.
+/// Drive SWIM over `socket` until `shutdown` resolves.
 ///
 /// `tick_interval` should be no larger than the configured ack timeout so probe
 /// deadlines are observed promptly. Membership changes are sent on `events`.
@@ -42,19 +42,34 @@ pub struct MembershipEvent {
 /// (logged at `debug` — per-packet `warn` would be a log-flooding lever; a
 /// rejected-datagram counter is planned observability work). `None` runs the
 /// gossip plane unauthenticated, which the caller must opt into loudly.
+///
+/// When `shutdown` resolves, the node announces a **graceful leave** (ADR 0019 §2):
+/// it gossips itself `Dead` directly to its peers so they drop it from the ring at
+/// once, then the driver returns. Pass `std::future::pending()` for a driver that
+/// only stops by being aborted.
 pub async fn run(
     socket: UdpSocket,
     mut swim: Swim,
     tick_interval: Duration,
     events: mpsc::UnboundedSender<MembershipEvent>,
     auth: Option<SwimAuth>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) {
     let start = Instant::now();
     let mut ticker = tokio::time::interval(tick_interval);
     let mut buf = vec![0u8; RECV_BUF];
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
+            () = &mut shutdown => {
+                // Graceful leave: announce our departure, flush it, and stop driving.
+                for action in swim.leave() {
+                    apply(&socket, action, &events, auth.as_ref()).await;
+                }
+                debug!("SWIM graceful leave announced; stopping driver");
+                return;
+            }
             _ = ticker.tick() => {
                 let now = elapsed_ms(start);
                 for action in swim.tick(now) {

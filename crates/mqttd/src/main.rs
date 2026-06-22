@@ -165,7 +165,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SWIM gossip membership (opt-in): discovers peers and drives the peer mesh,
     // replacing the need for a static MQTTD_PEERS list.
-    start_swim_from_env(&node_id, peer_bind, &hub_tx, peer_tls.as_ref(), placement).await?;
+    start_swim_from_env(
+        &node_id,
+        peer_bind,
+        &hub_tx,
+        peer_tls.as_ref(),
+        placement,
+        &shutdown,
+    )
+    .await?;
 
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
     // local-testing escape hatch. The serve loops stop themselves on `shutdown`.
@@ -524,6 +532,7 @@ async fn start_swim_from_env(
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
     peer_tls: Option<&peer::PeerTls>,
     placement: Arc<RwLock<Placement>>,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = non_empty_env("MQTTD_SWIM_BIND") else {
         return Ok(());
@@ -564,7 +573,16 @@ async fn start_swim_from_env(
         seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    tokio::spawn(swim_driver::run(socket, swim, SWIM_TICK, event_tx, auth));
+    // On graceful shutdown (ADR 0019) the driver announces a SWIM leave so peers drop
+    // this node from the ring immediately, instead of waiting out failure detection.
+    tokio::spawn(swim_driver::run(
+        socket,
+        swim,
+        SWIM_TICK,
+        event_tx,
+        auth,
+        shutdown.clone().cancelled_owned(),
+    ));
     tokio::spawn(cluster::maintain_peer_links(
         event_rx,
         node_id.clone(),

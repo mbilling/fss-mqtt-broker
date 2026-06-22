@@ -36,7 +36,30 @@ struct Node {
     view: Arc<Mutex<HashMap<String, MemberState>>>,
 }
 
+/// Spawn a node whose driver performs a **graceful SWIM leave** when the returned
+/// trigger is fired (ADR 0019 §2), instead of running until aborted.
+async fn spawn_leavable_node(
+    id: &str,
+    seeds: Vec<String>,
+) -> (String, Node, tokio::sync::oneshot::Sender<()>) {
+    let (leave_tx, leave_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, node) = spawn_node_inner(id, seeds, None, async move {
+        let _ = leave_rx.await;
+    })
+    .await;
+    (addr, node, leave_tx)
+}
+
 async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (String, Node) {
+    spawn_node_inner(id, seeds, auth, std::future::pending()).await
+}
+
+async fn spawn_node_inner(
+    id: &str,
+    seeds: Vec<String>,
+    auth: Option<SwimAuth>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> (String, Node) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap().to_string();
     // No peer-link transport in this test; the routing address is a placeholder.
@@ -59,7 +82,14 @@ async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (St
     });
 
     // Tick well under the ack timeout so deadlines are observed promptly.
-    let handle = tokio::spawn(run(socket, swim, Duration::from_millis(20), tx, auth));
+    let handle = tokio::spawn(run(
+        socket,
+        swim,
+        Duration::from_millis(20),
+        tx,
+        auth,
+        shutdown,
+    ));
     (addr, Node { handle, view })
 }
 
@@ -117,6 +147,39 @@ async fn three_nodes_converge_then_detect_failure() {
     // n1 and n2 still consider each other alive.
     assert!(sees(&n1, "n2", MemberState::Alive));
     assert!(sees(&n2, "n1", MemberState::Alive));
+
+    n1.handle.abort();
+    n2.handle.abort();
+}
+
+/// ADR 0019 §2: a node that leaves **gracefully** is seen `Dead` by its peer almost
+/// immediately — well before failure detection (one probe period + ack timeout +
+/// suspicion window) could even begin to conclude it dead. This is the latency a
+/// routine restart/upgrade saves on every node.
+#[tokio::test]
+async fn a_graceful_leave_is_seen_dead_faster_than_failure_detection() {
+    let (addr1, n1) = spawn_node("g1", vec![], None).await;
+    let (_addr2, n2, leave2) = spawn_leavable_node("g2", vec![addr1.clone()]).await;
+
+    let converged = wait_for(Duration::from_secs(5), || {
+        sees(&n1, "g2", MemberState::Alive) && sees(&n2, "g1", MemberState::Alive)
+    })
+    .await;
+    assert!(converged, "the two nodes failed to converge");
+
+    // g2 announces a graceful leave. The suspicion window alone is 500ms (and failure
+    // detection cannot even *start* concluding Dead until a probe has timed out), so a
+    // 400ms bound proves n1 learned it via the direct departure announcement, not
+    // failure detection.
+    leave2.send(()).unwrap();
+    let left = wait_for(Duration::from_millis(400), || {
+        sees(&n1, "g2", MemberState::Dead)
+    })
+    .await;
+    assert!(
+        left,
+        "n1 did not see the graceful leave as Dead within the no-failure-detection window"
+    );
 
     n1.handle.abort();
     n2.handle.abort();
