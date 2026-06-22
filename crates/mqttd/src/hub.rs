@@ -2197,9 +2197,13 @@ mod tests {
 
     /// ADR 0020-T4: the periodic gauge refresh snapshots the in-memory maps onto the
     /// broker state gauges — a persistent session with two filters reads back as one
-    /// session and two subscriptions in the rendered exposition. The hub runs its
-    /// normal loop (the sweep tick drives the refresh, every `SESSION_SWEEP_INTERVAL`).
-    #[tokio::test]
+    /// session and two subscriptions in the rendered exposition.
+    ///
+    /// Deterministic via paused virtual time: the runtime drains the pending Subscribe
+    /// commands (which need no timer) before it auto-advances the clock to fire the
+    /// hub's sweep tick, so the sweep is guaranteed to observe the full state — no
+    /// real-time polling or deadline.
+    #[tokio::test(start_paused = true)]
     async fn gauge_refresh_snapshots_sessions_and_subscriptions() {
         let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
         let (mut hub, tx) = Hub::with_config(
@@ -2214,19 +2218,12 @@ mod tests {
         subscribe(&tx, "c1", "a/b");
         subscribe(&tx, "c1", "c/d");
 
-        // The sweep tick (1s) refreshes the gauges; poll the exposition until it lands.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            let out = metrics.render();
-            if out.contains("mqttd_sessions 1") && out.contains("mqttd_subscriptions 2") {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "gauges never refreshed:\n{out}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        // Advance past one sweep interval; the sweep refreshes the gauges off the maps.
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+
+        let out = metrics.render();
+        assert!(out.contains("mqttd_sessions 1"), "{out}");
+        assert!(out.contains("mqttd_subscriptions 2"), "{out}");
     }
 
     fn publish_qos1(tx: &HubTx, topic: &str, payload: &'static [u8]) {

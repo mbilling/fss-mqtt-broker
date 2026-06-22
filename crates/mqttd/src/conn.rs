@@ -1487,6 +1487,39 @@ mod tests {
         );
     }
 
+    /// [MQTT-3.1.2-24] Deterministic keepalive enforcement via paused virtual time:
+    /// a client that negotiates `keep_alive=1` and then goes silent is closed once
+    /// 1.5x the interval elapses. No real wall-clock wait — the in-memory duplex
+    /// carries no traffic, so the runtime is idle and auto-advances the clock to the
+    /// broker's keepalive deadline. This is the time-injected unit-level counterpart
+    /// to the real-TCP keepalive integration tests.
+    #[tokio::test(start_paused = true)]
+    async fn idle_connection_is_closed_after_keepalive_grace() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        stub_hub(hub_rx);
+
+        // keep_alive = 1s; the broker closes after 1.5x with no inbound traffic.
+        let connect = Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
+            protocol: V4,
+            clean_session: true,
+            keep_alive: 1,
+            client_id: "idle".into(),
+            last_will: None,
+            username: None,
+            password: None,
+        });
+        writer.send(&connect).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // Advance past the 1.5s grace; the keepalive deadline fires and closes the conn.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            recv(&mut reader).await.is_none(),
+            "an idle keep_alive=1 connection must close once the grace elapses"
+        );
+    }
+
     /// ADR 0020-T3: a full connect/teardown moves the connection metrics — the
     /// per-protocol total increments and the active gauge returns to zero on close.
     #[tokio::test]
