@@ -51,6 +51,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
                 store: None,
                 connect_timeout: std::time::Duration::from_secs(10),
                 shutdown: None,
+                metrics: None,
                 enhanced: None,
             });
             let hub = hub_tx.clone();

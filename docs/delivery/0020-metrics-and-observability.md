@@ -15,7 +15,9 @@ tasks:
     evidence: health.rs route /metrics -> Metrics::render() (OpenMetrics content-type); HealthState::with_metrics; main.rs builds Metrics + MQTTD_METRICS_BIND separate listener; metrics_endpoint_serves_exposition_when_enabled; unknown_paths_are_404 (disabled case)
   - id: 0020-T3
     title: Instrument connections/handshakes/auth/ACL/keepalive in conn.rs
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: ConnPolicy carries Option<Arc<Metrics>>; count_connection_opened (by protocol after CONNACK) / count_connection_closed (on teardown) / count_connection_error (bounded reason class) helpers wired through conn.rs — connection_opened/closed on the active gauge + per-protocol total; connection_errors{reason} for auth (single-shot + enhanced), acl (will-topic deny) and keepalive expiry. Tests: connection_lifecycle_moves_the_metrics_counters; rejected_auth_increments_the_error_counter
   - id: 0020-T4
     title: Instrument publish/deliver, queue depth, evictions, inflight, retained/subs gauges in hub.rs
     status: in-progress
@@ -70,7 +72,7 @@ stable id used by commits, tests, and the dashboard.
 |------|--------|------|------------------|
 | 0020-T1 | ✅ done | 2026-06-22 | mqtt-observability/src/metrics.rs Metrics (prometheus-client 0.22, registry with_prefix mqttd) + render(); render_produces_valid_openmetrics_exposition; counters_and_gauges_move_and_render; no_unbounded_label_keys_are_used; cargo deny clean |
 | 0020-T2 | ✅ done | 2026-06-22 | health.rs route /metrics -> Metrics::render() (OpenMetrics content-type); HealthState::with_metrics; main.rs builds Metrics + MQTTD_METRICS_BIND separate listener; metrics_endpoint_serves_exposition_when_enabled; unknown_paths_are_404 (disabled case) |
-| 0020-T3 | ⬜ planned | — |  |
+| 0020-T3 | ✅ done | 2026-06-22 | ConnPolicy carries Option<Arc<Metrics>>; count_connection_opened (by protocol after CONNACK) / count_connection_closed (on teardown) / count_connection_error (bounded reason class) helpers wired through conn.rs — connection_opened/closed on the active gauge + per-protocol total; connection_errors{reason} for auth (single-shot + enhanced), acl (will-topic deny) and keepalive expiry. Tests: connection_lifecycle_moves_the_metrics_counters; rejected_auth_increments_the_error_counter |
 | 0020-T4 | 🚧 in-progress | — | publish_received/delivered (by qos) + publish_dropped (queue-overflow) wired in hub.rs via attach_metrics; the deliver-latency histogram and the sessions/retained/subs/inflight gauges remain |
 | 0020-T5 | ⬜ planned | — |  |
 | 0020-T6 | ⬜ planned | — |  |

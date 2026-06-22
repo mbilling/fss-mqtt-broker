@@ -293,6 +293,7 @@ async fn start_proxy_node(
         store: None,
         connect_timeout: std::time::Duration::from_secs(10),
         shutdown: None,
+        metrics: None,
         enhanced: None,
     });
     let (hub, hub_tx) = Hub::with_config(

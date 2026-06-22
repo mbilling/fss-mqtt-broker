@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let policy = client_policy_from_env(Some(proxy), store, shutdown.clone())?;
+    let policy = client_policy_from_env(Some(proxy), store, shutdown.clone(), metrics.clone())?;
 
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
@@ -284,6 +284,7 @@ fn client_policy_from_env(
     proxy: Option<conn::ProxyContext>,
     store: Arc<dyn SessionStore>,
     shutdown: tokio_util::sync::CancellationToken,
+    metrics: Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error::Error>> {
     let auth = authenticator_from_env()?;
 
@@ -312,6 +313,7 @@ fn client_policy_from_env(
         connect_timeout: conn::DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
         shutdown: Some(shutdown),
+        metrics: Some(metrics),
     }))
 }
 

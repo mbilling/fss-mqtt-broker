@@ -155,6 +155,9 @@ pub struct ConnPolicy {
     /// (the server is going away, the client is not — its session is retained for
     /// reconnect). `None` disables draining (tests, and the in-process test harness).
     pub shutdown: Option<tokio_util::sync::CancellationToken>,
+    /// Prometheus metrics (ADR 0020), when enabled: the connection lifecycle updates the
+    /// active-connections gauge and the per-protocol total. `None` in tests.
+    pub metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
 }
 
 /// Default [`ConnPolicy::connect_timeout`]: generous for a real handshake on a slow
@@ -185,6 +188,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
         shutdown: None,
+        metrics: None,
     });
     handle_stream(stream, peer, None, policy, hub).await;
 }
@@ -288,6 +292,7 @@ async fn will_rejected<W: AsyncWrite + Unpin>(
         return Ok(false);
     }
     warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
+    count_connection_error(policy, "acl");
     policy.audit.record(
         "acl.deny.will",
         Some(&principal.subject),
@@ -440,6 +445,7 @@ where
         }))
         .await?;
     debug!(client = %client.0, session_present, "CONNECT accepted");
+    count_connection_opened(policy, connect.protocol);
 
     // The connect Authentication Method (if any) bounds a later re-auth (ADR 0013 §4).
     let auth_method = connect
@@ -460,6 +466,7 @@ where
         &mut outbound_aliases,
     )
     .await;
+    count_connection_closed(policy);
     // Always deregister, even on error. The hub ignores this if we were taken
     // over. Only a clean DISCONNECT is graceful; anything else fires the will.
     let graceful = matches!(result, Ok(true));
@@ -578,6 +585,36 @@ pub async fn serve_proxied<R, W>(
     // relaying node, recorded in the auth audit.
     if let Err(e) = run_framed(reader, writer, identity, &policy, hub, false, via).await {
         warn!(?peer, error = %e, "proxied session ended with error");
+    }
+}
+
+/// The bounded `{protocol}` metric label for a negotiated version (ADR 0020).
+fn protocol_label(version: ProtocolVersion) -> &'static str {
+    match version {
+        ProtocolVersion::V311 => "3.1.1",
+        ProtocolVersion::V5 => "5",
+    }
+}
+
+/// Record a successful CONNACK on the shared metrics registry, if enabled (ADR 0020).
+fn count_connection_opened(policy: &ConnPolicy, version: ProtocolVersion) {
+    if let Some(m) = &policy.metrics {
+        m.connection_opened(protocol_label(version));
+    }
+}
+
+/// Record a connection teardown on the shared metrics registry, if enabled (ADR 0020).
+fn count_connection_closed(policy: &ConnPolicy) {
+    if let Some(m) = &policy.metrics {
+        m.connection_closed();
+    }
+}
+
+/// Record a failed handshake on the shared metrics registry, if enabled; `reason`
+/// is a bounded class (`"auth"`, `"acl"`, …) — never a per-client value (ADR 0020).
+fn count_connection_error(policy: &ConnPolicy, reason: &str) {
+    if let Some(m) = &policy.metrics {
+        m.connection_error(reason);
     }
 }
 
@@ -705,6 +742,7 @@ where
                 CONNACK_NOT_AUTHORIZED
             };
             warn!(client = %client.0, error = %e, "CONNECT rejected: authentication failed");
+            count_connection_error(policy, "auth");
             // The subject is the client id, not a credential — never log secrets.
             policy.audit.record(
                 "auth.failure",
@@ -777,6 +815,7 @@ where
         }
         ExchangeResult::Failed => {
             warn!(client = %client.0, method, "enhanced authentication failed");
+            count_connection_error(policy, "auth");
             policy.audit.record(
                 "auth.failure",
                 Some(&client.0),
@@ -1082,6 +1121,7 @@ where
             }
             () = idle => {
                 debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
+                count_connection_error(policy, "keepalive");
                 return Ok(false);
             }
             () = drain_signal(policy) => {
@@ -1354,6 +1394,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
             shutdown: None,
+            metrics: None,
         })
     }
 
@@ -1386,6 +1427,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
             shutdown: Some(shutdown),
+            metrics: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -1445,6 +1487,107 @@ mod tests {
         );
     }
 
+    /// ADR 0020-T3: a full connect/teardown moves the connection metrics — the
+    /// per-protocol total increments and the active gauge returns to zero on close.
+    #[tokio::test]
+    async fn connection_lifecycle_moves_the_metrics_counters() {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        stub_hub(hub_rx);
+        let policy = Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: Some(metrics.clone()),
+        });
+        let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        let mut reader = FrameReader::new(rh, V4);
+        let mut writer = FrameWriter::new(wh, V4);
+
+        writer
+            .send(&connect_packet("metric-me", true))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // Client half-close → the server connection task runs to completion.
+        drop(writer);
+        drop(reader);
+        timeout(Duration::from_secs(1), conn)
+            .await
+            .expect("connection task should finish promptly")
+            .expect("connection task should not panic");
+
+        let text = metrics.render();
+        assert!(
+            text.contains("mqttd_connections_total{protocol=\"3.1.1\"} 1"),
+            "the per-protocol connection total should read 1:\n{text}"
+        );
+        assert!(
+            text.contains("mqttd_connections_active 0"),
+            "the active-connections gauge should return to zero:\n{text}"
+        );
+    }
+
+    /// ADR 0020-T3: a rejected handshake increments the bounded `connection_errors`
+    /// counter under the `auth` reason class (and never opens a connection).
+    #[tokio::test]
+    async fn rejected_auth_increments_the_error_counter() {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        stub_hub(hub_rx);
+        let policy = Arc::new(ConnPolicy {
+            auth: Arc::new(BasicAuthenticator {
+                allow_anonymous: false,
+            }),
+            authz: Arc::new(mqtt_auth::AllowAll),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: Some(metrics.clone()),
+        });
+        let conn = tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        let mut reader = FrameReader::new(rh, V4);
+        let mut writer = FrameWriter::new(wh, V4);
+
+        // Anonymous CONNECT against a policy that forbids it: rejected at the gate.
+        writer
+            .send(&connect_packet("anon", true))
+            .await
+            .unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        drop(writer);
+        drop(reader);
+        timeout(Duration::from_secs(1), conn)
+            .await
+            .expect("connection task should finish promptly")
+            .expect("connection task should not panic");
+
+        let text = metrics.render();
+        assert!(
+            text.contains("mqttd_connection_errors_total{reason=\"auth\"} 1"),
+            "a rejected handshake should count one auth error:\n{text}"
+        );
+        assert!(
+            text.contains("mqttd_connections_active 0"),
+            "a rejected handshake never opens a connection:\n{text}"
+        );
+    }
+
     /// Minimal hub stub: accepts every Attach with `session_present = false`,
     /// records the client ids it sees, and keeps outbound senders alive so the
     /// connection's writer loop stays up.
@@ -1500,6 +1643,7 @@ mod tests {
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             shutdown: None,
+            metrics: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -1739,6 +1883,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
             shutdown: None,
+            metrics: None,
         });
 
         let (client, owner_side) = tokio::io::duplex(4096);
@@ -2356,6 +2501,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
             shutdown: None,
+            metrics: None,
         });
         tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
         let (rh, wh) = tokio::io::split(client);
