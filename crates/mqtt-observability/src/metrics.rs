@@ -40,6 +40,12 @@ struct ReasonLabel {
     reason: String,
 }
 
+/// `{listener}` label — a bounded set: `tls`, `plaintext`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ListenerLabel {
+    listener: String,
+}
+
 /// The broker's metric registry and typed handles. Cheap to share behind an `Arc`; all
 /// updates are lock-free atomic operations on the metric families.
 #[derive(Debug)]
@@ -47,6 +53,7 @@ pub struct Metrics {
     registry: Registry,
     connections_active: Gauge,
     connections_total: Family<ProtocolLabel, Counter>,
+    accepts_total: Family<ListenerLabel, Counter>,
     connection_errors_total: Family<ReasonLabel, Counter>,
     publish_received_total: Family<QosLabel, Counter>,
     publish_delivered_total: Family<QosLabel, Counter>,
@@ -76,6 +83,13 @@ impl Metrics {
             "connections",
             "Client connections accepted, by protocol version",
             connections_total.clone(),
+        );
+
+        let accepts_total = Family::<ListenerLabel, Counter>::default();
+        registry.register(
+            "accepts",
+            "TCP connections accepted, by listener (before TLS/CONNECT)",
+            accepts_total.clone(),
         );
 
         let connection_errors_total = Family::<ReasonLabel, Counter>::default();
@@ -154,6 +168,7 @@ impl Metrics {
             registry,
             connections_active,
             connections_total,
+            accepts_total,
             connection_errors_total,
             publish_received_total,
             publish_delivered_total,
@@ -191,6 +206,17 @@ impl Metrics {
     /// A client connection closed.
     pub fn connection_closed(&self) {
         self.connections_active.dec();
+    }
+
+    /// A TCP connection was accepted on `listener` (`"tls"` or `"plaintext"`), before
+    /// the TLS handshake and MQTT CONNECT — the gap to `connections_total` is the
+    /// handshake/connect drop-off (ADR 0020).
+    pub fn connection_accepted(&self, listener: &str) {
+        self.accepts_total
+            .get_or_create(&ListenerLabel {
+                listener: listener.to_string(),
+            })
+            .inc();
     }
 
     /// A connection failed to set up (`reason` is a bounded class, e.g. `"tls"`, `"auth"`).
@@ -294,6 +320,10 @@ mod tests {
         m.publish_received(1);
         m.publish_delivered(0);
         m.publish_dropped("no-subscriber");
+        m.connection_accepted("tls");
+        m.connection_error("tls");
+        m.set_sessions(3);
+        m.set_retained_messages(7);
         let out = m.render();
 
         assert!(out.contains("mqttd_connections_active 1"), "{out}");
@@ -313,6 +343,16 @@ mod tests {
             out.contains("mqttd_publish_dropped_total{reason=\"no-subscriber\"} 1"),
             "{out}"
         );
+        assert!(
+            out.contains("mqttd_accepts_total{listener=\"tls\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_connection_errors_total{reason=\"tls\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("mqttd_sessions 3"), "{out}");
+        assert!(out.contains("mqttd_retained_messages 7"), "{out}");
     }
 
     /// Cardinality guard (ADR 0020 §3): label *keys* are only ever from the fixed set; no

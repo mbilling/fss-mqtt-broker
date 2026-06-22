@@ -919,11 +919,17 @@ async fn serve_tls_clients(
                 Ok(accepted) => accepted,
                 Err(e) => {
                     warn!(error = %e, "TLS listener accept failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("accept");
+                    }
                     return;
                 }
             },
         };
         debug!(%peer, "accepted TLS connection");
+        if let Some(m) = &policy.metrics {
+            m.connection_accepted("tls");
+        }
         let acceptor = acceptor.clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
@@ -935,7 +941,12 @@ async fn serve_tls_clients(
                     let identity = conn::tls_identity(&tls_stream);
                     conn::handle_stream(tls_stream, Some(peer), identity, policy, hub).await;
                 }
-                Err(e) => debug!(%peer, error = %e, "TLS handshake failed"),
+                Err(e) => {
+                    debug!(%peer, error = %e, "TLS handshake failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("tls");
+                    }
+                }
             }
         });
     }
@@ -956,11 +967,17 @@ async fn serve_plaintext_clients(
                 Ok(accepted) => accepted,
                 Err(e) => {
                     warn!(error = %e, "plaintext listener accept failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("accept");
+                    }
                     return;
                 }
             },
         };
         debug!(%peer, "accepted connection");
+        if let Some(m) = &policy.metrics {
+            m.connection_accepted("plaintext");
+        }
         let _ = stream.set_nodelay(true);
         connections.spawn(conn::handle_stream(
             stream,
