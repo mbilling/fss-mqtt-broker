@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mqtt_cluster::replay::{SeqStore, SequenceAllocator};
 use mqtt_cluster::swim::{Config, Kind, MemberState, Message, Swim};
 use mqtt_cluster::swim_auth::{GossipSign, GossipVerify, SwimAuth, KEY_LEN};
-use mqtt_cluster::swim_driver::{run, MembershipEvent};
+use mqtt_cluster::swim_driver::{run, MembershipEvent, SeqAlloc};
 use mqtt_cluster::NodeId;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -59,6 +60,21 @@ fn signed_auth(key: u8, cn: &str) -> SwimAuth {
     )
 }
 
+/// An in-memory `SeqStore` for tests (anti-replay needs no real persistence here).
+#[derive(Default)]
+struct MemSeqStore {
+    reserved: std::sync::atomic::AtomicU64,
+}
+impl SeqStore for MemSeqStore {
+    fn reserved(&self) -> u64 {
+        self.reserved.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn persist(&mut self, reserved_until: u64) {
+        self.reserved
+            .store(reserved_until, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Tight timings so the test converges and detects failure in ~2s.
 fn cfg() -> Config {
     Config {
@@ -88,7 +104,7 @@ async fn spawn_leavable_node(
     seeds: Vec<String>,
 ) -> (String, Node, tokio::sync::oneshot::Sender<()>) {
     let (leave_tx, leave_rx) = tokio::sync::oneshot::channel::<()>();
-    let (addr, node) = spawn_node_inner(id, seeds, None, async move {
+    let (addr, node) = spawn_node_inner(id, seeds, None, None, async move {
         let _ = leave_rx.await;
     })
     .await;
@@ -96,7 +112,7 @@ async fn spawn_leavable_node(
 }
 
 async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (String, Node) {
-    spawn_node_inner(id, seeds, auth, std::future::pending()).await
+    spawn_node_inner(id, seeds, auth, None, std::future::pending()).await
 }
 
 /// Spawn a node that signs its gossip as itself (ADR 0022, require mode).
@@ -105,15 +121,25 @@ async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, No
         id,
         seeds,
         Some(signed_auth(key, id)),
+        None,
         std::future::pending(),
     )
     .await
+}
+
+/// Spawn a node that signs **and sequences** its gossip (ADR 0023, require mode), with an
+/// in-memory sequence allocator — so the driver windows inbound sequenced datagrams.
+async fn spawn_sequenced_node(id: &str, seeds: Vec<String>, key: u8) -> (String, Node) {
+    let auth = signed_auth(key, id).with_sequencing(true);
+    let alloc = SequenceAllocator::open(Box::new(MemSeqStore::default()) as Box<dyn SeqStore>, 64);
+    spawn_node_inner(id, seeds, Some(auth), Some(alloc), std::future::pending()).await
 }
 
 async fn spawn_node_inner(
     id: &str,
     seeds: Vec<String>,
     auth: Option<SwimAuth>,
+    seq_alloc: Option<SeqAlloc>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (String, Node) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -144,7 +170,7 @@ async fn spawn_node_inner(
         Duration::from_millis(20),
         tx,
         auth,
-        None, // seq allocator wired per-test below where anti-replay is exercised
+        seq_alloc,
         shutdown,
     ));
     (addr, Node { handle, view })
@@ -391,4 +417,75 @@ async fn a_dual_key_window_lets_nodes_on_different_primaries_converge() {
 
     n1.handle.abort();
     n2.handle.abort();
+}
+
+/// ADR 0023: two nodes that sign **and sequence** their gossip converge — the per-sender
+/// replay window must accept the live monotonic stream without false-dropping it.
+#[tokio::test]
+async fn sequenced_nodes_converge() {
+    let key = 0x55;
+    let (addr1, n1) = spawn_sequenced_node("sq1", vec![], key).await;
+    let (_addr2, n2) = spawn_sequenced_node("sq2", vec![addr1.clone()], key).await;
+
+    let ok = wait_for(Duration::from_secs(5), || {
+        sees(&n1, "sq2", MemberState::Alive) && sees(&n2, "sq1", MemberState::Alive)
+    })
+    .await;
+    assert!(
+        ok,
+        "sequenced nodes failed to converge (replay window false-dropping live traffic?)"
+    );
+
+    n1.handle.abort();
+    n2.handle.abort();
+}
+
+/// ADR 0023: a captured v3 datagram replayed to a peer is dropped by the sender's replay
+/// window. We deliver the same sequenced Ping twice; the victim Acks the fresh one and
+/// drops the replay, so exactly one Ack comes back (the victim's own probes are Pings, not
+/// Acks, so they do not inflate the count).
+#[tokio::test]
+async fn a_replayed_v3_datagram_is_dropped() {
+    let key = 0x66;
+    let (victim_addr, victim) = spawn_sequenced_node("victim", vec![], key).await;
+    let sender = signed_auth(key, "sender").with_sequencing(true);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let ping = Message {
+        from: "sender".into(),
+        from_addr: sock.local_addr().unwrap().to_string(),
+        from_peer_addr: String::new(),
+        kind: Kind::Ping { seq: 1 },
+        gossip: vec![],
+    };
+    // One datagram at anti-replay sequence 1, delivered twice.
+    let datagram = sender.seal_sequenced(&bincode::serialize(&ping).unwrap(), 1);
+    sock.send_to(&datagram, &victim_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sock.send_to(&datagram, &victim_addr).await.unwrap();
+
+    // Count the Acks the victim sends back over a window; the replay yields none.
+    let opener = signed_auth(key, "x"); // its verifier opens the victim's v3 replies
+    let mut acks = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await
+        {
+            if let Some(o) = opener.open(&buf[..n]) {
+                if let Ok(m) = bincode::deserialize::<Message>(o.payload) {
+                    if matches!(m.kind, Kind::Ack { .. }) {
+                        acks += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        acks, 1,
+        "exactly one Ack — the replayed Ping must be dropped"
+    );
+
+    victim.handle.abort();
 }

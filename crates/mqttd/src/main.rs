@@ -55,6 +55,12 @@
 //!   or `off`. Defaults to `prefer` when both `MQTTD_SWIM_KEY` and the peer-TLS
 //!   material are present, else `off`. `require`/`prefer` need both; otherwise a
 //!   startup error. Signs with the cluster-bus leaf key, verified against the CA.
+//! - `MQTTD_SWIM_REPLAY`    — gossip anti-replay (ADR 0023): `require` (sequence +
+//!   reject un-sequenced), `prefer` (sequence + still accept un-sequenced, for rollout),
+//!   or `off` (default). Needs `MQTTD_SWIM_SIGNED` (the sequence binds to the per-node
+//!   signature) and `MQTTD_DATA_DIR` (a restart-safe, clock-free sequence counter persists
+//!   in `<dir>/gossip-seq`); `require` needs `MQTTD_SWIM_SIGNED=require`. Otherwise a
+//!   startup error.
 //! - `MQTTD_HEALTH_BIND`    — HTTP health-probe bind for orchestrators, e.g.
 //!   `0.0.0.0:8080`; serves `GET /livez` (hub responsive) and `GET /readyz`
 //!   (mesh + durable-store ready). Unset = no health server.
@@ -605,8 +611,8 @@ fn signed_gossip_from_env(
 fn apply_signed_gossip(
     auth: Option<SwimAuth>,
     peer_tls: Option<&peer::PeerTls>,
+    mode: SignedGossip,
 ) -> Result<Option<SwimAuth>, Box<dyn std::error::Error>> {
-    let mode = signed_gossip_from_env(peer_tls.is_some(), auth.is_some())?;
     if mode == SignedGossip::Off {
         return Ok(auth);
     }
@@ -640,6 +646,120 @@ fn apply_signed_gossip(
     }
     info!(require, "SWIM gossip is SIGNED per-node (ADR 0022)");
     Ok(Some(base.with_signing(signer, verifier, require)))
+}
+
+/// How many gossip sequence numbers to reserve per fsync (ADR 0023). At gossip's
+/// few-datagrams-per-second this is one durable write every several minutes.
+const SEQ_BLOCK: u64 = 1024;
+
+/// On-disk persistence for the gossip sequence high-water (ADR 0023): an 8-byte little-endian
+/// counter in `<data dir>/gossip-seq`, fsync'd on every reservation so the sequence is never
+/// reused across a restart. A persist failure is fatal — silently reusing a sequence would
+/// reopen the replay window.
+struct FileSeqStore {
+    path: std::path::PathBuf,
+    reserved: u64,
+}
+
+impl FileSeqStore {
+    fn open(path: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let reserved = match std::fs::read(&path) {
+            Ok(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().unwrap()),
+            Ok(b) if b.is_empty() => 0,
+            Ok(_) => return Err(format!("corrupt gossip sequence file {}", path.display()).into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(format!("reading {}: {e}", path.display()).into()),
+        };
+        Ok(Self { path, reserved })
+    }
+}
+
+impl mqtt_cluster::replay::SeqStore for FileSeqStore {
+    fn reserved(&self) -> u64 {
+        self.reserved
+    }
+    fn persist(&mut self, reserved_until: u64) {
+        use std::io::Write as _;
+        // Fail-stop on any write/fsync error: continuing could reuse a sequence (ADR 0023).
+        let result = std::fs::File::create(&self.path).and_then(|mut f| {
+            f.write_all(&reserved_until.to_le_bytes())?;
+            f.sync_all()
+        });
+        assert!(
+            result.is_ok(),
+            "persisting the gossip sequence to {} failed ({:?}); refusing to risk sequence reuse",
+            self.path.display(),
+            result.err()
+        );
+        self.reserved = reserved_until;
+    }
+}
+
+/// Anti-replay posture (ADR 0023), from `MQTTD_SWIM_REPLAY`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayMode {
+    Off,
+    Prefer,
+    Require,
+}
+
+/// Layer anti-replay (ADR 0023) onto the signed `auth` when configured, returning the auth
+/// plus the per-node sequence allocator the driver uses to sequence outgoing datagrams.
+/// Anti-replay binds to the per-node signature, so it requires signed gossip; it persists a
+/// sequence counter, so it requires a data dir. A requested mode without them is a startup
+/// error. Defaults to `off` (opt-in).
+fn apply_anti_replay(
+    auth: Option<SwimAuth>,
+    signed: SignedGossip,
+) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
+    let mode = match non_empty_env("MQTTD_SWIM_REPLAY").as_deref() {
+        Some("require") => ReplayMode::Require,
+        Some("prefer") => ReplayMode::Prefer,
+        Some("off") | None => ReplayMode::Off,
+        Some(other) => {
+            return Err(format!(
+                "MQTTD_SWIM_REPLAY must be one of require|prefer|off (got {other:?})"
+            )
+            .into());
+        }
+    };
+    if mode == ReplayMode::Off {
+        return Ok((auth, None));
+    }
+    let Some(auth) = auth else {
+        return Err("MQTTD_SWIM_REPLAY requires MQTTD_SWIM_KEY".into());
+    };
+    if signed == SignedGossip::Off {
+        return Err(
+            "MQTTD_SWIM_REPLAY requires MQTTD_SWIM_SIGNED: anti-replay binds the \
+                    sequence to the per-node signature"
+                .into(),
+        );
+    }
+    if mode == ReplayMode::Require && signed != SignedGossip::Require {
+        return Err("MQTTD_SWIM_REPLAY=require needs MQTTD_SWIM_SIGNED=require".into());
+    }
+    let Some(dir) = non_empty_env("MQTTD_DATA_DIR") else {
+        return Err(
+            "MQTTD_SWIM_REPLAY requires MQTTD_DATA_DIR for the persisted, restart-safe \
+                    sequence counter"
+                .into(),
+        );
+    };
+    let store = FileSeqStore::open(Path::new(&dir).join("gossip-seq"))?;
+    let alloc = mqtt_cluster::replay::SequenceAllocator::open(
+        Box::new(store) as Box<dyn mqtt_cluster::replay::SeqStore>,
+        SEQ_BLOCK,
+    );
+    let require = mode == ReplayMode::Require;
+    if mode == ReplayMode::Prefer {
+        warn!(
+            "SWIM gossip anti-replay is in PREFER mode (transitional): un-sequenced datagrams \
+             are still accepted for rollout — set MQTTD_SWIM_REPLAY=require once every node sequences"
+        );
+    }
+    info!(require, "SWIM gossip anti-replay enabled (ADR 0023)");
+    Ok((Some(auth.with_sequencing(require)), Some(alloc)))
 }
 
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and
@@ -703,8 +823,11 @@ async fn start_swim_from_env(
         );
         None
     };
-    // Layer per-node signatures on top of the shared-key MAC when configured (ADR 0022).
-    let auth = apply_signed_gossip(auth, peer_tls)?;
+    // Layer per-node signatures (ADR 0022) then anti-replay sequencing (ADR 0023) on top of
+    // the shared-key MAC when configured.
+    let signed = signed_gossip_from_env(peer_tls.is_some(), auth.is_some())?;
+    let auth = apply_signed_gossip(auth, peer_tls, signed)?;
+    let (auth, seq_alloc) = apply_anti_replay(auth, signed)?;
     let socket = UdpSocket::bind(&bind).await?;
     let seeds: Vec<String> = non_empty_env("MQTTD_SWIM_SEEDS")
         .map(|s| {
@@ -732,7 +855,7 @@ async fn start_swim_from_env(
         SWIM_TICK,
         event_tx,
         auth,
-        None, // anti-replay sequencing wired in a later step
+        seq_alloc,
         shutdown.clone().cancelled_owned(),
     ));
     tokio::spawn(cluster::maintain_peer_links(

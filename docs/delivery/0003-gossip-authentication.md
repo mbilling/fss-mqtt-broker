@@ -34,8 +34,9 @@ tasks:
     notes: drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability)
   - id: 0003-T7
     title: Anti-replay window / per-peer nonces
-    status: in-progress
-    notes: being implemented as ADR 0023 — a clock-free, restart-safe persisted-sequence + sliding-window design bound to ADR 0022's authenticated identity
+    status: done
+    date: 2026-06-22
+    evidence: realized as ADR 0023 (clock-free persisted-sequence + sliding window, bound to ADR 0022 identity); a_replayed_v3_datagram_is_dropped
   - id: 0003-T8
     title: Zero-downtime key rotation (dual-key acceptance window)
     status: done
@@ -80,7 +81,7 @@ and the dashboard.
 | 0003-T4 | ✅ done | 2026-06-11 | main.rs SwimAuth::from_hex_key(&hex)? + INSECURE warn; hex_key_parsing_enforces_exact_length |
 | 0003-T5 | ✅ done | 2026-06-11 | swim.rs self-refutation (incarnation bump + Alive); refutes_suspicion_about_self; a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip |
 | 0003-T6 | 💤 deferred | — | drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability) |
-| 0003-T7 | 🚧 in-progress | — | being implemented as ADR 0023 — a clock-free, restart-safe persisted-sequence + sliding-window design bound to ADR 0022's authenticated identity |
+| 0003-T7 | ✅ done | 2026-06-22 | realized as ADR 0023 (clock-free persisted-sequence + sliding window, bound to ADR 0022 identity); a_replayed_v3_datagram_is_dropped |
 | 0003-T8 | ✅ done | 2026-06-22 | SwimAuth keyring (accept_also/accept_also_hex), seal uses primary, open tries the ring; MQTTD_SWIM_KEY_ACCEPT; a_datagram_sealed_with_an_accepted_secondary_key_opens; a_dual_key_window_lets_nodes_on_different_primaries_converge |
 | 0003-T9 | ✂️ cut | — | cryptographically unsound — the CA cert is public, so a key derived from it is not secret; the secure realisation (per-node signatures over the PKI) moved to ADR 0022 |
 <!-- /status-table:0003 -->

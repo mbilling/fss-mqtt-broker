@@ -20,14 +20,19 @@ tasks:
     evidence: swim_auth.rs seal_sequenced/parse_v3/with_sequencing; Opened.seq; sequenced_seal_open_roundtrips_with_seq_and_identity; v3_body_framing_is_pinned; require_sequenced_rejects_v1_and_v2_but_accepts_v3; tampering_any_v3_byte_is_rejected_by_the_hmac
   - id: 0023-P4
     title: Driver integration — per-sender windows keyed by the authenticated CN; reject replays
-    status: in-progress
-    notes: swim_driver holds per-sender ReplayWindows + an optional SeqAlloc; sequenced sends via seal_sequenced, inbound replays dropped by window. End-to-end forged-replay proof lands with P6
+    status: done
+    date: 2026-06-22
+    evidence: swim_driver per-sender ReplayWindows + SeqAlloc; sequenced sends + inbound replay drop; proven by a_replayed_v3_datagram_is_dropped
   - id: 0023-P5
     title: mqttd wiring — MQTTD_SWIM_REPLAY require/prefer/off, data-dir + signed require guards
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: main.rs FileSeqStore (fsync'd <dir>/gossip-seq, fail-stop on persist error) + apply_anti_replay; MQTTD_SWIM_REPLAY require/prefer/off with signed + data-dir guards
   - id: 0023-P6
     title: Over-UDP integration test — a replayed datagram is rejected; live traffic flows; prefer accepts v2
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: swim_cluster.rs sequenced_nodes_converge; a_replayed_v3_datagram_is_dropped (replay yields no second Ack over real UDP)
 ---
 
 # Delivery — ADR 0023: Gossip anti-replay
@@ -57,13 +62,18 @@ any wire/IO work builds on them.
 | 0023-P1 | ✅ done | 2026-06-22 | replay.rs ReplayWindow; an_exact_duplicate_is_rejected; out_of_order_within_the_window_is_accepted_once_then_rejected; a_sequence_below_the_window_is_rejected; a_large_forward_gap_slides_the_window_and_accepts |
 | 0023-P2 | ✅ done | 2026-06-22 | replay.rs SequenceAllocator/SeqStore; reserves_one_block_per_block_of_numbers; reopening_resumes_above_the_last_reserved_block_never_reusing |
 | 0023-P3 | ✅ done | 2026-06-22 | swim_auth.rs seal_sequenced/parse_v3/with_sequencing; Opened.seq; sequenced_seal_open_roundtrips_with_seq_and_identity; v3_body_framing_is_pinned; require_sequenced_rejects_v1_and_v2_but_accepts_v3; tampering_any_v3_byte_is_rejected_by_the_hmac |
-| 0023-P4 | 🚧 in-progress | — | swim_driver holds per-sender ReplayWindows + an optional SeqAlloc; sequenced sends via seal_sequenced, inbound replays dropped by window. End-to-end forged-replay proof lands with P6 |
-| 0023-P5 | ⬜ planned | — |  |
-| 0023-P6 | ⬜ planned | — |  |
+| 0023-P4 | ✅ done | 2026-06-22 | swim_driver per-sender ReplayWindows + SeqAlloc; sequenced sends + inbound replay drop; proven by a_replayed_v3_datagram_is_dropped |
+| 0023-P5 | ✅ done | 2026-06-22 | main.rs FileSeqStore (fsync'd <dir>/gossip-seq, fail-stop on persist error) + apply_anti_replay; MQTTD_SWIM_REPLAY require/prefer/off with signed + data-dir guards |
+| 0023-P6 | ✅ done | 2026-06-22 | swim_cluster.rs sequenced_nodes_converge; a_replayed_v3_datagram_is_dropped (replay yields no second Ack over real UDP) |
 <!-- /status-table:0023 -->
 
 ## Changelog
 
+- **2026-06-22** — P1–P6 landed, test-first: the pure replay window + persisted allocator;
+  wire format v3 in `swim_auth`; the driver's per-sender windowing keyed by the authenticated
+  CN; the `mqttd` wiring (`FileSeqStore` + `MQTTD_SWIM_REPLAY` require/prefer/off with the
+  signed-and-data-dir guards); and the over-UDP proof that a replayed datagram is dropped
+  while sequenced nodes converge. Clock-free and restart-safe by construction.
 - **2026-06-22** — ADR accepted; phased plan recorded. Realizes `0003-T7` with a clock-free,
   restart-safe design (persisted monotonic sequence + sliding window, bound to ADR 0022's
   authenticated identity).

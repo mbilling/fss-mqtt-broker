@@ -10,7 +10,7 @@
 |-----|-------|----------|-------|-----------------|
 | 0001 | Session durability in a horizontally-scalable cluster | Accepted | 8/11 done | 3 deferred |
 | 0002 | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | 7/10 done | 3 deferred |
-| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 6/9 done | 1 open, 1 deferred |
+| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 7/9 done | 1 deferred |
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
 | 0006 | Consensus & replication for durable sessions | Accepted | 10/11 done | 1 deferred |
@@ -30,7 +30,7 @@
 | 0020 | Metrics and runtime observability | Proposed | 0/9 done | 8 open, 1 deferred |
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
-| 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 3/6 done | 3 open |
+| 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 
 ## Open and deferred work
 
@@ -49,7 +49,6 @@
 **0003 — Gossip-plane authentication: keyed MAC on SWIM datagrams**
 
 - `0003-T6` 💤 deferred: Rejected-datagram metrics counter (operator signal for dropped gossip) — drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability)
-- `0003-T7` 🚧 in-progress: Anti-replay window / per-peer nonces — being implemented as ADR 0023 — a clock-free, restart-safe persisted-sequence + sliding-window design bound to ADR 0022's authenticated identity
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 
@@ -157,9 +156,3 @@
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
 - `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
-
-**0023 — Gossip anti-replay: persisted monotonic sequence + sliding window**
-
-- `0023-P4` 🚧 in-progress: Driver integration — per-sender windows keyed by the authenticated CN; reject replays — swim_driver holds per-sender ReplayWindows + an optional SeqAlloc; sequenced sends via seal_sequenced, inbound replays dropped by window. End-to-end forged-replay proof lands with P6
-- `0023-P5` ⬜ planned: mqttd wiring — MQTTD_SWIM_REPLAY require/prefer/off, data-dir + signed require guards
-- `0023-P6` ⬜ planned: Over-UDP integration test — a replayed datagram is rejected; live traffic flows; prefer accepts v2
