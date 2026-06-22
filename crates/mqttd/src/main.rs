@@ -62,8 +62,12 @@
 //!   in `<dir>/gossip-seq`); `require` needs `MQTTD_SWIM_SIGNED=require`. Otherwise a
 //!   startup error.
 //! - `MQTTD_HEALTH_BIND`    — HTTP health-probe bind for orchestrators, e.g.
-//!   `0.0.0.0:8080`; serves `GET /livez` (hub responsive) and `GET /readyz`
-//!   (mesh + durable-store ready). Unset = no health server.
+//!   `0.0.0.0:8080`; serves `GET /livez` (hub responsive), `GET /readyz`
+//!   (mesh + durable-store ready), and `GET /metrics` (Prometheus, ADR 0020).
+//!   Unset = no health server.
+//! - `MQTTD_METRICS_BIND`   — optional separate bind for `GET /metrics` (ADR 0020),
+//!   to isolate the metrics scrape from the health probes. Plaintext, internal/ops
+//!   network only — do not expose publicly.
 //! - `MQTTD_READY_MIN_MEMBERS` — smallest mesh size `/readyz` accepts (default 1;
 //!   raise it to hold a node out of rotation until it has joined its peers)
 //! - `MQTTD_SHUTDOWN_GRACE` — seconds to drain live client connections after a
@@ -135,7 +139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
-    let draining = start_health_from_env(&hub_tx, &placement, durable_plane).await?;
+    // Prometheus metrics (ADR 0020), served on /metrics. (Hot-path instrumentation is wired
+    // into the hub/connection/cluster code in later steps; the registry + build_info serve now.)
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new(env!(
+        "CARGO_PKG_VERSION"
+    )));
+    let draining = start_health_from_env(&hub_tx, &placement, durable_plane, metrics).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -464,28 +473,43 @@ async fn start_health_from_env(
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
     placement: &Arc<RwLock<Placement>>,
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    metrics: Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<Arc<std::sync::atomic::AtomicBool>, Box<dyn std::error::Error>> {
-    let Some(bind) = non_empty_env("MQTTD_HEALTH_BIND") else {
-        // No health server: hand back a standalone flag so the caller's shutdown path is
+    let health_bind = non_empty_env("MQTTD_HEALTH_BIND");
+    let metrics_bind = non_empty_env("MQTTD_METRICS_BIND");
+    if health_bind.is_none() && metrics_bind.is_none() {
+        // Neither server: hand back a standalone flag so the caller's shutdown path is
         // uniform (nothing reads it).
         return Ok(Arc::new(std::sync::atomic::AtomicBool::new(false)));
-    };
+    }
     let min_members = match non_empty_env("MQTTD_READY_MIN_MEMBERS") {
         Some(raw) => raw
             .parse()
             .map_err(|_| format!("MQTTD_READY_MIN_MEMBERS is not a number: {raw:?}"))?,
         None => 1,
     };
-    let listener = TcpListener::bind(&bind).await?;
-    info!(%bind, min_members, "serving health endpoints (/livez, /readyz, /healthz)");
+    // One state serves both binds: health endpoints plus `/metrics` (ADR 0020).
     let state = mqttd::health::HealthState::new(
         hub_tx.clone(),
         Some(placement.clone()),
         durable_plane,
         min_members,
-    );
+    )
+    .with_metrics(metrics);
     let draining = state.draining_handle();
-    tokio::spawn(mqttd::health::serve(listener, state));
+    if let Some(bind) = &health_bind {
+        let listener = TcpListener::bind(bind).await?;
+        info!(%bind, min_members, "serving health endpoints (/livez, /readyz, /healthz, /metrics)");
+        tokio::spawn(mqttd::health::serve(listener, state.clone()));
+    }
+    // An optional separate bind to isolate the metrics scrape from the health probes.
+    if let Some(bind) = &metrics_bind {
+        if Some(bind) != health_bind.as_ref() {
+            let listener = TcpListener::bind(bind).await?;
+            info!(%bind, "serving /metrics on a separate bind (ADR 0020)");
+            tokio::spawn(mqttd::health::serve(listener, state));
+        }
+    }
     Ok(draining)
 }
 

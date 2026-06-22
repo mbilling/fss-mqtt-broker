@@ -50,6 +50,8 @@ pub struct HealthState {
     /// so orchestrators stop routing new traffic, but `/livez` stays up so we are not
     /// killed mid-drain.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `GET /metrics` serves Prometheus exposition (ADR 0020); otherwise it 404s.
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -106,7 +108,15 @@ impl HealthState {
             durable,
             min_members,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: None,
         }
+    }
+
+    /// Serve Prometheus metrics on `GET /metrics` from this health server (ADR 0020).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// A handle to this state's draining flag (ADR 0019). Setting it makes `/readyz`
@@ -179,31 +189,42 @@ pub async fn serve(listener: TcpListener, state: HealthState) {
 /// Read one request, route it, write the response, close.
 async fn handle(mut stream: TcpStream, state: HealthState) -> std::io::Result<()> {
     let target = read_request_target(&mut stream).await?;
-    let (status, body) = match target {
+    let (status, body, content_type) = match target {
         Some(path) => route(&state, &path).await,
-        None => (400, "{\"error\":\"bad request\"}".to_string()),
+        None => (400, "{\"error\":\"bad request\"}".to_string(), JSON),
     };
-    write_response(&mut stream, status, &body).await
+    write_response(&mut stream, status, &body, content_type).await
 }
 
-/// Map a request path to an HTTP status and JSON body.
-async fn route(state: &HealthState, path: &str) -> (u16, String) {
+/// JSON content type for the health endpoints.
+const JSON: &str = "application/json";
+/// `OpenMetrics` content type for `/metrics` (the format `prometheus-client` emits).
+const OPENMETRICS: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+/// Map a request path to an HTTP status, body, and content type.
+async fn route(state: &HealthState, path: &str) -> (u16, String, &'static str) {
     match path {
         "/livez" | "/healthz" => {
             if state.live().await {
-                (200, "{\"status\":\"ok\",\"live\":true}".to_string())
+                (200, "{\"status\":\"ok\",\"live\":true}".to_string(), JSON)
             } else {
                 (
                     503,
                     "{\"status\":\"unavailable\",\"live\":false}".to_string(),
+                    JSON,
                 )
             }
         }
         "/readyz" => {
             let report = state.readiness().await;
-            (if report.ready { 200 } else { 503 }, report.to_json())
+            (if report.ready { 200 } else { 503 }, report.to_json(), JSON)
         }
-        _ => (404, "{\"error\":\"not found\"}".to_string()),
+        // Metrics exposition (ADR 0020); 404 when metrics are not enabled.
+        "/metrics" => match &state.metrics {
+            Some(m) => (200, m.render(), OPENMETRICS),
+            None => (404, "{\"error\":\"not found\"}".to_string(), JSON),
+        },
+        _ => (404, "{\"error\":\"not found\"}".to_string(), JSON),
     }
 }
 
@@ -242,7 +263,12 @@ fn parse_request_line(line: &[u8]) -> Option<String> {
 }
 
 /// Write a minimal HTTP/1.1 response with a JSON body and `Connection: close`.
-async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+async fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+    content_type: &str,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -251,7 +277,7 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std:
         _ => "",
     };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -335,7 +361,7 @@ mod tests {
         assert_eq!(super::route(&ready, "/readyz").await.0, 200);
 
         let waiting = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 2);
-        let (status, body) = super::route(&waiting, "/readyz").await;
+        let (status, body, _) = super::route(&waiting, "/readyz").await;
         assert_eq!(status, 503);
         assert!(body.contains("\"ready\":false"));
         assert!(body.contains("\"members\":1"));
@@ -348,7 +374,21 @@ mod tests {
     async fn unknown_paths_are_404() {
         let state = HealthState::new(spawn_live_hub(), None, None, 1);
         assert_eq!(super::route(&state, "/").await.0, 404);
+        // /metrics 404s when metrics are not enabled (no `with_metrics`).
         assert_eq!(super::route(&state, "/metrics").await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_exposition_when_enabled() {
+        let state = HealthState::new(spawn_live_hub(), None, None, 1)
+            .with_metrics(Arc::new(mqtt_observability::metrics::Metrics::new("test")));
+        let (status, body, content_type) = super::route(&state, "/metrics").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("mqttd_build_info{version=\"test\"}"),
+            "{body}"
+        );
+        assert!(content_type.contains("openmetrics-text"));
     }
 
     /// End to end over a real TCP socket: a GET to /livez returns a 200 with a JSON

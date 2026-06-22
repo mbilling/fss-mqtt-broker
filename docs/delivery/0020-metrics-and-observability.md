@@ -1,7 +1,7 @@
 ---
 adr: "0020"
 title: Metrics and runtime observability
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0020-T1
     title: Add prometheus-client to mqtt-observability; Metrics registry + typed handles + render()
@@ -10,7 +10,9 @@ tasks:
     evidence: mqtt-observability/src/metrics.rs Metrics (prometheus-client 0.22, registry with_prefix mqttd) + render(); render_produces_valid_openmetrics_exposition; counters_and_gauges_move_and_render; no_unbounded_label_keys_are_used; cargo deny clean
   - id: 0020-T2
     title: Serve GET /metrics from health.rs (replace the 404 + its test); MQTTD_METRICS_BIND option
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: health.rs route /metrics -> Metrics::render() (OpenMetrics content-type); HealthState::with_metrics; main.rs builds Metrics + MQTTD_METRICS_BIND separate listener; metrics_endpoint_serves_exposition_when_enabled; unknown_paths_are_404 (disabled case)
   - id: 0020-T3
     title: Instrument connections/handshakes/auth/ACL/keepalive in conn.rs
     status: planned
@@ -42,8 +44,7 @@ Decision: [docs/adr/0020-metrics-and-observability.md](../adr/0020-metrics-and-o
 ## Plan
 
 The decision's implementation-notes workstream decomposes into these tasks. Each carries a
-stable id used by commits, tests, and the dashboard. The ADR is **Proposed** (awaiting
-ratification), so all tasks are `planned`.
+stable id used by commits, tests, and the dashboard.
 
 | Task | Acceptance criterion |
 |------|----------------------|
@@ -63,7 +64,7 @@ ratification), so all tasks are `planned`.
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
 | 0020-T1 | ✅ done | 2026-06-22 | mqtt-observability/src/metrics.rs Metrics (prometheus-client 0.22, registry with_prefix mqttd) + render(); render_produces_valid_openmetrics_exposition; counters_and_gauges_move_and_render; no_unbounded_label_keys_are_used; cargo deny clean |
-| 0020-T2 | ⬜ planned | — |  |
+| 0020-T2 | ✅ done | 2026-06-22 | health.rs route /metrics -> Metrics::render() (OpenMetrics content-type); HealthState::with_metrics; main.rs builds Metrics + MQTTD_METRICS_BIND separate listener; metrics_endpoint_serves_exposition_when_enabled; unknown_paths_are_404 (disabled case) |
 | 0020-T3 | ⬜ planned | — |  |
 | 0020-T4 | ⬜ planned | — |  |
 | 0020-T5 | ⬜ planned | — |  |

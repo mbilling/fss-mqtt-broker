@@ -235,7 +235,10 @@ mod tests {
         let out = m.render();
 
         assert!(out.contains("mqttd_connections_active 1"), "{out}");
-        assert!(out.contains("mqttd_connections_total{protocol=\"5\"} 1"), "{out}");
+        assert!(
+            out.contains("mqttd_connections_total{protocol=\"5\"} 1"),
+            "{out}"
+        );
         assert!(
             out.contains("mqttd_connections_total{protocol=\"3.1.1\"} 1"),
             "{out}"
