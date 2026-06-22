@@ -29,7 +29,10 @@ pub const V4: ProtocolVersion = ProtocolVersion::V311;
 pub const V5: ProtocolVersion = ProtocolVersion::V5;
 
 /// How long a `recv`/`expect_*` waits before declaring the broker unresponsive.
-const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+/// Generous so a contended CI runner — where off-loop durable-session recovery
+/// (redb reopen + offline-queue replay after a node restart) can be momentarily
+/// starved of CPU — does not spuriously time out; it bounds only the failure path.
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn a permissive in-process broker (anonymous allowed, open ACL) on an
 /// ephemeral port and return its address. The common path for protocol tests.
