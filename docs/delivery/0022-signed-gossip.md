@@ -10,10 +10,13 @@ tasks:
     evidence: mqtt-auth/src/signed_gossip.rs; ecdsa_p256_sign_then_verify_returns_the_cn; ed25519_sign_then_verify_roundtrips; a_signature_from_another_key_is_rejected; a_cert_not_chaining_to_the_ca_is_rejected
   - id: 0022-P2
     title: Wire format v2 in swim_auth — optional signer/verifier, seal/open, KAT pinning, v1 still understood
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: swim_auth.rs v2 seal/open + GossipSign/GossipVerify; signed_seal_open_roundtrips_and_returns_the_identity; v2_body_framing_is_pinned; require_signed_rejects_an_unsigned_v1_datagram; tampering_any_v2_byte_is_rejected_by_the_hmac; v1 sealed_wire_format_matches_known_answer still passes
   - id: 0022-P3
     title: Driver binds identity — open returns authenticated CN; swim_driver enforces CN == SWIM from
-    status: planned
+    status: in-progress
+    notes: swim_driver drops a datagram whose authenticated CN != msg.from; end-to-end forged-from proof lands with P5
   - id: 0022-P4
     title: mqttd wiring — retain CA/cert/key material, build signer/verifier, MQTTD_SWIM_SIGNED mode + startup guards
     status: planned
@@ -56,8 +59,8 @@ adversarial tests for each forgery vector.
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
 | 0022-P1 | ✅ done | 2026-06-22 | mqtt-auth/src/signed_gossip.rs; ecdsa_p256_sign_then_verify_returns_the_cn; ed25519_sign_then_verify_roundtrips; a_signature_from_another_key_is_rejected; a_cert_not_chaining_to_the_ca_is_rejected |
-| 0022-P2 | ⬜ planned | — |  |
-| 0022-P3 | ⬜ planned | — |  |
+| 0022-P2 | ✅ done | 2026-06-22 | swim_auth.rs v2 seal/open + GossipSign/GossipVerify; signed_seal_open_roundtrips_and_returns_the_identity; v2_body_framing_is_pinned; require_signed_rejects_an_unsigned_v1_datagram; tampering_any_v2_byte_is_rejected_by_the_hmac; v1 sealed_wire_format_matches_known_answer still passes |
+| 0022-P3 | 🚧 in-progress | — | swim_driver drops a datagram whose authenticated CN != msg.from; end-to-end forged-from proof lands with P5 |
 | 0022-P4 | ⬜ planned | — |  |
 | 0022-P5 | ⬜ planned | — |  |
 | 0022-T6 | 💤 deferred | — | size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger |

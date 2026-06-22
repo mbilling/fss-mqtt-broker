@@ -29,7 +29,7 @@
 | 0019 | Graceful shutdown and connection draining | Accepted | 7/9 done | 2 deferred |
 | 0020 | Metrics and runtime observability | Proposed | 0/9 done | 8 open, 1 deferred |
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
-| 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 1/7 done | 4 open, 2 deferred |
+| 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 2/7 done | 3 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -155,8 +155,7 @@
 
 **0022 — Per-node signed gossip (authenticated SWIM identity)**
 
-- `0022-P2` ⬜ planned: Wire format v2 in swim_auth — optional signer/verifier, seal/open, KAT pinning, v1 still understood
-- `0022-P3` ⬜ planned: Driver binds identity — open returns authenticated CN; swim_driver enforces CN == SWIM from
+- `0022-P3` 🚧 in-progress: Driver binds identity — open returns authenticated CN; swim_driver enforces CN == SWIM from — swim_driver drops a datagram whose authenticated CN != msg.from; end-to-end forged-from proof lands with P5
 - `0022-P4` ⬜ planned: mqttd wiring — retain CA/cert/key material, build signer/verifier, MQTTD_SWIM_SIGNED mode + startup guards
 - `0022-P5` ⬜ planned: Over-the-wire integration test — signed gossip accepted; forged from rejected; prefer-mode accepts v1
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger

@@ -10,7 +10,7 @@
 //! never reach the protocol state machine.
 
 use crate::swim::{Action, MemberState, Message, Swim};
-use crate::swim_auth::SwimAuth;
+use crate::swim_auth::{Opened, SwimAuth};
 use crate::NodeId;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -79,19 +79,29 @@ pub async fn run(
             recv = socket.recv_from(&mut buf) => {
                 let Ok((n, src)) = recv else { continue };
                 // Authenticate before a single byte is deserialized.
-                let payload = if let Some(a) = &auth {
-                    let Some(p) = a.open(&buf[..n]) else {
+                let opened = if let Some(a) = &auth {
+                    let Some(o) = a.open(&buf[..n]) else {
                         debug!(%src, "dropping SWIM datagram failing authentication");
                         continue;
                     };
-                    p
+                    o
                 } else {
-                    &buf[..n]
+                    Opened { payload: &buf[..n], identity: None }
                 };
-                let Ok(msg) = bincode::deserialize::<Message>(payload) else {
+                let Ok(msg) = bincode::deserialize::<Message>(opened.payload) else {
                     trace!(%src, "dropping undecodable SWIM datagram");
                     continue;
                 };
+                // A signed datagram binds to its sender: the authenticated certificate
+                // Common Name must equal the claimed `from`, so a node cannot gossip as
+                // another (ADR 0022). Unsigned datagrams (no identity) fall through.
+                if let Some(cn) = &opened.identity {
+                    if cn != &msg.from {
+                        debug!(%src, claimed = %msg.from, authenticated = %cn,
+                            "dropping SWIM datagram whose signed identity does not match its sender");
+                        continue;
+                    }
+                }
                 let now = elapsed_ms(start);
                 for action in swim.handle(msg, now) {
                     apply(&socket, action, &events, auth.as_ref()).await;
