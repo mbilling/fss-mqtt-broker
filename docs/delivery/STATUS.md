@@ -30,7 +30,7 @@
 | 0020 | Metrics and runtime observability | Proposed | 0/9 done | 8 open, 1 deferred |
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
-| 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 2/6 done | 4 open |
+| 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 3/6 done | 3 open |
 
 ## Open and deferred work
 
@@ -160,7 +160,6 @@
 
 **0023 — Gossip anti-replay: persisted monotonic sequence + sliding window**
 
-- `0023-P3` ⬜ planned: Wire format v3 in swim_auth (seq + signature; v1/v2 still understood; require/prefer/off)
 - `0023-P4` ⬜ planned: Driver integration — per-sender windows keyed by the authenticated CN; reject replays
 - `0023-P5` ⬜ planned: mqttd wiring — MQTTD_SWIM_REPLAY require/prefer/off, data-dir + signed require guards
 - `0023-P6` ⬜ planned: Over-UDP integration test — a replayed datagram is rejected; live traffic flows; prefer accepts v2

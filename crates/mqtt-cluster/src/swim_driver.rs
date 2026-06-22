@@ -86,7 +86,7 @@ pub async fn run(
                     };
                     o
                 } else {
-                    Opened { payload: &buf[..n], identity: None }
+                    Opened { payload: &buf[..n], identity: None, seq: None }
                 };
                 let Ok(msg) = bincode::deserialize::<Message>(opened.payload) else {
                     trace!(%src, "dropping undecodable SWIM datagram");

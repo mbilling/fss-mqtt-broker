@@ -17,6 +17,9 @@ const VERSION_V1: u8 = 1;
 /// Signed datagram (ADR 0022): `[2][tag][cert_len][cert][sig_len][sig][payload]`, the tag
 /// covering everything after it.
 const VERSION_V2: u8 = 2;
+/// Signed + sequenced datagram (ADR 0023): `[3][tag][seq(8)][cert_len][cert][sig_len][sig][payload]`,
+/// the tag covering everything after it. Anti-replay builds on the v2 signature.
+const VERSION_V3: u8 = 3;
 /// HMAC-SHA256 tag length.
 const TAG_LEN: usize = 32;
 /// Required key length in bytes (64 hex characters).
@@ -53,6 +56,9 @@ pub struct Opened<'a> {
     pub payload: &'a [u8],
     /// The authenticated node identity, when the datagram carried a verified signature.
     pub identity: Option<String>,
+    /// The anti-replay sequence number, when the datagram was sequenced *and* its identity
+    /// was authenticated (so the receiver can safely window it by sender — ADR 0023).
+    pub seq: Option<u64>,
 }
 
 /// Seals and opens SWIM datagrams: always a cluster-shared-key HMAC (ADR 0003), and — when
@@ -66,8 +72,11 @@ pub struct SwimAuth {
     signer: Option<Arc<dyn GossipSign>>,
     /// When set, an incoming v2 datagram's signature is verified and its identity returned.
     verifier: Option<Arc<dyn GossipVerify>>,
-    /// When true, an unsigned (v1) datagram is rejected — the strict end state.
+    /// When true, an unsigned (v1) datagram is rejected — the strict signed end state.
     require_signed: bool,
+    /// When true, anything that is not signed *and* sequenced (v3) is rejected — the strict
+    /// anti-replay end state (ADR 0023). Implies `require_signed`.
+    require_sequenced: bool,
 }
 
 impl std::fmt::Debug for SwimAuth {
@@ -76,6 +85,7 @@ impl std::fmt::Debug for SwimAuth {
         f.debug_struct("SwimAuth")
             .field("signed", &self.signer.is_some())
             .field("require_signed", &self.require_signed)
+            .field("require_sequenced", &self.require_sequenced)
             .finish_non_exhaustive()
     }
 }
@@ -89,6 +99,7 @@ impl SwimAuth {
             signer: None,
             verifier: None,
             require_signed: false,
+            require_sequenced: false,
         }
     }
 
@@ -144,6 +155,26 @@ impl SwimAuth {
         self
     }
 
+    /// Add the anti-replay layer (ADR 0023): incoming datagrams must be signed *and* carry a
+    /// fresh sequence (the receiver windows them); `require_sequenced` rejects anything that
+    /// is not v3 (the strict end state), while `false` keeps accepting v1/v2 during rollout.
+    /// Outgoing v3 datagrams are produced by [`seal_sequenced`](Self::seal_sequenced); the
+    /// driver supplies the monotonic sequence. Sequencing implies signing, so call after
+    /// [`with_signing`](Self::with_signing).
+    #[must_use]
+    pub fn with_sequencing(mut self, require_sequenced: bool) -> Self {
+        self.require_sequenced = require_sequenced;
+        self
+    }
+
+    /// Whether incoming datagrams must be signed + sequenced (v3) — i.e. the receiver windows
+    /// every accepted datagram. The driver consults this to decide whether to sequence its
+    /// own outgoing datagrams.
+    #[must_use]
+    pub fn sequenced(&self) -> bool {
+        self.require_sequenced
+    }
+
     /// Wrap a serialized SWIM message for the wire. With a signer, produces a v2 (signed)
     /// datagram; otherwise the v1 shared-key-only datagram.
     ///
@@ -167,6 +198,33 @@ impl SwimAuth {
         body.extend_from_slice(&sig);
         body.extend_from_slice(payload);
         self.frame(VERSION_V2, &body)
+    }
+
+    /// Wrap a serialized SWIM message as a signed + sequenced v3 datagram (ADR 0023), the
+    /// sequence supplied by the driver's monotonic allocator. Falls back to [`seal`](Self::seal)
+    /// if no signer is configured (a misconfiguration — sequencing requires signing — that the
+    /// receiver's `require_sequenced` would reject anyway).
+    ///
+    /// # Panics
+    /// Panics if the certificate or signature exceeds 64 KiB (a `u16` length field).
+    #[must_use]
+    pub fn seal_sequenced(&self, payload: &[u8], seq: u64) -> Vec<u8> {
+        let Some(signer) = &self.signer else {
+            return self.seal(payload);
+        };
+        // v3 body: [seq(8)][cert_len][cert][sig_len][sig][payload].
+        let cert = signer.cert_der();
+        let sig = signer.sign(payload);
+        let cert_len = u16::try_from(cert.len()).expect("leaf certificate fits u16");
+        let sig_len = u16::try_from(sig.len()).expect("signature fits u16");
+        let mut body = Vec::with_capacity(8 + 2 + cert.len() + 2 + sig.len() + payload.len());
+        body.extend_from_slice(&seq.to_be_bytes());
+        body.extend_from_slice(&cert_len.to_be_bytes());
+        body.extend_from_slice(cert);
+        body.extend_from_slice(&sig_len.to_be_bytes());
+        body.extend_from_slice(&sig);
+        body.extend_from_slice(payload);
+        self.frame(VERSION_V3, &body)
     }
 
     /// `[version][HMAC(body)][body]`, sealed with the primary key.
@@ -198,35 +256,58 @@ impl SwimAuth {
 
         match version {
             VERSION_V1 => {
-                // Unsigned: only acceptable when we are not requiring signatures.
-                if self.require_signed {
+                // Unsigned/un-sequenced: only acceptable when neither is required.
+                if self.require_signed || self.require_sequenced {
                     return None;
                 }
                 Some(Opened {
                     payload: body,
                     identity: None,
+                    seq: None,
                 })
             }
             VERSION_V2 => {
-                let (cert, sig, payload) = parse_v2(body)?;
-                match &self.verifier {
-                    // Verify the signature and bind the authenticated identity.
-                    Some(v) => {
-                        let cn = v.verify(cert, payload, sig)?;
-                        Some(Opened {
-                            payload,
-                            identity: Some(cn),
-                        })
-                    }
-                    // No verifier (signatures off): the HMAC already authenticated the
-                    // datagram as cluster-internal; accept the payload, unauthenticated id.
-                    None => Some(Opened {
-                        payload,
-                        identity: None,
-                    }),
+                // Signed but un-sequenced: rejected when we require sequencing.
+                if self.require_sequenced {
+                    return None;
                 }
+                let (cert, sig, payload) = parse_v2(body)?;
+                Some(self.verify_signed(cert, sig, payload, None)?)
+            }
+            VERSION_V3 => {
+                let (seq, cert, sig, payload) = parse_v3(body)?;
+                Some(self.verify_signed(cert, sig, payload, Some(seq))?)
             }
             _ => None,
+        }
+    }
+
+    /// Verify a signed body's certificate + signature and bind the authenticated identity,
+    /// carrying `seq` through. With no verifier (signatures off) the HMAC already
+    /// authenticated the datagram as cluster-internal: accept the payload, but expose neither
+    /// an identity nor the sequence (it cannot be safely windowed without an authenticated
+    /// sender).
+    fn verify_signed<'a>(
+        &self,
+        cert: &[u8],
+        sig: &[u8],
+        payload: &'a [u8],
+        seq: Option<u64>,
+    ) -> Option<Opened<'a>> {
+        match &self.verifier {
+            Some(v) => {
+                let cn = v.verify(cert, payload, sig)?;
+                Some(Opened {
+                    payload,
+                    identity: Some(cn),
+                    seq,
+                })
+            }
+            None => Some(Opened {
+                payload,
+                identity: None,
+                seq: None,
+            }),
         }
     }
 }
@@ -245,6 +326,15 @@ fn parse_v2(body: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     Some((cert, sig, payload))
 }
 
+/// Parse a v3 body `[seq u64][cert_len u16][cert][sig_len u16][sig][payload]`: the 8-byte
+/// sequence prefix, then the v2 body. `None` on any short/overrunning field.
+#[allow(clippy::type_complexity)] // (seq, cert, sig, payload) — a flat parse result, not nested
+fn parse_v3(body: &[u8]) -> Option<(u64, &[u8], &[u8], &[u8])> {
+    let seq = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
+    let (cert, sig, payload) = parse_v2(body.get(8..)?)?;
+    Some((seq, cert, sig, payload))
+}
+
 /// Minimal hex decoder (avoids a dependency for one call site).
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
@@ -258,7 +348,10 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_v2, GossipSign, GossipVerify, SwimAuth, KEY_LEN, TAG_LEN, VERSION_V2};
+    use super::{
+        parse_v2, parse_v3, GossipSign, GossipVerify, SwimAuth, KEY_LEN, TAG_LEN, VERSION_V2,
+        VERSION_V3,
+    };
     use std::fmt::Write as _;
     use std::sync::Arc;
 
@@ -407,7 +500,7 @@ mod tests {
         // radix or formatting (the two booleans are configuration, not secret).
         assert_eq!(
             format!("{:?}", auth(0x42)),
-            "SwimAuth { signed: false, require_signed: false, .. }"
+            "SwimAuth { signed: false, require_signed: false, require_sequenced: false, .. }"
         );
     }
 
@@ -543,5 +636,75 @@ mod tests {
         let opened = receiver.open(&sealed).expect("opens");
         assert_eq!(opened.payload, b"signed-roll");
         assert_eq!(opened.identity.as_deref(), Some("node-a"));
+    }
+
+    // --- ADR 0023: signed + sequenced (v3) datagrams ---
+
+    #[test]
+    fn sequenced_seal_open_roundtrips_with_seq_and_identity() {
+        let a = signing_auth(7, "node-a", false).with_sequencing(true);
+        let sealed = a.seal_sequenced(b"update", 42);
+        assert_eq!(sealed[0], VERSION_V3);
+        let opened = a.open(&sealed).expect("opens");
+        assert_eq!(opened.payload, b"update");
+        assert_eq!(opened.identity.as_deref(), Some("node-a"));
+        assert_eq!(opened.seq, Some(42));
+    }
+
+    #[test]
+    fn v3_body_framing_is_pinned() {
+        let a = signing_auth(7, "node-a", false);
+        let sealed = a.seal_sequenced(b"PAYLOAD", 7);
+        assert_eq!(sealed[0], VERSION_V3);
+        let body = &sealed[1 + TAG_LEN..];
+        let (seq, cert, sig, payload) = parse_v3(body).expect("v3 body parses");
+        assert_eq!(seq, 7);
+        assert_eq!(cert, b"cert-of-node-a");
+        assert_eq!(sig, b"SIG:PAYLOAD");
+        assert_eq!(payload, b"PAYLOAD");
+    }
+
+    #[test]
+    fn require_sequenced_rejects_v1_and_v2_but_accepts_v3() {
+        let strict = signing_auth(7, "node-a", true).with_sequencing(true);
+        let v1 = auth(7).seal(b"x");
+        let v2 = signing_auth(7, "node-a", false).seal(b"x");
+        assert!(
+            strict.open(&v1).is_none(),
+            "v1 rejected under require_sequenced"
+        );
+        assert!(
+            strict.open(&v2).is_none(),
+            "v2 rejected under require_sequenced"
+        );
+        let v3 = signing_auth(7, "node-a", false)
+            .with_sequencing(true)
+            .seal_sequenced(b"x", 1);
+        assert_eq!(strict.open(&v3).expect("opens").seq, Some(1));
+    }
+
+    #[test]
+    fn tampering_any_v3_byte_is_rejected_by_the_hmac() {
+        let a = signing_auth(7, "node-a", false).with_sequencing(true);
+        let sealed = a.seal_sequenced(b"payload", 9);
+        for i in 0..sealed.len() {
+            let mut t = sealed.clone();
+            t[i] ^= 0x01;
+            assert!(a.open(&t).is_none(), "v3 bit flip at {i} accepted");
+        }
+    }
+
+    #[test]
+    fn an_off_mode_node_opens_v3_without_seq_or_identity() {
+        // A node with no verifier accepts a v3 datagram via the HMAC, but exposes neither the
+        // identity nor the sequence (it cannot window an unauthenticated sender).
+        let v3 = signing_auth(7, "node-a", false)
+            .with_sequencing(true)
+            .seal_sequenced(b"hello", 5);
+        let off = auth(7);
+        let opened = off.open(&v3).expect("off mode opens v3 via the HMAC");
+        assert_eq!(opened.payload, b"hello");
+        assert_eq!(opened.identity, None);
+        assert_eq!(opened.seq, None);
     }
 }
