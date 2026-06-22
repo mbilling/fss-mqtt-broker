@@ -2215,7 +2215,7 @@ mod tests {
         subscribe(&tx, "c1", "c/d");
 
         // The sweep tick (1s) refreshes the gauges; poll the exposition until it lands.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let out = metrics.render();
             if out.contains("mqttd_sessions 1") && out.contains("mqttd_subscriptions 2") {

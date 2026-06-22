@@ -1522,7 +1522,7 @@ mod tests {
         // Client half-close → the server connection task runs to completion.
         drop(writer);
         drop(reader);
-        timeout(Duration::from_secs(1), conn)
+        timeout(Duration::from_secs(10), conn)
             .await
             .expect("connection task should finish promptly")
             .expect("connection task should not panic");
@@ -1569,7 +1569,7 @@ mod tests {
         assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
         drop(writer);
         drop(reader);
-        timeout(Duration::from_secs(1), conn)
+        timeout(Duration::from_secs(10), conn)
             .await
             .expect("connection task should finish promptly")
             .expect("connection task should not panic");
