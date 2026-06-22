@@ -3,11 +3,15 @@
 - **Status:** Accepted
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0017-durable-attach-readiness.md](../delivery/0017-durable-attach-readiness.md) — plan, progress, and changelog
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement owns the session),
   [ADR 0006](0006-consensus-and-replication.md) / [ADR 0007](0007-durable-store-integration.md)
   (durable store + lease epochs), [ADR 0016](0016-swim-membership-stability.md)
   (membership stability — fixed the *replica set*; this ADR fixes the *attach path*),
   `docs/TEST-PLAN.md` (client-observable durable-failover gap)
+
+> This record states the decision only. How it is being built and how far along it is live
+> in the [delivery doc](../delivery/0017-durable-attach-readiness.md).
 
 ## Context
 
@@ -51,7 +55,7 @@ closes. The client retries; its durable session stays intact and is served on a 
 attempt once the lease has reassigned (or quorum returns). A clean-start connect needs
 no *recovery* answer (`session_present` is always `false`), but its durable **discard**
 (`remove`) can itself trigger a first-touch group recovery on a cold owner; that discard
-runs **off the loop** too (best-effort — see §"Update"), so a clean connect never freezes
+runs **off the loop** too (best-effort), so a clean connect never freezes
 the hub or stalls behind a cold-group recovery.
 
 Rejecting is strictly safer than downgrading: downgrade *destroys* a recoverable
@@ -119,25 +123,6 @@ They can become config later. The non-cluster `MemorySessionStore` never returns
   serving other commands while a recovery is in flight; (e) last-writer-wins on
   overlapping connects. Then the client-observable failover integration test (re-added)
   must pass deterministically.
-
-## Update — clean-start discard moved off-loop (2026-06-19)
-
-Two follow-ups closed gaps the integration tests surfaced:
-
-1. **Queue-key warming.** The off-loop recovery now also probes `pending`, warming the
-   offline-queue key alongside `ensure_session`/`subscriptions`, so the inline replay in
-   `finish_attach` is reliable — a resumed session delivers its queued messages on the
-   resuming connect, not only on a later one.
-2. **Clean-start discard.** Clean-start was initially left fully inline. But its durable
-   `remove` triggers a first-touch group recovery on a cold owner, which inline froze the
-   hub and stalled the CONNACK (a clean publisher connecting to a durable owner could time
-   out). The fix: the in-memory wipe stays on the loop (fast), and the durable `remove`
-   runs in a spawned task that posts `SessionRecovered::Cleaned`; the CONNACK is still
-   gated on it (via the same mechanism), so the clean-session wipe is observed before the
-   client proceeds — but the hub is never frozen. It is **best-effort**: a transient lease
-   error leaves any prior durable state for a later discard/sweep to reap (the in-memory
-   session is already fresh), so a clean connect is never *rejected* — unlike a persistent
-   resume, a clean start has no recoverable state to protect.
 
 ## Alternatives considered
 

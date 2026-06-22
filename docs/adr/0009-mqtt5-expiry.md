@@ -1,12 +1,15 @@
 # ADR 0009 — MQTT 5.0 session & message expiry
 
-- **Status:** Accepted (design); implementation phased (workstream G)
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0009-mqtt5-expiry.md](../delivery/0009-mqtt5-expiry.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (session lifecycle/storage),
   [ADR 0005](0005-session-affinity.md) (the owner serves a session),
-  [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire that carries these properties),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream G
+  [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire that carries these properties)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0009-mqtt5-expiry.md).
 
 ## Context
 
@@ -69,10 +72,9 @@ backend are both covered with one implementation.
 **Cluster.** A persistent session is relocated to its placement owner (ADR 0005), so
 the **owner's** hub holds it and runs its expiry — no cross-node coordination. *Carried
 limitation:* the expiry deadline is in-memory on the owner. If the owner dies and a
-replica takes over (workstream F), the session data survives (it is in the replicated
+replica takes over, the session data survives (it is in the replicated
 log) but the deadline is lost — the clock effectively restarts. Persisting the
-disconnect time in the session's durable meta snapshot closes this and is a follow-up,
-not phase 1.
+disconnect time in the session's durable meta snapshot closes this and is a follow-up.
 
 ### 3. Message expiry rides in the stored queue entry; the deadline is absolute
 
@@ -84,22 +86,13 @@ and set the outbound `Message Expiry Interval` to the **remaining** seconds
 elapsed time) is what survives a broker restart or a takeover correctly.
 
 This needs the stored message to gain an optional deadline; that is a storage-format
-change (phase 2), kept separate from the session-expiry phase.
+change.
 
 ### 4. Typed property accessors, not raw `Vec` scans at every use
 
 Per ADR 0008, the broker reads v5 properties through thin typed accessors on
 `Properties` (e.g. `session_expiry_interval() -> Option<u32>`), added as each is needed
 — keeping the generic wire model while giving the broker ergonomic, single-scan reads.
-
-### 5. Phased implementation
-
-1. **Session expiry** — the (clean_start, session_expiry) normalization, hub lifecycle
-   + sweep GC, and the `session_expiry_interval` accessor. *(this phase)*
-2. **Message expiry** — the stored deadline, drop-on-expiry at replay, remaining-interval
-   on delivery.
-3. **Durable expiry deadline** (the carried limitation in §2) — persist disconnect time
-   so a takeover preserves the session-expiry clock.
 
 ## Consequences
 

@@ -1,16 +1,19 @@
 # ADR 0007 — Wiring the durable cluster session store into the broker
 
-- **Status:** Accepted (design); implementation phased (workstream E step 4)
+- **Status:** Accepted
 - **Date:** 2026-06-15
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0007-durable-store-integration.md](../delivery/0007-durable-store-integration.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md), [ADR 0005](0005-session-affinity.md),
-  [ADR 0006](0006-consensus-and-replication.md),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream E step 4
+  [ADR 0006](0006-consensus-and-replication.md)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0007-durable-store-integration.md).
 
 ## Context
 
-Workstream E built every *component* of [ADR 0006](0006-consensus-and-replication.md)
-and validated each in isolation: the epoch-fenced quorum-replicated session log
+Every *component* of [ADR 0006](0006-consensus-and-replication.md) was built and
+validated in isolation: the epoch-fenced quorum-replicated session log
 (`cluster_log`), its networked transport (`repl_net`), the openraft lease state
 machine + conformance-tested store (`lease_raft`/`lease_store`), a live lease group
 over the peer wire (`lease_group`/`raft_mesh`), the replicated exactly-once state
@@ -18,7 +21,7 @@ over the peer wire (`lease_group`/`raft_mesh`), the replicated exactly-once stat
 
 None of it is connected to the running broker. `mqttd` still serves persistent
 sessions from an in-memory `MemorySessionStore`; ADR 0005's relocation is still
-**ephemeral** (an owner's death drops its sessions). Step 4 assembles the
+**ephemeral** (an owner's death drops its sessions). The integration assembles the
 components into the live broker so that guarantee finally upgrades to durable.
 
 Unlike the components, the *integration* has open questions ADR 0006 left as "wire
@@ -112,8 +115,8 @@ lifecycle carries both RPC systems:
 - **`PeerDisconnected` / `PeerDead`** → `fail_node` on both, so in-flight RPCs/appends
   resolve instead of hanging.
 
-These handlers exist already (`raft_mesh`, `repl_net`); step 4 connects their three
-handles to these three hub events.
+These handlers exist already (`raft_mesh`, `repl_net`); the integration connects their
+three handles to these three hub events.
 
 ### 5. `Arc<dyn SessionStore>`, shared with connections; opt-in durable backend
 
@@ -162,36 +165,3 @@ single-node and non-durable paths are unchanged.
 - **Auto-enabling the durable store whenever clustering is on** — violates
   secure/predictable defaults; an explicit opt-in (loudly logged) matches the rest
   of the broker.
-
-## Implementation phasing (workstream E step 4)
-
-Each sub-step is independently shippable and test-first; the live store swap is last
-so nothing destabilizes the running broker until the stack underneath is proven.
-
-- **4a — `NodeId ↔ RaftNodeId` mapping** ✅ *(done)*: `node_registry`.
-- **4b — placement groups**: `group(client)`, per-group replica set / owner over
-  `Placement`; refine relocation (ADR 0005) to the group owner. Pure, unit-tested.
-- **4c — durable-plane endpoint** ✅ *(done)*: `mqtt-cluster::durable_plane::DurablePlane`
-  bundles the lease `Raft` + `MeshRaftNetwork` + `PeerReplicaTransport` +
-  `ReplicaState` behind `register` / `fail` / `handle(frame) -> Option<reply>`.
-  *Refinement:* rather than routing these frames through the hub actor's serial
-  command loop (where `handle`'s `await` would block all hub commands), the plane is
-  a **shared handle the peer-link tasks call directly** — the consensus/replication
-  plane stays off the actor. The live peer-pump I/O wiring (and registration on
-  connect / `fail` on disconnect) lands in 4f. Proven by a two-node duplex test that
-  elects + commits a lease and quorum-replicates a session-log append, all through
-  the plane.
-- **4d — membership reconciler**: SWIM membership → openraft voters (debounced,
-  deterministic bootstrap). Tested with an in-memory membership feed.
-- **4e — the durable cluster `SessionStore`** ✅ *(done)*: `GroupRoutedLog` routes
-  each key to its group's `ClusterLog` (lease from a `LeaseSource`, replica set from
-  `Placement`) under `ReplicatedSessionStore`. The production `LocalLeaseSource`
-  (✅) reads the leader-assigned lease epoch from the local `LeaseStore`. A test
-  shows an enqueue replicating to a follower (durability).
-- **4f — wire into `mqttd`**: `Arc<dyn SessionStore>`; `MQTTD_DURABLE_SESSIONS` builds
-  the durable store; connections use the store for QoS-2 dedup / packet ids;
-  single-node path unchanged.
-
-Then **workstream F** (takeover/handoff) follows: on an owner's `Dead` event a
-replica is promoted (it already holds the quorum-replicated log) and serves the next
-reconnect.

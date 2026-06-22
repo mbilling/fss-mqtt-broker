@@ -1,13 +1,17 @@
 # ADR 0021 — Bounded lease-consensus voter set
 
-- **Status:** Proposed (awaiting ratification)
+- **Status:** Proposed
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0021-bounded-lease-voters.md](../delivery/0021-bounded-lease-voters.md) — plan, progress, and changelog
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement/ownership),
   [ADR 0006](0006-consensus-and-replication.md) (lease consensus + per-group replication),
   [ADR 0007](0007-durable-store-integration.md) (durable node assembly),
   [ADR 0016](0016-swim-membership-stability.md) (membership),
   [ADR 0018](0018-on-disk-persistence.md) (persistent lease store)
+
+> This record states the decision only. How it is being built and how far along it is live
+> in the [delivery doc](../delivery/0021-bounded-lease-voters.md).
 
 ## Context
 
@@ -114,7 +118,7 @@ tolerates one voter loss, `5` tolerates two.
   that becomes an owner depends on learner replication latency to learn its lease — already
   the steady-state path, and bounded by the same replication as a voter.
 - **Risk:** membership-change correctness is consensus-critical. It is gated by openraft's
-  safe `change_membership` and developed test-first (below), and the persistent vote (ADR
+  safe `change_membership` and developed test-first, and the persistent vote (ADR
   0018) already makes voter restarts safe. A degenerate config (`N = 1`, or `N` larger
   than the cluster) must behave sanely (single voter / all-voters), covered by tests.
 
@@ -132,19 +136,3 @@ tolerates one voter loss, `5` tolerates two.
   cluster size) ever becomes the bottleneck.
 - **External consensus (etcd/consul) for leases.** A heavy external dependency that cuts
   against the self-contained, single-binary, minimal-supply-chain design (ADR 0002/0018).
-
-## Implementation notes (for the workstream)
-
-- `durable_node.rs`: replace the `desired = all members` computation; pass the alive
-  member set and the current `RaftView` (voters) to the reconciler so it can apply the
-  sticky vacancy-fill policy and the `N` cap (`MQTTD_LEASE_VOTERS`).
-- `lease_membership.rs`: `decide` returns a target *(voters, learners)*; `apply_action`
-  adds learners, promotes fills, demotes removed voters to learners (retain), and removes
-  departed members. Keep the "only the leader reconciles" and one-tick-debounce guards.
-- Tests (pure where possible): a > N-node membership yields exactly `N` voters with the
-  rest learners; a dead voter is replaced by the lowest-id learner (count restored);
-  a new high-id node joins as a learner with **no** voter change; a learner that owns a
-  group reads its lease and serves it; `N` larger than the cluster makes all members
-  voters; `N = 1` is a sane single-voter group. Re-run openraft's storage conformance
-  (unaffected). An integration test: a 5+-node durable cluster forms with a bounded voter
-  set and a learner-owned session survives a non-voter and a voter failure.

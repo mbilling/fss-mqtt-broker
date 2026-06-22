@@ -1,11 +1,14 @@
 # ADR 0011 — MQTT 5.0 topic aliases
 
-- **Status:** Accepted (design); implementation phased (workstream G)
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0011-topic-aliases.md](../delivery/0011-topic-aliases.md) — plan, progress, and changelog
 - **Related:** [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire that carries the
-  properties), [ADR 0009](0009-mqtt5-expiry.md) (sibling v5-semantics work),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream G
+  properties), [ADR 0009](0009-mqtt5-expiry.md) (sibling v5-semantics work)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0011-topic-aliases.md).
 
 ## Context
 

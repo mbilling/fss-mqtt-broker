@@ -1,11 +1,13 @@
 # ADR 0006 — Consensus & replication for durable sessions
 
-- **Status:** Accepted; engine **ratified (openraft)** by the workstream-E spike
-- **Date:** 2026-06-13 (engine ratified 2026-06-15)
+- **Status:** Accepted
+- **Date:** 2026-06-13
 - **Deciders:** project maintainers
-- **Related:** [ADR 0001](0001-session-durability.md) §4, [ADR 0005](0005-session-affinity.md),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream D,
-  Capability Plan §8
+- **Delivery:** [docs/delivery/0006-consensus-and-replication.md](../delivery/0006-consensus-and-replication.md) — plan, progress, and changelog
+- **Related:** [ADR 0001](0001-session-durability.md) §4, [ADR 0005](0005-session-affinity.md)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0006-consensus-and-replication.md).
 
 ## Context
 
@@ -38,16 +40,21 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    ADR 0001 §4: consensus for *ownership and the log's integrity*, never on the
    fan-out path.
 
-2. **Use a proven consensus engine; do not hand-roll.** The ownership-lease /
-   epoch layer is built on an established Rust consensus library — **openraft**
-   is the leading candidate (async-native, actively maintained, fits the tokio
-   codebase). Hand-rolling leader election, fencing, and membership change is
-   precisely the class of subtle distributed-systems bug a correctness- and
-   security-first broker must not own. The fencing logic *we* write (rejecting
-   appends at a superseded epoch) sits on top of the engine's primitives.
-   **The workstream-E spike ratified openraft** (see *Spike outcome* below): it is
-   the only mature async-native Raft that passes our `cargo-deny` gate clean. The
-   fencing layer is prototyped engine-agnostically in `mqtt-cluster::lease`.
+2. **Use a proven consensus engine; do not hand-roll — specifically openraft.**
+   The ownership-lease / epoch layer is built on **openraft** (async-native,
+   actively maintained, fits the tokio codebase). Hand-rolling leader election,
+   fencing, and membership change is precisely the class of subtle
+   distributed-systems bug a correctness- and security-first broker must not own.
+   The fencing logic *we* write (rejecting appends at a superseded epoch) sits on
+   top of the engine's primitives, prototyped engine-agnostically in
+   `mqtt-cluster::lease`. openraft is chosen over the alternative async-incompatible
+   `raft-rs`: openraft is the only mature async-native Raft that passes our
+   `cargo-deny` gate clean, whereas `raft-rs` ships an *active* DoS vulnerability
+   (RUSTSEC-2024-0437, protobuf 2.x uncontrolled-recursion pinned through
+   `raft-proto`, unfixed upstream) plus an unmaintained `fxhash` (RUSTSEC-2025-0057)
+   — disqualifying for a security-first broker. The accepted cost is openraft's
+   heavier transitive tree (~79 net-new crates), which the durability investment
+   already anticipated; it is revisited if a lighter, gate-clean alternative appears.
 
 3. **`ReplicatedLog` is the seam.** A generic async append-log trait
    (`append` / `read` / `truncate` / `remove` over keyed, offset-addressed byte
@@ -69,38 +76,6 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    A stale lease-holder after a partition heals is **fenced**: replicas reject
    appends at a superseded epoch, so it cannot reach quorum and cannot diverge
    the log.
-
-## Spike outcome (workstream E step 1)
-
-The spike evaluated the two candidate engines against our `deny.toml` and built the
-engine-agnostic fencing prototype. Findings (2026-06-15):
-
-| Engine | Net-new crates | `cargo-deny` | Model | Verdict |
-|--------|---------------:|--------------|-------|---------|
-| **openraft** 0.9.24 | 79 | **clean** (advisories / licenses / bans / sources all ok) | async-native, actively maintained | **ratified** |
-| raft-rs (`raft`) 0.7.0 | 15 | **FAILS** — RUSTSEC-2024-0437 (protobuf 2.28 uncontrolled-recursion **DoS**, unfixed upstream in 0.7) + RUSTSEC-2025-0057 (`fxhash` unmaintained) | sync, protobuf-driven | rejected |
-
-- **openraft is ratified.** It is heavier (79 transitive crates — clap, chrono,
-  `rust_decimal`, `validit`, `anyerror` among them; ~+56% over the current
-  141-crate workspace) but it is the only mature async-native option and it passes
-  the supply-chain gate with **no new policy exceptions**. The weight is the
-  accepted cost ADR 0001/this ADR already anticipated; it is revisited if a
-  lighter, gate-clean alternative (e.g. a stable openraft 0.10, currently
-  alpha-only) appears before E step 3 binds it.
-- **raft-rs is rejected.** Despite a far smaller tree it ships an *active* DoS
-  vulnerability pinned through `raft-proto`'s protobuf 2.x — disqualifying for a
-  security-first broker.
-- **The engine is not yet a workspace dependency.** The spike measured it on a
-  throwaway branch and reverted; openraft lands for real at E step 3 (the
-  consensus-backed `ReplicatedLog`), so the 79 crates do not enter the build until
-  the code that needs them does.
-- **The fencing layer is built and proven** independent of the engine:
-  `mqtt-cluster::lease` (`LeaseGroup` / `OwnershipLease` / epoch fencing) is a pure,
-  sans-I/O state machine whose tests pin the split-brain-safety property (two
-  epochs can never both reach quorum; a superseded holder is fenced). It maps onto
-  openraft's leadership term at E step 3.
-
-This ratifies the ADR as written; no amendment was required.
 
 ## Consequences
 
@@ -130,65 +105,3 @@ This ratifies the ADR as written; no amendment was required.
 - **An external store as the default backend** — contradicts shared-nothing and
   moves the bottleneck into the store. Kept as an operator-selectable
   `ReplicatedLog` backend, not the default.
-
-## Phasing (workstream E)
-
-1. **Spike + decide the engine** ✅ *(done)*: `cargo-deny` review of openraft and
-   raft-rs plus the engine-agnostic ownership-lease/fencing prototype
-   (`mqtt-cluster::lease`). Outcome above — openraft ratified, ADR unchanged.
-2. **`SessionStore` over `ReplicatedLog`** ✅ *(done)*: `ReplicatedSessionStore`
-   (`mqtt-storage::logged`) implements the full `SessionStore` over a
-   `ReplicatedLog`, holding no durable state of its own — queue in a `q/{client}`
-   log, session metadata in `m/{client}`. A test pins the layering: a second store
-   over the same log sees the first's sessions in full, so a durable log yields
-   durable sessions. Done **first** (ahead of the spike): it needs no network and
-   no engine choice, and it validates the seam shape before any dependency lands.
-3. **The consensus-backed `ReplicatedLog`**, in three sub-steps:
-   - **3a — epoch-fenced quorum-append core** ✅ *(done)*: `mqtt-cluster::cluster_log`
-     — `ClusterLog` implements `ReplicatedLog` by quorum-replicating each append
-     across the replica set behind a `ReplicaTransport` seam, gated on the
-     lease-holder's epoch (`ReplicaState` fences a stale holder). Sans-I/O, with a
-     deterministic loss-injecting simulation pinning the contract: quorum-durable
-     append, single-replica-loss survival (R=3/q=2), below-quorum rejection with no
-     committed hole, stale-leader fencing, lazy local truncation, and the step-2
-     `ReplicatedSessionStore` running unchanged on top.
-   - **3b-i — networked transport** ✅ *(done)*: `mqtt-cluster::repl_net` —
-     `PeerReplicaTransport` realizes the `ReplicaTransport` seam over the peer mesh
-     (`PeerMessage::Replicate` / `ReplicateAck`, with `req_id` ack correlation and
-     `fail_node` on link drop). Pinned by tests over real framed streams: append
-     round-trip + follower apply, stale-epoch fencing over the wire, unreachable
-     replica, and in-flight failure on disconnect. Driven directly until the live
-     hub is wired (step 4).
-   - **3b-ii — openraft lease manager**, in turn:
-     - **state machine + type binding** ✅ *(done)*: openraft is now a real
-       dependency (in the build, through `cargo-deny`). `mqtt-cluster::lease_raft`
-       defines the replicated `LeaseMap` (`group -> (holder, epoch)`, monotonic
-       epoch — the fence source) and binds it to openraft via
-       `declare_raft_types!(LeaseConfig)` over numeric `RaftNodeId`s, with a
-       compile-assert that it is a valid `RaftTypeConfig`.
-     - **storage** ✅ *(done)*: `mqtt-cluster::lease_store::LeaseStore` implements
-       openraft's `RaftStorage` over `LeaseMap` (log, vote, applied state, snapshots —
-       in memory). Validated by openraft's own conformance `Suite`, which exercises
-       every storage method against the protocol's correctness requirements.
-     - **network + bring-up** ✅ *(done, in-memory)*: `mqtt-cluster::lease_group`
-       implements openraft's `RaftNetwork` (append-entries / vote / install-snapshot)
-       and brings up a real group. Tests prove the full stack end to end: a
-       single-node group elects itself and commits a lease, and a **three-node group
-       elects a leader and replicates a committed lease to every replica** — through
-       real consensus, into our `LeaseMap`.
-     - **mesh network** ✅ *(done)*: `mqtt-cluster::raft_mesh` carries the same RPCs
-       over the peer bus (`PeerMessage::RaftRpc`/`RaftRpcReply`, `req_id`-correlated,
-       `fail_node` on link drop; a `dispatch` receive side). A test elects a leader
-       and replicates a committed lease across **two nodes over a serialized duplex
-       link** — consensus over the wire. Keyed by `RaftNodeId`; the string `NodeId` ↔
-       `RaftNodeId` mapping and live-hub wiring are step 4.
-   - **3c — replicated exactly-once state** ✅ *(done)*: the `SessionStore` trait
-     gained `record_received` / `clear_received` / `received` / `next_packet_id`,
-     and `ReplicatedSessionStore` stores the **QoS-2 dedup window and the outbound
-     packet-id counter** in the replicated `m/{client}` snapshot — so a second store
-     over the same log sees them (exactly-once survives failover). *Remaining (minor,
-     correctness-neutral):* replace the in-memory backend's O(n) cap count with a
-     rebuildable per-key index.
-4. **Wire it in**: swap `mqttd`'s `MemorySessionStore` for the durable backend so
-   relocated-session owners (ADR 0005) write through it — ephemeral sessions become
-   durable — then cross-node takeover (workstream F).

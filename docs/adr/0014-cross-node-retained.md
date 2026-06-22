@@ -3,9 +3,12 @@
 - **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0014-cross-node-retained.md](../delivery/0014-cross-node-retained.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (cluster routing model),
-  [ADR 0010](0010-shared-subscriptions.md) (the other cross-node routing limitation),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md)
+  [ADR 0010](0010-shared-subscriptions.md) (the other cross-node routing limitation)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0014-cross-node-retained.md).
 
 ## Context
 

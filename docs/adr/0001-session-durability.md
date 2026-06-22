@@ -1,9 +1,13 @@
 # ADR 0001 — Session durability in a horizontally-scalable cluster
 
-- **Status:** Accepted (design); implementation phased (see Roadmap below)
+- **Status:** Accepted
 - **Date:** 2026-06-02
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0001-session-durability.md](../delivery/0001-session-durability.md) — plan, progress, and changelog
 - **Related:** [Capability Plan](../CAPABILITY-PLAN.md) §4 (scalability), `mqtt-storage::SessionStore`
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0001-session-durability.md).
 
 ## Context
 
@@ -152,27 +156,3 @@ trait surface today; they join the replicated state with the durable backend.
   performance, zero durability: a node crash loses every offline queue it held.
   Rejected for the default; may be offered as an explicit "ephemeral sessions"
   mode for workloads that don't need durability.
-
-## Roadmap (implementation phasing)
-
-The authoritative, dependency-sequenced breakdown — with per-workstream status and
-the carried limitations — lives in [Cluster Durability — Implementation
-Plan](../CLUSTER-DURABILITY-PLAN.md). In brief:
-
-1. **Done:** incremental async `SessionStore` trait + in-memory single-node impl
-   (`MemorySessionStore`); persistent-session handling wired in the broker
-   (offline queueing, replay, QoS 1/2 in-flight resume).
-2. **Done:** bounded queues + overflow policy (workstream A); HRW ownership over
-   SWIM membership (B); session affinity / relocation to the owner in ephemeral
-   mode ([ADR 0005](0005-session-affinity.md), C); the consensus-mechanism
-   decision ([ADR 0006](0006-consensus-and-replication.md), D); and the
-   `ReplicatedLog` seam with `SessionStore` expressed over it
-   (`ReplicatedSessionStore`, E step 2).
-3. **Next:** ratify the consensus engine (spike), then the consensus-backed
-   replicated log + durable backend (extending replicated state with the QoS-2
-   dedup set and packet-id counter) and the takeover protocol (E–F). Then MQTT 5
-   session/message expiry and shared-subscription load balancing (G, gated on the
-   v5 codec).
-
-Until step 3 lands, persistent sessions run in the documented **ephemeral mode**:
-sharded by owner (linear *capacity*), but an owner's death drops its queues.

@@ -1,11 +1,13 @@
 # ADR 0008 — MQTT 5.0 codec
 
-- **Status:** Accepted (design); implementation phased (codec milestone, gates workstream G)
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
-- **Related:** [ADR 0001](0001-session-durability.md) (session/message expiry needs v5),
-  [Capability Plan](../CAPABILITY-PLAN.md) Phase 4,
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream G
+- **Delivery:** [docs/delivery/0008-mqtt-5-codec.md](../delivery/0008-mqtt-5-codec.md) — plan, progress, and changelog
+- **Related:** [ADR 0001](0001-session-durability.md) (session/message expiry needs v5)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0008-mqtt-5-codec.md).
 
 ## Context
 
@@ -25,7 +27,7 @@ MQTT 5.0 is a strict superset of 3.1.1's framing with three additions:
 3. **New shapes** — an AUTH packet; SUBSCRIBE gains a per-filter *subscription options*
    byte (No-Local, Retain-As-Published, Retain-Handling) in place of a bare QoS.
 
-Several questions have one defensible answer each; this ADR fixes them so the phased
+Several questions have one defensible answer each; this ADR fixes them so the
 implementation is mechanical.
 
 ## Decision
@@ -83,26 +85,13 @@ is the broker's job; the codec's contract is to surface the right error *categor
 the broker can pick the reason code. (A reason-code-bearing error variant may be
 added if that mapping proves lossy; deferred until a consumer needs it.)
 
-### 5. Phased implementation
+### 5. Scope: a faithful v5 wire, not v5 semantics
 
-Each phase is a tested, gated, committed unit:
-
-1. **Properties foundation** — the `Property` enum, the `Properties` block codec,
-   and the string-pair primitive, decoded/encoded in isolation. *(this commit)*
-2. **CONNECT/CONNACK v5** — connect properties + will properties; connack reason +
-   properties. Flip nothing yet.
-3. **PUBLISH + acks v5** — publish properties; the four ack packets gain
-   `reason` + properties with the short-form rules.
-4. **SUBSCRIBE/SUBACK/UNSUBSCRIBE/UNSUBACK v5** — subscription options byte; reason
-   codes + properties.
-5. **DISCONNECT + AUTH v5** — reason + properties; the new AUTH packet.
-6. **Accept v5 in the broker** — remove `V5_UNSUPPORTED`, negotiate at CONNECT, and
-   honour the v5 behaviours the broker already has analogues for; the new v5
-   *semantics* (expiry, aliases, shared subs, flow control) are **workstream G**, not
-   the codec.
-
-The codec milestone is phases 1–6: a faithful v5 wire that round-trips every packet.
-It unblocks — but does not itself implement — workstream G.
+This ADR's scope is the codec — a faithful v5 wire that round-trips every packet
+(properties, reason codes, subscription options, AUTH) and lets the broker remove
+`V5_UNSUPPORTED` and negotiate v5 at CONNECT. The new v5 *semantics* (expiry, topic
+aliases, shared subscriptions, flow control) are **not** the codec's job; the codec
+unblocks, but does not itself implement, that broker-level work.
 
 ## Consequences
 

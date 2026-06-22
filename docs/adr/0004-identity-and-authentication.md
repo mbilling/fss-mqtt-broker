@@ -3,7 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-06-12
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0004-identity-and-authentication.md](../delivery/0004-identity-and-authentication.md) — plan, progress, and changelog
 - **Related:** ADR 0002 (transport security), Capability Plan §3, `mqtt-auth`
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0004-identity-and-authentication.md).
 
 ## Context
 
@@ -45,20 +49,11 @@ requires an identity model before an authorization model, and decisions about
 
 5. **One pluggable seam.** Everything flows through the existing
    `Authenticator` trait, so Argon2id passwords, JWT/OIDC, and LDAP slot in
-   without touching the connection gate.
+   without touching the connection gate. A `ChainAuthenticator` tries cert →
+   password → token; each non-handling member abstains (`NotPermitted`) and the
+   first real verdict is final.
 
-## Consequences
-
-- A default-configured TLS listener with a client CA serves only
-  certificate-authenticated clients; the plaintext listener is useless without
-  the explicit anonymous opt-in. Config claims and enforcement now agree.
-- The CN extraction is reusable on the cluster bus: binding peer `Hello`
-  node ids to peer-certificate CNs (ADR 0002's deferred item) is now one small
-  step.
-- `conn::handle` remains a permissive anonymous shim for the integration test
-  suites; production listeners do not use it.
-
-## Step 3 (implemented): the topic ACL engine
+### The topic ACL engine
 
 A TOML policy file (`MQTTD_ACL_FILE`) evaluated per identity, action, and
 topic; without a policy file authorization is **not enforced** and the broker
@@ -78,42 +73,44 @@ docs; the load-bearing decisions:
 - **Principals:** any-of `identities` globs (`*` only, byte-wise, literal
   otherwise) or any-of `groups`; both empty = everyone.
 - **`%i`** substitutes the identity subject in rule topics at evaluation time.
-  `%c` (client id) is deferred until the `Authorizer` trait carries the client
-  id.
 - **Enforcement:** SUBSCRIBE → per-filter 0x80, denied filters never reach the
   hub (so retained replay is implicitly gated); PUBLISH → dropped but still
   acknowledged per `QoS` (3.1.1 has no negative PUBACK; not acking strands
   conforming publishers in retry), logged; will topic → 0x05 at CONNECT (a
   will is a deferred publish — refuse it before accepting the session).
-- **Known limitation:** enforcement is subscription-time only; a *delivery-
-  time* check in the hub (needed if policies ever change under live
-  subscriptions) is deferred along with hot reload.
 
-## Steps 4–6 (implemented)
+### Auditing and peer binding
 
-- **Step 4 — audit trail.** The connection layer records `auth.success`,
-  `auth.failure`, `acl.deny.publish`, `acl.deny.subscribe`, and
-  `acl.deny.will` into an [`AuditSink`]. The production `AuditLog` hash-chains
-  every event (tamper-evident head) and emits a structured `tracing` event
-  (target `audit`). Failures are keyed by client id, never a credential — no
-  secret reaches the log.
-- **Step 5 — peer node-id ↔ certificate CN binding.** On the cluster bus a
-  peer's `Hello { node_id }` must equal its certificate's Subject CN, checked
-  on both link directions before the tie-break. Closes the ADR 0002 hole where
-  any cluster-cert holder could claim any node id. No binding on the plaintext
+- **Audit trail.** The connection layer records `auth.success`, `auth.failure`,
+  `acl.deny.publish`, `acl.deny.subscribe`, and `acl.deny.will` into an
+  [`AuditSink`]. The production `AuditLog` hash-chains every event (tamper-evident
+  head) and emits a structured `tracing` event (target `audit`). Failures are
+  keyed by client id, never a credential — no secret reaches the log.
+- **Peer node-id ↔ certificate CN binding.** On the cluster bus a peer's
+  `Hello { node_id }` must equal its certificate's Subject CN, checked on both
+  link directions before the tie-break. Closes the ADR 0002 hole where any
+  cluster-cert holder could claim any node id. No binding on the plaintext
   (insecure) mesh.
-- **Step 6 — password and token authenticators.** `PasswordAuthenticator`
-  (Argon2id, `username:phc-hash` file, identical error for unknown-user and
-  wrong-password — no enumeration oracle) and `TokenAuthenticator` (JWT HS256 /
-  RS256 with a static key, `exp`/`iss`/`aud` validation, subject from `sub`,
-  groups from a configurable claim). A `ChainAuthenticator` tries cert →
-  password → token; each non-handling member abstains (`NotPermitted`) and the
-  first real verdict is final.
+- **Password and token verifiers.** `PasswordAuthenticator` (Argon2id,
+  `username:phc-hash` file, identical error for unknown-user and wrong-password —
+  no enumeration oracle) and `TokenAuthenticator` (JWT HS256 / RS256 with a static
+  key, `exp`/`iss`/`aud` validation, subject from `sub`, groups from a configurable
+  claim).
 
-## Deferred
+## Consequences
 
-- Full OIDC discovery / JWKS rotation (step 6 takes a single static key); MQTT 5
-  enhanced auth after the v5 codec.
-- Delivery-time ACL re-check in the hub (enforcement is subscription-time only).
-- SAN-based identity selection; per-listener auth policies; hot ACL reload;
-  `%c` (client-id) substitution in ACL patterns.
+- A default-configured TLS listener with a client CA serves only
+  certificate-authenticated clients; the plaintext listener is useless without
+  the explicit anonymous opt-in. Config claims and enforcement now agree.
+- The CN extraction is reusable on the cluster bus: binding peer `Hello`
+  node ids to peer-certificate CNs (ADR 0002's deferred item) is now one small
+  step.
+- `conn::handle` remains a permissive anonymous shim for the integration test
+  suites; production listeners do not use it.
+- **Known limitation:** ACL enforcement is subscription-time only; a *delivery-
+  time* check in the hub (needed if policies ever change under live
+  subscriptions) is deferred along with hot reload. `%c` (client-id)
+  substitution in ACL patterns is deferred until the `Authorizer` trait carries
+  the client id. Full OIDC discovery / JWKS rotation, SAN-based identity
+  selection, per-listener auth policies, and MQTT 5 enhanced auth are likewise
+  deferred.

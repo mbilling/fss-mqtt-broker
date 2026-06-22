@@ -1,12 +1,16 @@
 # ADR 0012 — MQTT 5.0 flow control (Receive Maximum)
 
-- **Status:** Accepted (design); implementation phased (workstream G)
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0012-flow-control.md](../delivery/0012-flow-control.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (offline queue / in-flight
   state), [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire),
   [ADR 0009](0009-mqtt5-expiry.md) (queued-message expiry, which interacts with the
-  backlog), [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream G
+  backlog)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0012-flow-control.md).
 
 ## Context
 

@@ -4,9 +4,12 @@
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
 - **Supersedes:** the cluster limitation in [ADR 0010](0010-shared-subscriptions.md) §5
+- **Delivery:** [docs/delivery/0015-cluster-shared-subscriptions.md](../delivery/0015-cluster-shared-subscriptions.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (cluster routing),
-  [ADR 0014](0014-cross-node-retained.md) (the other cross-node fix),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md)
+  [ADR 0014](0014-cross-node-retained.md) (the other cross-node fix)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0015-cluster-shared-subscriptions.md).
 
 ## Context
 

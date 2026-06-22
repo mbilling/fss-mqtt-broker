@@ -1,11 +1,14 @@
 # ADR 0013 — MQTT 5.0 enhanced authentication (AUTH exchange)
 
-- **Status:** Accepted (design); implementation phased (workstream G)
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0013-enhanced-authentication.md](../delivery/0013-enhanced-authentication.md) — plan, progress, and changelog
 - **Related:** [ADR 0004](0004-identity-and-authentication.md) (identity model,
-  deny-by-default), [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire, AUTH packet),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream G
+  deny-by-default), [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire, AUTH packet)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0013-enhanced-authentication.md).
 
 ## Context
 

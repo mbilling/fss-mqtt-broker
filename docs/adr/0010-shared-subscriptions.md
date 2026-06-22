@@ -1,12 +1,15 @@
 # ADR 0010 — Shared subscriptions
 
-- **Status:** Accepted (design); implementation phased (workstream G)
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0010-shared-subscriptions.md](../delivery/0010-shared-subscriptions.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (session/queue lifecycle),
   [ADR 0005](0005-session-affinity.md) (cross-node placement),
-  [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire),
-  [Cluster Durability Plan](../CLUSTER-DURABILITY-PLAN.md) workstream G
+  [ADR 0008](0008-mqtt-5-codec.md) (the v5 wire)
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0010-shared-subscriptions.md).
 
 ## Context
 

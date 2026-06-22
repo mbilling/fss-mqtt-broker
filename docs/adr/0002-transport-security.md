@@ -3,7 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-06-11
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0002-transport-security.md](../delivery/0002-transport-security.md) — plan, progress, and changelog
 - **Related:** [Capability Plan](../CAPABILITY-PLAN.md) §3 (security), ADR 0001, `mqtt-net`
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0002-transport-security.md).
 
 ## Context
 

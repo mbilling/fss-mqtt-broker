@@ -1,11 +1,15 @@
 # ADR 0020 — Metrics and runtime observability
 
-- **Status:** Proposed (awaiting ratification)
+- **Status:** Proposed
 - **Date:** 2026-06-19
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0020-metrics-and-observability.md](../delivery/0020-metrics-and-observability.md) — plan, progress, and changelog
 - **Related:** [ADR 0004](0004-identity-and-authentication.md) (audit log),
   the health endpoints in `crates/mqttd/src/health.rs`,
   [ADR 0019](0019-graceful-shutdown.md) (lifecycle signals to surface)
+
+> This record states the decision only. How it is being built and how far along it is live
+> in the [delivery doc](../delivery/0020-metrics-and-observability.md).
 
 ## Context
 
@@ -83,20 +87,6 @@ wiring pattern already used for the `SessionStore`/placement. Hot-path updates a
 lock-free atomic increments (`prometheus-client` families are cheap). The hub already
 serializes state, so gauges like queue depth and subscription count are read off its
 in-memory maps on scrape (or updated on change).
-
-## Implementation notes (for the workstream)
-
-- `mqtt-observability`: add `prometheus-client`; define the `Metrics` registry + handles;
-  a `render() -> String` for the exposition format.
-- `health.rs`: route `GET /metrics` to `metrics.render()` (replace the 404 + its test).
-- Instrument: `conn.rs` (connections, handshakes, auth/ACL outcomes, keepalive reaps),
-  `hub.rs` (publish/deliver, queue depth, evictions, inflight, retained/subs gauges),
-  listeners in `main.rs` (accepts/errors), `mqtt-cluster` (members, peer links, lease
-  role, durable append latency/failures).
-- Keep instrumentation off the *critical correctness* path — a metrics update must never
-  change behaviour or block; failures to render are logged, not fatal.
-- Testing: a unit test that `/metrics` renders valid exposition and that a publish
-  round-trip moves the expected counters; assert no high-cardinality labels.
 
 ## Consequences
 

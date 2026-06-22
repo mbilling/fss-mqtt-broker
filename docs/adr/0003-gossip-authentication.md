@@ -3,7 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-06-11
 - **Deciders:** project maintainers
+- **Delivery:** [docs/delivery/0003-gossip-authentication.md](../delivery/0003-gossip-authentication.md) — plan, progress, and changelog
 - **Related:** ADR 0002 (deferred this), `mqtt-cluster::swim_driver`, Capability Plan §3/§4
+
+> This record states the decision only. How it is being built and how far along it is
+> live in the [delivery doc](../delivery/0003-gossip-authentication.md).
 
 ## Context
 
