@@ -130,7 +130,7 @@
 
 **0020 — Metrics and runtime observability**
 
-- `0020-T6` ⬜ planned: Instrument cluster (members/states, peer links, lease role/epoch, durable append latency/failures)
+- `0020-T6` 🚧 in-progress: Instrument cluster (members/states, peer links, lease role/epoch, durable append latency/failures) — "Hub-accessible cluster shape done: cluster_members gauge (placement-eligible members = this node + non-dead peers) and peer_links gauge (connected inter-node links), both snapshotted on the 1s sweep via Hub::refresh_gauges; metrics.rs counters_and_gauges_move_and_render asserts both. Remaining (needs threading Arc<Metrics> into mqtt-cluster, which has no observability dep today — a focused, correctness-sensitive pass): SWIM member breakdown by state, lease-group role/epoch gauges, and the durable-append latency histogram + failure counters (no-quorum, not-owner)."
 - `0020-T9` 💤 deferred: Later OpenTelemetry/OTLP export behind the same registry — explicitly out of scope now; addable later without changing instrumentation per the ADR
 
 **0021 — Bounded lease-consensus voter set**

@@ -1549,6 +1549,13 @@ impl Hub {
         if let Ok(n) = self.retained.count().await {
             m.set_retained_messages(n);
         }
+        // Cluster shape (ADR 0020-T6): placement-eligible members and live peer links.
+        m.set_peer_links(self.peers.len());
+        if let Some(placement) = &self.placement {
+            if let Ok(p) = placement.read() {
+                m.set_cluster_members(p.member_count());
+            }
+        }
     }
 
     /// Persist the current subscription set for a client if its session is durable.

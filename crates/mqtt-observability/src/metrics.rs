@@ -63,6 +63,8 @@ pub struct Metrics {
     subscriptions: Gauge,
     retained_messages: Gauge,
     inflight_messages: Gauge,
+    cluster_members: Gauge,
+    peer_links: Gauge,
 }
 
 impl Metrics {
@@ -71,53 +73,41 @@ impl Metrics {
     pub fn new(version: &str) -> Self {
         let mut registry = Registry::with_prefix("mqttd");
 
-        let connections_active = Gauge::default();
-        registry.register(
+        let connections_active = register_gauge(
+            &mut registry,
             "connections_active",
             "Currently open client connections",
-            connections_active.clone(),
         );
 
-        let connections_total = Family::<ProtocolLabel, Counter>::default();
-        registry.register(
+        let connections_total = register_family(
+            &mut registry,
             "connections",
             "Client connections accepted, by protocol version",
-            connections_total.clone(),
         );
-
-        let accepts_total = Family::<ListenerLabel, Counter>::default();
-        registry.register(
+        let accepts_total = register_family(
+            &mut registry,
             "accepts",
             "TCP connections accepted, by listener (before TLS/CONNECT)",
-            accepts_total.clone(),
         );
-
-        let connection_errors_total = Family::<ReasonLabel, Counter>::default();
-        registry.register(
+        let connection_errors_total = register_family(
+            &mut registry,
             "connection_errors",
             "Connection setup failures, by reason class",
-            connection_errors_total.clone(),
         );
-
-        let publish_received_total = Family::<QosLabel, Counter>::default();
-        registry.register(
+        let publish_received_total = register_family(
+            &mut registry,
             "publish_received",
             "PUBLISH packets received from clients, by QoS",
-            publish_received_total.clone(),
         );
-
-        let publish_delivered_total = Family::<QosLabel, Counter>::default();
-        registry.register(
+        let publish_delivered_total = register_family(
+            &mut registry,
             "publish_delivered",
             "PUBLISH packets delivered to subscribers, by QoS",
-            publish_delivered_total.clone(),
         );
-
-        let publish_dropped_total = Family::<ReasonLabel, Counter>::default();
-        registry.register(
+        let publish_dropped_total = register_family(
+            &mut registry,
             "publish_dropped",
             "Messages dropped, by reason (expired, queue-overflow, no-subscriber)",
-            publish_dropped_total.clone(),
         );
 
         // ~100us to ~3s, doubling — covers in-process delivery and slow cross-node paths.
@@ -128,32 +118,35 @@ impl Metrics {
             deliver_latency_seconds.clone(),
         );
 
-        let sessions = Gauge::default();
-        registry.register(
+        let sessions = register_gauge(
+            &mut registry,
             "sessions",
             "Known client sessions (connected or retained)",
-            sessions.clone(),
         );
-
-        let subscriptions = Gauge::default();
-        registry.register(
+        let subscriptions = register_gauge(
+            &mut registry,
             "subscriptions",
             "Active topic-filter subscriptions across all sessions",
-            subscriptions.clone(),
         );
-
-        let retained_messages = Gauge::default();
-        registry.register(
+        let retained_messages = register_gauge(
+            &mut registry,
             "retained_messages",
             "Retained messages held by the broker",
-            retained_messages.clone(),
         );
-
-        let inflight_messages = Gauge::default();
-        registry.register(
+        let inflight_messages = register_gauge(
+            &mut registry,
             "inflight_messages",
             "Unacknowledged QoS>0 messages outstanding to clients",
-            inflight_messages.clone(),
+        );
+        let cluster_members = register_gauge(
+            &mut registry,
+            "cluster_members",
+            "Cluster members eligible for placement (this node plus non-dead peers)",
+        );
+        let peer_links = register_gauge(
+            &mut registry,
+            "peer_links",
+            "Currently connected inter-node peer links",
         );
 
         let build_info = Family::<VersionLabel, Gauge>::default();
@@ -178,6 +171,8 @@ impl Metrics {
             subscriptions,
             retained_messages,
             inflight_messages,
+            cluster_members,
+            peer_links,
         }
     }
 
@@ -280,12 +275,43 @@ impl Metrics {
     pub fn set_inflight_messages(&self, n: usize) {
         self.inflight_messages.set(clamp_gauge(n));
     }
+
+    /// Set the current count of placement-eligible cluster members (ADR 0020-T6).
+    pub fn set_cluster_members(&self, n: usize) {
+        self.cluster_members.set(clamp_gauge(n));
+    }
+
+    /// Set the current count of connected inter-node peer links.
+    pub fn set_peer_links(&self, n: usize) {
+        self.peer_links.set(clamp_gauge(n));
+    }
 }
 
 /// Cast an in-memory map length to the gauge's signed counter, saturating rather
 /// than wrapping for the (unreachable) case of a count beyond `i64::MAX`.
 fn clamp_gauge(n: usize) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Register a fresh gauge under `name`/`help` and return a handle to it.
+fn register_gauge(registry: &mut Registry, name: &'static str, help: &'static str) -> Gauge {
+    let gauge = Gauge::default();
+    registry.register(name, help, gauge.clone());
+    gauge
+}
+
+/// Register a fresh labelled counter family under `name`/`help` and return a handle.
+fn register_family<L>(
+    registry: &mut Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Family<L, Counter>
+where
+    L: Clone + std::hash::Hash + Eq + EncodeLabelSet + Send + Sync + std::fmt::Debug + 'static,
+{
+    let family = Family::<L, Counter>::default();
+    registry.register(name, help, family.clone());
+    family
 }
 
 #[cfg(test)]
@@ -324,6 +350,8 @@ mod tests {
         m.connection_error("tls");
         m.set_sessions(3);
         m.set_retained_messages(7);
+        m.set_cluster_members(2);
+        m.set_peer_links(1);
         let out = m.render();
 
         assert!(out.contains("mqttd_connections_active 1"), "{out}");
@@ -353,6 +381,8 @@ mod tests {
         );
         assert!(out.contains("mqttd_sessions 3"), "{out}");
         assert!(out.contains("mqttd_retained_messages 7"), "{out}");
+        assert!(out.contains("mqttd_cluster_members 2"), "{out}");
+        assert!(out.contains("mqttd_peer_links 1"), "{out}");
     }
 
     /// Cardinality guard (ADR 0020 §3): label *keys* are only ever from the fixed set; no
