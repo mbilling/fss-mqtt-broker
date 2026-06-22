@@ -74,5 +74,11 @@ adversarial tests for each forgery vector.
 
 ## Changelog
 
+- **2026-06-22** — P1–P5 landed, test-first: the `mqtt-auth` crypto core (sign/verify, with
+  the forgery vectors); wire format v2 + `GossipSign`/`GossipVerify` in `swim_auth` (v1 KAT
+  still passes, so backward compatible); the driver's CN-to-`from` identity binding; the
+  `mqttd` wiring with `MQTTD_SWIM_SIGNED` require/prefer/off and startup guards; and the
+  over-UDP integration proof that a forged sender identity is rejected. T6 (cert-caching
+  size optimisation) and T7 (cert revocation/expiry) remain deferred.
 - **2026-06-22** — ADR accepted; phased plan recorded. Supersedes the (cryptographically
   unsound) `0003-T9` "derive the key from CA material" idea, which is now cut.
