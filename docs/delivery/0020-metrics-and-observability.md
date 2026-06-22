@@ -18,7 +18,8 @@ tasks:
     status: planned
   - id: 0020-T4
     title: Instrument publish/deliver, queue depth, evictions, inflight, retained/subs gauges in hub.rs
-    status: planned
+    status: in-progress
+    notes: publish_received/delivered (by qos) + publish_dropped (queue-overflow) wired in hub.rs via attach_metrics; the deliver-latency histogram and the sessions/retained/subs/inflight gauges remain
   - id: 0020-T5
     title: Instrument listener accepts/errors in main.rs
     status: planned
@@ -27,10 +28,14 @@ tasks:
     status: planned
   - id: 0020-T7
     title: Cardinality discipline (no per-client/per-topic labels; fixed small label sets)
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: all label families are fixed small sets (protocol/qos/reason/version); metrics.rs no_unbounded_label_keys_are_used + hub publish_round_trip asserts no client=/topic= labels
   - id: 0020-T8
     title: Tests (valid exposition render; publish round-trip moves counters; assert no high-cardinality labels)
-    status: planned
+    status: done
+    date: 2026-06-22
+    evidence: metrics.rs render_produces_valid_openmetrics_exposition; hub publish_round_trip_moves_the_metrics_counters; no-high-cardinality assertions in both
   - id: 0020-T9
     title: Later OpenTelemetry/OTLP export behind the same registry
     status: deferred
@@ -66,11 +71,11 @@ stable id used by commits, tests, and the dashboard.
 | 0020-T1 | ✅ done | 2026-06-22 | mqtt-observability/src/metrics.rs Metrics (prometheus-client 0.22, registry with_prefix mqttd) + render(); render_produces_valid_openmetrics_exposition; counters_and_gauges_move_and_render; no_unbounded_label_keys_are_used; cargo deny clean |
 | 0020-T2 | ✅ done | 2026-06-22 | health.rs route /metrics -> Metrics::render() (OpenMetrics content-type); HealthState::with_metrics; main.rs builds Metrics + MQTTD_METRICS_BIND separate listener; metrics_endpoint_serves_exposition_when_enabled; unknown_paths_are_404 (disabled case) |
 | 0020-T3 | ⬜ planned | — |  |
-| 0020-T4 | ⬜ planned | — |  |
+| 0020-T4 | 🚧 in-progress | — | publish_received/delivered (by qos) + publish_dropped (queue-overflow) wired in hub.rs via attach_metrics; the deliver-latency histogram and the sessions/retained/subs/inflight gauges remain |
 | 0020-T5 | ⬜ planned | — |  |
 | 0020-T6 | ⬜ planned | — |  |
-| 0020-T7 | ⬜ planned | — |  |
-| 0020-T8 | ⬜ planned | — |  |
+| 0020-T7 | ✅ done | 2026-06-22 | all label families are fixed small sets (protocol/qos/reason/version); metrics.rs no_unbounded_label_keys_are_used + hub publish_round_trip asserts no client=/topic= labels |
+| 0020-T8 | ✅ done | 2026-06-22 | metrics.rs render_produces_valid_openmetrics_exposition; hub publish_round_trip_moves_the_metrics_counters; no-high-cardinality assertions in both |
 | 0020-T9 | 💤 deferred | — | explicitly out of scope now; addable later without changing instrumentation per the ADR |
 <!-- /status-table:0020 -->
 

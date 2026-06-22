@@ -130,21 +130,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let connections = tokio_util::task::TaskTracker::new();
 
+    // Prometheus metrics (ADR 0020), built once and shared (Arc) into the hub (publish/
+    // deliver counts), the connections, and the health server's /metrics endpoint.
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new(env!(
+        "CARGO_PKG_VERSION"
+    )));
+
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
     // QoS-2 dedup window (ADR 0007 §5).
-    let (hub_tx, store, durable_plane, lease_driver) = start_hub(&node_id, &placement).await?;
+    let (hub_tx, store, durable_plane, lease_driver) =
+        start_hub(&node_id, &placement, &metrics).await?;
 
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
-    // Prometheus metrics (ADR 0020), served on /metrics. (Hot-path instrumentation is wired
-    // into the hub/connection/cluster code in later steps; the registry + build_info serve now.)
-    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new(env!(
-        "CARGO_PKG_VERSION"
-    )));
-    let draining = start_health_from_env(&hub_tx, &placement, durable_plane, metrics).await?;
+    let draining =
+        start_health_from_env(&hub_tx, &placement, durable_plane, metrics.clone()).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -380,6 +383,7 @@ type HubHandle = (
 async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
+    metrics: &Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<HubHandle, Box<dyn std::error::Error>> {
     // Claim the data directory for this node (ADR 0018 phase 5): refuse to open another
     // node's persistent state, before any store touches disk.
@@ -420,6 +424,7 @@ async fn start_hub(
         if let Some(dir) = &data_dir {
             hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
         }
+        hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(plane_for_health), Some(driver)))
     } else if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
@@ -443,16 +448,18 @@ async fn start_hub(
             Some(placement.clone()),
         );
         hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
+        hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     } else {
         let store: Arc<dyn SessionStore> =
             Arc::new(MemorySessionStore::with_limits(queue_limits_from_env()?));
-        let (hub, hub_tx) = hub::Hub::with_config_and_placement(
+        let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
             node_id.clone(),
             store.clone(),
             Some(placement.clone()),
         );
+        hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     }

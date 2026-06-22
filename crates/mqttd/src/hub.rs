@@ -503,6 +503,17 @@ pub struct Hub {
     /// to the latest `conn_id` (ADR 0017). A `SessionRecovered` whose `conn_id` no longer
     /// matches was superseded by a newer connect and is dropped (last-writer-wins).
     connecting: HashMap<ClientId, u64>,
+    /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+}
+
+/// Map a `QoS` to its wire numeric (0/1/2) for the `{qos}` metric label.
+fn qos_num(qos: QoS) -> u8 {
+    match qos {
+        QoS::AtMostOnce => 0,
+        QoS::AtLeastOnce => 1,
+        QoS::ExactlyOnce => 2,
+    }
 }
 
 impl Hub {
@@ -558,6 +569,7 @@ impl Hub {
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
+                metrics: None,
             },
             tx,
         )
@@ -575,6 +587,12 @@ impl Hub {
     /// phase 4).
     pub fn attach_retained_store(&mut self, retained: Box<dyn RetainedStore>) {
         self.retained = retained;
+    }
+
+    /// Attach the Prometheus metrics registry before [`run`](Self::run) so the hub records
+    /// publish/deliver/drop counts (ADR 0020).
+    pub fn attach_metrics(&mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Run the hub event loop: dispatch commands and periodically sweep expired
@@ -635,6 +653,9 @@ impl Hub {
                 retain,
                 message_expiry,
             } => {
+                if let Some(m) = &self.metrics {
+                    m.publish_received(qos_num(qos));
+                }
                 self.publish(&topic, &payload, qos, retain, message_expiry)
                     .await;
             }
@@ -1103,6 +1124,9 @@ impl Hub {
         };
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             self.send_to_client(client, &tx, &message, false, message_expiry);
+            if let Some(m) = &self.metrics {
+                m.publish_delivered(qos_num(qos));
+            }
         } else if self.is_persistent(client) {
             // Offline but persistent: queue for replay on reconnect. The absolute
             // deadline (ADR 0009 §3) is receipt time plus the interval. The queue is
@@ -1116,10 +1140,16 @@ impl Hub {
                 Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
                     warn!(client = %client.0, evicted, topic = %topic,
                           "offline queue full: evicted oldest message(s)");
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("queue-overflow");
+                    }
                 }
                 Ok(Enqueued::Rejected) => {
                     warn!(client = %client.0, topic = %topic,
                           "offline queue full: dropped message (reject-newest)");
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("queue-overflow");
+                    }
                 }
                 Ok(Enqueued::Stored { .. }) => {}
                 Err(e) => {
@@ -2086,6 +2116,43 @@ mod tests {
             filters: vec![(filter.into(), qos)],
         })
         .unwrap();
+    }
+
+    /// ADR 0020 (T8): a publish round-trip moves the metrics counters — the received and
+    /// delivered counters both advance for the `QoS`, observable in the rendered exposition.
+    #[tokio::test]
+    async fn publish_round_trip_moves_the_metrics_counters() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let (mut out_rx, _) = attach_full(&tx, "sub", 1, true, 0, u16::MAX).await;
+        subscribe(&tx, "sub", "t/1");
+        publish(&tx, "t/1", b"hi"); // QoS 0
+
+        // Receiving the delivered PUBLISH proves the publish was processed (counters moved).
+        let pkt = timeout(Duration::from_millis(500), out_rx.recv())
+            .await
+            .expect("delivery")
+            .expect("a packet");
+        assert!(matches!(pkt, Packet::Publish(_)));
+
+        let out = metrics.render();
+        assert!(
+            out.contains("mqttd_publish_received_total{qos=\"0\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_publish_delivered_total{qos=\"0\"} 1"),
+            "{out}"
+        );
+        // No per-client/per-topic label leaked onto the message metrics.
+        assert!(!out.contains("client="), "{out}");
+        assert!(!out.contains("topic="), "{out}");
     }
 
     fn publish_qos1(tx: &HubTx, topic: &str, payload: &'static [u8]) {

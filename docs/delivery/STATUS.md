@@ -27,7 +27,7 @@
 | 0017 | Durable attach waits for an authoritative session, never downgrades | Accepted | 8/9 done | 1 deferred |
 | 0018 | On-disk persistence for durable state | Accepted | 7/8 done | 1 deferred |
 | 0019 | Graceful shutdown and connection draining | Accepted | 7/9 done | 2 deferred |
-| 0020 | Metrics and runtime observability | Accepted | 2/9 done | 6 open, 1 deferred |
+| 0020 | Metrics and runtime observability | Accepted | 4/9 done | 4 open, 1 deferred |
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
@@ -131,11 +131,9 @@
 **0020 — Metrics and runtime observability**
 
 - `0020-T3` ⬜ planned: Instrument connections/handshakes/auth/ACL/keepalive in conn.rs
-- `0020-T4` ⬜ planned: Instrument publish/deliver, queue depth, evictions, inflight, retained/subs gauges in hub.rs
+- `0020-T4` 🚧 in-progress: Instrument publish/deliver, queue depth, evictions, inflight, retained/subs gauges in hub.rs — publish_received/delivered (by qos) + publish_dropped (queue-overflow) wired in hub.rs via attach_metrics; the deliver-latency histogram and the sessions/retained/subs/inflight gauges remain
 - `0020-T5` ⬜ planned: Instrument listener accepts/errors in main.rs
 - `0020-T6` ⬜ planned: Instrument cluster (members/states, peer links, lease role/epoch, durable append latency/failures)
-- `0020-T7` ⬜ planned: Cardinality discipline (no per-client/per-topic labels; fixed small label sets)
-- `0020-T8` ⬜ planned: Tests (valid exposition render; publish round-trip moves counters; assert no high-cardinality labels)
 - `0020-T9` 💤 deferred: Later OpenTelemetry/OTLP export behind the same registry — explicitly out of scope now; addable later without changing instrumentation per the ADR
 
 **0021 — Bounded lease-consensus voter set**
