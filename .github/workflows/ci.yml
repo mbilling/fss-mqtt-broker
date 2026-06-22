@@ -24,7 +24,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
       - name: Test
-        run: cargo test --all
+        shell: bash
+        run: |
+          # Run every test (no fail-fast so all failures surface at once), tee the
+          # output, then re-emit failing test names and panic sites as ::error::
+          # annotations. Annotations are visible in the run UI and via the check-run
+          # annotations API without repo-admin access, so a flaky failure is
+          # diagnosable from the API alone.
+          set +e
+          cargo test --all --no-fail-fast 2>&1 | tee test-output.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -E '^test .+ \.\.\. FAILED' test-output.txt | sort -u \
+              | sed 's/^/::error title=Test failed::/' || true
+            grep -E 'panicked at .+' test-output.txt | sort -u | head -n 20 \
+              | sed 's/^/::error title=Panic::/' || true
+          fi
+          exit "$code"
 
   docs:
     name: delivery dashboard
