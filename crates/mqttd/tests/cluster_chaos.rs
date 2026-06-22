@@ -187,8 +187,11 @@ async fn retained_message_replicates_across_nodes() {
     let mut pubr = Client::connect_v5_ok(b, "ret-pub").await;
     let _ = route(&mut pubr, &mut warmup, "warmup", b"up", QoS::AtMostOnce).await;
 
-    // Retain a message on node B.
-    pubr.publish_retained("only/here", b"r").await;
+    // Retain a message on node B. QoS 1 + PUBACK: the retain-store command is enqueued
+    // on B's hub before we subscribe below, so the subscriber observes it via
+    // retained-replay (retain=1) rather than racing the store and getting a live
+    // (retain=0) delivery — the source of an intermittent CI failure on this assert.
+    pubr.publish_retained_acked("only/here", b"r", 1).await;
 
     // A subscriber on the same node (B) receives it immediately.
     let mut same_node = Client::connect_v5_ok(b, "same-node").await;
@@ -220,7 +223,9 @@ async fn retained_back_fills_a_node_that_joins_after_the_publish() {
     // Node A is up alone; retain a message before any peer exists.
     let a = start_node("a").await;
     let mut pubr = Client::connect_v5_ok(a.client_addr, "ret-pub").await;
-    pubr.publish_retained("history/t", b"r").await;
+    // Acked so A has the retained message stored before node B links and pulls the
+    // retained snapshot (ADR 0014 §3) — otherwise the snapshot could race the store.
+    pubr.publish_retained_acked("history/t", b"r", 1).await;
 
     // Node B joins the cluster *after* the publish and links to A. On link-up A
     // sends B its retained snapshot, so B back-fills (ADR 0014 §3) — a subscriber

@@ -589,6 +589,25 @@ impl Client {
         .await;
     }
 
+    /// Publish a retained message at `QoS` 1 and wait for the PUBACK. The ack is sent
+    /// only after the connection has forwarded the PUBLISH to the hub, so by the time
+    /// it returns the retain-store command sits ahead of any later command in the hub's
+    /// FIFO queue. Use this (not the `QoS` 0 variant) when a subscribe that must observe
+    /// the retained message follows: it removes the store-vs-subscribe race.
+    pub async fn publish_retained_acked(&mut self, topic: &str, payload: &[u8], pkid: u16) {
+        self.send(&Packet::Publish(Publish {
+            properties: Properties::new(),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            topic: topic.into(),
+            pkid: Some(pkid),
+            payload: bytes::Bytes::copy_from_slice(payload),
+        }))
+        .await;
+        assert_eq!(self.recv().await, Packet::PubAck(pkid.into()));
+    }
+
     pub async fn puback(&mut self, pkid: u16) {
         self.send(&Packet::PubAck(pkid.into())).await;
     }

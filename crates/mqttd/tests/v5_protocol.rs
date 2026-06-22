@@ -198,7 +198,9 @@ async fn v5_shared_subscription_round_robins_one_member_each() {
 async fn v5_shared_subscription_skips_retained_but_ordinary_gets_it() {
     let addr = start_broker().await;
     let mut pubr = Client::connect_v5_ok(addr, "ret-pub").await;
-    pubr.publish_retained("t", b"r").await;
+    // Acked so the retained message is stored before the ordinary subscriber below
+    // subscribes, which must observe it via retained-replay (retain=1).
+    pubr.publish_retained_acked("t", b"r", 1).await;
 
     let mut shared = Client::connect_v5_ok(addr, "ret-shared").await;
     shared.subscribe(1, "$share/g/t", QoS::AtMostOnce).await;
