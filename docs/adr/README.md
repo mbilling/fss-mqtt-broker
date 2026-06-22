@@ -41,3 +41,4 @@ conventions.
 | [0019](0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [delivery](../delivery/0019-graceful-shutdown.md) |
 | [0020](0020-metrics-and-observability.md) | Metrics and runtime observability (Prometheus) | Proposed | [delivery](../delivery/0020-metrics-and-observability.md) |
 | [0021](0021-bounded-lease-voters.md) | Bounded lease-consensus voter set (small fixed quorum + learners) | Proposed | [delivery](../delivery/0021-bounded-lease-voters.md) |
+| [0022](0022-signed-gossip.md) | Per-node signed gossip (authenticated SWIM identity) | Accepted | [delivery](../delivery/0022-signed-gossip.md) |

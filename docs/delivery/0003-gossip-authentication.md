@@ -42,8 +42,8 @@ tasks:
     notes: SwimAuth holds a single key; rotation requires a cluster restart until a dual-key window is added
   - id: 0003-T9
     title: Derive the gossip key from cluster-CA material instead of a second secret
-    status: deferred
-    notes: gossip key is a standalone MQTTD_SWIM_KEY secret; no derivation from cluster-CA material exists
+    status: cut
+    notes: cryptographically unsound — the CA cert is public, so a key derived from it is not secret; the secure realisation (per-node signatures over the PKI) moved to ADR 0022
 ---
 
 # Delivery — ADR 0003: Gossip-plane authentication: keyed MAC on SWIM datagrams
@@ -81,7 +81,7 @@ and the dashboard.
 | 0003-T6 | 💤 deferred | — | drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability) |
 | 0003-T7 | 💤 deferred | — | deferred until operational experience shows the transient-refutation cost matters; no nonce/window logic in swim_auth/swim_driver |
 | 0003-T8 | 💤 deferred | — | SwimAuth holds a single key; rotation requires a cluster restart until a dual-key window is added |
-| 0003-T9 | 💤 deferred | — | gossip key is a standalone MQTTD_SWIM_KEY secret; no derivation from cluster-CA material exists |
+| 0003-T9 | ✂️ cut | — | cryptographically unsound — the CA cert is public, so a key derived from it is not secret; the secure realisation (per-node signatures over the PKI) moved to ADR 0022 |
 <!-- /status-table:0003 -->
 
 ## Changelog

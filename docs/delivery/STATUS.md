@@ -10,7 +10,7 @@
 |-----|-------|----------|-------|-----------------|
 | 0001 | Session durability in a horizontally-scalable cluster | Accepted | 8/11 done | 3 deferred |
 | 0002 | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | 7/10 done | 3 deferred |
-| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 5/9 done | 4 deferred |
+| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 5/9 done | 3 deferred |
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
 | 0006 | Consensus & replication for durable sessions | Accepted | 10/11 done | 1 deferred |
@@ -29,6 +29,7 @@
 | 0019 | Graceful shutdown and connection draining | Accepted | 7/9 done | 2 deferred |
 | 0020 | Metrics and runtime observability | Proposed | 0/9 done | 8 open, 1 deferred |
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
+| 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 0/7 done | 5 open, 2 deferred |
 
 ## Open and deferred work
 
@@ -49,7 +50,6 @@
 - `0003-T6` 💤 deferred: Rejected-datagram metrics counter (operator signal for dropped gossip) — drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability)
 - `0003-T7` 💤 deferred: Anti-replay window / per-peer nonces — deferred until operational experience shows the transient-refutation cost matters; no nonce/window logic in swim_auth/swim_driver
 - `0003-T8` 💤 deferred: Zero-downtime key rotation (dual-key acceptance window) — SwimAuth holds a single key; rotation requires a cluster restart until a dual-key window is added
-- `0003-T9` 💤 deferred: Derive the gossip key from cluster-CA material instead of a second secret — gossip key is a standalone MQTTD_SWIM_KEY secret; no derivation from cluster-CA material exists
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 
@@ -152,3 +152,13 @@
 - `0021-T7` ⬜ planned: Pure policy tests (>N -> exactly N voters; dead voter replaced by lowest-id learner; high-id join no voter change; learner-owner reads lease; N>cluster all-voters; N=1 single voter)
 - `0021-T8` ⬜ planned: Integration - 5+-node durable cluster with bounded voter set; learner-owned session survives a non-voter and a voter failure
 - `0021-T9` ⬜ planned: Re-run openraft storage conformance (asserted unaffected)
+
+**0022 — Per-node signed gossip (authenticated SWIM identity)**
+
+- `0022-P1` ⬜ planned: Crypto core — load node signing key; sign payload; verify cert chains to CA + extract CN + verify signature
+- `0022-P2` ⬜ planned: Wire format v2 in swim_auth — optional signer/verifier, seal/open, KAT pinning, v1 still understood
+- `0022-P3` ⬜ planned: Driver binds identity — open returns authenticated CN; swim_driver enforces CN == SWIM from
+- `0022-P4` ⬜ planned: mqttd wiring — retain CA/cert/key material, build signer/verifier, MQTTD_SWIM_SIGNED mode + startup guards
+- `0022-P5` ⬜ planned: Over-the-wire integration test — signed gossip accepted; forged from rejected; prefer-mode accepts v1
+- `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
+- `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
