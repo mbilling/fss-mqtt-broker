@@ -1565,10 +1565,7 @@ mod tests {
         let mut writer = FrameWriter::new(wh, V4);
 
         // Anonymous CONNECT against a policy that forbids it: rejected at the gate.
-        writer
-            .send(&connect_packet("anon", true))
-            .await
-            .unwrap();
+        writer.send(&connect_packet("anon", true)).await.unwrap();
         assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
         drop(writer);
         drop(reader);
