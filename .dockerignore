@@ -1,0 +1,5 @@
+# Keep the Docker build context small: never ship build artifacts or VCS state.
+target/
+.git/
+**/*.redb
+demo/grafana/data/

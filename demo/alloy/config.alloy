@@ -1,0 +1,43 @@
+// Grafana Alloy: the observability agent for the demo.
+//
+// Two metric paths, both ending in Prometheus (via remote_write):
+//   1. Scrape each broker's Prometheus /metrics endpoint  -> mqttd_* series.
+//   2. Receive the brokers' OTLP/HTTP push and convert it  -> same measurements,
+//      proving the broker's OTLP exporter end-to-end.
+// The provided dashboard queries the scraped mqttd_* names (stable, prefixed).
+
+// --- 1. Scrape the three brokers' /metrics --------------------------------------
+prometheus.scrape "brokers" {
+	targets = [
+		{ __address__ = "mqttd-1:8080", instance = "mqttd-1" },
+		{ __address__ = "mqttd-2:8080", instance = "mqttd-2" },
+		{ __address__ = "mqttd-3:8080", instance = "mqttd-3" },
+	]
+	metrics_path    = "/metrics"
+	scrape_interval = "5s"
+	forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+// --- 2. Receive the brokers' OTLP push and forward it to Prometheus -------------
+otelcol.receiver.otlp "default" {
+	http {
+		endpoint = "0.0.0.0:4318"
+	}
+	grpc {
+		endpoint = "0.0.0.0:4317"
+	}
+	output {
+		metrics = [otelcol.exporter.prometheus.otlp.input]
+	}
+}
+
+otelcol.exporter.prometheus "otlp" {
+	forward_to = [prometheus.remote_write.default.receiver]
+}
+
+// --- Sink: Prometheus remote-write ----------------------------------------------
+prometheus.remote_write "default" {
+	endpoint {
+		url = "http://prometheus:9090/api/v1/write"
+	}
+}

@@ -246,6 +246,14 @@ MQTTD_HEALTH_BIND=0.0.0.0:8080 MQTTD_OTLP_ENDPOINT=http://localhost:4318 \
   cargo run --bin mqttd
 ```
 
+For a turnkey view of all of this, [`demo/`](demo/) brings up a **3-node durable cluster**
+with **Grafana + Prometheus + Alloy** and a provisioned dashboard covering every metric —
+both the Prometheus scrape and the OTLP push paths:
+
+```sh
+cd demo && docker compose up --build   # then http://localhost:3000
+```
+
 ## Architecture decisions
 
 Every significant decision is recorded as an ADR. See the

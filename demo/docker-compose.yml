@@ -1,0 +1,111 @@
+name: mqttd-demo
+
+# A 3-node durable mqttd cluster plus a Grafana / Prometheus / Alloy observability
+# stack. Each broker BOTH exposes Prometheus /metrics (scraped by Alloy) and pushes
+# OTLP/HTTP to Alloy — so both metric paths are exercised. A small load generator
+# drives cross-node traffic so the dashboard is populated.
+#
+#   cd demo && docker compose up --build
+#   Grafana:    http://localhost:3000  (anonymous admin) -> "mqttd — broker overview"
+#   Prometheus: http://localhost:9090
+#   Alloy UI:   http://localhost:12345
+#   MQTT:       localhost:1883 / 1884 / 1885
+
+x-broker-env: &broker-env
+  MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext, loudly logged insecure
+  MQTTD_HEALTH_BIND: 0.0.0.0:8080      # serves /livez, /readyz, /metrics
+  MQTTD_DURABLE_SESSIONS: "1"          # consensus-backed sessions -> lease/durable metrics
+  MQTTD_DATA_DIR: /data
+  MQTTD_OTLP_ENDPOINT: http://alloy:4318
+  MQTTD_OTLP_INTERVAL: "5"
+  MQTTD_READY_MIN_MEMBERS: "3"
+  RUST_LOG: info
+
+services:
+  mqttd-1:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    image: mqttd-demo
+    hostname: mqttd-1
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-1
+      MQTTD_PEER_BIND: mqttd-1:7001    # advertised to peers -> must be resolvable
+      MQTTD_SWIM_BIND: mqttd-1:7946    # founder: no SWIM seeds
+    ports: ["1883:1883", "8080:8080"]
+    volumes: ["mqttd-1-data:/data"]
+    depends_on: [alloy]
+
+  mqttd-2:
+    image: mqttd-demo
+    hostname: mqttd-2
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-2
+      MQTTD_PEER_BIND: mqttd-2:7001
+      MQTTD_SWIM_BIND: mqttd-2:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1884:1883", "8081:8080"]
+    volumes: ["mqttd-2-data:/data"]
+    depends_on: [mqttd-1]
+
+  mqttd-3:
+    image: mqttd-demo
+    hostname: mqttd-3
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-3
+      MQTTD_PEER_BIND: mqttd-3:7001
+      MQTTD_SWIM_BIND: mqttd-3:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1885:1883", "8082:8080"]
+    volumes: ["mqttd-3-data:/data"]
+    depends_on: [mqttd-1]
+
+  alloy:
+    image: grafana/alloy:latest
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+    ports: ["12345:12345"]
+    depends_on: [prometheus]
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  loadgen:
+    image: eclipse-mosquitto:latest
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/loadgen.sh"]
+    volumes:
+      - ./loadgen/loadgen.sh:/loadgen.sh:ro
+    depends_on: [mqttd-1, mqttd-2, mqttd-3]
+
+volumes:
+  mqttd-1-data: {}
+  mqttd-2-data: {}
+  mqttd-3-data: {}
