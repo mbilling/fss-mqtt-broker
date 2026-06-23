@@ -105,8 +105,12 @@ async fn v5_session_expires_after_interval() {
     sub.subscribe(1, "t", QoS::AtMostOnce).await;
     sub.disconnect().await;
 
-    // Wait past the 1s interval plus the 1s sweep cadence (ADR 0009).
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Wait past the 1s interval plus the 1s sweep cadence (ADR 0009), with margin for
+    // a loaded CI runner where the sweep interval can slip. Probing earlier is not an
+    // option: reconnecting to this client id would cancel the pending expiry. The
+    // expiry *logic* is covered deterministically by the paused-time unit tests; this
+    // only confirms the end-to-end wire path, so a generous fixed wait is fine.
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
     let (_sub, ack) = Client::connect_v5(
         addr,

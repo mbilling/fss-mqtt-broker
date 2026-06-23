@@ -458,34 +458,51 @@ async fn a_replayed_v3_datagram_is_dropped() {
         kind: Kind::Ping { seq: 1 },
         gossip: vec![],
     };
-    // One datagram at anti-replay sequence 1, delivered twice.
+    // One datagram at anti-replay sequence 1.
     let datagram = sender.seal_sequenced(&bincode::serialize(&ping).unwrap(), 1);
-    sock.send_to(&datagram, &victim_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    sock.send_to(&datagram, &victim_addr).await.unwrap();
-
-    // Count the Acks the victim sends back over a window; the replay yields none.
     let opener = signed_auth(key, "x"); // its verifier opens the victim's v3 replies
-    let mut acks = 0;
     let mut buf = vec![0u8; 64 * 1024];
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Ok(Ok((n, _))) =
-            tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await
-        {
-            if let Some(o) = opener.open(&buf[..n]) {
-                if let Ok(m) = bincode::deserialize::<Message>(o.payload) {
-                    if matches!(m.kind, Kind::Ack { .. }) {
-                        acks += 1;
-                    }
+
+    // Deliver the fresh Ping and wait for the victim's Ack. The Ack is the causal
+    // proof that the victim processed the datagram and recorded sequence 1 in its
+    // replay window — so the replay below cannot race ahead of that bookkeeping (no
+    // fixed inter-send sleep to guess at).
+    sock.send_to(&datagram, &victim_addr).await.unwrap();
+    assert!(
+        recv_ack(&sock, &opener, &mut buf, Duration::from_secs(2)).await,
+        "the fresh Ping must be Acked"
+    );
+
+    // Replay the exact same datagram; the window must drop it, so no further Ack
+    // arrives in a bounded window (an erroneous accept would Ack within milliseconds).
+    sock.send_to(&datagram, &victim_addr).await.unwrap();
+    assert!(
+        !recv_ack(&sock, &opener, &mut buf, Duration::from_millis(500)).await,
+        "the replayed Ping must be dropped (no second Ack)"
+    );
+
+    victim.handle.abort();
+}
+
+/// Wait up to `within` for the victim to send back an Ack (its `v3` reply, opened
+/// with `opener`), returning whether one arrived. The victim's own probe Pings are
+/// ignored — only Acks count.
+async fn recv_ack(sock: &UdpSocket, opener: &SwimAuth, buf: &mut [u8], within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let Ok(Ok((n, _))) = tokio::time::timeout(remaining, sock.recv_from(buf)).await else {
+            return false; // window elapsed with no datagram
+        };
+        if let Some(o) = opener.open(&buf[..n]) {
+            if let Ok(m) = bincode::deserialize::<Message>(o.payload) {
+                if matches!(m.kind, Kind::Ack { .. }) {
+                    return true;
                 }
             }
         }
     }
-    assert_eq!(
-        acks, 1,
-        "exactly one Ack — the replayed Ping must be dropped"
-    );
-
-    victim.handle.abort();
 }
