@@ -17,8 +17,12 @@ x-broker-env: &broker-env
                                        # deny-by-default, so anonymous clients (the loadgen)
                                        # must be explicitly permitted (ADR 0004)
   MQTTD_HEALTH_BIND: 0.0.0.0:8080      # serves /livez, /readyz, /metrics
-  MQTTD_DURABLE_SESSIONS: "1"          # consensus-backed sessions -> lease/durable metrics
-  MQTTD_DATA_DIR: /data
+  # Ephemeral (in-memory) sessions: the SWIM-clustered default. This keeps the demo
+  # robust — it avoids the durable lease group, which currently churns at 3 nodes
+  # (the all-voters reconciler; bounded voters are ADR 0021, still Proposed). The
+  # lease_* and durable_append_* dashboard panels are therefore empty here; enable
+  # MQTTD_DURABLE_SESSIONS=1 + a per-node MQTTD_DATA_DIR to exercise them once that
+  # stability issue is fixed.
   MQTTD_OTLP_ENDPOINT: http://alloy:4318
   MQTTD_OTLP_INTERVAL: "5"
   MQTTD_READY_MIN_MEMBERS: "3"
@@ -37,7 +41,6 @@ services:
       MQTTD_PEER_BIND: mqttd-1:7001    # advertised to peers -> must be resolvable
       MQTTD_SWIM_BIND: mqttd-1:7946    # founder: no SWIM seeds
     ports: ["1883:1883", "8080:8080"]
-    volumes: ["mqttd-1-data:/data"]
     depends_on: [alloy]
 
   mqttd-2:
@@ -50,7 +53,6 @@ services:
       MQTTD_SWIM_BIND: mqttd-2:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["1884:1883", "8081:8080"]
-    volumes: ["mqttd-2-data:/data"]
     depends_on: [mqttd-1]
 
   mqttd-3:
@@ -63,7 +65,6 @@ services:
       MQTTD_SWIM_BIND: mqttd-3:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["1885:1883", "8082:8080"]
-    volumes: ["mqttd-3-data:/data"]
     depends_on: [mqttd-1]
 
   alloy:
@@ -107,8 +108,3 @@ services:
     volumes:
       - ./loadgen/loadgen.sh:/loadgen.sh:ro
     depends_on: [mqttd-1, mqttd-2, mqttd-3]
-
-volumes:
-  mqttd-1-data: {}
-  mqttd-2-data: {}
-  mqttd-3-data: {}

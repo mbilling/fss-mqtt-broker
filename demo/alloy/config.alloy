@@ -15,6 +15,7 @@ prometheus.scrape "brokers" {
 	]
 	metrics_path    = "/metrics"
 	scrape_interval = "5s"
+	scrape_timeout  = "3s" // must be <= scrape_interval
 	forward_to      = [prometheus.remote_write.default.receiver]
 }
 

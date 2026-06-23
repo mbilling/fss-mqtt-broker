@@ -48,10 +48,14 @@ Both metric paths are live:
   graph, or `docker compose logs alloy`. This exercises the broker's in-process OTLP
   exporter end to end.
 
-The cluster runs **durable sessions** so the lease and durable-append metrics populate:
-`mqttd-1` is the founder that bootstraps the lease group; `mqttd-2`/`mqttd-3` join via
-SWIM and become voters. Expect `cluster_members = 3`, `peer_links = 2` per node, one node
-with `lease_leader = 1`, and a rising `lease_epoch`.
+The cluster runs **ephemeral (in-memory) sessions** — SWIM-clustered but without the durable
+lease group. Expect `cluster_members = 3`, `peer_links = 2` per node, and `members{alive} = 3`.
+
+> The `lease_*` and `durable_append_*` panels are intentionally empty here: they only exist
+> in **durable** mode (`MQTTD_DURABLE_SESSIONS=1`), which is disabled because the all-voters
+> lease group currently churns at 3 nodes (re-electing ~1×/s). Bounded voters — the fix —
+> are ADR 0021, still *Proposed*. Enable durable mode (and a per-node `MQTTD_DATA_DIR`) to
+> exercise those panels once that lands.
 
 The **loadgen** keeps a persistent QoS-1 subscriber on node-2 and publishes QoS-1 +
 retained messages on node-1, so publishes route **across nodes** — populating
