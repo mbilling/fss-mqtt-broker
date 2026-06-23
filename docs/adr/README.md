@@ -44,3 +44,4 @@ conventions.
 | [0022](0022-signed-gossip.md) | Per-node signed gossip (authenticated SWIM identity) | Accepted | [delivery](../delivery/0022-signed-gossip.md) |
 | [0023](0023-gossip-anti-replay.md) | Gossip anti-replay (persisted monotonic sequence + sliding window) | Accepted | [delivery](../delivery/0023-gossip-anti-replay.md) |
 | [0024](0024-deterministic-testing.md) | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | [delivery](../delivery/0024-deterministic-testing.md) |
+| [0025](0025-boundary-bridge.md) | Boundary MQTT bridge to brokers in other security zones | Proposed | [delivery](../delivery/0025-boundary-bridge.md) |

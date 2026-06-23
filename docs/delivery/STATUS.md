@@ -32,6 +32,7 @@
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 | 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
+| 0025 | Boundary MQTT bridge to brokers in other security zones | Proposed | 0/11 done | 11 open |
 
 ## Open and deferred work
 
@@ -145,3 +146,17 @@
 **0024 — Deterministic testing: inject time, synchronize causally, gate in CI**
 
 - `0024-T7` 💤 deferred: Deterministic simulation harness (madsim/turmoil-style) for seed-reproducible cluster ordering races — the gold standard for distributed ordering races, but a large investment; per-test causal barriers (T5) and bounded poll-retry close the flakes seen today without it. Revisit if cluster-ordering flakes recur or a seed-reproducible failure is needed.
+
+**0025 — Boundary MQTT bridge to brokers in other security zones**
+
+- `0025-T1` ⬜ planned: New mqtt-bridge crate and binary skeleton (MQTT client built on mqtt-codec/mqtt-net)
+- `0025-T2` ⬜ planned: Config model and validation (upstreams, per-rule direction/filter/remap/qos, deny-by-default)
+- `0025-T3` ⬜ planned: Client engine (connect cluster + each upstream over TLS/mTLS, subscribe/publish, reconnect with backoff)
+- `0025-T4` ⬜ planned: Directional forwarding and topic remap; a one-way rule never opens the reverse path in code
+- `0025-T5` ⬜ planned: Loop prevention (MQTT5 origin user-property backstop + remap discipline)
+- `0025-T6` ⬜ planned: HA via cluster-side shared subscriptions and a persistent session (dedup across instances)
+- `0025-T7` ⬜ planned: Bounded disk-backed store-and-forward spool for transient outages, replayed on reconnect
+- `0025-T8` ⬜ planned: Per-side least-privilege credentials (publish-only/subscribe-only) and per-upstream mTLS identity + audit
+- `0025-T9` ⬜ planned: Bridge observability (forwarded/dropped per upstream+direction, lag, reconnects) via mqtt-observability + OTLP
+- `0025-T10` ⬜ planned: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
+- `0025-T11` ⬜ planned: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
