@@ -505,6 +505,9 @@ pub struct Hub {
     connecting: HashMap<ClientId, u64>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    /// Wall-clock source for absolute message-expiry deadlines (ADR 0009 §3).
+    /// Injectable so expiry can be tested without real time passing.
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 /// Map a `QoS` to its wire numeric (0/1/2) for the `{qos}` metric label.
@@ -570,6 +573,7 @@ impl Hub {
                 remote_interest: HashMap::new(),
                 placement,
                 metrics: None,
+                clock: crate::clock::system_clock(),
             },
             tx,
         )
@@ -593,6 +597,13 @@ impl Hub {
     /// publish/deliver/drop counts (ADR 0020).
     pub fn attach_metrics(&mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Replace the wall-clock source before [`run`](Self::run). Production uses the
+    /// default system clock; tests inject a controllable clock so absolute
+    /// message-expiry deadlines (ADR 0009 §3) can be exercised without real time.
+    pub fn attach_clock(&mut self, clock: Arc<dyn crate::clock::Clock>) {
+        self.clock = clock;
     }
 
     /// Run the hub event loop: dispatch commands and periodically sweep expired
@@ -993,7 +1004,7 @@ impl Hub {
         // remaining interval is forwarded on the rest (ADR 0009 §3).
         if !clean_start {
             if let Ok(pending) = self.store.pending(&client, 0, REPLAY_LIMIT).await {
-                let now = now_epoch_secs();
+                let now = self.clock.now_epoch_secs();
                 let mut last = 0;
                 for qm in pending {
                     last = qm.offset;
@@ -1140,7 +1151,8 @@ impl Hub {
             // Offline but persistent: queue for replay on reconnect. The absolute
             // deadline (ADR 0009 §3) is receipt time plus the interval. The queue is
             // bounded (ADR 0001 §6); log when the cap drops messages.
-            let expiry_at = message_expiry.map(|secs| now_epoch_secs() + u64::from(secs));
+            let expiry_at =
+                message_expiry.map(|secs| self.clock.now_epoch_secs() + u64::from(secs));
             match self
                 .store
                 .enqueue_with_expiry(client, &message, expiry_at)
@@ -1474,7 +1486,7 @@ impl Hub {
             Some(inf) if !inf.backlog.is_empty() => inf.backlog.drain(..).collect(),
             _ => return,
         };
-        let now = now_epoch_secs();
+        let now = self.clock.now_epoch_secs();
         for entry in backlog {
             let expiry_at = entry.message_expiry.map(|s| now + u64::from(s));
             if let Err(e) = self
@@ -1805,13 +1817,6 @@ fn publish_packet(
     })
 }
 
-/// The current time in Unix epoch seconds (for absolute message-expiry deadlines).
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Recover a persistent session off the hub command loop and post the result back as
 /// [`HubCommand::SessionRecovered`] (ADR 0017). Run in a spawned task so the bounded
 /// lease/quorum wait never blocks the single-threaded hub.
@@ -1909,6 +1914,41 @@ mod tests {
         let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), std::sync::Arc::new(store));
         tokio::spawn(hub.run());
         tx
+    }
+
+    /// A controllable wall clock for deterministic absolute-deadline tests: time only
+    /// moves when the test calls [`advance`](TestClock::advance).
+    #[derive(Debug, Clone)]
+    struct TestClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    impl TestClock {
+        fn new(start_epoch: u64) -> Self {
+            Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                start_epoch,
+            )))
+        }
+        fn advance(&self, secs: u64) {
+            self.0.fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl crate::clock::Clock for TestClock {
+        fn now_epoch_secs(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Spawn a hub whose wall clock is the returned [`TestClock`], so a test can move
+    /// message-expiry deadlines forward without any real time passing.
+    fn start_hub_with_clock() -> (HubTx, TestClock) {
+        let clock = TestClock::new(1_000_000);
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_clock(std::sync::Arc::new(clock.clone()));
+        tokio::spawn(hub.run());
+        (tx, clock)
     }
 
     fn start_hub_with_arc(store: std::sync::Arc<dyn mqtt_storage::SessionStore>) -> HubTx {
@@ -2585,6 +2625,56 @@ mod tests {
         assert!(
             recv_packet(&mut rx).await.is_none(),
             "only the still-fresh message replays"
+        );
+    }
+
+    /// Time-injected expiry (ADR 0009 §3): a message queued with a finite interval is
+    /// dropped at replay once that interval has actually elapsed — exercised with an
+    /// injected clock, so the real `now + interval` / `now >= deadline` arithmetic is
+    /// tested without the `expiry=0` shortcut or any real wall-clock wait.
+    #[tokio::test]
+    async fn queued_message_expires_once_its_interval_elapses() {
+        let (tx, clock) = start_hub_with_clock();
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+
+        // Enqueue with a 10s interval (deadline = clock now + 10), still fresh.
+        publish_with_expiry(&tx, "t", b"q", Some(10));
+        // Barrier: a round-trip attach flushes the FIFO command queue, so the publish
+        // above is enqueued at the *current* clock before we move it (otherwise the
+        // synchronous advance could race ahead of the async enqueue).
+        let _ = attach(&tx, "barrier", 99, true).await;
+
+        // Move the clock 11s forward: the message is now past its absolute deadline.
+        clock.advance(11);
+
+        let (mut rx, _) = attach(&tx, "p", 2, false).await;
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a message whose interval has elapsed must be dropped at replay"
+        );
+    }
+
+    /// The companion to the above: the same message replays intact when the clock has
+    /// *not* advanced past its deadline — proving the drop is the elapsed time, not the
+    /// queueing itself.
+    #[tokio::test]
+    async fn queued_message_survives_while_its_interval_remains() {
+        let (tx, clock) = start_hub_with_clock();
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+
+        publish_with_expiry(&tx, "t", b"q", Some(10));
+        let _ = attach(&tx, "barrier", 99, true).await; // flush the enqueue (see above)
+        clock.advance(3); // well within the 10s window
+
+        let (mut rx, _) = attach(&tx, "p", 2, false).await;
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"q",
+            "a message still within its interval must replay"
         );
     }
 

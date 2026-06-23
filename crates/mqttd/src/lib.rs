@@ -5,6 +5,7 @@
 //! wrapper that wires in listeners and configuration.
 
 pub mod aliases;
+pub mod clock;
 pub mod cluster;
 pub mod conn;
 pub mod health;
