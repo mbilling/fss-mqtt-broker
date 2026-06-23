@@ -671,7 +671,7 @@ impl Swim {
     /// member without having to out-race a lingering refutation.
     fn prune_tombstones(&mut self, now: u64) {
         self.members
-            .retain(|_, m| m.tombstone_deadline.map_or(true, |d| now < d));
+            .retain(|_, m| m.tombstone_deadline.is_none_or(|d| now < d));
     }
 
     fn expire_suspects(&mut self, now: u64, out: &mut Vec<Action>) {

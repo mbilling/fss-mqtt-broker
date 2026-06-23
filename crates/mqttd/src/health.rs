@@ -154,7 +154,7 @@ impl HealthState {
         let draining = self.draining.load(std::sync::atomic::Ordering::Acquire);
         let ready = !draining
             && live
-            && members.map_or(true, |n| n >= self.min_members)
+            && members.is_none_or(|n| n >= self.min_members)
             && lease_group_ready.unwrap_or(true);
         Report {
             live,
