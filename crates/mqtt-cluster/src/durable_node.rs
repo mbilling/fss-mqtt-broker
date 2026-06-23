@@ -63,6 +63,7 @@ pub async fn build_durable_node(
     placement: Arc<RwLock<Placement>>,
     can_bootstrap: bool,
     data_dir: Option<&std::path::Path>,
+    commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> (
     Arc<dyn SessionStore>,
     DurablePlane,
@@ -78,7 +79,8 @@ pub async fn build_durable_node(
     let lease_store = match data_dir {
         Some(dir) => LeaseStore::open(dir.join("lease.redb")).expect("open the lease store"),
         None => LeaseStore::new(),
-    };
+    }
+    .with_commit_delay(commit_delay);
     let (log_store, state_machine) = Adaptor::new(lease_store.clone());
     let raft: LeaseRaft = Raft::new(
         local,
@@ -180,7 +182,7 @@ mod tests {
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, _plane, _driver) = build_durable_node(node, placement, true, None).await;
+        let (store, _plane, _driver) = build_durable_node(node, placement, true, None, None).await;
 
         let client = ClientId("c".to_string());
         let msg = Message {
@@ -243,7 +245,7 @@ mod tests {
         // --- lifetime #1: bootstrap on disk, become writable ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
         let (store, plane, driver) =
-            build_durable_node(node.clone(), placement, true, Some(dir.path())).await;
+            build_durable_node(node.clone(), placement, true, Some(dir.path()), None).await;
         wait_writable(&store, &client, &msg).await;
 
         // --- teardown: release the on-disk locks (the part ADR 0019 unblocks) ---
@@ -259,7 +261,7 @@ mod tests {
         // --- lifetime #2: a fresh node over the SAME directory recovers and re-leads ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
         let (store, plane, driver) =
-            build_durable_node(node, placement, true, Some(dir.path())).await;
+            build_durable_node(node, placement, true, Some(dir.path()), None).await;
         // Becoming writable again proves the persisted lease store reopened (no
         // "Database already open" lock, no double-init panic) and the node re-led.
         wait_writable(&store, &client, &msg).await;

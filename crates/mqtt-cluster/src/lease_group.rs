@@ -35,11 +35,19 @@ pub type LeaseRaft = openraft::Raft<LeaseConfig>;
 #[must_use]
 pub fn config() -> Arc<Config> {
     Arc::new(
+        // Timing is budgeted for a fsync-on-commit persistent store (ADR 0026): every
+        // raft write (`save_vote`/`append_to_log`) durably commits before it returns, which
+        // costs tens of milliseconds on real disk. The heartbeat and leader-lease window
+        // must comfortably exceed that, or the leader cannot sustain its lease across slow
+        // commits and the group re-elects continuously. These values keep a stable leader
+        // on disk; the cost is failover detection in ~1.5–3s (fine for durable takeover,
+        // which already rebuilds a committed log over seconds). Safety is independent of
+        // these timeouts.
         Config {
             cluster_name: "mqttd-lease".to_string(),
-            heartbeat_interval: 100,
-            election_timeout_min: 300,
-            election_timeout_max: 600,
+            heartbeat_interval: 500,
+            election_timeout_min: 1500,
+            election_timeout_max: 3000,
             ..Default::default()
         }
         .validate()

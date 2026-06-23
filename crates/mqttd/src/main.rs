@@ -433,6 +433,7 @@ async fn start_hub(
             placement.clone(),
             founder,
             data_dir.as_deref().map(Path::new),
+            None, // no commit-latency fault injection in production (ADR 0026)
         )
         .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(

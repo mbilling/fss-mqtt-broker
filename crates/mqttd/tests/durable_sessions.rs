@@ -92,6 +92,17 @@ impl DurableNode {
 /// node assembly), the hub with the plane attached, a plaintext peer listener, and
 /// SWIM membership driving the mesh. A node with no seeds is the founder.
 async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
+    start_durable_node_cfg(id, swim_seeds, None).await
+}
+
+/// As [`start_durable_node`], but injects a per-commit latency into the lease store —
+/// simulating a slow-fsync durable backend so the lease-group timing can be exercised
+/// against it deterministically (ADR 0026).
+async fn start_durable_node_cfg(
+    id: &str,
+    swim_seeds: Vec<String>,
+    commit_delay: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> DurableNode {
     let node_id = NodeId(id.to_string());
     let can_bootstrap = swim_seeds.is_empty();
     let placement = Arc::new(RwLock::new(Placement::new(
@@ -99,8 +110,14 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
         DEFAULT_REPLICAS,
     )));
 
-    let (store, plane, driver) =
-        build_durable_node(node_id.clone(), placement.clone(), can_bootstrap, None).await;
+    let (store, plane, driver) = build_durable_node(
+        node_id.clone(),
+        placement.clone(),
+        can_bootstrap,
+        None,
+        commit_delay,
+    )
+    .await;
     let plane_observer = plane.clone();
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()));
@@ -199,6 +216,64 @@ async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// ADR 0026 persistent-path coverage: a durable lease group must **form and hold a stable
+/// leader** even when the store is slow to commit. A 200ms per-commit latency (simulating a
+/// slow-fsync disk — the condition that made the real demo churn) is injected from the start,
+/// so the write-heavy bring-up (initialize + add each voter, every write an fsync) runs under
+/// it. The relaxed timing (heartbeat 500ms / election 1500–3000ms) tolerates it: the group
+/// converges to one leader and the term settles.
+///
+/// Scope honesty: this is *coverage of the slow-commit write path*, not a deterministic guard
+/// for the churn itself. The demo churn is driven by heartbeat/lease maintenance over a real
+/// network with latency; this harness's in-process router delivers every RPC instantly, and
+/// `commit_delay` only delays the persist path (`save_vote`/`append_to_log`) — empty
+/// steady-state heartbeats never persist, so the latency does not reach the lease-maintenance
+/// path. A true regression guard needs network-latency injection into the raft RPCs (a
+/// madsim/turmoil-style harness — ADR 0024 T7, deferred); the timing fix itself was validated
+/// live in the demo (ADR 0026). This test does prove the persistent write path forms and
+/// serves under injected fsync latency, which the in-memory tests never exercise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn lease_group_forms_and_is_stable_under_slow_durable_commits() {
+    use mqtt_cluster::node_registry::raft_id;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    // The founder must be the *minimum* raft id, or the group never initializes
+    // (lease_membership::decide gates Initialize on `min == self`). Pick it deterministically
+    // so this test exercises the timing, not that fragility (tracked separately — ADR 0026 T-bug).
+    let mut names = ["lease-stab-1", "lease-stab-2", "lease-stab-3"];
+    names.sort_by_key(|n| raft_id(&NodeId((*n).to_string())));
+
+    // 200ms per-commit latency, on from the start so bring-up runs under slow commits.
+    let knob = Arc::new(AtomicU64::new(200));
+    let a = start_durable_node_cfg(names[0], vec![], Some(knob.clone())).await; // founder = min id
+    let b = start_durable_node_cfg(names[1], vec![a.swim_addr.clone()], Some(knob.clone())).await;
+    let c = start_durable_node_cfg(names[2], vec![a.swim_addr.clone()], Some(knob.clone())).await;
+    let nodes = [&a, &b, &c];
+
+    // Under slow commits, the group must converge to exactly one leader.
+    wait_until(Duration::from_secs(40), || {
+        nodes.iter().filter(|n| n.plane.lease_role().0).count() == 1
+    })
+    .await;
+
+    // And the leader holds: the term does not keep climbing over the window.
+    let term_before = nodes.iter().map(|n| n.plane.lease_role().1).max().unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let term_after = nodes.iter().map(|n| n.plane.lease_role().1).max().unwrap();
+    let leaders = nodes.iter().filter(|n| n.plane.lease_role().0).count();
+
+    assert_eq!(
+        leaders, 1,
+        "exactly one leader must remain under slow commits"
+    );
+    assert!(
+        term_after <= term_before + 1,
+        "lease term climbed under slow commits ({term_before} -> {term_after}): \
+         the lease group is re-electing — its raft timing is too tight for the store latency"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

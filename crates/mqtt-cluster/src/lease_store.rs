@@ -110,6 +110,11 @@ pub struct LeaseStore {
     /// `Some` when persisting to disk (ADR 0018 phase 2); `None` for the in-memory
     /// default.
     db: Option<Arc<Database>>,
+    /// Fault injection (ADR 0026): an artificial per-commit delay in **milliseconds**,
+    /// simulating slow-fsync storage deterministically (without a real slow disk) so the
+    /// lease-group timing can be tested against it. Shared + atomic so a test can toggle it
+    /// at runtime (form the group fast, then switch the latency on). `None` in production.
+    commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl LeaseStore {
@@ -117,6 +122,15 @@ impl LeaseStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Inject a shared, runtime-toggleable per-commit delay (ADR 0026 test fault injection),
+    /// simulating a slow-fsync durable store. Applies even to the in-memory variant, so a
+    /// multi-node lease group can be driven against slow-storage latency deterministically.
+    #[must_use]
+    pub fn with_commit_delay(mut self, delay: Option<Arc<std::sync::atomic::AtomicU64>>) -> Self {
+        self.commit_delay = delay;
+        self
     }
 
     /// Open (creating if absent) a **persistent** store at `path`, recovering any prior
@@ -137,6 +151,7 @@ impl LeaseStore {
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             db: Some(Arc::new(db)),
+            commit_delay: None,
         })
     }
 
@@ -155,6 +170,14 @@ impl LeaseStore {
     /// Durably apply a batch of mutations (one fsynced transaction), or a no-op when
     /// in-memory. Runs the blocking `redb` work off the async worker.
     async fn persist(&self, ops: Vec<WriteOp>) -> Result<(), StorageError<NodeId>> {
+        // Simulate slow-storage commit latency before the write is acknowledged (ADR 0026).
+        // openraft awaits this, so the delay reproduces a slow fsync on the raft hot path.
+        if let Some(h) = &self.commit_delay {
+            let ms = h.load(std::sync::atomic::Ordering::Relaxed);
+            if ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
         let Some(db) = self.db.clone() else {
             return Ok(());
         };
