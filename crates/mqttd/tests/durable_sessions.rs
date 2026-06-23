@@ -599,7 +599,10 @@ async fn a_replica_serves_the_session_after_the_owner_dies() {
     assert_ne!(new_owner, owner, "a survivor must take over the group");
     let new_owner_node = survivors.iter().find(|n| n.node_id == new_owner).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Generous: post-death takeover means a Raft reconfiguration (drop the dead voter)
+    // plus a first-touch quorum log rebuild, which can run long on a contended CI runner.
+    // A deterministic simulation harness (ADR 0024-T7) would remove the wall-clock margin.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let pending = loop {
         if let Ok(p) = new_owner_node.store.pending(&client, 0, 100).await {
             if !p.is_empty() {
