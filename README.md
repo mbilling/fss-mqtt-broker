@@ -202,8 +202,11 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_SWIM_BIND` | SWIM gossip UDP bind (needs `MQTTD_PEER_BIND`) |
 | `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
 | `MQTTD_SWIM_KEY` | 64-hex-char cluster gossip key (`openssl rand -hex 32`) |
-| `MQTTD_HEALTH_BIND` | HTTP health-probe bind, e.g. `0.0.0.0:8080` — serves `GET /livez` & `/readyz` |
+| `MQTTD_HEALTH_BIND` | HTTP health-probe bind, e.g. `0.0.0.0:8080` — serves `GET /livez`, `/readyz` & `/metrics` (Prometheus) |
 | `MQTTD_READY_MIN_MEMBERS` | Smallest mesh size `/readyz` accepts (default 1) |
+| `MQTTD_METRICS_BIND` | Optional separate bind for `GET /metrics`, to isolate the scrape from the health probes (internal/ops network only) |
+| `MQTTD_OTLP_ENDPOINT` | OTLP/HTTP base URL of an OpenTelemetry Collector, e.g. `http://collector:4318` — when set, metrics are also pushed via OTLP (`/v1/metrics` appended) |
+| `MQTTD_OTLP_INTERVAL` | OTLP push interval in seconds (default `10`) |
 
 ### Health probes
 
@@ -219,6 +222,29 @@ plain HTTP (no framework — a minimal hand-rolled server):
   durably own the sessions it would be handed). Wire to a k8s **readinessProbe** so a
   node is pulled from the Service during a rolling restart or a transient lease blip
   *without* being killed. Body example: `{"status":"ok","live":true,"ready":true,"members":3,"lease_group_ready":true}`.
+
+### Metrics
+
+The broker exports Prometheus-style metrics (connections, publish/deliver, sessions,
+retained, cluster membership, lease role/epoch, durable-append latency/failures, gossip
+rejects) with bounded label sets — no per-client or per-topic labels. Two ways to consume
+them, both from the one registry (ADR 0020):
+
+- **Prometheus (pull)** — `GET /metrics` on the health server (`MQTTD_HEALTH_BIND`), or on a
+  separate `MQTTD_METRICS_BIND` to keep the scrape off the probe port.
+- **OTLP (push)** — set `MQTTD_OTLP_ENDPOINT` to an OpenTelemetry Collector's OTLP/HTTP base
+  URL (e.g. `http://collector:4318`) and the same metrics are pushed every
+  `MQTTD_OTLP_INTERVAL` seconds (default 10) as `service.name=mqttd`, in addition to the
+  Prometheus endpoint. Unset = Prometheus only.
+
+```sh
+# Prometheus scrape
+MQTTD_HEALTH_BIND=0.0.0.0:8080 cargo run --bin mqttd   # then GET :8080/metrics
+
+# also push to an OpenTelemetry Collector
+MQTTD_HEALTH_BIND=0.0.0.0:8080 MQTTD_OTLP_ENDPOINT=http://localhost:4318 \
+  cargo run --bin mqttd
+```
 
 ## Architecture decisions
 
