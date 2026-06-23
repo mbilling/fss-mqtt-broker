@@ -44,9 +44,10 @@ tasks:
     date: 2026-06-22
     evidence: metrics.rs render_produces_valid_openmetrics_exposition; hub publish_round_trip_moves_the_metrics_counters; no-high-cardinality assertions in both
   - id: 0020-T9
-    title: Later OpenTelemetry/OTLP export behind the same registry
-    status: deferred
-    notes: explicitly out of scope now; addable later without changing instrumentation per the ADR
+    title: OpenTelemetry/OTLP export behind the same registry
+    status: done
+    date: 2026-06-23
+    evidence: "Metrics::with_otlp builds an OTLP/HTTP (protobuf, blocking reqwest+rustls) exporter + PeriodicReader + SdkMeterProvider; every Metrics method dual-writes to an OTel instrument mirror (OtelInstruments), so the Prometheus /metrics endpoint and OTLP push share one set of measurements. Gated by MQTTD_OTLP_ENDPOINT (+ MQTTD_OTLP_INTERVAL) in main.rs, flushed on graceful shutdown; off => no-op meter, no export. Test otlp_export_posts_to_the_endpoint proves an end-to-end POST /v1/metrics carrying service.name=mqttd + recorded instruments, with the Prometheus endpoint still rendering. deny.toml allows CDLA-Permissive-2.0 (webpki CA bundle); mqtt-net/tls.rs + the tls test pin the ring crypto provider explicitly (reqwest adds aws-lc-rs); workspace MSRV raised 1.75->1.85."
 ---
 
 # Delivery — ADR 0020: Metrics and runtime observability
@@ -83,11 +84,19 @@ stable id used by commits, tests, and the dashboard.
 | 0020-T6 | ✅ done | 2026-06-23 | "Done in mqttd (no mqtt-observability dependency added to mqtt-cluster): cluster_members + peer_links gauges on the hub sweep; members_by_state{alive|suspect|dead} gauge tracked from the MembershipEvent stream in maintain_peer_links (test member_states_drive_the_gauge); lease_leader + lease_epoch gauges sampled in Hub::refresh_gauges from a new read-only DurablePlane::lease_role() (openraft metrics); durable_append_latency_seconds histogram (gated to durable mode) and durable_append_failures{reason} counter at the hub enqueue path, with StorageError enriched to distinct NotOwner/NoQuorum variants (is_transient preserved) so reasons no-quorum/not-owner/unavailable/backend are exact (tests a_failed_durable_append_is_counted_by_reason, durable_failure_reasons_are_bounded). metrics.rs counters_and_gauges_move_and_render asserts members{state}, lease_leader/epoch, durable_append_latency_count and durable_append_failures{reason}." |
 | 0020-T7 | ✅ done | 2026-06-22 | all label families are fixed small sets (protocol/qos/reason/version); metrics.rs no_unbounded_label_keys_are_used + hub publish_round_trip asserts no client=/topic= labels |
 | 0020-T8 | ✅ done | 2026-06-22 | metrics.rs render_produces_valid_openmetrics_exposition; hub publish_round_trip_moves_the_metrics_counters; no-high-cardinality assertions in both |
-| 0020-T9 | 💤 deferred | — | explicitly out of scope now; addable later without changing instrumentation per the ADR |
+| 0020-T9 | ✅ done | 2026-06-23 | "Metrics::with_otlp builds an OTLP/HTTP (protobuf, blocking reqwest+rustls) exporter + PeriodicReader + SdkMeterProvider; every Metrics method dual-writes to an OTel instrument mirror (OtelInstruments), so the Prometheus /metrics endpoint and OTLP push share one set of measurements. Gated by MQTTD_OTLP_ENDPOINT (+ MQTTD_OTLP_INTERVAL) in main.rs, flushed on graceful shutdown; off => no-op meter, no export. Test otlp_export_posts_to_the_endpoint proves an end-to-end POST /v1/metrics carrying service.name=mqttd + recorded instruments, with the Prometheus endpoint still rendering. deny.toml allows CDLA-Permissive-2.0 (webpki CA bundle); mqtt-net/tls.rs + the tls test pin the ring crypto provider explicitly (reqwest adds aws-lc-rs); workspace MSRV raised 1.75->1.85." |
 <!-- /status-table:0020 -->
 
 ## Changelog
 
+- **2026-06-23** — T9 OTLP/HTTP export landed (ADR 0020 fully done). The chosen shape is
+  in-broker push: `Metrics::with_otlp` adds an OpenTelemetry SDK exporter that mirrors every
+  measurement to an OTel instrument (dual-write) and pushes to a Collector, gated by
+  `MQTTD_OTLP_ENDPOINT`; the Prometheus endpoint is unchanged. Notable supply-chain impact
+  (the OTel + reqwest stack): `cargo deny` gained an allowance for `CDLA-Permissive-2.0`
+  (the Mozilla CA bundle), the rustls crypto provider is now pinned to `ring` explicitly
+  (reqwest pulls a second provider, `aws-lc-rs`), and the workspace MSRV rose 1.75 → 1.85.
+- **2026-06-23** — T6 completed (cluster instrumentation); see its evidence above.
 - **2026-06-19** — Delivery doc opened from the Proposed ADR; all tasks `planned` pending
   ratification. T9 (OTLP export) recorded as deferred per the ADR's later-addition scope.
 - **2026-06-23** — T6 completed. The remaining cluster metrics (member-by-state, lease

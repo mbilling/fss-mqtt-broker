@@ -77,7 +77,14 @@ fn test_connector(ca: &Path, client_identity: Option<(&Path, &Path)>) -> TlsConn
     for cert in pem_certs(ca) {
         roots.add(cert).unwrap();
     }
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    // Explicit `ring` provider: the OTLP exporter adds a second rustls provider to the
+    // build, so auto-detection would be ambiguous (matches mqtt-net::tls).
+    let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots);
     let config = match client_identity {
         Some((cert, key)) => {
             let key = PrivateKeyDer::from_pem_file(key).unwrap();

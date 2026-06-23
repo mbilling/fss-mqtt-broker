@@ -68,6 +68,10 @@
 //! - `MQTTD_METRICS_BIND`   — optional separate bind for `GET /metrics` (ADR 0020),
 //!   to isolate the metrics scrape from the health probes. Plaintext, internal/ops
 //!   network only — do not expose publicly.
+//! - `MQTTD_OTLP_ENDPOINT`  — OTLP/HTTP base URL of an OpenTelemetry Collector (e.g.
+//!   `http://collector:4318`); when set, the same metrics are pushed via OTLP in
+//!   addition to the Prometheus endpoint (ADR 0020 T9). `/v1/metrics` is appended.
+//! - `MQTTD_OTLP_INTERVAL`  — OTLP push interval in seconds (default 10).
 //! - `MQTTD_READY_MIN_MEMBERS` — smallest mesh size `/readyz` accepts (default 1;
 //!   raise it to hold a node out of rotation until it has joined its peers)
 //! - `MQTTD_SHUTDOWN_GRACE` — seconds to drain live client connections after a
@@ -130,11 +134,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let connections = tokio_util::task::TaskTracker::new();
 
-    // Prometheus metrics (ADR 0020), built once and shared (Arc) into the hub (publish/
-    // deliver counts), the connections, and the health server's /metrics endpoint.
-    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new(env!(
-        "CARGO_PKG_VERSION"
-    )));
+    // Metrics (ADR 0020), built once and shared (Arc) into the hub (publish/deliver
+    // counts), the connections, the listeners, the gossip driver, and the health server's
+    // /metrics endpoint. With MQTTD_OTLP_ENDPOINT set, the same measurements are also
+    // pushed via OTLP/HTTP (ADR 0020 T9); otherwise it is the Prometheus endpoint only.
+    let version = env!("CARGO_PKG_VERSION");
+    let metrics = Arc::new(
+        if let Some(endpoint) = non_empty_env("MQTTD_OTLP_ENDPOINT") {
+            let interval = non_empty_env("MQTTD_OTLP_INTERVAL")
+                .and_then(|v| v.parse().ok())
+                .map_or(Duration::from_secs(10), Duration::from_secs);
+            let m = mqtt_observability::metrics::Metrics::with_otlp(version, &endpoint, interval)?;
+            info!(%endpoint, interval_s = interval.as_secs(), "OTLP/HTTP metric export enabled");
+            m
+        } else {
+            mqtt_observability::metrics::Metrics::new(version)
+        },
+    );
 
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
@@ -217,6 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lease_driver,
     )
     .await;
+    // Push a final OTLP batch so the last counters are not lost on exit (no-op without
+    // OTLP; the provider also flushes when the last Arc<Metrics> drops).
+    metrics.flush();
     Ok(())
 }
 

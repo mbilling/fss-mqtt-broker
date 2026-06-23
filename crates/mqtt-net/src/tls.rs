@@ -20,6 +20,14 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// non-feature until a deployment demands it (ADR 0002).
 static TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
+/// This broker's rustls crypto provider — `ring`, selected **explicitly** rather than
+/// via rustls' process-default auto-detection. The OTLP exporter (ADR 0020 T9) pulls
+/// reqwest's rustls, which adds a second provider (`aws-lc-rs`) to the build; naming
+/// `ring` here keeps every broker-built TLS config unambiguous and provider-stable.
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
 /// Build a server-side acceptor from PEM files.
 ///
 /// `client_ca` selects the posture:
@@ -38,11 +46,13 @@ pub fn server_acceptor(
 ) -> Result<TlsAcceptor, NetError> {
     let certs = load_certs(cert_chain)?;
     let key = load_key(key)?;
-    let builder = ServerConfig::builder_with_protocol_versions(TLS_VERSIONS);
+    let builder = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?;
     let config = match client_ca {
         Some(ca) => {
             let roots = load_roots(ca)?;
-            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
                 .build()
                 .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
             builder.with_client_cert_verifier(verifier)
@@ -67,7 +77,9 @@ pub fn client_connector(
     let roots = load_roots(ca)?;
     let certs = load_certs(cert_chain)?;
     let key = load_key(key)?;
-    let config = ClientConfig::builder_with_protocol_versions(TLS_VERSIONS)
+    let config = ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS client configuration", cert_chain, &e))?
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)
         .map_err(|e| tls_err("client certificate/key", cert_chain, &e))?;

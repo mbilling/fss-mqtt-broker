@@ -27,7 +27,7 @@
 | 0017 | Durable attach waits for an authoritative session, never downgrades | Accepted | 8/9 done | 1 deferred |
 | 0018 | On-disk persistence for durable state | Accepted | 7/8 done | 1 deferred |
 | 0019 | Graceful shutdown and connection draining | Accepted | 7/9 done | 2 deferred |
-| 0020 | Metrics and runtime observability | Accepted | 8/9 done | 1 deferred |
+| 0020 | Metrics and runtime observability | Accepted | 9/9 done | — |
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
@@ -124,10 +124,6 @@
 
 - `0019-T8` 💤 deferred: Lease-leadership transfer when the leaving node is the Raft leader — avoids one election (~300-600ms) on a leaving leader; needs openraft 0.9 transfer-API evaluation first
 - `0019-T9` 💤 deferred: In-flight QoS settle / hub Drain command — drain closes after current packet; durable state already protected by ADR 0018 + raft shutdown
-
-**0020 — Metrics and runtime observability**
-
-- `0020-T9` 💤 deferred: Later OpenTelemetry/OTLP export behind the same registry — explicitly out of scope now; addable later without changing instrumentation per the ADR
 
 **0021 — Bounded lease-consensus voter set**
 

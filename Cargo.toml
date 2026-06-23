@@ -15,7 +15,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# Raised from 1.75 by the OTLP/HTTP metric exporter (ADR 0020 T9): the OpenTelemetry
+# SDK + reqwest stack requires Rust 1.85.
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/TODO/mqtt-broker"
 authors = ["mqtt-broker contributors"]

@@ -8,6 +8,10 @@
 //! protocol version, reason class, member state). There are **no per-client or per-topic
 //! labels** — the one real footgun of metrics — so every family is bounded.
 
+use opentelemetry::metrics::{
+    Counter as OtelCounter, Gauge as OtelGauge, Histogram as OtelHistogram, Meter, UpDownCounter,
+};
+use opentelemetry::KeyValue;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -52,11 +56,79 @@ struct StateLabel {
     state: String,
 }
 
+/// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
+/// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
+/// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
+struct OtelInstruments {
+    connections_active: UpDownCounter<i64>,
+    connections: OtelCounter<u64>,
+    accepts: OtelCounter<u64>,
+    connection_errors: OtelCounter<u64>,
+    publish_received: OtelCounter<u64>,
+    publish_delivered: OtelCounter<u64>,
+    publish_dropped: OtelCounter<u64>,
+    deliver_latency: OtelHistogram<f64>,
+    sessions: OtelGauge<i64>,
+    subscriptions: OtelGauge<i64>,
+    retained_messages: OtelGauge<i64>,
+    inflight_messages: OtelGauge<i64>,
+    cluster_members: OtelGauge<i64>,
+    peer_links: OtelGauge<i64>,
+    members: OtelGauge<i64>,
+    lease_leader: OtelGauge<i64>,
+    lease_epoch: OtelGauge<i64>,
+    durable_append_latency: OtelHistogram<f64>,
+    durable_append_failures: OtelCounter<u64>,
+    gossip_rejected: OtelCounter<u64>,
+}
+
+impl OtelInstruments {
+    /// Create every instrument from `meter`, naming each to match its Prometheus
+    /// counterpart (the `mqttd` prefix is carried by the OTLP resource `service.name`).
+    fn new(meter: &Meter) -> Self {
+        Self {
+            connections_active: meter.i64_up_down_counter("connections_active").build(),
+            connections: meter.u64_counter("connections").build(),
+            accepts: meter.u64_counter("accepts").build(),
+            connection_errors: meter.u64_counter("connection_errors").build(),
+            publish_received: meter.u64_counter("publish_received").build(),
+            publish_delivered: meter.u64_counter("publish_delivered").build(),
+            publish_dropped: meter.u64_counter("publish_dropped").build(),
+            deliver_latency: meter.f64_histogram("deliver_latency_seconds").build(),
+            sessions: meter.i64_gauge("sessions").build(),
+            subscriptions: meter.i64_gauge("subscriptions").build(),
+            retained_messages: meter.i64_gauge("retained_messages").build(),
+            inflight_messages: meter.i64_gauge("inflight_messages").build(),
+            cluster_members: meter.i64_gauge("cluster_members").build(),
+            peer_links: meter.i64_gauge("peer_links").build(),
+            members: meter.i64_gauge("members").build(),
+            lease_leader: meter.i64_gauge("lease_leader").build(),
+            lease_epoch: meter.i64_gauge("lease_epoch").build(),
+            durable_append_latency: meter
+                .f64_histogram("durable_append_latency_seconds")
+                .build(),
+            durable_append_failures: meter.u64_counter("durable_append_failures").build(),
+            gossip_rejected: meter.u64_counter("gossip_rejected").build(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OtelInstruments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelInstruments").finish_non_exhaustive()
+    }
+}
+
 /// The broker's metric registry and typed handles. Cheap to share behind an `Arc`; all
 /// updates are lock-free atomic operations on the metric families.
 #[derive(Debug)]
 pub struct Metrics {
     registry: Registry,
+    /// The OTLP mirror, recorded alongside every Prometheus update.
+    otel: OtelInstruments,
+    /// The SDK meter provider, held to keep the OTLP export task alive (and for
+    /// `flush`/shutdown). `None` when OTLP is disabled (a no-op meter is used).
+    provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
     connections_active: Gauge,
     connections_total: Family<ProtocolLabel, Counter>,
     accepts_total: Family<ListenerLabel, Counter>,
@@ -80,11 +152,41 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Build the registry, register every metric, and stamp `mqttd_build_info{version}`.
-    // A flat, branch-free list of metric registrations: long by count, not by complexity.
-    #[allow(clippy::too_many_lines)]
+    /// A metrics set with **no** OTLP export — the Prometheus `/metrics` endpoint only.
+    /// Used by tests and by a broker without `MQTTD_OTLP_ENDPOINT` configured.
     #[must_use]
     pub fn new(version: &str) -> Self {
+        let noop = opentelemetry::metrics::noop::NoopMeterProvider::new();
+        let meter = opentelemetry::metrics::MeterProvider::meter(&noop, "mqttd");
+        Self::build(version, &meter, None)
+    }
+
+    /// A metrics set that also exports via OTLP/HTTP to `endpoint` (the OTLP base URL,
+    /// e.g. `http://collector:4318`; the exporter appends `/v1/metrics`), pushing every
+    /// `interval`. The Prometheus endpoint stays available. Must be called within a Tokio
+    /// runtime (the periodic export task is spawned on it).
+    ///
+    /// # Errors
+    /// Returns an error if the OTLP exporter cannot be built (e.g. a malformed endpoint).
+    pub fn with_otlp(
+        version: &str,
+        endpoint: &str,
+        interval: std::time::Duration,
+    ) -> Result<Self, opentelemetry_otlp::ExporterBuildError> {
+        let provider = build_otlp_provider(endpoint, interval)?;
+        let meter = opentelemetry::metrics::MeterProvider::meter(&provider, "mqttd");
+        Ok(Self::build(version, &meter, Some(provider)))
+    }
+
+    /// Build the registry, register every metric, stamp `mqttd_build_info{version}`, and
+    /// create the OTLP instrument mirror from `meter`.
+    // A flat, branch-free list of metric registrations: long by count, not by complexity.
+    #[allow(clippy::too_many_lines)]
+    fn build(
+        version: &str,
+        meter: &Meter,
+        provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+    ) -> Self {
         let mut registry = Registry::with_prefix("mqttd");
 
         let connections_active = register_gauge(
@@ -201,6 +303,8 @@ impl Metrics {
             .set(1);
 
         Self {
+            otel: OtelInstruments::new(meter),
+            provider,
             registry,
             connections_active,
             connections_total,
@@ -245,11 +349,16 @@ impl Metrics {
                 protocol: protocol.to_string(),
             })
             .inc();
+        self.otel.connections_active.add(1, &[]);
+        self.otel
+            .connections
+            .add(1, &[KeyValue::new("protocol", protocol.to_string())]);
     }
 
     /// A client connection closed.
     pub fn connection_closed(&self) {
         self.connections_active.dec();
+        self.otel.connections_active.add(-1, &[]);
     }
 
     /// A TCP connection was accepted on `listener` (`"tls"` or `"plaintext"`), before
@@ -261,6 +370,9 @@ impl Metrics {
                 listener: listener.to_string(),
             })
             .inc();
+        self.otel
+            .accepts
+            .add(1, &[KeyValue::new("listener", listener.to_string())]);
     }
 
     /// A connection failed to set up (`reason` is a bounded class, e.g. `"tls"`, `"auth"`).
@@ -270,6 +382,9 @@ impl Metrics {
                 reason: reason.to_string(),
             })
             .inc();
+        self.otel
+            .connection_errors
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
     /// A PUBLISH was received from a client at `qos` (0/1/2).
@@ -279,6 +394,9 @@ impl Metrics {
                 qos: qos.to_string(),
             })
             .inc();
+        self.otel
+            .publish_received
+            .add(1, &[KeyValue::new("qos", qos.to_string())]);
     }
 
     /// A PUBLISH was delivered to a subscriber at `qos` (0/1/2).
@@ -288,6 +406,9 @@ impl Metrics {
                 qos: qos.to_string(),
             })
             .inc();
+        self.otel
+            .publish_delivered
+            .add(1, &[KeyValue::new("qos", qos.to_string())]);
     }
 
     /// A message was dropped (`reason` a bounded class: `"expired"`, `"queue-overflow"`,
@@ -298,41 +419,51 @@ impl Metrics {
                 reason: reason.to_string(),
             })
             .inc();
+        self.otel
+            .publish_dropped
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
     /// Observe a publish-to-deliver latency in seconds.
     pub fn observe_deliver_latency(&self, seconds: f64) {
         self.deliver_latency_seconds.observe(seconds);
+        self.otel.deliver_latency.record(seconds, &[]);
     }
 
     /// Set the current session count (snapshot of an in-memory map; ADR 0020).
     pub fn set_sessions(&self, n: usize) {
         self.sessions.set(clamp_gauge(n));
+        self.otel.sessions.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current active-subscription count.
     pub fn set_subscriptions(&self, n: usize) {
         self.subscriptions.set(clamp_gauge(n));
+        self.otel.subscriptions.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current retained-message count.
     pub fn set_retained_messages(&self, n: usize) {
         self.retained_messages.set(clamp_gauge(n));
+        self.otel.retained_messages.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current count of unacknowledged QoS>0 messages outstanding to clients.
     pub fn set_inflight_messages(&self, n: usize) {
         self.inflight_messages.set(clamp_gauge(n));
+        self.otel.inflight_messages.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current count of placement-eligible cluster members (ADR 0020-T6).
     pub fn set_cluster_members(&self, n: usize) {
         self.cluster_members.set(clamp_gauge(n));
+        self.otel.cluster_members.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current count of connected inter-node peer links.
     pub fn set_peer_links(&self, n: usize) {
         self.peer_links.set(clamp_gauge(n));
+        self.otel.peer_links.record(clamp_gauge(n), &[]);
     }
 
     /// Set the member count for one bounded SWIM `state` (`"alive"`/`"suspect"`/`"dead"`).
@@ -342,17 +473,23 @@ impl Metrics {
                 state: state.to_string(),
             })
             .set(clamp_gauge(n));
+        self.otel
+            .members
+            .record(clamp_gauge(n), &[KeyValue::new("state", state.to_string())]);
     }
 
     /// Record this node's lease-group role (`leader`) and consensus epoch (term).
     pub fn set_lease_role(&self, is_leader: bool, epoch: u64) {
         self.lease_leader.set(i64::from(is_leader));
         self.lease_epoch.set(clamp_gauge_u64(epoch));
+        self.otel.lease_leader.record(i64::from(is_leader), &[]);
+        self.otel.lease_epoch.record(clamp_gauge_u64(epoch), &[]);
     }
 
     /// Observe a durable (quorum) append latency in seconds.
     pub fn observe_durable_append_latency(&self, seconds: f64) {
         self.durable_append_latency_seconds.observe(seconds);
+        self.otel.durable_append_latency.record(seconds, &[]);
     }
 
     /// A durable append failed; `reason` is a bounded class (`"no-quorum"`, `"not-owner"`,
@@ -363,6 +500,9 @@ impl Metrics {
                 reason: reason.to_string(),
             })
             .inc();
+        self.otel
+            .durable_append_failures
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
     /// A SWIM gossip datagram was dropped (ADR 0003); `reason` is a bounded class
@@ -373,7 +513,45 @@ impl Metrics {
                 reason: reason.to_string(),
             })
             .inc();
+        self.otel
+            .gossip_rejected
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
+
+    /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;
+    /// used on graceful shutdown and in tests to flush deterministically.
+    pub fn flush(&self) {
+        if let Some(p) = &self.provider {
+            let _ = p.force_flush();
+        }
+    }
+}
+
+/// Build an OTLP/HTTP metric exporter, a periodic reader pushing every `interval`, and the
+/// SDK meter provider that drives them. `endpoint` is the OTLP base URL (the exporter
+/// appends `/v1/metrics`); `service.name=mqttd` namespaces the metrics at the backend.
+fn build_otlp_provider(
+    endpoint: &str,
+    interval: std::time::Duration,
+) -> Result<opentelemetry_sdk::metrics::SdkMeterProvider, opentelemetry_otlp::ExporterBuildError> {
+    use opentelemetry_otlp::WithExportConfig;
+    // `with_endpoint` is used verbatim (unlike the env-var path, it does not append the
+    // signal path), so append `/v1/metrics` to the OTLP base ourselves.
+    let url = format!("{}/v1/metrics", endpoint.trim_end_matches('/'));
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_endpoint(url)
+        .build()?;
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+        .with_interval(interval)
+        .build();
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name("mqttd")
+        .build();
+    Ok(opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(resource)
+        .build())
 }
 
 /// Cast an in-memory map length to the gauge's signed counter, saturating rather
@@ -540,5 +718,62 @@ mod tests {
                 "unbounded label key {forbidden:?} present:\n{out}"
             );
         }
+    }
+
+    /// ADR 0020 (T9): with OTLP configured, recording a metric and flushing pushes an
+    /// OTLP/HTTP POST to `/v1/metrics` at the endpoint — proven end-to-end against a
+    /// local socket that captures the request. Multi-thread runtime so the synchronous
+    /// `flush` (`force_flush`) does not block the exporter's async push.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otlp_export_posts_to_the_endpoint() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = captured.clone();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                *sink.lock().await = String::from_utf8_lossy(&buf[..n]).into_owned();
+                // A minimal 200 so the exporter sees success.
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let endpoint = format!("http://{addr}");
+        // Long interval so the only push is the explicit flush below.
+        let m = Metrics::with_otlp("t", &endpoint, Duration::from_secs(3600)).unwrap();
+        m.connection_opened("5");
+        m.gossip_rejected("replay");
+        m.flush();
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("OTLP export never reached the endpoint")
+            .unwrap();
+        let req = captured.lock().await.clone();
+        // The exporter POSTed to /v1/metrics and the serialized payload carries our
+        // service name and at least one recorded instrument.
+        assert!(
+            req.contains("/v1/metrics"),
+            "not a /v1/metrics request:\n{req}"
+        );
+        assert!(
+            req.contains("mqttd"),
+            "OTLP payload missing service.name:\n{req}"
+        );
+        assert!(
+            req.contains("connections") || req.contains("gossip_rejected"),
+            "OTLP payload missing a recorded instrument:\n{req}"
+        );
+        // The Prometheus endpoint still works alongside OTLP.
+        assert!(m
+            .render()
+            .contains("mqttd_connections_total{protocol=\"5\"} 1"));
     }
 }

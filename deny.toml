@@ -30,6 +30,11 @@ allow = [
     "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
+    # Mozilla's CA root-certificate bundle (webpki-root-certs), the TLS trust store
+    # reqwest uses to verify the OTLP/HTTPS exporter endpoint (ADR 0020 OTLP export).
+    # A permissive *data* license for the cert set, not code; standard across the
+    # rustls ecosystem.
+    "CDLA-Permissive-2.0",
 ]
 
 [sources]
