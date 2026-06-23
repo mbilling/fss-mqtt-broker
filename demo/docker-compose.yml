@@ -13,6 +13,9 @@ name: mqttd-demo
 
 x-broker-env: &broker-env
   MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext, loudly logged insecure
+  MQTTD_ALLOW_ANONYMOUS: "1"           # demo only — no auth configured; the broker is
+                                       # deny-by-default, so anonymous clients (the loadgen)
+                                       # must be explicitly permitted (ADR 0004)
   MQTTD_HEALTH_BIND: 0.0.0.0:8080      # serves /livez, /readyz, /metrics
   MQTTD_DURABLE_SESSIONS: "1"          # consensus-backed sessions -> lease/durable metrics
   MQTTD_DATA_DIR: /data
