@@ -162,6 +162,7 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
             event_tx,
             Some(auth),
             None, // no anti-replay sequencing in this test
+            None, // no reject sink in this test
             std::future::pending(),
         ))
         .abort_handle(),

@@ -10,7 +10,7 @@
 |-----|-------|----------|-------|-----------------|
 | 0001 | Session durability in a horizontally-scalable cluster | Accepted | 8/11 done | 3 deferred |
 | 0002 | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | 7/10 done | 3 deferred |
-| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 7/9 done | 1 deferred |
+| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 8/9 done | — |
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
 | 0006 | Consensus & replication for durable sessions | Accepted | 10/11 done | 1 deferred |
@@ -46,10 +46,6 @@
 - `0002-T8` 💤 deferred: CRL / OCSP stapling — no revocation checking in tree (rg crl|ocsp|revocation -> none); pairs with hot-reloadable policy, Capability Plan §3
 - `0002-T9` 💤 deferred: Certificate rotation / hot-reload without dropping connections — TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work
 - `0002-T10` 💤 deferred: WebSocket-over-TLS listener — Transport::WebSocketTls enum variant exists but no listener/upgrade path; scheduled for Phase 4
-
-**0003 — Gossip-plane authentication: keyed MAC on SWIM datagrams**
-
-- `0003-T6` 💤 deferred: Rejected-datagram metrics counter (operator signal for dropped gossip) — drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability)
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 

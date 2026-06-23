@@ -76,6 +76,7 @@ pub struct Metrics {
     lease_epoch: Gauge,
     durable_append_latency_seconds: Histogram,
     durable_append_failures_total: Family<ReasonLabel, Counter>,
+    gossip_rejected_total: Family<ReasonLabel, Counter>,
 }
 
 impl Metrics {
@@ -185,6 +186,11 @@ impl Metrics {
             "durable_append_failures",
             "Durable append failures, by reason (no-quorum, not-owner, backend)",
         );
+        let gossip_rejected_total = register_family(
+            &mut registry,
+            "gossip_rejected",
+            "SWIM gossip datagrams dropped, by reason (auth, decode, identity, replay)",
+        );
 
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
@@ -215,6 +221,7 @@ impl Metrics {
             lease_epoch,
             durable_append_latency_seconds,
             durable_append_failures_total,
+            gossip_rejected_total,
         }
     }
 
@@ -357,6 +364,16 @@ impl Metrics {
             })
             .inc();
     }
+
+    /// A SWIM gossip datagram was dropped (ADR 0003); `reason` is a bounded class
+    /// (`"auth"`, `"decode"`, `"identity"`, `"replay"`).
+    pub fn gossip_rejected(&self, reason: &str) {
+        self.gossip_rejected_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+    }
 }
 
 /// Cast an in-memory map length to the gauge's signed counter, saturating rather
@@ -459,6 +476,7 @@ mod tests {
         m.set_lease_role(true, 7);
         m.observe_durable_append_latency(0.002);
         m.durable_append_failed("no-quorum");
+        m.gossip_rejected("replay");
         let out = m.render();
 
         assert!(out.contains("mqttd_connections_active 1"), "{out}");
@@ -500,6 +518,10 @@ mod tests {
         );
         assert!(
             out.contains("mqttd_durable_append_failures_total{reason=\"no-quorum\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_gossip_rejected_total{reason=\"replay\"} 1"),
             "{out}"
         );
     }

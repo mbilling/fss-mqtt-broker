@@ -882,6 +882,11 @@ async fn start_swim_from_env(
         seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    // Count dropped gossip datagrams by reason on the metrics registry (ADR 0003-T6).
+    let reject: swim_driver::RejectCounter = {
+        let m = metrics.clone();
+        Arc::new(move |reason: &'static str| m.gossip_rejected(reason))
+    };
     // On graceful shutdown (ADR 0019) the driver announces a SWIM leave so peers drop
     // this node from the ring immediately, instead of waiting out failure detection.
     tokio::spawn(swim_driver::run(
@@ -891,6 +896,7 @@ async fn start_swim_from_env(
         event_tx,
         auth,
         seq_alloc,
+        Some(reject),
         shutdown.clone().cancelled_owned(),
     ));
     tokio::spawn(cluster::maintain_peer_links(

@@ -91,10 +91,24 @@ fn cfg() -> Config {
     }
 }
 
-/// A running node: its driver task and the membership view it has observed.
+/// A running node: its driver task, the membership view it has observed, and the
+/// per-reason count of gossip datagrams its driver dropped (ADR 0003-T6).
 struct Node {
     handle: JoinHandle<()>,
     view: Arc<Mutex<HashMap<String, MemberState>>>,
+    rejects: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl Node {
+    /// How many inbound datagrams the driver dropped for `reason`.
+    fn reject_count(&self, reason: &str) -> u64 {
+        self.rejects
+            .lock()
+            .unwrap()
+            .get(reason)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Spawn a node whose driver performs a **graceful SWIM leave** when the returned
@@ -163,6 +177,17 @@ async fn spawn_node_inner(
         }
     });
 
+    // A reject counter that records each drop by reason, exposed on the Node for tests.
+    let rejects: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let rejects2 = rejects.clone();
+    let reject: mqtt_cluster::swim_driver::RejectCounter = Arc::new(move |reason: &'static str| {
+        *rejects2
+            .lock()
+            .unwrap()
+            .entry(reason.to_string())
+            .or_default() += 1;
+    });
+
     // Tick well under the ack timeout so deadlines are observed promptly.
     let handle = tokio::spawn(run(
         socket,
@@ -171,9 +196,17 @@ async fn spawn_node_inner(
         tx,
         auth,
         seq_alloc,
+        Some(reject),
         shutdown,
     ));
-    (addr, Node { handle, view })
+    (
+        addr,
+        Node {
+            handle,
+            view,
+            rejects,
+        },
+    )
 }
 
 /// Poll `cond` every 25ms until it holds or the deadline passes.
@@ -383,10 +416,17 @@ async fn a_forged_sender_identity_is_rejected() {
         gossip: vec![],
     };
     sock.send_to(&seal(&forged), &victim_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Causally wait for the driver to process and reject it — the reject is counted under
+    // reason `identity` (ADR 0003-T6) — then confirm "ghost" was never learned.
+    assert!(
+        wait_for(Duration::from_secs(3), || victim.reject_count("identity")
+            >= 1)
+        .await,
+        "a forged sender identity must be rejected and counted"
+    );
     assert!(
         !knows(&victim, "ghost"),
-        "a forged sender identity must be rejected"
+        "a forged sender identity must not be learned"
     );
 
     victim.handle.abort();
@@ -479,6 +519,12 @@ async fn a_replayed_v3_datagram_is_dropped() {
     assert!(
         !recv_ack(&sock, &opener, &mut buf, Duration::from_millis(500)).await,
         "the replayed Ping must be dropped (no second Ack)"
+    );
+
+    // ADR 0003-T6: the drop is also counted on the reject metric under reason `replay`.
+    assert!(
+        victim.reject_count("replay") >= 1,
+        "the dropped replay must be counted on the reject sink"
     );
 
     victim.handle.abort();

@@ -23,6 +23,12 @@ use tracing::{debug, trace};
 /// holds it behind a boxed [`SeqStore`] so the broker can inject the file-backed persistence.
 pub type SeqAlloc = SequenceAllocator<Box<dyn SeqStore>>;
 
+/// A sink for **dropped-gossip** events, called with a bounded reason class (`"auth"`,
+/// `"decode"`, `"identity"`, `"replay"`) each time an inbound datagram is rejected
+/// (ADR 0003). A callback rather than a metrics handle keeps this crate free of any
+/// observability backend — the broker passes a closure that bumps its counter.
+pub type RejectCounter = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
 /// Maximum SWIM datagram size we are willing to receive.
 const RECV_BUF: usize = 64 * 1024;
 
@@ -45,14 +51,18 @@ pub struct MembershipEvent {
 /// deadlines are observed promptly. Membership changes are sent on `events`.
 ///
 /// With `auth`, datagrams failing authentication are dropped before decode
-/// (logged at `debug` — per-packet `warn` would be a log-flooding lever; a
-/// rejected-datagram counter is planned observability work). `None` runs the
-/// gossip plane unauthenticated, which the caller must opt into loudly.
+/// (logged at `debug` — per-packet `warn` would be a log-flooding lever; the
+/// `reject` sink counts each drop by bounded reason instead, ADR 0003). `None`
+/// runs the gossip plane unauthenticated, which the caller must opt into loudly.
 ///
 /// When `shutdown` resolves, the node announces a **graceful leave** (ADR 0019 §2):
 /// it gossips itself `Dead` directly to its peers so they drop it from the ring at
 /// once, then the driver returns. Pass `std::future::pending()` for a driver that
 /// only stops by being aborted.
+// The driver's full I/O context: socket, state machine, timer, event sink, auth, the
+// sequence allocator, the reject sink, and the shutdown signal — distinct collaborators,
+// not a refactor smell.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     socket: UdpSocket,
     mut swim: Swim,
@@ -60,9 +70,16 @@ pub async fn run(
     events: mpsc::UnboundedSender<MembershipEvent>,
     auth: Option<SwimAuth>,
     mut seq_alloc: Option<SeqAlloc>,
+    reject: Option<RejectCounter>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     let start = Instant::now();
+    // Count one dropped-gossip event under its bounded reason class, if a sink is set.
+    let count_reject = |reason: &'static str| {
+        if let Some(r) = &reject {
+            r(reason);
+        }
+    };
     let mut ticker = tokio::time::interval(tick_interval);
     let mut buf = vec![0u8; RECV_BUF];
     // Per-sender replay windows, keyed by the authenticated sender id (ADR 0023).
@@ -91,6 +108,7 @@ pub async fn run(
                 let opened = if let Some(a) = &auth {
                     let Some(o) = a.open(&buf[..n]) else {
                         debug!(%src, "dropping SWIM datagram failing authentication");
+                        count_reject("auth");
                         continue;
                     };
                     o
@@ -99,6 +117,7 @@ pub async fn run(
                 };
                 let Ok(msg) = bincode::deserialize::<Message>(opened.payload) else {
                     trace!(%src, "dropping undecodable SWIM datagram");
+                    count_reject("decode");
                     continue;
                 };
                 // A signed datagram binds to its sender: the authenticated certificate
@@ -108,6 +127,7 @@ pub async fn run(
                     if cn != &msg.from {
                         debug!(%src, claimed = %msg.from, authenticated = %cn,
                             "dropping SWIM datagram whose signed identity does not match its sender");
+                        count_reject("identity");
                         continue;
                     }
                 }
@@ -118,6 +138,7 @@ pub async fn run(
                     let fresh = windows.entry(msg.from.clone()).or_default().check_and_set(seq);
                     if !fresh {
                         debug!(%src, from = %msg.from, seq, "dropping replayed SWIM datagram");
+                        count_reject("replay");
                         continue;
                     }
                 }

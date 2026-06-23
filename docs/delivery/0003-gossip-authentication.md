@@ -30,8 +30,9 @@ tasks:
     evidence: swim.rs self-refutation (incarnation bump + Alive); refutes_suspicion_about_self; a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip
   - id: 0003-T6
     title: Rejected-datagram metrics counter (operator signal for dropped gossip)
-    status: deferred
-    notes: drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability)
+    status: done
+    date: 2026-06-23
+    evidence: "swim_driver::run takes an Option<RejectCounter> (Arc<dyn Fn(&str)>) — a callback, so mqtt-cluster keeps no observability dependency — and counts each inbound drop by bounded reason (auth/decode/identity/replay) at the four drop sites; main.rs passes a closure bumping Metrics::gossip_rejected. Tests: swim_cluster a_replayed_v3_datagram_is_dropped asserts reject_count(replay)>=1 and a_forged_sender_identity_is_rejected causally waits on reject_count(identity)>=1; metrics.rs counters_and_gauges_move_and_render asserts gossip_rejected_total{reason=replay}."
   - id: 0003-T7
     title: Anti-replay window / per-peer nonces
     status: done
@@ -80,7 +81,7 @@ and the dashboard.
 | 0003-T3 | ✅ done | 2026-06-11 | mqtt-cluster/Cargo.toml ring workspace dep; no blake3 in Cargo.lock |
 | 0003-T4 | ✅ done | 2026-06-11 | main.rs SwimAuth::from_hex_key(&hex)? + INSECURE warn; hex_key_parsing_enforces_exact_length |
 | 0003-T5 | ✅ done | 2026-06-11 | swim.rs self-refutation (incarnation bump + Alive); refutes_suspicion_about_self; a_dead_member_is_not_revived_by_stale_higher_incarnation_gossip |
-| 0003-T6 | 💤 deferred | — | drop path logs at debug only, no metric; lands with the observability phase (no gossip-reject counter in mqtt-observability) |
+| 0003-T6 | ✅ done | 2026-06-23 | "swim_driver::run takes an Option<RejectCounter> (Arc<dyn Fn(&str)>) — a callback, so mqtt-cluster keeps no observability dependency — and counts each inbound drop by bounded reason (auth/decode/identity/replay) at the four drop sites; main.rs passes a closure bumping Metrics::gossip_rejected. Tests: swim_cluster a_replayed_v3_datagram_is_dropped asserts reject_count(replay)>=1 and a_forged_sender_identity_is_rejected causally waits on reject_count(identity)>=1; metrics.rs counters_and_gauges_move_and_render asserts gossip_rejected_total{reason=replay}." |
 | 0003-T7 | ✅ done | 2026-06-22 | realized as ADR 0023 (clock-free persisted-sequence + sliding window, bound to ADR 0022 identity); a_replayed_v3_datagram_is_dropped |
 | 0003-T8 | ✅ done | 2026-06-22 | SwimAuth keyring (accept_also/accept_also_hex), seal uses primary, open tries the ring; MQTTD_SWIM_KEY_ACCEPT; a_datagram_sealed_with_an_accepted_secondary_key_opens; a_dual_key_window_lets_nodes_on_different_primaries_converge |
 | 0003-T9 | ✂️ cut | — | cryptographically unsound — the CA cert is public, so a key derived from it is not secret; the secure realisation (per-node signatures over the PKI) moved to ADR 0022 |
@@ -88,6 +89,11 @@ and the dashboard.
 
 ## Changelog
 
+- **2026-06-23** — T6 reject counter landed (closing the last open item): the SWIM driver
+  takes an `Option<RejectCounter>` callback and counts each dropped datagram by bounded
+  reason (auth/decode/identity/replay), so `mqtt-cluster` stays free of any observability
+  dependency; the broker wires it to `Metrics::gossip_rejected`. The forged-sender and
+  replay integration tests now also assert the count (the forged test made causal on it).
 - **2026-06-22** — T8 zero-downtime key rotation landed: `SwimAuth` became a keyring
   (`accept_also`/`accept_also_hex`), sealing with the primary and opening against any
   accepted key; `MQTTD_SWIM_KEY_ACCEPT` stages rotation keys. Test-first, incl. an over-UDP
