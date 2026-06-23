@@ -153,7 +153,7 @@
 - `0025-T2` ⬜ planned: Config model and validation (upstreams, per-rule direction/filter/remap/qos, deny-by-default)
 - `0025-T3` ⬜ planned: Client engine (connect cluster + each upstream over TLS/mTLS, subscribe/publish, reconnect with backoff)
 - `0025-T4` ⬜ planned: Directional forwarding and topic remap; a one-way rule never opens the reverse path in code
-- `0025-T5` ⬜ planned: Loop prevention (MQTT5 origin user-property backstop + remap discipline)
+- `0025-T5` ⬜ planned: Loop prevention via fss-bridge-hop-count user property + configurable hop-count-limit (plus remap discipline)
 - `0025-T6` ⬜ planned: HA via cluster-side shared subscriptions and a persistent session (dedup across instances)
 - `0025-T7` ⬜ planned: Bounded disk-backed store-and-forward spool for transient outages, replayed on reconnect
 - `0025-T8` ⬜ planned: Per-side least-privilege credentials (publish-only/subscribe-only) and per-upstream mTLS identity + audit

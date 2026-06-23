@@ -89,12 +89,29 @@ the cluster load-balances the stream across them (dedup for free), and a **persi
 session** means a brief bridge restart does not drop messages. No bridge-side election is
 invented — it reuses existing broker features.
 
-### 6. Loop prevention
+### 6. Loop prevention: a bridge hop counter
 
-Directionality plus topic-prefix **remap** (e.g. local `telemetry/#` → upstream
-`ourorg/telemetry/#`) keeps a forwarded message from matching the rule that would send it
-back. An MQTT 5 **origin user-property** is stamped and checked as a backstop so a message
-is never re-forwarded across the boundary it arrived from, even under misconfiguration.
+Structural prevention comes first from **directionality** and topic **remap** — a one-way
+rule cannot echo, and a remap (local `telemetry/#` → upstream `ourorg/telemetry/#`) keeps a
+forwarded message from matching the rule that would send it straight back. But remap
+discipline alone cannot catch a cycle through *several* bridges (A→B→C→A), so every
+forwarded message also carries a hop counter that bounds **any** loop to a finite length:
+
+- An MQTT 5 user property **`fss-bridge-hop-count`** records how many fss bridges a message
+  has traversed. On each forward the bridge reads it, **increments** it (initialising it to
+  `1` when absent — this is the first bridge hop), and republishes with the new value.
+- A bridge **refuses to forward** a message whose hop count has reached the configured
+  **`hop-count-limit`** (a bridge setting): it drops the message and records the drop under
+  reason `hop-limit`. A loop therefore self-terminates within a bounded number of hops
+  regardless of any remap mistake. The default limit is conservative (a small TTL, e.g. `8`)
+  and must be set at least as high as the longest *legitimate* bridge chain; lower it for
+  stricter boundaries.
+
+Because MQTT 5 user properties do not exist in MQTT 3.1.1, the hop counter survives
+end-to-end only when every broker and bridge on the path speaks MQTT 5; across a 3.1.1
+boundary the property is stripped, so loop-bounding there falls back to the structural
+direction + remap discipline (which still prevents the immediate echo). The bridge logs this
+limitation for a configured 3.1.1 upstream so it is never a silent gap.
 
 ### 7. Store-and-forward across transient outages
 

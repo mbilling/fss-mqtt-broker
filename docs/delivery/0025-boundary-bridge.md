@@ -16,7 +16,7 @@ tasks:
     title: Directional forwarding and topic remap; a one-way rule never opens the reverse path in code
     status: planned
   - id: 0025-T5
-    title: Loop prevention (MQTT5 origin user-property backstop + remap discipline)
+    title: Loop prevention via fss-bridge-hop-count user property + configurable hop-count-limit (plus remap discipline)
     status: planned
   - id: 0025-T6
     title: HA via cluster-side shared subscriptions and a persistent session (dedup across instances)
@@ -56,7 +56,7 @@ test-first, with the one-way-never-leaks-reverse property as the central adversa
 | **0025-T2** Config | TOML config: a local-cluster connection + N upstreams (URL, TLS/mTLS, credentials), each with mapping rules (`direction` out/in/both, `filter`, `remap` strip/prefix, `qos`). Validation rejects ambiguous/loop-prone rules; forwarding is deny-by-default. |
 | **0025-T3** Engine | Connect the cluster + every upstream concurrently over TLS/mTLS; subscribe and publish per the rules; reconnect with bounded backoff; clean shutdown. |
 | **0025-T4** Direction + remap | Each rule forwards only in its configured direction with its topic remap applied; an `out`/`in` rule provably **never opens** the reverse subscription. |
-| **0025-T5** Loop prevention | A forwarded message is stamped with an origin marker and is never re-forwarded across the boundary it arrived from; a remap-only loop is impossible. |
+| **0025-T5** Loop prevention | Every forward increments an MQTT 5 `fss-bridge-hop-count` user property; a message at the configured `hop-count-limit` is dropped (reason `hop-limit`), so any multi-bridge cycle self-terminates in bounded hops. Direction + remap still prevent the immediate echo; the 3.1.1 fallback (no user properties) is logged, not silent. |
 | **0025-T6** HA | ≥2 bridge instances subscribe on the cluster side via a shared subscription with a persistent session: the stream is load-balanced, deduplicated, and survives a single instance restart. |
 | **0025-T7** Store-and-forward | A bounded, disk-backed spool holds messages for a momentarily-unreachable side and replays them on reconnect, dropping oldest past the cap (never unbounded). |
 | **0025-T8** Least privilege | Documented + enforced per-side credentials (publish-only / subscribe-only on allowed topics) and a distinct mTLS identity per upstream; an audit record of what crossed, in which direction. |
@@ -87,3 +87,7 @@ test-first, with the one-way-never-leaks-reverse property as the central adversa
 - **2026-06-23** — ADR proposed and delivery doc opened; all tasks `planned` pending design
   review. The decision (separate component vs in-process plugin; enforced unidirectional
   flow; shared-subscription HA) is up for argument before any code is written.
+- **2026-06-23** — Loop-prevention design (T5) refined per review: a `fss-bridge-hop-count`
+  MQTT 5 user property incremented on each forward, dropped at a configurable
+  `hop-count-limit`, bounds any multi-bridge cycle (replacing the simpler origin-marker
+  backstop). 3.1.1 boundaries fall back to direction + remap, logged not silent.
