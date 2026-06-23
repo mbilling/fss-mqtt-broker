@@ -44,17 +44,28 @@ pub enum StorageError {
     /// a terminal failure.
     #[error("storage temporarily unavailable: {0}")]
     Unavailable(String),
+    /// This node does not currently own the session's group — its ownership lease sits
+    /// elsewhere. **Transient** (a reassignment in flight); a specialization of
+    /// [`Self::Unavailable`] kept distinct so callers can observe the cause (ADR 0020).
+    #[error("not the owning node for this group")]
+    NotOwner,
+    /// A replication quorum was momentarily unreachable, so the durable append/read
+    /// could not be made safely. **Transient**; a specialization of [`Self::Unavailable`]
+    /// kept distinct so callers can observe the cause (ADR 0020).
+    #[error("no replication quorum")]
+    NoQuorum,
     /// A backend-specific, **terminal** failure (I/O, serialization, engine error, ...).
     #[error("storage backend error: {0}")]
     Backend(String),
 }
 
 impl StorageError {
-    /// Whether this error is the transient, retry-able [`Self::Unavailable`] condition
-    /// (lease in flux / quorum momentarily unreachable) rather than a terminal failure.
+    /// Whether this error is a transient, retry-able condition (the lease in flux or a
+    /// quorum momentarily unreachable — `Unavailable`/`NotOwner`/`NoQuorum`) rather than
+    /// a terminal failure. The durable attach path retries on these (ADR 0017).
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Unavailable(_))
+        matches!(self, Self::Unavailable(_) | Self::NotOwner | Self::NoQuorum)
     }
 }
 

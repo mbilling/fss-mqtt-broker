@@ -46,6 +46,12 @@ struct ListenerLabel {
     listener: String,
 }
 
+/// `{state}` label — the bounded SWIM member states: `alive`, `suspect`, `dead`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StateLabel {
+    state: String,
+}
+
 /// The broker's metric registry and typed handles. Cheap to share behind an `Arc`; all
 /// updates are lock-free atomic operations on the metric families.
 #[derive(Debug)]
@@ -65,10 +71,17 @@ pub struct Metrics {
     inflight_messages: Gauge,
     cluster_members: Gauge,
     peer_links: Gauge,
+    members_by_state: Family<StateLabel, Gauge>,
+    lease_leader: Gauge,
+    lease_epoch: Gauge,
+    durable_append_latency_seconds: Histogram,
+    durable_append_failures_total: Family<ReasonLabel, Counter>,
 }
 
 impl Metrics {
     /// Build the registry, register every metric, and stamp `mqttd_build_info{version}`.
+    // A flat, branch-free list of metric registrations: long by count, not by complexity.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn new(version: &str) -> Self {
         let mut registry = Registry::with_prefix("mqttd");
@@ -110,12 +123,10 @@ impl Metrics {
             "Messages dropped, by reason (expired, queue-overflow, no-subscriber)",
         );
 
-        // ~100us to ~3s, doubling — covers in-process delivery and slow cross-node paths.
-        let deliver_latency_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
-        registry.register(
+        let deliver_latency_seconds = register_latency_histogram(
+            &mut registry,
             "deliver_latency_seconds",
             "Publish-to-deliver latency",
-            deliver_latency_seconds.clone(),
         );
 
         let sessions = register_gauge(
@@ -149,6 +160,32 @@ impl Metrics {
             "Currently connected inter-node peer links",
         );
 
+        let members_by_state = register_gauge_family(
+            &mut registry,
+            "members",
+            "Cluster members by SWIM state (alive/suspect/dead)",
+        );
+        let lease_leader = register_gauge(
+            &mut registry,
+            "lease_leader",
+            "1 if this node is the leader of its lease group, else 0",
+        );
+        let lease_epoch = register_gauge(
+            &mut registry,
+            "lease_epoch",
+            "Current lease-group consensus term (epoch)",
+        );
+        let durable_append_latency_seconds = register_latency_histogram(
+            &mut registry,
+            "durable_append_latency_seconds",
+            "Durable (quorum) append latency",
+        );
+        let durable_append_failures_total = register_family(
+            &mut registry,
+            "durable_append_failures",
+            "Durable append failures, by reason (no-quorum, not-owner, backend)",
+        );
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         build_info
@@ -173,6 +210,11 @@ impl Metrics {
             inflight_messages,
             cluster_members,
             peer_links,
+            members_by_state,
+            lease_leader,
+            lease_epoch,
+            durable_append_latency_seconds,
+            durable_append_failures_total,
         }
     }
 
@@ -285,11 +327,46 @@ impl Metrics {
     pub fn set_peer_links(&self, n: usize) {
         self.peer_links.set(clamp_gauge(n));
     }
+
+    /// Set the member count for one bounded SWIM `state` (`"alive"`/`"suspect"`/`"dead"`).
+    pub fn set_members_in_state(&self, state: &str, n: usize) {
+        self.members_by_state
+            .get_or_create(&StateLabel {
+                state: state.to_string(),
+            })
+            .set(clamp_gauge(n));
+    }
+
+    /// Record this node's lease-group role (`leader`) and consensus epoch (term).
+    pub fn set_lease_role(&self, is_leader: bool, epoch: u64) {
+        self.lease_leader.set(i64::from(is_leader));
+        self.lease_epoch.set(clamp_gauge_u64(epoch));
+    }
+
+    /// Observe a durable (quorum) append latency in seconds.
+    pub fn observe_durable_append_latency(&self, seconds: f64) {
+        self.durable_append_latency_seconds.observe(seconds);
+    }
+
+    /// A durable append failed; `reason` is a bounded class (`"no-quorum"`, `"not-owner"`,
+    /// `"backend"`).
+    pub fn durable_append_failed(&self, reason: &str) {
+        self.durable_append_failures_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+    }
 }
 
 /// Cast an in-memory map length to the gauge's signed counter, saturating rather
 /// than wrapping for the (unreachable) case of a count beyond `i64::MAX`.
 fn clamp_gauge(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Cast a `u64` (e.g. a consensus term) to the gauge's signed counter, saturating.
+fn clamp_gauge_u64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
@@ -312,6 +389,31 @@ where
     let family = Family::<L, Counter>::default();
     registry.register(name, help, family.clone());
     family
+}
+
+/// Register a fresh labelled gauge family under `name`/`help` and return a handle.
+fn register_gauge_family<L>(
+    registry: &mut Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Family<L, Gauge>
+where
+    L: Clone + std::hash::Hash + Eq + EncodeLabelSet + Send + Sync + std::fmt::Debug + 'static,
+{
+    let family = Family::<L, Gauge>::default();
+    registry.register(name, help, family.clone());
+    family
+}
+
+/// Register a latency histogram (exponential buckets ~100us..3s) under `name`/`help`.
+fn register_latency_histogram(
+    registry: &mut Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Histogram {
+    let h = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+    registry.register(name, help, h.clone());
+    h
 }
 
 #[cfg(test)]
@@ -352,6 +454,11 @@ mod tests {
         m.set_retained_messages(7);
         m.set_cluster_members(2);
         m.set_peer_links(1);
+        m.set_members_in_state("alive", 2);
+        m.set_members_in_state("suspect", 1);
+        m.set_lease_role(true, 7);
+        m.observe_durable_append_latency(0.002);
+        m.durable_append_failed("no-quorum");
         let out = m.render();
 
         assert!(out.contains("mqttd_connections_active 1"), "{out}");
@@ -383,6 +490,18 @@ mod tests {
         assert!(out.contains("mqttd_retained_messages 7"), "{out}");
         assert!(out.contains("mqttd_cluster_members 2"), "{out}");
         assert!(out.contains("mqttd_peer_links 1"), "{out}");
+        assert!(out.contains("mqttd_members{state=\"alive\"} 2"), "{out}");
+        assert!(out.contains("mqttd_members{state=\"suspect\"} 1"), "{out}");
+        assert!(out.contains("mqttd_lease_leader 1"), "{out}");
+        assert!(out.contains("mqttd_lease_epoch 7"), "{out}");
+        assert!(
+            out.contains("mqttd_durable_append_latency_seconds_count 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_durable_append_failures_total{reason=\"no-quorum\"} 1"),
+            "{out}"
+        );
     }
 
     /// Cardinality guard (ADR 0020 §3): label *keys* are only ever from the fixed set; no

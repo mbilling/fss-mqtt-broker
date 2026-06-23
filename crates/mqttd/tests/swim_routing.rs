@@ -109,6 +109,7 @@ async fn start_node(
         hub_tx,
         None,
         Some(placement.clone()),
+        None,
     ));
 
     (cli_addr, swim_addr, placement)
@@ -355,6 +356,7 @@ async fn start_proxy_node(
         hub_tx,
         None,
         Some(placement.clone()),
+        None,
     ));
 
     (cli_addr, swim_addr, placement)

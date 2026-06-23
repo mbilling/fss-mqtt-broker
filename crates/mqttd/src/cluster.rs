@@ -41,9 +41,13 @@ pub async fn maintain_peer_links(
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<peer::PeerTls>,
     placement: Option<Arc<RwLock<Placement>>>,
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
 ) {
     // Active dialer per peer we own the link to.
     let mut dialers: HashMap<NodeId, JoinHandle<()>> = HashMap::new();
+    // Last-seen SWIM state per peer, for the members-by-state gauge (ADR 0020-T6). A
+    // node reuses its stable id across restarts, so a rejoin overwrites its `Dead` entry.
+    let mut member_states: HashMap<NodeId, MemberState> = HashMap::new();
 
     while let Some(ev) = events.recv().await {
         // Keep the placement ring in step with membership before routing reacts.
@@ -51,6 +55,10 @@ pub async fn maintain_peer_links(
             if let Ok(mut p) = placement.write() {
                 p.observe(&ev.id, ev.state, &ev.peer_addr);
             }
+        }
+        if let Some(m) = &metrics {
+            member_states.insert(ev.id.clone(), ev.state);
+            publish_member_gauges(m, &member_states);
         }
         match ev.state {
             MemberState::Alive => {
@@ -87,6 +95,28 @@ pub async fn maintain_peer_links(
             }
         }
     }
+}
+
+/// Recompute the members-by-state gauge from the per-peer state map (ADR 0020-T6).
+/// Counts the peers SWIM has reported on; this node itself is always alive and is
+/// added to the `alive` bucket so the total matches the cluster size.
+fn publish_member_gauges(
+    metrics: &mqtt_observability::metrics::Metrics,
+    member_states: &HashMap<NodeId, MemberState>,
+) {
+    let mut alive = 1usize; // this node
+    let mut suspect = 0usize;
+    let mut dead = 0usize;
+    for state in member_states.values() {
+        match state {
+            MemberState::Alive => alive += 1,
+            MemberState::Suspect => suspect += 1,
+            MemberState::Dead => dead += 1,
+        }
+    }
+    metrics.set_members_in_state("alive", alive);
+    metrics.set_members_in_state("suspect", suspect);
+    metrics.set_members_in_state("dead", dead);
 }
 
 #[cfg(test)]
@@ -127,8 +157,52 @@ mod tests {
             hub_tx,
             None,
             None,
+            None,
         ));
         (ev_tx, hub_rx)
+    }
+
+    /// ADR 0020-T6: the members-by-state gauge tracks the SWIM event stream — this node
+    /// counts as one `alive`, and a peer's state changes move it between buckets.
+    #[tokio::test]
+    async fn member_states_drive_the_gauge() {
+        use std::sync::Arc;
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+        tokio::spawn(maintain_peer_links(
+            ev_rx,
+            NodeId("a".into()),
+            hub_tx,
+            None,
+            None,
+            Some(metrics.clone()),
+        ));
+
+        // Two alive peers + self = 3 alive; then one goes suspect, then dead.
+        ev_tx.send(ev("b", "b:7000", MemberState::Alive)).unwrap();
+        ev_tx.send(ev("c", "c:7000", MemberState::Alive)).unwrap();
+        wait_for(&metrics, "mqttd_members{state=\"alive\"} 3").await;
+
+        ev_tx.send(ev("c", "c:7000", MemberState::Suspect)).unwrap();
+        wait_for(&metrics, "mqttd_members{state=\"suspect\"} 1").await;
+        wait_for(&metrics, "mqttd_members{state=\"alive\"} 2").await;
+
+        ev_tx.send(ev("c", "c:7000", MemberState::Dead)).unwrap();
+        wait_for(&metrics, "mqttd_members{state=\"dead\"} 1").await;
+        wait_for(&metrics, "mqttd_members{state=\"suspect\"} 0").await;
+    }
+
+    /// Poll the rendered exposition until it contains `needle`, or panic after ~2s.
+    /// (The link manager applies events on its own task; this awaits the effect.)
+    async fn wait_for(metrics: &mqtt_observability::metrics::Metrics, needle: &str) {
+        for _ in 0..200 {
+            if metrics.render().contains(needle) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("gauge never reached `{needle}`:\n{}", metrics.render());
     }
 
     /// An `Alive` member is dialed; a later `Dead` aborts the dialer (closing

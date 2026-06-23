@@ -173,6 +173,7 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
             hub_tx,
             None,
             Some(placement.clone()),
+            None,
         ))
         .abort_handle(),
     );

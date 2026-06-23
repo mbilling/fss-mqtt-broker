@@ -50,11 +50,13 @@ impl From<ReplError> for StorageError {
     fn from(e: ReplError) -> Self {
         match e {
             // "Not owner" / "no quorum" are **transient**: the lease is being reassigned
-            // or a quorum is momentarily unreachable, both self-healing. They surface as
-            // `Unavailable` so the durable attach path waits/retries instead of treating
-            // a recoverable session as absent (ADR 0017). For QoS≥1 appends this still
-            // (correctly) gates the PUBACK exactly as a dropped append would.
-            ReplError::NotOwner | ReplError::NoQuorum => StorageError::Unavailable(e.to_string()),
+            // or a quorum is momentarily unreachable, both self-healing. They stay
+            // `is_transient()` so the durable attach path waits/retries instead of
+            // treating a recoverable session as absent (ADR 0017), but keep their cause
+            // distinct so the broker can count them separately (ADR 0020). For QoS≥1
+            // appends this still (correctly) gates the PUBACK exactly as a drop would.
+            ReplError::NotOwner => StorageError::NotOwner,
+            ReplError::NoQuorum => StorageError::NoQuorum,
             ReplError::Backend(m) => StorageError::Backend(m),
         }
     }

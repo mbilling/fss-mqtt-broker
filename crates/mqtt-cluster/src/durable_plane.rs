@@ -78,6 +78,16 @@ impl DurablePlane {
         &self.transport
     }
 
+    /// This node's lease-group role and consensus epoch, for the observability gauges
+    /// (ADR 0020): `(is_leader, epoch)` where `epoch` is the current consensus term.
+    /// Read from the raft metrics — a read-only snapshot, no metrics dependency here.
+    #[must_use]
+    pub fn lease_role(&self) -> (bool, u64) {
+        let m = self.raft.metrics().borrow().clone();
+        let is_leader = m.current_leader == Some(m.id);
+        (is_leader, m.current_term)
+    }
+
     /// The number of voters currently configured in the lease group, read from the
     /// raft metrics. A readiness signal: a failover is only safe once the group has
     /// grown to enough voters that losing one still leaves a quorum.

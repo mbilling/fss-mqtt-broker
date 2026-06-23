@@ -510,6 +510,17 @@ pub struct Hub {
     clock: Arc<dyn crate::clock::Clock>,
 }
 
+/// The bounded `{reason}` label for a durable-append failure (ADR 0020-T6).
+fn durable_failure_reason(e: &StorageError) -> &'static str {
+    match e {
+        StorageError::NoQuorum => "no-quorum",
+        StorageError::NotOwner => "not-owner",
+        StorageError::Unavailable(_) => "unavailable",
+        StorageError::Backend(_) => "backend",
+        StorageError::NotFound => "not-found",
+    }
+}
+
 /// Map a `QoS` to its wire numeric (0/1/2) for the `{qos}` metric label.
 fn qos_num(qos: QoS) -> u8 {
     match qos {
@@ -1153,11 +1164,21 @@ impl Hub {
             // bounded (ADR 0001 §6); log when the cap drops messages.
             let expiry_at =
                 message_expiry.map(|secs| self.clock.now_epoch_secs() + u64::from(secs));
-            match self
+            // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
+            // The latency histogram is only meaningful when the store is the replicated
+            // one, so gate it on durable mode; a failure reason is recorded either way.
+            let durable = self.durable_plane.is_some();
+            let started = Instant::now();
+            let result = self
                 .store
                 .enqueue_with_expiry(client, &message, expiry_at)
-                .await
-            {
+                .await;
+            if durable {
+                if let Some(m) = &self.metrics {
+                    m.observe_durable_append_latency(started.elapsed().as_secs_f64());
+                }
+            }
+            match result {
                 Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
                     warn!(client = %client.0, evicted, topic = %topic,
                           "offline queue full: evicted oldest message(s)");
@@ -1174,6 +1195,9 @@ impl Hub {
                 }
                 Ok(Enqueued::Stored { .. }) => {}
                 Err(e) => {
+                    if let Some(m) = &self.metrics {
+                        m.durable_append_failed(durable_failure_reason(&e));
+                    }
                     warn!(client = %client.0, error = %e, "failed to enqueue offline message");
                 }
             }
@@ -1567,6 +1591,11 @@ impl Hub {
             if let Ok(p) = placement.read() {
                 m.set_cluster_members(p.member_count());
             }
+        }
+        // Lease-group role/epoch, read from the durable plane's raft metrics (durable mode).
+        if let Some(plane) = &self.durable_plane {
+            let (is_leader, epoch) = plane.lease_role();
+            m.set_lease_role(is_leader, epoch);
         }
     }
 
@@ -1983,6 +2012,8 @@ mod tests {
     struct FlakyStore {
         inner: MemorySessionStore,
         fail_remaining: std::sync::atomic::AtomicUsize,
+        /// When set, every `enqueue_with_expiry` fails with `NoQuorum` (ADR 0020-T6).
+        fail_enqueue_no_quorum: bool,
     }
 
     impl FlakyStore {
@@ -1990,6 +2021,17 @@ mod tests {
             std::sync::Arc::new(Self {
                 inner: MemorySessionStore::new(),
                 fail_remaining: std::sync::atomic::AtomicUsize::new(fail_ensure),
+                fail_enqueue_no_quorum: false,
+            })
+        }
+
+        /// A store whose durable append always fails with `NoQuorum` (everything else
+        /// delegates to the in-memory store), for the append-failure metric test.
+        fn new_no_quorum_enqueue() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: MemorySessionStore::new(),
+                fail_remaining: std::sync::atomic::AtomicUsize::new(0),
+                fail_enqueue_no_quorum: true,
             })
         }
     }
@@ -2035,6 +2077,9 @@ mod tests {
             message: &mqtt_core::Message,
             expiry_at: Option<u64>,
         ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+            if self.fail_enqueue_no_quorum {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
             self.inner
                 .enqueue_with_expiry(client, message, expiry_at)
                 .await
@@ -2675,6 +2720,64 @@ mod tests {
             payload_of(&recv_packet(&mut rx).await.unwrap()),
             b"q",
             "a message still within its interval must replay"
+        );
+    }
+
+    /// ADR 0020-T6: a durable append that fails surfaces on the failure counter under
+    /// its bounded reason class — here `no-quorum` from the replicated store.
+    #[tokio::test]
+    async fn a_failed_durable_append_is_counted_by_reason() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) =
+            Hub::with_config(NodeId("h".into()), FlakyStore::new_no_quorum_enqueue());
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        // A persistent, offline subscriber: a publish to it takes the durable-enqueue
+        // path, which this store fails with NoQuorum.
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "t");
+        detach(&tx, "p", 1);
+        publish(&tx, "t", b"x");
+
+        // The publish is processed off-loop; poll the exposition until the counter moves.
+        for _ in 0..200 {
+            if metrics
+                .render()
+                .contains("mqttd_durable_append_failures_total{reason=\"no-quorum\"} 1")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "durable-append failure was never counted:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The append-failure reason classes are bounded and map each `StorageError`.
+    #[test]
+    fn durable_failure_reasons_are_bounded() {
+        assert_eq!(
+            super::durable_failure_reason(&mqtt_storage::StorageError::NoQuorum),
+            "no-quorum"
+        );
+        assert_eq!(
+            super::durable_failure_reason(&mqtt_storage::StorageError::NotOwner),
+            "not-owner"
+        );
+        assert_eq!(
+            super::durable_failure_reason(&mqtt_storage::StorageError::Unavailable("x".into())),
+            "unavailable"
+        );
+        assert_eq!(
+            super::durable_failure_reason(&mqtt_storage::StorageError::Backend("x".into())),
+            "backend"
+        );
+        assert_eq!(
+            super::durable_failure_reason(&mqtt_storage::StorageError::NotFound),
+            "not-found"
         );
     }
 

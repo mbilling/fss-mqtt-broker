@@ -200,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peer_tls.as_ref(),
         placement,
         &shutdown,
+        metrics.clone(),
     )
     .await?;
 
@@ -804,6 +805,7 @@ async fn start_swim_from_env(
     peer_tls: Option<&peer::PeerTls>,
     placement: Arc<RwLock<Placement>>,
     shutdown: &tokio_util::sync::CancellationToken,
+    metrics: Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = non_empty_env("MQTTD_SWIM_BIND") else {
         return Ok(());
@@ -897,6 +899,7 @@ async fn start_swim_from_env(
         hub_tx.clone(),
         peer_tls.cloned(),
         Some(placement),
+        Some(metrics),
     ));
     Ok(())
 }
