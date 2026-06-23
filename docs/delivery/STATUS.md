@@ -31,6 +31,7 @@
 | 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
+| 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
 
 ## Open and deferred work
 
@@ -149,3 +150,7 @@
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
 - `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
+
+**0024 — Deterministic testing: inject time, synchronize causally, gate in CI**
+
+- `0024-T7` 💤 deferred: Deterministic simulation harness (madsim/turmoil-style) for seed-reproducible cluster ordering races — the gold standard for distributed ordering races, but a large investment; per-test causal barriers (T5) and bounded poll-retry close the flakes seen today without it. Revisit if cluster-ordering flakes recur or a seed-reproducible failure is needed.
