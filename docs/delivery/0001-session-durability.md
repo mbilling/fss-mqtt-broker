@@ -45,8 +45,9 @@ tasks:
     evidence: persistent_log.rs PersistentLog (state_survives_reopen); durable_node a_persistent_durable_node_restarts_from_its_data_dir; realized by ADR 0017/0018
   - id: 0001-T9
     title: Default-on durable sessions (retire the ephemeral default)
-    status: deferred
-    notes: MQTTD_DURABLE_SESSIONS is off by default, so the shipping default is ephemeral mode — an owner's death drops its queues; durability requires enabling the durable store (R>=2 / quorum)
+    status: done
+    date: 2026-06-24
+    evidence: "Done by ADR 0029 — MQTTD_DURABLE_SESSIONS is now default-on (opt-out), so the shipping default is the consensus-backed replicated store. Stability prerequisites landed first: ADR 0026 (timing), 0027 (replica group-commit), 0028 (link-gated voter admission). See docs/delivery/0029-durable-by-default.md."
   - id: 0001-T10
     title: Durable session-expiry deadline across takeover (ADR 0009 phase 3)
     status: deferred
@@ -101,7 +102,7 @@ tests, and the dashboard.
 | 0001-T6 | ✅ done | 2026-06-22 | drop_oldest_evicts_oldest_and_keeps_newest; hub sweep_expired_sessions; shared.rs SharedSubscriptionTable matching_reports_group_members_in_order_with_qos |
 | 0001-T7 | ✅ done | 2026-06-22 | mqtt-storage/src/lib.rs SessionStore trait + MemorySessionStore; logged.rs ReplicatedSessionStore over InMemoryReplicatedLog (q/{client}, m/{client}) |
 | 0001-T8 | ✅ done | 2026-06-22 | persistent_log.rs PersistentLog (state_survives_reopen); durable_node a_persistent_durable_node_restarts_from_its_data_dir; realized by ADR 0017/0018 |
-| 0001-T9 | 💤 deferred | — | MQTTD_DURABLE_SESSIONS is off by default, so the shipping default is ephemeral mode — an owner's death drops its queues; durability requires enabling the durable store (R>=2 / quorum) |
+| 0001-T9 | ✅ done | 2026-06-24 | "Done by ADR 0029 — MQTTD_DURABLE_SESSIONS is now default-on (opt-out), so the shipping default is the consensus-backed replicated store. Stability prerequisites landed first: ADR 0026 (timing), 0027 (replica group-commit), 0028 (link-gated voter admission). See docs/delivery/0029-durable-by-default.md." |
 | 0001-T10 | 💤 deferred | — | message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3) |
 | 0001-T11 | 💤 deferred | — | takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass |
 <!-- /status-table:0001 -->
