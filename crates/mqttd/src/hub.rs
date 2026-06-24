@@ -405,6 +405,9 @@ pub enum HubCommand {
         payload: Bytes,
         /// Already-downgraded delivery `QoS`.
         qos: QoS,
+        /// The publisher's Message Expiry Interval (seconds), carried across the link so
+        /// the queued copy keeps its deadline (ADR 0015 T7). `None` = no expiry.
+        message_expiry: Option<u32>,
     },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
@@ -417,6 +420,9 @@ pub enum HubCommand {
         /// Whether to store this as the topic's retained message on this node, so a
         /// later subscriber here sees it (cross-node retained replication, ADR 0014).
         retain: bool,
+        /// The publisher's Message Expiry Interval (seconds), carried across the link so
+        /// the queued copy keeps its deadline (ADR 0014 T9). `None` = no expiry.
+        message_expiry: Option<u32>,
     },
     /// A durable-plane frame (consensus / session-log replication, ADR 0006/0007)
     /// from `node`, routed to the [`DurablePlane`]. The hub spawns its handling so
@@ -715,13 +721,15 @@ impl Hub {
                 payload,
                 qos,
                 retain,
+                message_expiry,
             } => {
                 // Forwarded from a peer: apply locally (deliver + store retained) but
                 // never re-forward. A retained copy updates this node's store so a
-                // later local subscriber sees it (ADR 0014). The peer link does not
-                // yet carry the message-expiry interval, so a cross-node delivery has
-                // no deadline (carried limitation).
-                self.deliver(&topic, &payload, qos, retain, None).await;
+                // later local subscriber sees it (ADR 0014). The publisher's message
+                // expiry is carried over the link (ADR 0014 T9), so a queued cross-node
+                // copy keeps the same deadline.
+                self.deliver(&topic, &payload, qos, retain, message_expiry)
+                    .await;
             }
             HubCommand::PeerConnected { node, conn_id, tx } => {
                 self.peer_connected(node.clone(), conn_id, tx);
@@ -760,10 +768,13 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                message_expiry,
             } => {
                 // Targeted by a peer's shared selection: deliver to this one client
-                // (ADR 0015), never re-selected or re-forwarded.
-                self.deliver_to_client(&client, &topic, &payload, qos, None)
+                // (ADR 0015), never re-selected or re-forwarded. The publisher's message
+                // expiry is carried over the link (ADR 0015 T7) so a queued copy keeps its
+                // deadline.
+                self.deliver_to_client(&client, &topic, &payload, qos, message_expiry)
                     .await;
             }
             // Client/session commands are handled in `dispatch`; they never route here.
@@ -788,7 +799,7 @@ impl Hub {
         // node (ADR 0015), so this runs only for locally-originated publishes.
         self.deliver_shared(topic, payload, qos, message_expiry)
             .await;
-        self.forward_to_peers(topic, payload, qos, retain);
+        self.forward_to_peers(topic, payload, qos, retain, message_expiry);
     }
 
     /// Apply a message on this node: store/clear retained state and deliver to local
@@ -1234,7 +1245,14 @@ impl Hub {
                     .await;
                 }
                 Some(node) => {
-                    self.send_shared_to_peer(&node, &chosen.client, topic, payload, delivered_qos);
+                    self.send_shared_to_peer(
+                        &node,
+                        &chosen.client,
+                        topic,
+                        payload,
+                        delivered_qos,
+                        message_expiry,
+                    );
                 }
             }
         }
@@ -1637,7 +1655,14 @@ impl Hub {
     /// message goes to *every* peer regardless of current interest, so each node
     /// stores it for its future subscribers (ADR 0014). Receivers apply it locally
     /// only, so there is no relay/loop.
-    fn forward_to_peers(&self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) {
+    fn forward_to_peers(
+        &self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        retain: bool,
+        message_expiry: Option<u32>,
+    ) {
         for (node, peer) in &self.peers {
             let interested = self
                 .remote_interest
@@ -1649,6 +1674,7 @@ impl Hub {
                     payload: payload.to_vec(),
                     qos: qos as u8,
                     retain,
+                    message_expiry,
                 });
             }
         }
@@ -1812,6 +1838,7 @@ impl Hub {
         topic: &str,
         payload: &Bytes,
         qos: QoS,
+        message_expiry: Option<u32>,
     ) {
         if let Some(peer) = self.peers.get(node) {
             let _ = peer.tx.send(PeerMessage::SharedDeliver {
@@ -1819,6 +1846,7 @@ impl Hub {
                 topic: topic.to_string(),
                 payload: payload.to_vec(),
                 qos: qos as u8,
+                message_expiry,
             });
         }
     }
@@ -3093,6 +3121,29 @@ mod tests {
         );
     }
 
+    /// A publisher's Message Expiry Interval is carried on the cross-node forward, so a
+    /// peer's queued copy keeps the same deadline (ADR 0014 T9).
+    #[tokio::test]
+    async fn forwarded_publish_carries_message_expiry() {
+        let tx = start_hub();
+        let mut p1 = connect_peer(&tx, "n1", 1);
+        recv_peer(&mut p1).await; // initial interest snapshot
+        remote_interest(&tx, "n1", &["a/#"]);
+
+        publish_with_expiry(&tx, "a/x", b"ttl", Some(45));
+        match recv_peer(&mut p1).await {
+            Some(PeerMessage::Publish {
+                topic,
+                message_expiry,
+                ..
+            }) => {
+                assert_eq!(topic, "a/x");
+                assert_eq!(message_expiry, Some(45), "expiry carried over the link");
+            }
+            other => panic!("expected forwarded Publish, got {other:?}"),
+        }
+    }
+
     /// Publishes fan out only to peers whose announced interest matches
     /// (wildcards honored), and a peer-forwarded publish is never re-forwarded.
     #[tokio::test]
@@ -3123,6 +3174,7 @@ mod tests {
             payload: Bytes::from_static(b"no-relay"),
             qos: QoS::AtMostOnce,
             retain: false,
+            message_expiry: None,
         })
         .unwrap();
         // Neither peer may see anything further (n1's non-match included).

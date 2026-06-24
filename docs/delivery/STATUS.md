@@ -21,8 +21,8 @@
 | 0011 | MQTT 5.0 topic aliases | Accepted | 7/7 done | — |
 | 0012 | MQTT 5.0 flow control (Receive Maximum) | Accepted | 6/6 done | — |
 | 0013 | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | 8/9 done | 1 deferred |
-| 0014 | Cross-node retained-message replication | Accepted | 5/9 done | 4 deferred |
-| 0015 | Cluster-wide shared subscriptions | Accepted | 6/8 done | 2 deferred |
+| 0014 | Cross-node retained-message replication | Accepted | 6/9 done | 3 deferred |
+| 0015 | Cluster-wide shared subscriptions | Accepted | 7/8 done | 1 deferred |
 | 0016 | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | 3/4 done | 1 open |
 | 0017 | Durable attach waits for an authoritative session, never downgrades | Accepted | 8/9 done | 1 deferred |
 | 0018 | On-disk persistence for durable state | Accepted | 7/8 done | 1 deferred |
@@ -85,11 +85,9 @@
 - `0014-T6` 💤 deferred: Digest-diff back-fill (avoid re-sending the whole retained set on every link-up) — ADR §3 leaves this as a later optimization; current back-fill re-sends the full set on each link-up (no digest code in the tree).
 - `0014-T7` 💤 deferred: Partition-heal conflict reconciliation (two nodes holding different values for the same topic) — ADR §3 leaves divergence unresolved — gap-fill keeps each side's own value; reconciling needs per-message timestamps / version vectors, out of scope.
 - `0014-T8` 💤 deferred: Chunking a very large retained snapshot beyond the peer frame limit — ADR §3 — snapshot size is bounded by the peer frame limit; chunking is deferred.
-- `0014-T9` 💤 deferred: Carry message-expiry interval on the cross-node peer link — ADR Consequences — cross-node delivery carries no message-expiry deadline (the peer link does not yet carry the interval); pre-existing carried limitation.
 
 **0015 — Cluster-wide shared subscriptions**
 
-- `0015-T7` 💤 deferred: Carry message-expiry deadline on cross-node SharedDeliver — ADR Consequences — SharedDeliver carries no message-expiry deadline, same carried limitation as RemotePublish; the peer link does not yet carry the interval.
 - `0015-T8` 💤 deferred: Remote-member liveness awareness in the selector — ADR Consequences — selector does not know a remote member's liveness, so it may target a member offline on its home node (which then queues) even when a local member is online; an accepted, spec-permitted selection-quality trade-off.
 
 **0016 — SWIM membership stability (dead-node fencing + false-positive resistance)**

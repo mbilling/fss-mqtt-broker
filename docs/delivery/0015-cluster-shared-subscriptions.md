@@ -35,8 +35,9 @@ tasks:
     evidence: shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs); v5_shared_subscription_round_robins_one_member_each
   - id: 0015-T7
     title: Carry message-expiry deadline on cross-node SharedDeliver
-    status: deferred
-    notes: ADR Consequences — SharedDeliver carries no message-expiry deadline, same carried limitation as RemotePublish; the peer link does not yet carry the interval.
+    status: done
+    date: 2026-06-24
+    evidence: "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field."
   - id: 0015-T8
     title: Remote-member liveness awareness in the selector
     status: deferred
@@ -77,7 +78,7 @@ flags as costs, not unbuilt mechanism.
 | 0015-T4 | ✅ done | 2026-06-17 | RemoteSharedDeliver -> deliver_to_client; deliver_to_client online-or-queue helper |
 | 0015-T5 | ✅ done | 2026-06-17 | shared_selection_round_robins_local_and_remote_member; shared_subscription_round_robins_one_member |
 | 0015-T6 | ✅ done | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs); v5_shared_subscription_round_robins_one_member_each |
-| 0015-T7 | 💤 deferred | — | ADR Consequences — SharedDeliver carries no message-expiry deadline, same carried limitation as RemotePublish; the peer link does not yet carry the interval. |
+| 0015-T7 | ✅ done | 2026-06-24 | "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field." |
 | 0015-T8 | 💤 deferred | — | ADR Consequences — selector does not know a remote member's liveness, so it may target a member offline on its home node (which then queues) even when a local member is online; an accepted, spec-permitted selection-quality trade-off. |
 <!-- /status-table:0015 -->
 

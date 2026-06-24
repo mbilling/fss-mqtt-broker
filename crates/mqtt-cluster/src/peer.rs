@@ -48,6 +48,10 @@ pub enum PeerMessage {
         /// Whether the message was published with the retain flag. The receiver
         /// stores it as retained too (cross-node replication, ADR 0014).
         retain: bool,
+        /// The MQTT 5 Message Expiry Interval (seconds) the publisher set, if any, so
+        /// the receiver applies the same deadline to its queued copy rather than
+        /// dropping it (ADR 0014 T9). `None` = no expiry.
+        message_expiry: Option<u32>,
     },
     /// A full snapshot of the sender's shared-subscription membership (ADR 0015 §2),
     /// so the receiver can select one member per group across the whole cluster.
@@ -75,6 +79,9 @@ pub enum PeerMessage {
         payload: Vec<u8>,
         /// Already-downgraded delivery `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The MQTT 5 Message Expiry Interval (seconds) the publisher set, if any, so the
+        /// receiver applies the same deadline to a queued copy (ADR 0015 T7). `None` = none.
+        message_expiry: Option<u32>,
     },
     /// First frame of a **session proxy** (ADR 0005): instead of a peer link,
     /// this connection relocates a persistent client session to its placement
@@ -229,6 +236,7 @@ mod tests {
             payload: b"21.5C".to_vec(),
             qos: 1,
             retain: false,
+            message_expiry: Some(30),
         });
         roundtrip(&PeerMessage::SharedInterest {
             groups: vec![(
@@ -242,6 +250,7 @@ mod tests {
             topic: "t/x".into(),
             payload: b"hi".to_vec(),
             qos: 2,
+            message_expiry: None,
         });
         roundtrip(&PeerMessage::RetainedSnapshot {
             messages: vec![
@@ -324,6 +333,7 @@ mod tests {
                 payload: vec![1, 2, 3],
                 qos: 0,
                 retain: false,
+                message_expiry: None,
             },
             &mut out,
         )

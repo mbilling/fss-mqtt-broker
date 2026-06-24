@@ -368,12 +368,14 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             payload,
             qos,
             retain,
+            message_expiry,
         } => {
             let _ = hub.send(HubCommand::RemotePublish {
                 topic,
                 payload: payload.into(),
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
                 retain,
+                message_expiry,
             });
         }
         PeerMessage::SharedInterest { groups } => {
@@ -403,12 +405,14 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             topic,
             payload,
             qos,
+            message_expiry,
         } => {
             let _ = hub.send(HubCommand::RemoteSharedDeliver {
                 client: mqtt_core::ClientId(client),
                 topic,
                 payload: payload.into(),
                 qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                message_expiry,
             });
         }
         PeerMessage::RetainedSnapshot { messages } => {

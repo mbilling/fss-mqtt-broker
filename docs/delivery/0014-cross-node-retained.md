@@ -42,8 +42,9 @@ tasks:
     notes: ADR §3 — snapshot size is bounded by the peer frame limit; chunking is deferred.
   - id: 0014-T9
     title: Carry message-expiry interval on the cross-node peer link
-    status: deferred
-    notes: ADR Consequences — cross-node delivery carries no message-expiry deadline (the peer link does not yet carry the interval); pre-existing carried limitation.
+    status: done
+    date: 2026-06-24
+    evidence: "PeerMessage::Publish gained a message_expiry: Option<u32> field (carried over the peer link); hub forward_to_peers passes the publisher's interval and the RemotePublish handler applies it to the local enqueue instead of None. Test forwarded_publish_carries_message_expiry; peer roundtrip covers the wire field."
 ---
 
 # Delivery — ADR 0014: Cross-node retained-message replication
@@ -82,7 +83,7 @@ the optimizations and unreconciled edges the ADR itself flags as out of scope.
 | 0014-T6 | 💤 deferred | — | ADR §3 leaves this as a later optimization; current back-fill re-sends the full set on each link-up (no digest code in the tree). |
 | 0014-T7 | 💤 deferred | — | ADR §3 leaves divergence unresolved — gap-fill keeps each side's own value; reconciling needs per-message timestamps / version vectors, out of scope. |
 | 0014-T8 | 💤 deferred | — | ADR §3 — snapshot size is bounded by the peer frame limit; chunking is deferred. |
-| 0014-T9 | 💤 deferred | — | ADR Consequences — cross-node delivery carries no message-expiry deadline (the peer link does not yet carry the interval); pre-existing carried limitation. |
+| 0014-T9 | ✅ done | 2026-06-24 | "PeerMessage::Publish gained a message_expiry: Option<u32> field (carried over the peer link); hub forward_to_peers passes the publisher's interval and the RemotePublish handler applies it to the local enqueue instead of None. Test forwarded_publish_carries_message_expiry; peer roundtrip covers the wire field." |
 <!-- /status-table:0014 -->
 
 ## Changelog
