@@ -535,6 +535,15 @@ impl Client {
         assert!(pkt.is_none(), "expected connection close, got {pkt:?}");
     }
 
+    /// Assert the broker sent a v5 DISCONNECT with reason `reason`, then closed.
+    pub async fn expect_disconnect(&mut self, reason: u8) {
+        match self.recv().await {
+            Packet::Disconnect(d) => assert_eq!(d.reason, reason, "DISCONNECT reason"),
+            other => panic!("expected DISCONNECT {reason:#04x}, got {other:?}"),
+        }
+        self.expect_closed().await;
+    }
+
     /// Subscribe to one filter and return the SUBACK.
     pub async fn subscribe(&mut self, pkid: u16, filter: &str, qos: QoS) -> SubAck {
         self.send(&Packet::Subscribe(Subscribe {

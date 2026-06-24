@@ -89,7 +89,7 @@ async fn topic_alias_zero_closes_connection() {
         vec![Property::TopicAlias(0)],
     )
     .await;
-    c.expect_closed().await;
+    c.expect_disconnect(0x94).await;
 }
 
 #[tokio::test]
@@ -105,7 +105,7 @@ async fn topic_alias_above_maximum_closes_connection() {
         vec![Property::TopicAlias(99)],
     )
     .await;
-    c.expect_closed().await;
+    c.expect_disconnect(0x94).await;
 }
 
 #[tokio::test]
@@ -121,7 +121,7 @@ async fn unmapped_topic_alias_reference_closes_connection() {
         vec![Property::TopicAlias(5)],
     )
     .await;
-    c.expect_closed().await;
+    c.expect_disconnect(0x94).await;
 }
 
 // --- AUTH / re-auth violations (ADR 0013) -----------------------------------
