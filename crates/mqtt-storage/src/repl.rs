@@ -125,6 +125,13 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
 
     /// Remove `key`'s log entirely.
     async fn remove(&self, key: &Self::Key) -> Result<(), ReplError>;
+
+    /// Every key this node currently holds a (non-empty) log for. Used to enumerate
+    /// sessions after a takeover so a new owner can schedule their expiry (ADR 0009 §3) —
+    /// not on any hot path. Default: empty (a backend that cannot enumerate its keys).
+    async fn keys(&self) -> Result<Vec<Self::Key>, ReplError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Forward [`ReplicatedLog`] through an [`Arc`](std::sync::Arc) so a single log
@@ -157,6 +164,10 @@ impl<L: ReplicatedLog + ?Sized> ReplicatedLog for std::sync::Arc<L> {
 
     async fn remove(&self, key: &Self::Key) -> Result<(), ReplError> {
         (**self).remove(key).await
+    }
+
+    async fn keys(&self) -> Result<Vec<Self::Key>, ReplError> {
+        (**self).keys().await
     }
 }
 
@@ -252,6 +263,16 @@ impl ReplicatedLog for InMemoryReplicatedLog {
             }
         }
         Ok(())
+    }
+
+    async fn keys(&self) -> Result<Vec<String>, ReplError> {
+        // Only keys with retained entries — a fully-truncated log is effectively absent.
+        Ok(self
+            .lock()
+            .iter()
+            .filter(|(_, s)| !s.entries.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect())
     }
 
     async fn remove(&self, key: &String) -> Result<(), ReplError> {

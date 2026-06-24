@@ -368,6 +368,18 @@ impl ReplicaState {
         self.truncated.get(key).copied().unwrap_or(0)
     }
 
+    /// Every logical key this replica currently holds entries for (ADR 0009 §3): a new
+    /// owner reads these at takeover to find the session metadata it inherited, so it can
+    /// schedule those sessions' expiry. Only non-empty logs are reported.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.logs
+            .iter()
+            .filter(|(_, log)| !log.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// This replica's stored entries for `key`, in offset order (for takeover /
     /// tests). Followers store what they are sent; commit is the leader's notion.
     #[must_use]

@@ -268,6 +268,37 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         self.log.remove(&Self::meta_key(client)).await?;
         Ok(())
     }
+
+    async fn set_session_expiry(
+        &self,
+        client: &ClientId,
+        deadline: Option<u64>,
+    ) -> Result<(), StorageError> {
+        // Read-modify-write the snapshot so subscriptions / dedup / packet-id survive.
+        let mut meta = self.load_meta(client).await?.unwrap_or_default();
+        meta.session_expiry_at = deadline;
+        self.store_meta(client, &meta).await
+    }
+
+    async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
+        // Enumerate the metadata keys this node holds (`m/{client}`) and return those with
+        // a persisted deadline. Off the hot path — used at takeover to inherit expiries.
+        let mut out = Vec::new();
+        for key in self.log.keys().await? {
+            let Some(id) = key.strip_prefix("m/") else {
+                continue;
+            };
+            let client = ClientId(id.to_string());
+            if let Some(deadline) = self
+                .load_meta(&client)
+                .await?
+                .and_then(|m| m.session_expiry_at)
+            {
+                out.push((client, deadline));
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +321,12 @@ struct SessionMeta {
     received_qos2: BTreeSet<u16>,
     /// Last outbound packet id allocated (0 = none yet).
     last_packet_id: u16,
+    /// MQTT 5.0 Session Expiry: the absolute **Unix epoch seconds** at which a
+    /// *disconnected* session should be discarded, or `None` while connected / for a
+    /// never-expiring session (ADR 0009 phase 3). Persisting the absolute deadline lets a
+    /// new owner expire the session at the right wall-clock time after a takeover, instead
+    /// of restarting the clock.
+    session_expiry_at: Option<u64>,
 }
 
 fn qos_to_u8(q: QoS) -> u8 {
@@ -350,6 +387,15 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
         out.extend_from_slice(&id.to_be_bytes());
     }
     out.extend_from_slice(&m.last_packet_id.to_be_bytes());
+    // Appended after the original fields so older records (which end here) still decode
+    // (their `session_expiry_at` reads as `None`).
+    match m.session_expiry_at {
+        Some(deadline) => {
+            out.push(1);
+            out.extend_from_slice(&deadline.to_be_bytes());
+        }
+        None => out.push(0),
+    }
     out
 }
 
@@ -362,6 +408,12 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    /// Whether all bytes have been consumed — used to tolerate records written before a
+    /// trailing field was appended (backward-compatible decode).
+    fn is_empty(&self) -> bool {
+        self.pos >= self.buf.len()
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], StorageError> {
@@ -454,16 +506,26 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
         received_qos2.insert(r.u16()?);
     }
     let last_packet_id = r.u16()?;
+    // Backward-compatible: a record written before ADR 0009 phase 3 ends here, so an empty
+    // remainder means "no expiry deadline".
+    let session_expiry_at = if r.is_empty() {
+        None
+    } else if r.u8()? == 1 {
+        Some(r.u64()?)
+    } else {
+        None
+    };
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
         last_packet_id,
+        session_expiry_at,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ReplicatedSessionStore;
+    use super::{decode_session_meta, ReplicatedSessionStore};
     use crate::repl::InMemoryReplicatedLog;
     use crate::{Enqueued, Offset, OverflowPolicy, QueueLimits, SessionStore};
     use mqtt_core::{ClientId, Message, QoS, Subscription};
@@ -728,6 +790,60 @@ mod tests {
         s.remove(&c).await.unwrap();
         assert!(s.pending(&c, 0, 100).await.unwrap().is_empty());
         assert!(s.subscriptions(&c).await.unwrap().is_empty());
+    }
+
+    /// ADR 0009 §3: a session's absolute expiry deadline persists in the metadata snapshot
+    /// (surviving subscription changes / a restart over the same log) and is enumerable via
+    /// `expiring_sessions` for a new owner to inherit; clearing it removes it from the set.
+    #[tokio::test]
+    async fn session_expiry_persists_and_enumerates() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let s = ReplicatedSessionStore::new(log.clone());
+        let c = cid("c");
+        s.ensure_session(&c).await.unwrap();
+        s.set_subscriptions(&c, &[sub("a", QoS::AtLeastOnce, false)])
+            .await
+            .unwrap();
+
+        // No deadline yet.
+        assert!(s.expiring_sessions().await.unwrap().is_empty());
+
+        // Persist a deadline; it is enumerable, and a subscription change preserves it.
+        s.set_session_expiry(&c, Some(1_000_000)).await.unwrap();
+        s.set_subscriptions(&c, &[sub("b", QoS::AtMostOnce, false)])
+            .await
+            .unwrap();
+
+        // A fresh store over the same log (the "new owner" / restart) sees the deadline.
+        let owner = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            owner.expiring_sessions().await.unwrap(),
+            vec![(c.clone(), 1_000_000)],
+            "deadline survives and is enumerable for the new owner"
+        );
+        // ...and the subscription change did not drop it.
+        assert_eq!(owner.subscriptions(&c).await.unwrap()[0].filter, "b");
+
+        // Clearing it (e.g. on reconnect) removes it from the expiring set.
+        owner.set_session_expiry(&c, None).await.unwrap();
+        assert!(owner.expiring_sessions().await.unwrap().is_empty());
+    }
+
+    /// A metadata record written before the expiry field existed (the original 3-field
+    /// encoding) still decodes — its `session_expiry_at` reads as `None` (backward compat).
+    #[test]
+    fn decodes_pre_expiry_meta_records() {
+        // The original encoding: subs count (0), received count (0), last_packet_id (0).
+        let legacy = {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0u32.to_be_bytes()); // no subscriptions
+            out.extend_from_slice(&0u32.to_be_bytes()); // no received qos2
+            out.extend_from_slice(&0u16.to_be_bytes()); // last_packet_id
+            out
+        };
+        let meta = decode_session_meta(&legacy).unwrap();
+        assert_eq!(meta.session_expiry_at, None);
+        assert!(meta.subscriptions.is_empty());
     }
 
     /// The layering proof: a second store over the **same log** sees the first

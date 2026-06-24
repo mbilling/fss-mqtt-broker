@@ -227,6 +227,27 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
 
     /// Remove the session and its queue entirely (clean start / session expiry).
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError>;
+
+    /// Persist the session's **absolute** MQTT 5.0 expiry deadline (Unix epoch seconds) —
+    /// the wall-clock time a disconnected session should be discarded — or clear it
+    /// (`None`) while the client is connected or for a never-expiring session (ADR 0009
+    /// §3). Persisting it lets a new owner expire the session at the right time after a
+    /// takeover rather than restarting the clock. Default: a no-op (stores without durable
+    /// metadata, e.g. test stubs).
+    async fn set_session_expiry(
+        &self,
+        _client: &ClientId,
+        _deadline: Option<u64>,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Every session this store currently holds with a persisted expiry deadline, as
+    /// `(client, deadline epoch secs)`. A new owner reads this after a takeover to
+    /// schedule the expiry sweep for sessions it inherited (ADR 0009 §3). Default: empty.
+    async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Stores retained messages keyed by topic.
@@ -265,6 +286,9 @@ struct SessionEntry {
     received_qos2: BTreeSet<u16>,
     /// Last outbound packet id allocated (0 = none yet).
     last_packet_id: u16,
+    /// Absolute expiry deadline (Unix epoch secs) for a disconnected session, or `None`
+    /// while connected / never-expiring (ADR 0009 §3).
+    session_expiry_at: Option<u64>,
 }
 
 /// A non-durable, single-process [`SessionStore`] backed by in-memory maps.
@@ -441,6 +465,26 @@ impl SessionStore for MemorySessionStore {
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError> {
         self.lock().remove(client);
         Ok(())
+    }
+
+    async fn set_session_expiry(
+        &self,
+        client: &ClientId,
+        deadline: Option<u64>,
+    ) -> Result<(), StorageError> {
+        // Only record a deadline against an existing session; nothing to expire otherwise.
+        if let Some(entry) = self.lock().get_mut(client) {
+            entry.session_expiry_at = deadline;
+        }
+        Ok(())
+    }
+
+    async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
+        Ok(self
+            .lock()
+            .iter()
+            .filter_map(|(c, e)| e.session_expiry_at.map(|d| (c.clone(), d)))
+            .collect())
     }
 }
 

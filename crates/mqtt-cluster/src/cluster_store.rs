@@ -305,6 +305,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
     async fn remove(&self, key: &String) -> Result<(), ReplError> {
         self.log_for_key(key).await?.remove(key).await
     }
+
+    async fn keys(&self) -> Result<Vec<String>, ReplError> {
+        // The replicated copies this node holds (ADR 0009 §3): the session metadata a new
+        // owner inherited at takeover, and (on a persistent backend) what reopened from
+        // disk after a restart, live here. Sessions this node already owns and is actively
+        // managing are tracked in the hub's in-memory expiry map, so reading the replica
+        // keys is what the takeover-expiry reconcile needs.
+        Ok(self
+            .local_replicas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys())
+    }
 }
 
 #[cfg(test)]
