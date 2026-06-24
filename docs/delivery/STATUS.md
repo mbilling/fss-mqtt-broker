@@ -8,7 +8,7 @@
 
 | ADR | Title | Decision | Tasks | Open / deferred |
 |-----|-------|----------|-------|-----------------|
-| 0001 | Session durability in a horizontally-scalable cluster | Accepted | 9/11 done | 2 deferred |
+| 0001 | Session durability in a horizontally-scalable cluster | Accepted | 10/11 done | 1 deferred |
 | 0002 | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | 7/10 done | 3 deferred |
 | 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 8/9 done | — |
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
@@ -16,7 +16,7 @@
 | 0006 | Consensus & replication for durable sessions | Accepted | 11/11 done | — |
 | 0007 | Wiring the durable cluster session store into the broker | Accepted | 7/9 done | 2 deferred |
 | 0008 | MQTT 5.0 codec | Accepted | 8/8 done | — |
-| 0009 | MQTT 5.0 session & message expiry | Accepted | 2/3 done | 1 deferred |
+| 0009 | MQTT 5.0 session & message expiry | Accepted | 3/3 done | — |
 | 0010 | Shared subscriptions | Accepted | 7/8 done | 1 deferred |
 | 0011 | MQTT 5.0 topic aliases | Accepted | 7/7 done | — |
 | 0012 | MQTT 5.0 flow control (Receive Maximum) | Accepted | 6/6 done | — |
@@ -42,7 +42,6 @@
 
 **0001 — Session durability in a horizontally-scalable cluster**
 
-- `0001-T10` 💤 deferred: Durable session-expiry deadline across takeover (ADR 0009 phase 3) — message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3)
 - `0001-T11` 💤 deferred: Client-facing reconnect during promotion + spec-legal QoS-1 redelivery bounds (takeover hardening) — takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass
 
 **0002 — Transport security: TLS 1.3 everywhere, mTLS on the cluster bus**
@@ -67,10 +66,6 @@
 
 - `0007-T8` 💤 deferred: Dynamic-reconfiguration hardening under rapid churn (flap -> ephemeral degrade) — v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
 - `0007-T9` 💤 deferred: Connection-driven next_packet_id over the durable store — store impls next_packet_id but conn.rs never calls it; outbound packet-id allocation stays hub-side, so the per-packet durable path is record_received/clear_received only
-
-**0009 — MQTT 5.0 session & message expiry**
-
-- `0009-P3` 💤 deferred: Durable expiry deadline (persist disconnect time so takeover preserves the clock) — expiry deadline is in-memory only (hub expiring HashMap of Instant); SessionMeta snapshot has no disconnect-time field, so a takeover restarts the clock; documented §2 follow-up gated on workstream F
 
 **0010 — Shared subscriptions**
 

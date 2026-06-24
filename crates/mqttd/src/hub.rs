@@ -65,6 +65,12 @@ const MAX_BACKLOG: usize = 10_000;
 /// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How many sweep ticks between reconciling persisted expiry deadlines from the durable
+/// store (ADR 0009 §3). This inherits deadlines for sessions a takeover handed this node
+/// without seeing their disconnect; takeover is rare and the scan is O(owned sessions), so
+/// it runs at a coarse cadence rather than every second.
+const EXPIRY_RECONCILE_EVERY: u32 = 30;
+
 /// MQTT 5.0 Session Expiry Interval meaning "never expire" (0xFFFFFFFF). v3.1.1
 /// `clean_session=0` maps to this.
 const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
@@ -488,9 +494,14 @@ pub struct Hub {
     /// client is present here iff its session survives disconnect (expiry != 0);
     /// v3.1.1 `clean_session=0` maps to `u32::MAX` (never expire). See ADR 0009.
     session_expiry: HashMap<ClientId, u32>,
-    /// Disconnected sessions with a finite expiry, and the instant they expire. The
-    /// sweep discards those past due; a reconnect cancels the entry.
-    expiring: HashMap<ClientId, Instant>,
+    /// Disconnected sessions with a finite expiry, and the **absolute Unix-epoch second**
+    /// they expire at (ADR 0009 §3). The sweep discards those past due; a reconnect cancels
+    /// the entry. An absolute wall-clock deadline (not a monotonic `Instant`) is what lets a
+    /// new owner inherit the right deadline after a takeover — the same value is persisted in
+    /// the durable session metadata.
+    expiring: HashMap<ClientId, u64>,
+    /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
+    expiry_reconcile_tick: u32,
     /// Per-client subscription filters with their granted `QoS`.
     subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
     /// Routing index covering online clients and offline persistent sessions.
@@ -595,6 +606,7 @@ impl Hub {
                 online: HashMap::new(),
                 session_expiry: HashMap::new(),
                 expiring: HashMap::new(),
+                expiry_reconcile_tick: 0,
                 subs_by_client: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
@@ -986,6 +998,12 @@ impl Hub {
             self.session_expiry.remove(&client);
         } else {
             self.session_expiry.insert(client.clone(), session_expiry);
+            // Connected again → the session must not expire while online. Clear any persisted
+            // deadline (ADR 0009 §3); the next disconnect re-arms it. This also prevents a
+            // restart-while-connected from inheriting a stale deadline and wrongly expiring an
+            // active session. Only for a persistent session — a clean session has no durable
+            // metadata, and writing a cleared deadline would wrongly materialize one.
+            let _ = self.store.set_session_expiry(&client, None).await;
         }
 
         // Adopt this connection's outbound Receive Maximum quota (ADR 0012). A
@@ -1540,7 +1558,11 @@ impl Hub {
             }
             Some(secs) => {
                 self.flush_backlog_to_store(client).await;
-                let deadline = Instant::now() + Duration::from_secs(u64::from(secs));
+                // Absolute wall-clock deadline, persisted durably so a new owner expires the
+                // session at the right time after a takeover instead of restarting the clock
+                // (ADR 0009 §3).
+                let deadline = self.clock.now_epoch_secs() + u64::from(secs);
+                let _ = self.store.set_session_expiry(client, Some(deadline)).await;
                 self.expiring.insert(client.clone(), deadline);
                 info!(client = %client.0, expires_in_s = secs, "client detached (session expiring)");
             }
@@ -1596,7 +1618,14 @@ impl Hub {
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
     /// (ADR 0009). Runs on the hub's periodic sweep tick.
     async fn sweep_expired_sessions(&mut self) {
-        let now = Instant::now();
+        // Periodically inherit persisted deadlines for owned sessions this node did not see
+        // disconnect — those handed to it by a takeover (ADR 0009 §3).
+        self.expiry_reconcile_tick = self.expiry_reconcile_tick.wrapping_add(1);
+        if self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0 {
+            self.reconcile_inherited_expiries().await;
+        }
+
+        let now = self.clock.now_epoch_secs();
         let expired: Vec<ClientId> = self
             .expiring
             .iter()
@@ -1612,6 +1641,45 @@ impl Hub {
         }
         // Interest may have shrunk now that expired subscriptions are gone.
         self.gossip_interest();
+    }
+
+    /// Pull persisted expiry deadlines from the durable store for sessions this node now
+    /// **owns** but is not already tracking — the orphaned, never-reconnected sessions a
+    /// takeover handed it. Without this, such a session would never expire on the new owner
+    /// (the clock effectively restarts); with it, the new owner expires it at the original
+    /// absolute deadline (ADR 0009 §3).
+    async fn reconcile_inherited_expiries(&mut self) {
+        let persisted = match self.store.expiring_sessions().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "could not read persisted session expiries");
+                return;
+            }
+        };
+        for (client, deadline) in persisted {
+            // Skip ones we already handle (online here, or already scheduled), and ones we
+            // do not own (a replica we hold for another node — its owner expires it).
+            if self.online.contains_key(&client)
+                || self.expiring.contains_key(&client)
+                || !self.owns_session(&client)
+            {
+                continue;
+            }
+            // Schedule its expiry at the inherited absolute deadline; the sweep discards it
+            // when due (discard_session removes the durable session and any local state).
+            self.expiring.insert(client, deadline);
+        }
+    }
+
+    /// Whether this node is the placement owner of `client`'s session. Outside a cluster
+    /// (no placement, or a single member) every session is local, so it is always owned.
+    fn owns_session(&self, client: &ClientId) -> bool {
+        match &self.placement {
+            None => true,
+            Some(p) => p
+                .read()
+                .map_or(true, |p| p.member_count() <= 1 || p.owns(&client.0)),
+        }
     }
 
     /// Refresh the broker state gauges (sessions, subscriptions, retained, inflight)
@@ -1986,14 +2054,14 @@ async fn recover_once(
 mod tests {
     use super::{
         AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound,
-        RemoteSharedGroup, MAX_BACKLOG, REPLAY_LIMIT,
+        RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, REPLAY_LIMIT,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::PeerMessage;
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
     use mqtt_core::ClientId;
-    use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits};
+    use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
@@ -3145,15 +3213,20 @@ mod tests {
     /// then the sweep discards it once the interval elapses (ADR 0009).
     #[tokio::test(start_paused = true)]
     async fn session_expiry_finite_retains_then_expires() {
-        let tx = start_hub();
+        let (tx, clock) = start_hub_with_clock();
         let (_rx, _) = attach_v5(&tx, "e", 1, false, 1).await;
         subscribe(&tx, "e", "e/t");
         detach(&tx, "e", 1);
         // Retained during the expiry window: the offline message queues.
         publish(&tx, "e/t", b"m");
 
-        // Advance past the 1s interval; the hub's sweep discards the session.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Let the actor record the deadline (from the current clock) before advancing, so
+        // the deadline is computed from "now", not the post-advance time.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Past the 1s wall-clock interval (the deadline is absolute epoch now), then let a
+        // sweep tick fire to discard the session.
+        clock.advance(3);
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         let (mut rx, present) = attach_v5(&tx, "e", 2, false, 1).await;
         assert!(!present, "the session must have expired");
@@ -3189,6 +3262,51 @@ mod tests {
         assert_eq!(
             payload_of(&recv_packet(&mut rx).await.unwrap()),
             b"still-here"
+        );
+    }
+
+    /// ADR 0009 §3 takeover: a session whose absolute expiry deadline was persisted by a
+    /// *prior* owner (this hub never saw it connect or disconnect) is inherited from the
+    /// durable store and expired at the **original** deadline — the clock does not restart.
+    #[tokio::test(start_paused = true)]
+    async fn inherited_session_expiry_is_swept_after_takeover() {
+        use std::sync::Arc;
+        // The durable store already holds a persistent session with a finite deadline, as if
+        // a now-failed owner had persisted it before dying.
+        let store = Arc::new(MemorySessionStore::new());
+        let client = ClientId("orphan".into());
+        store.ensure_session(&client).await.unwrap();
+        store
+            .set_session_expiry(&client, Some(1_000_050))
+            .await
+            .unwrap();
+
+        // A fresh hub (the new owner) over that store, its wall clock just before the
+        // deadline. No placement → it owns every session.
+        let clock = TestClock::new(1_000_000);
+        let (mut hub, _tx) = Hub::with_config(NodeId("new-owner".into()), store.clone());
+        hub.attach_clock(Arc::new(clock.clone()));
+        tokio::spawn(hub.run());
+
+        // Past at least one reconcile cadence but before the deadline: the deadline is
+        // inherited (scheduled) but the session is kept.
+        tokio::time::sleep(Duration::from_secs(u64::from(EXPIRY_RECONCILE_EVERY + 2))).await;
+        assert_eq!(
+            store.expiring_sessions().await.unwrap().len(),
+            1,
+            "deadline still persisted before it elapses"
+        );
+
+        // Past the deadline: the next sweep discards the inherited session.
+        clock.advance(100);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            store.expiring_sessions().await.unwrap().is_empty(),
+            "inherited session expired at the original deadline"
+        );
+        assert!(
+            store.subscriptions(&client).await.unwrap().is_empty(),
+            "the durable session was removed"
         );
     }
 

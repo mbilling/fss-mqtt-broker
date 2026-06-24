@@ -15,8 +15,9 @@ tasks:
     evidence: logged::enqueue_with_expiry_round_trips_the_deadline; hub::replayed_message_forwards_remaining_expiry_interval
   - id: 0009-P3
     title: Durable expiry deadline (persist disconnect time so takeover preserves the clock)
-    status: deferred
-    notes: expiry deadline is in-memory only (hub expiring HashMap of Instant); SessionMeta snapshot has no disconnect-time field, so a takeover restarts the clock; documented §2 follow-up gated on workstream F
+    status: done
+    date: 2026-06-24
+    evidence: "ADR 0009 phase 3. SessionMeta persists session_expiry_at (absolute epoch); the hub's expiring map + sweep use absolute wall-clock (Clock) so deadlines are portable; detach persists the deadline, attach (persistent only) clears it; the sweep reconciles store.expiring_sessions() for OWNED, offline, untracked sessions every EXPIRY_RECONCILE_EVERY ticks so a new owner inherits orphaned deadlines after a takeover and expires them at the original time. Tests inherited_session_expiry_is_swept_after_takeover, session_expiry_finite_retains_then_expires (clock-driven), session_expiry_persists_and_enumerates, decodes_pre_expiry_meta_records; full workspace green."
 ---
 
 # Delivery — ADR 0009: MQTT 5.0 session & message expiry
@@ -42,7 +43,7 @@ storage-format message-expiry change, then the durable-deadline follow-up that c
 |------|--------|------|------------------|
 | 0009-P1 | ✅ done | 2026-06-22 | hub::session_expiry_finite_retains_then_expires; hub::session_expiry_reconnect_cancels_expiry |
 | 0009-P2 | ✅ done | 2026-06-22 | logged::enqueue_with_expiry_round_trips_the_deadline; hub::replayed_message_forwards_remaining_expiry_interval |
-| 0009-P3 | 💤 deferred | — | expiry deadline is in-memory only (hub expiring HashMap of Instant); SessionMeta snapshot has no disconnect-time field, so a takeover restarts the clock; documented §2 follow-up gated on workstream F |
+| 0009-P3 | ✅ done | 2026-06-24 | "ADR 0009 phase 3. SessionMeta persists session_expiry_at (absolute epoch); the hub's expiring map + sweep use absolute wall-clock (Clock) so deadlines are portable; detach persists the deadline, attach (persistent only) clears it; the sweep reconciles store.expiring_sessions() for OWNED, offline, untracked sessions every EXPIRY_RECONCILE_EVERY ticks so a new owner inherits orphaned deadlines after a takeover and expires them at the original time. Tests inherited_session_expiry_is_swept_after_takeover, session_expiry_finite_retains_then_expires (clock-driven), session_expiry_persists_and_enumerates, decodes_pre_expiry_meta_records; full workspace green." |
 <!-- /status-table:0009 -->
 
 **Carried limitation (from §2):** the expiry deadline lives only in the owner's in-memory

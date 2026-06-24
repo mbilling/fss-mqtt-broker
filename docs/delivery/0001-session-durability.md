@@ -50,8 +50,9 @@ tasks:
     evidence: "Done by ADR 0029 — MQTTD_DURABLE_SESSIONS is now default-on (opt-out), so the shipping default is the consensus-backed replicated store. Stability prerequisites landed first: ADR 0026 (timing), 0027 (replica group-commit), 0028 (link-gated voter admission). See docs/delivery/0029-durable-by-default.md."
   - id: 0001-T10
     title: Durable session-expiry deadline across takeover (ADR 0009 phase 3)
-    status: deferred
-    notes: message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3)
+    status: done
+    date: 2026-06-24
+    evidence: "ADR 0009 phase 3. SessionMeta persists session_expiry_at (absolute epoch); the hub's expiring map + sweep use absolute wall-clock (Clock) so deadlines are portable; detach persists the deadline, attach (persistent only) clears it; the sweep reconciles store.expiring_sessions() for OWNED, offline, untracked sessions every EXPIRY_RECONCILE_EVERY ticks so a new owner inherits orphaned deadlines after a takeover and expires them at the original time. Tests inherited_session_expiry_is_swept_after_takeover, session_expiry_finite_retains_then_expires (clock-driven), session_expiry_persists_and_enumerates, decodes_pre_expiry_meta_records; full workspace green."
   - id: 0001-T11
     title: Client-facing reconnect during promotion + spec-legal QoS-1 redelivery bounds (takeover hardening)
     status: deferred
@@ -103,7 +104,7 @@ tests, and the dashboard.
 | 0001-T7 | ✅ done | 2026-06-22 | mqtt-storage/src/lib.rs SessionStore trait + MemorySessionStore; logged.rs ReplicatedSessionStore over InMemoryReplicatedLog (q/{client}, m/{client}) |
 | 0001-T8 | ✅ done | 2026-06-22 | persistent_log.rs PersistentLog (state_survives_reopen); durable_node a_persistent_durable_node_restarts_from_its_data_dir; realized by ADR 0017/0018 |
 | 0001-T9 | ✅ done | 2026-06-24 | "Done by ADR 0029 — MQTTD_DURABLE_SESSIONS is now default-on (opt-out), so the shipping default is the consensus-backed replicated store. Stability prerequisites landed first: ADR 0026 (timing), 0027 (replica group-commit), 0028 (link-gated voter admission). See docs/delivery/0029-durable-by-default.md." |
-| 0001-T10 | 💤 deferred | — | message-expiry deadline is durable in the log, but the session-expiry timer restarts on takeover; the one open durability item (see ADR 0009 / delivery 0009-T3) |
+| 0001-T10 | ✅ done | 2026-06-24 | "ADR 0009 phase 3. SessionMeta persists session_expiry_at (absolute epoch); the hub's expiring map + sweep use absolute wall-clock (Clock) so deadlines are portable; detach persists the deadline, attach (persistent only) clears it; the sweep reconciles store.expiring_sessions() for OWNED, offline, untracked sessions every EXPIRY_RECONCILE_EVERY ticks so a new owner inherits orphaned deadlines after a takeover and expires them at the original time. Tests inherited_session_expiry_is_swept_after_takeover, session_expiry_finite_retains_then_expires (clock-driven), session_expiry_persists_and_enumerates, decodes_pre_expiry_meta_records; full workspace green." |
 | 0001-T11 | 💤 deferred | — | takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass |
 <!-- /status-table:0001 -->
 
