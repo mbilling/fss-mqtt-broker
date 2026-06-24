@@ -33,7 +33,8 @@
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 | 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
 | 0025 | Boundary MQTT bridge to brokers in other security zones | Proposed | 0/11 done | 11 open |
-| 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 6/7 done | 1 open |
+| 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 7/7 done | — |
+| 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
 
 ## Open and deferred work
 
@@ -161,7 +162,3 @@
 - `0025-T9` ⬜ planned: Bridge observability (forwarded/dropped per upstream+direction, lag, reconnects) via mqtt-observability + OTLP
 - `0025-T10` ⬜ planned: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
 - `0025-T11` ⬜ planned: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
-
-**0026 — Lease-group raft timing tolerant of durable-storage latency**
-
-- `0026-T5` ⬜ planned: Group-commit / coalesce raft log writes to cut fsync count (residual under-load churn) — "Promoted from deferred — T4 surfaced concrete evidence it is needed: a durable 3-node demo holds a stable leader AT REST, but under even light sustained QoS-1 load the lease epoch/term climbs slowly (session-log fsyncs contend with the lease raft's fsyncs, delaying heartbeats into election timeouts). openraft already batches AppendEntries so the marginal win is bounded; may also need to isolate the durable session-log I/O from the lease-group raft I/O."

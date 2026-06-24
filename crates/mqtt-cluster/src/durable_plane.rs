@@ -20,7 +20,8 @@
 //! the hub actor's serial command loop. Wiring it into `mqttd`'s peer pump is the
 //! final integration step (4f).
 
-use crate::cluster_log::ReplicaState;
+use crate::cluster_log::{ReplOp, ReplicaState};
+use crate::lease::Epoch;
 use crate::lease_group::LeaseRaft;
 use crate::node_registry::raft_id;
 use crate::peer::PeerMessage;
@@ -28,7 +29,11 @@ use crate::raft_mesh::{dispatch, MeshRaftNetwork};
 use crate::repl_net::PeerReplicaTransport;
 use crate::NodeId;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+/// One queued replica write: the holder's `op` at `epoch`, plus a one-shot to return
+/// whether it was accepted (durably applied / not fenced) to the waiting frame.
+type ReplicaWrite = (Epoch, ReplOp, oneshot::Sender<bool>);
 
 /// A node's endpoint on the durable plane: its lease-group consensus handle, its
 /// replication-follower state, and its replication-leader transport, plus the routing
@@ -39,6 +44,11 @@ pub struct DurablePlane {
     network: MeshRaftNetwork,
     transport: Arc<PeerReplicaTransport>,
     replicas: Arc<Mutex<ReplicaState>>,
+    /// Sender into the single **replica-writer** task (ADR 0027): inbound `Replicate`
+    /// frames hand their op here instead of each fsyncing on its own, so the writer can
+    /// group-commit a burst into one transaction. The recovery-read path still locks
+    /// `replicas` directly (between batches).
+    replica_tx: mpsc::UnboundedSender<ReplicaWrite>,
 }
 
 impl std::fmt::Debug for DurablePlane {
@@ -57,11 +67,13 @@ impl DurablePlane {
         transport: Arc<PeerReplicaTransport>,
         replicas: Arc<Mutex<ReplicaState>>,
     ) -> Self {
+        let replica_tx = spawn_replica_writer(replicas.clone());
         Self {
             raft,
             network,
             transport,
             replicas,
+            replica_tx,
         }
     }
 
@@ -148,19 +160,18 @@ impl DurablePlane {
                 self.network.complete_reply(req_id, payload);
                 None
             }
-            // Replication append → apply to our follower copy, ack accept/fence. Run the
-            // apply (which, when persistent, fsyncs before acking — ADR 0018 phase 3) off
-            // the async worker so a durable write never stalls the plane's frame loop.
+            // Replication append → hand to the replica-writer, which group-commits a burst
+            // of ops into one fsync'd transaction and answers with accept/fence (ADR 0027).
+            // A `true` ack still means the op is durably on disk (the batch committed).
             PeerMessage::Replicate { req_id, epoch, op } => {
-                let replicas = self.replicas.clone();
-                let accepted = tokio::task::spawn_blocking(move || {
-                    replicas
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .apply(epoch, &op)
-                })
-                .await
-                .unwrap_or(false);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                // If the writer is gone (shutdown) or never answers, the op is not durable
+                // → do not ack acceptance.
+                let accepted = if self.replica_tx.send((epoch, op, reply_tx)).is_ok() {
+                    reply_rx.await.unwrap_or(false)
+                } else {
+                    false
+                };
                 Some(PeerMessage::ReplicateAck { req_id, accepted })
             }
             // Replication ack → wake the waiting append.
@@ -208,6 +219,50 @@ impl DurablePlane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Spawn the single **replica-writer** task for a node's follower copy (ADR 0027).
+///
+/// Inbound `Replicate` frames send their op here rather than each fsyncing on its own.
+/// The writer takes the next queued op, **drains everything else already queued**, and
+/// applies the whole burst with one [`ReplicaState::apply_batch`] — a single fsync for
+/// the batch instead of one per message. Each waiting frame is then answered with its
+/// op's accept/fence result. Under load this collapses N per-message fsyncs into one per
+/// batch (the contention ADR 0026 T4 found); at rest (one op in flight) it is exactly the
+/// previous one-op-per-commit behaviour. Returns the sender the plane keeps; the task
+/// lives until every sender drops (all plane clones gone).
+fn spawn_replica_writer(replicas: Arc<Mutex<ReplicaState>>) -> mpsc::UnboundedSender<ReplicaWrite> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ReplicaWrite>();
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            // Coalesce the current backlog: this op plus everything already queued.
+            let mut batch = vec![first];
+            while let Ok(next) = rx.try_recv() {
+                batch.push(next);
+            }
+            let mut ops = Vec::with_capacity(batch.len());
+            let mut replies = Vec::with_capacity(batch.len());
+            for (epoch, op, reply) in batch {
+                ops.push((epoch, op));
+                replies.push(reply);
+            }
+            // Run the (fsyncing) batch apply off the async worker; one fsync for the burst.
+            let n = replies.len();
+            let replicas = replicas.clone();
+            let results = tokio::task::spawn_blocking(move || {
+                replicas
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .apply_batch(&ops)
+            })
+            .await
+            .unwrap_or_else(|_| vec![false; n]);
+            for (reply, accepted) in replies.into_iter().zip(results) {
+                let _ = reply.send(accepted);
+            }
+        }
+    });
+    tx
 }
 
 #[cfg(test)]
@@ -439,5 +494,57 @@ mod tests {
 
         p1.raft().shutdown().await.unwrap();
         p2.raft().shutdown().await.unwrap();
+    }
+
+    /// ADR 0027: a burst of `Replicate` frames handled concurrently is all accepted and
+    /// durably applied by the single replica-writer — the ops can coalesce into one
+    /// fsync'd batch, and none is dropped or corrupted under the concurrency. (The
+    /// fsync-count reduction itself is validated live; here we prove correctness.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replica_writer_group_commits_a_concurrent_burst() {
+        let p = node("burst-node").await;
+
+        // Fire 50 appends to distinct keys concurrently through the plane — they race into
+        // the writer's queue, where it batches whatever is pending into one apply_batch.
+        let mut tasks = Vec::new();
+        for i in 0..50u8 {
+            let plane = p.clone();
+            tasks.push(tokio::spawn(async move {
+                let frame = PeerMessage::Replicate {
+                    req_id: u64::from(i),
+                    epoch: 1,
+                    op: ReplOp::Append {
+                        key: format!("q/{i}"),
+                        offset: 1,
+                        record: vec![i],
+                    },
+                };
+                match plane.handle(frame).await {
+                    Some(PeerMessage::ReplicateAck { accepted, .. }) => accepted,
+                    _ => false,
+                }
+            }));
+        }
+        let mut accepted = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 50, "every op in the burst is accepted");
+
+        // All 50 keys are durably present on the follower copy, each with its record.
+        // (Scoped so the guard is dropped before the await below.)
+        {
+            let replicas = p.replicas.lock().unwrap();
+            assert_eq!(replicas.fence(), 1);
+            for i in 0..50u8 {
+                let entries = replicas.entries(&format!("q/{i}"));
+                assert_eq!(entries.len(), 1, "key q/{i} applied exactly once");
+                assert_eq!(entries[0].record, vec![i]);
+            }
+        }
+
+        p.raft().shutdown().await.unwrap();
     }
 }

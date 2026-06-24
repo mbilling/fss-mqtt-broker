@@ -30,8 +30,9 @@ tasks:
     evidence: demo/durable.yml opt-in override (durable sessions + per-node /data volumes); lease_* / durable_append_* panels populate with a stable leader at rest (verified live — lease epoch flat once load is stopped). Kept opt-in, not default, because of the under-load churn finding below (T5). README + demo comments document the overlay.
   - id: 0026-T5
     title: Group-commit / coalesce raft log writes to cut fsync count (residual under-load churn)
-    status: planned
-    notes: "Promoted from deferred — T4 surfaced concrete evidence it is needed: a durable 3-node demo holds a stable leader AT REST, but under even light sustained QoS-1 load the lease epoch/term climbs slowly (session-log fsyncs contend with the lease raft's fsyncs, delaying heartbeats into election timeouts). openraft already batches AppendEntries so the marginal win is bounded; may also need to isolate the durable session-log I/O from the lease-group raft I/O."
+    status: done
+    date: 2026-06-24
+    evidence: "Addressed by ADR 0027 (group-commit on the durable replica apply path). Root cause was the follower replica fsyncing once per replicated message; ADR 0027's replica-writer coalesces a burst into one fsync. Validated live — under the demo loadgen the durable lease epoch now goes flat (was climbing continuously). See docs/delivery/0027-replica-group-commit.md."
   - id: 0026-T6
     title: Cross-reference the timing/storage-latency constraint from the 0007 and 0018 delivery docs
     status: done
@@ -70,7 +71,7 @@ it — test the persistent path under injected commit latency.
 | 0026-T7 | ✅ done | 2026-06-24 | lease_membership::decide now bootstraps on can_bootstrap alone (the min-id tiebreak removed — it never prevented the multi-founder race it targeted and wrongly blocked a non-min founder). Unit test any_founder_bootstraps_with_itself_regardless_of_id_rank; integration guard durable_sessions::lease_group_forms_and_is_stable_under_slow_durable_commits now deliberately makes the founder the MAX raft id (previously hung at term 0). |
 | 0026-T3 | ✅ done | 2026-06-24 | DRIVER_TICK 200ms -> 1s (durable_node.rs); RaftView.changing (membership().get_joint_config().len() > 1) makes decide() return None while a change is in joint consensus. Unit test a_leader_does_not_re_propose_while_a_change_is_in_flight; full durable_sessions suite (7/7) green under the slower tick. |
 | 0026-T4 | ✅ done | 2026-06-24 | demo/durable.yml opt-in override (durable sessions + per-node /data volumes); lease_* / durable_append_* panels populate with a stable leader at rest (verified live — lease epoch flat once load is stopped). Kept opt-in, not default, because of the under-load churn finding below (T5). README + demo comments document the overlay. |
-| 0026-T5 | ⬜ planned | — | "Promoted from deferred — T4 surfaced concrete evidence it is needed: a durable 3-node demo holds a stable leader AT REST, but under even light sustained QoS-1 load the lease epoch/term climbs slowly (session-log fsyncs contend with the lease raft's fsyncs, delaying heartbeats into election timeouts). openraft already batches AppendEntries so the marginal win is bounded; may also need to isolate the durable session-log I/O from the lease-group raft I/O." |
+| 0026-T5 | ✅ done | 2026-06-24 | "Addressed by ADR 0027 (group-commit on the durable replica apply path). Root cause was the follower replica fsyncing once per replicated message; ADR 0027's replica-writer coalesces a burst into one fsync. Validated live — under the demo loadgen the durable lease epoch now goes flat (was climbing continuously). See docs/delivery/0027-replica-group-commit.md." |
 | 0026-T6 | ✅ done | 2026-06-24 | 0007 and 0018 delivery docs each carry a lease-timing↔storage-latency note pointing at ADR 0026 (and T5 for the under-load churn). |
 <!-- /status-table:0026 -->
 
@@ -100,6 +101,13 @@ failure than the original (epoch 218 churn → now a slow climb), and it is cont
 raft-timing-vs-fsync mismatch T1 fixed. The fix lives in **T5** (coalesce raft log writes;
 possibly isolate the session-log I/O from the lease raft). Until then durable is an **opt-in**
 demo overlay (`demo/durable.yml`), not the default.
+
+**Resolved (2026-06-24):** [ADR 0027](../adr/0027-replica-group-commit.md) implemented the
+group-commit. The contention came from the follower replica fsyncing **once per replicated
+message**; a single replica-writer now coalesces a burst into one fsync (mirroring the lease
+store's own batching). Validated live: under the same loadgen the durable lease epoch now goes
+**flat** (was climbing continuously). Durable remains an opt-in demo overlay for now, but the
+steady-state under-load churn is gone.
 
 ## Changelog
 

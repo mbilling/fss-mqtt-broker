@@ -215,38 +215,51 @@ impl ReplicaState {
         })
     }
 
-    /// Durably apply `op` at `fence = epoch` in one fsync'd transaction (the on-disk
-    /// mirror of the in-memory mutation). No-op when in-memory.
-    fn persist(&self, epoch: Epoch, op: &ReplOp) -> Result<(), ReplError> {
+    /// Durably apply a batch of ops at `final_fence` in **one** fsync'd transaction — the
+    /// on-disk mirror of the in-memory mutations, coalesced so a burst of replicated
+    /// messages costs a single fsync rather than one each (ADR 0027). Ops apply in slice
+    /// order. No-op (`Ok`) when in-memory.
+    fn persist_batch(&self, final_fence: Epoch, ops: &[&ReplOp]) -> Result<(), ReplError> {
         let Some(db) = &self.db else {
             return Ok(());
         };
         let mut txn = db.begin_write().map_err(rdb)?;
-        txn.set_durability(Durability::Immediate); // fsync on commit (ADR 0018)
+        txn.set_durability(Durability::Immediate); // one fsync for the whole batch (ADR 0018/0027)
         {
             let mut meta = txn.open_table(R_META).map_err(rdb)?;
-            meta.insert(R_FENCE, epoch).map_err(rdb)?;
+            meta.insert(R_FENCE, final_fence).map_err(rdb)?;
             let mut entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
             let mut trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
-            match op {
-                ReplOp::Append {
-                    key,
-                    offset,
-                    record,
-                } => {
-                    entries
-                        .insert(r_entry_key(key, *offset).as_slice(), record.as_slice())
-                        .map_err(rdb)?;
-                }
-                ReplOp::Truncate { key, up_to } => {
-                    delete_entry_range(&mut entries, key, 0, *up_to)?;
-                    // Persist the monotonic per-key truncation low-water (phase 3b).
-                    let wm = self.watermark(key).max(*up_to);
-                    trunc.insert(key.as_str(), wm).map_err(rdb)?;
-                }
-                ReplOp::Remove { key } => {
-                    delete_entry_range(&mut entries, key, 0, Offset::MAX)?;
-                    trunc.remove(key.as_str()).map_err(rdb)?;
+            // Running per-key truncation low-water across this batch, overlaying the
+            // committed `self.truncated`, so successive truncates in one batch compound.
+            let mut wm: BTreeMap<&str, Offset> = BTreeMap::new();
+            for op in ops {
+                match op {
+                    ReplOp::Append {
+                        key,
+                        offset,
+                        record,
+                    } => {
+                        entries
+                            .insert(r_entry_key(key, *offset).as_slice(), record.as_slice())
+                            .map_err(rdb)?;
+                    }
+                    ReplOp::Truncate { key, up_to } => {
+                        delete_entry_range(&mut entries, key, 0, *up_to)?;
+                        // Persist the monotonic per-key truncation low-water (phase 3b).
+                        let base = wm
+                            .get(key.as_str())
+                            .copied()
+                            .unwrap_or_else(|| self.watermark(key));
+                        let new_wm = base.max(*up_to);
+                        trunc.insert(key.as_str(), new_wm).map_err(rdb)?;
+                        wm.insert(key.as_str(), new_wm);
+                    }
+                    ReplOp::Remove { key } => {
+                        delete_entry_range(&mut entries, key, 0, Offset::MAX)?;
+                        trunc.remove(key.as_str()).map_err(rdb)?;
+                        wm.remove(key.as_str());
+                    }
                 }
             }
         }
@@ -254,29 +267,8 @@ impl ReplicaState {
         Ok(())
     }
 
-    /// The highest leadership epoch this replica has acknowledged.
-    #[must_use]
-    pub fn fence(&self) -> Epoch {
-        self.fence
-    }
-
-    /// Apply a lease-holder's `op` sent at `epoch`.
-    ///
-    /// Returns `false` (fenced) without mutating if `epoch` is stale (`<` the
-    /// replica's acknowledged epoch). Otherwise it durably persists the op (when
-    /// persistent, **before** mutating the in-memory copy), learns `epoch`
-    /// (monotonically), applies the op, and returns `true`. A persist failure also
-    /// returns `false` (the op was not durably stored, so the follower must not ack it).
-    pub fn apply(&mut self, epoch: Epoch, op: &ReplOp) -> bool {
-        if epoch < self.fence {
-            return false;
-        }
-        // Persist-before-mutate: a `true` ack means the op is on disk (ADR 0018 phase 3).
-        if let Err(e) = self.persist(epoch, op) {
-            tracing::warn!(error = %e, "replica persist failed; not acking the replication op");
-            return false;
-        }
-        self.fence = epoch;
+    /// Apply one op's mutation to the in-memory copy (after it is durable on disk).
+    fn apply_in_memory(&mut self, op: &ReplOp) {
         match op {
             ReplOp::Append {
                 key,
@@ -300,7 +292,73 @@ impl ReplicaState {
                 self.truncated.remove(key);
             }
         }
+    }
+
+    /// The highest leadership epoch this replica has acknowledged.
+    #[must_use]
+    pub fn fence(&self) -> Epoch {
+        self.fence
+    }
+
+    /// Apply a lease-holder's `op` sent at `epoch`.
+    ///
+    /// Returns `false` (fenced) without mutating if `epoch` is stale (`<` the
+    /// replica's acknowledged epoch). Otherwise it durably persists the op (when
+    /// persistent, **before** mutating the in-memory copy), learns `epoch`
+    /// (monotonically), applies the op, and returns `true`. A persist failure also
+    /// returns `false` (the op was not durably stored, so the follower must not ack it).
+    pub fn apply(&mut self, epoch: Epoch, op: &ReplOp) -> bool {
+        if epoch < self.fence {
+            return false;
+        }
+        // Persist-before-mutate: a `true` ack means the op is on disk (ADR 0018 phase 3).
+        if let Err(e) = self.persist_batch(epoch, &[op]) {
+            tracing::warn!(error = %e, "replica persist failed; not acking the replication op");
+            return false;
+        }
+        self.fence = epoch;
+        self.apply_in_memory(op);
         true
+    }
+
+    /// Durably apply a **batch** of `(epoch, op)` in one fsync'd transaction (ADR 0027).
+    ///
+    /// Each op is fence-checked in slice order with exactly the semantics of [`apply`]: an
+    /// op whose `epoch` is older than the fence reached so far is rejected (its slot in the
+    /// returned vec is `false`) and not persisted; an accepted op advances the fence. All
+    /// accepted ops are persisted in a **single** `Durability::Immediate` transaction, so
+    /// the per-message fsync cost collapses to one per batch under load. The
+    /// persist-before-ack invariant holds at batch granularity: every `true` means the op
+    /// is on disk (the batch transaction committed); if that commit fails the whole batch
+    /// is rejected (all `false`), since nothing was durably stored.
+    pub fn apply_batch(&mut self, batch: &[(Epoch, ReplOp)]) -> Vec<bool> {
+        let mut accepted = Vec::with_capacity(batch.len());
+        let mut running_fence = self.fence;
+        let mut to_persist: Vec<&ReplOp> = Vec::new();
+        for (epoch, op) in batch {
+            if *epoch < running_fence {
+                accepted.push(false);
+            } else {
+                running_fence = *epoch;
+                to_persist.push(op);
+                accepted.push(true);
+            }
+        }
+        if to_persist.is_empty() {
+            return accepted;
+        }
+        // One fsync for every accepted op in the batch (persist-before-mutate).
+        if let Err(e) = self.persist_batch(running_fence, &to_persist) {
+            tracing::warn!(error = %e, "replica batch persist failed; not acking the batch");
+            return vec![false; batch.len()];
+        }
+        self.fence = running_fence;
+        for ((_, op), ok) in batch.iter().zip(&accepted) {
+            if *ok {
+                self.apply_in_memory(op);
+            }
+        }
+        accepted
     }
 
     /// The truncation low-water for `key`: the highest acked offset this replica knows
@@ -757,6 +815,119 @@ mod tests {
         // The truncation low-water persisted too (ADR 0018 §3b), so recovery still
         // fences the acked prefix after a restart.
         assert_eq!(r.watermark("q/c"), 1);
+    }
+
+    fn ap(key: &str, offset: u64, rec: &[u8]) -> ReplOp {
+        ReplOp::Append {
+            key: key.to_string(),
+            offset,
+            record: rec.to_vec(),
+        }
+    }
+
+    /// ADR 0027: a batch of appends applied in one `apply_batch` is durable (survives a
+    /// reopen) and accepts every op — the group-commit equivalent of N single `apply`s.
+    #[test]
+    fn apply_batch_persists_a_whole_burst_in_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.redb");
+        {
+            let mut r = ReplicaState::open(&path).unwrap();
+            let batch = vec![
+                (5, ap("q/a", 1, b"a1")),
+                (5, ap("q/a", 2, b"a2")),
+                (5, ap("q/b", 1, b"b1")),
+            ];
+            assert_eq!(r.apply_batch(&batch), vec![true, true, true]);
+            assert_eq!(r.fence(), 5);
+        }
+        // All three survive the reopen, on their respective keys.
+        let r = ReplicaState::open(&path).unwrap();
+        assert_eq!(
+            r.entries("q/a")
+                .iter()
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(r.entries("q/b").len(), 1);
+        assert_eq!(r.fence(), 5);
+    }
+
+    /// Per-op fencing inside a batch matches sequential `apply`: an op older than the
+    /// fence reached so far is rejected in place, the rest still apply, and the fence
+    /// advances to the last accepted epoch.
+    #[test]
+    fn apply_batch_fences_stale_ops_in_slice_order() {
+        let mut r = ReplicaState::new();
+        let batch = vec![
+            (3, ap("k", 1, b"x")), // accept, fence -> 3
+            (2, ap("k", 2, b"y")), // 2 < 3 -> reject
+            (4, ap("k", 3, b"z")), // accept, fence -> 4
+        ];
+        assert_eq!(r.apply_batch(&batch), vec![true, false, true]);
+        assert_eq!(r.fence(), 4);
+        // Only the accepted offsets are present (the rejected one never applied).
+        assert_eq!(
+            r.entries("k").iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    /// Ops apply in slice order within the batch, including a truncate after appends —
+    /// and the truncation low-water survives a reopen (ADR 0018 §3b under ADR 0027).
+    #[test]
+    fn apply_batch_applies_in_order_with_a_trailing_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.redb");
+        {
+            let mut r = ReplicaState::open(&path).unwrap();
+            let batch = vec![
+                (7, ap("q/c", 1, b"a")),
+                (7, ap("q/c", 2, b"b")),
+                (7, ap("q/c", 3, b"c")),
+                (
+                    7,
+                    ReplOp::Truncate {
+                        key: "q/c".into(),
+                        up_to: 2,
+                    },
+                ),
+            ];
+            assert_eq!(r.apply_batch(&batch), vec![true, true, true, true]);
+            // Only offset 3 survives the in-batch truncate.
+            assert_eq!(
+                r.entries("q/c")
+                    .iter()
+                    .map(|e| e.offset)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+            assert_eq!(r.watermark("q/c"), 2);
+        }
+        // ...and that state is exactly what reopens from disk (one fsync'd commit).
+        let r = ReplicaState::open(&path).unwrap();
+        assert_eq!(
+            r.entries("q/c")
+                .iter()
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(r.watermark("q/c"), 2);
+    }
+
+    /// A single-element `apply_batch` is exactly `apply` — same accept and same fence.
+    #[test]
+    fn apply_batch_of_one_equals_apply() {
+        let mut a = ReplicaState::new();
+        let mut b = ReplicaState::new();
+        assert_eq!(
+            a.apply(9, &ap("k", 1, b"v")),
+            b.apply_batch(&[(9, ap("k", 1, b"v"))])[0]
+        );
+        assert_eq!(a.fence(), b.fence());
+        assert_eq!(a.entries("k"), b.entries("k"));
     }
 
     /// Deterministic in-process transport holding the follower replicas, with an

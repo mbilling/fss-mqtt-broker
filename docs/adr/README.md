@@ -45,3 +45,5 @@ conventions.
 | [0023](0023-gossip-anti-replay.md) | Gossip anti-replay (persisted monotonic sequence + sliding window) | Accepted | [delivery](../delivery/0023-gossip-anti-replay.md) |
 | [0024](0024-deterministic-testing.md) | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | [delivery](../delivery/0024-deterministic-testing.md) |
 | [0025](0025-boundary-bridge.md) | Boundary MQTT bridge to brokers in other security zones | Proposed | [delivery](../delivery/0025-boundary-bridge.md) |
+| [0026](0026-lease-timing-durable-storage.md) | Lease-group raft timing tolerant of durable-storage latency | Accepted | [delivery](../delivery/0026-lease-timing-durable-storage.md) |
+| [0027](0027-replica-group-commit.md) | Group-commit for the durable replica apply path | Accepted | [delivery](../delivery/0027-replica-group-commit.md) |
