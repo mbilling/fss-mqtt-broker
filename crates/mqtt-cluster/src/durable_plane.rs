@@ -49,6 +49,21 @@ pub struct DurablePlane {
     /// group-commit a burst into one transaction. The recovery-read path still locks
     /// `replicas` directly (between batches).
     replica_tx: mpsc::UnboundedSender<ReplicaWrite>,
+    /// Aborts the replica-writer when the **last** plane clone drops. The writer holds a
+    /// clone of `replicas` (hence of the persistent `replicas.redb` handle); without this,
+    /// the writer outlives the plane and the file lock is never released, so a restart
+    /// over the same data dir cannot reopen it (ADR 0018 phase 5 / ADR 0019 shutdown).
+    _writer: Arc<AbortOnDrop>,
+}
+
+/// Aborts a spawned task when dropped — used to bound the replica-writer's lifetime to the
+/// plane's (so its `replicas` clone, and the redb handle inside it, are released on drop).
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl std::fmt::Debug for DurablePlane {
@@ -67,13 +82,14 @@ impl DurablePlane {
         transport: Arc<PeerReplicaTransport>,
         replicas: Arc<Mutex<ReplicaState>>,
     ) -> Self {
-        let replica_tx = spawn_replica_writer(replicas.clone());
+        let (replica_tx, writer) = spawn_replica_writer(replicas.clone());
         Self {
             raft,
             network,
             transport,
             replicas,
             replica_tx,
+            _writer: Arc::new(AbortOnDrop(writer)),
         }
     }
 
@@ -229,11 +245,17 @@ impl DurablePlane {
 /// the batch instead of one per message. Each waiting frame is then answered with its
 /// op's accept/fence result. Under load this collapses N per-message fsyncs into one per
 /// batch (the contention ADR 0026 T4 found); at rest (one op in flight) it is exactly the
-/// previous one-op-per-commit behaviour. Returns the sender the plane keeps; the task
-/// lives until every sender drops (all plane clones gone).
-fn spawn_replica_writer(replicas: Arc<Mutex<ReplicaState>>) -> mpsc::UnboundedSender<ReplicaWrite> {
+/// previous one-op-per-commit behaviour. Returns the sender the plane keeps and the task's
+/// abort handle (the plane aborts it when its last clone drops, releasing the `replicas`
+/// redb handle for a clean restart); the loop also exits on its own when every sender drops.
+fn spawn_replica_writer(
+    replicas: Arc<Mutex<ReplicaState>>,
+) -> (
+    mpsc::UnboundedSender<ReplicaWrite>,
+    tokio::task::AbortHandle,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ReplicaWrite>();
-    tokio::spawn(async move {
+    let join = tokio::spawn(async move {
         while let Some(first) = rx.recv().await {
             // Coalesce the current backlog: this op plus everything already queued.
             let mut batch = vec![first];
@@ -262,7 +284,8 @@ fn spawn_replica_writer(replicas: Arc<Mutex<ReplicaState>>) -> mpsc::UnboundedSe
             }
         }
     });
-    tx
+    let abort = join.abort_handle();
+    (tx, abort)
 }
 
 #[cfg(test)]
