@@ -138,7 +138,12 @@ pub async fn build_durable_node(
         }
         None => ReplicaState::new(),
     }));
-    let plane = DurablePlane::new(raft.clone(), network, transport.clone(), replicas.clone());
+    let plane = DurablePlane::new(
+        raft.clone(),
+        network.clone(),
+        transport.clone(),
+        replicas.clone(),
+    );
 
     // --- durable store over the shared transport ---
     let lease_source = LocalLeaseSource::new(lease_store.clone(), local);
@@ -157,6 +162,8 @@ pub async fn build_durable_node(
     // restart can release the on-disk lease/replica locks (ADR 0018 phase 5).
     let driver = tokio::spawn(run_driver(
         raft,
+        network,
+        local,
         lease_store,
         placement.clone(),
         MembershipReconciler::new(local, can_bootstrap),
@@ -166,10 +173,35 @@ pub async fn build_durable_node(
     (store, plane, driver)
 }
 
+/// The desired lease-group voter set: placement `members`, with a member **admitted** only
+/// once its raft link is up (ADR 0028).
+///
+/// Admitting a voter the leader cannot reach loses the quorum lease and churns the group
+/// through elections until the mesh converges — the multi-minute formation churn that made
+/// durable unusable on every startup. The gate is **admission-only**: a node already a voter
+/// stays one across a transient link blip (it must drop its link *and* be evicted from
+/// `members` by SWIM to be removed), so this never amplifies a flap. `local` is always
+/// reachable to itself. A member removed from `members` (SWIM declared it dead) drops out
+/// even if it was a voter.
+fn admit_desired(
+    members: &[RaftNodeId],
+    local: RaftNodeId,
+    voters: &BTreeSet<RaftNodeId>,
+    is_connected: impl Fn(RaftNodeId) -> bool,
+) -> BTreeSet<RaftNodeId> {
+    members
+        .iter()
+        .copied()
+        .filter(|id| *id == local || voters.contains(id) || is_connected(*id))
+        .collect()
+}
+
 /// The lease-group control loop: on each tick, reconcile the voter set toward the
 /// live membership and (as leader) keep each group's lease on its placement owner.
 async fn run_driver(
     raft: LeaseRaft,
+    network: MeshRaftNetwork,
+    local: RaftNodeId,
     lease_store: LeaseStore,
     placement: Arc<RwLock<Placement>>,
     reconciler: MembershipReconciler,
@@ -181,15 +213,18 @@ async fn run_driver(
     loop {
         tokio::time::sleep(DRIVER_TICK).await;
 
-        let desired: BTreeSet<RaftNodeId> = {
+        let view = raft_view(&raft);
+
+        let members: Vec<RaftNodeId> = {
             let p = placement
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             p.members().iter().map(raft_id).collect()
         };
+        let desired = admit_desired(&members, local, &view.voters, |id| network.is_connected(id));
 
         if desired == prev_desired {
-            let action = reconciler.decide(&raft_view(&raft), &desired);
+            let action = reconciler.decide(&view, &desired);
             if let Err(e) = apply_action(&raft, &action).await {
                 warn!(error = %e, "lease-group membership reconcile failed");
             }
@@ -205,13 +240,57 @@ async fn run_driver(
 
 #[cfg(test)]
 mod tests {
-    use super::build_durable_node;
+    use super::{admit_desired, build_durable_node};
+    use crate::lease_raft::RaftNodeId;
     use crate::placement::{Placement, DEFAULT_REPLICAS};
     use crate::NodeId;
     use mqtt_core::{ClientId, Message, QoS};
     use mqtt_storage::SessionStore;
+    use std::collections::BTreeSet;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
+
+    fn set(ids: &[RaftNodeId]) -> BTreeSet<RaftNodeId> {
+        ids.iter().copied().collect()
+    }
+
+    /// ADR 0028 admission gate. The local node and any **reachable** member are admitted;
+    /// a member that is neither reachable nor already a voter is held out (the formation-churn
+    /// fix — never admit a voter the leader cannot reach).
+    #[test]
+    fn admit_desired_admits_local_and_reachable_members_only() {
+        let members = [1, 2, 3];
+        let voters = set(&[1]); // only the founder is a voter so far
+                                // Only node 2's link is up; node 3's is not.
+        let connected = |id: RaftNodeId| id == 2;
+        // local (1) always; 2 is reachable → admitted; 3 is unreachable + not a voter → held out.
+        assert_eq!(admit_desired(&members, 1, &voters, connected), set(&[1, 2]));
+    }
+
+    /// The gate is admission-only: a node already a voter is **not** dropped when its link
+    /// blips (it must also leave `members` — SWIM eviction — to be removed), so a transient
+    /// blip never churns the voter set.
+    #[test]
+    fn admit_desired_keeps_a_current_voter_through_a_link_blip() {
+        let members = [1, 2, 3];
+        let voters = set(&[1, 2, 3]); // all three are voters
+        let connected = |_id: RaftNodeId| false; // every link is momentarily down
+                                                 // All stay, because they are current voters still present in `members`.
+        assert_eq!(
+            admit_desired(&members, 1, &voters, connected),
+            set(&[1, 2, 3])
+        );
+    }
+
+    /// A member SWIM evicted from `members` (declared dead) drops out even if it was a voter.
+    #[test]
+    fn admit_desired_drops_a_member_evicted_from_placement() {
+        let members = [1, 2]; // node 3 was evicted (dead)
+        let voters = set(&[1, 2, 3]); // 3 was a voter
+        let connected = |_id: RaftNodeId| true;
+        // 3 is gone from `members`, so it is not in the desired set regardless of voter status.
+        assert_eq!(admit_desired(&members, 1, &voters, connected), set(&[1, 2]));
+    }
 
     /// A single node's durable stack bootstraps itself (the driver elects the lease
     /// group and assigns leases), after which an enqueue commits and replays — the

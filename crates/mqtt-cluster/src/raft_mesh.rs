@@ -130,6 +130,15 @@ impl MeshRaftNetwork {
         self.lock().peers.insert(node, tx);
     }
 
+    /// Whether a peer's raft link is currently registered — i.e. an RPC to it can be
+    /// delivered. Used to gate lease-group voter admission on link readiness (ADR 0028):
+    /// adding a voter the leader cannot yet reach would lose quorum until the mesh
+    /// converges, churning the group through repeated elections during bring-up.
+    #[must_use]
+    pub fn is_connected(&self, node: RaftNodeId) -> bool {
+        self.lock().peers.contains_key(&node)
+    }
+
     /// Route an inbound [`PeerMessage::RaftRpcReply`] to its waiting RPC.
     pub fn complete_reply(&self, req_id: u64, payload: Vec<u8>) {
         if let Some(p) = self.lock().pending.remove(&req_id) {

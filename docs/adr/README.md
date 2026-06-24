@@ -47,3 +47,4 @@ conventions.
 | [0025](0025-boundary-bridge.md) | Boundary MQTT bridge to brokers in other security zones | Proposed | [delivery](../delivery/0025-boundary-bridge.md) |
 | [0026](0026-lease-timing-durable-storage.md) | Lease-group raft timing tolerant of durable-storage latency | Accepted | [delivery](../delivery/0026-lease-timing-durable-storage.md) |
 | [0027](0027-replica-group-commit.md) | Group-commit for the durable replica apply path | Accepted | [delivery](../delivery/0027-replica-group-commit.md) |
+| [0028](0028-link-gated-voter-admission.md) | Link-gated lease-group voter admission (fixes formation churn) | Accepted | [delivery](../delivery/0028-link-gated-voter-admission.md) |

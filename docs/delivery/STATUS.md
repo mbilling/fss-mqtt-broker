@@ -35,6 +35,7 @@
 | 0025 | Boundary MQTT bridge to brokers in other security zones | Proposed | 0/11 done | 11 open |
 | 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 7/7 done | — |
 | 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
+| 0028 | Link-gated lease-group voter admission | Accepted | 2/3 done | 1 open |
 
 ## Open and deferred work
 
@@ -162,3 +163,7 @@
 - `0025-T9` ⬜ planned: Bridge observability (forwarded/dropped per upstream+direction, lag, reconnects) via mqtt-observability + OTLP
 - `0025-T10` ⬜ planned: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
 - `0025-T11` ⬜ planned: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
+
+**0028 — Link-gated lease-group voter admission**
+
+- `0028-T3` ⬜ planned: Revisit the durable-default decision once formation is proven (broker + demo) — Gated on T2. The user wants durable as the default (broker + demo) but asked to fix formation first and keep it opt-in until proven.
