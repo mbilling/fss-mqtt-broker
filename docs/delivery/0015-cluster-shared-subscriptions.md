@@ -40,8 +40,9 @@ tasks:
     evidence: "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field."
   - id: 0015-T8
     title: Remote-member liveness awareness in the selector
-    status: deferred
-    notes: ADR Consequences — selector does not know a remote member's liveness, so it may target a member offline on its home node (which then queues) even when a local member is online; an accepted, spec-permitted selection-quality trade-off.
+    status: done
+    date: 2026-06-24
+    evidence: "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green."
 ---
 
 # Delivery — ADR 0015: Cluster-wide shared subscriptions
@@ -79,7 +80,7 @@ flags as costs, not unbuilt mechanism.
 | 0015-T5 | ✅ done | 2026-06-17 | shared_selection_round_robins_local_and_remote_member; shared_subscription_round_robins_one_member |
 | 0015-T6 | ✅ done | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs); v5_shared_subscription_round_robins_one_member_each |
 | 0015-T7 | ✅ done | 2026-06-24 | "PeerMessage::SharedDeliver gained message_expiry: Option<u32>; send_shared_to_peer carries the publisher's interval and the RemoteSharedDeliver handler applies it to deliver_to_client instead of None. Peer roundtrip covers the wire field." |
-| 0015-T8 | 💤 deferred | — | ADR Consequences — selector does not know a remote member's liveness, so it may target a member offline on its home node (which then queues) even when a local member is online; an accepted, spec-permitted selection-quality trade-off. |
+| 0015-T8 | ✅ done | 2026-06-24 | "SharedGroupsWire carries per-member liveness (client,qos,online); shared_snapshot tags each member from self.online; inbound gossip builds hub::RemoteSharedGroup with the bit; select_shared prefers any member online on its home node (local or gossiped-remote) and falls back to local-persistent then any-remote, so an offline-at-home remote member is no longer chosen over a live one. Test shared_selection_skips_an_offline_remote_member; round-robin + peer roundtrip still green." |
 <!-- /status-table:0015 -->
 
 ## Changelog

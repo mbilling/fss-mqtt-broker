@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Wire form of a shared-subscription membership snapshot (ADR 0015 §2): each entry
-/// is `(ShareName, filter, [(client id, granted QoS u8)])`.
-pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8)>)>;
+/// is `(ShareName, filter, [(client id, granted QoS u8, online-on-this-node)])`. The
+/// per-member liveness lets a peer's selector skip a member offline on its home node
+/// (ADR 0015 T8).
+pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8, bool)>)>;
 
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,7 +244,7 @@ mod tests {
             groups: vec![(
                 "grp".into(),
                 "t/+".into(),
-                vec![("c1".into(), 1), ("c2".into(), 0)],
+                vec![("c1".into(), 1, true), ("c2".into(), 0, false)],
             )],
         });
         roundtrip(&PeerMessage::SharedDeliver {

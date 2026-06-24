@@ -36,8 +36,8 @@ use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{
-    parse_shared, topic_matches, ClientId, Message, SharedGroup, SharedSubscriptionTable,
-    Subscription, SubscriptionTable,
+    parse_shared, topic_matches, ClientId, Message, SharedSubscriptionTable, Subscription,
+    SubscriptionTable,
 };
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore, StorageError,
@@ -95,6 +95,24 @@ struct SharedCandidate {
     node: Option<NodeId>,
     client: ClientId,
     qos: QoS,
+    /// Whether this member is **online on the node that owns its connection** — locally
+    /// from `self.online`, for a remote member from its home node's gossiped liveness
+    /// (ADR 0015 T8). The selector prefers an online member so a publish is delivered now
+    /// rather than queued on a member offline at its home.
+    online: bool,
+}
+
+/// A peer's shared-group membership as gossiped to us — like [`SharedGroup`] but each
+/// member carries its **liveness on that home node** (ADR 0015 T8), so the cross-node
+/// selector can avoid choosing a member that is offline (and would only queue) there.
+#[derive(Debug, Clone)]
+pub struct RemoteSharedGroup {
+    /// The share name.
+    pub group: String,
+    /// The underlying topic filter.
+    pub filter: String,
+    /// Members: `(client, granted QoS, online-on-home-node)`.
+    pub members: Vec<(ClientId, QoS, bool)>,
 }
 
 /// Sender for packets destined to a single client's socket.
@@ -385,7 +403,7 @@ pub enum HubCommand {
         /// The announcing node.
         node: NodeId,
         /// That node's shared groups with members.
-        groups: Vec<SharedGroup>,
+        groups: Vec<RemoteSharedGroup>,
     },
     /// A peer's retained-message snapshot, sent on link-up to back-fill a node that
     /// joined after a retained publish (ADR 0014 §3). Applied gap-fill (topics we do
@@ -482,7 +500,7 @@ pub struct Hub {
     shared: SharedSubscriptionTable,
     /// Each peer's last-announced shared-subscription membership, so this node can
     /// select one member per group across the whole cluster (ADR 0015 §2).
-    remote_shared: HashMap<NodeId, Vec<SharedGroup>>,
+    remote_shared: HashMap<NodeId, Vec<RemoteSharedGroup>>,
     /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
     shared_cursor: HashMap<SharedKey, usize>,
     /// Per-session outbound `QoS` > 0 in-flight state.
@@ -1271,10 +1289,12 @@ impl Hub {
                     .entry((group.to_string(), filter.to_string()))
                     .or_default();
                 for (client, qos) in members {
+                    let online = self.online.contains_key(client);
                     entry.push(SharedCandidate {
                         node: None,
                         client: client.clone(),
                         qos: *qos,
+                        online,
                     });
                 }
             });
@@ -1286,11 +1306,12 @@ impl Hub {
                 let entry = by_key
                     .entry((g.group.clone(), g.filter.clone()))
                     .or_default();
-                for (client, qos) in &g.members {
+                for (client, qos, online) in &g.members {
                     entry.push(SharedCandidate {
                         node: Some((*node).clone()),
                         client: client.clone(),
                         qos: *qos,
+                        online: *online,
                     });
                 }
             }
@@ -1313,13 +1334,15 @@ impl Hub {
         let start = self.shared_cursor.get(key).copied().unwrap_or(0) % n;
         self.shared_cursor.insert(key.clone(), (start + 1) % n);
         let rotated = || candidates.iter().cycle().skip(start).take(n);
-        // Immediately deliverable: a local online member or any remote member.
-        let immediate = rotated().find(|c| match &c.node {
-            None => self.online.contains_key(&c.client),
-            Some(_) => true,
-        });
+        // Immediately deliverable: any member online on its home node — local (our
+        // `online`) or remote (its home node's gossiped liveness, ADR 0015 T8). Targeting a
+        // member offline at home would only queue there while a live member could deliver now.
+        let immediate = rotated().find(|c| c.online);
         immediate
+            // No one online: a local persistent member queues for replay (ADR 0015 §4)...
             .or_else(|| rotated().find(|c| c.node.is_none() && self.is_persistent(&c.client)))
+            // ...else a remote member (it queues at its home) so the message is not dropped.
+            .or_else(|| rotated().find(|c| c.node.is_some()))
             .cloned()
     }
 
@@ -1806,7 +1829,16 @@ impl Hub {
             .snapshot()
             .into_iter()
             .map(|g| {
-                let members = g.members.into_iter().map(|(c, q)| (c.0, q as u8)).collect();
+                // Tag each member with whether it is online here, so a peer's selector can
+                // avoid choosing a member offline on its home node (ADR 0015 T8).
+                let members = g
+                    .members
+                    .into_iter()
+                    .map(|(c, q)| {
+                        let online = self.online.contains_key(&c);
+                        (c.0, q as u8, online)
+                    })
+                    .collect();
                 (g.group, g.filter, members)
             })
             .collect()
@@ -1953,8 +1985,8 @@ async fn recover_once(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound, MAX_BACKLOG,
-        REPLAY_LIMIT,
+        AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound,
+        RemoteSharedGroup, MAX_BACKLOG, REPLAY_LIMIT,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::PeerMessage;
@@ -2389,16 +2421,30 @@ mod tests {
         .unwrap();
     }
 
-    /// Announce a peer's shared-group membership (one group, given members).
+    /// Announce a peer's shared-group membership (one group, given members), all online
+    /// on their home node.
     fn remote_shared_interest(tx: &HubTx, node: &str, group: &str, filter: &str, members: &[&str]) {
+        let online: Vec<(&str, bool)> = members.iter().map(|c| (*c, true)).collect();
+        remote_shared_interest_live(tx, node, group, filter, &online);
+    }
+
+    /// As [`remote_shared_interest`], but each member carries its liveness on the home
+    /// node (ADR 0015 T8).
+    fn remote_shared_interest_live(
+        tx: &HubTx,
+        node: &str,
+        group: &str,
+        filter: &str,
+        members: &[(&str, bool)],
+    ) {
         tx.send(HubCommand::RemoteSharedInterest {
             node: NodeId(node.into()),
-            groups: vec![mqtt_core::SharedGroup {
+            groups: vec![RemoteSharedGroup {
                 group: group.into(),
                 filter: filter.into(),
                 members: members
                     .iter()
-                    .map(|c| (ClientId((*c).into()), QoS::AtMostOnce))
+                    .map(|(c, online)| (ClientId((*c).into()), QoS::AtMostOnce, *online))
                     .collect(),
             }],
         })
@@ -2529,6 +2575,31 @@ mod tests {
             recv_packet(&mut ra).await.is_none(),
             "single delivery per publish"
         );
+    }
+
+    /// A remote member offline on its home node is skipped while a member online
+    /// somewhere can deliver now (ADR 0015 T8): both publishes go to the local online
+    /// member instead of queuing one at the offline remote member's home.
+    #[tokio::test]
+    async fn shared_selection_skips_an_offline_remote_member() {
+        let tx = start_hub();
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        let (mut ra, _) = attach(&tx, "ra", 1, true).await;
+        subscribe(&tx, "ra", "$share/g/t");
+        // A remote member "rb" that is OFFLINE on its home node "n".
+        remote_shared_interest_live(&tx, "n", "g", "t", &[("rb", false)]);
+
+        // Both publishes go to the local online member: were the offline remote chosen for
+        // either (single delivery per publish), `ra` would miss that one.
+        publish(&tx, "t", b"m1");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m1");
+        publish(&tx, "t", b"m2");
+        assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m2");
     }
 
     /// On link-up the hub sends its retained set to the new peer, so a node that
