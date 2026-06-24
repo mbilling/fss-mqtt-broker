@@ -17,12 +17,15 @@ x-broker-env: &broker-env
                                        # deny-by-default, so anonymous clients (the loadgen)
                                        # must be explicitly permitted (ADR 0004)
   MQTTD_HEALTH_BIND: 0.0.0.0:8080      # serves /livez, /readyz, /metrics
-  # Ephemeral (in-memory) sessions: the SWIM-clustered default. This keeps the demo
-  # robust — it avoids the durable lease group, which currently churns at 3 nodes
-  # (the all-voters reconciler; bounded voters are ADR 0021, still Proposed). The
-  # lease_* and durable_append_* dashboard panels are therefore empty here; enable
-  # MQTTD_DURABLE_SESSIONS=1 + a per-node MQTTD_DATA_DIR to exercise them once that
-  # stability issue is fixed.
+  # Ephemeral (in-memory) sessions by default — the SWIM-clustered default, robust under
+  # the loadgen. To exercise the durable lease group and the lease_* / durable_append_*
+  # panels, overlay the opt-in durable override:
+  #     docker compose -f docker-compose.yml -f durable.yml up --build
+  # ADR 0026 budgets the raft timing for fsync-on-commit latency, so the durable lease
+  # group now holds a **stable leader at rest**. Under sustained client load it can still
+  # show slow lease-epoch churn (session-log fsync contends with the lease raft) — being
+  # addressed by ADR 0026 T5 (coalescing raft writes) — which is why durable is opt-in,
+  # not the default.
   MQTTD_OTLP_ENDPOINT: http://alloy:4318
   MQTTD_OTLP_INTERVAL: "5"
   MQTTD_READY_MIN_MEMBERS: "3"

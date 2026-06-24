@@ -85,6 +85,15 @@ until a follower has them, so restart-durability of session content needs **R≥
 at store level in `cluster_log`). T6's cluster-path test therefore asserts the *lease*
 state survives a restart, not the queue.
 
+**Storage-latency ↔ lease-timing constraint (ADR 0026):** the `Durability::Immediate`
+(fsync) commit each persistent store does on every raft write (P2's lease store, P3's
+replica log) costs tens of milliseconds on real disk. The lease group's raft timing is
+sized for that latency, not in-memory speed — see
+[ADR 0026](../adr/0026-lease-timing-durable-storage.md). If a future change makes the
+on-disk commit slower (larger transactions, more groups, slower media), the lease timing
+budget is the thing to re-verify; under sustained load, session-log fsyncs contend with the
+lease raft (ADR 0026 T5 tracks coalescing the raft writes).
+
 ## Changelog
 
 - **2026-06-22** — T6 node-level restart proofs landed (single-node persistent path in

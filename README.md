@@ -246,13 +246,24 @@ MQTTD_HEALTH_BIND=0.0.0.0:8080 MQTTD_OTLP_ENDPOINT=http://localhost:4318 \
   cargo run --bin mqttd
 ```
 
-For a turnkey view of all of this, [`demo/`](demo/) brings up a **3-node durable cluster**
-with **Grafana + Prometheus + Alloy** and a provisioned dashboard covering every metric —
-both the Prometheus scrape and the OTLP push paths:
+For a turnkey view of all of this, [`demo/`](demo/) brings up a **3-node cluster** with
+**Grafana + Prometheus + Alloy** and a provisioned dashboard covering every metric — both
+the Prometheus scrape and the OTLP push paths:
 
 ```sh
 cd demo && docker compose up --build   # then http://localhost:3000
 ```
+
+The default cluster uses ephemeral (in-memory) sessions. To exercise the **durable** lease
+group and the `lease_*` / `durable_append_*` panels, overlay the opt-in durable override:
+
+```sh
+cd demo && docker compose -f docker-compose.yml -f durable.yml up --build
+```
+
+The durable lease group holds a stable leader at rest; under sustained load it can still
+show slow lease-epoch churn (session-log fsyncs contend with the lease raft), which is why
+durable is opt-in — see [ADR 0026](docs/adr/0026-lease-timing-durable-storage.md).
 
 ## Architecture decisions
 

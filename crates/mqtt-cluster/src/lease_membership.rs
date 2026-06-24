@@ -9,10 +9,10 @@
 //! - **Pure decision** ([`MembershipReconciler::decide`]): given the current raft
 //!   view and the desired stable voter set (the `Alive` members, mapped to
 //!   [`RaftNodeId`](crate::lease_raft::RaftNodeId)), return the [`MembershipAction`]
-//!   to take. **Bootstrap is deterministic**: only the smallest-id member
-//!   initializes (with itself); the elected leader then grows membership. Only the
-//!   **leader** reconciles voters afterwards. A non-leader / not-yet-bootstrapped
-//!   node does nothing — the leader pulls it in as a learner.
+//!   to take. **The founder bootstraps** (with itself); the elected leader then grows
+//!   membership. Only the **leader** reconciles voters afterwards, and only once a
+//!   prior change has settled (no overlapping joint-consensus changes). A non-leader /
+//!   not-yet-bootstrapped node does nothing — the leader pulls it in as a learner.
 //! - **Executor** ([`apply_action`]): perform the action against the raft handle
 //!   (`initialize` / `add_learner` + `change_membership`).
 //! - **View** ([`raft_view`]): read the current state from the raft's metrics.
@@ -51,6 +51,11 @@ pub struct RaftView {
     pub initialized: bool,
     /// Whether this node is the current leader (only the leader changes membership).
     pub is_leader: bool,
+    /// Whether a membership change is still in flight (the config is in joint
+    /// consensus). The leader must not propose another change until it settles, or
+    /// openraft rejects it ("already undergoing a configuration change") — see
+    /// [ADR 0026](../../../docs/adr/0026-lease-timing-durable-storage.md) §2.
+    pub changing: bool,
     /// The current voter set.
     pub voters: BTreeSet<RaftNodeId>,
 }
@@ -74,11 +79,12 @@ impl MembershipReconciler {
     /// A reconciler for the node with raft id `local`.
     ///
     /// `can_bootstrap` gates whether this node may *create* the lease group (a
-    /// **founder** — a node started with no SWIM seeds). A non-founder never
-    /// initializes; it waits to be added by the founder's elected leader. This
-    /// prevents independently-starting nodes — each initially seeing only itself —
-    /// from each bootstrapping a separate single-node group (an unmergeable
-    /// split-brain). Exactly one founder per cluster.
+    /// **founder** — a node started with no SWIM seeds), and is the **sole** guard
+    /// against a split-brain bootstrap: exactly one founder per cluster, so exactly one
+    /// node ever initializes. A non-founder never initializes; it waits to be added by
+    /// the founder's elected leader. (An earlier min-id tiebreak was removed — it both
+    /// failed to prevent the multi-founder race and broke a legitimate non-min founder;
+    /// ADR 0026 T7.)
     #[must_use]
     pub fn new(local: RaftNodeId, can_bootstrap: bool) -> Self {
         Self {
@@ -95,10 +101,16 @@ impl MembershipReconciler {
             return MembershipAction::None;
         }
         if !view.initialized {
-            // Deterministic bootstrap: only a founder that is also the smallest-id
-            // desired member starts the group, with itself; the elected leader grows
-            // it from there. Non-founders wait to be added.
-            if self.can_bootstrap && desired.iter().min() == Some(&self.local) {
+            // A founder bootstraps the group with itself; the elected leader grows it
+            // from there. `can_bootstrap` is the *sole* guard — exactly one founder
+            // per cluster (a node started with no SWIM seeds), so exactly one node
+            // ever initializes. There is deliberately no min-id tiebreak: it failed to
+            // prevent the multi-founder race it was meant to (each founder first sees
+            // only itself, so each is trivially its own min and would still bootstrap)
+            // while wrongly blocking a legitimate founder that was not the global min
+            // id — so the durable group never formed at all (ADR 0026 T7). Non-founders
+            // wait to be added by the leader.
+            if self.can_bootstrap {
                 let mut just_me = BTreeSet::new();
                 just_me.insert(self.local);
                 return MembershipAction::Initialize(just_me);
@@ -107,6 +119,12 @@ impl MembershipReconciler {
         }
         // Initialized: only the leader reconciles the voter set.
         if !view.is_leader {
+            return MembershipAction::None;
+        }
+        // A membership change is still settling (joint consensus): wait for it rather
+        // than re-proposing, which openraft rejects as already in progress and which —
+        // re-fired every driver tick under churn — amplifies the churn (ADR 0026 §2).
+        if view.changing {
             return MembershipAction::None;
         }
         if &view.voters != desired {
@@ -124,10 +142,14 @@ impl MembershipReconciler {
 #[must_use]
 pub fn raft_view(raft: &LeaseRaft) -> RaftView {
     let metrics = raft.metrics().borrow().clone();
-    let voters: BTreeSet<RaftNodeId> = metrics.membership_config.voter_ids().collect();
+    let membership = metrics.membership_config.membership();
+    let voters: BTreeSet<RaftNodeId> = membership.voter_ids().collect();
     RaftView {
         initialized: !voters.is_empty(),
         is_leader: metrics.state == ServerState::Leader,
+        // A joint (transitional) config carries >1 config set; a settled uniform one carries
+        // exactly one. More than one means a membership change is still in flight.
+        changing: membership.get_joint_config().len() > 1,
         voters,
     }
 }
@@ -211,39 +233,44 @@ mod tests {
         let view = RaftView {
             initialized: false,
             is_leader: false,
+            changing: false,
             voters: set(&[]),
         };
         assert_eq!(r.decide(&view, &set(&[])), MembershipAction::None);
     }
 
     #[test]
-    fn smallest_id_bootstraps_with_itself() {
+    fn any_founder_bootstraps_with_itself_regardless_of_id_rank() {
         let view = RaftView {
             initialized: false,
             is_leader: false,
+            changing: false,
             voters: set(&[]),
         };
-        // Node 1 is the smallest in {1,2,3} → it bootstraps.
+        // The founder bootstraps with itself whether or not it is the smallest id —
+        // `can_bootstrap` is the sole guard (ADR 0026 T7). Node 1 (the min):
         assert_eq!(
             MembershipReconciler::new(1, true).decide(&view, &set(&[1, 2, 3])),
             MembershipAction::Initialize(set(&[1])),
         );
-        // Node 2 is not the smallest → it waits.
+        // ...and node 2 (NOT the min) — the case the old min-id tiebreak wrongly blocked,
+        // leaving the durable group unformed.
         assert_eq!(
             MembershipReconciler::new(2, true).decide(&view, &set(&[1, 2, 3])),
-            MembershipAction::None,
+            MembershipAction::Initialize(set(&[2])),
         );
     }
 
     #[test]
-    fn a_non_founder_never_bootstraps_even_as_the_smallest() {
+    fn a_non_founder_never_bootstraps() {
         let view = RaftView {
             initialized: false,
             is_leader: false,
+            changing: false,
             voters: set(&[]),
         };
-        // Node 1 is the smallest, but it is not a founder (started with seeds) — it
-        // waits to be added rather than starting a rival group.
+        // Not a founder (started with seeds) — it waits to be added rather than starting
+        // a rival group, even though it is the smallest id.
         assert_eq!(
             MembershipReconciler::new(1, false).decide(&view, &set(&[1, 2, 3])),
             MembershipAction::None,
@@ -256,11 +283,40 @@ mod tests {
         let follower = RaftView {
             initialized: true,
             is_leader: false,
+            changing: false,
             voters: set(&[1]),
         };
         assert_eq!(
             MembershipReconciler::new(2, true).decide(&follower, &desired),
             MembershipAction::None,
+        );
+    }
+
+    #[test]
+    fn a_leader_does_not_re_propose_while_a_change_is_in_flight() {
+        // Leader, voters {1} but desired {1,2,3} — yet a change is already settling
+        // (joint consensus). It must wait, not fire a second change (ADR 0026 §2).
+        let changing = RaftView {
+            initialized: true,
+            is_leader: true,
+            changing: true,
+            voters: set(&[1]),
+        };
+        assert_eq!(
+            MembershipReconciler::new(1, true).decide(&changing, &set(&[1, 2, 3])),
+            MembershipAction::None,
+        );
+        // Once it settles (changing = false), the same gap is reconciled.
+        let settled = RaftView {
+            changing: false,
+            ..changing
+        };
+        assert_eq!(
+            MembershipReconciler::new(1, true).decide(&settled, &set(&[1, 2, 3])),
+            MembershipAction::SetVoters {
+                desired: set(&[1, 2, 3]),
+                add_as_learner: set(&[2, 3]),
+            },
         );
     }
 
@@ -271,6 +327,7 @@ mod tests {
         let view = RaftView {
             initialized: true,
             is_leader: true,
+            changing: false,
             voters: set(&[1]),
         };
         assert_eq!(
@@ -284,6 +341,7 @@ mod tests {
         let view = RaftView {
             initialized: true,
             is_leader: true,
+            changing: false,
             voters: set(&[1, 2, 3]),
         };
         assert_eq!(
@@ -297,6 +355,7 @@ mod tests {
         let view = RaftView {
             initialized: true,
             is_leader: true,
+            changing: false,
             voters: set(&[1, 2]),
         };
         assert_eq!(r.decide(&view, &set(&[1, 2])), MembershipAction::None);

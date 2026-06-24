@@ -1,0 +1,41 @@
+# Opt-in durable override for the demo cluster.
+#
+#   docker compose -f docker-compose.yml -f durable.yml up --build
+#
+# Switches the three brokers from ephemeral (in-memory) sessions to **durable**
+# (on-disk, consensus-backed) sessions: each persists its lease group and session log
+# to its own /data volume, so the lease_* and durable_append_* dashboard panels
+# populate with a real raft leader.
+#
+# Status (ADR 0026): the lease group holds a **stable leader at rest** — the raft timing
+# is budgeted for fsync-on-commit latency. Under sustained client load the demo can still
+# show slow lease-epoch churn: the durable session-log fsyncs contend with the lease
+# group's raft fsyncs and delay heartbeats into election timeouts. That residual churn is
+# tracked by ADR 0026 T5 (coalescing raft log writes). It is why durable is an opt-in
+# overlay here rather than the default. To watch the panels settle, let the cluster form,
+# then stop the loadgen (`docker compose stop loadgen`) and the lease epoch goes flat.
+
+services:
+  mqttd-1:
+    environment:
+      MQTTD_DURABLE_SESSIONS: "1"
+      MQTTD_DATA_DIR: /data
+    volumes: ["d1:/data"]
+
+  mqttd-2:
+    environment:
+      MQTTD_DURABLE_SESSIONS: "1"
+      MQTTD_DATA_DIR: /data
+    volumes: ["d2:/data"]
+
+  mqttd-3:
+    environment:
+      MQTTD_DURABLE_SESSIONS: "1"
+      MQTTD_DATA_DIR: /data
+    volumes: ["d3:/data"]
+
+# Per-node durable state (lease group + session log); each broker gets its own volume.
+volumes:
+  d1:
+  d2:
+  d3:

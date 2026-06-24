@@ -240,15 +240,16 @@ async fn lease_group_forms_and_is_stable_under_slow_durable_commits() {
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
-    // The founder must be the *minimum* raft id, or the group never initializes
-    // (lease_membership::decide gates Initialize on `min == self`). Pick it deterministically
-    // so this test exercises the timing, not that fragility (tracked separately — ADR 0026 T-bug).
+    // Deliberately make the founder the *maximum* raft id — NOT the min. This doubles as the
+    // ADR 0026 T7 regression guard: the founder must form the group regardless of its id rank
+    // (the old min-id bootstrap tiebreak hung a non-min founder at term 0). `can_bootstrap` —
+    // not id rank — decides who initializes.
     let mut names = ["lease-stab-1", "lease-stab-2", "lease-stab-3"];
-    names.sort_by_key(|n| raft_id(&NodeId((*n).to_string())));
+    names.sort_by_key(|n| std::cmp::Reverse(raft_id(&NodeId((*n).to_string()))));
 
     // 200ms per-commit latency, on from the start so bring-up runs under slow commits.
     let knob = Arc::new(AtomicU64::new(200));
-    let a = start_durable_node_cfg(names[0], vec![], Some(knob.clone())).await; // founder = min id
+    let a = start_durable_node_cfg(names[0], vec![], Some(knob.clone())).await; // founder = max id
     let b = start_durable_node_cfg(names[1], vec![a.swim_addr.clone()], Some(knob.clone())).await;
     let c = start_durable_node_cfg(names[2], vec![a.swim_addr.clone()], Some(knob.clone())).await;
     let nodes = [&a, &b, &c];

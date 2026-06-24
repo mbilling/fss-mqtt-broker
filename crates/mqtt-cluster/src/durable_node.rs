@@ -43,10 +43,12 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 /// How often the driver reconciles membership + lease assignment against the live
-/// placement ring. A short tick keeps lease/voter changes responsive after a
-/// membership change; the work is cheap (a membership read plus, in steady state, a
-/// no-op).
-const DRIVER_TICK: Duration = Duration::from_millis(200);
+/// placement ring. The work is a no-op in steady state (a membership read), so the tick
+/// only needs to be brisk enough to react to a membership change within a second or so.
+/// It is kept at ~1s rather than sub-second on purpose (ADR 0026 §2): on a persistent
+/// store every reconfiguration fsyncs, and a fast tick that re-fires the same
+/// membership/lease change before the previous one commits amplifies durable-store churn.
+const DRIVER_TICK: Duration = Duration::from_secs(1);
 
 /// Build a node's durable session store, lease-group endpoint, and background
 /// driver. Returns the store (for the hub) and the [`DurablePlane`] (to attach to

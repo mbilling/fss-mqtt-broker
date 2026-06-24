@@ -33,7 +33,7 @@
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 | 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
 | 0025 | Boundary MQTT bridge to brokers in other security zones | Proposed | 0/11 done | 11 open |
-| 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 2/7 done | 4 open, 1 deferred |
+| 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 6/7 done | 1 open |
 
 ## Open and deferred work
 
@@ -164,8 +164,4 @@
 
 **0026 — Lease-group raft timing tolerant of durable-storage latency**
 
-- `0026-T7` ⬜ planned: "Bug: durable lease group only bootstraps if the founder is also the minimum raft id (lease_membership::decide gates Initialize on min == self)" — Discovered while writing the T2 test (worked around there by sorting names so the founder is the min id). An operator's chosen founder that does not hash to the global min raft id never forms the durable cluster (term stays 0). Decouple bootstrap eligibility from the min-id tiebreak.
-- `0026-T3` ⬜ planned: Slow the lease driver tick and guard the reconciler against re-proposing an in-flight config change
-- `0026-T4` ⬜ planned: Re-enable persistent durable in the demo and restore the lease/durable dashboard panels
-- `0026-T5` 💤 deferred: Group-commit / coalesce raft log writes to cut fsync count (only if relaxed timing is insufficient) — openraft already batches AppendEntries, so the marginal win is bounded; revisit only if very slow storage still churns under the relaxed timing.
-- `0026-T6` ⬜ planned: Cross-reference the timing/storage-latency constraint from the 0007 and 0018 delivery docs
+- `0026-T5` ⬜ planned: Group-commit / coalesce raft log writes to cut fsync count (residual under-load churn) — "Promoted from deferred — T4 surfaced concrete evidence it is needed: a durable 3-node demo holds a stable leader AT REST, but under even light sustained QoS-1 load the lease epoch/term climbs slowly (session-log fsyncs contend with the lease raft's fsyncs, delaying heartbeats into election timeouts). openraft already batches AppendEntries so the marginal win is bounded; may also need to isolate the durable session-log I/O from the lease-group raft I/O."

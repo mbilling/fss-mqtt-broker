@@ -91,6 +91,14 @@ removed; in practice it became the no-store fallback dedup window and is bypasse
 store is configured, rather than being deleted. The connection's durable hot-path is
 `record_received`/`clear_received`; `next_packet_id` from the connection is tracked as T9.
 
+**Lease-timing ↔ storage-latency constraint (ADR 0026):** the lease group this wires up is
+tuned for fsync-on-commit latency, not in-memory speed. Its raft heartbeat/election timing
+([`lease_group::config`](../../crates/mqtt-cluster/src/lease_group.rs)) and the reconcile
+[`DRIVER_TICK`](../../crates/mqtt-cluster/src/durable_node.rs) are budgeted so a durable
+(redb) store holds a stable leader; do not retune them for faster failover without
+re-checking the persistent path. See [ADR 0026](../adr/0026-lease-timing-durable-storage.md)
+(and its T5, coalescing raft writes, for the residual under-load churn).
+
 ## Changelog
 
 - **2026-06-22** — Migration audit: steps 4a–4f and workstream F verified built against
