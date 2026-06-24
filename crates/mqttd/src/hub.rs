@@ -1245,16 +1245,21 @@ impl Hub {
     /// order, so the round-robin cursor is stable (ADR 0015 §2).
     fn shared_candidates(&self, topic: &str) -> Vec<SharedMatch> {
         let mut by_key: BTreeMap<SharedKey, Vec<SharedCandidate>> = BTreeMap::new();
-        for g in self.shared.matching(topic) {
-            let entry = by_key.entry((g.group, g.filter)).or_default();
-            for (client, qos) in g.members {
-                entry.push(SharedCandidate {
-                    node: None,
-                    client,
-                    qos,
-                });
-            }
-        }
+        // Borrow each matching group's members (ADR 0010 T8): clone only what we keep — the
+        // key and each candidate — not the whole member list per publish.
+        self.shared
+            .for_each_matching(topic, |group, filter, members| {
+                let entry = by_key
+                    .entry((group.to_string(), filter.to_string()))
+                    .or_default();
+                for (client, qos) in members {
+                    entry.push(SharedCandidate {
+                        node: None,
+                        client: client.clone(),
+                        qos: *qos,
+                    });
+                }
+            });
         for (node, groups) in self.remote_shared.iter().collect::<BTreeMap<_, _>>() {
             for g in groups {
                 if !topic_matches(&g.filter, topic) {

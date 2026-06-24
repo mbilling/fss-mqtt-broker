@@ -94,19 +94,37 @@ impl SharedSubscriptionTable {
         });
     }
 
-    /// Every group whose `{filter}` matches `topic`, with its members. The hub
-    /// merges these with peer members and selects one per group (ADR 0015).
+    /// Visit each group whose `{filter}` matches `topic`, **by reference** — the
+    /// per-publish selection path (ADR 0010 T8). Unlike [`matching`](Self::matching) this
+    /// allocates nothing and clones no member list: the caller (the hub's shared selector)
+    /// borrows `(group, filter, members)` and copies only what it actually keeps. `f` is
+    /// invoked once per matching group, in arbitrary order.
+    pub fn for_each_matching<F>(&self, topic: &str, mut f: F)
+    where
+        F: FnMut(&str, &str, &[(ClientId, QoS)]),
+    {
+        for ((group, filter), members) in &self.groups {
+            if topic_matches(filter, topic) {
+                f(group, filter, members);
+            }
+        }
+    }
+
+    /// Every group whose `{filter}` matches `topic`, with its members (an owned snapshot).
+    /// The hub merges these with peer members and selects one per group (ADR 0015). The
+    /// per-publish hot path uses [`for_each_matching`](Self::for_each_matching) to avoid
+    /// the per-group clone; this owned form remains for callers that need to retain it.
     #[must_use]
     pub fn matching(&self, topic: &str) -> Vec<SharedGroup> {
-        self.groups
-            .iter()
-            .filter(|((_, filter), _)| topic_matches(filter, topic))
-            .map(|((group, filter), members)| SharedGroup {
-                group: group.clone(),
-                filter: filter.clone(),
-                members: members.clone(),
-            })
-            .collect()
+        let mut out = Vec::new();
+        self.for_each_matching(topic, |group, filter, members| {
+            out.push(SharedGroup {
+                group: group.to_string(),
+                filter: filter.to_string(),
+                members: members.to_vec(),
+            });
+        });
+        out
     }
 
     /// Every shared group with its members — the snapshot gossiped to peers so they
@@ -186,6 +204,38 @@ mod tests {
         // the round-robin selection over this list (ADR 0015).
         assert_eq!(groups[0].members[0], (cid("a"), QoS::AtLeastOnce));
         assert_eq!(groups[0].members[1], (cid("b"), QoS::AtLeastOnce));
+    }
+
+    #[test]
+    fn for_each_matching_visits_the_same_groups_without_cloning() {
+        let mut t = SharedSubscriptionTable::new();
+        t.subscribe(cid("a"), "grp", "t/+", QoS::AtLeastOnce);
+        t.subscribe(cid("b"), "grp", "t/+", QoS::ExactlyOnce);
+        t.subscribe(cid("c"), "other", "z/#", QoS::AtMostOnce); // does not match
+
+        // The borrowing visitor yields exactly the matching group, by reference.
+        let mut visits = 0;
+        let mut seen_group = String::new();
+        let mut seen_members: Vec<(ClientId, QoS)> = Vec::new();
+        t.for_each_matching("t/x", |group, filter, members| {
+            visits += 1;
+            assert_eq!(filter, "t/+");
+            seen_group = group.to_string();
+            seen_members = members.to_vec();
+        });
+        assert_eq!(visits, 1, "only the matching group is visited");
+        assert_eq!(seen_group, "grp");
+        assert_eq!(
+            seen_members,
+            vec![(cid("a"), QoS::AtLeastOnce), (cid("b"), QoS::ExactlyOnce)],
+            "members in insertion order with granted QoS"
+        );
+
+        // `matching` is the owned form of the same data.
+        let owned = t.matching("t/x");
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].group, seen_group);
+        assert_eq!(owned[0].members, seen_members);
     }
 
     #[test]

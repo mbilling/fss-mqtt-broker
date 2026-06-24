@@ -13,11 +13,11 @@
 | 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 8/9 done | — |
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
-| 0006 | Consensus & replication for durable sessions | Accepted | 10/11 done | 1 deferred |
+| 0006 | Consensus & replication for durable sessions | Accepted | 11/11 done | — |
 | 0007 | Wiring the durable cluster session store into the broker | Accepted | 7/9 done | 2 deferred |
 | 0008 | MQTT 5.0 codec | Accepted | 8/8 done | — |
 | 0009 | MQTT 5.0 session & message expiry | Accepted | 2/3 done | 1 deferred |
-| 0010 | Shared subscriptions | Accepted | 6/8 done | 2 deferred |
+| 0010 | Shared subscriptions | Accepted | 7/8 done | 1 deferred |
 | 0011 | MQTT 5.0 topic aliases | Accepted | 7/7 done | — |
 | 0012 | MQTT 5.0 flow control (Receive Maximum) | Accepted | 6/6 done | — |
 | 0013 | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | 8/9 done | 1 deferred |
@@ -63,10 +63,6 @@
 - `0005-P2d` 💤 deferred: Durability across owner loss (ephemeral mode until replication) — owner death mid-session drops the session; durability is workstream E (ADR 0006), not this ADR
 - `0005-P3` 💤 deferred: MQTT 5 Server-Reference redirect replacing the relay for v5 clients — needs the v5 codec and v5 clients; the proxy serves 3.1.1 and v5 alike until then
 
-**0006 — Consensus & replication for durable sessions**
-
-- `0006-P3c-i` 💤 deferred: Replace in-memory backend O(n) cap count with a rebuildable per-key index — correctness-neutral; in-memory backend's cap count reads the whole log (O(n)) per the 3c "remaining (minor)" note
-
 **0007 — Wiring the durable cluster session store into the broker**
 
 - `0007-T8` 💤 deferred: Dynamic-reconfiguration hardening under rapid churn (flap -> ephemeral degrade) — v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
@@ -79,7 +75,6 @@
 **0010 — Shared subscriptions**
 
 - `0010-T7` 💤 deferred: Subscription-Identifier handling for shared subscriptions — ADR 0010 Consequences notes no Subscription-Identifier handling yet; out of scope for the routing lever
-- `0010-T8` 💤 deferred: Indexed shared-group selection (avoid per-publish member-list clone) — matching/snapshot clone matching groups' member lists per publish; small in practice, ADR 0010 flags indexed selection as a later optimization
 
 **0013 — MQTT 5.0 enhanced authentication (AUTH exchange)**
 

@@ -55,8 +55,9 @@ tasks:
     evidence: main.rs build_durable_node wiring (MQTTD_DATA_DIR); durable_sessions::a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover / enqueue_is_durable_across_a_three_node_cluster
   - id: 0006-P3c-i
     title: Replace in-memory backend O(n) cap count with a rebuildable per-key index
-    status: deferred
-    notes: correctness-neutral; in-memory backend's cap count reads the whole log (O(n)) per the 3c "remaining (minor)" note
+    status: done
+    date: 2026-06-24
+    evidence: "Already satisfied: ReplicatedLog::live_range is overridden by InMemoryReplicatedLog (repl.rs) with an O(1) VecDeque front/back offset lookup, and logged.rs enqueue computes the cap count as high-low+1 over the contiguous retained range — no whole-log scan. The offset watermarks (maintained on push_back/pop_front, rebuilt from disk on the persistent backend) are the per-key index the note asked for. Introduced with the live_range watermark design (ADR 0017/0018)."
 ---
 
 # Delivery — ADR 0006: Consensus & replication for durable sessions
@@ -99,7 +100,7 @@ exist. Each carries a stable id used by commits, tests, and the dashboard.
 | 0006-P3b-ii-4 | ✅ done | 2026-06-15 | raft_mesh::two_nodes_elect_and_replicate_over_the_wire |
 | 0006-P3c | ✅ done | 2026-06-15 | logged::qos2_state_replicates_through_the_log; SessionStore record_received/clear_received/received/next_packet_id |
 | 0006-P4 | ✅ done | 2026-06-22 | main.rs build_durable_node wiring (MQTTD_DATA_DIR); durable_sessions::a_persistent_client_resumes_its_session_on_the_new_owner_after_takeover / enqueue_is_durable_across_a_three_node_cluster |
-| 0006-P3c-i | 💤 deferred | — | correctness-neutral; in-memory backend's cap count reads the whole log (O(n)) per the 3c "remaining (minor)" note |
+| 0006-P3c-i | ✅ done | 2026-06-24 | "Already satisfied: ReplicatedLog::live_range is overridden by InMemoryReplicatedLog (repl.rs) with an O(1) VecDeque front/back offset lookup, and logged.rs enqueue computes the cap count as high-low+1 over the contiguous retained range — no whole-log scan. The offset watermarks (maintained on push_back/pop_front, rebuilt from disk on the persistent backend) are the per-key index the note asked for. Introduced with the live_range watermark design (ADR 0017/0018)." |
 <!-- /status-table:0006 -->
 
 **Note carried from the ADR:** the engine selection (P1) is the *ratified* decision —

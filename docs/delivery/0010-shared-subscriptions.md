@@ -40,8 +40,9 @@ tasks:
     notes: ADR 0010 Consequences notes no Subscription-Identifier handling yet; out of scope for the routing lever
   - id: 0010-T8
     title: Indexed shared-group selection (avoid per-publish member-list clone)
-    status: deferred
-    notes: matching/snapshot clone matching groups' member lists per publish; small in practice, ADR 0010 flags indexed selection as a later optimization
+    status: done
+    date: 2026-06-24
+    evidence: "SharedSubscriptionTable::for_each_matching visits matching groups by reference (no member-list clone / allocation); hub::shared_candidates uses it on the per-publish path, cloning only the key + each retained candidate. matching() kept as the owned form (delegates to the visitor). Test for_each_matching_visits_the_same_groups_without_cloning; hub shared-selection suite green."
 ---
 
 # Delivery — ADR 0010: Shared subscriptions
@@ -76,7 +77,7 @@ id used by commits, tests, and the dashboard.
 | 0010-T5 | ✅ done | 2026-06-17 | min_qos in deliver_shared (hub.rs); shared membership rebuilt from persisted subscriptions (hub.rs reconcile loop, parse_shared) |
 | 0010-T6 | ✅ done | 2026-06-17 | shared_subscription_delivers_once_cluster_wide (cluster_chaos.rs) |
 | 0010-T7 | 💤 deferred | — | ADR 0010 Consequences notes no Subscription-Identifier handling yet; out of scope for the routing lever |
-| 0010-T8 | 💤 deferred | — | matching/snapshot clone matching groups' member lists per publish; small in practice, ADR 0010 flags indexed selection as a later optimization |
+| 0010-T8 | ✅ done | 2026-06-24 | "SharedSubscriptionTable::for_each_matching visits matching groups by reference (no member-list clone / allocation); hub::shared_candidates uses it on the per-publish path, cloning only the key + each retained candidate. matching() kept as the owned form (delegates to the visitor). Test for_each_matching_visits_the_same_groups_without_cloning; hub shared-selection suite green." |
 <!-- /status-table:0010 -->
 
 **Note:** ADR 0010 §5's per-node single-delivery limitation is explicitly superseded by
