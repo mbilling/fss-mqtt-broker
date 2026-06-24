@@ -35,12 +35,14 @@ tasks:
     evidence: v5_protocol::v5_connect_and_pubsub_roundtrip; conn.rs set_version on negotiated CONNECT
   - id: 0008-T7
     title: Codec-owned property validation (allowed-on-packet-type + duplicate non-repeatable -> Protocol Error)
-    status: deferred
-    notes: properties.rs deliberately round-trips any well-formed block; per-packet allow-list and duplicate-rejection are not implemented and have no tests; enforcement currently lives above the wire
+    status: done
+    date: 2026-06-24
+    evidence: "properties::PropContext + Properties::validate_for/decode_for enforce per-packet-type allowed properties and reject duplicate non-repeatable properties (User Property always repeatable; Subscription Identifier only on PUBLISH) as ProtocolViolation. Wired into every packet decode site in packet.rs. Tests: validate_rejects_a_property_illegal_on_the_packet, _duplicated_non_repeatable_property, subscription_identifier_repeats_only_on_publish, decode_for_rejects_an_illegal_property_at_the_wire_boundary."
   - id: 0008-T8
     title: Shared reason-code constants module (reason::SUCCESS, reason::NOT_AUTHORIZED, ...)
-    status: deferred
-    notes: reason codes carried as bare u8 literals; no shared reason-constants module in mqtt-codec, only broker-local consts in conn.rs
+    status: done
+    date: 2026-06-24
+    evidence: "New mqtt_codec::reason module: named u8 constants for the MQTT 5 reason codes + is_error(); conn.rs sources every v5 reason code from it (the v3.1.1 CONNACK return codes stay distinct). Test canonical_wire_values_and_error_classification."
 ---
 
 # Delivery — ADR 0008: MQTT 5.0 codec
@@ -75,8 +77,8 @@ carries a stable id used by commits, tests, and the dashboard.
 | 0008-P4 | ✅ done | 2026-06-22 | roundtrip_subscribe_v5_with_options_and_properties; subscribe_v5_reserved_and_bad_retain_handling_are_rejected |
 | 0008-P5 | ✅ done | 2026-06-22 | roundtrip_disconnect_and_auth_v5; auth_is_rejected_on_v3_1_1 |
 | 0008-P6 | ✅ done | 2026-06-22 | v5_protocol::v5_connect_and_pubsub_roundtrip; conn.rs set_version on negotiated CONNECT |
-| 0008-T7 | 💤 deferred | — | properties.rs deliberately round-trips any well-formed block; per-packet allow-list and duplicate-rejection are not implemented and have no tests; enforcement currently lives above the wire |
-| 0008-T8 | 💤 deferred | — | reason codes carried as bare u8 literals; no shared reason-constants module in mqtt-codec, only broker-local consts in conn.rs |
+| 0008-T7 | ✅ done | 2026-06-24 | "properties::PropContext + Properties::validate_for/decode_for enforce per-packet-type allowed properties and reject duplicate non-repeatable properties (User Property always repeatable; Subscription Identifier only on PUBLISH) as ProtocolViolation. Wired into every packet decode site in packet.rs. Tests: validate_rejects_a_property_illegal_on_the_packet, _duplicated_non_repeatable_property, subscription_identifier_repeats_only_on_publish, decode_for_rejects_an_illegal_property_at_the_wire_boundary." |
+| 0008-T8 | ✅ done | 2026-06-24 | "New mqtt_codec::reason module: named u8 constants for the MQTT 5 reason codes + is_error(); conn.rs sources every v5 reason code from it (the v3.1.1 CONNACK return codes stay distinct). Test canonical_wire_values_and_error_classification." |
 <!-- /status-table:0008 -->
 
 **Coverage note:** the value-decode-within-bounds half of P1's codec-owned validation is

@@ -19,7 +19,7 @@ use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{
     packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck},
-    Packet, ProtocolVersion, QoS,
+    reason, Packet, ProtocolVersion, QoS,
 };
 use mqtt_core::{is_shared_filter, parse_shared, ClientId, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
@@ -40,42 +40,87 @@ use tracing::{debug, info, warn};
 const KEEPALIVE_GRACE_NUM: u64 = 3;
 const KEEPALIVE_GRACE_DEN: u64 = 2;
 
-/// CONNACK reason: unacceptable protocol version (MQTT 3.1.1 return code 1).
+// MQTT 3.1.1 CONNACK **return codes** (0x01–0x05) — a code space distinct from v5 reason
+// codes (e.g. v3 return code 1 = unacceptable protocol; v5 reason 0x01 = Granted QoS 1), so
+// these stay as their own constants rather than aliasing `mqtt_codec::reason`.
+/// CONNACK return code: unacceptable protocol version (MQTT 3.1.1 return code 1).
 const CONNACK_UNACCEPTABLE_PROTOCOL: u8 = 0x01;
-/// CONNACK reason: identifier rejected (MQTT 3.1.1 return code 2).
+/// CONNACK return code: identifier rejected (MQTT 3.1.1 return code 2).
 const CONNACK_IDENTIFIER_REJECTED: u8 = 0x02;
-/// CONNACK reason: the server is temporarily unavailable (MQTT 3.1.1 return code 3) —
+/// CONNACK return code: the server is temporarily unavailable (MQTT 3.1.1 return code 3) —
 /// used when a durable session cannot be recovered yet (lease handoff / no quorum) so
 /// the client retries rather than starting clean (ADR 0017).
 const CONNACK_SERVER_UNAVAILABLE: u8 = 0x03;
-/// CONNACK reason: bad user name or password (MQTT 3.1.1 return code 4).
+/// CONNACK return code: bad user name or password (MQTT 3.1.1 return code 4).
 const CONNACK_BAD_CREDENTIALS: u8 = 0x04;
-/// CONNACK reason: not authorized (MQTT 3.1.1 return code 5).
+/// CONNACK return code: not authorized (MQTT 3.1.1 return code 5).
 const CONNACK_NOT_AUTHORIZED: u8 = 0x05;
-/// SUBACK return code: failure (subscription refused) [MQTT-3.9.3].
-const SUBACK_FAILURE: u8 = 0x80;
+
+// v5 reason codes — sourced from the shared `mqtt_codec::reason` catalogue (ADR 0008 T8) so
+// there is a single audited definition of each wire value. The broker-context aliases below
+// keep call sites self-documenting (e.g. `SUBACK_FAILURE` reads better than `UNSPECIFIED_ERROR`
+// in a SUBACK).
+/// SUBACK return code: failure (subscription refused) — v5 `0x80` Unspecified error.
+const SUBACK_FAILURE: u8 = reason::UNSPECIFIED_ERROR;
 /// AUTH reason code: success (the enhanced-auth exchange completed) (ADR 0013).
-const AUTH_SUCCESS: u8 = 0x00;
+const AUTH_SUCCESS: u8 = reason::SUCCESS;
 /// AUTH reason code: continue the enhanced-authentication exchange (ADR 0013).
-const AUTH_CONTINUE: u8 = 0x18;
+const AUTH_CONTINUE: u8 = reason::CONTINUE_AUTHENTICATION;
 /// AUTH reason code: re-authenticate an established session (ADR 0013 §4).
-const AUTH_REAUTH: u8 = 0x19;
+const AUTH_REAUTH: u8 = reason::REAUTHENTICATE;
 /// CONNACK reason (v5): not authorized.
-const CONNACK_V5_NOT_AUTHORIZED: u8 = 0x87;
+const CONNACK_V5_NOT_AUTHORIZED: u8 = reason::NOT_AUTHORIZED;
 /// CONNACK reason (v5): the requested authentication method is not supported.
-const CONNACK_V5_BAD_AUTH_METHOD: u8 = 0x8C;
+const CONNACK_V5_BAD_AUTH_METHOD: u8 = reason::BAD_AUTHENTICATION_METHOD;
 /// DISCONNECT reason (v5): protocol error.
-const DISCONNECT_PROTOCOL_ERROR: u8 = 0x82;
+const DISCONNECT_PROTOCOL_ERROR: u8 = reason::PROTOCOL_ERROR;
 /// DISCONNECT reason (v5): not authorized (a failed re-authentication, ADR 0013 §4).
-const DISCONNECT_NOT_AUTHORIZED: u8 = 0x87;
+const DISCONNECT_NOT_AUTHORIZED: u8 = reason::NOT_AUTHORIZED;
 /// DISCONNECT reason (v5): the server is shutting down (graceful drain, ADR 0019).
-const DISCONNECT_SERVER_SHUTTING_DOWN: u8 = 0x8B;
-/// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
-/// topic alias the server will accept on a connection.
-const SERVER_TOPIC_ALIAS_MAX: u16 = 16;
-/// Receive Maximum advertised to v5 clients (ADR 0012 §3): the most unacked
-/// `QoS` > 0 publishes the server invites the client to have outstanding to it.
-const SERVER_RECEIVE_MAXIMUM: u16 = 256;
+const DISCONNECT_SERVER_SHUTTING_DOWN: u8 = reason::SERVER_SHUTTING_DOWN;
+/// DISCONNECT reason (v5): topic alias invalid (out of range / unmapped, ADR 0011 §2).
+const DISCONNECT_TOPIC_ALIAS_INVALID: u8 = reason::TOPIC_ALIAS_INVALID;
+/// DISCONNECT reason (v5): the client exceeded the server's Receive Maximum (ADR 0012 §3).
+const DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED: u8 = reason::RECEIVE_MAXIMUM_EXCEEDED;
+/// Server-advertised MQTT 5.0 wire limits, configurable at startup (ADR 0011/0012/0013).
+/// These are genuinely server-wide (the same maxima are advertised to every connection),
+/// so they live in one process-wide value set once from config rather than per-connection.
+#[derive(Debug, Clone, Copy)]
+pub struct WireLimits {
+    /// Topic Alias Maximum advertised to v5 clients (ADR 0011 §2): the highest inbound
+    /// topic alias the server accepts. `0` disables inbound topic aliases.
+    pub topic_alias_max: u16,
+    /// Receive Maximum advertised to v5 clients (ADR 0012 §3): the most unacked `QoS` > 0
+    /// publishes a client may have outstanding **to** the server before it is disconnected
+    /// with reason `0x93`.
+    pub receive_maximum: u16,
+    /// How long the server waits for the client's reply in each round of the enhanced-auth
+    /// exchange before aborting it (ADR 0013 §3) — bounds a stalled half-open auth.
+    pub auth_round_timeout: Duration,
+}
+
+impl Default for WireLimits {
+    fn default() -> Self {
+        Self {
+            topic_alias_max: 16,
+            receive_maximum: 256,
+            auth_round_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+static WIRE_LIMITS: std::sync::OnceLock<WireLimits> = std::sync::OnceLock::new();
+
+/// Set the process-wide [`WireLimits`] once, at startup before any connection is served
+/// (a no-op if already set). Production reads them from env in `main`; tests use the default.
+pub fn set_wire_limits(limits: WireLimits) {
+    let _ = WIRE_LIMITS.set(limits);
+}
+
+/// The configured [`WireLimits`], or the default if [`set_wire_limits`] was never called.
+fn wire_limits() -> WireLimits {
+    *WIRE_LIMITS.get_or_init(WireLimits::default)
+}
 
 /// Monotonic source of unique connection ids (distinct from client ids).
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -462,6 +507,7 @@ where
         policy,
         &mut out_rx,
         connect.keep_alive,
+        connect.protocol == ProtocolVersion::V5,
         &mut inbound_aliases,
         &mut outbound_aliases,
     )
@@ -876,15 +922,26 @@ where
                     }))
                     .await?;
 
-                // The reply must be an AUTH(Continue) keeping the same method.
-                let reply = match reader.next_packet().await? {
-                    Some(Packet::Auth(a)) if a.reason == AUTH_CONTINUE => a,
-                    Some(other) => {
-                        warn!(client = %client.0, packet = ?other.packet_type(),
-                              "expected AUTH(continue); aborting auth exchange");
+                // The reply must be an AUTH(Continue) keeping the same method, and must
+                // arrive within the per-round auth timeout (ADR 0013 §3) — a stalled round
+                // must not pin the connection (the keepalive timer is not yet running).
+                let next =
+                    tokio::time::timeout(wire_limits().auth_round_timeout, reader.next_packet())
+                        .await;
+                let reply = match next {
+                    Err(_elapsed) => {
+                        warn!(client = %client.0, "enhanced-auth round timed out; aborting");
                         return Ok(ExchangeResult::Aborted);
                     }
-                    None => return Ok(ExchangeResult::Aborted), // EOF mid-exchange
+                    Ok(inbound) => match inbound? {
+                        Some(Packet::Auth(a)) if a.reason == AUTH_CONTINUE => a,
+                        Some(other) => {
+                            warn!(client = %client.0, packet = ?other.packet_type(),
+                                  "expected AUTH(continue); aborting auth exchange");
+                            return Ok(ExchangeResult::Aborted);
+                        }
+                        None => return Ok(ExchangeResult::Aborted), // EOF mid-exchange
+                    },
                 };
                 if reply.properties.authentication_method() != Some(method) {
                     warn!(client = %client.0, "AUTH method changed mid-exchange; aborting");
@@ -1026,7 +1083,8 @@ fn negotiate_v5_properties(
     properties: &mqtt_codec::Properties,
 ) -> (mqtt_codec::Properties, InboundAliases, OutboundAliases) {
     let is_v5 = protocol == ProtocolVersion::V5;
-    let server_alias_max = if is_v5 { SERVER_TOPIC_ALIAS_MAX } else { 0 };
+    let limits = wire_limits();
+    let server_alias_max = if is_v5 { limits.topic_alias_max } else { 0 };
     let client_alias_max = if is_v5 {
         properties.topic_alias_maximum().unwrap_or(0)
     } else {
@@ -1036,7 +1094,7 @@ fn negotiate_v5_properties(
     if is_v5 {
         props
             .0
-            .push(mqtt_codec::Property::ReceiveMaximum(SERVER_RECEIVE_MAXIMUM));
+            .push(mqtt_codec::Property::ReceiveMaximum(limits.receive_maximum));
     }
     if server_alias_max > 0 {
         props
@@ -1061,6 +1119,7 @@ async fn serve<R, W>(
     policy: &ConnPolicy,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
+    is_v5: bool,
     inbound_aliases: &mut InboundAliases,
     outbound_aliases: &mut OutboundAliases,
 ) -> Result<bool, NetError>
@@ -1076,6 +1135,10 @@ where
     // Inbound QoS 2 ids seen but not yet PUBREL-released; forwarding only on first
     // sight is what makes inbound QoS 2 exactly-once [MQTT-4.3.3-2].
     let mut qos2_inbound: HashSet<u16> = HashSet::new();
+    // Count of distinct unreleased inbound QoS>0 publishes — the client's outstanding
+    // window against the server's Receive Maximum (ADR 0012). QoS 1 is acked inline so
+    // never accumulates; QoS 2 holds a slot from PUBLISH until PUBREL. Overrun → 0x93.
+    let mut qos2_inflight: usize = 0;
 
     loop {
         let idle = async {
@@ -1098,7 +1161,7 @@ where
                         }
                     }
                     Some(packet) => {
-                        if handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, inbound_aliases).await? {
+                        if handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
                     }
@@ -1163,6 +1226,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     principal: &Identity,
     policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
+    qos2_inflight: &mut usize,
+    is_v5: bool,
     inbound_aliases: &mut InboundAliases,
 ) -> Result<bool, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
@@ -1172,7 +1237,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
     let alias = publish.properties.topic_alias();
     let Ok(topic) = inbound_aliases.resolve(&publish.topic, alias) else {
-        warn!(client = %client.0, alias = ?alias, "invalid topic alias; closing connection");
+        // An out-of-range or unmapped alias is a protocol error: tell the v5 client why
+        // (DISCONNECT 0x94 Topic Alias Invalid, ADR 0011 §2) rather than a bare close. The
+        // alias property is v5-only, so reaching here implies a v5 connection.
+        warn!(client = %client.0, alias = ?alias, "invalid topic alias; DISCONNECT 0x94");
+        disconnect(writer, DISCONNECT_TOPIC_ALIAS_INVALID).await?;
         return Ok(true);
     };
     let Publish {
@@ -1229,6 +1298,17 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 None => qos2_inbound.insert(id),
             };
             if first_sighting {
+                // Receive Maximum (ADR 0012 §3): a *new* unreleased QoS 2 id beyond the
+                // server's advertised window is a flow-control breach — DISCONNECT 0x93.
+                // A DUP of an already-held id does not consume a new slot. v5 only (3.1.1
+                // has no Receive Maximum and the server does not send DISCONNECT).
+                if is_v5 && *qos2_inflight >= wire_limits().receive_maximum as usize {
+                    warn!(client = %client.0, limit = wire_limits().receive_maximum,
+                          "client exceeded Receive Maximum; DISCONNECT 0x93");
+                    disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
+                    return Ok(true);
+                }
+                *qos2_inflight += 1;
                 forward(hub);
             }
             writer.send(&Packet::PubRec(id.into())).await?;
@@ -1248,6 +1328,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     principal: &Identity,
     policy: &ConnPolicy,
     qos2_inbound: &mut HashSet<u16>,
+    qos2_inflight: &mut usize,
+    is_v5: bool,
     inbound_aliases: &mut InboundAliases,
 ) -> Result<bool, NetError> {
     match packet {
@@ -1261,6 +1343,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 principal,
                 policy,
                 qos2_inbound,
+                qos2_inflight,
+                is_v5,
                 inbound_aliases,
             )
             .await?
@@ -1280,6 +1364,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     qos2_inbound.remove(&id);
                 }
             }
+            // The QoS 2 id is released — free its Receive-Maximum slot (ADR 0012).
+            *qos2_inflight = qos2_inflight.saturating_sub(1);
             writer.send(&Packet::PubComp(id.into())).await?;
         }
         // Subscriber-side acknowledgements for our downstream deliveries.
@@ -1355,10 +1441,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        handle_stream, ConnPolicy, DEFAULT_CONNECT_TIMEOUT, SERVER_RECEIVE_MAXIMUM,
-        SERVER_TOPIC_ALIAS_MAX,
-    };
+    use super::{handle_stream, wire_limits, ConnPolicy, DEFAULT_CONNECT_TIMEOUT};
     use crate::hub::{AttachOutcome, HubCommand, Outbound};
     use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
@@ -2114,7 +2197,7 @@ mod tests {
         match recv(&mut reader).await {
             Some(Packet::ConnAck(a)) => assert_eq!(
                 a.properties.topic_alias_maximum(),
-                Some(SERVER_TOPIC_ALIAS_MAX),
+                Some(wire_limits().topic_alias_max),
                 "CONNACK advertises our inbound maximum"
             ),
             other => panic!("expected CONNACK, got {other:?}"),
@@ -2147,10 +2230,10 @@ mod tests {
         assert_eq!(second, "sensors/t", "reference resolves to the same topic");
     }
 
-    /// Referencing a topic alias that was never established is a protocol error and
-    /// closes the connection (ADR 0011 §2).
+    /// Referencing a topic alias that was never established is a protocol error: the
+    /// server sends DISCONNECT 0x94 (Topic Alias Invalid) and then closes (ADR 0011 §2).
     #[tokio::test]
-    async fn v5_invalid_topic_alias_closes_connection() {
+    async fn v5_invalid_topic_alias_disconnects_0x94() {
         let (mut reader, mut writer, hub_rx) = v5_pipe();
         let _topics = stub_hub_topics(hub_rx);
         writer.send(&connect_v5("c", vec![])).await.unwrap();
@@ -2168,11 +2251,44 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_eq!(
-            recv(&mut reader).await,
-            None,
-            "an unmapped alias reference closes the connection"
-        );
+        match recv(&mut reader).await {
+            Some(Packet::Disconnect(d)) => assert_eq!(
+                d.reason,
+                mqtt_codec::reason::TOPIC_ALIAS_INVALID,
+                "unmapped alias yields DISCONNECT 0x94"
+            ),
+            other => panic!("expected DISCONNECT 0x94, got {other:?}"),
+        }
+        assert_eq!(recv(&mut reader).await, None, "then the connection closes");
+    }
+
+    /// A client must not have more unreleased `QoS` 2 publishes outstanding than the
+    /// server's Receive Maximum; the publish that exceeds the window is answered with
+    /// DISCONNECT 0x93 (Receive Maximum exceeded), ADR 0012 §3.
+    #[tokio::test]
+    async fn v5_receive_maximum_exceeded_disconnects_0x93() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // Fill the window: `limit` distinct QoS 2 ids, each PUBREC'd, none PUBREL'd (so they
+        // stay outstanding). Send-then-read each to avoid filling the duplex pipe buffer.
+        let limit = wire_limits().receive_maximum;
+        for id in 1..=limit {
+            writer.send(&qos2_publish(id)).await.unwrap();
+            assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(id.into())));
+        }
+        // One more distinct unreleased id exceeds the window.
+        writer.send(&qos2_publish(limit + 1)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Disconnect(d)) => assert_eq!(
+                d.reason,
+                mqtt_codec::reason::RECEIVE_MAXIMUM_EXCEEDED,
+                "exceeding Receive Maximum yields DISCONNECT 0x93"
+            ),
+            other => panic!("expected DISCONNECT 0x93, got {other:?}"),
+        }
     }
 
     /// When the client advertises a Topic Alias Maximum, the server assigns an alias
@@ -2224,7 +2340,7 @@ mod tests {
         match recv(&mut reader).await {
             Some(Packet::ConnAck(a)) => assert_eq!(
                 a.properties.receive_maximum(),
-                Some(SERVER_RECEIVE_MAXIMUM),
+                Some(wire_limits().receive_maximum),
                 "CONNACK advertises our inbound Receive Maximum"
             ),
             other => panic!("expected CONNACK, got {other:?}"),

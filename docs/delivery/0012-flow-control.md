@@ -30,8 +30,9 @@ tasks:
     evidence: MAX_BACKLOG / push_backlog; flow_control_backlog_is_bounded_drop_oldest
   - id: 0012-T6
     title: Strictly enforce client to server Receive Maximum (DISCONNECT 0x93 on overrun)
-    status: deferred
-    notes: client to server direction is advertised but NOT strictly enforced; broker acks inbound promptly so it self-limits, DISCONNECT 0x93 folded into act-on-v5-reason-codes work (ADR 0012 §3); still holds
+    status: done
+    date: 2026-06-24
+    evidence: "The serve loop tracks unreleased inbound QoS2 ids (qos2_inflight); a new id beyond WireLimits.receive_maximum (configurable via MQTTD_RECEIVE_MAXIMUM) is answered with DISCONNECT 0x93 (v5 only). Test v5_receive_maximum_exceeded_disconnects_0x93."
 ---
 
 # Delivery — ADR 0012: MQTT 5.0 flow control (Receive Maximum)
@@ -63,7 +64,7 @@ dashboard.
 | 0012-T3 | ✅ done | 2026-06-17 | SERVER_RECEIVE_MAXIMUM in conn.rs; v5_receive_maximum_is_advertised_and_forwarded / v311_receive_maximum_defaults_to_unlimited |
 | 0012-T4 | ✅ done | 2026-06-17 | Inflight.pending.len() gates send (hub.rs); v5_receive_maximum_limits_inflight_until_acked |
 | 0012-T5 | ✅ done | 2026-06-17 | MAX_BACKLOG / push_backlog; flow_control_backlog_is_bounded_drop_oldest |
-| 0012-T6 | 💤 deferred | — | client to server direction is advertised but NOT strictly enforced; broker acks inbound promptly so it self-limits, DISCONNECT 0x93 folded into act-on-v5-reason-codes work (ADR 0012 §3); still holds |
+| 0012-T6 | ✅ done | 2026-06-24 | "The serve loop tracks unreleased inbound QoS2 ids (qos2_inflight); a new id beyond WireLimits.receive_maximum (configurable via MQTTD_RECEIVE_MAXIMUM) is answered with DISCONNECT 0x93 (v5 only). Test v5_receive_maximum_exceeded_disconnects_0x93." |
 <!-- /status-table:0012 -->
 
 **Documented limit still in force:** the client→server (inbound) direction is advertised

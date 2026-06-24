@@ -7,7 +7,7 @@
 //! types, defaulted/empty for v3.1.1 so the older wire is unaffected.
 
 use crate::io::{self, Reader};
-use crate::{varint, CodecError, Properties, ProtocolVersion, QoS};
+use crate::{varint, CodecError, PropContext, Properties, ProtocolVersion, QoS};
 use bytes::{Buf, Bytes, BytesMut};
 
 /// The fixed-header packet type (the high nibble of the first byte).
@@ -488,7 +488,7 @@ impl Packet {
                     return Err(CodecError::ProtocolViolation("AUTH is MQTT 5.0 only"));
                 }
                 expect_flags(header.flags, 0)?;
-                let (reason, properties) = decode_reason_and_properties(&mut r)?;
+                let (reason, properties) = decode_reason_and_properties(&mut r, PropContext::Auth)?;
                 Packet::Auth(Auth { reason, properties })
             }
         };
@@ -603,7 +603,7 @@ fn decode_ack(version: ProtocolVersion, r: &mut Reader) -> Result<Ack, CodecErro
     let properties = if r.is_empty() {
         Properties::new()
     } else {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::PubAck)?
     };
     expect_empty(r)?;
     Ok(Ack {
@@ -655,7 +655,7 @@ fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
     let keep_alive = r.read_u16()?;
     // The CONNECT properties block (v5) ends the variable header, before the payload.
     let properties = if is_v5 {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::Connect)?
     } else {
         Properties::new()
     };
@@ -666,7 +666,7 @@ fn decode_connect(r: &mut Reader) -> Result<Connect, CodecError> {
             QoS::from_u8(will_qos_bits).ok_or(CodecError::MalformedPacket("invalid will QoS"))?;
         // Will properties (v5) precede the will topic in the payload.
         let will_properties = if is_v5 {
-            Properties::decode(r)?
+            Properties::decode_for(r, PropContext::Will)?
         } else {
             Properties::new()
         };
@@ -765,7 +765,7 @@ fn decode_connack(r: &mut Reader, version: ProtocolVersion) -> Result<ConnAck, C
     }
     let code = r.read_u8()?;
     let properties = if version == ProtocolVersion::V5 {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::ConnAck)?
     } else {
         Properties::new()
     };
@@ -828,7 +828,7 @@ fn decode_publish(
     };
     // The PUBLISH properties block (v5) sits between the packet id and the payload.
     let properties = if version == ProtocolVersion::V5 {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::Publish)?
     } else {
         Properties::new()
     };
@@ -875,7 +875,7 @@ fn decode_subscribe(version: ProtocolVersion, r: &mut Reader) -> Result<Subscrib
     let is_v5 = version == ProtocolVersion::V5;
     let pkid = r.read_u16()?;
     let properties = if is_v5 {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::Subscribe)?
     } else {
         Properties::new()
     };
@@ -957,7 +957,7 @@ fn encode_subscribe(
 fn decode_suback(version: ProtocolVersion, r: &mut Reader) -> Result<SubAck, CodecError> {
     let pkid = r.read_u16()?;
     let properties = if version == ProtocolVersion::V5 {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::SubAck)?
     } else {
         Properties::new()
     };
@@ -991,7 +991,7 @@ fn encode_suback(
 fn decode_unsubscribe(version: ProtocolVersion, r: &mut Reader) -> Result<Unsubscribe, CodecError> {
     let pkid = r.read_u16()?;
     let properties = if version == ProtocolVersion::V5 {
-        Properties::decode(r)?
+        Properties::decode_for(r, PropContext::Unsubscribe)?
     } else {
         Properties::new()
     };
@@ -1034,7 +1034,7 @@ fn decode_unsuback(version: ProtocolVersion, r: &mut Reader) -> Result<UnsubAck,
         expect_empty(r)?;
         return Ok(UnsubAck::new(pkid));
     }
-    let properties = Properties::decode(r)?;
+    let properties = Properties::decode_for(r, PropContext::UnsubAck)?;
     let mut reason_codes = Vec::new();
     while !r.is_empty() {
         reason_codes.push(r.read_u8()?);
@@ -1067,7 +1067,10 @@ fn encode_unsuback(
 /// Decode a v5 "reason code + properties" body (shared by DISCONNECT and AUTH), with
 /// the short forms: an empty body is reason 0 with no properties; a reason with no
 /// trailing bytes omits the property length (no properties).
-fn decode_reason_and_properties(r: &mut Reader) -> Result<(u8, Properties), CodecError> {
+fn decode_reason_and_properties(
+    r: &mut Reader,
+    ctx: PropContext,
+) -> Result<(u8, Properties), CodecError> {
     if r.is_empty() {
         return Ok((0, Properties::new()));
     }
@@ -1075,7 +1078,7 @@ fn decode_reason_and_properties(r: &mut Reader) -> Result<(u8, Properties), Code
     let properties = if r.is_empty() {
         Properties::new()
     } else {
-        Properties::decode(r)?
+        Properties::decode_for(r, ctx)?
     };
     expect_empty(r)?;
     Ok((reason, properties))
@@ -1101,7 +1104,7 @@ fn decode_disconnect(version: ProtocolVersion, r: &mut Reader) -> Result<Disconn
         expect_empty(r)?;
         return Ok(Disconnect::default());
     }
-    let (reason, properties) = decode_reason_and_properties(r)?;
+    let (reason, properties) = decode_reason_and_properties(r, PropContext::Disconnect)?;
     Ok(Disconnect { reason, properties })
 }
 

@@ -44,8 +44,9 @@ tasks:
     notes: ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs).
   - id: 0013-T9
     title: Dedicated per-round AUTH-exchange timeout
-    status: deferred
-    notes: the exchange blocks on the client between rounds with no dedicated timeout (same surface as existing pre-CONNACK reads); ADR Consequences flags this as a known limit.
+    status: done
+    date: 2026-06-24
+    evidence: "drive_auth_exchange wraps each round's reply read in a tokio timeout of WireLimits.auth_round_timeout (configurable via MQTTD_AUTH_TIMEOUT); a stalled round aborts the exchange rather than pinning the connection."
 ---
 
 # Delivery — ADR 0013: MQTT 5.0 enhanced authentication (AUTH exchange)
@@ -85,7 +86,7 @@ and the no-per-round-timeout limit remain open.
 | 0013-T6 | ✅ done | 2026-06-17 | reauthenticate(); v5_enhanced_auth_then_reauthentication |
 | 0013-T7 | ✅ done | 2026-06-17 | v5_reauthentication_method_change_is_protocol_error / v5_reauthentication_wrong_proof_disconnects |
 | 0013-T8 | 💤 deferred | — | ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs). |
-| 0013-T9 | 💤 deferred | — | the exchange blocks on the client between rounds with no dedicated timeout (same surface as existing pre-CONNACK reads); ADR Consequences flags this as a known limit. |
+| 0013-T9 | ✅ done | 2026-06-24 | "drive_auth_exchange wraps each round's reply read in a tokio timeout of WireLimits.auth_round_timeout (configurable via MQTTD_AUTH_TIMEOUT); a stalled round aborts the exchange rather than pinning the connection." |
 <!-- /status-table:0013 -->
 
 ## Changelog

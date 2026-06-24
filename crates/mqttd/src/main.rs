@@ -13,6 +13,12 @@
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
 //! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
 //! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
+//! - `MQTTD_TOPIC_ALIAS_MAX` — Topic Alias Maximum advertised to v5 clients (ADR 0011;
+//!   default 16, `0` disables inbound topic aliases)
+//! - `MQTTD_RECEIVE_MAXIMUM` — Receive Maximum advertised to v5 clients (ADR 0012;
+//!   default 256, floored at 1). A client exceeding it is sent DISCONNECT `0x93`.
+//! - `MQTTD_AUTH_TIMEOUT` — per-round enhanced-auth reply timeout in seconds (ADR 0013;
+//!   default 10, floored at 1)
 //! - `MQTTD_DURABLE_SESSIONS` — the durable, consensus-backed session store
 //!   (ADR 0006/0007), replicating persistent sessions across the peer mesh, is the
 //!   **default** (ADR 0029). Opt out with `0`/`false`/`off`/`no` for the lightweight
@@ -123,6 +129,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_anonymous = config.security.allow_anonymous,
         "configuration validated (secure defaults)"
     );
+
+    // Server-wide MQTT 5 wire limits (ADR 0011/0012/0013), configurable via env, set once
+    // before any connection is served.
+    conn::set_wire_limits(wire_limits_from_env()?);
 
     // Session-placement ring (ADR 0005), kept in step with SWIM membership and
     // read by the hub to identify each persistent session's owner node.
@@ -1036,6 +1046,36 @@ async fn serve_plaintext_clients(
 /// Read an environment variable, treating unset or empty as absent.
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Parse an env var as `T`, falling back to `default` when unset/empty. An unparseable
+/// value is a startup error rather than a silent fallback.
+fn parse_env<T>(key: &str, default: T) -> Result<T, Box<dyn std::error::Error>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match non_empty_env(key) {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<T>()
+            .map_err(|e| format!("{key}: invalid value {v:?}: {e}").into()),
+    }
+}
+
+/// Build the server-wide MQTT 5 wire limits from env (ADR 0011/0012/0013), each with a
+/// spec-sensible default. `MQTTD_TOPIC_ALIAS_MAX` (default 16; `0` disables inbound
+/// aliases), `MQTTD_RECEIVE_MAXIMUM` (default 256; floored at 1 — a Receive Maximum of 0
+/// is a Protocol Error), `MQTTD_AUTH_TIMEOUT` seconds (default 10; floored at 1).
+fn wire_limits_from_env() -> Result<conn::WireLimits, Box<dyn std::error::Error>> {
+    let d = conn::WireLimits::default();
+    Ok(conn::WireLimits {
+        topic_alias_max: parse_env("MQTTD_TOPIC_ALIAS_MAX", d.topic_alias_max)?,
+        receive_maximum: parse_env("MQTTD_RECEIVE_MAXIMUM", d.receive_maximum)?.max(1),
+        auth_round_timeout: Duration::from_secs(
+            parse_env("MQTTD_AUTH_TIMEOUT", d.auth_round_timeout.as_secs())?.max(1),
+        ),
+    })
 }
 
 /// Default graceful-shutdown drain deadline (ADR 0019), aligned with a typical

@@ -322,6 +322,144 @@ impl Properties {
         }
         Ok(Self(properties))
     }
+
+    /// [`decode`](Self::decode) the block, then [`validate_for`](Self::validate_for) the
+    /// packet context — the form callers use when decoding a real packet (the codec knows
+    /// the packet type there), so a property illegal on that packet is rejected at the
+    /// wire boundary (ADR 0008 T7).
+    ///
+    /// # Errors
+    /// As [`decode`](Self::decode), plus [`CodecError::ProtocolViolation`] if a property is
+    /// not permitted on `ctx` or a non-repeatable property is duplicated.
+    pub fn decode_for(r: &mut Reader, ctx: PropContext) -> Result<Self, CodecError> {
+        let props = Self::decode(r)?;
+        props.validate_for(ctx)?;
+        Ok(props)
+    }
+
+    /// Validate this block against its packet context (MQTT 5.0 §2.2.2 / §3.x): every
+    /// property must be permitted on that packet type, and a property that may not repeat
+    /// must appear at most once. Either is a **Protocol Error**.
+    ///
+    /// The repeatable properties are User Property (everywhere) and Subscription Identifier
+    /// (only on PUBLISH, where a single message may carry several).
+    ///
+    /// # Errors
+    /// [`CodecError::ProtocolViolation`] on a disallowed or duplicated property.
+    pub fn validate_for(&self, ctx: PropContext) -> Result<(), CodecError> {
+        // Property identifiers are 0x01..=0x2A, so a u64 is a sufficient "seen" bitset.
+        let mut seen: u64 = 0;
+        for p in &self.0 {
+            let id = p.id();
+            if !ctx.allows(id) {
+                return Err(CodecError::ProtocolViolation(
+                    "property not allowed on this packet type",
+                ));
+            }
+            if !ctx.repeatable(id) {
+                let bit = 1u64 << id;
+                if seen & bit != 0 {
+                    return Err(CodecError::ProtocolViolation(
+                        "duplicate of a non-repeatable property",
+                    ));
+                }
+                seen |= bit;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The packet context a property block appears in — selects which properties are allowed
+/// and which may repeat (MQTT 5.0 §3.x). `PubAck` covers PUBACK/PUBREC/PUBREL/PUBCOMP,
+/// which share a property set; `Will` is the CONNECT payload's Will Properties block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropContext {
+    /// CONNECT variable-header properties (§3.1.2.11).
+    Connect,
+    /// CONNECT payload Will Properties (§3.1.3.2).
+    Will,
+    /// CONNACK properties (§3.2.2.3).
+    ConnAck,
+    /// PUBLISH properties (§3.3.2.3).
+    Publish,
+    /// PUBACK / PUBREC / PUBREL / PUBCOMP properties (§3.4.2.2 etc.).
+    PubAck,
+    /// SUBSCRIBE properties (§3.8.2.1).
+    Subscribe,
+    /// SUBACK properties (§3.9.2.1).
+    SubAck,
+    /// UNSUBSCRIBE properties (§3.10.2.1).
+    Unsubscribe,
+    /// UNSUBACK properties (§3.11.2.1).
+    UnsubAck,
+    /// DISCONNECT properties (§3.14.2.2).
+    Disconnect,
+    /// AUTH properties (§3.15.2.2).
+    Auth,
+}
+
+impl PropContext {
+    /// Whether property identifier `id` is permitted on this packet type (MQTT 5.0 §3.x).
+    #[must_use]
+    pub fn allows(self, id: u8) -> bool {
+        match self {
+            // session-expiry, receive-max, max-packet-size, topic-alias-max, request-resp-info,
+            // request-problem-info, user-property, auth-method, auth-data
+            PropContext::Connect => {
+                matches!(
+                    id,
+                    0x11 | 0x21 | 0x27 | 0x22 | 0x19 | 0x17 | 0x26 | 0x15 | 0x16
+                )
+            }
+            // will-delay, payload-format, message-expiry, content-type, response-topic,
+            // correlation-data, user-property
+            PropContext::Will => matches!(id, 0x18 | 0x01 | 0x02 | 0x03 | 0x08 | 0x09 | 0x26),
+            PropContext::ConnAck => matches!(
+                id,
+                0x11 | 0x21
+                    | 0x24
+                    | 0x25
+                    | 0x27
+                    | 0x12
+                    | 0x22
+                    | 0x1F
+                    | 0x26
+                    | 0x28
+                    | 0x29
+                    | 0x2A
+                    | 0x13
+                    | 0x1A
+                    | 0x1C
+                    | 0x15
+                    | 0x16
+            ),
+            // payload-format, message-expiry, topic-alias, response-topic, correlation-data,
+            // user-property, subscription-identifier, content-type
+            PropContext::Publish => {
+                matches!(id, 0x01 | 0x02 | 0x23 | 0x08 | 0x09 | 0x26 | 0x0B | 0x03)
+            }
+            // reason-string, user-property
+            PropContext::PubAck | PropContext::SubAck | PropContext::UnsubAck => {
+                matches!(id, 0x1F | 0x26)
+            }
+            // subscription-identifier, user-property
+            PropContext::Subscribe => matches!(id, 0x0B | 0x26),
+            // user-property only
+            PropContext::Unsubscribe => id == 0x26,
+            // session-expiry, reason-string, user-property, server-reference
+            PropContext::Disconnect => matches!(id, 0x11 | 0x1F | 0x26 | 0x1C),
+            // auth-method, auth-data, reason-string, user-property
+            PropContext::Auth => matches!(id, 0x15 | 0x16 | 0x1F | 0x26),
+        }
+    }
+
+    /// Whether property `id` may legitimately appear more than once on this packet:
+    /// User Property (0x26) always; Subscription Identifier (0x0B) only on PUBLISH.
+    #[must_use]
+    pub fn repeatable(self, id: u8) -> bool {
+        id == 0x26 || (id == 0x0B && self == PropContext::Publish)
+    }
 }
 
 impl From<Vec<Property>> for Properties {
@@ -332,7 +470,7 @@ impl From<Vec<Property>> for Properties {
 
 #[cfg(test)]
 mod tests {
-    use super::{Properties, Property};
+    use super::{PropContext, Properties, Property};
     use crate::io::Reader;
     use crate::CodecError;
     use bytes::Bytes;
@@ -358,6 +496,73 @@ mod tests {
             Property::CorrelationData(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF])), // binary
             Property::UserProperty("k".to_string(), "v".to_string()), // string pair
         ]));
+    }
+
+    // ---- packet-context validation (ADR 0008 T7) ----
+
+    #[test]
+    fn validate_accepts_properties_legal_on_the_packet() {
+        // A representative legal CONNECT block.
+        let p = Properties(vec![
+            Property::SessionExpiryInterval(60),
+            Property::ReceiveMaximum(10),
+            Property::UserProperty("a".into(), "b".into()),
+            Property::UserProperty("c".into(), "d".into()), // repeatable everywhere
+        ]);
+        assert!(p.validate_for(PropContext::Connect).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_property_illegal_on_the_packet() {
+        // ReasonString (0x1F) is not a CONNECT property.
+        let p = Properties(vec![Property::ReasonString("nope".into())]);
+        assert!(matches!(
+            p.validate_for(PropContext::Connect),
+            Err(CodecError::ProtocolViolation(_))
+        ));
+        // ...but it is legal on a DISCONNECT.
+        assert!(p.validate_for(PropContext::Disconnect).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_duplicated_non_repeatable_property() {
+        let p = Properties(vec![
+            Property::SessionExpiryInterval(1),
+            Property::SessionExpiryInterval(2), // duplicate, non-repeatable
+        ]);
+        assert!(matches!(
+            p.validate_for(PropContext::Connect),
+            Err(CodecError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn subscription_identifier_repeats_only_on_publish() {
+        let two = Properties(vec![
+            Property::SubscriptionIdentifier(1),
+            Property::SubscriptionIdentifier(2),
+        ]);
+        // A PUBLISH may carry several (one per matching subscription).
+        assert!(two.validate_for(PropContext::Publish).is_ok());
+        // A SUBSCRIBE may carry at most one.
+        assert!(matches!(
+            two.validate_for(PropContext::Subscribe),
+            Err(CodecError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn decode_for_rejects_an_illegal_property_at_the_wire_boundary() {
+        // Encode a ReasonString-only block, then decode it as a CONNECT context.
+        let mut out = Vec::new();
+        Properties(vec![Property::ReasonString("x".into())])
+            .encode(&mut out)
+            .unwrap();
+        let mut r = Reader::new(Bytes::from(out));
+        assert!(matches!(
+            Properties::decode_for(&mut r, PropContext::Connect),
+            Err(CodecError::ProtocolViolation(_))
+        ));
     }
 
     #[test]

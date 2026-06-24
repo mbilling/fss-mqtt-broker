@@ -15,12 +15,12 @@
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
 | 0006 | Consensus & replication for durable sessions | Accepted | 10/11 done | 1 deferred |
 | 0007 | Wiring the durable cluster session store into the broker | Accepted | 7/9 done | 2 deferred |
-| 0008 | MQTT 5.0 codec | Accepted | 6/8 done | 2 deferred |
+| 0008 | MQTT 5.0 codec | Accepted | 8/8 done | — |
 | 0009 | MQTT 5.0 session & message expiry | Accepted | 2/3 done | 1 deferred |
 | 0010 | Shared subscriptions | Accepted | 6/8 done | 2 deferred |
-| 0011 | MQTT 5.0 topic aliases | Accepted | 5/7 done | 2 deferred |
-| 0012 | MQTT 5.0 flow control (Receive Maximum) | Accepted | 5/6 done | 1 deferred |
-| 0013 | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | 7/9 done | 2 deferred |
+| 0011 | MQTT 5.0 topic aliases | Accepted | 7/7 done | — |
+| 0012 | MQTT 5.0 flow control (Receive Maximum) | Accepted | 6/6 done | — |
+| 0013 | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | 8/9 done | 1 deferred |
 | 0014 | Cross-node retained-message replication | Accepted | 5/9 done | 4 deferred |
 | 0015 | Cluster-wide shared subscriptions | Accepted | 6/8 done | 2 deferred |
 | 0016 | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | 3/4 done | 1 open |
@@ -72,11 +72,6 @@
 - `0007-T8` 💤 deferred: Dynamic-reconfiguration hardening under rapid churn (flap -> ephemeral degrade) — v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
 - `0007-T9` 💤 deferred: Connection-driven next_packet_id over the durable store — store impls next_packet_id but conn.rs never calls it; outbound packet-id allocation stays hub-side, so the per-packet durable path is record_received/clear_received only
 
-**0008 — MQTT 5.0 codec**
-
-- `0008-T7` 💤 deferred: Codec-owned property validation (allowed-on-packet-type + duplicate non-repeatable -> Protocol Error) — properties.rs deliberately round-trips any well-formed block; per-packet allow-list and duplicate-rejection are not implemented and have no tests; enforcement currently lives above the wire
-- `0008-T8` 💤 deferred: Shared reason-code constants module (reason::SUCCESS, reason::NOT_AUTHORIZED, ...) — reason codes carried as bare u8 literals; no shared reason-constants module in mqtt-codec, only broker-local consts in conn.rs
-
 **0009 — MQTT 5.0 session & message expiry**
 
 - `0009-P3` 💤 deferred: Durable expiry deadline (persist disconnect time so takeover preserves the clock) — expiry deadline is in-memory only (hub expiring HashMap of Instant); SessionMeta snapshot has no disconnect-time field, so a takeover restarts the clock; documented §2 follow-up gated on workstream F
@@ -86,19 +81,9 @@
 - `0010-T7` 💤 deferred: Subscription-Identifier handling for shared subscriptions — ADR 0010 Consequences notes no Subscription-Identifier handling yet; out of scope for the routing lever
 - `0010-T8` 💤 deferred: Indexed shared-group selection (avoid per-publish member-list clone) — matching/snapshot clone matching groups' member lists per publish; small in practice, ADR 0010 flags indexed selection as a later optimization
 
-**0011 — MQTT 5.0 topic aliases**
-
-- `0011-T6` 💤 deferred: Configurable server Topic Alias Maximum — SERVER_TOPIC_ALIAS_MAX is a fixed constant (16) in conn.rs, not yet configurable (ADR 0011 §2 / Consequences); still holds
-- `0011-T7` 💤 deferred: Emit DISCONNECT 0x94 (Topic Alias Invalid) instead of bare close — invalid alias closes the connection rather than sending DISCONNECT 0x94; folded into the later act-on-v5-reason-codes work (ADR 0011 §2)
-
-**0012 — MQTT 5.0 flow control (Receive Maximum)**
-
-- `0012-T6` 💤 deferred: Strictly enforce client to server Receive Maximum (DISCONNECT 0x93 on overrun) — client to server direction is advertised but NOT strictly enforced; broker acks inbound promptly so it self-limits, DISCONNECT 0x93 folded into act-on-v5-reason-codes work (ADR 0012 §3); still holds
-
 **0013 — MQTT 5.0 enhanced authentication (AUTH exchange)**
 
 - `0013-T8` 💤 deferred: Server-initiated re-auth (server sends AUTH 0x19 to demand re-authentication) — ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs).
-- `0013-T9` 💤 deferred: Dedicated per-round AUTH-exchange timeout — the exchange blocks on the client between rounds with no dedicated timeout (same surface as existing pre-CONNACK reads); ADR Consequences flags this as a known limit.
 
 **0014 — Cross-node retained-message replication**
 

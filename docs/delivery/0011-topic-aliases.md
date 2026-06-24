@@ -30,12 +30,14 @@ tasks:
     evidence: aliases owned by connection task in conn.rs; InboundAliases::new(0) for non-v5 (inbound_with_zero_max_rejects_any_alias)
   - id: 0011-T6
     title: Configurable server Topic Alias Maximum
-    status: deferred
-    notes: SERVER_TOPIC_ALIAS_MAX is a fixed constant (16) in conn.rs, not yet configurable (ADR 0011 §2 / Consequences); still holds
+    status: done
+    date: 2026-06-24
+    evidence: "conn::WireLimits.topic_alias_max (was a hardcoded const), set once from MQTTD_TOPIC_ALIAS_MAX via main::wire_limits_from_env; negotiate_v5_properties advertises it."
   - id: 0011-T7
     title: Emit DISCONNECT 0x94 (Topic Alias Invalid) instead of bare close
-    status: deferred
-    notes: invalid alias closes the connection rather than sending DISCONNECT 0x94; folded into the later act-on-v5-reason-codes work (ADR 0011 §2)
+    status: done
+    date: 2026-06-24
+    evidence: "handle_publish sends DISCONNECT 0x94 (reason::TOPIC_ALIAS_INVALID) then closes on an out-of-range/unmapped alias, instead of a bare close. Test v5_invalid_topic_alias_disconnects_0x94."
 ---
 
 # Delivery — ADR 0011: MQTT 5.0 topic aliases
@@ -67,8 +69,8 @@ tasks. Each carries a stable id used by commits, tests, and the dashboard.
 | 0011-T3 | ✅ done | 2026-06-17 | topic_alias_zero_closes_connection / topic_alias_above_maximum_closes_connection / unmapped_topic_alias_reference_closes_connection |
 | 0011-T4 | ✅ done | 2026-06-17 | OutboundAliases::apply; v5_outbound_topic_alias_assigned_then_referenced; outbound_stops_assigning_when_full_but_keeps_existing |
 | 0011-T5 | ✅ done | 2026-06-17 | aliases owned by connection task in conn.rs; InboundAliases::new(0) for non-v5 (inbound_with_zero_max_rejects_any_alias) |
-| 0011-T6 | 💤 deferred | — | SERVER_TOPIC_ALIAS_MAX is a fixed constant (16) in conn.rs, not yet configurable (ADR 0011 §2 / Consequences); still holds |
-| 0011-T7 | 💤 deferred | — | invalid alias closes the connection rather than sending DISCONNECT 0x94; folded into the later act-on-v5-reason-codes work (ADR 0011 §2) |
+| 0011-T6 | ✅ done | 2026-06-24 | "conn::WireLimits.topic_alias_max (was a hardcoded const), set once from MQTTD_TOPIC_ALIAS_MAX via main::wire_limits_from_env; negotiate_v5_properties advertises it." |
+| 0011-T7 | ✅ done | 2026-06-24 | "handle_publish sends DISCONNECT 0x94 (reason::TOPIC_ALIAS_INVALID) then closes on an out-of-range/unmapped alias, instead of a bare close. Test v5_invalid_topic_alias_disconnects_0x94." |
 <!-- /status-table:0011 -->
 
 **Documented limits still in force:** the server's advertised Topic Alias Maximum is the
