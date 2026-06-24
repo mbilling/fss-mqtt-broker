@@ -86,12 +86,15 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 
 - **Durable, replicated session storage** ([ADR 0001](docs/adr/0001-session-durability.md),
   [0006](docs/adr/0006-consensus-and-replication.md),
-  [0007](docs/adr/0007-durable-store-integration.md)). Opt-in via
-  `MQTTD_DURABLE_SESSIONS`: an openraft lease group (per placement group, leader-
-  assigned) mints an epoch, and each persistent session's append-log is
-  quorum-replicated across its replica set, epoch-fenced against a stale owner. The
-  default remains the bounded in-memory store. Proven by a 3-node integration test
-  (an enqueue is quorum-durable across the real peer mesh).
+  [0007](docs/adr/0007-durable-store-integration.md)) — **on by default**
+  ([ADR 0029](docs/adr/0029-durable-by-default.md)). An openraft lease group (per placement
+  group, leader-assigned) mints an epoch, and each persistent session's append-log is
+  quorum-replicated across its replica set, epoch-fenced against a stale owner. Stable at
+  rest, under load, and through formation (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md)
+  / [0027](docs/adr/0027-replica-group-commit.md) /
+  [0028](docs/adr/0028-link-gated-voter-admission.md)). Opt out with
+  `MQTTD_DURABLE_SESSIONS=0` for the bounded in-memory store. Proven by a 3-node
+  integration test (an enqueue is quorum-durable across the real peer mesh).
 
 ### In progress / planned
 - **MQTT 5.0**: session/message expiry, topic aliases, flow control, shared
@@ -178,7 +181,8 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_NODE_ID` | This node's id (default `node-local`) |
 | `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`) |
 | `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
-| `MQTTD_DURABLE_SESSIONS` | `1`/`true`: durable, consensus-backed replicated session store (ADR 0006/0007); default in-memory. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
+| `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
+| `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); unset → in-memory |
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
 | `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
 | `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN |
@@ -246,24 +250,20 @@ MQTTD_HEALTH_BIND=0.0.0.0:8080 MQTTD_OTLP_ENDPOINT=http://localhost:4318 \
   cargo run --bin mqttd
 ```
 
-For a turnkey view of all of this, [`demo/`](demo/) brings up a **3-node cluster** with
-**Grafana + Prometheus + Alloy** and a provisioned dashboard covering every metric — both
-the Prometheus scrape and the OTLP push paths:
+For a turnkey view of all of this, [`demo/`](demo/) brings up a **3-node durable cluster**
+with **Grafana + Prometheus + Alloy** and a provisioned dashboard covering every metric —
+both the Prometheus scrape and the OTLP push paths:
 
 ```sh
 cd demo && docker compose up --build   # then http://localhost:3000
 ```
 
-The default cluster uses ephemeral (in-memory) sessions. To exercise the **durable** lease
-group and the `lease_*` / `durable_append_*` panels, overlay the opt-in durable override:
-
-```sh
-cd demo && docker compose -f docker-compose.yml -f durable.yml up --build
-```
-
-The durable lease group holds a stable leader at rest; under sustained load it can still
-show slow lease-epoch churn (session-log fsyncs contend with the lease raft), which is why
-durable is opt-in — see [ADR 0026](docs/adr/0026-lease-timing-durable-storage.md).
+The cluster runs **durable sessions by default** (ADR 0029), each node persisting its lease
+group and replicated session log to its own volume, so the `lease_*` / `durable_append_*`
+panels populate with a real leader. The durable group forms in ~90s and holds a flat term
+under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
+[0027](docs/adr/0027-replica-group-commit.md) /
+[0028](docs/adr/0028-link-gated-voter-admission.md)).
 
 ## Architecture decisions
 

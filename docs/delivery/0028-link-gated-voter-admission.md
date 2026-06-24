@@ -15,8 +15,9 @@ tasks:
     evidence: "Rebuilt durable demo under the loadgen: lease term settled at 8 within ~90s of bring-up and stayed flat for 20+ min (formation watch 8 min + sustained watch 15 min), zero restarts. Before the gate the same setup churned term 7 -> 71 over ~8 min (68 elections on one node) before settling. Formation churn eliminated."
   - id: 0028-T3
     title: Revisit the durable-default decision once formation is proven (broker + demo)
-    status: planned
-    notes: Gated on T2. The user wants durable as the default (broker + demo) but asked to fix formation first and keep it opt-in until proven.
+    status: done
+    date: 2026-06-24
+    evidence: "Formation proven clean (T2), so durable was made the default for the broker and demo — see ADR 0029 (docs/delivery/0029-durable-by-default.md)."
 ---
 
 # Delivery — ADR 0028: Link-gated lease-group voter admission
@@ -43,7 +44,7 @@ link readiness.
 |------|--------|------|------------------|
 | 0028-T1 | ✅ done | 2026-06-24 | "MeshRaftNetwork::is_connected exposes the peer registry; durable_node::admit_desired filters placement members to local OR current-voter OR connected, wired into run_driver. Unit tests admit_desired_admits_local_and_reachable_members_only, _keeps_a_current_voter_through_a_link_blip, _drops_a_member_evicted_from_placement. Full durable_sessions suite (7/7) still forms green." |
 | 0028-T2 | ✅ done | 2026-06-24 | "Rebuilt durable demo under the loadgen: lease term settled at 8 within ~90s of bring-up and stayed flat for 20+ min (formation watch 8 min + sustained watch 15 min), zero restarts. Before the gate the same setup churned term 7 -> 71 over ~8 min (68 elections on one node) before settling. Formation churn eliminated." |
-| 0028-T3 | ⬜ planned | — | Gated on T2. The user wants durable as the default (broker + demo) but asked to fix formation first and keep it opt-in until proven. |
+| 0028-T3 | ✅ done | 2026-06-24 | "Formation proven clean (T2), so durable was made the default for the broker and demo — see ADR 0029 (docs/delivery/0029-durable-by-default.md)." |
 <!-- /status-table:0028 -->
 
 ## Changelog

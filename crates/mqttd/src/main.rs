@@ -13,14 +13,16 @@
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
 //! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
 //! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
-//! - `MQTTD_DURABLE_SESSIONS` — `1`/`true` opts into the durable, consensus-backed
-//!   session store (ADR 0006/0007); persistent sessions replicate across the peer
-//!   mesh. Default-off (the in-memory store). A node with no `MQTTD_SWIM_SEEDS` is
-//!   the cluster founder that bootstraps the lease group (exactly one per cluster).
-//! - `MQTTD_DATA_DIR`        — directory for on-disk session persistence (ADR 0018).
-//!   When set (and `MQTTD_DURABLE_SESSIONS` is off), single-node sessions are stored in
-//!   `<dir>/sessions.redb` and survive a restart (not replicated). Default-off
-//!   (in-memory, lost on restart). Ignored when `MQTTD_DURABLE_SESSIONS` is on.
+//! - `MQTTD_DURABLE_SESSIONS` — the durable, consensus-backed session store
+//!   (ADR 0006/0007), replicating persistent sessions across the peer mesh, is the
+//!   **default** (ADR 0029). Opt out with `0`/`false`/`off`/`no` for the lightweight
+//!   in-memory store. A node with no `MQTTD_SWIM_SEEDS` is the cluster founder that
+//!   bootstraps the lease group (exactly one per cluster).
+//! - `MQTTD_DATA_DIR`        — directory for on-disk session persistence (ADR 0018),
+//!   orthogonal to durability. With durable on (the default) it makes the lease group
+//!   and replicated log on-disk, so sessions survive a full-cluster restart (the
+//!   recommended production setup). With durable opted out, it stores single-node
+//!   sessions in `<dir>/sessions.redb` (restart-safe, not replicated). Unset → in-memory.
 //! - `MQTTD_TLS_BIND`       — TLS client listener bind, e.g. `0.0.0.0:8883`
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
@@ -389,10 +391,10 @@ fn jwt_config_from_env() -> mqtt_auth::token::TokenConfig {
 /// and `MQTTD_QUEUE_OVERFLOW`. Bounded by default; an unparseable value is a
 /// startup error rather than a silent fallback.
 /// Build and spawn the routing hub with its session store, returning the command
-/// sender. By default the store is the bounded in-memory backend (ADR 0001 §6).
-/// `MQTTD_DURABLE_SESSIONS` opts into the **durable, consensus-backed** store
-/// (ADR 0006/0007): a lease group over the peer mesh replicates each persistent
-/// session's log. Opt-in and loudly logged, like every cluster feature.
+/// sender. The store is the **durable, consensus-backed** backend by default
+/// (ADR 0006/0007/0029): a lease group over the peer mesh replicates each persistent
+/// session's log. `MQTTD_DURABLE_SESSIONS=0|false|off|no` opts out to the bounded
+/// in-memory backend (ADR 0001 §6). The effective mode is loudly logged.
 type HubHandle = (
     mpsc::UnboundedSender<hub::HubCommand>,
     Arc<dyn SessionStore>,
@@ -401,6 +403,18 @@ type HubHandle = (
     // rather than leave it spinning against a shut-down raft (ADR 0019).
     Option<tokio::task::JoinHandle<()>>,
 );
+
+/// Whether durable sessions are enabled given the `MQTTD_DURABLE_SESSIONS` value
+/// (ADR 0029). Durable is the **default**: unset → on; `0`/`false`/`off`/`no`
+/// (case-insensitive) opts out to the in-memory store; anything else → on.
+fn durable_enabled(val: Option<&str>) -> bool {
+    val.is_none_or(|v| {
+        !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
 
 async fn start_hub(
     node_id: &NodeId,
@@ -412,8 +426,9 @@ async fn start_hub(
     if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
         mqtt_storage::data_dir::guard_data_dir(&dir, &node_id.0)?;
     }
-    let durable = non_empty_env("MQTTD_DURABLE_SESSIONS")
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // Durable is the **default** (ADR 0029): the consensus-backed replicated store is on
+    // unless explicitly opted out. `0/false/off/no` selects the lightweight in-memory store.
+    let durable = durable_enabled(non_empty_env("MQTTD_DURABLE_SESSIONS").as_deref());
     if durable {
         // A node started with no SWIM seeds is the cluster founder — only it
         // bootstraps the lease group (ADR 0007 §2). Exactly one founder per cluster.
@@ -1102,5 +1117,24 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::durable_enabled;
+
+    #[test]
+    fn durable_is_the_default_and_opts_out_explicitly() {
+        // Default (unset) → durable on (ADR 0029).
+        assert!(durable_enabled(None));
+        // Explicit falsey values opt out, case-insensitively.
+        for v in ["0", "false", "False", "FALSE", "off", "OFF", "no", "No"] {
+            assert!(!durable_enabled(Some(v)), "{v} should opt out");
+        }
+        // Truthy / anything-else stays on.
+        for v in ["1", "true", "TRUE", "on", "yes", "anything"] {
+            assert!(durable_enabled(Some(v)), "{v} should stay durable");
+        }
     }
 }

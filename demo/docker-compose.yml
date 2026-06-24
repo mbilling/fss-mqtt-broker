@@ -17,15 +17,12 @@ x-broker-env: &broker-env
                                        # deny-by-default, so anonymous clients (the loadgen)
                                        # must be explicitly permitted (ADR 0004)
   MQTTD_HEALTH_BIND: 0.0.0.0:8080      # serves /livez, /readyz, /metrics
-  # Ephemeral (in-memory) sessions by default — the SWIM-clustered default, robust under
-  # the loadgen. To exercise the durable lease group and the lease_* / durable_append_*
-  # panels, overlay the opt-in durable override:
-  #     docker compose -f docker-compose.yml -f durable.yml up --build
-  # ADR 0026 budgets the raft timing for fsync-on-commit latency, so the durable lease
-  # group now holds a **stable leader at rest**. Under sustained client load it can still
-  # show slow lease-epoch churn (session-log fsync contends with the lease raft) — being
-  # addressed by ADR 0026 T5 (coalescing raft writes) — which is why durable is opt-in,
-  # not the default.
+  # Durable (on-disk, consensus-backed) sessions — the default (ADR 0029). Each broker
+  # persists its lease group and replicated session log to its own /data volume (mounted
+  # per service below), so the lease_* / durable_append_* panels populate with a real,
+  # stable leader. The lease group forms in ~90s and holds a flat term under load
+  # (ADR 0026 timing, ADR 0027 replica group-commit, ADR 0028 link-gated voter admission).
+  MQTTD_DATA_DIR: /data
   MQTTD_OTLP_ENDPOINT: http://alloy:4318
   MQTTD_OTLP_INTERVAL: "5"
   MQTTD_READY_MIN_MEMBERS: "3"
@@ -44,6 +41,7 @@ services:
       MQTTD_PEER_BIND: mqttd-1:7001    # advertised to peers -> must be resolvable
       MQTTD_SWIM_BIND: mqttd-1:7946    # founder: no SWIM seeds
     ports: ["1883:1883", "8080:8080"]
+    volumes: ["d1:/data"]
     depends_on: [alloy]
 
   mqttd-2:
@@ -56,6 +54,7 @@ services:
       MQTTD_SWIM_BIND: mqttd-2:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["1884:1883", "8081:8080"]
+    volumes: ["d2:/data"]
     depends_on: [mqttd-1]
 
   mqttd-3:
@@ -68,6 +67,7 @@ services:
       MQTTD_SWIM_BIND: mqttd-3:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["1885:1883", "8082:8080"]
+    volumes: ["d3:/data"]
     depends_on: [mqttd-1]
 
   alloy:
@@ -111,3 +111,9 @@ services:
     volumes:
       - ./loadgen/loadgen.sh:/loadgen.sh:ro
     depends_on: [mqttd-1, mqttd-2, mqttd-3]
+
+# Per-node durable state (lease group + replicated session log); each broker gets its own.
+volumes:
+  d1:
+  d2:
+  d3:
