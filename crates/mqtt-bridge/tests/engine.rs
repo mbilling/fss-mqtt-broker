@@ -232,3 +232,125 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
     b1.shutdown();
     b2.shutdown();
 }
+
+/// ADR 0025-T10 (loop bounding): a `both` rule with no remap echoes between local and
+/// upstream — the classic loop. The hop-count limit must **terminate** it (a copy reaches
+/// the limit and is dropped) rather than amplify forever.
+#[tokio::test]
+async fn a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit() {
+    let local = start_broker().await;
+    let upstream = start_broker().await;
+
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        hop_count_limit = 3
+        share_group = ""
+        [local]
+        url = "{local}"
+        [[upstreams]]
+        name = "a"
+        url = "{upstream}"
+        [[upstreams.rules]]
+        direction = "both"
+        filter = "loop/#"
+        "#,
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    let metrics = bridge.metrics();
+
+    // Let both sides connect and subscribe (both directions of the `both` rule).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut local_pub = client(local, "loop-pub").await;
+    local_pub
+        .publish(
+            "loop/x",
+            Bytes::from_static(b"echo"),
+            QoS::AtMostOnce,
+            None,
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+
+    // The loop must self-terminate: a copy reaches the hop limit and is dropped.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while metrics.dropped_hop_limit_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the no-remap both-rule loop never hit the hop limit (did it amplify unbounded?)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    bridge.shutdown();
+}
+
+/// ADR 0025-T10 (multi-upstream): a local message matching an `out` rule on two upstreams is
+/// forwarded to both.
+#[tokio::test]
+async fn a_local_message_fans_out_to_multiple_upstreams() {
+    let local = start_broker().await;
+    let up1 = start_broker().await;
+    let up2 = start_broker().await;
+
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        [[upstreams]]
+        name = "one"
+        url = "{up1}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "fan/#"
+        [[upstreams]]
+        name = "two"
+        url = "{up2}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "fan/#"
+        "#,
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+
+    let mut sub1 = client(up1, "fan-sub-1").await;
+    subscribe(&mut sub1, "fan/#").await;
+    let mut sub2 = client(up2, "fan-sub-2").await;
+    subscribe(&mut sub2, "fan/#").await;
+
+    let mut local_pub = client(local, "fan-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (mut got1, mut got2) = (false, false);
+    while !(got1 && got2) {
+        local_pub
+            .publish(
+                "fan/x",
+                Bytes::from_static(b"fanout"),
+                QoS::AtMostOnce,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        if let Ok(Ok(Event::Publish(_))) =
+            tokio::time::timeout(Duration::from_millis(150), sub1.next_event()).await
+        {
+            got1 = true;
+        }
+        if let Ok(Ok(Event::Publish(_))) =
+            tokio::time::timeout(Duration::from_millis(150), sub2.next_event()).await
+        {
+            got2 = true;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a local message did not reach both upstreams (got1={got1}, got2={got2})"
+        );
+    }
+
+    bridge.shutdown();
+}

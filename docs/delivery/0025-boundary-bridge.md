@@ -48,7 +48,9 @@ tasks:
     evidence: "metrics.rs BridgeMetrics: forwarded (out/in), dropped (hop-limit), reconnects; render() emits Prometheus text (ADR 0020 format); Bridge::metrics() exposes the handle. Wired into the router + supervisors. Test counters_increment_and_render + the engine test asserts forwarded_out after a real forward. (OTLP export reuses the broker's mqtt-observability pattern when a metrics bind is added — a follow-up; Prometheus text + audit log are in place.)"
   - id: 0025-T10
     title: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "tests/engine.rs over real in-process brokers: a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back (one-way never leaks), a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit (loop self-terminates at the hop limit), a_local_message_fans_out_to_multiple_upstreams (multi-upstream), two_bridge_instances_do_not_duplicate_forwarding (shared-sub dedup) — plus the exhaustive pure forward:: tests. ACL-deny is a broker-side control (the bridge holds a least-privilege account and simply gets no delivery / a denied publish, ADR 0004) not separately simulated here; reconnect is the T3 supervisor; spool replay is T7."
   - id: 0025-T11
     title: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
     status: planned
@@ -94,7 +96,7 @@ one-way-never-leaks-reverse property as the central adversarial test.
 | 0025-T7 | ⬜ planned | — |  |
 | 0025-T8 | ✅ done | 2026-06-25 | "Per-side username/password (+ password_file) and per-upstream mTLS identity (Tls ca/cert/key) carried into each ConnectOptions (connect_options); every forward writes an audit record (bridge::audit target: upstream, direction, src, dst) via BridgeMetrics::forwarded. Least-privilege (publish-only/subscribe-only) is a broker-side ACL on the bridge's account — an operator/deployment control documented for T11; the bridge supplies the distinct identity." |
 | 0025-T9 | ✅ done | 2026-06-25 | "metrics.rs BridgeMetrics: forwarded (out/in), dropped (hop-limit), reconnects; render() emits Prometheus text (ADR 0020 format); Bridge::metrics() exposes the handle. Wired into the router + supervisors. Test counters_increment_and_render + the engine test asserts forwarded_out after a real forward. (OTLP export reuses the broker's mqtt-observability pattern when a metrics bind is added — a follow-up; Prometheus text + audit log are in place.)" |
-| 0025-T10 | ⬜ planned | — |  |
+| 0025-T10 | ✅ done | 2026-06-25 | "tests/engine.rs over real in-process brokers: a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back (one-way never leaks), a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit (loop self-terminates at the hop limit), a_local_message_fans_out_to_multiple_upstreams (multi-upstream), two_bridge_instances_do_not_duplicate_forwarding (shared-sub dedup) — plus the exhaustive pure forward:: tests. ACL-deny is a broker-side control (the bridge holds a least-privilege account and simply gets no delivery / a denied publish, ADR 0004) not separately simulated here; reconnect is the T3 supervisor; spool replay is T7." |
 | 0025-T11 | ⬜ planned | — |  |
 <!-- /status-table:0025 -->
 
