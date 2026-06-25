@@ -38,6 +38,7 @@
 | 0028 | Link-gated lease-group voter admission | Accepted | 3/3 done | — |
 | 0029 | Durable sessions by default | Accepted | 3/3 done | — |
 | 0030 | Forward MQTT 5 User Properties through delivery | Accepted | 5/5 done | — |
+| 0031 | Bind the session to the authenticated identity | Proposed | 0/6 done | 6 open |
 
 ## Open and deferred work
 
@@ -102,3 +103,12 @@
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
 - `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
+
+**0031 — Bind the session to the authenticated identity**
+
+- `0031-T1` ⬜ planned: Decide the mechanism (resume/takeover guard vs key namespacing) and the rotation/mismatch policy
+- `0031-T2` ⬜ planned: SessionMeta carries the owning identity (durable codec + cluster carry, backward-compatible)
+- `0031-T3` ⬜ planned: Attach guard — a persistent resume/takeover requires the connecting principal to match the session owner; mismatch is a reason-coded reject + audit
+- `0031-T4` ⬜ planned: Anonymous-principal handling (shared namespace under allow_anonymous, documented as insecure-by-toggle)
+- `0031-T5` ⬜ planned: Optional authorize_connect(identity, client_id) Authorizer hook + ACL syntax for id-namespacing policy
+- `0031-T6` ⬜ planned: Adversarial tests (a different principal never resumes/takes over another's session; same principal always can; cross-node; offline-queue inheritance blocked)
