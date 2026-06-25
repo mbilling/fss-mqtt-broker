@@ -31,7 +31,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
@@ -173,13 +173,18 @@ impl std::fmt::Debug for ProxyContext {
 /// ([`AuditSink`], ADR 0004 step 4), and — when clustered — how to relocate a
 /// persistent session to its owner ([`ProxyContext`], ADR 0005).
 pub struct ConnPolicy {
-    /// Authenticates the CONNECT credentials.
-    pub auth: Arc<dyn Authenticator>,
+    /// Authenticates the CONNECT credentials. Held behind a [`watch::Receiver`] so a
+    /// SIGHUP reload (ADR 0032) can swap the authenticator under live connections; each
+    /// CONNECT reads the **current** value ([`ConnPolicy::authenticator`]).
+    pub auth: watch::Receiver<Arc<dyn Authenticator>>,
     /// Optional MQTT 5.0 enhanced-authentication mechanism (ADR 0013): runs the
     /// SASL-style AUTH exchange when a CONNECT names its method. `None` disables it.
     pub enhanced: Option<Arc<dyn EnhancedAuthenticator>>,
-    /// Authorizes publish/subscribe topics.
-    pub authz: Arc<dyn Authorizer>,
+    /// Authorizes publish/subscribe topics. Held behind a [`watch::Receiver`] so a reload
+    /// reaches **live** connections — each publish/subscribe reads the current value
+    /// ([`ConnPolicy::authorizer`]), so a tightened ACL denies an already-subscribed
+    /// client's next operation (ADR 0032).
+    pub authz: watch::Receiver<Arc<dyn Authorizer>>,
     /// Records auth and authorization decisions.
     pub audit: Arc<dyn AuditSink>,
     /// Session relocation context; `None` outside a cluster (serve locally).
@@ -215,6 +220,34 @@ impl std::fmt::Debug for ConnPolicy {
     }
 }
 
+impl ConnPolicy {
+    /// The **current** authenticator — re-read on every CONNECT so a SIGHUP reload (ADR
+    /// 0032) takes effect without restarting.
+    #[must_use]
+    pub fn authenticator(&self) -> Arc<dyn Authenticator> {
+        self.auth.borrow().clone()
+    }
+    /// The **current** authorizer — re-read on every publish/subscribe so a reload reaches
+    /// live connections (ADR 0032).
+    #[must_use]
+    pub fn authorizer(&self) -> Arc<dyn Authorizer> {
+        self.authz.borrow().clone()
+    }
+}
+
+/// A read-only [`watch::Receiver`] around a fixed authenticator, for tests and
+/// non-reloadable callers (the sender is dropped; `borrow()` still returns the value).
+#[must_use]
+pub fn auth_handle(a: Arc<dyn Authenticator>) -> watch::Receiver<Arc<dyn Authenticator>> {
+    watch::channel(a).1
+}
+
+/// A read-only [`watch::Receiver`] around a fixed authorizer (see [`auth_handle`]).
+#[must_use]
+pub fn authz_handle(a: Arc<dyn Authorizer>) -> watch::Receiver<Arc<dyn Authorizer>> {
+    watch::channel(a).1
+}
+
 /// Drive one accepted plaintext TCP connection to completion, logging any error.
 ///
 /// Test-only convenience path: anonymous clients are permitted, no transport
@@ -223,10 +256,10 @@ impl std::fmt::Debug for ConnPolicy {
 pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     let peer = stream.peer_addr().ok();
     let policy = Arc::new(ConnPolicy {
-        auth: Arc::new(BasicAuthenticator {
+        auth: auth_handle(Arc::new(BasicAuthenticator {
             allow_anonymous: true,
-        }),
-        authz: Arc::new(AllowAll),
+        })),
+        authz: authz_handle(Arc::new(AllowAll)),
         audit: Arc::new(AuditLog::new()),
         proxy: None,
         store: None,
@@ -333,7 +366,7 @@ async fn will_rejected<W: AsyncWrite + Unpin>(
     let Some(w) = &connect.last_will else {
         return Ok(false);
     };
-    if policy.authz.authorize_publish(principal, &w.topic) {
+    if policy.authorizer().authorize_publish(principal, &w.topic) {
         return Ok(false);
     }
     warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
@@ -769,7 +802,7 @@ where
         Credentials::Token(_) => "token",
         Credentials::Anonymous => "anonymous",
     };
-    match policy.auth.authenticate(client, &creds) {
+    match policy.authenticator().authenticate(client, &creds) {
         Ok(id) => {
             // For a relocated session, attribute it to the node that vouched (ADR
             // 0005); a direct client has no `via`.
@@ -1288,7 +1321,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped but still
     // acknowledged — 3.1.1 has no negative PUBACK, and not acking would leave
     // conforming publishers retrying forever.
-    let authorized = policy.authz.authorize_publish(principal, &topic);
+    let authorized = policy.authorizer().authorize_publish(principal, &topic);
     if !authorized {
         debug!(client = %client.0, identity = %principal.subject, topic = %topic,
                "publish denied by ACL; dropping");
@@ -1427,7 +1460,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 if is_shared_filter(&f.path) && parse_shared(&f.path).is_none() {
                     debug!(client = %client.0, filter = %f.path, "malformed shared subscription");
                     return_codes.push(SUBACK_FAILURE);
-                } else if policy.authz.authorize_subscribe(principal, &f.path) {
+                } else if policy.authorizer().authorize_subscribe(principal, &f.path) {
                     granted.push((f.path.clone(), f.qos));
                     return_codes.push(f.qos as u8);
                 } else {
@@ -1469,7 +1502,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_stream, wire_limits, ConnPolicy, DEFAULT_CONNECT_TIMEOUT};
+    use super::{
+        auth_handle, authz_handle, handle_stream, wire_limits, ConnPolicy, DEFAULT_CONNECT_TIMEOUT,
+    };
     use crate::hub::{AttachOutcome, HubCommand, Outbound};
     use bytes::Bytes;
     use mqtt_auth::basic::BasicAuthenticator;
@@ -1495,10 +1530,10 @@ mod tests {
     /// gate (covered in tests/auth.rs, tests/acl.rs, and mqtt-auth's tests).
     fn permissive() -> Arc<ConnPolicy> {
         Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
-            }),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -1528,10 +1563,10 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
-            }),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -1640,10 +1675,10 @@ mod tests {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         stub_hub(hub_rx);
         let policy = Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
-            }),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -1691,10 +1726,10 @@ mod tests {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         stub_hub(hub_rx);
         let policy = Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: false,
-            }),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -1772,13 +1807,13 @@ mod tests {
         let mut secrets = std::collections::HashMap::new();
         secrets.insert("alice".to_string(), b"alice-secret".to_vec());
         let policy = Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
-            }),
+            })),
             enhanced: Some(Arc::new(mqtt_auth::HmacChallengeAuthenticator::new(
                 secrets,
             ))),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -2014,10 +2049,10 @@ mod tests {
     async fn proxied_session_records_the_relaying_node_in_the_audit() {
         let audit = Arc::new(mqtt_observability::RecordingAuditSink::new());
         let policy = Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
-            }),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: audit.clone(),
             proxy: None,
             store: None,
@@ -2665,10 +2700,10 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         let policy = Arc::new(ConnPolicy {
-            auth: Arc::new(BasicAuthenticator {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
                 allow_anonymous: true,
-            }),
-            authz: Arc::new(mqtt_auth::AllowAll),
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: Some(store),

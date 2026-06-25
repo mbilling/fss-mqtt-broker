@@ -125,8 +125,8 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                         allow_anonymous: true,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
-                        auth,
-                        authz: Arc::new(mqtt_auth::AllowAll),
+                        auth: mqttd::conn::auth_handle(auth),
+                        authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
@@ -501,8 +501,8 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
                         allow_anonymous: false,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
-                        auth,
-                        authz: Arc::new(mqtt_auth::AllowAll),
+                        auth: mqttd::conn::auth_handle(auth),
+                        authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
@@ -590,8 +590,8 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
                         allow_anonymous: false,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
-                        auth,
-                        authz: Arc::new(mqtt_auth::AllowAll),
+                        auth: mqttd::conn::auth_handle(auth),
+                        authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,

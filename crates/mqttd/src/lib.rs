@@ -11,5 +11,6 @@ pub mod conn;
 pub mod health;
 pub mod hub;
 pub mod peer;
+pub mod reload;
 
 pub use hub::{Hub, HubCommand};

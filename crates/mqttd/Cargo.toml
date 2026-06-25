@@ -31,6 +31,9 @@ tokio-rustls.workspace = true
 [dev-dependencies]
 # fault-injecting SessionStore double for the durable-attach readiness tests (ADR 0017)
 async-trait = "0.1"
+# Argon2id PHC hashing to forge rotated password files in the auth hot-reload test
+# (ADR 0032 T5). Already in the tree via mqtt-auth — not a new supply-chain crate.
+argon2.workspace = true
 rcgen.workspace = true
 ring = { workspace = true }
 rustls.workspace = true

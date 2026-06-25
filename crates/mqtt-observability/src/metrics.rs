@@ -56,6 +56,12 @@ struct StateLabel {
     state: String,
 }
 
+/// `{outcome}` label — a bounded set for hot reloads: `ok`, `rejected`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct OutcomeLabel {
+    outcome: String,
+}
+
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
 /// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
 /// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
@@ -80,6 +86,7 @@ struct OtelInstruments {
     durable_append_latency: OtelHistogram<f64>,
     durable_append_failures: OtelCounter<u64>,
     gossip_rejected: OtelCounter<u64>,
+    security_reloads: OtelCounter<u64>,
 }
 
 impl OtelInstruments {
@@ -109,6 +116,7 @@ impl OtelInstruments {
                 .build(),
             durable_append_failures: meter.u64_counter("durable_append_failures").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
+            security_reloads: meter.u64_counter("security_reloads").build(),
         }
     }
 }
@@ -149,6 +157,7 @@ pub struct Metrics {
     durable_append_latency_seconds: Histogram,
     durable_append_failures_total: Family<ReasonLabel, Counter>,
     gossip_rejected_total: Family<ReasonLabel, Counter>,
+    security_reloads_total: Family<OutcomeLabel, Counter>,
 }
 
 impl Metrics {
@@ -293,6 +302,11 @@ impl Metrics {
             "gossip_rejected",
             "SWIM gossip datagrams dropped, by reason (auth, decode, identity, replay)",
         );
+        let security_reloads_total = register_family(
+            &mut registry,
+            "security_reloads",
+            "Hot reloads of the security policy, by outcome (ok, rejected)",
+        );
 
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
@@ -326,6 +340,7 @@ impl Metrics {
             durable_append_latency_seconds,
             durable_append_failures_total,
             gossip_rejected_total,
+            security_reloads_total,
         }
     }
 
@@ -516,6 +531,19 @@ impl Metrics {
         self.otel
             .gossip_rejected
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// A hot reload of the security policy completed with `outcome` (`"ok"` for an applied
+    /// swap, `"rejected"` for a validate-before-swap failure that kept the running policy).
+    pub fn security_reload(&self, outcome: &str) {
+        self.security_reloads_total
+            .get_or_create(&OutcomeLabel {
+                outcome: outcome.to_string(),
+            })
+            .inc();
+        self.otel
+            .security_reloads
+            .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
     }
 
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;

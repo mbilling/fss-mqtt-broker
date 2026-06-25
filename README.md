@@ -59,6 +59,12 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 - **Authorization**: deny-by-default TOML topic ACLs with `%i` identity
   substitution and asymmetric allow-covers / deny-overlaps semantics so a narrow
   grant can't widen and a broad subscription can't tunnel past a deny.
+- **Hot-reloadable security policy**: `SIGHUP` re-reads the ACL, the
+  authenticator chain, and the TLS cert/key/client-CA and swaps them on **live**
+  connections — no restart, no dropped sessions. The reload is **validate-before-swap**:
+  a missing or unparseable file is rejected and the running policy is kept intact
+  (never fail open, never brick); every reload is audited and metered
+  ([ADR 0032](docs/adr/0032-hot-reloadable-security-policy.md)).
 - **Tamper-evident audit log**: a hash-chained record of auth and authorization
   decisions (no credential ever reaches it).
 - **Secure by default**: plaintext listeners, anonymous access, an unkeyed
@@ -231,11 +237,37 @@ plain HTTP (no framework — a minimal hand-rolled server):
   node is pulled from the Service during a rolling restart or a transient lease blip
   *without* being killed. Body example: `{"status":"ok","live":true,"ready":true,"members":3,"lease_group_ready":true}`.
 
+### Hot reload (SIGHUP)
+
+Send `SIGHUP` to rotate the security policy **without a restart** and **without dropping
+connections** (ADR 0032):
+
+```sh
+kill -HUP "$(pidof mqttd)"   # re-read ACL, authenticators, and TLS cert/key/client-CA
+```
+
+The broker re-reads the configured files in place and swaps them on **live** connections:
+
+- **ACL** (`MQTTD_ACL_FILE`) — a tightened rule denies an *already-connected* client's next
+  publish/subscribe; a loosened rule takes effect immediately.
+- **Authenticators** (`MQTTD_PASSWORD_FILE`, `MQTTD_JWT_*`) — a rotated password file or JWT
+  key authenticates the new credential and rejects the old on the next CONNECT.
+- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA`) — a renewed certificate is
+  served on the next handshake; **in-flight TLS sessions are undisturbed**.
+
+The reload is **validate-before-swap and all-or-nothing**: every file is parsed first, and
+the swap is applied only if *all* succeed. A missing or unparseable file is **rejected** —
+the running policy is kept exactly as it was (the broker never fails open and never bricks
+itself on a typo). Every reload, success or rejection, emits a `security.reload` audit event
+and increments the `mqttd_security_reloads_total{outcome}` metric. To rotate paths (not just
+file contents) restart the broker. On non-Unix platforms `SIGHUP` is unavailable, so reload
+requires a restart. *(Cert revocation/CRL and peer-bus TLS reload are tracked follow-ons.)*
+
 ### Metrics
 
 The broker exports Prometheus-style metrics (connections, publish/deliver, sessions,
 retained, cluster membership, lease role/epoch, durable-append latency/failures, gossip
-rejects) with bounded label sets — no per-client or per-topic labels. Two ways to consume
+rejects, security reloads) with bounded label sets — no per-client or per-topic labels. Two ways to consume
 them, both from the one registry (ADR 0020):
 
 - **Prometheus (pull)** — `GET /metrics` on the health server (`MQTTD_HEALTH_BIND`), or on a

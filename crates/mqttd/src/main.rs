@@ -94,12 +94,12 @@ use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_config::Config;
 use mqtt_net::tls;
-use mqtt_observability::AuditLog;
+use mqtt_observability::{AuditLog, AuditSink};
 use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::persistent_log::PersistentLog;
 use mqtt_storage::persistent_retained::PersistentRetainedStore;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
-use mqttd::{cluster, conn, hub, peer};
+use mqttd::{cluster, conn, hub, peer, reload};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -189,7 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let policy = client_policy_from_env(Some(proxy), store, shutdown.clone(), metrics.clone())?;
+    let (policy, mut reloader) =
+        client_policy_from_env(Some(proxy), store, shutdown.clone(), metrics.clone())?;
 
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
@@ -233,8 +234,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
-    // local-testing escape hatch. The serve loops stop themselves on `shutdown`.
-    start_client_listeners(hub_tx, policy, &shutdown, &connections).await?;
+    // local-testing escape hatch. The serve loops stop themselves on `shutdown`. The TLS
+    // branch registers its acceptor with the reloader so SIGHUP also rotates cert/key/CA.
+    start_client_listeners(hub_tx, policy, &mut reloader, &shutdown, &connections).await?;
+
+    // SIGHUP reloads the security policy (ACL + authenticator + TLS material) in place
+    // (ADR 0032) — no restart, no dropped connections; a bad file keeps the running policy.
+    spawn_reload_handler(reloader);
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
     graceful_shutdown(
@@ -257,6 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn start_client_listeners(
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
+    reloader: &mut reload::Reloader,
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -269,16 +276,27 @@ async fn start_client_listeners(
             return Err("MQTTD_TLS_BIND requires MQTTD_TLS_CERT and MQTTD_TLS_KEY".into());
         };
         let client_ca = non_empty_env("MQTTD_TLS_CLIENT_CA");
+        let mtls = client_ca.is_some();
         let acceptor = tls::server_acceptor(
             Path::new(&cert),
             Path::new(&key),
             client_ca.as_deref().map(Path::new),
         )?;
+        // Register the acceptor for SIGHUP reload: the closure re-reads the same paths so a
+        // renewed cert/key/client-CA is served on the next handshake (ADR 0032 T6).
+        let acceptor_rx = reloader.attach_tls(acceptor, move || {
+            tls::server_acceptor(
+                Path::new(&cert),
+                Path::new(&key),
+                client_ca.as_deref().map(Path::new),
+            )
+            .map_err(|e| e.to_string())
+        });
         let listener = TcpListener::bind(&bind).await?;
-        info!(%bind, mtls = client_ca.is_some(), "accepting MQTT 3.1.1 clients over TLS 1.3");
+        info!(%bind, mtls, "accepting MQTT 3.1.1 clients over TLS 1.3");
         tokio::spawn(serve_tls_clients(
             listener,
-            acceptor,
+            acceptor_rx,
             hub_tx.clone(),
             policy.clone(),
             shutdown.clone(),
@@ -317,36 +335,77 @@ fn client_policy_from_env(
     store: Arc<dyn SessionStore>,
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
-) -> Result<Arc<conn::ConnPolicy>, Box<dyn std::error::Error>> {
-    let auth = authenticator_from_env()?;
-
-    // A TOML ACL file gives deny-by-default per-identity topic policy; without
-    // one, authorization is not enforced — loudly.
-    let authz: Arc<dyn Authorizer> = if let Some(path) = non_empty_env("MQTTD_ACL_FILE") {
-        let text = std::fs::read_to_string(&path)?;
-        let policy = mqtt_auth::acl::AclPolicy::from_toml_str(&text)?;
-        info!(%path, "topic ACL policy loaded (deny by default)");
-        Arc::new(policy)
-    } else {
-        warn!(
-            "INSECURE: no MQTTD_ACL_FILE configured — topic authorization is \
-             NOT enforced (every authenticated client may publish/subscribe \
-             anywhere)"
-        );
-        Arc::new(mqtt_auth::AllowAll)
+) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
+    let audit: Arc<dyn AuditSink> = Arc::new(AuditLog::new());
+    // Build the initial policy, and a closure that re-reads the configured files on reload
+    // (ADR 0032). The closure returns the freshly-built (authorizer, authenticator) or an
+    // error string that aborts the swap — validate-before-swap lives in `reload::Reloader`.
+    let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) =
+        (authorizer_from_env()?, authenticator_from_env()?);
+    let build = || -> reload::BuildResult {
+        let authz = authorizer_from_env().map_err(|e| e.to_string())?;
+        let auth = authenticator_from_env().map_err(|e| e.to_string())?;
+        Ok((authz, auth))
     };
+    let (reloader, handles) =
+        reload::Reloader::with_metrics(initial, audit.clone(), Some(metrics.clone()), build);
 
-    Ok(Arc::new(conn::ConnPolicy {
-        auth,
-        authz,
-        audit: Arc::new(AuditLog::new()),
+    let policy = Arc::new(conn::ConnPolicy {
+        auth: handles.auth,
+        authz: handles.authz,
+        audit,
         proxy,
         store: Some(store),
         connect_timeout: conn::DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
         shutdown: Some(shutdown),
         metrics: Some(metrics),
-    }))
+    });
+    Ok((policy, reloader))
+}
+
+/// Build the topic authorizer (ADR 0004 step 3): a TOML ACL file gives deny-by-default
+/// per-identity topic policy; without one, authorization is not enforced — loudly. Reads
+/// the file fresh each call, so it is reusable at startup *and* on a SIGHUP reload (ADR 0032).
+fn authorizer_from_env() -> Result<Arc<dyn Authorizer>, Box<dyn std::error::Error>> {
+    if let Some(path) = non_empty_env("MQTTD_ACL_FILE") {
+        let text = std::fs::read_to_string(&path)?;
+        let policy = mqtt_auth::acl::AclPolicy::from_toml_str(&text)?;
+        info!(%path, "topic ACL policy loaded (deny by default)");
+        Ok(Arc::new(policy))
+    } else {
+        warn!(
+            "INSECURE: no MQTTD_ACL_FILE configured — topic authorization is \
+             NOT enforced (every authenticated client may publish/subscribe \
+             anywhere)"
+        );
+        Ok(Arc::new(mqtt_auth::AllowAll))
+    }
+}
+
+/// Install the SIGHUP handler that drives [`reload::Reloader::reload`] for the process
+/// lifetime (ADR 0032). Non-Unix has no SIGHUP, so reload is unavailable there (logged).
+#[cfg(unix)]
+fn spawn_reload_handler(reloader: reload::Reloader) {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "cannot install SIGHUP handler; security reload disabled");
+                return;
+            }
+        };
+        while hup.recv().await.is_some() {
+            info!("SIGHUP received — reloading security policy");
+            reloader.reload();
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_handler(_reloader: reload::Reloader) {
+    warn!("security policy reload (SIGHUP) is unavailable on this platform");
 }
 
 /// Build the CONNECT authenticator (ADR 0004 steps 2 + 6): a certificate /
@@ -983,7 +1042,7 @@ async fn start_swim_from_env(
 /// a slow handshake cannot stall other clients), then normal MQTT handling.
 async fn serve_tls_clients(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1008,7 +1067,9 @@ async fn serve_tls_clients(
         if let Some(m) = &policy.metrics {
             m.connection_accepted("tls");
         }
-        let acceptor = acceptor.clone();
+        // Read the *current* acceptor per accept, so a SIGHUP cert/key/CA reload is served
+        // on the next handshake (ADR 0032 T6); in-flight TLS sessions are undisturbed.
+        let acceptor = acceptor_rx.borrow().clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
         connections.spawn(async move {
