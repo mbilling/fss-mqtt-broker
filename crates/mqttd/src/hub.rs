@@ -71,6 +71,12 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// it runs at a coarse cadence rather than every second.
 const EXPIRY_RECONCILE_EVERY: u32 = 30;
 
+/// How many outbound packet ids are durably reserved per block (ADR 0007 T9). One durable
+/// write covers this many `QoS` > 0 sends to a session, so the per-message path stays
+/// write-free; a takeover wastes at most this many ids (negligible against the 65535 space,
+/// and the counter simply wraps).
+const PKID_BLOCK: u16 = 1024;
+
 /// MQTT 5.0 Session Expiry Interval meaning "never expire" (0xFFFFFFFF). v3.1.1
 /// `clean_session=0` maps to this.
 const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
@@ -172,7 +178,12 @@ struct Backlog {
 /// sessions can resume their in-flight messages (redelivered with `DUP`).
 #[derive(Debug)]
 struct Inflight {
+    /// The packet-id allocation cursor — the last id handed out. Seeded from the durable
+    /// block reservation (ADR 0007 T9), so a fresh `Inflight` on a new owner resumes past
+    /// the prior owner's reserved ids rather than restarting at 1.
     next_pkid: u16,
+    /// Ids left in the current durable reservation before the next block must be reserved.
+    block_remaining: u16,
     pending: BTreeMap<u16, PendingOut>,
     /// The client's MQTT 5.0 Receive Maximum: the most `QoS` > 0 publishes we may
     /// have unacked to it at once (ADR 0012).
@@ -185,6 +196,7 @@ impl Default for Inflight {
     fn default() -> Self {
         Self {
             next_pkid: 0,
+            block_remaining: 0,
             pending: BTreeMap::new(),
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
             backlog: VecDeque::new(),
@@ -193,19 +205,6 @@ impl Default for Inflight {
 }
 
 impl Inflight {
-    /// Allocate the next free packet id (1..=65535, skipping ids in flight).
-    fn alloc_pkid(&mut self) -> u16 {
-        loop {
-            self.next_pkid = self.next_pkid.wrapping_add(1);
-            if self.next_pkid == 0 {
-                self.next_pkid = 1;
-            }
-            if !self.pending.contains_key(&self.next_pkid) {
-                return self.next_pkid;
-            }
-        }
-    }
-
     /// Whether the `QoS` > 0 in-flight quota is exhausted (ADR 0012).
     fn quota_full(&self) -> bool {
         self.pending.len() >= self.receive_maximum as usize
@@ -726,9 +725,9 @@ impl Hub {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
                 }
             }
-            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid),
+            HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
-            HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid),
+            HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid).await,
             HubCommand::Detach {
                 client,
                 conn_id,
@@ -1078,9 +1077,13 @@ impl Hub {
                                 &qm.message,
                                 false,
                                 Some(remaining),
-                            );
+                            )
+                            .await;
                         }
-                        None => self.send_to_client(&client, &outbound, &qm.message, false, None),
+                        None => {
+                            self.send_to_client(&client, &outbound, &qm.message, false, None)
+                                .await;
+                        }
                     }
                 }
                 if last > 0 {
@@ -1124,7 +1127,7 @@ impl Hub {
 
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             for m in replay {
-                self.send_to_client(client, &tx, &m, true, None);
+                self.send_to_client(client, &tx, &m, true, None).await;
             }
         }
     }
@@ -1201,7 +1204,8 @@ impl Hub {
             retain: false,
         };
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
-            self.send_to_client(client, &tx, &message, false, message_expiry);
+            self.send_to_client(client, &tx, &message, false, message_expiry)
+                .await;
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
             }
@@ -1367,7 +1371,7 @@ impl Hub {
     /// Send one message to an online client at its (already downgraded) `QoS`,
     /// registering `QoS` > 0 deliveries in the in-flight table. `message_expiry` is
     /// the MQTT 5.0 Message Expiry Interval to forward (the remaining seconds), if any.
-    fn send_to_client(
+    async fn send_to_client(
         &mut self,
         client: &ClientId,
         tx: &Outbound,
@@ -1406,14 +1410,59 @@ impl Hub {
                       "flow-control backlog full: evicted oldest message");
             }
         } else {
-            self.send_qos_publish(client, tx, message, retain, message_expiry);
+            self.send_qos_publish(client, tx, message, retain, message_expiry)
+                .await;
         }
     }
 
     /// Put one `QoS` > 0 message on the wire: allocate a packet id, register it in the
     /// in-flight table, and send. The caller has already confirmed quota is available
     /// (ADR 0012).
-    fn send_qos_publish(
+    /// Allocate an outbound packet id for `client` (1..=65535, never 0, skipping ids still
+    /// in flight). Ids come from a durably-reserved block (ADR 0007 T9): when the block is
+    /// spent, the next block is reserved with one store write that advances the persisted
+    /// high-water, so a takeover resumes past it. A reservation failure (or a non-durable /
+    /// clean session, which returns base 0) degrades to a free-running in-memory counter
+    /// rather than blocking delivery.
+    async fn alloc_pkid(&mut self, client: &ClientId) -> u16 {
+        loop {
+            let spent = self
+                .inflight
+                .get(client)
+                .is_none_or(|i| i.block_remaining == 0);
+            if spent {
+                match self.store.reserve_packet_ids(client, PKID_BLOCK).await {
+                    // base = persisted high-water before the reservation; resume from it.
+                    Ok(base) if base != 0 => {
+                        let inf = self.inflight.entry(client.clone()).or_default();
+                        inf.next_pkid = base;
+                    }
+                    // No durable session (clean / non-durable store) or a failed reserve:
+                    // keep the in-memory cursor and just refill the local block.
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!(client = %client.0, error = %e, "packet-id reservation failed; in-memory fallback");
+                    }
+                }
+                self.inflight
+                    .entry(client.clone())
+                    .or_default()
+                    .block_remaining = PKID_BLOCK;
+            }
+            let inf = self.inflight.entry(client.clone()).or_default();
+            inf.next_pkid = inf.next_pkid.wrapping_add(1);
+            if inf.next_pkid == 0 {
+                inf.next_pkid = 1; // packet id 0 is invalid
+            }
+            inf.block_remaining = inf.block_remaining.saturating_sub(1);
+            let id = inf.next_pkid;
+            if !inf.pending.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    async fn send_qos_publish(
         &mut self,
         client: &ClientId,
         tx: &Outbound,
@@ -1421,8 +1470,8 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
     ) {
+        let pkid = self.alloc_pkid(client).await;
         let inf = self.inflight.entry(client.clone()).or_default();
-        let pkid = inf.alloc_pkid();
         let state = if message.qos == QoS::AtLeastOnce {
             OutState::AwaitingPubAck
         } else {
@@ -1448,7 +1497,7 @@ impl Hub {
 
     /// Drain backlogged `QoS` > 0 messages onto the wire while the client is online and
     /// quota is available (ADR 0012). Called after a PUBACK/PUBCOMP frees a slot.
-    fn drain_backlog(&mut self, client: &ClientId) {
+    async fn drain_backlog(&mut self, client: &ClientId) {
         let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) else {
             return;
         };
@@ -1466,12 +1515,13 @@ impl Hub {
                 &entry.message,
                 entry.retain,
                 entry.message_expiry,
-            );
+            )
+            .await;
         }
     }
 
     /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012).
-    fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
+    async fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.inflight.get_mut(client).is_some_and(|inf| {
             if inf
                 .pending
@@ -1485,7 +1535,7 @@ impl Hub {
             }
         });
         if completed {
-            self.drain_backlog(client);
+            self.drain_backlog(client).await;
         }
     }
 
@@ -1509,7 +1559,7 @@ impl Hub {
     }
 
     /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012).
-    fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
+    async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.inflight.get_mut(client).is_some_and(|inf| {
             if inf
                 .pending
@@ -1523,7 +1573,7 @@ impl Hub {
             }
         });
         if completed {
-            self.drain_backlog(client);
+            self.drain_backlog(client).await;
         }
     }
 
@@ -3307,6 +3357,33 @@ mod tests {
         assert!(
             store.subscriptions(&client).await.unwrap().is_empty(),
             "the durable session was removed"
+        );
+    }
+
+    /// ADR 0007 T9: a new owner allocates outbound packet ids **past** the durable
+    /// high-water it inherited, instead of restarting at 1 and risking reuse of an id the
+    /// client still considers in flight from the prior owner.
+    #[tokio::test]
+    async fn outbound_packet_ids_resume_past_the_durable_high_water() {
+        use std::sync::Arc;
+        // A durable store where a prior owner already reserved ids up to 5000 for a
+        // persistent subscriber.
+        let store: Arc<dyn mqtt_storage::SessionStore> = Arc::new(MemorySessionStore::new());
+        let sub = ClientId("sub".into());
+        store.ensure_session(&sub).await.unwrap();
+        store.reserve_packet_ids(&sub, 5000).await.unwrap();
+
+        // A fresh hub (the takeover owner) over that store; the subscriber resumes.
+        let tx = start_hub_with_arc(store);
+        let (mut rx, _) = attach_v5(&tx, "sub", 1, false, 100).await;
+        subscribe_qos(&tx, "sub", "t", QoS::AtLeastOnce);
+
+        // The first QoS 1 delivery's packet id is past the inherited high-water, not 1.
+        publish_qos1(&tx, "t", b"m");
+        let pkid = pkid_of(&recv_packet(&mut rx).await.unwrap());
+        assert!(
+            pkid > 5000,
+            "packet id {pkid} resumed past the inherited high-water"
         );
     }
 

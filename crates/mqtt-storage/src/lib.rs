@@ -225,6 +225,25 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// a failover.
     async fn next_packet_id(&self, client: &ClientId) -> Result<u16, StorageError>;
 
+    /// Durably reserve a **block** of `count` outbound packet ids in one write, returning
+    /// the base (the high-water *before* the reservation): the reserved ids are
+    /// `base+1 ..= base+count` (mod 2¹⁶). The caller hands them out from memory and reserves
+    /// the next block when the current one is spent — so a new owner, after a takeover,
+    /// resumes past the prior owner's reserved high-water instead of restarting from 1 and
+    /// colliding with a still-unacked id (ADR 0007 T9). Block reservation keeps the durable
+    /// write off the per-message hot path.
+    ///
+    /// Reserves **only against an existing (persistent) session** — a `None` metadata record
+    /// returns base `0` (in-memory allocation), so a clean session never materialises durable
+    /// state. Default: `0` (non-durable stores / stubs).
+    async fn reserve_packet_ids(
+        &self,
+        _client: &ClientId,
+        _count: u16,
+    ) -> Result<u16, StorageError> {
+        Ok(0)
+    }
+
     /// Remove the session and its queue entirely (clean start / session expiry).
     async fn remove(&self, client: &ClientId) -> Result<(), StorageError>;
 
@@ -485,6 +504,17 @@ impl SessionStore for MemorySessionStore {
             .iter()
             .filter_map(|(c, e)| e.session_expiry_at.map(|d| (c.clone(), d)))
             .collect())
+    }
+
+    async fn reserve_packet_ids(&self, client: &ClientId, count: u16) -> Result<u16, StorageError> {
+        // Only an existing session reserves; a missing one gets base 0 (in-memory).
+        let mut map = self.lock();
+        let Some(entry) = map.get_mut(client) else {
+            return Ok(0);
+        };
+        let base = entry.last_packet_id;
+        entry.last_packet_id = base.wrapping_add(count);
+        Ok(base)
     }
 }
 

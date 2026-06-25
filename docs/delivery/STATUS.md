@@ -14,7 +14,7 @@
 | 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
 | 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
 | 0006 | Consensus & replication for durable sessions | Accepted | 11/11 done | — |
-| 0007 | Wiring the durable cluster session store into the broker | Accepted | 7/9 done | 2 deferred |
+| 0007 | Wiring the durable cluster session store into the broker | Accepted | 8/9 done | 1 deferred |
 | 0008 | MQTT 5.0 codec | Accepted | 8/8 done | — |
 | 0009 | MQTT 5.0 session & message expiry | Accepted | 3/3 done | — |
 | 0010 | Shared subscriptions | Accepted | 7/8 done | 1 deferred |
@@ -65,7 +65,6 @@
 **0007 — Wiring the durable cluster session store into the broker**
 
 - `0007-T8` 💤 deferred: Dynamic-reconfiguration hardening under rapid churn (flap -> ephemeral degrade) — v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
-- `0007-T9` 💤 deferred: Connection-driven next_packet_id over the durable store — store impls next_packet_id but conn.rs never calls it; outbound packet-id allocation stays hub-side, so the per-packet durable path is record_received/clear_received only
 
 **0010 — Shared subscriptions**
 

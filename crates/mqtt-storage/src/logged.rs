@@ -299,6 +299,19 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         }
         Ok(out)
     }
+
+    async fn reserve_packet_ids(&self, client: &ClientId, count: u16) -> Result<u16, StorageError> {
+        // Reserve only against an existing (persistent) session, so a clean session never
+        // materialises durable metadata. One snapshot write advances the high-water by a
+        // whole block (ADR 0007 T9).
+        let Some(mut meta) = self.load_meta(client).await? else {
+            return Ok(0);
+        };
+        let base = meta.last_packet_id;
+        meta.last_packet_id = base.wrapping_add(count);
+        self.store_meta(client, &meta).await?;
+        Ok(base)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +840,33 @@ mod tests {
         // Clearing it (e.g. on reconnect) removes it from the expiring set.
         owner.set_session_expiry(&c, None).await.unwrap();
         assert!(owner.expiring_sessions().await.unwrap().is_empty());
+    }
+
+    /// ADR 0007 T9: reserving a block advances the durable packet-id high-water; a fresh
+    /// store over the same log (a new owner after takeover) resumes **past** it rather than
+    /// restarting — and a non-persistent session reserves nothing (base 0 = in-memory).
+    #[tokio::test]
+    async fn reserve_packet_ids_advances_a_durable_high_water() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let s = ReplicatedSessionStore::new(log.clone());
+        let c = cid("c");
+
+        // No persistent session yet → base 0 (caller falls back to in-memory allocation).
+        assert_eq!(s.reserve_packet_ids(&c, 1024).await.unwrap(), 0);
+
+        s.ensure_session(&c).await.unwrap();
+        // Successive blocks return the prior high-water and advance it.
+        assert_eq!(s.reserve_packet_ids(&c, 1024).await.unwrap(), 0);
+        assert_eq!(s.reserve_packet_ids(&c, 1024).await.unwrap(), 1024);
+
+        // A fresh store over the same log (the takeover owner) continues from there.
+        let owner = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(owner.reserve_packet_ids(&c, 1024).await.unwrap(), 2048);
+        // The reservation rode on the metadata snapshot, leaving subscriptions intact.
+        s.set_subscriptions(&c, &[sub("a", QoS::AtMostOnce, false)])
+            .await
+            .unwrap();
+        assert_eq!(owner.reserve_packet_ids(&c, 1).await.unwrap(), 3072);
     }
 
     /// A metadata record written before the expiry field existed (the original 3-field

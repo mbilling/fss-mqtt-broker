@@ -44,8 +44,9 @@ tasks:
     notes: v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
   - id: 0007-T9
     title: Connection-driven next_packet_id over the durable store
-    status: deferred
-    notes: store impls next_packet_id but conn.rs never calls it; outbound packet-id allocation stays hub-side, so the per-packet durable path is record_received/clear_received only
+    status: done
+    date: 2026-06-25
+    evidence: "SessionStore::reserve_packet_ids reserves a block of outbound packet ids in one durable snapshot write (advancing last_packet_id; only against an existing/persistent session, so clean sessions don't materialise metadata). The hub's per-session cursor (Inflight.next_pkid/block_remaining) is seeded from each block and refills via PKID_BLOCK=1024 reservations, so the per-message path is write-free; a fresh Inflight on a takeover owner reserves from the durable high-water and resumes past it. Tests reserve_packet_ids_advances_a_durable_high_water (storage) and outbound_packet_ids_resume_past_the_durable_high_water (hub); full workspace green after the send-path async ripple."
 ---
 
 # Delivery — ADR 0007: Wiring the durable cluster session store into the broker
@@ -83,7 +84,7 @@ independently shippable and test-first, with the live store swap last. Workstrea
 | 0007-T6 | ✅ done | 2026-06-22 | qos2_dedup_window_is_backed_by_the_store; durable_sessions::enqueue_is_durable_across_a_three_node_cluster |
 | 0007-T7 | ✅ done | 2026-06-22 | cluster_store::takeover_recovers_a_keys_log_from_the_shared_replica_state; durable_sessions::a_replica_serves_the_session_after_the_owner_dies |
 | 0007-T8 | 💤 deferred | — | v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet |
-| 0007-T9 | 💤 deferred | — | store impls next_packet_id but conn.rs never calls it; outbound packet-id allocation stays hub-side, so the per-packet durable path is record_received/clear_received only |
+| 0007-T9 | ✅ done | 2026-06-25 | "SessionStore::reserve_packet_ids reserves a block of outbound packet ids in one durable snapshot write (advancing last_packet_id; only against an existing/persistent session, so clean sessions don't materialise metadata). The hub's per-session cursor (Inflight.next_pkid/block_remaining) is seeded from each block and refills via PKID_BLOCK=1024 reservations, so the per-message path is write-free; a fresh Inflight on a takeover owner reserves from the durable high-water and resumes past it. Tests reserve_packet_ids_advances_a_durable_high_water (storage) and outbound_packet_ids_resume_past_the_durable_high_water (hub); full workspace green after the send-path async ripple." |
 <!-- /status-table:0007 -->
 
 **Deviation note (carried from T6):** the ADR said `conn.rs`'s local `HashSet` dedup is
