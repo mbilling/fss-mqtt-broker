@@ -426,6 +426,24 @@ fn durable_enabled(val: Option<&str>) -> bool {
     })
 }
 
+/// The bounded lease-consensus voter-set size `N` from `MQTTD_LEASE_VOTERS` (ADR 0021).
+/// Default `5` (recommend odd). An unparseable or zero value is a startup error rather
+/// than a silent fallback — a zero-voter group would be un-electable.
+fn lease_voters() -> Result<usize, Box<dyn std::error::Error>> {
+    match non_empty_env("MQTTD_LEASE_VOTERS") {
+        None => Ok(5),
+        Some(raw) => {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| format!("MQTTD_LEASE_VOTERS is not a number: {raw:?}"))?;
+            if n == 0 {
+                return Err("MQTTD_LEASE_VOTERS must be at least 1".into());
+            }
+            Ok(n)
+        }
+    }
+}
+
 async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
@@ -448,15 +466,21 @@ async fn start_hub(
         // session log survive a restart (restoring Raft safety and full-cluster-restart
         // durability). Without it the durable plane is in-memory (rebuilds from peers).
         let data_dir = non_empty_env("MQTTD_DATA_DIR");
+        // Bound the lease-consensus voter set (ADR 0021): at most `N` members vote, the
+        // rest join as learners that still receive the lease log. Default 5 (recommend
+        // odd); decouples consensus cost from cluster size.
+        let voter_cap = lease_voters()?;
         info!(
             founder,
             persistent = data_dir.is_some(),
+            voter_cap,
             "DURABLE sessions enabled: consensus-backed replicated store"
         );
         let (store, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
             node_id.clone(),
             placement.clone(),
             founder,
+            voter_cap,
             data_dir.as_deref().map(Path::new),
             None, // no commit-latency fault injection in production (ADR 0026)
         )

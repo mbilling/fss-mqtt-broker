@@ -1,7 +1,7 @@
 # ADR 0021 — Bounded lease-consensus voter set
 
-- **Status:** Proposed
-- **Date:** 2026-06-19
+- **Status:** Accepted
+- **Date:** 2026-06-19 (accepted 2026-06-25)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0021-bounded-lease-voters.md](../delivery/0021-bounded-lease-voters.md) — plan, progress, and changelog
 - **Related:** [ADR 0005](0005-session-affinity.md) (placement/ownership),

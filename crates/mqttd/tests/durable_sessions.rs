@@ -92,7 +92,9 @@ impl DurableNode {
 /// node assembly), the hub with the plane attached, a plaintext peer listener, and
 /// SWIM membership driving the mesh. A node with no seeds is the founder.
 async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
-    start_durable_node_cfg(id, swim_seeds, None).await
+    // Cap 5: every node in these small (≤5) clusters votes, preserving the original
+    // all-voters behaviour these tests assert (ADR 0021).
+    start_durable_node_capped(id, swim_seeds, 5, None).await
 }
 
 /// As [`start_durable_node`], but injects a per-commit latency into the lease store —
@@ -101,6 +103,17 @@ async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
 async fn start_durable_node_cfg(
     id: &str,
     swim_seeds: Vec<String>,
+    commit_delay: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> DurableNode {
+    start_durable_node_capped(id, swim_seeds, 5, commit_delay).await
+}
+
+/// As [`start_durable_node_cfg`], but with an explicit bounded voter cap `N` (ADR 0021)
+/// so a larger cluster can be brought up with only `N` voters and the rest as learners.
+async fn start_durable_node_capped(
+    id: &str,
+    swim_seeds: Vec<String>,
+    voter_cap: usize,
     commit_delay: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 ) -> DurableNode {
     let node_id = NodeId(id.to_string());
@@ -114,6 +127,7 @@ async fn start_durable_node_cfg(
         node_id.clone(),
         placement.clone(),
         can_bootstrap,
+        voter_cap,
         None,
         commit_delay,
     )
@@ -693,4 +707,179 @@ async fn a_replica_serves_the_session_after_the_owner_dies() {
     };
     assert_eq!(pending.len(), 1);
     assert_eq!(&pending[0].message.payload[..], b"survives-takeover");
+}
+
+/// ADR 0021 (bounded lease voters) — integration. A **five-node** durable cluster with a
+/// voter cap of `3` forms a *bounded* voter set (exactly 3 voters, 2 learners) instead of
+/// a 5-voter group, and a session owned by a **learner** (a non-voting member) is durable
+/// and survives both a non-voter and a voter failure. This exercises the whole wiring:
+/// ownership (HRW) and session-data replication (R = 3) are independent of the lease voter
+/// set, so a learner can own and serve sessions, and the sticky vacancy-fill promotes a
+/// learner to voter live when a voter is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // a multi-phase 5-node integration scenario
+async fn a_bounded_voter_cluster_keeps_a_learner_owned_session_through_failures() {
+    use mqtt_cluster::lease_raft::RaftNodeId;
+    use mqtt_cluster::node_registry::raft_id;
+    use std::collections::BTreeSet;
+
+    let a = start_durable_node_capped("bv-a", vec![], 3, None).await; // founder
+    let b = start_durable_node_capped("bv-b", vec![a.swim_addr.clone()], 3, None).await;
+    let c = start_durable_node_capped("bv-c", vec![a.swim_addr.clone()], 3, None).await;
+    let nd = start_durable_node_capped("bv-d", vec![a.swim_addr.clone()], 3, None).await;
+    let ne = start_durable_node_capped("bv-e", vec![a.swim_addr.clone()], 3, None).await;
+    let nodes = [&a, &b, &c, &nd, &ne];
+
+    // SWIM converges: every node sees all five members.
+    wait_until(Duration::from_secs(30), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 5)
+    })
+    .await;
+
+    // The lease group BOUNDS its voter set: exactly 3 voters even with 5 members.
+    wait_until(Duration::from_secs(45), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+
+    // Voter identity from the settled membership (all nodes agree once bounded; read it
+    // from the founder). Snapshot it now, before any kills.
+    let voter_rids: BTreeSet<RaftNodeId> = a
+        .plane
+        .raft()
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect();
+    let is_voter = |n: &DurableNode| voter_rids.contains(&raft_id(&n.node_id));
+    let learners: Vec<&&DurableNode> = nodes.iter().filter(|n| !is_voter(n)).collect();
+    assert_eq!(
+        nodes.iter().filter(|n| is_voter(n)).count(),
+        3,
+        "the lease group is bounded to 3 voters"
+    );
+    assert_eq!(learners.len(), 2, "the other two members are learners");
+
+    // A client whose placement owner is a **learner** (ownership is independent of voting).
+    let client = (0..4000)
+        .map(|i| ClientId(format!("bv-sess-{i}")))
+        .find(|c| {
+            let owner = a.placement.read().unwrap().owner(&c.0);
+            learners.iter().any(|n| n.node_id == owner)
+        })
+        .expect("some client hashes to a learner owner");
+    let owner_id = a.placement.read().unwrap().owner(&client.0);
+    let owner_node = *nodes.iter().find(|n| n.node_id == owner_id).unwrap();
+    assert!(
+        !is_voter(owner_node),
+        "the chosen session owner is a non-voting learner"
+    );
+
+    // Durably enqueue on the learner owner — quorum-replicated over its R=3 replica set.
+    let msg = Message {
+        topic: "t".to_string(),
+        payload: bytes::Bytes::from_static(b"learner-owned"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if owner_node.store.enqueue(&client, &msg).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "durable enqueue on a learner owner never committed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The learner owner serves it back — a non-voter reads/serves its lease (ADR 0021 §2).
+    let pending = owner_node.store.pending(&client, 0, 100).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(&pending[0].message.payload[..], b"learner-owned");
+
+    // Pick failure victims that keep the session's data quorum: the replica set R has 3 of
+    // the 5 nodes (incl. the owner). Kill the OTHER learner (a non-voter), then a voter
+    // OUTSIDE R — so at most one of R's three replicas is lost (≥2/3 survive) and the
+    // learner owner itself survives, keeping the session readable throughout.
+    let replica_set: BTreeSet<NodeId> = a
+        .placement
+        .read()
+        .unwrap()
+        .replica_set(&client.0)
+        .into_iter()
+        .collect();
+    let victim_nonvoter = learners
+        .iter()
+        .find(|n| n.node_id != owner_id)
+        .map(|n| n.node_id.clone())
+        .expect("a second learner exists");
+    let victim_voter = nodes
+        .iter()
+        .find(|n| is_voter(n) && !replica_set.contains(&n.node_id))
+        .map(|n| n.node_id.clone())
+        .expect("a voter outside the replica set exists");
+
+    // --- survive a NON-VOTER (learner) failure ---
+    nodes
+        .iter()
+        .find(|n| n.node_id == victim_nonvoter)
+        .unwrap()
+        .kill();
+    wait_until(Duration::from_secs(25), || {
+        nodes
+            .iter()
+            .filter(|n| n.node_id != victim_nonvoter)
+            .all(|n| n.placement.read().unwrap().member_count() == 4)
+    })
+    .await;
+    let pending = owner_node.store.pending(&client, 0, 100).await.unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the learner-owned session survives a non-voter failure"
+    );
+
+    // --- survive a VOTER failure (sticky vacancy-fill promotes a learner live) ---
+    nodes
+        .iter()
+        .find(|n| n.node_id == victim_voter)
+        .unwrap()
+        .kill();
+    let survivors: Vec<&&DurableNode> = nodes
+        .iter()
+        .filter(|n| n.node_id != victim_nonvoter && n.node_id != victim_voter)
+        .collect();
+    wait_until(Duration::from_secs(30), || {
+        survivors
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    // The three survivors (now ≤ cap) all become voters — a learner is promoted to refill
+    // the voter set after the loss (vacancy-fill, live).
+    wait_until(Duration::from_secs(45), || {
+        survivors.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+    // The session — still owned by the surviving learner-turned-voter — replays intact.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pending = loop {
+        if let Ok(p) = owner_node.store.pending(&client, 0, 100).await {
+            if !p.is_empty() {
+                break p;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session did not survive the voter failure"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(pending.len(), 1);
+    assert_eq!(&pending[0].message.payload[..], b"learner-owned");
 }

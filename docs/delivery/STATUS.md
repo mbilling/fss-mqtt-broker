@@ -28,7 +28,7 @@
 | 0018 | On-disk persistence for durable state | Accepted | 7/8 done | 1 deferred |
 | 0019 | Graceful shutdown and connection draining | Accepted | 7/9 done | 2 deferred |
 | 0020 | Metrics and runtime observability | Accepted | 9/9 done | — |
-| 0021 | Bounded lease-consensus voter set | Proposed | 0/9 done | 9 open |
+| 0021 | Bounded lease-consensus voter set | Accepted | 9/9 done | — |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 | 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
@@ -96,18 +96,6 @@
 
 - `0019-T8` 💤 deferred: Lease-leadership transfer when the leaving node is the Raft leader — "Spike 2026-06-25 (openraft 0.9 transfer-API evaluation, the task's stated prerequisite): openraft 0.9.24 exposes NO public leadership-transfer/TimeoutNow API — Trigger has only elect/heartbeat/snapshot/purge_log. change_membership-remove-self steps the leader down internally (raft_core.rs:1311 -> leader_step_down) but does not provoke an immediate election, so the remaining voters still wait out their election timeout: it does not close the gap. Trigger::transfer_leader exists only on the alpha-only 0.10 line (latest 0.10.0-alpha.23, Jun 2026; no beta/RC/stable, no v0.9->v0.10 upgrade guide; maintainer keeps 0.9.24 as the production default). Deferred pending a stable openraft release exposing transfer_leader — pulling an alpha into the consensus core is a poor trade for a bounded ~1.5-3s graceful-leave gap (relaxed ADR 0026 timing) that already degrades safely via survivors' election."
 - `0019-T9` 💤 deferred: In-flight QoS settle / hub Drain command — drain closes after current packet; durable state already protected by ADR 0018 + raft shutdown
-
-**0021 — Bounded lease-consensus voter set**
-
-- `0021-T1` ⬜ planned: MQTTD_LEASE_VOTERS config (default 5, odd; effective = min(N, live_eligible))
-- `0021-T2` ⬜ planned: durable_node.rs - replace desired=all-members with alive set + RaftView passed to reconciler
-- `0021-T3` ⬜ planned: Sticky vacancy-fill voter selection (promote lowest-id alive learner; never demote a live voter on join)
-- `0021-T4` ⬜ planned: All members added as learners so the committed lease log replicates to every node
-- `0021-T5` ⬜ planned: Reconciler reshape - decide returns target (voters, learners); apply_action adds/promotes/demotes-to-learner/drops-departed
-- `0021-T6` ⬜ planned: Founder/bootstrap unaffected (sole-voter bootstrap then grows capped at N)
-- `0021-T7` ⬜ planned: Pure policy tests (>N -> exactly N voters; dead voter replaced by lowest-id learner; high-id join no voter change; learner-owner reads lease; N>cluster all-voters; N=1 single voter)
-- `0021-T8` ⬜ planned: Integration - 5+-node durable cluster with bounded voter set; learner-owned session survives a non-voter and a voter failure
-- `0021-T9` ⬜ planned: Re-run openraft storage conformance (asserted unaffected)
 
 **0022 — Per-node signed gossip (authenticated SWIM identity)**
 

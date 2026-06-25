@@ -7,41 +7,53 @@
 //! from the other:
 //!
 //! - **Pure decision** ([`MembershipReconciler::decide`]): given the current raft
-//!   view and the desired stable voter set (the `Alive` members, mapped to
+//!   view and the `eligible` member set (the `Alive`, admitted members, mapped to
 //!   [`RaftNodeId`](crate::lease_raft::RaftNodeId)), return the [`MembershipAction`]
 //!   to take. **The founder bootstraps** (with itself); the elected leader then grows
-//!   membership. Only the **leader** reconciles voters afterwards, and only once a
-//!   prior change has settled (no overlapping joint-consensus changes). A non-leader /
+//!   membership. Only the **leader** reconciles afterwards, and only once a prior change
+//!   has settled (no overlapping joint-consensus changes). A non-leader /
 //!   not-yet-bootstrapped node does nothing — the leader pulls it in as a learner.
 //! - **Executor** ([`apply_action`]): perform the action against the raft handle
 //!   (`initialize` / `add_learner` + `change_membership`).
 //! - **View** ([`raft_view`]): read the current state from the raft's metrics.
 //!
-//! The caller (the live driver, step 4f) computes the desired set from SWIM, reads
+//! **Bounded voters** ([ADR 0021](../../../docs/adr/0021-bounded-lease-voters.md)): the
+//! voter set is capped at a small `N` ([`target_voters`], sticky vacancy-fill); every
+//! other eligible member joins as a non-voting *learner* that still receives the committed
+//! lease log and can own/serve placement groups. So consensus cost (quorum, election size)
+//! stays fixed as the cluster grows, and cluster membership is decoupled from voting.
+//!
+//! The caller (the live driver, step 4f) computes the eligible set from SWIM, reads
 //! [`raft_view`], calls [`decide`](MembershipReconciler::decide), and applies the
 //! result — **debounced** so a flapping member does not churn the voter set. Keeping
 //! `decide` pure makes the policy exhaustively unit-testable without a cluster.
 
 use crate::lease_group::LeaseRaft;
 use crate::lease_raft::RaftNodeId;
-use openraft::{BasicNode, ServerState};
+use openraft::{BasicNode, ChangeMembers, ServerState};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// What to do to bring the lease group's voter set toward the desired membership.
+/// What to do to bring the lease group toward the desired membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MembershipAction {
     /// Nothing to do.
     None,
     /// This node should bootstrap the group with `voters` (just itself).
     Initialize(BTreeSet<RaftNodeId>),
-    /// This node (the leader) should set the voter set to `desired`, first adding
-    /// `add_as_learner` (the new members) as learners so they can be promoted.
-    SetVoters {
-        /// The target voter set.
-        desired: BTreeSet<RaftNodeId>,
-        /// Members in `desired` not yet voters — to add as learners before promoting.
+    /// This node (the leader) should drive the group toward `target_voters` (the
+    /// bounded, sticky voter set, ADR 0021), first adding `add_as_learner` (eligible
+    /// members not yet known to the group) as learners so the committed lease log reaches
+    /// them and any filling a voter vacancy can be promoted. A voter dropped from the set
+    /// is **retained as a learner** (it keeps the log), not removed.
+    Reconcile {
+        /// The bounded target voter set (≤ `N`).
+        target_voters: BTreeSet<RaftNodeId>,
+        /// Eligible members not yet in the group — added as learners first.
         add_as_learner: BTreeSet<RaftNodeId>,
     },
+    /// This node (the leader) should remove `departed` members — nodes still in the group
+    /// as learners that have left the cluster — from membership entirely.
+    Drop(BTreeSet<RaftNodeId>),
 }
 
 /// A snapshot of the local raft node's membership-relevant state.
@@ -58,6 +70,43 @@ pub struct RaftView {
     pub changing: bool,
     /// The current voter set.
     pub voters: BTreeSet<RaftNodeId>,
+    /// All nodes currently in the group — voters **and** learners. Lets the policy tell a
+    /// new eligible member (add as learner) from a departed one (drop), since under ADR
+    /// 0021 most members are non-voting learners.
+    pub nodes: BTreeSet<RaftNodeId>,
+}
+
+/// The bounded, sticky target voter set (ADR 0021 §1): keep every still-eligible current
+/// voter, fill vacancies up to `cap` with the **lowest-id** eligible non-voters, and — on
+/// the upgrade path from an all-voters cluster — shrink an over-large live voter set down
+/// to the lowest-id `cap`. A deterministic function of *(cap, eligible, current voters)*,
+/// so every node and every successive leader computes the same target and reconcilers do
+/// not disagree. Effective voters = `min(cap, eligible.len())`.
+#[must_use]
+fn target_voters(
+    cap: usize,
+    eligible: &BTreeSet<RaftNodeId>,
+    current: &BTreeSet<RaftNodeId>,
+) -> BTreeSet<RaftNodeId> {
+    let cap = cap.max(1);
+    // Still-eligible current voters are sticky — they never lose a seat to a join.
+    let live: BTreeSet<RaftNodeId> = current.intersection(eligible).copied().collect();
+    if live.len() >= cap {
+        // Shrink (e.g. a pre-0021 all-voters cluster adopting the cap): keep lowest-id `cap`;
+        // the rest become learners via `change_membership(.., retain = true)`.
+        return live.iter().take(cap).copied().collect();
+    }
+    // Grow / vacancy-fill: promote the lowest-id eligible non-voters until `cap` is reached
+    // (or the eligible set is exhausted). `BTreeSet::difference` yields ascending ids.
+    let mut target = live;
+    let vacancies = cap - target.len();
+    let fills: Vec<RaftNodeId> = eligible
+        .difference(&target)
+        .take(vacancies)
+        .copied()
+        .collect();
+    target.extend(fills);
+    target
 }
 
 /// Errors from applying a [`MembershipAction`].
@@ -73,6 +122,7 @@ pub enum MembershipError {
 pub struct MembershipReconciler {
     local: RaftNodeId,
     can_bootstrap: bool,
+    voter_cap: usize,
 }
 
 impl MembershipReconciler {
@@ -85,19 +135,24 @@ impl MembershipReconciler {
     /// the founder's elected leader. (An earlier min-id tiebreak was removed — it both
     /// failed to prevent the multi-founder race and broke a legitimate non-min founder;
     /// ADR 0026 T7.)
+    ///
+    /// `voter_cap` is the bounded voter-set size `N` (ADR 0021): at most `N` members vote;
+    /// every other eligible member joins as a non-voting learner. Clamped to `≥ 1`.
     #[must_use]
-    pub fn new(local: RaftNodeId, can_bootstrap: bool) -> Self {
+    pub fn new(local: RaftNodeId, can_bootstrap: bool, voter_cap: usize) -> Self {
         Self {
             local,
             can_bootstrap,
+            voter_cap: voter_cap.max(1),
         }
     }
 
-    /// Decide the action to take given the current `view` and the `desired` stable
-    /// voter set. Pure — see the module docs for the policy.
+    /// Decide the action to take given the current `view` and the `eligible` member set
+    /// (alive, admitted members mapped to [`RaftNodeId`]). Pure — see the module docs and
+    /// [ADR 0021](../../../docs/adr/0021-bounded-lease-voters.md) for the policy.
     #[must_use]
-    pub fn decide(&self, view: &RaftView, desired: &BTreeSet<RaftNodeId>) -> MembershipAction {
-        if desired.is_empty() {
+    pub fn decide(&self, view: &RaftView, eligible: &BTreeSet<RaftNodeId>) -> MembershipAction {
+        if eligible.is_empty() {
             return MembershipAction::None;
         }
         if !view.initialized {
@@ -117,7 +172,7 @@ impl MembershipReconciler {
             }
             return MembershipAction::None;
         }
-        // Initialized: only the leader reconciles the voter set.
+        // Initialized: only the leader reconciles membership.
         if !view.is_leader {
             return MembershipAction::None;
         }
@@ -127,12 +182,22 @@ impl MembershipReconciler {
         if view.changing {
             return MembershipAction::None;
         }
-        if &view.voters != desired {
-            let add_as_learner = desired.difference(&view.voters).copied().collect();
-            return MembershipAction::SetVoters {
-                desired: desired.clone(),
+        // Reshape the voter set first: bring every eligible member into the group (as a
+        // learner) and drive the voters toward the bounded sticky target.
+        let target_voters = target_voters(self.voter_cap, eligible, &view.voters);
+        let add_as_learner: BTreeSet<RaftNodeId> =
+            eligible.difference(&view.nodes).copied().collect();
+        if target_voters != view.voters || !add_as_learner.is_empty() {
+            return MembershipAction::Reconcile {
+                target_voters,
                 add_as_learner,
             };
+        }
+        // Voters are at target and every eligible member is in the group. Drop any member
+        // that has left the cluster (now lingering as a learner) from membership entirely.
+        let departed: BTreeSet<RaftNodeId> = view.nodes.difference(eligible).copied().collect();
+        if !departed.is_empty() {
+            return MembershipAction::Drop(departed);
         }
         MembershipAction::None
     }
@@ -144,6 +209,7 @@ pub fn raft_view(raft: &LeaseRaft) -> RaftView {
     let metrics = raft.metrics().borrow().clone();
     let membership = metrics.membership_config.membership();
     let voters: BTreeSet<RaftNodeId> = membership.voter_ids().collect();
+    let nodes: BTreeSet<RaftNodeId> = membership.nodes().map(|(id, _)| *id).collect();
     RaftView {
         initialized: !voters.is_empty(),
         is_leader: metrics.state == ServerState::Leader,
@@ -151,14 +217,19 @@ pub fn raft_view(raft: &LeaseRaft) -> RaftView {
         // exactly one. More than one means a membership change is still in flight.
         changing: membership.get_joint_config().len() > 1,
         voters,
+        nodes,
     }
 }
 
 /// Apply a [`MembershipAction`] to `raft`.
 ///
-/// `Initialize` bootstraps the group; `SetVoters` adds the new members as learners
-/// (blocking until they catch up) and then replaces the voter set. Removed voters
-/// are dropped (not retained as learners).
+/// - `Initialize` bootstraps the group.
+/// - `Reconcile` adds each new eligible member as a learner (blocking until it catches up
+///   so the committed lease log reaches it) and then, **only if the voter set actually
+///   differs**, replaces the voters with `target_voters` using `retain = true` — so any
+///   voter dropped from the set becomes a *learner* (it keeps the log, ADR 0021 §3), not
+///   removed. A pure learner addition (target unchanged) thus issues no voter change.
+/// - `Drop` removes departed members (now learners) from the group entirely.
 ///
 /// # Errors
 /// [`MembershipError::Raft`] if a raft membership operation fails.
@@ -177,8 +248,8 @@ pub async fn apply_action(
                 .await
                 .map_err(|e| MembershipError::Raft(e.to_string()))
         }
-        MembershipAction::SetVoters {
-            desired,
+        MembershipAction::Reconcile {
+            target_voters,
             add_as_learner,
         } => {
             for id in add_as_learner {
@@ -186,8 +257,30 @@ pub async fn apply_action(
                     .await
                     .map_err(|e| MembershipError::Raft(e.to_string()))?;
             }
-            // A BTreeSet<NodeId> converts to ChangeMembers::ReplaceAllVoters.
-            raft.change_membership(desired.clone(), false)
+            // Skip a no-op voter change (a pure learner join leaves the voter set at
+            // target): openraft would otherwise propose a redundant joint config.
+            let current: BTreeSet<RaftNodeId> = raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .collect();
+            if &current != target_voters {
+                // retain = true: a voter dropped from the set is kept as a learner.
+                raft.change_membership(
+                    ChangeMembers::ReplaceAllVoters(target_voters.clone()),
+                    true,
+                )
+                .await
+                .map_err(|e| MembershipError::Raft(e.to_string()))?;
+            }
+            Ok(())
+        }
+        MembershipAction::Drop(departed) => {
+            // The departed members are learners here (a still-voting member would have
+            // been reshaped out first), so RemoveNodes is safe.
+            raft.change_membership(ChangeMembers::RemoveNodes(departed.clone()), false)
                 .await
                 .map_err(|e| MembershipError::Raft(e.to_string()))?;
             Ok(())
@@ -225,140 +318,248 @@ mod tests {
         ids.iter().copied().collect()
     }
 
-    // ---- pure policy ----
-
-    #[test]
-    fn empty_desired_is_a_noop() {
-        let r = MembershipReconciler::new(1, true);
-        let view = RaftView {
+    /// A fresh, uninitialized raft view (no group yet).
+    fn uninit() -> RaftView {
+        RaftView {
             initialized: false,
             is_leader: false,
             changing: false,
             voters: set(&[]),
-        };
-        assert_eq!(r.decide(&view, &set(&[])), MembershipAction::None);
+            nodes: set(&[]),
+        }
+    }
+
+    /// A leader view with the given voter set and full node set (voters + learners).
+    fn leader(voters: &[RaftNodeId], nodes: &[RaftNodeId]) -> RaftView {
+        RaftView {
+            initialized: true,
+            is_leader: true,
+            changing: false,
+            voters: set(voters),
+            nodes: set(nodes),
+        }
+    }
+
+    // ---- pure policy (ADR 0021) ----
+
+    #[test]
+    fn empty_eligible_is_a_noop() {
+        assert_eq!(
+            MembershipReconciler::new(1, true, 5).decide(&uninit(), &set(&[])),
+            MembershipAction::None,
+        );
     }
 
     #[test]
     fn any_founder_bootstraps_with_itself_regardless_of_id_rank() {
-        let view = RaftView {
-            initialized: false,
-            is_leader: false,
-            changing: false,
-            voters: set(&[]),
-        };
         // The founder bootstraps with itself whether or not it is the smallest id —
         // `can_bootstrap` is the sole guard (ADR 0026 T7). Node 1 (the min):
         assert_eq!(
-            MembershipReconciler::new(1, true).decide(&view, &set(&[1, 2, 3])),
+            MembershipReconciler::new(1, true, 5).decide(&uninit(), &set(&[1, 2, 3])),
             MembershipAction::Initialize(set(&[1])),
         );
         // ...and node 2 (NOT the min) — the case the old min-id tiebreak wrongly blocked,
         // leaving the durable group unformed.
         assert_eq!(
-            MembershipReconciler::new(2, true).decide(&view, &set(&[1, 2, 3])),
+            MembershipReconciler::new(2, true, 5).decide(&uninit(), &set(&[1, 2, 3])),
             MembershipAction::Initialize(set(&[2])),
         );
     }
 
     #[test]
     fn a_non_founder_never_bootstraps() {
-        let view = RaftView {
-            initialized: false,
-            is_leader: false,
-            changing: false,
-            voters: set(&[]),
-        };
         // Not a founder (started with seeds) — it waits to be added rather than starting
         // a rival group, even though it is the smallest id.
         assert_eq!(
-            MembershipReconciler::new(1, false).decide(&view, &set(&[1, 2, 3])),
+            MembershipReconciler::new(1, false, 5).decide(&uninit(), &set(&[1, 2, 3])),
             MembershipAction::None,
         );
     }
 
     #[test]
-    fn only_the_leader_reconciles_voters() {
-        let desired = set(&[1, 2, 3]);
+    fn only_the_leader_reconciles_membership() {
         let follower = RaftView {
-            initialized: true,
             is_leader: false,
-            changing: false,
-            voters: set(&[1]),
+            ..leader(&[1], &[1])
         };
         assert_eq!(
-            MembershipReconciler::new(2, true).decide(&follower, &desired),
+            MembershipReconciler::new(2, true, 5).decide(&follower, &set(&[1, 2, 3])),
             MembershipAction::None,
         );
     }
 
     #[test]
     fn a_leader_does_not_re_propose_while_a_change_is_in_flight() {
-        // Leader, voters {1} but desired {1,2,3} — yet a change is already settling
+        // Leader, voters {1} but eligible {1,2,3} — yet a change is already settling
         // (joint consensus). It must wait, not fire a second change (ADR 0026 §2).
         let changing = RaftView {
-            initialized: true,
-            is_leader: true,
             changing: true,
-            voters: set(&[1]),
+            ..leader(&[1], &[1])
         };
         assert_eq!(
-            MembershipReconciler::new(1, true).decide(&changing, &set(&[1, 2, 3])),
+            MembershipReconciler::new(1, true, 5).decide(&changing, &set(&[1, 2, 3])),
             MembershipAction::None,
         );
-        // Once it settles (changing = false), the same gap is reconciled.
-        let settled = RaftView {
-            changing: false,
-            ..changing
-        };
+        // Once it settles, the same gap is reconciled (grow toward the cap).
         assert_eq!(
-            MembershipReconciler::new(1, true).decide(&settled, &set(&[1, 2, 3])),
-            MembershipAction::SetVoters {
-                desired: set(&[1, 2, 3]),
+            MembershipReconciler::new(1, true, 5).decide(&leader(&[1], &[1]), &set(&[1, 2, 3])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
                 add_as_learner: set(&[2, 3]),
             },
         );
     }
 
     #[test]
-    fn leader_grows_and_shrinks_the_voter_set() {
-        let r = MembershipReconciler::new(1, true);
-        // Grow {1} -> {1,2,3}: add 2 and 3 as learners.
-        let view = RaftView {
-            initialized: true,
-            is_leader: true,
-            changing: false,
-            voters: set(&[1]),
-        };
+    fn more_than_n_members_yield_exactly_n_voters() {
+        // cap 3, all five already learners; the founder is the sole voter. Fill the two
+        // vacancies with the lowest-id learners → exactly 3 voters, no learners to add.
+        let r = MembershipReconciler::new(1, true, 3);
         assert_eq!(
-            r.decide(&view, &set(&[1, 2, 3])),
-            MembershipAction::SetVoters {
-                desired: set(&[1, 2, 3]),
-                add_as_learner: set(&[2, 3]),
-            },
-        );
-        // Shrink {1,2,3} -> {1,2}: no learners to add, just replace.
-        let view = RaftView {
-            initialized: true,
-            is_leader: true,
-            changing: false,
-            voters: set(&[1, 2, 3]),
-        };
-        assert_eq!(
-            r.decide(&view, &set(&[1, 2])),
-            MembershipAction::SetVoters {
-                desired: set(&[1, 2]),
+            r.decide(&leader(&[1], &[1, 2, 3, 4, 5]), &set(&[1, 2, 3, 4, 5])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
                 add_as_learner: set(&[]),
             },
         );
-        // Already at target: nothing to do.
-        let view = RaftView {
-            initialized: true,
-            is_leader: true,
-            changing: false,
-            voters: set(&[1, 2]),
-        };
-        assert_eq!(r.decide(&view, &set(&[1, 2])), MembershipAction::None);
+    }
+
+    #[test]
+    fn a_high_id_join_becomes_a_learner_without_changing_voters() {
+        // cap 3, voters already full at {1,2,3}; nodes 4,5 join. They join as learners and
+        // the voter set is unchanged (target == voters), so apply issues no voter change.
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide(&leader(&[1, 2, 3], &[1, 2, 3]), &set(&[1, 2, 3, 4, 5])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
+                add_as_learner: set(&[4, 5]),
+            },
+        );
+    }
+
+    #[test]
+    fn a_live_voter_is_never_demoted_just_because_a_node_joins() {
+        // Sticky (ADR 0021 §1): voters {1,2,3} at the cap, node 4 joins. 4 becomes a
+        // learner; no live voter is displaced.
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide(&leader(&[1, 2, 3], &[1, 2, 3]), &set(&[1, 2, 3, 4])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
+                add_as_learner: set(&[4]),
+            },
+        );
+    }
+
+    #[test]
+    fn a_dead_voter_is_replaced_by_the_lowest_id_learner() {
+        // cap 3, voters {1,2,3}, learners {4,5}. Voter 2 dies (drops out of eligible).
+        let r = MembershipReconciler::new(1, true, 3);
+        // Step 1: 2 is reshaped out of the voter set and the lowest-id learner (4) fills
+        // the vacancy — voter count restored to 3. (retain keeps 2 as a learner for now.)
+        assert_eq!(
+            r.decide(
+                &leader(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+                &set(&[1, 3, 4, 5]), // 2 gone
+            ),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 3, 4]),
+                add_as_learner: set(&[]),
+            },
+        );
+        // Step 2: voters now {1,3,4}; the dead node 2 lingers as a learner and is dropped.
+        assert_eq!(
+            r.decide(&leader(&[1, 3, 4], &[1, 2, 3, 4, 5]), &set(&[1, 3, 4, 5]),),
+            MembershipAction::Drop(set(&[2])),
+        );
+    }
+
+    #[test]
+    fn an_all_voters_cluster_shrinks_to_the_cap() {
+        // Upgrade path (ADR 0021 §3): a pre-0021 cluster has every member voting. With
+        // cap 3, keep the lowest-id 3 as voters; the rest are demoted to learners
+        // (apply uses retain = true).
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide(
+                &leader(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5]),
+                &set(&[1, 2, 3, 4, 5]),
+            ),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
+                add_as_learner: set(&[]),
+            },
+        );
+    }
+
+    #[test]
+    fn n_larger_than_the_cluster_makes_every_member_a_voter() {
+        // cap 5 but only 3 members: all three vote (effective voters = min(N, cluster)).
+        let r = MembershipReconciler::new(1, true, 5);
+        assert_eq!(
+            r.decide(&leader(&[1], &[1, 2, 3]), &set(&[1, 2, 3])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
+                add_as_learner: set(&[]),
+            },
+        );
+    }
+
+    #[test]
+    fn n_equals_one_keeps_a_single_voter() {
+        // cap 1: exactly one voter; every other member is a learner.
+        let r = MembershipReconciler::new(1, true, 1);
+        // Growth: members 2,3 join as learners, the voter set stays {1}.
+        assert_eq!(
+            r.decide(&leader(&[1], &[1]), &set(&[1, 2, 3])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1]),
+                add_as_learner: set(&[2, 3]),
+            },
+        );
+        // Steady state: one voter, the rest learners, nothing to do.
+        assert_eq!(
+            r.decide(&leader(&[1], &[1, 2, 3]), &set(&[1, 2, 3])),
+            MembershipAction::None,
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_is_clamped_to_a_single_voter() {
+        // A degenerate `N = 0` must not yield a zero-voter (un-electable) group: it is
+        // clamped to a single voter, the rest joining as learners.
+        let r = MembershipReconciler::new(1, true, 0);
+        assert_eq!(
+            r.decide(&leader(&[1], &[1]), &set(&[1, 2, 3])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1]),
+                add_as_learner: set(&[2, 3]),
+            },
+        );
+    }
+
+    #[test]
+    fn a_departed_learner_is_dropped() {
+        // cap 3, voters {1,2,3}, learner {4}. Node 4 leaves the cluster → dropped entirely.
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide(&leader(&[1, 2, 3], &[1, 2, 3, 4]), &set(&[1, 2, 3])),
+            MembershipAction::Drop(set(&[4])),
+        );
+    }
+
+    #[test]
+    fn a_steady_bounded_group_is_a_noop() {
+        // cap 3: voters at target, every eligible member present, none departed → None.
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide(
+                &leader(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+                &set(&[1, 2, 3, 4, 5])
+            ),
+            MembershipAction::None,
+        );
     }
 
     // ---- live bring-up + grow ----
@@ -445,7 +646,7 @@ mod tests {
         } else {
             (&p2, r2, &s1)
         };
-        let recon = MembershipReconciler::new(boot_id, true);
+        let recon = MembershipReconciler::new(boot_id, true, 5);
 
         // Step 1: bootstrap (Initialize with self), then it wins the election.
         let action = recon.decide(&raft_view(boot.raft()), &desired);
@@ -457,9 +658,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Step 2: as leader, grow membership to the full desired set.
+        // Step 2: as leader, grow membership to the full desired set (≤ cap, so both vote).
         let action = recon.decide(&raft_view(boot.raft()), &desired);
-        assert!(matches!(action, MembershipAction::SetVoters { .. }));
+        assert!(matches!(action, MembershipAction::Reconcile { .. }));
         apply_action(boot.raft(), &action).await.unwrap();
 
         // Both nodes are now voters.

@@ -82,12 +82,16 @@ async fn open_retrying<T, E: std::fmt::Display>(
 /// a founder creates the lease group; joiners wait to be added by the founder's
 /// leader. Exactly one founder per cluster (see [`MembershipReconciler::new`]).
 ///
+/// `voter_cap` bounds the lease-group voter set (ADR 0021): at most that many members
+/// vote, every other member joins as a learner that still receives the lease log.
+///
 /// # Panics
 /// Panics if the lease `Raft` fails to start (a programming/config error at boot).
 pub async fn build_durable_node(
     node_id: NodeId,
     placement: Arc<RwLock<Placement>>,
     can_bootstrap: bool,
+    voter_cap: usize,
     data_dir: Option<&std::path::Path>,
     commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> (
@@ -166,7 +170,7 @@ pub async fn build_durable_node(
         local,
         lease_store,
         placement.clone(),
-        MembershipReconciler::new(local, can_bootstrap),
+        MembershipReconciler::new(local, can_bootstrap, voter_cap),
         LeaseAssigner::new(placement),
     ));
 
@@ -299,7 +303,8 @@ mod tests {
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, _plane, _driver) = build_durable_node(node, placement, true, None, None).await;
+        let (store, _plane, _driver) =
+            build_durable_node(node, placement, true, 5, None, None).await;
 
         let client = ClientId("c".to_string());
         let msg = Message {
@@ -362,7 +367,7 @@ mod tests {
         // --- lifetime #1: bootstrap on disk, become writable ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
         let (store, plane, driver) =
-            build_durable_node(node.clone(), placement, true, Some(dir.path()), None).await;
+            build_durable_node(node.clone(), placement, true, 5, Some(dir.path()), None).await;
         wait_writable(&store, &client, &msg).await;
 
         // --- teardown: release the on-disk locks (the part ADR 0019 unblocks) ---
@@ -378,7 +383,7 @@ mod tests {
         // --- lifetime #2: a fresh node over the SAME directory recovers and re-leads ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
         let (store, plane, driver) =
-            build_durable_node(node, placement, true, Some(dir.path()), None).await;
+            build_durable_node(node, placement, true, 5, Some(dir.path()), None).await;
         // Becoming writable again proves the persisted lease store reopened (no
         // "Database already open" lock, no double-init panic) and the node re-led.
         wait_writable(&store, &client, &msg).await;
