@@ -1,11 +1,13 @@
 ---
 adr: "0025"
 title: Boundary MQTT bridge to brokers in other security zones
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0025-T1
     title: New mqtt-bridge crate and binary skeleton (MQTT client built on mqtt-codec/mqtt-net)
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "crates/mqtt-bridge: MqttClient (connect over plain TCP / TLS-mTLS via mqtt-net, CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PING/DISCONNECT, next_event loop) on mqtt-codec/mqtt-net; binary skeleton. Test the_client_connects_subscribes_and_round_trips_a_publish (against an in-process mqttd; the hop-count User Property survives the broker hop now that ADR 0030 forwards it) + connect_refused_surfaces_as_an_error."
   - id: 0025-T2
     title: Config model and validation (upstreams, per-rule direction/filter/remap/qos, deny-by-default)
     status: planned
@@ -45,8 +47,8 @@ Decision: [docs/adr/0025-boundary-bridge.md](../adr/0025-boundary-bridge.md).
 A standalone `mqtt-bridge` component — an MQTT client to both the local cluster and one or
 more external brokers — that forwards configured topics across a security-zone boundary,
 with per-rule direction (and **enforced** unidirectional flow as the headline security
-control). Proposed: the decision is up for review before any code; every phase lands
-test-first, with the one-way-never-leaks-reverse property as the central adversarial test.
+control). Accepted and under construction; every phase lands test-first, with the
+one-way-never-leaks-reverse property as the central adversarial test.
 
 ## Plan
 
@@ -69,7 +71,7 @@ test-first, with the one-way-never-leaks-reverse property as the central adversa
 <!-- status-table:0025 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0025-T1 | ⬜ planned | — |  |
+| 0025-T1 | ✅ done | 2026-06-25 | "crates/mqtt-bridge: MqttClient (connect over plain TCP / TLS-mTLS via mqtt-net, CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PING/DISCONNECT, next_event loop) on mqtt-codec/mqtt-net; binary skeleton. Test the_client_connects_subscribes_and_round_trips_a_publish (against an in-process mqttd; the hop-count User Property survives the broker hop now that ADR 0030 forwards it) + connect_refused_surfaces_as_an_error." |
 | 0025-T2 | ⬜ planned | — |  |
 | 0025-T3 | ⬜ planned | — |  |
 | 0025-T4 | ⬜ planned | — |  |
@@ -84,6 +86,12 @@ test-first, with the one-way-never-leaks-reverse property as the central adversa
 
 ## Changelog
 
+- **2026-06-25** — ADR ratified (Accepted) and T1 landed: the `mqtt-bridge` crate + a
+  minimal `MqttClient` (TCP/TLS over `mqtt-codec`/`mqtt-net`), proven against an in-process
+  broker. Building T1 surfaced that the broker dropped MQTT 5 User Properties on delivery —
+  a conformance gap (MQTT-3.3.2-17) and a blocker for the hop-count loop-prevention (T5).
+  Fixed first as [ADR 0030](../adr/0030-user-property-forwarding.md) (User Properties now
+  forwarded end to end), which unblocks T5. Remaining tasks T2–T11 in progress.
 - **2026-06-23** — ADR proposed and delivery doc opened; all tasks `planned` pending design
   review. The decision (separate component vs in-process plugin; enforced unidirectional
   flow; shared-subscription HA) is up for argument before any code is written.

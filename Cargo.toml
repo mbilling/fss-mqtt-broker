@@ -10,6 +10,7 @@ members = [
     "crates/mqtt-observability",
     "crates/mqtt-config",
     "crates/mqttd",
+    "crates/mqtt-bridge",
 ]
 
 [workspace.package]

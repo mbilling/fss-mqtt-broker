@@ -1,0 +1,37 @@
+[package]
+name = "mqtt-bridge"
+description = "Boundary MQTT bridge to brokers in other security zones (ADR 0025)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mqtt-bridge"
+path = "src/main.rs"
+
+[lib]
+name = "mqtt_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+mqtt-net = { path = "../mqtt-net", version = "0.1.0" }
+mqtt-observability = { path = "../mqtt-observability", version = "0.1.0" }
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+mqttd = { path = "../mqttd", version = "0.1.0" }
+mqtt-storage = { path = "../mqtt-storage", version = "0.1.0" }
+tempfile = "3"
+
+[lints]
+workspace = true

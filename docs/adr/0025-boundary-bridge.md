@@ -1,7 +1,7 @@
 # ADR 0025 — Boundary MQTT bridge to brokers in other security zones
 
-- **Status:** Proposed
-- **Date:** 2026-06-23
+- **Status:** Accepted
+- **Date:** 2026-06-23 (accepted 2026-06-25)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0025-boundary-bridge.md](../delivery/0025-boundary-bridge.md) — plan, progress, and changelog
 - **Related:** [ADR 0004](0004-identity-and-authentication.md) (the deny-by-default identity
