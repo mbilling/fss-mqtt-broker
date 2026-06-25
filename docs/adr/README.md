@@ -49,3 +49,7 @@ conventions.
 | [0027](0027-replica-group-commit.md) | Group-commit for the durable replica apply path | Accepted | [delivery](../delivery/0027-replica-group-commit.md) |
 | [0028](0028-link-gated-voter-admission.md) | Link-gated lease-group voter admission (fixes formation churn) | Accepted | [delivery](../delivery/0028-link-gated-voter-admission.md) |
 | [0029](0029-durable-by-default.md) | Durable sessions by default (opt-out) | Accepted | [delivery](../delivery/0029-durable-by-default.md) |
+| [0030](0030-user-property-forwarding.md) | MQTT 5.0 User Property / application-property forwarding | Accepted | [delivery](../delivery/0030-user-property-forwarding.md) |
+| [0031](0031-session-identity-binding.md) | Bind the session to the authenticated identity | Proposed | [delivery](../delivery/0031-session-identity-binding.md) |
+| [0032](0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy (SIGHUP, validate-before-swap) | Accepted | [delivery](../delivery/0032-hot-reloadable-security-policy.md) |
+| [0033](0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy (opt-in) | Proposed | [delivery](../delivery/0033-config-file-watch-reload.md) |
