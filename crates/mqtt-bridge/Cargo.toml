@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
+mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
 mqtt-net = { path = "../mqtt-net", version = "0.1.0" }
 mqtt-observability = { path = "../mqtt-observability", version = "0.1.0" }
 tokio.workspace = true

@@ -1215,6 +1215,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "mqtt-codec",
+ "mqtt-core",
  "mqtt-net",
  "mqtt-observability",
  "mqtt-storage",

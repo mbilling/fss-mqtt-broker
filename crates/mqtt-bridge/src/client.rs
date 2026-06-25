@@ -24,6 +24,7 @@ use mqtt_net::tls::{client_connector, server_name};
 use mqtt_net::{FrameReader, FrameWriter};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 /// Any byte stream the client can run over (plain TCP or a TLS session).
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -120,6 +121,35 @@ pub enum Event {
         pkid: u16,
         /// Per-filter granted `QoS` / `0x80` failure codes.
         return_codes: Vec<u8>,
+    },
+}
+
+/// A command driven into a running client's **writer** side by the forwarding engine. The
+/// engine has already applied the rule's direction, remap, `QoS`, and hop count before
+/// issuing a [`Command::Publish`]; the client just serializes it.
+#[derive(Debug)]
+pub enum Command {
+    /// Subscribe to `filter` at `qos` with subscribe id `pkid`.
+    Subscribe {
+        /// Subscribe packet id.
+        pkid: u16,
+        /// Topic filter to subscribe to.
+        filter: String,
+        /// Requested maximum `QoS`.
+        qos: QoS,
+    },
+    /// Publish a message (already transformed by the engine).
+    Publish {
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Bytes,
+        /// Delivery `QoS`.
+        qos: QoS,
+        /// Packet id for `QoS` ≥ 1 (ignored for `QoS` 0).
+        pkid: Option<u16>,
+        /// MQTT 5 properties (e.g. the incremented hop-count user property).
+        properties: Properties,
     },
 }
 
@@ -287,6 +317,87 @@ impl MqttClient {
                 properties: Properties::new(),
             }))
             .await;
+    }
+
+    /// Drive this client until the connection ends, consuming it.
+    ///
+    /// Concurrently: reads inbound packets — emitting each delivered PUBLISH to `inbound`
+    /// and **auto-acking** a `QoS` 1 delivery — while serializing `commands` from the
+    /// engine onto the wire and sending a periodic keepalive PING. Reading and writing run
+    /// in one `select!` over the split reader/writer, so a connection used for only one
+    /// direction (a one-way rule) still answers pings and never blocks. Returns the
+    /// terminal [`ClientError`] (so a supervisor can reconnect with backoff).
+    pub async fn run(
+        self,
+        commands: &mut mpsc::UnboundedReceiver<Command>,
+        inbound: &mpsc::UnboundedSender<Publish>,
+        keep_alive: u16,
+    ) -> ClientError {
+        let Self {
+            mut reader,
+            mut writer,
+        } = self;
+        let mut ping = tokio::time::interval(ping_interval(keep_alive));
+        loop {
+            tokio::select! {
+                packet = reader.next_packet() => match packet {
+                    Ok(Some(Packet::Publish(p))) => {
+                        // Acknowledge a QoS 1 delivery so the source broker releases it
+                        // (at-least-once; the cross-broker spool is ADR 0025 T7).
+                        if p.qos == QoS::AtLeastOnce {
+                            if let Some(id) = p.pkid {
+                                if writer.send(&Packet::PubAck(Ack::new(id))).await.is_err() {
+                                    return ClientError::Closed;
+                                }
+                            }
+                        }
+                        if inbound.send(p).is_err() {
+                            return ClientError::Closed; // the engine is gone
+                        }
+                    }
+                    // SUBACK / PUBACK / PINGRESP: housekeeping we do not act on here.
+                    Ok(Some(_)) => {}
+                    Ok(None) => return ClientError::Closed,
+                    Err(e) => return ClientError::Protocol(e.to_string()),
+                },
+                cmd = commands.recv() => match cmd {
+                    Some(Command::Subscribe { pkid, filter, qos }) => {
+                        let pkt = Packet::Subscribe(Subscribe {
+                            properties: Properties::new(),
+                            pkid,
+                            filters: vec![SubscribeFilter {
+                                path: filter,
+                                qos,
+                                options: mqtt_codec::packet::SubscriptionOptions::default(),
+                            }],
+                        });
+                        if writer.send(&pkt).await.is_err() {
+                            return ClientError::Closed;
+                        }
+                    }
+                    Some(Command::Publish { topic, payload, qos, pkid, properties }) => {
+                        let pkt = Packet::Publish(Publish {
+                            dup: false,
+                            qos,
+                            retain: false,
+                            topic,
+                            pkid: if qos == QoS::AtMostOnce { None } else { pkid },
+                            properties,
+                            payload,
+                        });
+                        if writer.send(&pkt).await.is_err() {
+                            return ClientError::Closed;
+                        }
+                    }
+                    None => return ClientError::Closed, // the engine dropped our command channel
+                },
+                _ = ping.tick() => {
+                    if writer.send(&Packet::PingReq).await.is_err() {
+                        return ClientError::Closed;
+                    }
+                }
+            }
+        }
     }
 }
 

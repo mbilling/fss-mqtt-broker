@@ -10,16 +10,24 @@ tasks:
     evidence: "crates/mqtt-bridge: MqttClient (connect over plain TCP / TLS-mTLS via mqtt-net, CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PING/DISCONNECT, next_event loop) on mqtt-codec/mqtt-net; binary skeleton. Test the_client_connects_subscribes_and_round_trips_a_publish (against an in-process mqttd; the hop-count User Property survives the broker hop now that ADR 0030 forwards it) + connect_refused_surfaces_as_an_error."
   - id: 0025-T2
     title: Config model and validation (upstreams, per-rule direction/filter/remap/qos, deny-by-default)
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "config.rs: BridgeConfig (TOML, deny_unknown_fields) — local endpoint + N upstreams, each with direction/filter/remap/qos rules; validate() rejects a zero hop limit, malformed filters, duplicate upstream names, an mTLS half-identity, and both password sources. 9 tests."
   - id: 0025-T3
     title: Client engine (connect cluster + each upstream over TLS/mTLS, subscribe/publish, reconnect with backoff)
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "engine.rs Bridge::start — one supervised connection per side (connect, subscribe per direction, MqttClient::run pump, reconnect with bounded backoff), a central router, clean shutdown. client.rs gained Command + run (concurrent read/write select). Integration test a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back over two in-process brokers."
   - id: 0025-T4
     title: Directional forwarding and topic remap; a one-way rule never opens the reverse path in code
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "forward::plan_forwards — local-origin only forwards out (out/both rules), upstream-origin only forwards in (in/both); a one-way rule cannot produce a reverse forward, AND local/upstream_subscriptions never subscribe the closed side. apply_remap (strip+prefix). Tests a_one_way_out/in_rule_never_forwards_*, subscriptions_follow_direction + the live no-leak integration test."
   - id: 0025-T5
     title: Loop prevention via fss-bridge-hop-count user property + configurable hop-count-limit (plus remap discipline)
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "read_hop_count/set_hop_count (preserve other user properties, drop connection-scoped props); plan_forwards drops a message at hop_count_limit; the router stamps hop+1 on each forward. Unblocked by ADR 0030 (user properties survive the broker hop). Tests the_hop_limit_drops_a_message_at_the_limit, hop_count_reads_default_zero_and_increments_preserving_other_props + the live integration test (hop-count=1 observed)."
   - id: 0025-T6
     title: HA via cluster-side shared subscriptions and a persistent session (dedup across instances)
     status: planned
@@ -72,10 +80,10 @@ one-way-never-leaks-reverse property as the central adversarial test.
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
 | 0025-T1 | ✅ done | 2026-06-25 | "crates/mqtt-bridge: MqttClient (connect over plain TCP / TLS-mTLS via mqtt-net, CONNECT/SUBSCRIBE/PUBLISH/PUBACK/PING/DISCONNECT, next_event loop) on mqtt-codec/mqtt-net; binary skeleton. Test the_client_connects_subscribes_and_round_trips_a_publish (against an in-process mqttd; the hop-count User Property survives the broker hop now that ADR 0030 forwards it) + connect_refused_surfaces_as_an_error." |
-| 0025-T2 | ⬜ planned | — |  |
-| 0025-T3 | ⬜ planned | — |  |
-| 0025-T4 | ⬜ planned | — |  |
-| 0025-T5 | ⬜ planned | — |  |
+| 0025-T2 | ✅ done | 2026-06-25 | "config.rs: BridgeConfig (TOML, deny_unknown_fields) — local endpoint + N upstreams, each with direction/filter/remap/qos rules; validate() rejects a zero hop limit, malformed filters, duplicate upstream names, an mTLS half-identity, and both password sources. 9 tests." |
+| 0025-T3 | ✅ done | 2026-06-25 | "engine.rs Bridge::start — one supervised connection per side (connect, subscribe per direction, MqttClient::run pump, reconnect with bounded backoff), a central router, clean shutdown. client.rs gained Command + run (concurrent read/write select). Integration test a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back over two in-process brokers." |
+| 0025-T4 | ✅ done | 2026-06-25 | "forward::plan_forwards — local-origin only forwards out (out/both rules), upstream-origin only forwards in (in/both); a one-way rule cannot produce a reverse forward, AND local/upstream_subscriptions never subscribe the closed side. apply_remap (strip+prefix). Tests a_one_way_out/in_rule_never_forwards_*, subscriptions_follow_direction + the live no-leak integration test." |
+| 0025-T5 | ✅ done | 2026-06-25 | "read_hop_count/set_hop_count (preserve other user properties, drop connection-scoped props); plan_forwards drops a message at hop_count_limit; the router stamps hop+1 on each forward. Unblocked by ADR 0030 (user properties survive the broker hop). Tests the_hop_limit_drops_a_message_at_the_limit, hop_count_reads_default_zero_and_increments_preserving_other_props + the live integration test (hop-count=1 observed)." |
 | 0025-T6 | ⬜ planned | — |  |
 | 0025-T7 | ⬜ planned | — |  |
 | 0025-T8 | ⬜ planned | — |  |
