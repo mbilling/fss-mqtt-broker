@@ -121,8 +121,13 @@ be reproduced blind. That is how the second flaky test in this very effort was i
   durational. Generous fixed waits are reserved for genuine time semantics (§3).
 - **A full deterministic-simulation harness** (madsim/turmoil-style: deterministic scheduler +
   simulated network + virtual clock, reproducible from a seed). The gold standard for
-  *distributed* ordering races, recorded as the ambitious end-state (`0024-T7`, deferred). It
-  is a large investment; the per-test causal barriers and bounded poll-retry close the flakes
-  seen today without it.
+  *distributed* ordering races (`0024-T7`). **Realized for the SWIM layer** — the flake-prone
+  one — as an in-house, dependency-free harness (`tests/swim_sim.rs`): N pure `Swim` state
+  machines over a virtual clock + a seeded simulated network (loss, reordering, partitions),
+  every choice from one seed. Building it required making `Swim` deterministic (its internal
+  `HashMap` iteration was leaking process-random order into probe/gossip selection). The
+  async-I/O-entangled openraft lease layer is the remaining extension. The per-test causal
+  barriers and bounded poll-retry remain the day-to-day defence; the harness is the
+  seed-reproducible backstop for the membership protocol.
 - **Retry the whole Test step on failure.** Rejected: it masks real failures and reruns the
   entire suite; the annotation diagnostic plus fixing the causes is the durable path.

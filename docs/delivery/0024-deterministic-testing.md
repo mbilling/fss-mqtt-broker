@@ -35,8 +35,9 @@ tasks:
     evidence: common/mod.rs shared RECV_TIMEOUT 2s -> 10s (off-loop redb recovery under load); v5_protocol session-expiry e2e 2.5s -> 4s (sweep slips under load, cannot probe without cancelling expiry); conn connection-task joins 1s -> 10s
   - id: 0024-T7
     title: Deterministic simulation harness (madsim/turmoil-style) for seed-reproducible cluster ordering races
-    status: deferred
-    notes: the gold standard for distributed ordering races, but a large investment; per-test causal barriers (T5) and bounded poll-retry close the flakes seen today without it. Revisit if cluster-ordering flakes recur or a seed-reproducible failure is needed.
+    status: done
+    date: 2026-06-25
+    evidence: "crates/mqtt-cluster/tests/swim_sim.rs — a deterministic, seed-reproducible simulation of the SWIM membership protocol: N pure Swim state machines over a virtual ms clock + a seeded-xorshift simulated network (latency, loss, reordering, partitions), every choice from ONE seed, so a run is a pure function of the seed and a failure reruns identically (REPRO_SEED narrows to one). Enabled by making Swim deterministic — its internal HashMap/HashSet → BTreeMap/BTreeSet (HashMap iteration order leaked process-random order into probe/gossip selection; member sets are tiny so no cost) — verified by all 26 swim unit tests + the real-UDP swim_cluster test still green. Scenarios, 48 seeds each: convergence under 20% loss + reordering; a stopped node detected Dead by every survivor; a healed partition reconverges; plus a same-seed-same-run reproducibility check. Scope: the SWIM layer (the flake-prone one that produced the real flakes); the openraft lease/replication layer is async-I/O-entangled — the natural extension once a seam exists to drive it deterministically. No new dependencies."
 ---
 
 # Delivery — ADR 0024: Deterministic testing
@@ -71,11 +72,19 @@ end-state.
 | 0024-T4 | ✅ done | 2026-06-23 | crates/mqttd/src/clock.rs Clock trait + SystemClock + system_clock(); Hub holds clock Arc<dyn Clock> with attach_clock; queued_message_expires_once_its_interval_elapses and the survives-while-fresh companion drive a TestClock (advance only), with a FIFO-flush barrier so the synchronous advance cannot outrun the async enqueue |
 | 0024-T5 | ✅ done | 2026-06-23 | publish_retained_acked (QoS1 + PUBACK) barrier removes the store-vs-subscribe race in cluster_chaos + v5_protocol; swim_cluster a_replayed_v3_datagram_is_dropped awaits the fresh Ping's Ack before replaying; bounded poll-retry confirmed prevailing (wait_until / wait_for_kind / durable retry loops); each verified under 8-core saturation |
 | 0024-T6 | ✅ done | 2026-06-22 | common/mod.rs shared RECV_TIMEOUT 2s -> 10s (off-loop redb recovery under load); v5_protocol session-expiry e2e 2.5s -> 4s (sweep slips under load, cannot probe without cancelling expiry); conn connection-task joins 1s -> 10s |
-| 0024-T7 | 💤 deferred | — | the gold standard for distributed ordering races, but a large investment; per-test causal barriers (T5) and bounded poll-retry close the flakes seen today without it. Revisit if cluster-ordering flakes recur or a seed-reproducible failure is needed. |
+| 0024-T7 | ✅ done | 2026-06-25 | "crates/mqtt-cluster/tests/swim_sim.rs — a deterministic, seed-reproducible simulation of the SWIM membership protocol: N pure Swim state machines over a virtual ms clock + a seeded-xorshift simulated network (latency, loss, reordering, partitions), every choice from ONE seed, so a run is a pure function of the seed and a failure reruns identically (REPRO_SEED narrows to one). Enabled by making Swim deterministic — its internal HashMap/HashSet → BTreeMap/BTreeSet (HashMap iteration order leaked process-random order into probe/gossip selection; member sets are tiny so no cost) — verified by all 26 swim unit tests + the real-UDP swim_cluster test still green. Scenarios, 48 seeds each: convergence under 20% loss + reordering; a stopped node detected Dead by every survivor; a healed partition reconverges; plus a same-seed-same-run reproducibility check. Scope: the SWIM layer (the flake-prone one that produced the real flakes); the openraft lease/replication layer is async-I/O-entangled — the natural extension once a seam exists to drive it deterministically. No new dependencies." |
 <!-- /status-table:0024 -->
 
 ## Changelog
 
+- **2026-06-25** — T7 landed, scoped to the SWIM layer: a deterministic, seed-reproducible
+  simulation harness (`tests/swim_sim.rs`) — N pure `Swim` state machines over a virtual
+  clock + a seeded simulated network. Building it required making `Swim` deterministic
+  (`HashMap`/`HashSet` → `BTreeMap`/`BTreeSet`): its `HashMap` iteration order was leaking
+  process-random order into probe/gossip selection, which a reproducible harness cannot
+  tolerate — a latent non-determinism the harness itself surfaced. Convergence-under-loss,
+  failure detection, and partition-heal each hold across 48 seeds; the openraft lease layer
+  (async-I/O-entangled) remains the natural extension. No new dependencies.
 - **2026-06-23** — ADR ratified after the practice was applied across the suite. T1/T2/T6
   (CI gate, self-describing failures, margined backstops) landed during the CI-stabilization
   pass; T3/T4/T5 (virtual time, the `Clock` seam, causal synchronization) landed in the

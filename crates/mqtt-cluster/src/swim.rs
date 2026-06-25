@@ -22,7 +22,11 @@
 
 use crate::NodeId;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+// BTreeMap/BTreeSet (not Hash*) so iteration order is deterministic: the SWIM state machine
+// is then a pure function of its inputs, which the deterministic simulation harness
+// (ADR 0024-T7, tests/swim_sim.rs) relies on for seed-reproducible runs. Member sets are
+// small, so the ordered-map cost is irrelevant.
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A node-controlled version counter used to order conflicting membership claims.
 pub type Incarnation = u64;
@@ -125,7 +129,7 @@ pub struct Member {
     /// Distinct nodes that independently suspect this member at its current incarnation
     /// (ADR 0016 §3). Its size shrinks the effective suspicion window; reset whenever the
     /// member's `(incarnation, state)` identity changes.
-    suspecters: HashSet<NodeId>,
+    suspecters: BTreeSet<NodeId>,
 }
 
 /// A membership update disseminated via gossip.
@@ -237,7 +241,7 @@ pub struct Swim {
     local_peer_addr: String,
     incarnation: Incarnation,
     cfg: Config,
-    members: HashMap<NodeId, Member>,
+    members: BTreeMap<NodeId, Member>,
     seeds: Vec<String>,
     /// Updates pending dissemination, each with a remaining re-broadcast count.
     gossip: Vec<(Update, u32)>,
@@ -245,7 +249,7 @@ pub struct Swim {
     probe: Option<Probe>,
     seq: u64,
     /// Relayed probes we issued for a `PingReq`: our seq -> (requester addr, target).
-    relays: HashMap<u64, (String, NodeId)>,
+    relays: BTreeMap<u64, (String, NodeId)>,
     probe_order: Vec<NodeId>,
     probe_idx: usize,
     rng: u64,
@@ -285,13 +289,13 @@ impl Swim {
             local_peer_addr,
             incarnation: 1,
             cfg,
-            members: HashMap::new(),
+            members: BTreeMap::new(),
             seeds,
             gossip: Vec::new(),
             next_probe_at: 0,
             probe: None,
             seq: 0,
-            relays: HashMap::new(),
+            relays: BTreeMap::new(),
             probe_order: Vec::new(),
             probe_idx: 0,
             rng: rng | 1,
@@ -515,11 +519,11 @@ impl Swim {
                     },
                     suspecters: match (u.state, &u.suspecter) {
                         (MemberState::Suspect, Some(sus)) => {
-                            let mut s = HashSet::new();
+                            let mut s = BTreeSet::new();
                             s.insert(NodeId(sus.clone()));
                             s
                         }
-                        _ => HashSet::new(),
+                        _ => BTreeSet::new(),
                     },
                 },
             );

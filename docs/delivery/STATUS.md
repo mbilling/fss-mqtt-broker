@@ -31,7 +31,7 @@
 | 0021 | Bounded lease-consensus voter set | Accepted | 9/9 done | — |
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
-| 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
+| 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 7/7 done | — |
 | 0025 | Boundary MQTT bridge to brokers in other security zones | Accepted | 11/11 done | — |
 | 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 7/7 done | — |
 | 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
@@ -102,10 +102,6 @@
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
 - `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
-
-**0024 — Deterministic testing: inject time, synchronize causally, gate in CI**
-
-- `0024-T7` 💤 deferred: Deterministic simulation harness (madsim/turmoil-style) for seed-reproducible cluster ordering races — the gold standard for distributed ordering races, but a large investment; per-test causal barriers (T5) and bounded poll-retry close the flakes seen today without it. Revisit if cluster-ordering flakes recur or a seed-reproducible failure is needed.
 
 **0030 — Forward MQTT 5 User Properties through delivery**
 
