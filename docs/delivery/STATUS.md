@@ -39,6 +39,7 @@
 | 0029 | Durable sessions by default | Accepted | 3/3 done | — |
 | 0030 | Forward MQTT 5 User Properties through delivery | Accepted | 5/5 done | — |
 | 0031 | Bind the session to the authenticated identity | Proposed | 0/6 done | 6 open |
+| 0032 | Hot-reloadable security policy | Accepted | 0/9 done | 8 open, 1 deferred |
 
 ## Open and deferred work
 
@@ -112,3 +113,15 @@
 - `0031-T4` ⬜ planned: Anonymous-principal handling (shared namespace under allow_anonymous, documented as insecure-by-toggle)
 - `0031-T5` ⬜ planned: Optional authorize_connect(identity, client_id) Authorizer hook + ACL syntax for id-namespacing policy
 - `0031-T6` ⬜ planned: Adversarial tests (a different principal never resumes/takes over another's session; same principal always can; cross-node; offline-queue inheritance blocked)
+
+**0032 — Hot-reloadable security policy**
+
+- `0032-T1` ⬜ planned: Reloadable handles — Authorizer + Authenticator (+ TLS acceptor) behind tokio::sync::watch; connection reads the current value per check
+- `0032-T2` ⬜ planned: SIGHUP wiring + reload routine (re-read the configured files; build new values), extending the ADR 0019 signal task
+- `0032-T3` ⬜ planned: Validate-before-swap — a missing/unparseable file keeps the running policy unchanged (never fail open or brick); reload is all-or-nothing
+- `0032-T4` ⬜ planned: ACL hot-reload end to end — a tightened ACL denies an already-subscribed client's next publish/subscribe (live enforcement)
+- `0032-T5` ⬜ planned: Authenticator hot-reload end to end — a rotated password file / JWT key authenticates the new credential and rejects the old
+- `0032-T6` ⬜ planned: TLS material reload — a renewed cert/key/client-CA is served on the next handshake; in-flight TLS sessions are undisturbed
+- `0032-T7` ⬜ planned: Audit event (security.reload) + reload metric on every reload (success and rejection)
+- `0032-T8` ⬜ planned: Operator docs + README — SIGHUP, what reloads, the fail-safe (validate-before-swap) semantics
+- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — enabled by the T1/T6 reloadable verifier; tracked separately to avoid bundling a client-facing change with the consensus bus and the larger revocation surface (CRL parsing/distribution, OCSP).
