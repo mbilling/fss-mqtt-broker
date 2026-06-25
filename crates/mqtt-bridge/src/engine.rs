@@ -8,6 +8,7 @@
 //! destination sides — so all the security-relevant decisions live in the tested pure core,
 //! and this layer is just plumbing.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use crate::client::{Command, ConnectOptions, MqttClient, Transport};
 use crate::config::{BridgeConfig, Endpoint};
 use crate::forward::{plan_forwards, read_hop_count, set_hop_count, Side};
 use crate::metrics::{BridgeMetrics, CrossDirection};
+use crate::spool::{Spool, SpooledMessage};
 
 /// A fixed keepalive (seconds) for every bridge connection; the client pings at half this.
 const KEEP_ALIVE: u16 = 30;
@@ -59,6 +61,18 @@ impl Bridge {
         // One inbound channel into the router, tagged with the originating side.
         let (in_tx, in_rx) = mpsc::unbounded_channel::<(Side, Publish)>();
 
+        // Per-side store-and-forward spool + a connected flag the router consults: a forward
+        // to a connected side goes straight to its channel; a forward to a disconnected side
+        // is spooled (bounded) and replayed when the supervisor reconnects (§7).
+        let mut spools = Vec::with_capacity(n_sides);
+        let mut connected = Vec::with_capacity(n_sides);
+        spools.push(build_spool(&cfg, Side::Local));
+        connected.push(Arc::new(AtomicBool::new(false)));
+        for i in 0..cfg.upstreams.len() {
+            spools.push(build_spool(&cfg, Side::Upstream(i)));
+            connected.push(Arc::new(AtomicBool::new(false)));
+        }
+
         let mut tasks = Vec::new();
 
         // Local supervisor (side index 0).
@@ -69,6 +83,8 @@ impl Bridge {
             cmd_tx[0].clone(),
             in_tx.clone(),
             metrics.clone(),
+            spools[0].clone(),
+            connected[0].clone(),
         ));
         // Upstream supervisors. `cmd_rx.remove(0)` keeps popping the front as sides advance.
         for i in 0..cfg.upstreams.len() {
@@ -79,10 +95,19 @@ impl Bridge {
                 cmd_tx[i + 1].clone(),
                 in_tx.clone(),
                 metrics.clone(),
+                spools[i + 1].clone(),
+                connected[i + 1].clone(),
             ));
         }
 
-        tasks.push(spawn_router(cfg, cmd_tx, in_rx, metrics.clone()));
+        tasks.push(spawn_router(
+            cfg,
+            cmd_tx,
+            in_rx,
+            metrics.clone(),
+            spools,
+            connected,
+        ));
         Self { tasks, metrics }
     }
 
@@ -101,6 +126,7 @@ impl Bridge {
 }
 
 /// The per-side connection supervisor: (re)connect, subscribe, pump, backoff.
+#[allow(clippy::too_many_arguments)] // a supervisor wires together one side's channels + state
 fn spawn_supervisor(
     side: Side,
     cfg: Arc<BridgeConfig>,
@@ -108,6 +134,8 @@ fn spawn_supervisor(
     self_tx: mpsc::UnboundedSender<Command>,
     inbound_central: mpsc::UnboundedSender<(Side, Publish)>,
     metrics: Arc<BridgeMetrics>,
+    spool: Arc<Spool>,
+    connected: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     // Tag each inbound PUBLISH with this side before it reaches the router.
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Publish>();
@@ -153,7 +181,12 @@ fn spawn_supervisor(
                         });
                         pkid = pkid.wrapping_add(1).max(1);
                     }
+                    // Replay anything spooled while this side was down (§7), oldest first,
+                    // before opening the live fast path so order is preserved.
+                    replay_spool(&spool, &self_tx, side);
+                    connected.store(true, Ordering::SeqCst);
                     let err = client.run(&mut commands, &in_tx, KEEP_ALIVE).await;
+                    connected.store(false, Ordering::SeqCst);
                     warn!(?side, error = %err, "bridge side disconnected; reconnecting");
                 }
                 Err(e) => warn!(?side, addr = %opts.addr, error = %e, "bridge connect failed"),
@@ -170,10 +203,10 @@ fn spawn_router(
     cmd_tx: Vec<mpsc::UnboundedSender<Command>>,
     mut inbound: mpsc::UnboundedReceiver<(Side, Publish)>,
     metrics: Arc<BridgeMetrics>,
+    spools: Vec<Arc<Spool>>,
+    connected: Vec<Arc<AtomicBool>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // A per-side outbound packet-id cursor (each side's own QoS-1 id space).
-        let mut pkids = vec![0u16; cmd_tx.len()];
         while let Some((side, publish)) = inbound.recv().await {
             let hop = read_hop_count(&publish.properties);
             let forwards = plan_forwards(&cfg, side, &publish.topic, hop);
@@ -183,13 +216,6 @@ fn spawn_router(
             }
             for f in forwards {
                 let idx = side_index(f.dest);
-                let qos = qos_from_u8(f.qos);
-                let pkid = if qos == QoS::AtMostOnce {
-                    None
-                } else {
-                    pkids[idx] = pkids[idx].wrapping_add(1).max(1);
-                    Some(pkids[idx])
-                };
                 // Record + audit the crossing (the upstream involved is the non-local side).
                 let (dir, up_name) = match side {
                     Side::Local => (CrossDirection::Out, upstream_name(&cfg, f.dest)),
@@ -198,16 +224,94 @@ fn spawn_router(
                 metrics.forwarded(up_name, dir, &publish.topic, &f.topic);
                 // Forward the publisher's user properties, with the hop count incremented.
                 let properties = set_hop_count(&publish.properties, hop + 1);
-                let _ = cmd_tx[idx].send(Command::Publish {
-                    topic: f.topic,
-                    payload: publish.payload.clone(),
-                    qos,
-                    pkid,
+                if connected[idx].load(Ordering::SeqCst) {
+                    // Fast path: the destination is up — the run loop assigns the packet id.
+                    let _ = cmd_tx[idx].send(Command::Publish {
+                        topic: f.topic,
+                        payload: publish.payload.clone(),
+                        qos: qos_from_u8(f.qos),
+                        pkid: None,
+                        properties,
+                    });
+                } else {
+                    // The destination is down: spool it (bounded) for replay on reconnect (§7).
+                    let user_properties = properties
+                        .0
+                        .iter()
+                        .filter_map(|p| match p {
+                            mqtt_codec::Property::UserProperty(k, v) => {
+                                Some((k.clone(), v.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let spooled = SpooledMessage {
+                        topic: f.topic,
+                        payload: publish.payload.to_vec(),
+                        qos: f.qos,
+                        user_properties,
+                    };
+                    if let Err(e) = spools[idx].push(&spooled) {
+                        warn!(dest = idx, error = %e, "failed to spool a message for a down side");
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Build a side's spool: disk-backed under `spool.dir` when configured (so it survives a
+/// bridge restart), else in-memory — both bounded to `spool.max_messages` (§7).
+fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
+    let cap = cfg.spool.max_messages;
+    match &cfg.spool.dir {
+        Some(dir) => {
+            let file = match side {
+                Side::Local => "spool-local.redb".to_string(),
+                Side::Upstream(i) => format!("spool-upstream-{i}.redb"),
+            };
+            let path = std::path::Path::new(dir).join(file);
+            match Spool::on_disk(&path, cap) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    warn!(?side, error = %e, "disk spool unavailable; using an in-memory spool");
+                    Arc::new(Spool::in_memory(cap))
+                }
+            }
+        }
+        None => Arc::new(Spool::in_memory(cap)),
+    }
+}
+
+/// Replay every spooled message for a side onto its command channel, oldest first.
+fn replay_spool(spool: &Spool, self_tx: &mpsc::UnboundedSender<Command>, side: Side) {
+    match spool.drain() {
+        Ok(msgs) => {
+            if !msgs.is_empty() {
+                info!(
+                    ?side,
+                    count = msgs.len(),
+                    "replaying spooled messages on reconnect"
+                );
+            }
+            for m in msgs {
+                let properties = mqtt_codec::Properties(
+                    m.user_properties
+                        .into_iter()
+                        .map(|(k, v)| mqtt_codec::Property::UserProperty(k, v))
+                        .collect(),
+                );
+                let _ = self_tx.send(Command::Publish {
+                    topic: m.topic,
+                    payload: Bytes::from(m.payload),
+                    qos: qos_from_u8(m.qos),
+                    pkid: None,
                     properties,
                 });
             }
         }
-    })
+        Err(e) => warn!(?side, error = %e, "failed to drain the spool on reconnect"),
+    }
 }
 
 /// The configured name of the upstream involved in a side (for audit/metrics labels).

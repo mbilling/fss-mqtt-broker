@@ -1220,6 +1220,7 @@ dependencies = [
  "mqtt-observability",
  "mqtt-storage",
  "mqttd",
+ "redb",
  "rustls-pki-types",
  "serde",
  "tempfile",

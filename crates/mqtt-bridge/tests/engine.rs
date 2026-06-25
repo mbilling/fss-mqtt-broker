@@ -17,17 +17,23 @@ use mqttd::Hub;
 use tokio::net::TcpListener;
 
 async fn start_broker() -> SocketAddr {
-    let (hub, hub_tx) = Hub::new();
-    tokio::spawn(hub.run());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    serve_broker(listener);
+    addr
+}
+
+/// Start a broker on an already-bound listener (so a test can reserve a port, keep an
+/// upstream "down", then bring it up on the same address).
+fn serve_broker(listener: TcpListener) {
+    let (hub, hub_tx) = Hub::new();
+    tokio::spawn(hub.run());
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             tokio::spawn(mqttd::conn::handle(stream, hub_tx.clone()));
         }
     });
-    addr
 }
 
 async fn client(addr: SocketAddr, id: &str) -> MqttClient {
@@ -231,6 +237,88 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
 
     b1.shutdown();
     b2.shutdown();
+}
+
+/// ADR 0025-T7: messages destined for a **down** upstream are spooled (not lost) and
+/// replayed when it comes back.
+#[tokio::test]
+async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
+    let local = start_broker().await;
+    // Reserve an upstream address, then free it so the bridge's connects are refused (the
+    // upstream is "down").
+    let upstream_addr = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        [[upstreams]]
+        name = "down"
+        url = "{upstream_addr}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "t/#"
+        qos = 1
+        "#,
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+
+    // Let the local side connect; the upstream keeps failing (down).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Publish while the upstream is down → the router spools these for it.
+    let mut local_pub = client(local, "spool-pub").await;
+    for n in 1..=5u16 {
+        local_pub
+            .publish(
+                "t/x",
+                Bytes::from(format!("s{n}")),
+                QoS::AtLeastOnce,
+                Some(n),
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bring the upstream up on the reserved address, and subscribe before the bridge's
+    // backoff fires its reconnect (which replays the spool).
+    let listener = TcpListener::bind(upstream_addr).await.unwrap();
+    serve_broker(listener);
+    let mut up_sub = client(upstream_addr, "spool-up-sub").await;
+    subscribe(&mut up_sub, "t/#").await;
+
+    // The spooled messages replay to the upstream once the bridge reconnects.
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while seen.is_empty() {
+        if let Ok(Ok(Event::Publish(p))) =
+            tokio::time::timeout(Duration::from_millis(300), up_sub.next_event()).await
+        {
+            assert!(
+                p.payload.starts_with(b"s"),
+                "unexpected payload {:?}",
+                p.payload
+            );
+            seen.insert(p.payload.to_vec());
+            if let Some(id) = p.pkid {
+                up_sub.puback(id).await.unwrap();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "spooled messages never replayed after the upstream came back"
+        );
+    }
+
+    bridge.shutdown();
 }
 
 /// ADR 0025-T10 (loop bounding): a `both` rule with no remap echoes between local and

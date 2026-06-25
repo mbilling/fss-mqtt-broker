@@ -31,6 +31,36 @@ pub struct BridgeConfig {
     /// distinct `local.client_id` (a persistent session is per client).
     #[serde(default = "default_share_group")]
     pub share_group: String,
+    /// Store-and-forward spool settings (§7): bounded buffering for a momentarily-
+    /// unreachable side, replayed on reconnect.
+    #[serde(default)]
+    pub spool: Spool,
+}
+
+/// Store-and-forward spool configuration (§7).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spool {
+    /// Directory for the disk-backed spool; absent → an in-memory (still bounded) spool that
+    /// does not survive a bridge restart.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Per-side spool cap in messages (drop-oldest past it). Default 10000.
+    #[serde(default = "default_spool_max")]
+    pub max_messages: usize,
+}
+
+impl Default for Spool {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            max_messages: default_spool_max(),
+        }
+    }
+}
+
+fn default_spool_max() -> usize {
+    10_000
 }
 
 fn default_hop_limit() -> u32 {

@@ -338,6 +338,9 @@ impl MqttClient {
             mut writer,
         } = self;
         let mut ping = tokio::time::interval(ping_interval(keep_alive));
+        // One packet-id space per connection: the run loop assigns ids for QoS ≥ 1 so live
+        // and replayed (spooled) publishes never need the caller to track them.
+        let mut next_pkid: u16 = 0;
         loop {
             tokio::select! {
                 packet = reader.next_packet() => match packet {
@@ -376,12 +379,20 @@ impl MqttClient {
                         }
                     }
                     Some(Command::Publish { topic, payload, qos, pkid, properties }) => {
+                        let pkid = if qos == QoS::AtMostOnce {
+                            None
+                        } else {
+                            pkid.or_else(|| {
+                                next_pkid = next_pkid.wrapping_add(1).max(1);
+                                Some(next_pkid)
+                            })
+                        };
                         let pkt = Packet::Publish(Publish {
                             dup: false,
                             qos,
                             retain: false,
                             topic,
-                            pkid: if qos == QoS::AtMostOnce { None } else { pkid },
+                            pkid,
                             properties,
                             payload,
                         });
