@@ -307,12 +307,12 @@ mod tests {
             build_durable_node(node, placement, true, 5, None, None).await;
 
         let client = ClientId("c".to_string());
-        let msg = Message {
-            topic: "t".to_string(),
-            payload: bytes::Bytes::from_static(b"durable"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-        };
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"durable"),
+            QoS::AtLeastOnce,
+            false,
+        );
 
         // Poll until the driver has bootstrapped the lease group and assigned this
         // node its groups' leases, at which point the enqueue commits.
@@ -357,12 +357,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = NodeId("durable-restart".to_string());
         let client = ClientId("c".to_string());
-        let msg = Message {
-            topic: "t".to_string(),
-            payload: bytes::Bytes::from_static(b"durable"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-        };
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"durable"),
+            QoS::AtLeastOnce,
+            false,
+        );
 
         // --- lifetime #1: bootstrap on disk, become writable ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));

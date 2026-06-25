@@ -371,8 +371,11 @@ fn encode_message(m: &Message) -> Vec<u8> {
     out
 }
 
-/// Encode a queue entry: the message followed by its optional absolute expiry
-/// deadline (a presence flag, then a `u64` of Unix epoch seconds when present).
+/// Encode a queue entry: the message, its optional absolute expiry deadline (a presence
+/// flag, then a `u64` of Unix epoch seconds when present), and finally the publisher's
+/// User Properties (ADR 0030). The properties are written **last** so a record from an
+/// older build (no trailing bytes) still decodes — [`decode_queued`] reads them only if
+/// bytes remain, the same EOF-defaulting discipline as the session-expiry field.
 fn encode_queued(m: &Message, expiry_at: Option<u64>) -> Vec<u8> {
     let mut out = encode_message(m);
     match expiry_at {
@@ -381,6 +384,15 @@ fn encode_queued(m: &Message, expiry_at: Option<u64>) -> Vec<u8> {
             out.extend_from_slice(&deadline.to_be_bytes());
         }
         None => out.push(0),
+    }
+    // User Properties: a count, then each (key, value) string pair, in order. A count of
+    // 0 is still written so the field is present on new records (forward field after this
+    // would key off remaining bytes — there is none today, so this stays the last field).
+    let n = u32::try_from(m.user_properties.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&n.to_be_bytes());
+    for (k, v) in m.user_properties.iter().take(n as usize) {
+        put_str(&mut out, k);
+        put_str(&mut out, v);
     }
     out
 }
@@ -488,15 +500,20 @@ fn decode_queued(buf: &[u8]) -> Result<(Message, Option<u64>), StorageError> {
     let qos = qos_from_u8(r.u8()?)?;
     let retain = r.u8()? != 0;
     let expiry_at = if r.u8()? == 1 { Some(r.u64()?) } else { None };
-    Ok((
-        Message {
-            topic,
-            payload,
-            qos,
-            retain,
-        },
-        expiry_at,
-    ))
+    // User Properties (ADR 0030), present only on records written by a build that encodes
+    // them; an older record ends here and decodes to none (EOF-defaulted).
+    let mut user_properties = Vec::new();
+    if !r.is_empty() {
+        let n = r.u32()?;
+        for _ in 0..n {
+            let k = r.string()?;
+            let v = r.string()?;
+            user_properties.push((k, v));
+        }
+    }
+    let mut message = Message::new(topic, payload, qos, retain);
+    message.user_properties = user_properties;
+    Ok((message, expiry_at))
 }
 
 fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
@@ -553,12 +570,12 @@ mod tests {
     }
 
     fn msg(topic: &str, payload: &'static [u8], qos: QoS) -> Message {
-        Message {
-            topic: topic.to_string(),
-            payload: bytes::Bytes::from_static(payload),
+        Message::new(
+            topic.to_string(),
+            bytes::Bytes::from_static(payload),
             qos,
-            retain: false,
-        }
+            false,
+        )
     }
 
     fn sub(filter: &str, max_qos: QoS, no_local: bool) -> Subscription {
@@ -587,6 +604,47 @@ mod tests {
             .into_iter()
             .map(|m| m.offset)
             .collect()
+    }
+
+    /// ADR 0030: the durable queue codec round-trips User Properties, in order.
+    #[test]
+    fn queued_codec_round_trips_user_properties() {
+        let mut m = msg("t", b"p", QoS::AtLeastOnce);
+        m.user_properties = vec![("a".into(), "1".into()), ("b".into(), "two".into())];
+        let bytes = super::encode_queued(&m, Some(123));
+        let (back, expiry) = super::decode_queued(&bytes).unwrap();
+        assert_eq!(expiry, Some(123));
+        assert_eq!(back.user_properties, m.user_properties);
+    }
+
+    /// Backward compatibility: a record written before ADR 0030 (no trailing property
+    /// block) decodes to an empty User-Property set rather than erroring.
+    #[test]
+    fn queued_codec_reads_a_pre_0030_record_as_empty() {
+        let m = msg("t", b"p", QoS::AtLeastOnce);
+        // The pre-0030 on-disk format: message bytes then the expiry presence flag, and
+        // nothing after it.
+        let mut old = super::encode_message(&m);
+        old.push(0); // expiry absent
+        let (back, expiry) = super::decode_queued(&old).unwrap();
+        assert_eq!(expiry, None);
+        assert!(back.user_properties.is_empty());
+    }
+
+    /// End to end: User Properties survive a durable enqueue + replay (ADR 0030-T2).
+    #[tokio::test]
+    async fn user_properties_survive_enqueue_and_replay() {
+        let s = store();
+        let c = cid("c");
+        let mut m = msg("t", b"hi", QoS::AtLeastOnce);
+        m.user_properties = vec![("trace".into(), "xyz".into())];
+        s.enqueue(&c, &m).await.unwrap();
+        let pending = s.pending(&c, 0, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].message.user_properties,
+            vec![("trace".to_string(), "xyz".to_string())]
+        );
     }
 
     #[tokio::test]

@@ -956,13 +956,24 @@ where
     }
 }
 
-/// Convert a CONNECT's Last Will into a deferred will [`Message`].
+/// Convert a CONNECT's Last Will into a deferred will [`Message`], carrying the will's
+/// User Properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030).
 fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
+    let user_properties = w
+        .properties
+        .0
+        .iter()
+        .filter_map(|p| match p {
+            mqtt_codec::Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
     Message {
         topic: w.topic,
         payload: w.payload,
         qos: w.qos,
         retain: w.retain,
+        user_properties,
     }
 }
 
@@ -1233,6 +1244,17 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
     let message_expiry = publish.properties.message_expiry_interval();
+    // The publisher's User Properties, forwarded unaltered to subscribers (MQTT-3.3.2-17,
+    // ADR 0030), in wire order. Empty for v3.1.1 / a publish without any.
+    let user_properties: Vec<(String, String)> = publish
+        .properties
+        .0
+        .iter()
+        .filter_map(|p| match p {
+            mqtt_codec::Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
     // Resolve any topic alias to the full topic name before anything else sees it
     // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
     let alias = publish.properties.topic_alias();
@@ -1277,6 +1299,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 qos,
                 retain,
                 message_expiry,
+                user_properties,
             });
         }
     };

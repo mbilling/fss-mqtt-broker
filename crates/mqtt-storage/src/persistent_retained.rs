@@ -42,12 +42,12 @@ fn encode(m: &Message) -> Vec<u8> {
 fn decode(topic: &str, bytes: &[u8]) -> Option<Message> {
     let qos = QoS::from_u8(*bytes.first()?)?;
     let retain = *bytes.get(1)? != 0;
-    Some(Message {
-        topic: topic.to_string(),
-        payload: Bytes::copy_from_slice(&bytes[2..]),
+    Some(Message::new(
+        topic.to_string(),
+        Bytes::copy_from_slice(&bytes[2..]),
         qos,
         retain,
-    })
+    ))
 }
 
 /// A durable [`RetainedStore`] persisting to a `redb` file (ADR 0018 phase 4).
@@ -165,12 +165,12 @@ mod tests {
     use mqtt_core::{Message, QoS};
 
     fn msg(topic: &str, payload: &[u8]) -> Message {
-        Message {
-            topic: topic.to_string(),
-            payload: Bytes::copy_from_slice(payload),
-            qos: QoS::AtLeastOnce,
-            retain: true,
-        }
+        Message::new(
+            topic.to_string(),
+            Bytes::copy_from_slice(payload),
+            QoS::AtLeastOnce,
+            true,
+        )
     }
 
     /// Retained messages survive the database being closed and reopened, an empty

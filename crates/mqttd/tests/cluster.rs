@@ -7,7 +7,7 @@ use std::time::Duration;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{
     packet::{Connect, Publish, Subscribe, SubscribeFilter},
-    Packet, ProtocolVersion, QoS,
+    Packet, Property, ProtocolVersion, QoS,
 };
 use mqtt_storage::MemorySessionStore;
 use mqttd::Hub;
@@ -152,6 +152,57 @@ impl Client {
             .and_then(Result::ok)
             .flatten()
     }
+
+    /// Connect as an MQTT 5 client (so User Properties traverse the wire).
+    async fn connect_v5(addr: SocketAddr, id: &str) -> Self {
+        let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut c = Client {
+            reader: mqtt_net::FrameReader::new(rh, ProtocolVersion::V5),
+            writer: mqtt_net::FrameWriter::new(wh, ProtocolVersion::V5),
+        };
+        c.writer
+            .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
+                protocol: ProtocolVersion::V5,
+                clean_session: true,
+                keep_alive: 30,
+                client_id: id.to_string(),
+                last_will: None,
+                username: None,
+                password: None,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(c.recv().await, Some(Packet::ConnAck(_))));
+        c
+    }
+
+    /// Publish (`QoS` 0) with MQTT 5 User Properties.
+    async fn publish_with_props(
+        &mut self,
+        topic: &str,
+        payload: &'static [u8],
+        props: &[(&str, &str)],
+    ) {
+        let properties = mqtt_codec::Properties(
+            props
+                .iter()
+                .map(|(k, v)| Property::UserProperty((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+        self.writer
+            .send(&Packet::Publish(Publish {
+                properties,
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: topic.to_string(),
+                pkid: None,
+                payload: bytes::Bytes::from_static(payload),
+            }))
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -170,6 +221,49 @@ async fn publish_on_one_node_reaches_subscriber_on_another() {
         if let Some(Packet::Publish(p)) = sub.recv().await {
             assert_eq!(p.topic, "cluster/zone1/data");
             assert_eq!(&p.payload[..], b"cross-node");
+            return;
+        }
+        assert!(attempt < 49, "message never arrived across the cluster");
+    }
+}
+
+/// ADR 0030-T3: a publisher's User Properties are forwarded unaltered to a subscriber on
+/// **another** node (MQTT-3.3.2-17), so they survive the peer-link hop too.
+#[tokio::test]
+async fn user_properties_survive_cross_node_delivery() {
+    let (addr_a, addr_b) = start_two_node_cluster().await;
+
+    let mut sub = Client::connect_v5(addr_a, "sub-v5").await;
+    sub.subscribe("cluster/+/data").await;
+
+    let mut pubr = Client::connect_v5(addr_b, "pub-v5").await;
+
+    for attempt in 0..50 {
+        pubr.publish_with_props(
+            "cluster/zone1/data",
+            b"cross-node",
+            &[("fss-bridge-hop-count", "2"), ("trace", "abc")],
+        )
+        .await;
+        if let Some(Packet::Publish(p)) = sub.recv().await {
+            assert_eq!(&p.payload[..], b"cross-node");
+            let props: Vec<(String, String)> = p
+                .properties
+                .0
+                .iter()
+                .filter_map(|prop| match prop {
+                    Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                props,
+                vec![
+                    ("fss-bridge-hop-count".to_string(), "2".to_string()),
+                    ("trace".to_string(), "abc".to_string()),
+                ],
+                "user properties must cross the peer link unaltered and in order"
+            );
             return;
         }
         assert!(attempt < 49, "message never arrived across the cluster");

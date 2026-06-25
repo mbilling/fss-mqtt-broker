@@ -445,12 +445,12 @@ mod tests {
         ));
 
         let (group, client) = owned_group_and_client(&placement.read().unwrap());
-        let msg = Message {
-            topic: "t".to_string(),
-            payload: bytes::Bytes::from_static(b"durable"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-        };
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"durable"),
+            QoS::AtLeastOnce,
+            false,
+        );
         store.ensure_session(&client).await.unwrap();
         store.enqueue(&client, &msg).await.unwrap();
 
@@ -550,12 +550,12 @@ mod tests {
         ));
 
         let foreign = foreign_client(&placement.read().unwrap());
-        let msg = Message {
-            topic: "t".to_string(),
-            payload: bytes::Bytes::from_static(b"x"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-        };
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"x"),
+            QoS::AtLeastOnce,
+            false,
+        );
         let err = store.enqueue(&foreign, &msg).await.unwrap_err();
         assert!(
             err.is_transient(),

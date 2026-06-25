@@ -1207,12 +1207,12 @@ mod tests {
 
         let store = ReplicatedSessionStore::new(log);
         let c = ClientId("client".to_string());
-        let msg = Message {
-            topic: "t".to_string(),
-            payload: bytes::Bytes::from_static(b"payload"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-        };
+        let msg = Message::new(
+            "t".to_string(),
+            bytes::Bytes::from_static(b"payload"),
+            QoS::AtLeastOnce,
+            false,
+        );
         store.ensure_session(&c).await.unwrap();
         store.enqueue(&c, &msg).await.unwrap();
 

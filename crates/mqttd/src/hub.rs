@@ -340,6 +340,8 @@ pub enum HubCommand {
         /// MQTT 5.0 Message Expiry Interval in seconds, if the publisher set one.
         /// A queued copy past its deadline is dropped on replay (ADR 0009 §3).
         message_expiry: Option<u32>,
+        /// The publisher's MQTT 5 User Properties, forwarded unaltered (ADR 0030).
+        user_properties: Vec<(String, String)>,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -431,6 +433,8 @@ pub enum HubCommand {
         /// The publisher's Message Expiry Interval (seconds), carried across the link so
         /// the queued copy keeps its deadline (ADR 0015 T7). `None` = no expiry.
         message_expiry: Option<u32>,
+        /// The publisher's MQTT 5 User Properties, forwarded unaltered (ADR 0030).
+        user_properties: Vec<(String, String)>,
     },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
@@ -446,6 +450,8 @@ pub enum HubCommand {
         /// The publisher's Message Expiry Interval (seconds), carried across the link so
         /// the queued copy keeps its deadline (ADR 0014 T9). `None` = no expiry.
         message_expiry: Option<u32>,
+        /// The publisher's MQTT 5 User Properties, forwarded unaltered (ADR 0030).
+        user_properties: Vec<(String, String)>,
     },
     /// A durable-plane frame (consensus / session-log replication, ADR 0006/0007)
     /// from `node`, routed to the [`DurablePlane`]. The hub spawns its handling so
@@ -712,6 +718,7 @@ impl Hub {
                 qos,
                 retain,
                 message_expiry,
+                user_properties,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
@@ -719,8 +726,15 @@ impl Hub {
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
-                self.publish(&topic, &payload, qos, retain, message_expiry)
-                    .await;
+                self.publish(
+                    &topic,
+                    &payload,
+                    qos,
+                    retain,
+                    message_expiry,
+                    &user_properties,
+                )
+                .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
                 }
@@ -751,14 +765,22 @@ impl Hub {
                 qos,
                 retain,
                 message_expiry,
+                user_properties,
             } => {
                 // Forwarded from a peer: apply locally (deliver + store retained) but
                 // never re-forward. A retained copy updates this node's store so a
                 // later local subscriber sees it (ADR 0014). The publisher's message
                 // expiry is carried over the link (ADR 0014 T9), so a queued cross-node
-                // copy keeps the same deadline.
-                self.deliver(&topic, &payload, qos, retain, message_expiry)
-                    .await;
+                // copy keeps the same deadline. User Properties ride along (ADR 0030).
+                self.deliver(
+                    &topic,
+                    &payload,
+                    qos,
+                    retain,
+                    message_expiry,
+                    &user_properties,
+                )
+                .await;
             }
             HubCommand::PeerConnected { node, conn_id, tx } => {
                 self.peer_connected(node.clone(), conn_id, tx);
@@ -798,13 +820,21 @@ impl Hub {
                 payload,
                 qos,
                 message_expiry,
+                user_properties,
             } => {
                 // Targeted by a peer's shared selection: deliver to this one client
                 // (ADR 0015), never re-selected or re-forwarded. The publisher's message
                 // expiry is carried over the link (ADR 0015 T7) so a queued copy keeps its
-                // deadline.
-                self.deliver_to_client(&client, &topic, &payload, qos, message_expiry)
-                    .await;
+                // deadline. User Properties ride along (ADR 0030).
+                self.deliver_to_client(
+                    &client,
+                    &topic,
+                    &payload,
+                    qos,
+                    message_expiry,
+                    &user_properties,
+                )
+                .await;
             }
             // Client/session commands are handled in `dispatch`; they never route here.
             _ => {}
@@ -821,14 +851,29 @@ impl Hub {
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
-        self.deliver(topic, payload, qos, retain, message_expiry)
+        self.deliver(topic, payload, qos, retain, message_expiry, user_properties)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
         // node (ADR 0015), so this runs only for locally-originated publishes.
-        self.deliver_shared(topic, payload, qos, message_expiry)
+        self.deliver_shared(topic, payload, qos, message_expiry, user_properties)
             .await;
-        self.forward_to_peers(topic, payload, qos, retain, message_expiry);
+        self.forward_to_peers(topic, payload, qos, retain, message_expiry, user_properties);
+    }
+
+    /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
+    /// will's own User Properties (ADR 0030); a will never sets a message-expiry.
+    async fn publish_will(&mut self, w: &Message) {
+        self.publish(
+            &w.topic,
+            &w.payload,
+            w.qos,
+            w.retain,
+            None,
+            &w.user_properties,
+        )
+        .await;
     }
 
     /// Apply a message on this node: store/clear retained state and deliver to local
@@ -843,6 +888,7 @@ impl Hub {
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
         if retain {
             // A zero-length retained payload clears the retained message
@@ -852,13 +898,14 @@ impl Hub {
                 payload: payload.clone(),
                 qos,
                 retain: true,
+                user_properties: user_properties.to_vec(),
             };
             if let Err(e) = self.retained.set(&message).await {
                 warn!(topic = %topic, error = %e, "failed to update retained message");
             }
         }
         // Live deliveries carry retain=0 [MQTT-3.3.1-9].
-        self.deliver_local(topic, payload, qos, message_expiry)
+        self.deliver_local(topic, payload, qos, message_expiry, user_properties)
             .await;
     }
 
@@ -1018,8 +1065,7 @@ impl Hub {
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             if let Some(w) = old.will {
-                self.publish(&w.topic, &w.payload, w.qos, w.retain, None)
-                    .await;
+                self.publish_will(&w).await;
             }
         }
         self.online.insert(
@@ -1048,6 +1094,7 @@ impl Hub {
                         true,
                         false,
                         None,
+                        &p.message.user_properties,
                     ),
                     OutState::AwaitingPubComp => Packet::PubRel((*pkid).into()),
                 };
@@ -1168,6 +1215,7 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
         let targets: Vec<(ClientId, QoS)> = self
             .table
@@ -1180,8 +1228,15 @@ impl Hub {
             .collect();
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
         for (c, granted) in targets {
-            self.deliver_to_client(&c, topic, payload, min_qos(qos, granted), message_expiry)
-                .await;
+            self.deliver_to_client(
+                &c,
+                topic,
+                payload,
+                min_qos(qos, granted),
+                message_expiry,
+                user_properties,
+            )
+            .await;
         }
     }
 
@@ -1196,12 +1251,14 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
             qos,
             retain: false,
+            user_properties: user_properties.to_vec(),
         };
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             self.send_to_client(client, &tx, &message, false, message_expiry)
@@ -1266,6 +1323,7 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
         for (key, candidates) in self.shared_candidates(topic) {
             let Some(chosen) = self.select_shared(&key, &candidates) else {
@@ -1281,6 +1339,7 @@ impl Hub {
                         payload,
                         delivered_qos,
                         message_expiry,
+                        user_properties,
                     )
                     .await;
                 }
@@ -1292,6 +1351,7 @@ impl Hub {
                         payload,
                         delivered_qos,
                         message_expiry,
+                        user_properties,
                     );
                 }
             }
@@ -1390,6 +1450,7 @@ impl Hub {
                 false,
                 retain,
                 message_expiry,
+                &message.user_properties,
             ));
             return;
         }
@@ -1492,6 +1553,7 @@ impl Hub {
             false,
             retain,
             message_expiry,
+            &message.user_properties,
         ));
     }
 
@@ -1589,8 +1651,7 @@ impl Hub {
         if !graceful {
             if let Some(w) = departed.and_then(|o| o.will) {
                 info!(client = %client.0, topic = %w.topic, "publishing will (ungraceful disconnect)");
-                self.publish(&w.topic, &w.payload, w.qos, w.retain, None)
-                    .await;
+                self.publish_will(&w).await;
             }
         }
         // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
@@ -1803,6 +1864,7 @@ impl Hub {
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
         for (node, peer) in &self.peers {
             let interested = self
@@ -1816,6 +1878,7 @@ impl Hub {
                     qos: qos as u8,
                     retain,
                     message_expiry,
+                    user_properties: user_properties.to_vec(),
                 });
             }
         }
@@ -1854,11 +1917,14 @@ impl Hub {
             if have.contains(&topic) {
                 continue;
             }
+            // The retained-snapshot wire does not carry User Properties (a narrow gap, like
+            // the persistent-retained codec); a back-filled retained message has none.
             let message = Message {
                 topic,
                 payload,
                 qos,
                 retain: true,
+                user_properties: Vec::new(),
             };
             if self.retained.set(&message).await.is_ok() {
                 filled += 1;
@@ -1981,6 +2047,7 @@ impl Hub {
     }
 
     /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
+    #[allow(clippy::too_many_arguments)] // mirrors the SharedDeliver wire fields
     fn send_shared_to_peer(
         &self,
         node: &NodeId,
@@ -1989,6 +2056,7 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
+        user_properties: &[(String, String)],
     ) {
         if let Some(peer) = self.peers.get(node) {
             let _ = peer.tx.send(PeerMessage::SharedDeliver {
@@ -1997,6 +2065,7 @@ impl Hub {
                 payload: payload.to_vec(),
                 qos: qos as u8,
                 message_expiry,
+                user_properties: user_properties.to_vec(),
             });
         }
     }
@@ -2011,12 +2080,19 @@ fn publish_packet(
     dup: bool,
     retain: bool,
     message_expiry: Option<u32>,
+    user_properties: &[(String, String)],
 ) -> Packet {
     let mut properties = mqtt_codec::Properties::new();
     if let Some(secs) = message_expiry {
         properties
             .0
             .push(mqtt_codec::Property::MessageExpiryInterval(secs));
+    }
+    // Forward the publisher's User Properties unaltered (MQTT-3.3.2-17, ADR 0030), in order.
+    for (k, v) in user_properties {
+        properties
+            .0
+            .push(mqtt_codec::Property::UserProperty(k.clone(), v.clone()));
     }
     Packet::Publish(Publish {
         properties,
@@ -2409,6 +2485,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             message_expiry,
+            user_properties: Vec::new(),
         })
         .unwrap();
     }
@@ -2501,6 +2578,7 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
             message_expiry: None,
+            user_properties: Vec::new(),
         })
         .unwrap();
     }
@@ -3034,6 +3112,7 @@ mod tests {
                 payload: Bytes::from_static(b"x"),
                 qos: QoS::AtLeastOnce,
                 retain: false,
+                user_properties: Vec::new(),
             },
             retain: false,
             message_expiry: None,
@@ -3130,6 +3209,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: true,
             message_expiry: None,
+            user_properties: Vec::new(),
         })
         .unwrap();
     }
@@ -3441,6 +3521,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             message_expiry: None,
+            user_properties: Vec::new(),
         })
         .unwrap();
         // Neither peer may see anything further (n1's non-match included).

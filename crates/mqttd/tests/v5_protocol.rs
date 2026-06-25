@@ -10,7 +10,10 @@ mod common;
 use std::time::Duration;
 
 use common::{enhanced, start_broker, start_broker_with_policy, Client};
-use mqtt_codec::{packet::Connect, Packet, Properties, Property, ProtocolVersion, QoS};
+use mqtt_codec::{
+    packet::{Connect, LastWill},
+    Packet, Properties, Property, ProtocolVersion, QoS,
+};
 
 fn find<F, T>(props: &Properties, f: F) -> Option<T>
 where
@@ -54,6 +57,94 @@ async fn v5_connect_and_pubsub_roundtrip() {
     let p = sub.expect_publish().await;
     assert_eq!(p.topic, "sensors/kitchen/temp");
     assert_eq!(&p.payload[..], b"21.5C");
+}
+
+/// ADR 0030-T1: the broker forwards a publisher's User Properties unaltered to a
+/// subscriber (MQTT-3.3.2-17), in order.
+#[tokio::test]
+async fn v5_user_properties_are_forwarded_to_subscribers() {
+    let addr = start_broker().await;
+    let mut sub = Client::connect_v5_ok(addr, "up-sub").await;
+    sub.subscribe(1, "up/+", QoS::AtMostOnce).await;
+
+    let mut pubr = Client::connect_v5_ok(addr, "up-pub").await;
+    pubr.publish(
+        "up/x",
+        b"body",
+        QoS::AtMostOnce,
+        None,
+        vec![
+            Property::UserProperty("k1".into(), "v1".into()),
+            Property::UserProperty("k2".into(), "v2".into()),
+        ],
+    )
+    .await;
+
+    let p = sub.expect_publish().await;
+    let got: Vec<(String, String)> = p
+        .properties
+        .0
+        .iter()
+        .filter_map(|prop| match prop {
+            Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("k1".to_string(), "v1".to_string()),
+            ("k2".to_string(), "v2".to_string())
+        ]
+    );
+}
+
+/// ADR 0030-T4: a Will message's User Properties are forwarded when the will fires.
+#[tokio::test]
+async fn v5_will_user_properties_are_forwarded() {
+    let addr = start_broker().await;
+    let mut sub = Client::connect_v5_ok(addr, "will-up-sub").await;
+    sub.subscribe(1, "will/up", QoS::AtLeastOnce).await;
+
+    // A publisher whose Will carries a User Property, then an abrupt drop (no DISCONNECT).
+    let mut pubr = Client::open(addr, ProtocolVersion::V5).await;
+    pubr.send(&Packet::Connect(Connect {
+        properties: Properties::new(),
+        protocol: ProtocolVersion::V5,
+        clean_session: true,
+        keep_alive: 30,
+        client_id: "will-up-pub".to_string(),
+        last_will: Some(LastWill {
+            topic: "will/up".to_string(),
+            payload: bytes::Bytes::from_static(b"gone"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            properties: Properties(vec![Property::UserProperty(
+                "reason".into(),
+                "crash".into(),
+            )]),
+        }),
+        username: None,
+        password: None,
+    }))
+    .await;
+    match pubr.recv().await {
+        Packet::ConnAck(a) => assert_eq!(a.code, 0),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    drop(pubr); // abrupt close fires the will
+
+    let p = sub.expect_publish().await;
+    assert_eq!(p.topic, "will/up");
+    let reason = p.properties.0.iter().find_map(|prop| match prop {
+        Property::UserProperty(k, v) if k == "reason" => Some(v.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        reason.as_deref(),
+        Some("crash"),
+        "the will's user property must forward"
+    );
 }
 
 // --- session expiry (ADR 0009 phase 1) --------------------------------------

@@ -37,6 +37,7 @@
 | 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
 | 0028 | Link-gated lease-group voter admission | Accepted | 3/3 done | — |
 | 0029 | Durable sessions by default | Accepted | 3/3 done | — |
+| 0030 | Forward MQTT 5 User Properties through delivery | Accepted | 4/5 done | 1 deferred |
 
 ## Open and deferred work
 
@@ -119,3 +120,7 @@
 - `0025-T9` ⬜ planned: Bridge observability (forwarded/dropped per upstream+direction, lag, reconnects) via mqtt-observability + OTLP
 - `0025-T10` ⬜ planned: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
 - `0025-T11` ⬜ planned: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
+
+**0030 — Forward MQTT 5 User Properties through delivery**
+
+- `0030-T5` 💤 deferred: Remaining message-level application properties (content-type, response-topic, correlation-data, payload-format) — "Out of scope for the bridge-unblocking fix; User Properties are the explicit MUST (MQTT-3.3.2-17) and the only one ADR 0025 needs. Tracked here rather than silently omitted; same plumbing pattern as T1-T3 when done."

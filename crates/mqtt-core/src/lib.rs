@@ -45,6 +45,24 @@ pub struct Message {
     pub qos: QoS,
     /// Whether the broker should retain this message for the topic.
     pub retain: bool,
+    /// The publisher's MQTT 5 **User Properties**, in wire order. Forwarded unaltered to
+    /// subscribers per MQTT-3.3.2-17 (ADR 0030). Empty for v3.1.1 / no properties.
+    pub user_properties: Vec<(String, String)>,
+}
+
+impl Message {
+    /// A message with no User Properties — the common constructor for internally
+    /// generated messages (retained reconstructions, tests) that carry none.
+    #[must_use]
+    pub fn new(topic: TopicName, payload: bytes::Bytes, qos: QoS, retain: bool) -> Self {
+        Self {
+            topic,
+            payload,
+            qos,
+            retain,
+            user_properties: Vec::new(),
+        }
+    }
 }
 
 /// Returns whether a wildcard topic `filter` matches a concrete `topic`.

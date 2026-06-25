@@ -609,12 +609,12 @@ mod tests {
     }
 
     fn msg(topic: &str, payload: &'static [u8]) -> Message {
-        Message {
-            topic: topic.to_string(),
-            payload: bytes::Bytes::from_static(payload),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-        }
+        Message::new(
+            topic.to_string(),
+            bytes::Bytes::from_static(payload),
+            QoS::AtLeastOnce,
+            false,
+        )
     }
 
     #[tokio::test]

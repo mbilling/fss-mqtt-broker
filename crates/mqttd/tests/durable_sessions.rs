@@ -311,12 +311,12 @@ async fn enqueue_is_durable_across_a_three_node_cluster() {
     let owner = a.placement.read().unwrap().owner(&client.0);
     let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
 
-    let msg = Message {
-        topic: "t".to_string(),
-        payload: bytes::Bytes::from_static(b"survives"),
-        qos: QoS::AtLeastOnce,
-        retain: false,
-    };
+    let msg = Message::new(
+        "t".to_string(),
+        bytes::Bytes::from_static(b"survives"),
+        QoS::AtLeastOnce,
+        false,
+    );
 
     // Enqueue on the owner, polling until it COMMITS. A committed enqueue on a
     // three-node group required quorum (owner + ≥1 follower), so the message has
@@ -561,12 +561,12 @@ async fn a_queued_message_is_replayed_to_the_client_after_takeover() {
     // queue path is covered by unit tests; here we drive the durable queue directly so
     // the failover assertion is deterministic.)
     let cid = ClientId(client_id.to_string());
-    let msg = Message {
-        topic: "t".to_string(),
-        payload: bytes::Bytes::from_static(b"in-flight"),
-        qos: QoS::AtLeastOnce,
-        retain: false,
-    };
+    let msg = Message::new(
+        "t".to_string(),
+        bytes::Bytes::from_static(b"in-flight"),
+        QoS::AtLeastOnce,
+        false,
+    );
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         if owner_node.store.enqueue(&cid, &msg).await.is_ok() {
@@ -641,12 +641,12 @@ async fn a_replica_serves_the_session_after_the_owner_dies() {
     let client = ClientId("takeover-session-1".to_string());
     let owner = a.placement.read().unwrap().owner(&client.0);
     let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
-    let msg = Message {
-        topic: "t".to_string(),
-        payload: bytes::Bytes::from_static(b"survives-takeover"),
-        qos: QoS::AtLeastOnce,
-        retain: false,
-    };
+    let msg = Message::new(
+        "t".to_string(),
+        bytes::Bytes::from_static(b"survives-takeover"),
+        QoS::AtLeastOnce,
+        false,
+    );
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         if owner_node.store.enqueue(&client, &msg).await.is_ok() {
@@ -780,12 +780,12 @@ async fn a_bounded_voter_cluster_keeps_a_learner_owned_session_through_failures(
     );
 
     // Durably enqueue on the learner owner — quorum-replicated over its R=3 replica set.
-    let msg = Message {
-        topic: "t".to_string(),
-        payload: bytes::Bytes::from_static(b"learner-owned"),
-        qos: QoS::AtLeastOnce,
-        retain: false,
-    };
+    let msg = Message::new(
+        "t".to_string(),
+        bytes::Bytes::from_static(b"learner-owned"),
+        QoS::AtLeastOnce,
+        false,
+    );
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         if owner_node.store.enqueue(&client, &msg).await.is_ok() {
