@@ -34,6 +34,37 @@ pub struct Subscription {
     pub no_local: bool,
 }
 
+/// The MQTT 5 **application properties** a publisher sets that the broker forwards to
+/// subscribers unaltered (ADR 0030): the message-level properties that are part of the
+/// Application Message, not connection- or subscription-scoped (Topic Alias / Subscription
+/// Identifier are excluded; Message Expiry is handled separately for its decrement). Empty
+/// for v3.1.1 / a publish without any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppProperties {
+    /// `0x01` Payload Format Indicator (0 = bytes, 1 = UTF-8).
+    pub payload_format: Option<u8>,
+    /// `0x03` Content Type (a MIME-ish description of the payload).
+    pub content_type: Option<String>,
+    /// `0x08` Response Topic (request/response).
+    pub response_topic: Option<String>,
+    /// `0x09` Correlation Data (opaque request/response correlation token).
+    pub correlation_data: Option<bytes::Bytes>,
+    /// User Properties, in wire order (`0x26`, repeatable).
+    pub user_properties: Vec<(String, String)>,
+}
+
+impl AppProperties {
+    /// Whether no forwardable application property is present (the common case).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.payload_format.is_none()
+            && self.content_type.is_none()
+            && self.response_topic.is_none()
+            && self.correlation_data.is_none()
+            && self.user_properties.is_empty()
+    }
+}
+
 /// A message in flight through the broker.
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -45,13 +76,12 @@ pub struct Message {
     pub qos: QoS,
     /// Whether the broker should retain this message for the topic.
     pub retain: bool,
-    /// The publisher's MQTT 5 **User Properties**, in wire order. Forwarded unaltered to
-    /// subscribers per MQTT-3.3.2-17 (ADR 0030). Empty for v3.1.1 / no properties.
-    pub user_properties: Vec<(String, String)>,
+    /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+    pub app: AppProperties,
 }
 
 impl Message {
-    /// A message with no User Properties — the common constructor for internally
+    /// A message with no application properties — the common constructor for internally
     /// generated messages (retained reconstructions, tests) that carry none.
     #[must_use]
     pub fn new(topic: TopicName, payload: bytes::Bytes, qos: QoS, retain: bool) -> Self {
@@ -60,7 +90,7 @@ impl Message {
             payload,
             qos,
             retain,
-            user_properties: Vec::new(),
+            app: AppProperties::default(),
         }
     }
 }

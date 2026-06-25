@@ -36,8 +36,8 @@ use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
 use mqtt_core::{
-    parse_shared, topic_matches, ClientId, Message, SharedSubscriptionTable, Subscription,
-    SubscriptionTable,
+    parse_shared, topic_matches, AppProperties, ClientId, Message, SharedSubscriptionTable,
+    Subscription, SubscriptionTable,
 };
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore, StorageError,
@@ -340,8 +340,8 @@ pub enum HubCommand {
         /// MQTT 5.0 Message Expiry Interval in seconds, if the publisher set one.
         /// A queued copy past its deadline is dropped on replay (ADR 0009 §3).
         message_expiry: Option<u32>,
-        /// The publisher's MQTT 5 User Properties, forwarded unaltered (ADR 0030).
-        user_properties: Vec<(String, String)>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -433,8 +433,8 @@ pub enum HubCommand {
         /// The publisher's Message Expiry Interval (seconds), carried across the link so
         /// the queued copy keeps its deadline (ADR 0015 T7). `None` = no expiry.
         message_expiry: Option<u32>,
-        /// The publisher's MQTT 5 User Properties, forwarded unaltered (ADR 0030).
-        user_properties: Vec<(String, String)>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
     },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
@@ -450,8 +450,8 @@ pub enum HubCommand {
         /// The publisher's Message Expiry Interval (seconds), carried across the link so
         /// the queued copy keeps its deadline (ADR 0014 T9). `None` = no expiry.
         message_expiry: Option<u32>,
-        /// The publisher's MQTT 5 User Properties, forwarded unaltered (ADR 0030).
-        user_properties: Vec<(String, String)>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
     },
     /// A durable-plane frame (consensus / session-log replication, ADR 0006/0007)
     /// from `node`, routed to the [`DurablePlane`]. The hub spawns its handling so
@@ -718,7 +718,7 @@ impl Hub {
                 qos,
                 retain,
                 message_expiry,
-                user_properties,
+                app,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
@@ -726,15 +726,8 @@ impl Hub {
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
-                self.publish(
-                    &topic,
-                    &payload,
-                    qos,
-                    retain,
-                    message_expiry,
-                    &user_properties,
-                )
-                .await;
+                self.publish(&topic, &payload, qos, retain, message_expiry, &app)
+                    .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
                 }
@@ -765,22 +758,15 @@ impl Hub {
                 qos,
                 retain,
                 message_expiry,
-                user_properties,
+                app,
             } => {
                 // Forwarded from a peer: apply locally (deliver + store retained) but
                 // never re-forward. A retained copy updates this node's store so a
                 // later local subscriber sees it (ADR 0014). The publisher's message
                 // expiry is carried over the link (ADR 0014 T9), so a queued cross-node
                 // copy keeps the same deadline. User Properties ride along (ADR 0030).
-                self.deliver(
-                    &topic,
-                    &payload,
-                    qos,
-                    retain,
-                    message_expiry,
-                    &user_properties,
-                )
-                .await;
+                self.deliver(&topic, &payload, qos, retain, message_expiry, &app)
+                    .await;
             }
             HubCommand::PeerConnected { node, conn_id, tx } => {
                 self.peer_connected(node.clone(), conn_id, tx);
@@ -820,21 +806,14 @@ impl Hub {
                 payload,
                 qos,
                 message_expiry,
-                user_properties,
+                app,
             } => {
                 // Targeted by a peer's shared selection: deliver to this one client
                 // (ADR 0015), never re-selected or re-forwarded. The publisher's message
                 // expiry is carried over the link (ADR 0015 T7) so a queued copy keeps its
-                // deadline. User Properties ride along (ADR 0030).
-                self.deliver_to_client(
-                    &client,
-                    &topic,
-                    &payload,
-                    qos,
-                    message_expiry,
-                    &user_properties,
-                )
-                .await;
+                // deadline. Application properties ride along (ADR 0030).
+                self.deliver_to_client(&client, &topic, &payload, qos, message_expiry, &app)
+                    .await;
             }
             // Client/session commands are handled in `dispatch`; they never route here.
             _ => {}
@@ -851,29 +830,22 @@ impl Hub {
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
-        self.deliver(topic, payload, qos, retain, message_expiry, user_properties)
+        self.deliver(topic, payload, qos, retain, message_expiry, app)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
         // node (ADR 0015), so this runs only for locally-originated publishes.
-        self.deliver_shared(topic, payload, qos, message_expiry, user_properties)
+        self.deliver_shared(topic, payload, qos, message_expiry, app)
             .await;
-        self.forward_to_peers(topic, payload, qos, retain, message_expiry, user_properties);
+        self.forward_to_peers(topic, payload, qos, retain, message_expiry, app);
     }
 
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
-    /// will's own User Properties (ADR 0030); a will never sets a message-expiry.
+    /// will's own application properties (ADR 0030); a will never sets a message-expiry.
     async fn publish_will(&mut self, w: &Message) {
-        self.publish(
-            &w.topic,
-            &w.payload,
-            w.qos,
-            w.retain,
-            None,
-            &w.user_properties,
-        )
-        .await;
+        self.publish(&w.topic, &w.payload, w.qos, w.retain, None, &w.app)
+            .await;
     }
 
     /// Apply a message on this node: store/clear retained state and deliver to local
@@ -888,7 +860,7 @@ impl Hub {
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
         if retain {
             // A zero-length retained payload clears the retained message
@@ -898,14 +870,14 @@ impl Hub {
                 payload: payload.clone(),
                 qos,
                 retain: true,
-                user_properties: user_properties.to_vec(),
+                app: app.clone(),
             };
             if let Err(e) = self.retained.set(&message).await {
                 warn!(topic = %topic, error = %e, "failed to update retained message");
             }
         }
         // Live deliveries carry retain=0 [MQTT-3.3.1-9].
-        self.deliver_local(topic, payload, qos, message_expiry, user_properties)
+        self.deliver_local(topic, payload, qos, message_expiry, app)
             .await;
     }
 
@@ -1094,7 +1066,7 @@ impl Hub {
                         true,
                         false,
                         None,
-                        &p.message.user_properties,
+                        &p.message.app,
                     ),
                     OutState::AwaitingPubComp => Packet::PubRel((*pkid).into()),
                 };
@@ -1215,7 +1187,7 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
         let targets: Vec<(ClientId, QoS)> = self
             .table
@@ -1234,7 +1206,7 @@ impl Hub {
                 payload,
                 min_qos(qos, granted),
                 message_expiry,
-                user_properties,
+                app,
             )
             .await;
         }
@@ -1251,14 +1223,14 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
             qos,
             retain: false,
-            user_properties: user_properties.to_vec(),
+            app: app.clone(),
         };
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             self.send_to_client(client, &tx, &message, false, message_expiry)
@@ -1323,7 +1295,7 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
         for (key, candidates) in self.shared_candidates(topic) {
             let Some(chosen) = self.select_shared(&key, &candidates) else {
@@ -1339,7 +1311,7 @@ impl Hub {
                         payload,
                         delivered_qos,
                         message_expiry,
-                        user_properties,
+                        app,
                     )
                     .await;
                 }
@@ -1351,7 +1323,7 @@ impl Hub {
                         payload,
                         delivered_qos,
                         message_expiry,
-                        user_properties,
+                        app,
                     );
                 }
             }
@@ -1450,7 +1422,7 @@ impl Hub {
                 false,
                 retain,
                 message_expiry,
-                &message.user_properties,
+                &message.app,
             ));
             return;
         }
@@ -1553,7 +1525,7 @@ impl Hub {
             false,
             retain,
             message_expiry,
-            &message.user_properties,
+            &message.app,
         ));
     }
 
@@ -1864,7 +1836,7 @@ impl Hub {
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
         for (node, peer) in &self.peers {
             let interested = self
@@ -1878,7 +1850,7 @@ impl Hub {
                     qos: qos as u8,
                     retain,
                     message_expiry,
-                    user_properties: user_properties.to_vec(),
+                    app: app_to_wire(app),
                 });
             }
         }
@@ -1917,14 +1889,15 @@ impl Hub {
             if have.contains(&topic) {
                 continue;
             }
-            // The retained-snapshot wire does not carry User Properties (a narrow gap, like
-            // the persistent-retained codec); a back-filled retained message has none.
+            // The retained-snapshot wire does not carry application properties (a narrow
+            // gap, like the persistent-retained codec); a back-filled retained message
+            // has none.
             let message = Message {
                 topic,
                 payload,
                 qos,
                 retain: true,
-                user_properties: Vec::new(),
+                app: AppProperties::default(),
             };
             if self.retained.set(&message).await.is_ok() {
                 filled += 1;
@@ -2056,7 +2029,7 @@ impl Hub {
         payload: &Bytes,
         qos: QoS,
         message_expiry: Option<u32>,
-        user_properties: &[(String, String)],
+        app: &AppProperties,
     ) {
         if let Some(peer) = self.peers.get(node) {
             let _ = peer.tx.send(PeerMessage::SharedDeliver {
@@ -2065,9 +2038,31 @@ impl Hub {
                 payload: payload.to_vec(),
                 qos: qos as u8,
                 message_expiry,
-                user_properties: user_properties.to_vec(),
+                app: app_to_wire(app),
             });
         }
+    }
+}
+
+/// Convert in-memory application properties to their cross-node wire form (ADR 0030).
+pub(crate) fn app_to_wire(a: &AppProperties) -> mqtt_cluster::peer::WireAppProps {
+    mqtt_cluster::peer::WireAppProps {
+        payload_format: a.payload_format,
+        content_type: a.content_type.clone(),
+        response_topic: a.response_topic.clone(),
+        correlation_data: a.correlation_data.as_ref().map(|b| b.to_vec()),
+        user_properties: a.user_properties.clone(),
+    }
+}
+
+/// Convert cross-node wire application properties back to the in-memory form.
+pub(crate) fn app_from_wire(w: mqtt_cluster::peer::WireAppProps) -> AppProperties {
+    AppProperties {
+        payload_format: w.payload_format,
+        content_type: w.content_type,
+        response_topic: w.response_topic,
+        correlation_data: w.correlation_data.map(Bytes::from),
+        user_properties: w.user_properties,
     }
 }
 
@@ -2080,19 +2075,30 @@ fn publish_packet(
     dup: bool,
     retain: bool,
     message_expiry: Option<u32>,
-    user_properties: &[(String, String)],
+    app: &AppProperties,
 ) -> Packet {
+    use mqtt_codec::Property;
     let mut properties = mqtt_codec::Properties::new();
     if let Some(secs) = message_expiry {
-        properties
-            .0
-            .push(mqtt_codec::Property::MessageExpiryInterval(secs));
+        properties.0.push(Property::MessageExpiryInterval(secs));
     }
-    // Forward the publisher's User Properties unaltered (MQTT-3.3.2-17, ADR 0030), in order.
-    for (k, v) in user_properties {
+    // Forward the publisher's application properties unaltered (MQTT-3.3.2-17, ADR 0030).
+    if let Some(pf) = app.payload_format {
+        properties.0.push(Property::PayloadFormatIndicator(pf));
+    }
+    if let Some(ct) = &app.content_type {
+        properties.0.push(Property::ContentType(ct.clone()));
+    }
+    if let Some(rt) = &app.response_topic {
+        properties.0.push(Property::ResponseTopic(rt.clone()));
+    }
+    if let Some(cd) = &app.correlation_data {
+        properties.0.push(Property::CorrelationData(cd.clone()));
+    }
+    for (k, v) in &app.user_properties {
         properties
             .0
-            .push(mqtt_codec::Property::UserProperty(k.clone(), v.clone()));
+            .push(Property::UserProperty(k.clone(), v.clone()));
     }
     Packet::Publish(Publish {
         properties,
@@ -2186,7 +2192,7 @@ mod tests {
     use mqtt_cluster::peer::PeerMessage;
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
-    use mqtt_core::ClientId;
+    use mqtt_core::{AppProperties, ClientId};
     use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
@@ -2485,7 +2491,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             message_expiry,
-            user_properties: Vec::new(),
+            app: AppProperties::default(),
         })
         .unwrap();
     }
@@ -2578,7 +2584,7 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
             message_expiry: None,
-            user_properties: Vec::new(),
+            app: AppProperties::default(),
         })
         .unwrap();
     }
@@ -3112,7 +3118,7 @@ mod tests {
                 payload: Bytes::from_static(b"x"),
                 qos: QoS::AtLeastOnce,
                 retain: false,
-                user_properties: Vec::new(),
+                app: AppProperties::default(),
             },
             retain: false,
             message_expiry: None,
@@ -3209,7 +3215,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: true,
             message_expiry: None,
-            user_properties: Vec::new(),
+            app: AppProperties::default(),
         })
         .unwrap();
     }
@@ -3521,7 +3527,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             message_expiry: None,
-            user_properties: Vec::new(),
+            app: AppProperties::default(),
         })
         .unwrap();
         // Neither peer may see anything further (n1's non-match included).

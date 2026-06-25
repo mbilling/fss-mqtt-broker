@@ -385,16 +385,52 @@ fn encode_queued(m: &Message, expiry_at: Option<u64>) -> Vec<u8> {
         }
         None => out.push(0),
     }
-    // User Properties: a count, then each (key, value) string pair, in order. A count of
-    // 0 is still written so the field is present on new records (forward field after this
-    // would key off remaining bytes — there is none today, so this stays the last field).
-    let n = u32::try_from(m.user_properties.len()).unwrap_or(u32::MAX);
+    // User Properties: a count, then each (key, value) string pair, in order.
+    let props = &m.app.user_properties;
+    let n = u32::try_from(props.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&n.to_be_bytes());
-    for (k, v) in m.user_properties.iter().take(n as usize) {
+    for (k, v) in props.iter().take(n as usize) {
         put_str(&mut out, k);
         put_str(&mut out, v);
     }
+    // The other forwardable application properties (ADR 0030-T5), appended after the user
+    // properties — each a presence flag then the value — so an older record (which ends at
+    // the user-property block) still decodes (EOF-defaulted in `decode_queued`).
+    put_opt_u8(&mut out, m.app.payload_format);
+    put_opt_str(&mut out, m.app.content_type.as_deref());
+    put_opt_str(&mut out, m.app.response_topic.as_deref());
+    put_opt_bytes(&mut out, m.app.correlation_data.as_deref());
     out
+}
+
+fn put_opt_u8(out: &mut Vec<u8>, v: Option<u8>) {
+    match v {
+        Some(b) => {
+            out.push(1);
+            out.push(b);
+        }
+        None => out.push(0),
+    }
+}
+
+fn put_opt_str(out: &mut Vec<u8>, v: Option<&str>) {
+    match v {
+        Some(s) => {
+            out.push(1);
+            put_str(out, s);
+        }
+        None => out.push(0),
+    }
+}
+
+fn put_opt_bytes(out: &mut Vec<u8>, v: Option<&[u8]>) {
+    match v {
+        Some(b) => {
+            out.push(1);
+            put_bytes(out, b);
+        }
+        None => out.push(0),
+    }
 }
 
 fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
@@ -500,19 +536,32 @@ fn decode_queued(buf: &[u8]) -> Result<(Message, Option<u64>), StorageError> {
     let qos = qos_from_u8(r.u8()?)?;
     let retain = r.u8()? != 0;
     let expiry_at = if r.u8()? == 1 { Some(r.u64()?) } else { None };
-    // User Properties (ADR 0030), present only on records written by a build that encodes
-    // them; an older record ends here and decodes to none (EOF-defaulted).
-    let mut user_properties = Vec::new();
+    // Application properties (ADR 0030), present only on records written by a build that
+    // encodes them; an older record ends here and decodes to none (EOF-defaulted).
+    let mut message = Message::new(topic, payload, qos, retain);
     if !r.is_empty() {
         let n = r.u32()?;
         for _ in 0..n {
             let k = r.string()?;
             let v = r.string()?;
-            user_properties.push((k, v));
+            message.app.user_properties.push((k, v));
+        }
+        // The other application properties (T5), each a presence flag then the value. A
+        // record written by the 0030-T1..T4 build ends after the user properties, so guard
+        // each read on remaining bytes too (EOF → absent).
+        if !r.is_empty() && r.u8()? == 1 {
+            message.app.payload_format = Some(r.u8()?);
+        }
+        if !r.is_empty() && r.u8()? == 1 {
+            message.app.content_type = Some(r.string()?);
+        }
+        if !r.is_empty() && r.u8()? == 1 {
+            message.app.response_topic = Some(r.string()?);
+        }
+        if !r.is_empty() && r.u8()? == 1 {
+            message.app.correlation_data = Some(bytes::Bytes::copy_from_slice(r.bytes()?));
         }
     }
-    let mut message = Message::new(topic, payload, qos, retain);
-    message.user_properties = user_properties;
     Ok((message, expiry_at))
 }
 
@@ -606,19 +655,24 @@ mod tests {
             .collect()
     }
 
-    /// ADR 0030: the durable queue codec round-trips User Properties, in order.
+    /// ADR 0030: the durable queue codec round-trips all forwardable application
+    /// properties — User Properties plus the T5 message-level ones — in order.
     #[test]
-    fn queued_codec_round_trips_user_properties() {
+    fn queued_codec_round_trips_application_properties() {
         let mut m = msg("t", b"p", QoS::AtLeastOnce);
-        m.user_properties = vec![("a".into(), "1".into()), ("b".into(), "two".into())];
+        m.app.user_properties = vec![("a".into(), "1".into()), ("b".into(), "two".into())];
+        m.app.payload_format = Some(1);
+        m.app.content_type = Some("application/json".into());
+        m.app.response_topic = Some("resp/x".into());
+        m.app.correlation_data = Some(bytes::Bytes::from_static(b"\x00\x01corr"));
         let bytes = super::encode_queued(&m, Some(123));
         let (back, expiry) = super::decode_queued(&bytes).unwrap();
         assert_eq!(expiry, Some(123));
-        assert_eq!(back.user_properties, m.user_properties);
+        assert_eq!(back.app, m.app);
     }
 
     /// Backward compatibility: a record written before ADR 0030 (no trailing property
-    /// block) decodes to an empty User-Property set rather than erroring.
+    /// block) decodes to empty application properties rather than erroring.
     #[test]
     fn queued_codec_reads_a_pre_0030_record_as_empty() {
         let m = msg("t", b"p", QoS::AtLeastOnce);
@@ -628,23 +682,21 @@ mod tests {
         old.push(0); // expiry absent
         let (back, expiry) = super::decode_queued(&old).unwrap();
         assert_eq!(expiry, None);
-        assert!(back.user_properties.is_empty());
+        assert!(back.app.is_empty());
     }
 
-    /// End to end: User Properties survive a durable enqueue + replay (ADR 0030-T2).
+    /// End to end: application properties survive a durable enqueue + replay (ADR 0030).
     #[tokio::test]
-    async fn user_properties_survive_enqueue_and_replay() {
+    async fn application_properties_survive_enqueue_and_replay() {
         let s = store();
         let c = cid("c");
         let mut m = msg("t", b"hi", QoS::AtLeastOnce);
-        m.user_properties = vec![("trace".into(), "xyz".into())];
+        m.app.user_properties = vec![("trace".into(), "xyz".into())];
+        m.app.content_type = Some("text/plain".into());
         s.enqueue(&c, &m).await.unwrap();
         let pending = s.pending(&c, 0, 10).await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(
-            pending[0].message.user_properties,
-            vec![("trace".to_string(), "xyz".to_string())]
-        );
+        assert_eq!(pending[0].message.app, m.app);
     }
 
     #[tokio::test]

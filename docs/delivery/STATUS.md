@@ -37,7 +37,7 @@
 | 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
 | 0028 | Link-gated lease-group voter admission | Accepted | 3/3 done | — |
 | 0029 | Durable sessions by default | Accepted | 3/3 done | — |
-| 0030 | Forward MQTT 5 User Properties through delivery | Accepted | 4/5 done | 1 deferred |
+| 0030 | Forward MQTT 5 User Properties through delivery | Accepted | 5/5 done | — |
 
 ## Open and deferred work
 
@@ -102,7 +102,3 @@
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
 - `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
-
-**0030 — Forward MQTT 5 User Properties through delivery**
-
-- `0030-T5` 💤 deferred: Remaining message-level application properties (content-type, response-topic, correlation-data, payload-format) — "Out of scope for the bridge-unblocking fix; User Properties are the explicit MUST (MQTT-3.3.2-17) and the only one ADR 0025 needs. Tracked here rather than silently omitted; same plumbing pattern as T1-T3 when done."

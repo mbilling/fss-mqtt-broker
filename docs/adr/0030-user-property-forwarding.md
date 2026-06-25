@@ -47,12 +47,12 @@ value must serialize over the cluster peer wire (bincode) and persist in the dur
 codec; `Property` is a codec type without those derives. Empty vec = none (the common case,
 zero overhead).
 
-Only **User Properties** are forwarded by this ADR. The other message-level application
-properties the spec also forwards (Payload Format Indicator, Content Type, Response Topic,
-Correlation Data) are a documented follow-up (delivery T6) — User Properties are the
-explicit `MUST`, the bridge's actual need, and a clean, self-contained first step. Topic
-Alias and Subscription Identifier are deliberately **not** forwarded: they are hop-by-hop /
-per-subscription, not part of the application message.
+**User Properties** ship first (T1–T4) — the explicit `MUST` and the bridge's actual need —
+then the other message-level application properties the spec also forwards (Payload Format
+Indicator, Content Type, Response Topic, Correlation Data) follow in T5, bundled with User
+Properties into one `AppProperties` value carried on `Message`. Topic Alias and Subscription
+Identifier are deliberately **not** forwarded: they are hop-by-hop / per-subscription, not
+part of the application message.
 
 ### 2. Ingestion and delivery
 

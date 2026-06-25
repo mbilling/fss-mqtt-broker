@@ -99,6 +99,59 @@ async fn v5_user_properties_are_forwarded_to_subscribers() {
     );
 }
 
+/// ADR 0030-T5: the broker forwards the other message-level application properties —
+/// Content Type, Response Topic, Correlation Data, Payload Format — unaltered, alongside
+/// User Properties.
+#[tokio::test]
+async fn v5_application_properties_are_forwarded_to_subscribers() {
+    let addr = start_broker().await;
+    let mut sub = Client::connect_v5_ok(addr, "ap-sub").await;
+    sub.subscribe(1, "ap/+", QoS::AtMostOnce).await;
+
+    let mut pubr = Client::connect_v5_ok(addr, "ap-pub").await;
+    pubr.publish(
+        "ap/x",
+        b"{}",
+        QoS::AtMostOnce,
+        None,
+        vec![
+            Property::PayloadFormatIndicator(1),
+            Property::ContentType("application/json".into()),
+            Property::ResponseTopic("ap/reply".into()),
+            Property::CorrelationData(bytes::Bytes::from_static(b"\x00\x01id")),
+            Property::UserProperty("trace".into(), "abc".into()),
+        ],
+    )
+    .await;
+
+    let p = sub.expect_publish().await;
+    let pf = find(&p.properties, |prop| match prop {
+        Property::PayloadFormatIndicator(v) => Some(*v),
+        _ => None,
+    });
+    let ct = find(&p.properties, |prop| match prop {
+        Property::ContentType(s) => Some(s.clone()),
+        _ => None,
+    });
+    let rt = find(&p.properties, |prop| match prop {
+        Property::ResponseTopic(s) => Some(s.clone()),
+        _ => None,
+    });
+    let cd = find(&p.properties, |prop| match prop {
+        Property::CorrelationData(b) => Some(b.clone()),
+        _ => None,
+    });
+    let up = find(&p.properties, |prop| match prop {
+        Property::UserProperty(k, v) if k == "trace" => Some(v.clone()),
+        _ => None,
+    });
+    assert_eq!(pf, Some(1));
+    assert_eq!(ct.as_deref(), Some("application/json"));
+    assert_eq!(rt.as_deref(), Some("ap/reply"));
+    assert_eq!(cd.as_deref(), Some(&b"\x00\x01id"[..]));
+    assert_eq!(up.as_deref(), Some("abc"));
+}
+
 /// ADR 0030-T4: a Will message's User Properties are forwarded when the will fires.
 #[tokio::test]
 async fn v5_will_user_properties_are_forwarded() {

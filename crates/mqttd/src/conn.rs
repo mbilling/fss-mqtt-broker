@@ -21,7 +21,7 @@ use mqtt_codec::{
     packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck},
     reason, Packet, ProtocolVersion, QoS,
 };
-use mqtt_core::{is_shared_filter, parse_shared, ClientId, Message};
+use mqtt_core::{is_shared_filter, parse_shared, AppProperties, ClientId, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
 use mqtt_observability::{AuditLog, AuditSink};
 use std::collections::HashSet;
@@ -957,24 +957,36 @@ where
 }
 
 /// Convert a CONNECT's Last Will into a deferred will [`Message`], carrying the will's
-/// User Properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030).
+/// application properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030).
 fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
-    let user_properties = w
-        .properties
-        .0
-        .iter()
-        .filter_map(|p| match p {
-            mqtt_codec::Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
-            _ => None,
-        })
-        .collect();
+    let app = app_properties(&w.properties);
     Message {
         topic: w.topic,
         payload: w.payload,
         qos: w.qos,
         retain: w.retain,
-        user_properties,
+        app,
     }
+}
+
+/// Extract the forwardable MQTT 5 application properties from a property block (ADR 0030):
+/// Payload Format Indicator, Content Type, Response Topic, Correlation Data, and User
+/// Properties (in wire order). Connection/subscription-scoped properties (Topic Alias,
+/// Subscription Identifier) and Message Expiry (handled separately) are not included.
+fn app_properties(props: &mqtt_codec::Properties) -> AppProperties {
+    use mqtt_codec::Property;
+    let mut app = AppProperties::default();
+    for p in &props.0 {
+        match p {
+            Property::PayloadFormatIndicator(v) => app.payload_format = Some(*v),
+            Property::ContentType(s) => app.content_type = Some(s.clone()),
+            Property::ResponseTopic(s) => app.response_topic = Some(s.clone()),
+            Property::CorrelationData(b) => app.correlation_data = Some(b.clone()),
+            Property::UserProperty(k, v) => app.user_properties.push((k.clone(), v.clone())),
+            _ => {}
+        }
+    }
+    app
 }
 
 /// Send a v5 DISCONNECT with `reason` and no properties.
@@ -1244,17 +1256,10 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
     let message_expiry = publish.properties.message_expiry_interval();
-    // The publisher's User Properties, forwarded unaltered to subscribers (MQTT-3.3.2-17,
-    // ADR 0030), in wire order. Empty for v3.1.1 / a publish without any.
-    let user_properties: Vec<(String, String)> = publish
-        .properties
-        .0
-        .iter()
-        .filter_map(|p| match p {
-            mqtt_codec::Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
-            _ => None,
-        })
-        .collect();
+    // The publisher's forwardable application properties (User Properties + Content Type,
+    // Response Topic, Correlation Data, Payload Format), forwarded unaltered to subscribers
+    // (MQTT-3.3.2-17, ADR 0030). Empty for v3.1.1 / a publish without any.
+    let app = app_properties(&publish.properties);
     // Resolve any topic alias to the full topic name before anything else sees it
     // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
     let alias = publish.properties.topic_alias();
@@ -1299,7 +1304,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 qos,
                 retain,
                 message_expiry,
-                user_properties,
+                app,
             });
         }
     };

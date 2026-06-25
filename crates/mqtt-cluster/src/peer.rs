@@ -22,6 +22,24 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// (ADR 0015 T8).
 pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8, bool)>)>;
 
+/// The forwardable MQTT 5 application properties carried cross-node (ADR 0030): the
+/// publisher's User Properties plus the other message-level properties, so a peer re-emits
+/// them to its subscribers exactly as the origin node would (MQTT-3.3.2-17). Mirrors
+/// `mqtt_core::AppProperties` in a wire-friendly form (`Vec<u8>` correlation data).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireAppProps {
+    /// `0x01` Payload Format Indicator.
+    pub payload_format: Option<u8>,
+    /// `0x03` Content Type.
+    pub content_type: Option<String>,
+    /// `0x08` Response Topic.
+    pub response_topic: Option<String>,
+    /// `0x09` Correlation Data.
+    pub correlation_data: Option<Vec<u8>>,
+    /// `0x26` User Properties, in wire order.
+    pub user_properties: Vec<(String, String)>,
+}
+
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
@@ -54,9 +72,8 @@ pub enum PeerMessage {
         /// the receiver applies the same deadline to its queued copy rather than
         /// dropping it (ADR 0014 T9). `None` = no expiry.
         message_expiry: Option<u32>,
-        /// The publisher's MQTT 5 User Properties, forwarded unaltered cross-node
-        /// (MQTT-3.3.2-17, ADR 0030). Empty = none.
-        user_properties: Vec<(String, String)>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: WireAppProps,
     },
     /// A full snapshot of the sender's shared-subscription membership (ADR 0015 §2),
     /// so the receiver can select one member per group across the whole cluster.
@@ -87,9 +104,8 @@ pub enum PeerMessage {
         /// The MQTT 5 Message Expiry Interval (seconds) the publisher set, if any, so the
         /// receiver applies the same deadline to a queued copy (ADR 0015 T7). `None` = none.
         message_expiry: Option<u32>,
-        /// The publisher's MQTT 5 User Properties, forwarded unaltered cross-node
-        /// (MQTT-3.3.2-17, ADR 0030). Empty = none.
-        user_properties: Vec<(String, String)>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: WireAppProps,
     },
     /// First frame of a **session proxy** (ADR 0005): instead of a peer link,
     /// this connection relocates a persistent client session to its placement
@@ -220,7 +236,7 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, PeerMessage};
+    use super::{decode, encode, PeerMessage, WireAppProps};
     use bytes::BytesMut;
 
     fn roundtrip(msg: &PeerMessage) {
@@ -245,7 +261,13 @@ mod tests {
             qos: 1,
             retain: false,
             message_expiry: Some(30),
-            user_properties: vec![("trace".into(), "abc".into()), ("hop".into(), "1".into())],
+            app: WireAppProps {
+                payload_format: Some(1),
+                content_type: Some("text/plain".into()),
+                response_topic: Some("resp/x".into()),
+                correlation_data: Some(b"\x00corr".to_vec()),
+                user_properties: vec![("trace".into(), "abc".into()), ("hop".into(), "1".into())],
+            },
         });
         roundtrip(&PeerMessage::SharedInterest {
             groups: vec![(
@@ -260,7 +282,10 @@ mod tests {
             payload: b"hi".to_vec(),
             qos: 2,
             message_expiry: None,
-            user_properties: vec![("k".into(), "v".into())],
+            app: WireAppProps {
+                user_properties: vec![("k".into(), "v".into())],
+                ..Default::default()
+            },
         });
         roundtrip(&PeerMessage::RetainedSnapshot {
             messages: vec![
@@ -344,7 +369,7 @@ mod tests {
                 qos: 0,
                 retain: false,
                 message_expiry: None,
-                user_properties: Vec::new(),
+                app: WireAppProps::default(),
             },
             &mut out,
         )
