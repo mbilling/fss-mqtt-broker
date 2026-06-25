@@ -35,6 +35,10 @@ pub struct BridgeConfig {
     /// unreachable side, replayed on reconnect.
     #[serde(default)]
     pub spool: Spool,
+    /// Optional `host:port` to serve the bridge's Prometheus metrics on (§9). Absent →
+    /// metrics are still collected and visible via the audit log, just not scraped.
+    #[serde(default)]
+    pub metrics_bind: Option<String>,
 }
 
 /// Store-and-forward spool configuration (§7).
@@ -432,6 +436,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid topic filter"));
+    }
+
+    /// The shipped demo config must stay valid (a broken demo is a broken doc).
+    #[test]
+    fn the_demo_config_parses() {
+        let toml = include_str!("../../../demo/bridge/bridge.toml");
+        let cfg = BridgeConfig::parse_toml(toml).expect("demo bridge.toml must be valid");
+        assert_eq!(cfg.upstreams.len(), 1);
+        assert_eq!(cfg.upstreams[0].rules.len(), 2);
     }
 
     #[test]

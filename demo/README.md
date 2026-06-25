@@ -81,13 +81,59 @@ filter by broker and panels grouped roughly as:
   append p95 + failures by reason (no-quorum / not-owner / …).
 - **Security** — gossip datagrams rejected by reason; build info.
 
+## Boundary bridge (ADR 0025)
+
+The demo also runs a **boundary bridge** between the cluster and a separate, isolated
+`partner-broker` (a standalone `mqttd` that is **not** part of the mesh — a stand-in for a
+broker in another security/administrative zone). The bridge is a standalone MQTT client to
+*both* sides — not an in-process plugin — so the crossing is a small, isolated, auditable
+unit whose failure domain is its own: a bridge fault cannot touch the cluster's consensus
+or membership.
+
+Its config — [`bridge/bridge.toml`](bridge/bridge.toml) — declares two mappings:
+
+- **`telemetry/#` — unidirectional (`out`):** cluster telemetry flows to the partner only,
+  remapped under `from-cluster/telemetry/…`. The one-wayness is enforced *in code* — for an
+  `out` rule the bridge never subscribes to the topic on the partner — not merely as a
+  setting, so the partner can never push back on this channel (a data-diode direction).
+- **`shared/#` — bidirectional (`both`):** a command/response channel that crosses both
+  ways; the hop-count user property (`fss-bridge-hop-count`, bounded by `hop_count_limit`)
+  guarantees any forwarding loop self-terminates.
+
+Try it (with `mosquitto` clients):
+
+```sh
+# one-way: a telemetry publish on the cluster reaches the partner, remapped...
+mosquitto_sub -h localhost -p 1886 -t 'from-cluster/telemetry/#' -v &   # partner
+mosquitto_pub -h localhost -p 1883 -t 'telemetry/room/temp' -m '21C'    # cluster
+# ...but a publish on the partner under telemetry/# never crosses back (one-way enforced).
+
+# both-way: shared/# crosses in either direction.
+mosquitto_sub -h localhost -p 1883 -t 'shared/#' -v &                   # cluster
+mosquitto_pub -h localhost -p 1886 -t 'shared/cmd' -m 'ping'            # partner -> cluster
+```
+
+The bridge exposes Prometheus metrics on `:8090` (`fss_bridge_forwarded_total`,
+`…_dropped_total`, `…_reconnects_total`, scraped by Alloy) and writes an **audit** log line
+(`bridge::audit`) for every message that crosses, recording the upstream, direction, and
+source/destination topics.
+
+**Production note (least privilege, ADR 0025 §8):** the demo uses plaintext and anonymous
+access for convenience. A real boundary uses a **distinct mTLS identity per upstream** and a
+**least-privilege account on each broker** — publish-only or subscribe-only on exactly the
+bridged topics (an ACL on the bridge's account, ADR 0004) — so even a bridge code fault
+cannot open a path the credentials forbid. Run ≥2 instances with a shared `share_group` for
+HA (the cluster load-balances and deduplicates across them).
+
 ## Files
 
 | Path | Purpose |
 |------|---------|
 | `docker-compose.yml` | the whole topology |
 | `Dockerfile` | builds the `mqttd` binary on a slim runtime |
-| `alloy/config.alloy` | Alloy: scrape `/metrics` + receive OTLP → remote_write to Prometheus |
+| `Dockerfile.bridge` | builds the `mqtt-bridge` binary (ADR 0025) |
+| `bridge/bridge.toml` | the boundary-bridge config (one-way + bidirectional mappings) |
+| `alloy/config.alloy` | Alloy: scrape `/metrics` (brokers + bridge) + receive OTLP → remote_write to Prometheus |
 | `prometheus/prometheus.yml` | Prometheus (remote-write receiver) |
 | `grafana/provisioning/*` | datasource + dashboard auto-provisioning |
 | `grafana/dashboards/mqttd.json` | the dashboard |

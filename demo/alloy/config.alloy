@@ -19,6 +19,17 @@ prometheus.scrape "brokers" {
 	forward_to      = [prometheus.remote_write.default.receiver]
 }
 
+// --- 1b. Scrape the boundary bridge's /metrics (ADR 0025) -----------------------
+prometheus.scrape "bridge" {
+	targets = [
+		{ __address__ = "bridge:8090", instance = "bridge" },
+	]
+	metrics_path    = "/metrics"
+	scrape_interval = "5s"
+	scrape_timeout  = "3s"
+	forward_to      = [prometheus.remote_write.default.receiver]
+}
+
 // --- 2. Receive the brokers' OTLP push and forward it to Prometheus -------------
 otelcol.receiver.otlp "default" {
 	http {

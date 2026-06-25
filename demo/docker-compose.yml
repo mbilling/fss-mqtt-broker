@@ -112,8 +112,42 @@ services:
       - ./loadgen/loadgen.sh:/loadgen.sh:ro
     depends_on: [mqttd-1, mqttd-2, mqttd-3]
 
+  # --- boundary bridge (ADR 0025) ----------------------------------------------------
+  # A SEPARATE, isolated broker in a different "security zone" — a single standalone mqttd,
+  # NOT joined to the cluster (no SWIM seeds, its own data volume). It stands in for a
+  # partner / cloud / edge broker the cluster must not be merged with.
+  partner-broker:
+    image: mqttd-demo
+    hostname: partner-broker
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext
+      MQTTD_ALLOW_ANONYMOUS: "1"           # demo only
+      MQTTD_HEALTH_BIND: 0.0.0.0:8080
+      RUST_LOG: info
+      # No MQTTD_DURABLE / no SWIM: a plain standalone broker, deliberately outside the mesh.
+      MQTTD_DURABLE_SESSIONS: "0"
+    ports: ["1886:1883", "8083:8080"]
+    depends_on: [mqttd-1]
+
+  # The bridge: an MQTT client to BOTH the cluster (mqttd-1) and the partner broker. It
+  # forwards `telemetry/#` one-way (cluster -> partner) and `shared/#` both ways, per
+  # demo/bridge/bridge.toml. Its failure domain is its own — a bridge fault cannot touch
+  # the cluster's consensus or membership.
+  bridge:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bridge
+    image: mqtt-bridge-demo
+    hostname: bridge
+    volumes:
+      - ./bridge/bridge.toml:/etc/bridge/bridge.toml:ro
+      - bridge-spool:/data
+    ports: ["8090:8090"]   # bridge Prometheus metrics
+    depends_on: [mqttd-1, partner-broker]
+
 # Per-node durable state (lease group + replicated session log); each broker gets its own.
 volumes:
   d1:
   d2:
   d3:
+  bridge-spool:

@@ -55,7 +55,9 @@ tasks:
     evidence: "tests/engine.rs over real in-process brokers: a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back (one-way never leaks), a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit (loop self-terminates at the hop limit), a_local_message_fans_out_to_multiple_upstreams (multi-upstream), two_bridge_instances_do_not_duplicate_forwarding (shared-sub dedup) — plus the exhaustive pure forward:: tests. ACL-deny is a broker-side control (the bridge holds a least-privilege account and simply gets no delivery / a denied publish, ADR 0004) not separately simulated here; reconnect is the T3 supervisor; spool replay is T7."
   - id: 0025-T11
     title: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "main.rs runs the bridge from a TOML path (loads config, Bridge::start, optional metrics_bind HTTP endpoint, ctrl-c shutdown). demo/: a standalone partner-broker (isolated mqttd, not in the mesh) + a bridge service (Dockerfile.bridge, bridge/bridge.toml) with a one-way telemetry/# (out, remapped) and a bidirectional shared/# (both) mapping; Alloy scrapes the bridge's :8090 metrics. demo/README.md documents the mappings, a mosquitto try-it, the observability/audit, and the least-privilege production posture."
 ---
 
 # Delivery — ADR 0025: Boundary MQTT bridge
@@ -65,7 +67,7 @@ Decision: [docs/adr/0025-boundary-bridge.md](../adr/0025-boundary-bridge.md).
 A standalone `mqtt-bridge` component — an MQTT client to both the local cluster and one or
 more external brokers — that forwards configured topics across a security-zone boundary,
 with per-rule direction (and **enforced** unidirectional flow as the headline security
-control). Accepted and under construction; every phase lands test-first, with the
+control). **All eleven tasks are complete** — every phase landed test-first, with the
 one-way-never-leaks-reverse property as the central adversarial test.
 
 ## Plan
@@ -99,11 +101,18 @@ one-way-never-leaks-reverse property as the central adversarial test.
 | 0025-T8 | ✅ done | 2026-06-25 | "Per-side username/password (+ password_file) and per-upstream mTLS identity (Tls ca/cert/key) carried into each ConnectOptions (connect_options); every forward writes an audit record (bridge::audit target: upstream, direction, src, dst) via BridgeMetrics::forwarded. Least-privilege (publish-only/subscribe-only) is a broker-side ACL on the bridge's account — an operator/deployment control documented for T11; the bridge supplies the distinct identity." |
 | 0025-T9 | ✅ done | 2026-06-25 | "metrics.rs BridgeMetrics: forwarded (out/in), dropped (hop-limit), reconnects; render() emits Prometheus text (ADR 0020 format); Bridge::metrics() exposes the handle. Wired into the router + supervisors. Test counters_increment_and_render + the engine test asserts forwarded_out after a real forward. (OTLP export reuses the broker's mqtt-observability pattern when a metrics bind is added — a follow-up; Prometheus text + audit log are in place.)" |
 | 0025-T10 | ✅ done | 2026-06-25 | "tests/engine.rs over real in-process brokers: a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back (one-way never leaks), a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit (loop self-terminates at the hop limit), a_local_message_fans_out_to_multiple_upstreams (multi-upstream), two_bridge_instances_do_not_duplicate_forwarding (shared-sub dedup) — plus the exhaustive pure forward:: tests. ACL-deny is a broker-side control (the bridge holds a least-privilege account and simply gets no delivery / a denied publish, ADR 0004) not separately simulated here; reconnect is the T3 supervisor; spool replay is T7." |
-| 0025-T11 | ⬜ planned | — |  |
+| 0025-T11 | ✅ done | 2026-06-25 | "main.rs runs the bridge from a TOML path (loads config, Bridge::start, optional metrics_bind HTTP endpoint, ctrl-c shutdown). demo/: a standalone partner-broker (isolated mqttd, not in the mesh) + a bridge service (Dockerfile.bridge, bridge/bridge.toml) with a one-way telemetry/# (out, remapped) and a bidirectional shared/# (both) mapping; Alloy scrapes the bridge's :8090 metrics. demo/README.md documents the mappings, a mosquitto try-it, the observability/audit, and the least-privilege production posture." |
 <!-- /status-table:0025 -->
 
 ## Changelog
 
+- **2026-06-25** — **ADR 0025 complete (T1–T11).** Shipped the full boundary bridge: the
+  config model + validation (T2), the pure directional/loop-bounding forwarding core (T4/T5),
+  the supervised reconnecting engine + router (T3), shared-subscription HA (T6), the bounded
+  disk-backed store-and-forward spool (T7), per-side mTLS identity + audit (T8), Prometheus
+  metrics + a `:metrics_bind` endpoint (T9), the adversarial suite (T10), and the demo + docs
+  (T11). The hop-count loop-prevention was unblocked mid-build by [ADR 0030](../adr/0030-user-property-forwarding.md)
+  (the broker now forwards MQTT 5 User Properties). 32 bridge tests; full gate green.
 - **2026-06-25** — ADR ratified (Accepted) and T1 landed: the `mqtt-bridge` crate + a
   minimal `MqttClient` (TCP/TLS over `mqtt-codec`/`mqtt-net`), proven against an in-process
   broker. Building T1 surfaced that the broker dropped MQTT 5 User Properties on delivery —

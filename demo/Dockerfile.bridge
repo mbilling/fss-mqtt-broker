@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+# Build the mqtt-bridge boundary bridge binary (ADR 0025), then ship it on a slim runtime.
+# Build context is the repo root (see docker-compose.yml `build.context: ..`).
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release --bin mqtt-bridge
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/mqtt-bridge /usr/local/bin/mqtt-bridge
+# Bridge metrics (8090) — Prometheus text, scraped like the brokers.
+EXPOSE 8090
+ENTRYPOINT ["mqtt-bridge"]
+CMD ["/etc/bridge/bridge.toml"]

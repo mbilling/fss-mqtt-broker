@@ -32,7 +32,7 @@
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 | 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
-| 0025 | Boundary MQTT bridge to brokers in other security zones | Accepted | 10/11 done | 1 open |
+| 0025 | Boundary MQTT bridge to brokers in other security zones | Accepted | 11/11 done | — |
 | 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 7/7 done | — |
 | 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
 | 0028 | Link-gated lease-group voter admission | Accepted | 3/3 done | — |
@@ -106,10 +106,6 @@
 **0024 — Deterministic testing: inject time, synchronize causally, gate in CI**
 
 - `0024-T7` 💤 deferred: Deterministic simulation harness (madsim/turmoil-style) for seed-reproducible cluster ordering races — the gold standard for distributed ordering races, but a large investment; per-test causal barriers (T5) and bounded poll-retry close the flakes seen today without it. Revisit if cluster-ordering flakes recur or a seed-reproducible failure is needed.
-
-**0025 — Boundary MQTT bridge to brokers in other security zones**
-
-- `0025-T11` ⬜ planned: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
 
 **0030 — Forward MQTT 5 User Properties through delivery**
 
