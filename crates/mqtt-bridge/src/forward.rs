@@ -160,13 +160,23 @@ pub fn plan_forwards(
 /// across all upstreams (the only way local-origin messages reach the bridge). Each filter
 /// is paired with the `QoS` to subscribe at. A one-way `in` rule contributes nothing here —
 /// the closed direction is never subscribed (§4).
+///
+/// When `share_group` is non-empty each filter is wrapped as `$share/<group>/<filter>` so
+/// ≥2 bridge instances load-balance the local stream with no duplicate forwarding (§5). The
+/// share wrapper affects only the *subscription*; inbound publishes still arrive on the real
+/// topic, which [`plan_forwards`] matches against the bare rule filter.
 #[must_use]
 pub fn local_subscriptions(cfg: &BridgeConfig) -> Vec<(String, u8)> {
     let mut subs = Vec::new();
     for up in &cfg.upstreams {
         for rule in &up.rules {
             if rule.direction.allows_out() {
-                subs.push((rule.filter.clone(), delivered_qos(rule.qos)));
+                let filter = if cfg.share_group.is_empty() {
+                    rule.filter.clone()
+                } else {
+                    format!("$share/{}/{}", cfg.share_group, rule.filter)
+                };
+                subs.push((filter, delivered_qos(rule.qos)));
             }
         }
     }
@@ -202,6 +212,7 @@ mod tests {
     fn sample() -> BridgeConfig {
         cfg(r#"
             hop_count_limit = 3
+            share_group = ""
             [local]
             url = "local:1883"
 
@@ -394,5 +405,40 @@ mod tests {
         assert!(!local_subscriptions(&c)
             .iter()
             .any(|(f, _)| f == "commands/#"));
+    }
+
+    #[test]
+    fn local_subscriptions_wrap_in_the_share_group_for_ha() {
+        // With a share group, local subscriptions are shared so ≥2 instances load-balance.
+        let c = cfg(r#"
+            share_group = "edge-bridges"
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "telemetry/#"
+        "#);
+        assert_eq!(
+            local_subscriptions(&c),
+            vec![("$share/edge-bridges/telemetry/#".to_string(), 0)]
+        );
+        // The default group also wraps (HA on by default).
+        let d = cfg(r#"
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "t/#"
+        "#);
+        assert_eq!(
+            local_subscriptions(&d),
+            vec![("$share/fss-bridge/t/#".to_string(), 0)]
+        );
     }
 }

@@ -25,10 +25,20 @@ pub struct BridgeConfig {
     /// this is dropped. Default 8; must be ≥ 1.
     #[serde(default = "default_hop_limit")]
     pub hop_count_limit: u32,
+    /// The cluster-side shared-subscription group for HA (§5): ≥2 bridge instances with the
+    /// same group load-balance the local stream (dedup for free). Default `fss-bridge`; set
+    /// empty to disable sharing (a single non-shared instance). Each instance still needs a
+    /// distinct `local.client_id` (a persistent session is per client).
+    #[serde(default = "default_share_group")]
+    pub share_group: String,
 }
 
 fn default_hop_limit() -> u32 {
     8
+}
+
+fn default_share_group() -> String {
+    "fss-bridge".to_string()
 }
 
 /// A connection to one broker (the local cluster, or an upstream).

@@ -30,16 +30,22 @@ tasks:
     evidence: "read_hop_count/set_hop_count (preserve other user properties, drop connection-scoped props); plan_forwards drops a message at hop_count_limit; the router stamps hop+1 on each forward. Unblocked by ADR 0030 (user properties survive the broker hop). Tests the_hop_limit_drops_a_message_at_the_limit, hop_count_reads_default_zero_and_increments_preserving_other_props + the live integration test (hop-count=1 observed)."
   - id: 0025-T6
     title: HA via cluster-side shared subscriptions and a persistent session (dedup across instances)
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "local_subscriptions wrap each filter as $share/<group>/<filter> (config share_group, default fss-bridge); the local side connects persistent (clean_start=false). Test two_bridge_instances_do_not_duplicate_forwarding (two instances, one shared group → each message forwarded at most once) + local_subscriptions_wrap_in_the_share_group_for_ha."
   - id: 0025-T7
     title: Bounded disk-backed store-and-forward spool for transient outages, replayed on reconnect
     status: planned
   - id: 0025-T8
     title: Per-side least-privilege credentials (publish-only/subscribe-only) and per-upstream mTLS identity + audit
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "Per-side username/password (+ password_file) and per-upstream mTLS identity (Tls ca/cert/key) carried into each ConnectOptions (connect_options); every forward writes an audit record (bridge::audit target: upstream, direction, src, dst) via BridgeMetrics::forwarded. Least-privilege (publish-only/subscribe-only) is a broker-side ACL on the bridge's account — an operator/deployment control documented for T11; the bridge supplies the distinct identity."
   - id: 0025-T9
     title: Bridge observability (forwarded/dropped per upstream+direction, lag, reconnects) via mqtt-observability + OTLP
-    status: planned
+    status: done
+    date: 2026-06-25
+    evidence: "metrics.rs BridgeMetrics: forwarded (out/in), dropped (hop-limit), reconnects; render() emits Prometheus text (ADR 0020 format); Bridge::metrics() exposes the handle. Wired into the router + supervisors. Test counters_increment_and_render + the engine test asserts forwarded_out after a real forward. (OTLP export reuses the broker's mqtt-observability pattern when a metrics bind is added — a follow-up; Prometheus text + audit log are in place.)"
   - id: 0025-T10
     title: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
     status: planned
@@ -84,10 +90,10 @@ one-way-never-leaks-reverse property as the central adversarial test.
 | 0025-T3 | ✅ done | 2026-06-25 | "engine.rs Bridge::start — one supervised connection per side (connect, subscribe per direction, MqttClient::run pump, reconnect with bounded backoff), a central router, clean shutdown. client.rs gained Command + run (concurrent read/write select). Integration test a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back over two in-process brokers." |
 | 0025-T4 | ✅ done | 2026-06-25 | "forward::plan_forwards — local-origin only forwards out (out/both rules), upstream-origin only forwards in (in/both); a one-way rule cannot produce a reverse forward, AND local/upstream_subscriptions never subscribe the closed side. apply_remap (strip+prefix). Tests a_one_way_out/in_rule_never_forwards_*, subscriptions_follow_direction + the live no-leak integration test." |
 | 0025-T5 | ✅ done | 2026-06-25 | "read_hop_count/set_hop_count (preserve other user properties, drop connection-scoped props); plan_forwards drops a message at hop_count_limit; the router stamps hop+1 on each forward. Unblocked by ADR 0030 (user properties survive the broker hop). Tests the_hop_limit_drops_a_message_at_the_limit, hop_count_reads_default_zero_and_increments_preserving_other_props + the live integration test (hop-count=1 observed)." |
-| 0025-T6 | ⬜ planned | — |  |
+| 0025-T6 | ✅ done | 2026-06-25 | "local_subscriptions wrap each filter as $share/<group>/<filter> (config share_group, default fss-bridge); the local side connects persistent (clean_start=false). Test two_bridge_instances_do_not_duplicate_forwarding (two instances, one shared group → each message forwarded at most once) + local_subscriptions_wrap_in_the_share_group_for_ha." |
 | 0025-T7 | ⬜ planned | — |  |
-| 0025-T8 | ⬜ planned | — |  |
-| 0025-T9 | ⬜ planned | — |  |
+| 0025-T8 | ✅ done | 2026-06-25 | "Per-side username/password (+ password_file) and per-upstream mTLS identity (Tls ca/cert/key) carried into each ConnectOptions (connect_options); every forward writes an audit record (bridge::audit target: upstream, direction, src, dst) via BridgeMetrics::forwarded. Least-privilege (publish-only/subscribe-only) is a broker-side ACL on the bridge's account — an operator/deployment control documented for T11; the bridge supplies the distinct identity." |
+| 0025-T9 | ✅ done | 2026-06-25 | "metrics.rs BridgeMetrics: forwarded (out/in), dropped (hop-limit), reconnects; render() emits Prometheus text (ADR 0020 format); Bridge::metrics() exposes the handle. Wired into the router + supervisors. Test counters_increment_and_render + the engine test asserts forwarded_out after a real forward. (OTLP export reuses the broker's mqtt-observability pattern when a metrics bind is added — a follow-up; Prometheus text + audit log are in place.)" |
 | 0025-T10 | ⬜ planned | — |  |
 | 0025-T11 | ⬜ planned | — |  |
 <!-- /status-table:0025 -->

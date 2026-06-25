@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use crate::client::{Command, ConnectOptions, MqttClient, Transport};
 use crate::config::{BridgeConfig, Endpoint};
 use crate::forward::{plan_forwards, read_hop_count, set_hop_count, Side};
+use crate::metrics::{BridgeMetrics, CrossDirection};
 
 /// A fixed keepalive (seconds) for every bridge connection; the client pings at half this.
 const KEEP_ALIVE: u16 = 30;
@@ -32,6 +33,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub struct Bridge {
     tasks: Vec<JoinHandle<()>>,
+    metrics: Arc<BridgeMetrics>,
 }
 
 impl Bridge {
@@ -40,6 +42,7 @@ impl Bridge {
     #[must_use]
     pub fn start(cfg: BridgeConfig) -> Self {
         let cfg = Arc::new(cfg);
+        let metrics = Arc::new(BridgeMetrics::new());
         let n_sides = 1 + cfg.upstreams.len();
 
         // One command channel per side (index 0 = local, i+1 = upstream i). The router keeps
@@ -65,6 +68,7 @@ impl Bridge {
             cmd_rx.remove(0),
             cmd_tx[0].clone(),
             in_tx.clone(),
+            metrics.clone(),
         ));
         // Upstream supervisors. `cmd_rx.remove(0)` keeps popping the front as sides advance.
         for i in 0..cfg.upstreams.len() {
@@ -74,11 +78,18 @@ impl Bridge {
                 cmd_rx.remove(0),
                 cmd_tx[i + 1].clone(),
                 in_tx.clone(),
+                metrics.clone(),
             ));
         }
 
-        tasks.push(spawn_router(cfg, cmd_tx, in_rx));
-        Self { tasks }
+        tasks.push(spawn_router(cfg, cmd_tx, in_rx, metrics.clone()));
+        Self { tasks, metrics }
+    }
+
+    /// The bridge's metrics handle (forwarded/dropped/reconnect counters, Prometheus text).
+    #[must_use]
+    pub fn metrics(&self) -> Arc<BridgeMetrics> {
+        self.metrics.clone()
     }
 
     /// Stop every connection and the router.
@@ -96,6 +107,7 @@ fn spawn_supervisor(
     mut commands: mpsc::UnboundedReceiver<Command>,
     self_tx: mpsc::UnboundedSender<Command>,
     inbound_central: mpsc::UnboundedSender<(Side, Publish)>,
+    metrics: Arc<BridgeMetrics>,
 ) -> JoinHandle<()> {
     // Tag each inbound PUBLISH with this side before it reaches the router.
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Publish>();
@@ -114,9 +126,12 @@ fn spawn_supervisor(
         let endpoint = endpoint_for(&cfg, side);
         let subs = subscriptions_for(&cfg, side);
         let default_id = default_client_id(side);
+        // The local side uses a **persistent** session (§5): a brief bridge restart resumes
+        // its shared subscription and buffered messages. Upstreams stay clean.
+        let persistent = matches!(side, Side::Local);
         let mut backoff = BACKOFF_START;
         loop {
-            let opts = match connect_options(endpoint, &default_id) {
+            let opts = match connect_options(endpoint, &default_id, persistent) {
                 Ok(o) => o,
                 Err(e) => {
                     warn!(?side, error = %e, "bridge endpoint misconfigured; not connecting");
@@ -126,6 +141,7 @@ fn spawn_supervisor(
             match MqttClient::connect(&opts).await {
                 Ok(client) => {
                     backoff = BACKOFF_START;
+                    metrics.reconnect();
                     info!(?side, addr = %opts.addr, subs = subs.len(), "bridge side connected");
                     // (Re)subscribe for this side's open direction(s) only.
                     let mut pkid: u16 = 1;
@@ -153,6 +169,7 @@ fn spawn_router(
     cfg: Arc<BridgeConfig>,
     cmd_tx: Vec<mpsc::UnboundedSender<Command>>,
     mut inbound: mpsc::UnboundedReceiver<(Side, Publish)>,
+    metrics: Arc<BridgeMetrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // A per-side outbound packet-id cursor (each side's own QoS-1 id space).
@@ -161,6 +178,7 @@ fn spawn_router(
             let hop = read_hop_count(&publish.properties);
             let forwards = plan_forwards(&cfg, side, &publish.topic, hop);
             if forwards.is_empty() && hop >= cfg.hop_count_limit {
+                metrics.dropped_hop_limit();
                 debug!(?side, topic = %publish.topic, hop, "hop limit reached; dropped");
             }
             for f in forwards {
@@ -172,6 +190,12 @@ fn spawn_router(
                     pkids[idx] = pkids[idx].wrapping_add(1).max(1);
                     Some(pkids[idx])
                 };
+                // Record + audit the crossing (the upstream involved is the non-local side).
+                let (dir, up_name) = match side {
+                    Side::Local => (CrossDirection::Out, upstream_name(&cfg, f.dest)),
+                    Side::Upstream(_) => (CrossDirection::In, upstream_name(&cfg, side)),
+                };
+                metrics.forwarded(up_name, dir, &publish.topic, &f.topic);
                 // Forward the publisher's user properties, with the hop count incremented.
                 let properties = set_hop_count(&publish.properties, hop + 1);
                 let _ = cmd_tx[idx].send(Command::Publish {
@@ -184,6 +208,14 @@ fn spawn_router(
             }
         }
     })
+}
+
+/// The configured name of the upstream involved in a side (for audit/metrics labels).
+fn upstream_name(cfg: &BridgeConfig, side: Side) -> &str {
+    match side {
+        Side::Local => "local",
+        Side::Upstream(i) => cfg.upstreams.get(i).map_or("unknown", |u| u.name.as_str()),
+    }
 }
 
 fn side_index(side: Side) -> usize {
@@ -223,7 +255,11 @@ fn qos_from_u8(v: u8) -> QoS {
 /// # Errors
 /// A string error if the endpoint requests TLS without an mTLS identity (cert+key), which
 /// the client cannot yet honour, or a password file that cannot be read.
-fn connect_options(ep: &Endpoint, default_id: &str) -> Result<ConnectOptions, String> {
+fn connect_options(
+    ep: &Endpoint,
+    default_id: &str,
+    persistent: bool,
+) -> Result<ConnectOptions, String> {
     let transport = match &ep.tls {
         None => Transport::Plain,
         Some(tls) => match (&tls.cert, &tls.key) {
@@ -262,6 +298,6 @@ fn connect_options(ep: &Endpoint, default_id: &str) -> Result<ConnectOptions, St
         username: ep.username.clone(),
         password,
         keep_alive: KEEP_ALIVE,
-        clean_start: true,
+        clean_start: !persistent,
     })
 }

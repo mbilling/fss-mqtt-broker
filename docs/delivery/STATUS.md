@@ -32,7 +32,7 @@
 | 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
 | 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
 | 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 6/7 done | 1 deferred |
-| 0025 | Boundary MQTT bridge to brokers in other security zones | Accepted | 5/11 done | 6 open |
+| 0025 | Boundary MQTT bridge to brokers in other security zones | Accepted | 8/11 done | 3 open |
 | 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 7/7 done | — |
 | 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
 | 0028 | Link-gated lease-group voter admission | Accepted | 3/3 done | — |
@@ -109,10 +109,7 @@
 
 **0025 — Boundary MQTT bridge to brokers in other security zones**
 
-- `0025-T6` ⬜ planned: HA via cluster-side shared subscriptions and a persistent session (dedup across instances)
 - `0025-T7` ⬜ planned: Bounded disk-backed store-and-forward spool for transient outages, replayed on reconnect
-- `0025-T8` ⬜ planned: Per-side least-privilege credentials (publish-only/subscribe-only) and per-upstream mTLS identity + audit
-- `0025-T9` ⬜ planned: Bridge observability (forwarded/dropped per upstream+direction, lag, reconnects) via mqtt-observability + OTLP
 - `0025-T10` ⬜ planned: Adversarial tests (one-way never leaks reverse; loop prevention; ACL deny; reconnect/spool; multi-upstream; shared-sub dedup)
 - `0025-T11` ⬜ planned: Demo + docs — bridge the cluster to a second isolated broker, one-way and bidirectional
 

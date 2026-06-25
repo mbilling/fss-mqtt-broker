@@ -154,5 +154,81 @@ async fn a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back() {
         }
     }
 
+    // Observability (T9): the out forward was counted; nothing was forwarded inbound.
+    let m = bridge.metrics();
+    assert!(m.forwarded_out_count() >= 1, "the out forward was counted");
+    assert_eq!(m.forwarded_in_count(), 0, "nothing was forwarded inbound");
+
     bridge.shutdown();
+}
+
+/// ADR 0025-T6: two bridge instances sharing a cluster-side group must **not** duplicate
+/// forwarding — the shared subscription load-balances, so each local message is forwarded
+/// to the upstream at most once.
+#[tokio::test]
+async fn two_bridge_instances_do_not_duplicate_forwarding() {
+    let local = start_broker().await;
+    let upstream = start_broker().await;
+
+    let cfg = |client_id: &str| {
+        BridgeConfig::parse_toml(&format!(
+            r#"
+            share_group = "ha"
+            [local]
+            url = "{local}"
+            client_id = "{client_id}"
+            [[upstreams]]
+            name = "partner"
+            url = "{upstream}"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "telemetry/#"
+            "#,
+        ))
+        .unwrap()
+    };
+    let b1 = Bridge::start(cfg("bridge-a"));
+    let b2 = Bridge::start(cfg("bridge-b"));
+
+    // A subscriber on the upstream collects forwarded messages.
+    let mut up_sub = client(upstream, "ha-up-sub").await;
+    subscribe(&mut up_sub, "telemetry/#").await;
+
+    // Let both instances connect and register their shared subscription.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Publish a batch of uniquely-payloaded messages on the local side.
+    let mut local_pub = client(local, "ha-local-pub").await;
+    for n in 0..20u32 {
+        local_pub
+            .publish(
+                "telemetry/x",
+                Bytes::from(format!("m{n}")),
+                QoS::AtMostOnce,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Collect for a window; every payload must appear at most once (no duplicate forward).
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    while let Ok(Ok(Event::Publish(p))) =
+        tokio::time::timeout(Duration::from_millis(400), up_sub.next_event()).await
+    {
+        assert!(
+            seen.insert(p.payload.to_vec()),
+            "duplicate forward of {:?}: two instances both forwarded it",
+            String::from_utf8_lossy(&p.payload)
+        );
+    }
+    assert!(
+        !seen.is_empty(),
+        "the HA pair forwarded nothing — the shared subscription never delivered"
+    );
+
+    b1.shutdown();
+    b2.shutdown();
 }
