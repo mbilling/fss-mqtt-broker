@@ -41,7 +41,7 @@ tasks:
   - id: 0019-T8
     title: Lease-leadership transfer when the leaving node is the Raft leader
     status: deferred
-    notes: avoids one election (~300-600ms) on a leaving leader; needs openraft 0.9 transfer-API evaluation first
+    notes: "Spike 2026-06-25 (openraft 0.9 transfer-API evaluation, the task's stated prerequisite): openraft 0.9.24 exposes NO public leadership-transfer/TimeoutNow API — Trigger has only elect/heartbeat/snapshot/purge_log. change_membership-remove-self steps the leader down internally (raft_core.rs:1311 -> leader_step_down) but does not provoke an immediate election, so the remaining voters still wait out their election timeout: it does not close the gap. Trigger::transfer_leader exists only on the alpha-only 0.10 line (latest 0.10.0-alpha.23, Jun 2026; no beta/RC/stable, no v0.9->v0.10 upgrade guide; maintainer keeps 0.9.24 as the production default). Deferred pending a stable openraft release exposing transfer_leader — pulling an alpha into the consensus core is a poor trade for a bounded ~1.5-3s graceful-leave gap (relaxed ADR 0026 timing) that already degrades safely via survivors' election."
   - id: 0019-T9
     title: In-flight QoS settle / hub Drain command
     status: deferred
@@ -81,12 +81,17 @@ id used by commits, tests, and the dashboard.
 | 0019-T5 | ✅ done | 2026-06-22 | main.rs graceful_shutdown (driver.abort + raft shutdown) |
 | 0019-T6 | ✅ done | 2026-06-22 | a_graceful_leave_is_seen_dead_faster_than_failure_detection |
 | 0019-T7 | ✅ done | 2026-06-22 | persistence.rs; durable_node::a_persistent_durable_node_restarts_from_its_data_dir |
-| 0019-T8 | 💤 deferred | — | avoids one election (~300-600ms) on a leaving leader; needs openraft 0.9 transfer-API evaluation first |
+| 0019-T8 | 💤 deferred | — | "Spike 2026-06-25 (openraft 0.9 transfer-API evaluation, the task's stated prerequisite): openraft 0.9.24 exposes NO public leadership-transfer/TimeoutNow API — Trigger has only elect/heartbeat/snapshot/purge_log. change_membership-remove-self steps the leader down internally (raft_core.rs:1311 -> leader_step_down) but does not provoke an immediate election, so the remaining voters still wait out their election timeout: it does not close the gap. Trigger::transfer_leader exists only on the alpha-only 0.10 line (latest 0.10.0-alpha.23, Jun 2026; no beta/RC/stable, no v0.9->v0.10 upgrade guide; maintainer keeps 0.9.24 as the production default). Deferred pending a stable openraft release exposing transfer_leader — pulling an alpha into the consensus core is a poor trade for a bounded ~1.5-3s graceful-leave gap (relaxed ADR 0026 timing) that already degrades safely via survivors' election." |
 | 0019-T9 | 💤 deferred | — | drain closes after current packet; durable state already protected by ADR 0018 + raft shutdown |
 <!-- /status-table:0019 -->
 
 ## Changelog
 
+- **2026-06-25** — T8 spike: evaluated openraft 0.9's transfer API (the task's stated
+  prerequisite). 0.9.24 has no public leadership-transfer/TimeoutNow lever and
+  `change_membership`-remove-self does not close the election gap; `transfer_leader`
+  exists only on the alpha-only 0.10 line. T8 stays deferred pending a stable openraft
+  release exposing it — see the T8 note for the full rationale.
 - **2026-06-22** — T6 SWIM graceful leave landed (self-declared `Dead`, `leaving` flag,
   generic-future driver shutdown); lease handoff confirmed to fall out of survivor
   reconciliation. T8 (leader transfer) split out as the remaining cluster-leave gap.
