@@ -93,12 +93,16 @@ gen_pki() {
   openssl req -newkey rsa:2048 -nodes -keyout "$d/server.key" -out "$d/server.csr" \
     -subj '/CN=127.0.0.1' >/dev/null 2>&1
   openssl x509 -req -in "$d/server.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -CAcreateserial \
-    -out "$d/server.crt" -days 1 -extfile <(printf 'subjectAltName=IP:127.0.0.1') >/dev/null 2>&1
-  # client leaf (for mTLS)
+    -out "$d/server.crt" -days 1 \
+    -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth') >/dev/null 2>&1
+  # client leaf (for mTLS). The clientAuth EKU is REQUIRED: rustls/webpki rejects a client
+  # cert without it ("certificate unknown"). OpenSSL's `x509 -req` does not add it by default,
+  # so set it explicitly (matches the broker's own rcgen client certs in tests/tls.rs).
   openssl req -newkey rsa:2048 -nodes -keyout "$d/client.key" -out "$d/client.csr" \
     -subj '/CN=interop-client' >/dev/null 2>&1
   openssl x509 -req -in "$d/client.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -CAcreateserial \
-    -out "$d/client.crt" -days 1 >/dev/null 2>&1
+    -out "$d/client.crt" -days 1 \
+    -extfile <(printf 'extendedKeyUsage=clientAuth') >/dev/null 2>&1
 }
 
 # ===========================================================================
