@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>mqttd — MQTT playground</title>
+<style>
+  :root {
+    --bg:#0f1419; --panel:#1a212b; --panel2:#222c38; --line:#2c3845;
+    --fg:#e6edf3; --mut:#8b98a5; --accent:#4cc2ff; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; font-weight:650; }
+  header .sub { color:var(--mut); font-size:12.5px; }
+  .dot { width:9px; height:9px; border-radius:50%; display:inline-block; background:var(--mut); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); } .dot.warn{ background:var(--warn); }
+  main { padding:16px; max-width:980px; margin:0 auto; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { background:var(--accent); color:#06121c; border:0; border-radius:8px;
+           padding:9px 14px; font-weight:650; font-size:14px; cursor:pointer; }
+  button.ghost { background:var(--panel2); color:var(--fg); border:1px solid var(--line); }
+  button.tiny { padding:5px 9px; font-size:12.5px; }
+  button:active { transform:translateY(1px); }
+  input,select { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+                 border-radius:8px; padding:9px 10px; font-size:14px; min-width:0; }
+  input { flex:1; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+          padding:14px; margin:12px 0; }
+  .card h3 { margin:0 0 4px; font-size:14.5px; display:flex; align-items:center; gap:8px; }
+  .cid { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  .pill { font-size:11px; color:var(--mut); border:1px solid var(--line); border-radius:20px; padding:1px 8px; }
+  .subs { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0 4px; }
+  .sub { font-size:12px; background:var(--panel2); border:1px solid var(--line);
+         border-radius:20px; padding:3px 9px; display:flex; gap:6px; align-items:center; }
+  .sub b { font-family:ui-monospace,monospace; font-weight:600; }
+  .sub span { color:var(--mut); cursor:pointer; }
+  .muted { color:var(--mut); font-size:12.5px; }
+  label.lbl { color:var(--mut); font-size:12px; margin-right:4px; }
+  #log { background:#0a0e13; border:1px solid var(--line); border-radius:12px; padding:10px;
+         height:46vh; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+         font-size:12.5px; }
+  .msg { padding:3px 4px; border-bottom:1px solid #131a22; white-space:pre-wrap; word-break:break-word; }
+  .msg .t { color:var(--mut); } .msg .top { color:var(--accent); } .msg .pl { color:var(--fg); }
+  .msg .who { font-weight:650; }
+  .feed { color:var(--warn); }
+  .sectit { display:flex; align-items:center; justify-content:space-between; margin:18px 0 6px; }
+  .sectit h2 { font-size:14px; margin:0; color:var(--mut); text-transform:uppercase; letter-spacing:.04em; }
+  @media (max-width:560px){ input{flex-basis:100%;} }
+</style>
+</head>
+<body>
+<header>
+  <h1>mqttd · MQTT playground</h1>
+  <span class="sub"><span id="conn" class="dot"></span> <span id="connText">connecting…</span></span>
+  <span class="sub">cluster bridge: <code class="cid">play/up → mqttd → play/down</code></span>
+</header>
+
+<main>
+  <div class="card">
+    <div class="row">
+      <button id="addSub">+ Subscriber</button>
+      <button id="addPub" class="ghost">+ Publisher</button>
+      <button id="addBoth" class="ghost">+ Session (pub + sub)</button>
+      <span class="muted">Each session is a real MQTT client with a unique client-id. Messages
+        round-trip the 3-node mqttd cluster (watch Grafana :3000).</span>
+    </div>
+  </div>
+
+  <div class="sectit"><h2>Sessions</h2><span id="count" class="muted"></span></div>
+  <div id="sessions"></div>
+
+  <div class="sectit">
+    <h2>Message log</h2>
+    <button id="clearLog" class="ghost tiny">clear</button>
+  </div>
+  <div id="log"></div>
+  <p class="muted" style="margin-top:8px">
+    Tip: open this page in several tabs / on several devices — they all share the cluster.
+    The orange <span class="feed">live feed</span> lines are the demo loadgen's real
+    cross-cluster traffic (<code>demo/#</code>).
+  </p>
+</main>
+
+<script src="mqtt.min.js"></script>
+<script>
+(() => {
+  const $ = (s, r=document) => r.querySelector(s);
+  // The web UI is served by nginx on :8088; the MQTT-over-WS gateway is on :8089 of the
+  // same host. (mqttd has no WS listener yet, so a mosquitto gateway bridges to the cluster.)
+  const WS_PORT = 8089;
+  const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':' + WS_PORT + '/';
+  const PUB_PREFIX = 'play/up/';
+  const SUB_PREFIX = 'play/down/';
+  const FEED = 'demo/#';
+
+  // --- a small connectivity probe client so the header reflects gateway health -------
+  const connDot = $('#conn'), connText = $('#connText');
+  const probe = mqtt.connect(wsUrl, { clientId: 'web-probe-' + rand(), clean: true, reconnectPeriod: 2000 });
+  probe.on('connect', () => { connDot.className = 'dot ok'; connText.textContent = 'connected to ' + location.host; });
+  probe.on('reconnect', () => { connDot.className = 'dot warn'; connText.textContent = 'reconnecting…'; });
+  probe.on('close', () => { connDot.className = 'dot bad'; connText.textContent = 'disconnected'; });
+  probe.on('error', e => { connDot.className = 'dot bad'; connText.textContent = 'error: ' + e.message; });
+
+  // --- log ---------------------------------------------------------------------------
+  const logEl = $('#log');
+  function log(who, color, topic, payload, qos, feed) {
+    const at = new Date().toLocaleTimeString();
+    const div = document.createElement('div');
+    div.className = 'msg' + (feed ? ' feed' : '');
+    div.innerHTML =
+      `<span class="t">${at}</span> ` +
+      `<span class="who" style="color:${color}">${esc(who)}</span> ◂ ` +
+      `<span class="top">${esc(topic)}</span>` +
+      (qos != null ? ` <span class="t">q${qos}</span>` : '') +
+      `  <span class="pl">${esc(payload)}</span>`;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  $('#clearLog').onclick = () => logEl.innerHTML = '';
+
+  // --- sessions ----------------------------------------------------------------------
+  const sessionsEl = $('#sessions');
+  let n = 0;
+  const palette = ['#4cc2ff','#3fb950','#d29922','#ff7b72','#bc8cff','#39c5cf','#f0883e','#db61a2'];
+
+  function addSession({ sub = false, pub = false } = {}) {
+    const idx = ++n;
+    const color = palette[(idx - 1) % palette.length];
+    const clientId = 'web-' + idx + '-' + rand();
+    const client = mqtt.connect(wsUrl, { clientId, clean: true, reconnectPeriod: 2000 });
+    const subs = new Map(); // logical filter -> wire filter
+
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <h3><span class="dot"></span> <span class="cid">${clientId}</span>
+          <span class="pill st">connecting…</span>
+          <span style="flex:1"></span>
+          <button class="ghost tiny kill">disconnect</button></h3>
+      <div class="subrow row">
+        <label class="lbl">subscribe</label>
+        <input class="subf" placeholder="topic filter, e.g. room/1 or sensors/#" />
+        <button class="tiny dosub">Subscribe</button>
+        <button class="ghost tiny dofeed">+ live cluster feed</button>
+      </div>
+      <div class="subs"></div>
+      <div class="pubrow row">
+        <label class="lbl">publish</label>
+        <input class="pubt" placeholder="topic, e.g. room/1" />
+        <input class="pubm" placeholder="message" />
+        <select class="pubq"><option>0</option><option>1</option><option>2</option></select>
+        <button class="tiny dopub">Send</button>
+      </div>`;
+    sessionsEl.prepend(card);
+    const dot = $('.dot', card), st = $('.st', card), subsEl = $('.subs', card);
+
+    client.on('connect', () => { dot.className = 'dot ok'; st.textContent = 'connected'; });
+    client.on('reconnect', () => { dot.className = 'dot warn'; st.textContent = 'reconnecting'; });
+    client.on('close', () => { dot.className = 'dot bad'; st.textContent = 'offline'; });
+    client.on('error', e => { st.textContent = 'error: ' + e.message; });
+
+    client.on('message', (wireTopic, payloadBuf, packet) => {
+      const payload = payloadBuf.toString();
+      if (wireTopic.startsWith(SUB_PREFIX)) {
+        log(clientId, color, wireTopic.slice(SUB_PREFIX.length), payload, packet.qos, false);
+      } else {
+        log(clientId, color, wireTopic, payload, packet.qos, true); // live cluster feed
+      }
+    });
+
+    function renderSubs() {
+      subsEl.innerHTML = '';
+      for (const f of subs.keys()) {
+        const el = document.createElement('span');
+        el.className = 'sub';
+        el.innerHTML = `<b>${esc(f)}</b> <span title="unsubscribe">✕</span>`;
+        el.querySelector('span').onclick = () => { unsub(f); };
+        subsEl.appendChild(el);
+      }
+    }
+    function sub(filter) {
+      filter = (filter || '').trim(); if (!filter || subs.has(filter)) return;
+      const wire = SUB_PREFIX + filter;
+      client.subscribe(wire, { qos: 0 }, err => { if (!err) { subs.set(filter, wire); renderSubs(); } });
+    }
+    function subFeed() {
+      if (subs.has('demo/# (cluster feed)')) return;
+      client.subscribe(FEED, { qos: 0 }, err => { if (!err) { subs.set('demo/# (cluster feed)', FEED); renderSubs(); } });
+    }
+    function unsub(filter) {
+      const wire = subs.get(filter); if (!wire) return;
+      client.unsubscribe(wire, () => { subs.delete(filter); renderSubs(); });
+    }
+    function pub(topic, msg, qos) {
+      topic = (topic || '').trim(); if (!topic) return;
+      client.publish(PUB_PREFIX + topic, msg ?? '', { qos: Number(qos) || 0 });
+    }
+
+    $('.dosub', card).onclick = () => { sub($('.subf', card).value); $('.subf', card).value=''; };
+    $('.subf', card).addEventListener('keydown', e => { if (e.key === 'Enter') $('.dosub', card).click(); });
+    $('.dofeed', card).onclick = subFeed;
+    $('.dopub', card).onclick = () => pub($('.pubt', card).value, $('.pubm', card).value, $('.pubq', card).value);
+    $('.pubm', card).addEventListener('keydown', e => { if (e.key === 'Enter') $('.dopub', card).click(); });
+    $('.kill', card).onclick = () => { client.end(true); card.remove(); updateCount(); };
+
+    if (sub && !pub) $('.pubrow', card).style.display = 'none';
+    if (pub && !sub) $('.subrow', card).style.display = 'none', $('.subs', card).style.display = 'none';
+    updateCount();
+  }
+
+  function updateCount() { $('#count').textContent = sessionsEl.children.length + ' active'; }
+  function rand() { return Math.random().toString(16).slice(2, 8); }
+  function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+  $('#addSub').onclick = () => addSession({ sub: true });
+  $('#addPub').onclick = () => addSession({ pub: true });
+  $('#addBoth').onclick = () => addSession({ sub: true, pub: true });
+
+  // Start with a friendly default: one subscriber on room/# and one publisher.
+  addSession({ sub: true, pub: true });
+})();
+</script>
+</body>
+</html>

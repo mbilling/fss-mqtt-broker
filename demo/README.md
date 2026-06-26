@@ -14,6 +14,7 @@ First build compiles the broker (a few minutes); subsequent starts are fast. The
 
 | URL | What |
 |-----|------|
+| <http://localhost:8088> | **MQTT playground** → a browser page to spin up MQTT sessions, publish, and watch subscribers (see below) |
 | <http://localhost:3000> | **Grafana** → dashboard **"mqttd — broker overview"** (anonymous admin) |
 | <http://localhost:9090> | Prometheus |
 | <http://localhost:12345> | Alloy UI (pipeline graph, OTLP receiver, scrape targets) |
@@ -80,6 +81,29 @@ filter by broker and panels grouped roughly as:
 - **Cluster** — members & peer links, members by SWIM state, lease leader/epoch, durable
   append p95 + failures by reason (no-quorum / not-owner / …).
 - **Security** — gossip datagrams rejected by reason; build info.
+
+## MQTT playground (browser)
+
+Open <http://localhost:8088> (or `http://<host>:8088` over Tailscale/LAN). A small page to
+exercise the cluster from a browser — or a phone:
+
+- **+ Subscriber / + Publisher / + Session** — each spins up a **real MQTT client with a
+  unique client-id**. Publishers send to a topic; subscribers subscribe to a filter
+  (`room/1`, `sensors/#`, …).
+- **Message log** — every message any subscriber receives, with its session, topic, and QoS.
+- **+ live cluster feed** — subscribe a session to the loadgen's real `demo/#` traffic.
+
+Open it in several tabs or on several devices; they all share the cluster. Every publish makes
+a **full round-trip through the 3-node mqttd cluster** before fanning out — watch the
+`publish_received` / `publish_delivered` panels in Grafana light up as you send.
+
+How it works (browsers can't speak raw MQTT/TCP, and mqttd has no WebSocket listener yet —
+the deferred [ADR 0002](../docs/adr/0002-transport-security.md) item): the page (served by an
+`nginx` container on `:8088`) talks **MQTT-over-WebSockets** to a small `mosquitto` gateway
+(`:8089`) that is **bridged into the cluster**. To make every message traverse mqttd with no
+bridge echo, browser publishes go to `play/up/<topic>`, a cluster-side relay republishes them
+to `play/down/<topic>`, and subscribers receive those — a clean round-trip on disjoint topic
+trees. (This is a demo convenience; a native broker WS listener is tracked under ADR 0002.)
 
 ## Boundary bridge (ADR 0025)
 

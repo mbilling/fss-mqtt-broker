@@ -112,6 +112,31 @@ services:
       - ./loadgen/loadgen.sh:/loadgen.sh:ro
     depends_on: [mqttd-1, mqttd-2, mqttd-3]
 
+  # --- browser MQTT playground -------------------------------------------------------
+  # Browsers can't speak raw MQTT/TCP (and mqttd has no WS listener yet), so two small
+  # services back the playground: `playground` (nginx) serves the static web UI, and
+  # `playground-gw` (mosquitto) is the MQTT-over-WebSockets entry point bridged into the
+  # cluster. Browser publishes (play/up/#) are relayed THROUGH mqttd to play/down/# which
+  # the subscribers receive — a full cluster round-trip. Open http://localhost:8088
+  # (or http://<host>:8088 over Tailscale).
+  playground:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./playground/web:/usr/share/nginx/html:ro
+    ports: ["8088:80"]
+    depends_on: [playground-gw]
+
+  playground-gw:
+    image: eclipse-mosquitto:latest
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    volumes:
+      - ./playground/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./playground/entrypoint.sh:/entrypoint.sh:ro
+    ports: ["8089:9001"]   # MQTT-over-WebSockets for the browser
+    depends_on: [mqttd-1, mqttd-2, mqttd-3]
+
   # --- boundary bridge (ADR 0025) ----------------------------------------------------
   # A SEPARATE, isolated broker in a different "security zone" — a single standalone mqttd,
   # NOT joined to the cluster (no SWIM seeds, its own data volume). It stands in for a
