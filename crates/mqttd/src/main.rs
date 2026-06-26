@@ -257,9 +257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Bind and spawn the MQTT client listeners (TLS and/or plaintext) selected by
-/// the `MQTTD_*_BIND` shims. Each accept loop owns its `shutdown` clone and stops
-/// itself when the token fires, so the join handles are intentionally dropped.
+/// Bind and spawn the MQTT client listeners (TLS, WSS, QUIC, plaintext, WS) selected by the
+/// `MQTTD_*_BIND` shims. Each accept loop owns its `shutdown` clone and stops itself when the
+/// token fires, so the join handles are intentionally dropped.
+// A flat sequence of per-listener setup blocks: long by count (one per transport), not by
+// branching complexity — like `Metrics::build`'s registration list.
+#[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -358,11 +361,41 @@ async fn start_client_listeners(
         ));
         any = true;
     }
+    if let Some(bind) = non_empty_env("MQTTD_QUIC_BIND") {
+        // QUIC mandates TLS 1.3 (no plaintext mode); it reuses the same cert material as the
+        // TLS listener. The endpoint is built once (cert hot-reload is a follow-on, ADR 0036).
+        let (Some(cert), Some(key)) = (
+            non_empty_env("MQTTD_TLS_CERT"),
+            non_empty_env("MQTTD_TLS_KEY"),
+        ) else {
+            return Err("MQTTD_QUIC_BIND requires MQTTD_TLS_CERT and MQTTD_TLS_KEY".into());
+        };
+        let client_ca = non_empty_env("MQTTD_TLS_CLIENT_CA");
+        let udp: std::net::SocketAddr = bind
+            .parse()
+            .map_err(|e| format!("MQTTD_QUIC_BIND is not a UDP socket address ({bind}): {e}"))?;
+        let endpoint = mqtt_net::quic::server_endpoint(
+            udp,
+            Path::new(&cert),
+            Path::new(&key),
+            client_ca.as_deref().map(Path::new),
+        )?;
+        info!(%bind, "accepting MQTT clients over QUIC + TLS 1.3 (ADR 0036)");
+        tokio::spawn(serve_quic_clients(
+            endpoint,
+            hub_tx.clone(),
+            policy.clone(),
+            shutdown.clone(),
+            connections.clone(),
+        ));
+        any = true;
+    }
     if !any {
         warn!(
-            "No client listener active. Set MQTTD_TLS_BIND or MQTTD_WSS_BIND (with \
-             MQTTD_TLS_CERT and MQTTD_TLS_KEY) for the secure TLS / WebSocket-TLS \
-             listeners, or MQTTD_PLAINTEXT_BIND / MQTTD_WS_BIND for insecure local testing."
+            "No client listener active. Set MQTTD_TLS_BIND, MQTTD_WSS_BIND, or \
+             MQTTD_QUIC_BIND (with MQTTD_TLS_CERT and MQTTD_TLS_KEY) for the secure \
+             TLS / WebSocket-TLS / QUIC listeners, or MQTTD_PLAINTEXT_BIND / MQTTD_WS_BIND \
+             for insecure local testing."
         );
     }
     Ok(())
@@ -1266,6 +1299,63 @@ async fn serve_wss_clients(
                     if let Some(m) = &policy.metrics {
                         m.connection_error("tls");
                     }
+                }
+            }
+        });
+    }
+}
+
+/// Accept MQTT-over-QUIC clients (ADR 0036). QUIC mandates TLS 1.3, so the mTLS **identity** is
+/// the verified leaf-cert CN read from the connection (ADR 0004), exactly as for a TCP TLS
+/// client. The MQTT session runs over the connection's first **bidirectional** stream (the
+/// control stream) — multi-stream data streams layer on this foundation.
+async fn serve_quic_clients(
+    endpoint: quinn::Endpoint,
+    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    policy: Arc<conn::ConnPolicy>,
+    shutdown: tokio_util::sync::CancellationToken,
+    connections: tokio_util::task::TaskTracker,
+) {
+    loop {
+        let incoming = tokio::select! {
+            () = shutdown.cancelled() => {
+                endpoint.close(0u32.into(), b"shutdown");
+                return;
+            }
+            inc = endpoint.accept() => match inc {
+                Some(inc) => inc,
+                None => return, // endpoint closed
+            },
+        };
+        let hub = hub_tx.clone();
+        let policy = policy.clone();
+        connections.spawn(async move {
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    debug!(error = %e, "QUIC handshake failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("tls");
+                    }
+                    return;
+                }
+            };
+            let peer = conn.remote_address();
+            debug!(%peer, "accepted QUIC connection");
+            if let Some(m) = &policy.metrics {
+                m.connection_accepted("quic");
+            }
+            // mTLS identity (ADR 0004): the verified leaf cert's CN, from the QUIC handshake.
+            let identity = mqtt_net::quic::peer_leaf_cert(&conn)
+                .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
+            // The control stream — the first bidi stream — carries the MQTT session.
+            match conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    let stream = mqtt_net::quic::byte_stream(send, recv);
+                    conn::handle_stream(stream, Some(peer), identity, policy, hub).await;
+                }
+                Err(e) => {
+                    debug!(%peer, error = %e, "QUIC connection opened no control stream");
                 }
             }
         });

@@ -68,6 +68,9 @@ rcgen = "0.13"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 # Stream/Sink adapters for the WebSocket byte-stream shim (already in-tree transitively).
 futures-util = "0.3"
+# QUIC transport (ADR 0036): MQTT-over-QUIC. Pinned to the `ring` rustls provider (no aws-lc),
+# matching the rest of the broker; already in-tree transitively on our rustls 0.23.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 
 [profile.release]
 lto = "thin"

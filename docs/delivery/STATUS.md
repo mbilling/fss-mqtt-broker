@@ -43,6 +43,7 @@
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [6/7 done](0035-websocket-transport.md) | 1 deferred |
+| [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Proposed | [5/8 done](0036-quic-transport.md) | 2 open, 1 deferred |
 
 ## Open and deferred work
 
@@ -138,3 +139,9 @@
 **0035 — Native MQTT-over-WebSocket transport**
 
 - `0035-T7` 💤 deferred: Follow-on — MQTT-over-QUIC (separate ADR) reuses the same handle_stream<S> seam — QUIC is its own ADR (multi-stream mapping, quinn — already in the lock file); sequenced after WebSocket per the maintainer's call.
+
+**0036 — MQTT-over-QUIC transport (multi-stream)**
+
+- `0036-T5` ⬜ planned: Multi-stream demux — accept additional bidi data streams and feed their PUBLISH packets into the SAME session; route outbound PUBLISH across streams (no cross-stream head-of-line blocking). The connection-model generalisation (one session, N streams), built on T1–T4
+- `0036-T6` ⬜ planned: Multi-stream test — two data streams carry independent PUBLISH flows into one session; a stalled/large publish on one stream does not block delivery on the other
+- `0036-T8` 💤 deferred: Follow-on — connection migration validation + 1-RTT resumption tuning; optional demo wiring — QUIC connection migration and resumption are quinn-provided; explicit validation/tuning and any demo exposure are a follow-on once the transport + multi-stream land.

@@ -44,6 +44,23 @@ pub fn server_acceptor(
     key: &Path,
     client_ca: Option<&Path>,
 ) -> Result<TlsAcceptor, NetError> {
+    Ok(TlsAcceptor::from(Arc::new(server_config(
+        cert_chain, key, client_ca,
+    )?)))
+}
+
+/// Build the rustls [`ServerConfig`] underlying [`server_acceptor`] — TLS 1.3 only, `ring`
+/// provider, with optional mTLS client-cert verification. Exposed so the QUIC listener
+/// (ADR 0036) can build its endpoint from the *same* audited config (adding ALPN `mqtt`),
+/// keeping a single TLS configuration path in the broker.
+///
+/// # Errors
+/// [`NetError::Tls`] on the same conditions as [`server_acceptor`].
+pub fn server_config(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+) -> Result<ServerConfig, NetError> {
     let certs = load_certs(cert_chain)?;
     let key = load_key(key)?;
     let builder = ServerConfig::builder_with_provider(provider())
@@ -61,7 +78,7 @@ pub fn server_acceptor(
     }
     .with_single_cert(certs, key)
     .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(config)
 }
 
 /// Build a dialing-side connector for the cluster bus: verifies the remote

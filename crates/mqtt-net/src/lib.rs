@@ -7,6 +7,7 @@
 //! acceptors/connectors are built (ADR 0002).
 
 mod frame;
+pub mod quic;
 pub mod tls;
 pub mod ws;
 pub use frame::{FrameReader, FrameWriter};
@@ -22,13 +23,18 @@ pub enum Transport {
     WebSocket,
     /// WebSocket over TLS (ADR 0035).
     WebSocketTls,
+    /// MQTT-over-QUIC (ADR 0036) — always TLS 1.3 (QUIC has no plaintext mode).
+    Quic,
 }
 
 impl Transport {
     /// Whether this transport encrypts traffic in flight.
     #[must_use]
     pub fn is_encrypted(self) -> bool {
-        matches!(self, Transport::Tls | Transport::WebSocketTls)
+        matches!(
+            self,
+            Transport::Tls | Transport::WebSocketTls | Transport::Quic
+        )
     }
 }
 
