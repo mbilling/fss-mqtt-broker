@@ -313,9 +313,10 @@ under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
 
 ## Architecture decisions
 
-Every significant decision is recorded as an ADR. See the
-[**ADR index**](docs/adr/README.md) for the full catalogue and
-[`docs/delivery/STATUS.md`](docs/delivery/STATUS.md) for live build status.
+Every significant decision is recorded as an ADR. See
+[`docs/adr/`](docs/adr/README.md) for the model and conventions, and the generated
+[**delivery dashboard**](docs/delivery/STATUS.md) for the full catalogue of decisions
+and their live build status.
 
 ## License
 

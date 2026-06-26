@@ -130,6 +130,13 @@ def adr_title(num: str) -> str:
     return "?"
 
 
+def adr_file(num: str) -> str | None:
+    """The ADR markdown filename for `num`, or None if there is no ADR file."""
+    for p in ADR_DIR.glob(f"{num}-*.md"):
+        return p.name
+    return None
+
+
 def build_dashboard(docs: list[dict]) -> str:
     by_adr = {d["adr"].split(",")[0].strip().strip('"'): d for d in docs}
     all_nums = sorted(p.name[:4] for p in ADR_DIR.glob("0*.md"))
@@ -148,21 +155,27 @@ def build_dashboard(docs: list[dict]) -> str:
     ]
     for num in all_nums:
         title = adr_title(num)
+        # Link the ADR number to its decision record; this dashboard is the canonical ADR
+        # catalogue, so the navigation the old hand-maintained index gave lives here now.
+        af = adr_file(num)
+        num_cell = f"[{num}](../adr/{af})" if af else num
         d = by_adr.get(num)
         if d is None:
-            out.append(f"| {num} | {title} | {adr_status_line(num)} | _not migrated_ | — |")
+            out.append(f"| {num_cell} | {title} | {adr_status_line(num)} | _not migrated_ | — |")
             continue
         tasks = d["tasks"]
         done = sum(1 for t in tasks if t["status"] == "done")
         opened = sum(1 for t in tasks if t["status"] in OPEN_STATUSES)
         deferred = sum(1 for t in tasks if t["status"] == "deferred")
         prog = f"{done}/{len(tasks)} done" if tasks else "—"
+        # Link the progress to the delivery doc (same dir as this file) for the task detail.
+        prog_cell = f"[{prog}]({d['_path'].name})"
         tail = []
         if opened:
             tail.append(f"{opened} open")
         if deferred:
             tail.append(f"{deferred} deferred")
-        out.append(f"| {num} | {title} | {d['adr_status']} | {prog} | {', '.join(tail) or '—'} |")
+        out.append(f"| {num_cell} | {title} | {d['adr_status']} | {prog_cell} | {', '.join(tail) or '—'} |")
 
     # Open + deferred detail across all migrated docs.
     out += ["", "## Open and deferred work", ""]

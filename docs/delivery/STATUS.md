@@ -8,40 +8,40 @@
 
 | ADR | Title | Decision | Tasks | Open / deferred |
 |-----|-------|----------|-------|-----------------|
-| 0001 | Session durability in a horizontally-scalable cluster | Accepted | 10/11 done | 1 deferred |
-| 0002 | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | 7/10 done | 3 deferred |
-| 0003 | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | 8/9 done | — |
-| 0004 | Identity model: mTLS Common Name first, deny by default | Accepted | 8/11 done | 3 deferred |
-| 0005 | Session affinity: relocate persistent sessions to their owner | Accepted | 3/6 done | 3 deferred |
-| 0006 | Consensus & replication for durable sessions | Accepted | 11/11 done | — |
-| 0007 | Wiring the durable cluster session store into the broker | Accepted | 8/9 done | 1 deferred |
-| 0008 | MQTT 5.0 codec | Accepted | 8/8 done | — |
-| 0009 | MQTT 5.0 session & message expiry | Accepted | 3/3 done | — |
-| 0010 | Shared subscriptions | Accepted | 7/8 done | 1 deferred |
-| 0011 | MQTT 5.0 topic aliases | Accepted | 7/7 done | — |
-| 0012 | MQTT 5.0 flow control (Receive Maximum) | Accepted | 6/6 done | — |
-| 0013 | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | 8/9 done | 1 deferred |
-| 0014 | Cross-node retained-message replication | Accepted | 6/9 done | 3 deferred |
-| 0015 | Cluster-wide shared subscriptions | Accepted | 8/8 done | — |
-| 0016 | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | 3/4 done | 1 open |
-| 0017 | Durable attach waits for an authoritative session, never downgrades | Accepted | 8/9 done | 1 deferred |
-| 0018 | On-disk persistence for durable state | Accepted | 7/8 done | 1 deferred |
-| 0019 | Graceful shutdown and connection draining | Accepted | 7/9 done | 2 deferred |
-| 0020 | Metrics and runtime observability | Accepted | 9/9 done | — |
-| 0021 | Bounded lease-consensus voter set | Accepted | 9/9 done | — |
-| 0022 | Per-node signed gossip (authenticated SWIM identity) | Accepted | 5/7 done | 2 deferred |
-| 0023 | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | 6/6 done | — |
-| 0024 | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | 7/7 done | — |
-| 0025 | Boundary MQTT bridge to brokers in other security zones | Accepted | 11/11 done | — |
-| 0026 | Lease-group raft timing tolerant of durable-storage latency | Accepted | 7/7 done | — |
-| 0027 | Group-commit for the durable replica apply path | Accepted | 4/4 done | — |
-| 0028 | Link-gated lease-group voter admission | Accepted | 3/3 done | — |
-| 0029 | Durable sessions by default | Accepted | 3/3 done | — |
-| 0030 | Forward MQTT 5 User Properties through delivery | Accepted | 5/5 done | — |
-| 0031 | Bind the session to the authenticated identity | Proposed | 0/6 done | 6 open |
-| 0032 | Hot-reloadable security policy | Accepted | 8/9 done | 1 deferred |
-| 0033 | Filesystem-watch auto-reload of the security policy | Proposed | 0/7 done | 6 open, 1 deferred |
-| 0034 | Foreign-client interop conformance testing | Accepted | 6/7 done | 1 deferred |
+| [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [10/11 done](0001-session-durability.md) | 1 deferred |
+| [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [7/10 done](0002-transport-security.md) | 3 deferred |
+| [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
+| [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [8/11 done](0004-identity-and-authentication.md) | 3 deferred |
+| [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [3/6 done](0005-session-affinity.md) | 3 deferred |
+| [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [11/11 done](0006-consensus-and-replication.md) | — |
+| [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [8/9 done](0007-durable-store-integration.md) | 1 deferred |
+| [0008](../adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec | Accepted | [8/8 done](0008-mqtt-5-codec.md) | — |
+| [0009](../adr/0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [3/3 done](0009-mqtt5-expiry.md) | — |
+| [0010](../adr/0010-shared-subscriptions.md) | Shared subscriptions | Accepted | [7/8 done](0010-shared-subscriptions.md) | 1 deferred |
+| [0011](../adr/0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted | [7/7 done](0011-topic-aliases.md) | — |
+| [0012](../adr/0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | [6/6 done](0012-flow-control.md) | — |
+| [0013](../adr/0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [8/9 done](0013-enhanced-authentication.md) | 1 deferred |
+| [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [6/9 done](0014-cross-node-retained.md) | 3 deferred |
+| [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [8/8 done](0015-cluster-shared-subscriptions.md) | — |
+| [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [3/4 done](0016-swim-membership-stability.md) | 1 open |
+| [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
+| [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [7/8 done](0018-on-disk-persistence.md) | 1 deferred |
+| [0019](../adr/0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [7/9 done](0019-graceful-shutdown.md) | 2 deferred |
+| [0020](../adr/0020-metrics-and-observability.md) | Metrics and runtime observability | Accepted | [9/9 done](0020-metrics-and-observability.md) | — |
+| [0021](../adr/0021-bounded-lease-voters.md) | Bounded lease-consensus voter set | Accepted | [9/9 done](0021-bounded-lease-voters.md) | — |
+| [0022](../adr/0022-signed-gossip.md) | Per-node signed gossip (authenticated SWIM identity) | Accepted | [5/7 done](0022-signed-gossip.md) | 2 deferred |
+| [0023](../adr/0023-gossip-anti-replay.md) | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | [6/6 done](0023-gossip-anti-replay.md) | — |
+| [0024](../adr/0024-deterministic-testing.md) | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | [7/7 done](0024-deterministic-testing.md) | — |
+| [0025](../adr/0025-boundary-bridge.md) | Boundary MQTT bridge to brokers in other security zones | Accepted | [11/11 done](0025-boundary-bridge.md) | — |
+| [0026](../adr/0026-lease-timing-durable-storage.md) | Lease-group raft timing tolerant of durable-storage latency | Accepted | [7/7 done](0026-lease-timing-durable-storage.md) | — |
+| [0027](../adr/0027-replica-group-commit.md) | Group-commit for the durable replica apply path | Accepted | [4/4 done](0027-replica-group-commit.md) | — |
+| [0028](../adr/0028-link-gated-voter-admission.md) | Link-gated lease-group voter admission | Accepted | [3/3 done](0028-link-gated-voter-admission.md) | — |
+| [0029](../adr/0029-durable-by-default.md) | Durable sessions by default | Accepted | [3/3 done](0029-durable-by-default.md) | — |
+| [0030](../adr/0030-user-property-forwarding.md) | Forward MQTT 5 User Properties through delivery | Accepted | [5/5 done](0030-user-property-forwarding.md) | — |
+| [0031](../adr/0031-session-identity-binding.md) | Bind the session to the authenticated identity | Proposed | [0/6 done](0031-session-identity-binding.md) | 6 open |
+| [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |
+| [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
+| [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 
 ## Open and deferred work
 
