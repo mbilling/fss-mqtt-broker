@@ -1,6 +1,6 @@
 # ADR 0034 — Foreign-client interop conformance testing
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-26
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0034-foreign-client-interop-conformance.md](../delivery/0034-foreign-client-interop-conformance.md) — plan, progress, and changelog

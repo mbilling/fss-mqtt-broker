@@ -1,26 +1,38 @@
 ---
 adr: "0034"
 title: Foreign-client interop conformance testing
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0034-T1
     title: Interop harness — scripts/interop/run.sh boots the real mqttd (plaintext listener), waits on /readyz, runs a mosquitto_pub/_sub round-trip, asserts the payload, tears down; exits non-zero on mismatch; runnable locally
-    status: planned
+    status: done
+    date: 2026-06-26
+    evidence: "scripts/interop/run.sh — boots the real mqttd binary (MQTTD_BIN override or cargo build), gates on /readyz, runs concurrent mosquitto_sub/_pub round-trips via a roundtrip() helper with per-test timeout + unique client ids, asserts payloads, traps cleanup of every broker PID + tempdir. Verified locally: 8/8 checks pass (INTEROP OK)."
   - id: 0034-T2
     title: v3.1.1 matrix — QoS 0/1/2 payload-integrity round-trips plus a retained message delivered to a late subscriber
-    status: planned
+    status: done
+    date: 2026-06-26
+    evidence: "Phase A: QoS 0/1/2 payload round-trips + a retained message published-then-read by a late subscriber (and cleared). All pass against target/debug/mqttd."
   - id: 0034-T3
     title: v5 round-trip — mosquitto -V 5; assert a v5 User Property survives to the subscriber (ties the foreign oracle to ADR 0030)
-    status: planned
+    status: done
+    date: 2026-06-26
+    evidence: "mosquitto_pub -V mqttv5 -D publish user-property zone kitchen → mosquitto_sub -V mqttv5 -F '%p|%P' observes 'hello-v5|zone:kitchen' — the User Property survives the broker hop against a foreign client (ADR 0030)."
   - id: 0034-T4
     title: TLS interop — a Mosquitto client completes a TLS 1.3 handshake against the rustls listener (--cafile), proving OpenSSL↔rustls; an mTLS variant presents a client cert
-    status: planned
+    status: done
+    date: 2026-06-26
+    evidence: "gen_pki() mints a CA + 127.0.0.1 server leaf + client leaf via openssl. Phase A: OpenSSL client ↔ rustls server TLS 1.3 round-trip. Phase B: mTLS — a CA-signed client cert round-trips; a client with no cert is refused (empty receive). All pass."
   - id: 0034-T5
     title: CI job — a gating `interop` job in .github/workflows/ci.yml installs mosquitto-clients, builds the broker, runs scripts/interop/run.sh; isolated from the unit gate; deterministic (no flake)
-    status: planned
+    status: done
+    date: 2026-06-26
+    evidence: ".github/workflows/ci.yml `interop` job: installs mosquitto-clients (apt), cargo build -p mqttd, runs MQTTD_BIN=target/debug/mqttd ./scripts/interop/run.sh; isolated from the unit `test` job. Determinism via readiness-gating + unique client ids + per-test timeouts."
   - id: 0034-T6
     title: Docs — README + docs/TEST-PLAN.md note (what it asserts, how to run locally, the no-new-crate supply-chain property)
-    status: planned
+    status: done
+    date: 2026-06-26
+    evidence: "README Build & test: how to run scripts/interop/run.sh, what it asserts, the no-new-crate property. docs/TEST-PLAN.md priority #5 marked done with the non-Rust-oracle rationale (chosen over rumqttc)."
   - id: 0034-T7
     title: Follow-on — a second foreign client (Paho Python) behind the same harness for richer assertions (reason codes, properties, flow control)
     status: deferred
@@ -55,12 +67,12 @@ adversarial/malformed input; this complements it for well-formed foreign-encodin
 <!-- status-table:0034 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0034-T1 | ⬜ planned | — |  |
-| 0034-T2 | ⬜ planned | — |  |
-| 0034-T3 | ⬜ planned | — |  |
-| 0034-T4 | ⬜ planned | — |  |
-| 0034-T5 | ⬜ planned | — |  |
-| 0034-T6 | ⬜ planned | — |  |
+| 0034-T1 | ✅ done | 2026-06-26 | "scripts/interop/run.sh — boots the real mqttd binary (MQTTD_BIN override or cargo build), gates on /readyz, runs concurrent mosquitto_sub/_pub round-trips via a roundtrip() helper with per-test timeout + unique client ids, asserts payloads, traps cleanup of every broker PID + tempdir. Verified locally: 8/8 checks pass (INTEROP OK)." |
+| 0034-T2 | ✅ done | 2026-06-26 | "Phase A: QoS 0/1/2 payload round-trips + a retained message published-then-read by a late subscriber (and cleared). All pass against target/debug/mqttd." |
+| 0034-T3 | ✅ done | 2026-06-26 | "mosquitto_pub -V mqttv5 -D publish user-property zone kitchen → mosquitto_sub -V mqttv5 -F '%p|%P' observes 'hello-v5|zone:kitchen' — the User Property survives the broker hop against a foreign client (ADR 0030)." |
+| 0034-T4 | ✅ done | 2026-06-26 | "gen_pki() mints a CA + 127.0.0.1 server leaf + client leaf via openssl. Phase A: OpenSSL client ↔ rustls server TLS 1.3 round-trip. Phase B: mTLS — a CA-signed client cert round-trips; a client with no cert is refused (empty receive). All pass." |
+| 0034-T5 | ✅ done | 2026-06-26 | ".github/workflows/ci.yml `interop` job: installs mosquitto-clients (apt), cargo build -p mqttd, runs MQTTD_BIN=target/debug/mqttd ./scripts/interop/run.sh; isolated from the unit `test` job. Determinism via readiness-gating + unique client ids + per-test timeouts." |
+| 0034-T6 | ✅ done | 2026-06-26 | "README Build & test: how to run scripts/interop/run.sh, what it asserts, the no-new-crate property. docs/TEST-PLAN.md priority #5 marked done with the non-Rust-oracle rationale (chosen over rumqttc)." |
 | 0034-T7 | 💤 deferred | — | start with one independent oracle (Mosquitto) to bound CI surface and flake sources; a second client adds coverage on the same harness once the first is stable in CI. |
 <!-- /status-table:0034 -->
 
@@ -71,3 +83,9 @@ adversarial/malformed input; this complements it for well-formed foreign-encodin
   dev-dep: stronger codec independence and **zero** added supply chain. Mechanism: a locally-
   runnable `scripts/interop/run.sh` driving the real `mqttd` with the Mosquitto CLI, gated in a
   dedicated CI job. Tasks `planned`; T7 (a second foreign client, Paho) deferred.
+- **2026-06-26** — T1–T6 delivered. `scripts/interop/run.sh` drives the real `mqttd` binary
+  with the Eclipse Mosquitto CLI through **8 checks** — v3.1.1 QoS 0/1/2, retained-to-a-late-
+  subscriber, a v5 User Property surviving a hop (ADR 0030), OpenSSL↔rustls TLS 1.3, and mTLS
+  (client cert accepted / no-cert refused) — all green locally (`INTEROP OK`). Added the gating
+  `interop` CI job and the README / TEST-PLAN docs. **No crate added** to the dependency tree:
+  the foreign client is an external process. T7 (a second foreign client, Paho) stays deferred.

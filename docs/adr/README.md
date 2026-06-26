@@ -53,4 +53,4 @@ conventions.
 | [0031](0031-session-identity-binding.md) | Bind the session to the authenticated identity | Proposed | [delivery](../delivery/0031-session-identity-binding.md) |
 | [0032](0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy (SIGHUP, validate-before-swap) | Accepted | [delivery](../delivery/0032-hot-reloadable-security-policy.md) |
 | [0033](0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy (opt-in) | Proposed | [delivery](../delivery/0033-config-file-watch-reload.md) |
-| [0034](0034-foreign-client-interop-conformance.md) | Foreign-client (non-Rust) interop conformance testing | Proposed | [delivery](../delivery/0034-foreign-client-interop-conformance.md) |
+| [0034](0034-foreign-client-interop-conformance.md) | Foreign-client (non-Rust) interop conformance testing | Accepted | [delivery](../delivery/0034-foreign-client-interop-conformance.md) |

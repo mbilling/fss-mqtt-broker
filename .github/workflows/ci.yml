@@ -50,6 +50,22 @@ jobs:
       - name: Status dashboard is up to date
         run: python3 scripts/gen-status.py --check
 
+  interop:
+    name: foreign-client interop (mosquitto)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # ADR 0034: drive the real mqttd binary with a non-Rust client (Eclipse Mosquitto).
+      # An external process, not a cargo dep — no addition to the broker's supply chain.
+      - name: Install mosquitto clients
+        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
+      - name: Build broker
+        run: cargo build --quiet -p mqttd
+      - name: Interop conformance
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/interop/run.sh
+
   supply-chain:
     name: supply-chain audit
     runs-on: ubuntu-latest

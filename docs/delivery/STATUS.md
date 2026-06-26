@@ -41,7 +41,7 @@
 | 0031 | Bind the session to the authenticated identity | Proposed | 0/6 done | 6 open |
 | 0032 | Hot-reloadable security policy | Accepted | 8/9 done | 1 deferred |
 | 0033 | Filesystem-watch auto-reload of the security policy | Proposed | 0/7 done | 6 open, 1 deferred |
-| 0034 | Foreign-client interop conformance testing | Proposed | 0/7 done | 6 open, 1 deferred |
+| 0034 | Foreign-client interop conformance testing | Accepted | 6/7 done | 1 deferred |
 
 ## Open and deferred work
 
@@ -132,10 +132,4 @@
 
 **0034 — Foreign-client interop conformance testing**
 
-- `0034-T1` ⬜ planned: Interop harness — scripts/interop/run.sh boots the real mqttd (plaintext listener), waits on /readyz, runs a mosquitto_pub/_sub round-trip, asserts the payload, tears down; exits non-zero on mismatch; runnable locally
-- `0034-T2` ⬜ planned: v3.1.1 matrix — QoS 0/1/2 payload-integrity round-trips plus a retained message delivered to a late subscriber
-- `0034-T3` ⬜ planned: v5 round-trip — mosquitto -V 5; assert a v5 User Property survives to the subscriber (ties the foreign oracle to ADR 0030)
-- `0034-T4` ⬜ planned: TLS interop — a Mosquitto client completes a TLS 1.3 handshake against the rustls listener (--cafile), proving OpenSSL↔rustls; an mTLS variant presents a client cert
-- `0034-T5` ⬜ planned: CI job — a gating `interop` job in .github/workflows/ci.yml installs mosquitto-clients, builds the broker, runs scripts/interop/run.sh; isolated from the unit gate; deterministic (no flake)
-- `0034-T6` ⬜ planned: Docs — README + docs/TEST-PLAN.md note (what it asserts, how to run locally, the no-new-crate supply-chain property)
 - `0034-T7` 💤 deferred: Follow-on — a second foreign client (Paho Python) behind the same harness for richer assertions (reason codes, properties, flow control) — start with one independent oracle (Mosquitto) to bound CI surface and flake sources; a second client adds coverage on the same harness once the first is stable in CI.

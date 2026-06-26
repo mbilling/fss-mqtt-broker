@@ -141,7 +141,17 @@ cargo deny check          # supply-chain: licenses, advisories, bans, sources
 # Fuzz the codec (the untrusted-input boundary). Requires nightly + cargo-fuzz:
 #   cargo install cargo-fuzz
 cargo +nightly fuzz run packet_decode --fuzz-dir crates/mqtt-codec/fuzz
+
+# Foreign-client interop conformance (ADR 0034): drives the real mqttd binary with the
+# Eclipse Mosquitto CLI — a non-Rust client that shares no code with the broker's codec, so
+# it catches conformance drift the self-codec tests cannot. Needs `mosquitto-clients`,
+# `openssl`, `python3`, `curl` on PATH; adds NO crate to the dependency tree. Runs in CI.
+./scripts/interop/run.sh
 ```
+
+The interop suite asserts v3.1.1 round-trips at QoS 0/1/2, a retained message to a late
+subscriber, an MQTT 5 **User Property** surviving a hop (ADR 0030), and OpenSSL↔rustls TLS 1.3
+plus mTLS — all against an independent implementation.
 
 ## Running
 

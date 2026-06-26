@@ -43,13 +43,15 @@ Keep **both** client styles, deliberately:
 - **The self-codec client stays primary.** It is the only way to send the malformed
   and adversarial packets darksky tests need — a conformant client library will not
   emit a wildcard PUBLISH topic or an out-of-range topic alias.
-- **A thin real-client interop suite** (`rumqttc`, behind an opt-in `interop`
-  feature so it is CI-only): a foreign client doing a pub/sub round-trip in v3.1.1
-  and v5. This catches codec-conformance drift the self-codec cannot. ~6 tests.
-  **Not yet added** — pulling a third-party client drags in a dependency tree that
-  `cargo deny` will scrutinise; for a security-first broker this is a deliberate
-  supply-chain decision for the maintainer, not an incidental dev-dep. Tracked as
-  an explicit follow-up.
+- **A thin real-client interop suite** — **done** ([ADR 0034](adr/0034-foreign-client-interop-conformance.md),
+  `scripts/interop/run.sh` + the `interop` CI job). Resolved the supply-chain question by
+  choosing a **non-Rust** oracle (the Eclipse Mosquitto CLI) over the originally-sketched
+  `rumqttc` dev-dep: stronger codec independence (shares zero code with the broker) and
+  **zero** crates added to the dependency tree — the foreign client is an external process,
+  not a `dev-dependency`. Drives the real `mqttd` binary through v3.1.1 QoS 0/1/2 round-trips,
+  a retained-to-a-late-subscriber, a v5 User Property surviving a hop (ADR 0030), and
+  OpenSSL↔rustls TLS 1.3 + mTLS. (`rumqttc` remains a possible Rust-side complement if an
+  in-`cargo test` interop check is ever wanted.)
 - **One process-level smoke test** — done (`binary_smoke`): launches the real
   `mqttd` binary (env-var config, plaintext listener) and drives a pub/sub
   round-trip, the only test exercising `main.rs`.
@@ -60,7 +62,7 @@ Keep **both** client styles, deliberately:
 2. ✅ **Darksky** protocol-violation + security suite.
 3. ✅ Cluster routing gaps (cross-node QoS 1; shared per-node; retained-not-replicated).
 4. ✅ Binary smoke test.
-5. `rumqttc` interop — pending a supply-chain decision (see Strategy).
+5. ✅ Real-client interop — non-Rust (Mosquitto) oracle, ADR 0034 (see Strategy).
 6. Deeper cluster chaos: partition+heal reconvergence, owner-dies-mid-publish,
    takeover-across-nodes with in-flight messages, QoS 2 across nodes.
 7. Retrofit the existing 13 files onto the shared harness (mechanical; lowest value).
