@@ -611,6 +611,55 @@ mod tests {
         assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 3);
     }
 
+    /// Recovery **fails closed**: when a quorum of the replica set cannot be read, the new
+    /// owner must NOT fabricate an empty (clean) log — it returns `NoQuorum` so the attach
+    /// retries (the error is classified transient, so ADR 0017's `recover_until_ready` waits
+    /// rather than downgrading). A committed entry could live only on an unreachable replica;
+    /// serving an empty log would silently drop it and wipe a durable session. This guards
+    /// the "merge a quorum or refuse" contract in [`recover_key`](super::GroupRoutedLog).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_below_quorum_fails_closed_with_noquorum() {
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two followers that are NOT reachable.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000");
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000");
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        // This node's own committed copy DOES hold an entry — so recovery is not blocked by
+        // missing local data; it is blocked purely by being unable to reach a quorum, which
+        // is exactly the case where fabricating an empty log would be unsafe.
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        replicas.lock().unwrap().apply(
+            3,
+            &ReplOp::Append {
+                key: qkey.clone(),
+                offset: 1,
+                record: b"m1".to_vec(),
+            },
+        );
+
+        // A transport with NO followers registered: each peer recovery-read resolves to
+        // `None` immediately ("replica not connected", repl_net.rs), so only this node's own
+        // read is available — 1 of the required 2.
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            Arc::new(PeerReplicaTransport::new()),
+            FixedLease(7),
+            replicas,
+        );
+
+        // First touch attempts recovery, cannot reach a quorum, and refuses to serve.
+        let err = log.read(&qkey, 0, 100).await.unwrap_err();
+        assert!(
+            matches!(err, mqtt_storage::repl::ReplError::NoQuorum),
+            "below quorum, recovery must fail closed with NoQuorum (never an empty log); got {err:?}"
+        );
+    }
+
     /// When a group's lease epoch advances (ownership lost then regained), the cached
     /// `ClusterLog` — which writes at the stale epoch and would be fenced by followers
     /// forever — is rebuilt at the new epoch and the group's keys are re-recovered

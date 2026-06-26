@@ -620,6 +620,96 @@ async fn a_queued_message_is_replayed_to_the_client_after_takeover() {
     );
 }
 
+/// QoS-2 **inbound exactly-once across an owner failover** (ADR 0001 §5, ADR 0006 §4): the
+/// received-packet-id dedup set is replicated session state, so a redelivered PUBLISH (same
+/// packet id) after a takeover is de-duplicated by the **new** owner — it is not processed a
+/// second time. This is the headline exactly-once guarantee, exercised over a *real* cluster
+/// failover: the owner records the receipt (quorum-durable), is killed, and a survivor — which
+/// must rebuild the dedup set from a quorum of replicas — still sees the id as a duplicate.
+///
+/// Like the queue-replay takeover test, this drives the durable store directly so the
+/// failover assertion is deterministic (the hub's PUBLISH→`record_received` dedup path is
+/// covered by `qos2.rs`); here we prove the *replicated state* survives the owner change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn qos2_inbound_dedup_survives_owner_takeover() {
+    let a = start_durable_node("dur-a", vec![]).await; // founder
+    let b = start_durable_node("dur-b", vec![a.swim_addr.clone()]).await;
+    let c = start_durable_node("dur-c", vec![a.swim_addr.clone()]).await;
+    let nodes = [&a, &b, &c];
+
+    wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+
+    let client_id = "failover-qos2-1";
+    let cid = ClientId(client_id.to_string());
+    let owner = a.placement.read().unwrap().owner(client_id);
+    let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
+
+    // The owner records the inbound QoS-2 PUBLISH (packet id 5). The receipt commits only
+    // across a quorum (owner + ≥1 follower), so once it returns Ok it is guaranteed to
+    // survive the owner's loss. First receipt → `true`.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Ok(newly) = owner_node.store.record_received(&cid, 5).await {
+            assert!(newly, "the first receipt of packet id 5 is new");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the QoS-2 receipt never durably committed on the owner"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Kill the owner; a survivor takes over the group.
+    owner_node.kill();
+    let survivors: Vec<&&DurableNode> = nodes.iter().filter(|n| n.node_id != owner).collect();
+    wait_until(Duration::from_secs(20), || {
+        survivors
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 2)
+    })
+    .await;
+    let new_owner = survivors[0].placement.read().unwrap().owner(client_id);
+    assert_ne!(new_owner, owner, "a survivor must take over the group");
+    let new_owner_node = survivors.iter().find(|n| n.node_id == new_owner).unwrap();
+
+    // On the new owner, the redelivered PUBLISH (same packet id 5) must be seen as a
+    // DUPLICATE — the dedup set was rebuilt from a quorum of replicas during takeover, so
+    // `record_received` returns `false` and the message is not delivered a second time.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(newly) = new_owner_node.store.record_received(&cid, 5).await {
+            assert!(
+                !newly,
+                "after takeover, the redelivered packet id 5 must be a duplicate \
+                 (the dedup set survived the owner change) — exactly-once preserved"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new owner never recovered the QoS-2 dedup set after takeover"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // And the recovered dedup window still lists id 5 (authoritative resume state).
+    assert_eq!(
+        new_owner_node.store.received(&cid).await.unwrap(),
+        vec![5],
+        "the recovered session must report packet id 5 as still received-not-completed"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_replica_serves_the_session_after_the_owner_dies() {
     let a = start_durable_node("dur-a", vec![]).await; // founder
