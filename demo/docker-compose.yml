@@ -13,6 +13,9 @@ name: mqttd-demo
 
 x-broker-env: &broker-env
   MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext, loudly logged insecure
+  MQTTD_WS_BIND: 0.0.0.0:1890          # demo only — native MQTT-over-WebSocket (ADR 0035),
+                                       # plaintext; lets the browser playground be real mqttd
+                                       # sessions (no mosquitto gateway)
   MQTTD_ALLOW_ANONYMOUS: "1"           # demo only — no auth configured; the broker is
                                        # deny-by-default, so anonymous clients (the loadgen)
                                        # must be explicitly permitted (ADR 0004)
@@ -40,7 +43,7 @@ services:
       MQTTD_NODE_ID: mqttd-1
       MQTTD_PEER_BIND: mqttd-1:7001    # advertised to peers -> must be resolvable
       MQTTD_SWIM_BIND: mqttd-1:7946    # founder: no SWIM seeds
-    ports: ["1883:1883", "8080:8080"]
+    ports: ["1883:1883", "8080:8080", "8089:1890"]   # 8089 -> native MQTT-over-WS (playground)
     volumes: ["d1:/data"]
     depends_on: [alloy]
 
@@ -113,29 +116,17 @@ services:
     depends_on: [mqttd-1, mqttd-2, mqttd-3]
 
   # --- browser MQTT playground -------------------------------------------------------
-  # Browsers can't speak raw MQTT/TCP (and mqttd has no WS listener yet), so two small
-  # services back the playground: `playground` (nginx) serves the static web UI, and
-  # `playground-gw` (mosquitto) is the MQTT-over-WebSockets entry point bridged into the
-  # cluster. Browser publishes (play/up/#) are relayed THROUGH mqttd to play/down/# which
-  # the subscribers receive — a full cluster round-trip. Open http://localhost:8088
-  # (or http://<host>:8088 over Tailscale).
+  # The page connects directly to mqttd's NATIVE MQTT-over-WebSocket listener (ADR 0035) on
+  # mqttd-1 (host port 8089) — so each browser tab is a real mqttd session (its own client-id,
+  # placement, durability, ACL, audit, metrics). nginx serves only the static page; there is
+  # no mosquitto gateway or bridge. Open http://localhost:8088 (or http://<host>:8088).
   playground:
     image: nginx:alpine
     restart: unless-stopped
     volumes:
       - ./playground/web:/usr/share/nginx/html:ro
     ports: ["8088:80"]
-    depends_on: [playground-gw]
-
-  playground-gw:
-    image: eclipse-mosquitto:latest
-    restart: unless-stopped
-    entrypoint: ["/bin/sh", "/entrypoint.sh"]
-    volumes:
-      - ./playground/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - ./playground/entrypoint.sh:/entrypoint.sh:ro
-    ports: ["8089:9001"]   # MQTT-over-WebSockets for the browser
-    depends_on: [mqttd-1, mqttd-2, mqttd-3]
+    depends_on: [mqttd-1]
 
   # --- boundary bridge (ADR 0025) ----------------------------------------------------
   # A SEPARATE, isolated broker in a different "security zone" — a single standalone mqttd,

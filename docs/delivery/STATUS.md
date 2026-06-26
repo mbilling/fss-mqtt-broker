@@ -42,6 +42,7 @@
 | [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
+| [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [6/7 done](0035-websocket-transport.md) | 1 deferred |
 
 ## Open and deferred work
 
@@ -133,3 +134,7 @@
 **0034 — Foreign-client interop conformance testing**
 
 - `0034-T7` 💤 deferred: Follow-on — a second foreign client (Paho Python) behind the same harness for richer assertions (reason codes, properties, flow control) — start with one independent oracle (Mosquitto) to bound CI surface and flake sources; a second client adds coverage on the same harness once the first is stable in CI.
+
+**0035 — Native MQTT-over-WebSocket transport**
+
+- `0035-T7` 💤 deferred: Follow-on — MQTT-over-QUIC (separate ADR) reuses the same handle_stream<S> seam — QUIC is its own ADR (multi-stream mapping, quinn — already in the lock file); sequenced after WebSocket per the maintainer's call.

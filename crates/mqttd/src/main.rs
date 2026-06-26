@@ -268,35 +268,63 @@ async fn start_client_listeners(
     connections: &tokio_util::task::TaskTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut any = false;
-    if let Some(bind) = non_empty_env("MQTTD_TLS_BIND") {
+    let tls_bind = non_empty_env("MQTTD_TLS_BIND");
+    let wss_bind = non_empty_env("MQTTD_WSS_BIND");
+
+    // A single reloadable client-TLS acceptor, shared by the TLS and WSS listeners (ADR 0035
+    // WSS reuses the ADR 0002 TLS stack + the ADR 0032 reloadable acceptor — one TLS path).
+    let acceptor_rx = if tls_bind.is_some() || wss_bind.is_some() {
         let (Some(cert), Some(key)) = (
             non_empty_env("MQTTD_TLS_CERT"),
             non_empty_env("MQTTD_TLS_KEY"),
         ) else {
-            return Err("MQTTD_TLS_BIND requires MQTTD_TLS_CERT and MQTTD_TLS_KEY".into());
+            return Err(
+                "MQTTD_TLS_BIND / MQTTD_WSS_BIND require MQTTD_TLS_CERT and MQTTD_TLS_KEY".into(),
+            );
         };
         let client_ca = non_empty_env("MQTTD_TLS_CLIENT_CA");
-        let mtls = client_ca.is_some();
         let acceptor = tls::server_acceptor(
             Path::new(&cert),
             Path::new(&key),
             client_ca.as_deref().map(Path::new),
         )?;
-        // Register the acceptor for SIGHUP reload: the closure re-reads the same paths so a
-        // renewed cert/key/client-CA is served on the next handshake (ADR 0032 T6).
-        let acceptor_rx = reloader.attach_tls(acceptor, move || {
+        // Register the acceptor for SIGHUP reload (ADR 0032 T6): the closure re-reads the
+        // same paths so a renewed cert/key/client-CA is served on the next handshake.
+        Some(reloader.attach_tls(acceptor, move || {
             tls::server_acceptor(
                 Path::new(&cert),
                 Path::new(&key),
                 client_ca.as_deref().map(Path::new),
             )
             .map_err(|e| e.to_string())
-        });
+        }))
+    } else {
+        None
+    };
+
+    if let Some(bind) = tls_bind {
         let listener = TcpListener::bind(&bind).await?;
-        info!(%bind, mtls, "accepting MQTT 3.1.1 clients over TLS 1.3");
+        info!(%bind, "accepting MQTT 3.1.1 clients over TLS 1.3");
         tokio::spawn(serve_tls_clients(
             listener,
-            acceptor_rx,
+            acceptor_rx
+                .clone()
+                .expect("acceptor built when tls_bind set"),
+            hub_tx.clone(),
+            policy.clone(),
+            shutdown.clone(),
+            connections.clone(),
+        ));
+        any = true;
+    }
+    if let Some(bind) = wss_bind {
+        let listener = TcpListener::bind(&bind).await?;
+        info!(%bind, "accepting MQTT clients over WebSocket + TLS 1.3 (wss, ADR 0035)");
+        tokio::spawn(serve_wss_clients(
+            listener,
+            acceptor_rx
+                .clone()
+                .expect("acceptor built when wss_bind set"),
             hub_tx.clone(),
             policy.clone(),
             shutdown.clone(),
@@ -310,8 +338,21 @@ async fn start_client_listeners(
         info!(%addr, "accepting MQTT 3.1.1 clients");
         tokio::spawn(serve_plaintext_clients(
             listener,
-            hub_tx,
-            policy,
+            hub_tx.clone(),
+            policy.clone(),
+            shutdown.clone(),
+            connections.clone(),
+        ));
+        any = true;
+    }
+    if let Some(addr) = non_empty_env("MQTTD_WS_BIND") {
+        warn!(%addr, "INSECURE: starting PLAINTEXT WebSocket listener (no TLS) — testing use only");
+        let listener = TcpListener::bind(&addr).await?;
+        info!(%addr, "accepting MQTT clients over WebSocket (ws, ADR 0035)");
+        tokio::spawn(serve_ws_clients(
+            listener,
+            hub_tx.clone(),
+            policy.clone(),
             shutdown.clone(),
             connections.clone(),
         ));
@@ -319,9 +360,9 @@ async fn start_client_listeners(
     }
     if !any {
         warn!(
-            "No client listener active. Set MQTTD_TLS_BIND (with MQTTD_TLS_CERT \
-             and MQTTD_TLS_KEY) for the TLS listener, or MQTTD_PLAINTEXT_BIND for \
-             insecure local testing."
+            "No client listener active. Set MQTTD_TLS_BIND or MQTTD_WSS_BIND (with \
+             MQTTD_TLS_CERT and MQTTD_TLS_KEY) for the secure TLS / WebSocket-TLS \
+             listeners, or MQTTD_PLAINTEXT_BIND / MQTTD_WS_BIND for insecure local testing."
         );
     }
     Ok(())
@@ -1125,6 +1166,109 @@ async fn serve_plaintext_clients(
             policy.clone(),
             hub_tx.clone(),
         ));
+    }
+}
+
+/// Accept MQTT-over-WebSocket clients over plaintext (insecure; explicitly opted into).
+/// The WebSocket handshake (per connection, off the accept loop) yields a byte stream that
+/// the MQTT engine reads exactly like a TCP socket (ADR 0035).
+async fn serve_ws_clients(
+    listener: TcpListener,
+    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    policy: Arc<conn::ConnPolicy>,
+    shutdown: tokio_util::sync::CancellationToken,
+    connections: tokio_util::task::TaskTracker,
+) {
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, "ws listener accept failed");
+                    if let Some(m) = &policy.metrics { m.connection_error("accept"); }
+                    return;
+                }
+            },
+        };
+        debug!(%peer, "accepted ws connection");
+        if let Some(m) = &policy.metrics {
+            m.connection_accepted("ws");
+        }
+        let hub = hub_tx.clone();
+        let policy = policy.clone();
+        connections.spawn(async move {
+            let _ = stream.set_nodelay(true);
+            match mqtt_net::ws::accept(stream).await {
+                Ok(ws) => conn::handle_stream(ws, Some(peer), None, policy, hub).await,
+                Err(e) => {
+                    debug!(%peer, error = %e, "websocket handshake failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("ws");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Accept MQTT-over-WebSocket clients over TLS (`wss://`, ADR 0035). TLS is done first with
+/// the (reloadable) ADR 0002 acceptor — so the mTLS client-cert **identity** is extracted from
+/// the TLS stream exactly as for a TCP TLS client (ADR 0004) — then the WebSocket handshake
+/// runs over the TLS stream.
+async fn serve_wss_clients(
+    listener: TcpListener,
+    acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
+    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    policy: Arc<conn::ConnPolicy>,
+    shutdown: tokio_util::sync::CancellationToken,
+    connections: tokio_util::task::TaskTracker,
+) {
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, "wss listener accept failed");
+                    if let Some(m) = &policy.metrics { m.connection_error("accept"); }
+                    return;
+                }
+            },
+        };
+        debug!(%peer, "accepted wss connection");
+        if let Some(m) = &policy.metrics {
+            m.connection_accepted("wss");
+        }
+        // Read the current acceptor per accept so a SIGHUP cert reload is served next handshake.
+        let acceptor = acceptor_rx.borrow().clone();
+        let hub = hub_tx.clone();
+        let policy = policy.clone();
+        connections.spawn(async move {
+            let _ = stream.set_nodelay(true);
+            match acceptor.accept(stream).await {
+                Ok(tls) => {
+                    // mTLS identity (ADR 0004): the verified leaf cert's CN — read before the
+                    // TLS stream is consumed by the WebSocket adapter.
+                    let identity = conn::tls_identity(&tls);
+                    match mqtt_net::ws::accept(tls).await {
+                        Ok(ws) => conn::handle_stream(ws, Some(peer), identity, policy, hub).await,
+                        Err(e) => {
+                            debug!(%peer, error = %e, "websocket handshake failed");
+                            if let Some(m) = &policy.metrics {
+                                m.connection_error("ws");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(%peer, error = %e, "TLS handshake failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("tls");
+                    }
+                }
+            }
+        });
     }
 }
 

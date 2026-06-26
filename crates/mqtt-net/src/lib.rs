@@ -8,6 +8,7 @@
 
 mod frame;
 pub mod tls;
+pub mod ws;
 pub use frame::{FrameReader, FrameWriter};
 
 /// The transport a client connection arrived over.
@@ -17,7 +18,9 @@ pub enum Transport {
     PlainTcp,
     /// TLS over TCP (the default, secure transport).
     Tls,
-    /// WebSocket over TLS.
+    /// Plaintext WebSocket (ADR 0035) — insecure, opt-in, for local/dev only.
+    WebSocket,
+    /// WebSocket over TLS (ADR 0035).
     WebSocketTls,
 }
 

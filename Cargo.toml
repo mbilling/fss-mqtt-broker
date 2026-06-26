@@ -63,6 +63,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pki-types = "1"
 # test-only PKI: integration tests mint throwaway CAs instead of skipping verification
 rcgen = "0.13"
+# WebSocket transport (ADR 0035): the HTTP Upgrade handshake + WS frame codec only — TLS is
+# done by our own rustls (no tungstenite TLS feature), so there is one TLS stack in the broker.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# Stream/Sink adapters for the WebSocket byte-stream shim (already in-tree transitively).
+futures-util = "0.3"
 
 [profile.release]
 lto = "thin"

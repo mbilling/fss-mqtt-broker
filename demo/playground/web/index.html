@@ -56,7 +56,7 @@
 <header>
   <h1>mqttd · MQTT playground</h1>
   <span class="sub"><span id="conn" class="dot"></span> <span id="connText">connecting…</span></span>
-  <span class="sub">cluster bridge: <code class="cid">play/up → mqttd → play/down</code></span>
+  <span class="sub">native MQTT-over-WebSocket → <code class="cid">mqttd cluster</code></span>
 </header>
 
 <main>
@@ -65,8 +65,8 @@
       <button id="addSub">+ Subscriber</button>
       <button id="addPub" class="ghost">+ Publisher</button>
       <button id="addBoth" class="ghost">+ Session (pub + sub)</button>
-      <span class="muted">Each session is a real MQTT client with a unique client-id. Messages
-        round-trip the 3-node mqttd cluster (watch Grafana :3000).</span>
+      <span class="muted">Each session is a real mqttd client (unique client-id) over native
+        MQTT-over-WebSocket — full placement, durability, ACL, audit. Watch Grafana :3000.</span>
     </div>
   </div>
 
@@ -89,15 +89,13 @@
 <script>
 (() => {
   const $ = (s, r=document) => r.querySelector(s);
-  // The web UI is served by nginx on :8088; the MQTT-over-WS gateway is on :8089 of the
-  // same host. (mqttd has no WS listener yet, so a mosquitto gateway bridges to the cluster.)
+  // The web UI is served by nginx on :8088; mqttd's NATIVE MQTT-over-WebSocket listener
+  // (ADR 0035) is on :8089 of the same host. Each tab is a real mqttd session.
   const WS_PORT = 8089;
   const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':' + WS_PORT + '/';
-  const PUB_PREFIX = 'play/up/';
-  const SUB_PREFIX = 'play/down/';
   const FEED = 'demo/#';
 
-  // --- a small connectivity probe client so the header reflects gateway health -------
+  // --- a small connectivity probe client so the header reflects broker health -------
   const connDot = $('#conn'), connText = $('#connText');
   const probe = mqtt.connect(wsUrl, { clientId: 'web-probe-' + rand(), clean: true, reconnectPeriod: 2000 });
   probe.on('connect', () => { connDot.className = 'dot ok'; connText.textContent = 'connected to ' + location.host; });
@@ -163,13 +161,10 @@
     client.on('close', () => { dot.className = 'dot bad'; st.textContent = 'offline'; });
     client.on('error', e => { st.textContent = 'error: ' + e.message; });
 
-    client.on('message', (wireTopic, payloadBuf, packet) => {
+    client.on('message', (topic, payloadBuf, packet) => {
       const payload = payloadBuf.toString();
-      if (wireTopic.startsWith(SUB_PREFIX)) {
-        log(clientId, color, wireTopic.slice(SUB_PREFIX.length), payload, packet.qos, false);
-      } else {
-        log(clientId, color, wireTopic, payload, packet.qos, true); // live cluster feed
-      }
+      const feed = topic.startsWith('demo/'); // the loadgen's live cluster traffic
+      log(clientId, color, topic, payload, packet.qos, feed);
     });
 
     function renderSubs() {
@@ -184,8 +179,7 @@
     }
     function sub(filter) {
       filter = (filter || '').trim(); if (!filter || subs.has(filter)) return;
-      const wire = SUB_PREFIX + filter;
-      client.subscribe(wire, { qos: 0 }, err => { if (!err) { subs.set(filter, wire); renderSubs(); } });
+      client.subscribe(filter, { qos: 0 }, err => { if (!err) { subs.set(filter, filter); renderSubs(); } });
     }
     function subFeed() {
       if (subs.has('demo/# (cluster feed)')) return;
@@ -197,7 +191,7 @@
     }
     function pub(topic, msg, qos) {
       topic = (topic || '').trim(); if (!topic) return;
-      client.publish(PUB_PREFIX + topic, msg ?? '', { qos: Number(qos) || 0 });
+      client.publish(topic, msg ?? '', { qos: Number(qos) || 0 });
     }
 
     $('.dosub', card).onclick = () => { sub($('.subf', card).value); $('.subf', card).value=''; };

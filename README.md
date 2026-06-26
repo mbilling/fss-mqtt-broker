@@ -46,7 +46,9 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 
 ### Security
 - **TLS 1.3** client listener (`rustls` + `ring`), optional per-listener client
-  certificate mTLS — [ADR 0002](docs/adr/0002-transport-security.md).
+  certificate mTLS — [ADR 0002](docs/adr/0002-transport-security.md). Also native
+  **MQTT-over-WebSocket** (`ws://` / `wss://`, the latter sharing the same TLS 1.3 + mTLS),
+  so browsers are first-class clients — [ADR 0035](docs/adr/0035-websocket-transport.md).
 - **Mutually-authenticated cluster bus** against a dedicated cluster CA; each
   peer's node id is bound to its certificate Common Name
   ([ADR 0004](docs/adr/0004-identity-and-authentication.md)).
@@ -206,7 +208,9 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
 | `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
 | `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN |
-| `MQTTD_PLAINTEXT_BIND` | **Insecure** plaintext client listener |
+| `MQTTD_WSS_BIND` | MQTT-over-WebSocket **over TLS** (`wss://`), e.g. `0.0.0.0:8884` (ADR 0035; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA` — same TLS 1.3 + mTLS + hot reload as the TLS listener) |
+| `MQTTD_WS_BIND` | **Insecure** plaintext MQTT-over-WebSocket (`ws://`) — for browsers in local/dev only (ADR 0035) |
+| `MQTTD_PLAINTEXT_BIND` | **Insecure** plaintext TCP client listener |
 
 ### Client authentication & authorization
 | Variable | Purpose |

@@ -34,6 +34,9 @@ async-trait = "0.1"
 # Argon2id PHC hashing to forge rotated password files in the auth hot-reload test
 # (ADR 0032 T5). Already in the tree via mqtt-auth — not a new supply-chain crate.
 argon2.workspace = true
+# WebSocket client for the MQTT-over-WS transport tests (ADR 0035). Same crate the broker
+# uses for the server side — no new supply-chain surface.
+tokio-tungstenite.workspace = true
 rcgen.workspace = true
 ring = { workspace = true }
 rustls.workspace = true

@@ -93,17 +93,15 @@ exercise the cluster from a browser — or a phone:
 - **Message log** — every message any subscriber receives, with its session, topic, and QoS.
 - **+ live cluster feed** — subscribe a session to the loadgen's real `demo/#` traffic.
 
-Open it in several tabs or on several devices; they all share the cluster. Every publish makes
-a **full round-trip through the 3-node mqttd cluster** before fanning out — watch the
+Open it in several tabs or on several devices; they all share the cluster — watch the
 `publish_received` / `publish_delivered` panels in Grafana light up as you send.
 
-How it works (browsers can't speak raw MQTT/TCP, and mqttd has no WebSocket listener yet —
-the deferred [ADR 0002](../docs/adr/0002-transport-security.md) item): the page (served by an
-`nginx` container on `:8088`) talks **MQTT-over-WebSockets** to a small `mosquitto` gateway
-(`:8089`) that is **bridged into the cluster**. To make every message traverse mqttd with no
-bridge echo, browser publishes go to `play/up/<topic>`, a cluster-side relay republishes them
-to `play/down/<topic>`, and subscribers receive those — a clean round-trip on disjoint topic
-trees. (This is a demo convenience; a native broker WS listener is tracked under ADR 0002.)
+How it works: the page (served by an `nginx` container on `:8088`) connects over
+**native MQTT-over-WebSocket** ([ADR 0035](../docs/adr/0035-websocket-transport.md)) straight
+to mqttd-1's WS listener (`MQTTD_WS_BIND`, host port `:8089`). Each browser tab is therefore a
+**real mqttd session** — its own client-id, placement, durability, ACL, audit, metrics — no
+mosquitto gateway, no bridge. (In production use `wss://` via `MQTTD_WSS_BIND`; this demo uses
+plaintext `ws://` over the local network.)
 
 ## Boundary bridge (ADR 0025)
 
