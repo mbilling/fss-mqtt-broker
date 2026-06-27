@@ -250,6 +250,24 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Client<S> {
             .unwrap();
     }
 
+    /// Publish at `QoS` 1 and wait for the matching PUBACK, returning `true` if it arrives. Used to
+    /// prove the broker→client return path works (e.g. across a connection migration).
+    async fn publish_qos1_acked(&mut self, topic: &str, payload: &'static [u8], pkid: u16) -> bool {
+        self.writer
+            .send(&Packet::Publish(Publish {
+                properties: mqtt_codec::Properties::new(),
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: topic.to_string(),
+                pkid: Some(pkid),
+                payload: bytes::Bytes::from_static(payload),
+            }))
+            .await
+            .unwrap();
+        matches!(self.recv().await, Some(Packet::PubAck(ack)) if ack.pkid == pkid)
+    }
+
     /// Open a new QUIC data stream on this connection and return its send half (for raw
     /// PUBLISH bytes, exercising the multi-stream mux).
     async fn open_data_stream(&self) -> quinn::SendStream {
@@ -411,6 +429,69 @@ async fn quic_outbound_fans_publishes_across_streams() {
         got.len(),
         topics.len(),
         "every fanned-out publish arrives intact via the symmetric mux"
+    );
+}
+
+/// Connection migration (ADR 0036 §3b): QUIC keeps a connection alive across a **client path
+/// change**. We rebind the publisher's endpoint to a fresh UDP socket (a new source address on the
+/// *same* connection — what a Wi-Fi↔cellular handover or NAT rebind looks like server-side), then
+/// assert the session survived without re-establishing: the connection object is unchanged
+/// (`stable_id`), the local path actually moved, and **both directions** keep working on the new
+/// path — a forward PUBLISH reaches the subscriber and a QoS-1 PUBLISH gets its PUBACK back. A
+/// reconnect could fake none of these together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_connection_migration_survives_path_change() {
+    let pki = mint_pki("migrate");
+    let addr = start_quic_node(&pki.cert, &pki.key, &pki.ca);
+
+    // Separate endpoints so rebinding the publisher's socket does not touch the subscriber.
+    let sub_client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
+    let pub_client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
+
+    let mut sub = Client::connect(&sub_client, addr, "migrate-sub").await;
+    sub.subscribe("migrate/#").await;
+
+    let mut publ = Client::connect(&pub_client, addr, "migrate-pub").await;
+    publ.publish("migrate/before", b"before").await;
+    match sub.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"before"),
+        other => panic!("expected the pre-migration publish, got {other:?}"),
+    }
+
+    // Move the path: rebind the publisher's endpoint to a new ephemeral UDP port. quinn migrates
+    // the live connection onto it; the next packet leaves from a new source address.
+    let id_before = publ.conn.stable_id();
+    let addr_before = pub_client.local_addr().unwrap();
+    pub_client
+        .rebind(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .expect("rebind to a new local socket");
+    let addr_after = pub_client.local_addr().unwrap();
+
+    assert_ne!(
+        addr_before, addr_after,
+        "the rebind must actually move the client's local path"
+    );
+    assert_eq!(
+        id_before,
+        publ.conn.stable_id(),
+        "migration keeps the SAME connection — not a reconnect"
+    );
+
+    // Forward path on the new route: a publish still reaches the subscriber.
+    publ.publish("migrate/after", b"after").await;
+    match sub.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(
+            &p.payload[..],
+            b"after",
+            "delivery continues over the migrated path"
+        ),
+        other => panic!("expected the post-migration publish, got {other:?}"),
+    }
+
+    // Return path on the new route: a QoS-1 publish gets its PUBACK back from the broker.
+    assert!(
+        publ.publish_qos1_acked("migrate/ack", b"q1", 1).await,
+        "the broker→client return path (PUBACK) must work after migration"
     );
 }
 

@@ -8,7 +8,10 @@
 //!
 //! Env: `QUIC_TARGET` (host:port), `QUIC_SERVERNAME` (cert SAN to verify), `QUIC_CA`,
 //! `QUIC_CERT`, `QUIC_KEY` (PEM paths), `QUIC_STREAMS` (data streams, default 3),
-//! `QUIC_INTERVAL_MS` (per-publish delay, default 500).
+//! `QUIC_INTERVAL_MS` (per-publish delay, default 500), `QUIC_MIGRATE_MS` (if >0, rebind the
+//! client's UDP socket every N ms to simulate a network path change — connection migration,
+//! ADR 0036 §3b; the broker logs the migration and `mqttd_quic_path_migrations_total` ticks while
+//! this same feed keeps flowing, with no reconnect).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +48,9 @@ async fn main() {
     let key = env("QUIC_KEY", "/certs/client.key");
     let n_streams: usize = env("QUIC_STREAMS", "3").parse().unwrap_or(3);
     let interval = Duration::from_millis(env("QUIC_INTERVAL_MS", "500").parse().unwrap_or(500));
+    // 0 disables migration; otherwise rebind the client socket every N ms (a new source port →
+    // the broker sees the same connection from a new path = connection migration).
+    let migrate_ms: u64 = env("QUIC_MIGRATE_MS", "0").parse().unwrap_or(0);
 
     // QUIC client config: trust the demo CA, present the client cert (mTLS), ALPN `mqtt`.
     let mut roots = rustls::RootCertStore::empty();
@@ -83,11 +89,29 @@ async fn main() {
 
     // Reconnect forever (the cluster may not be up yet, or a node may restart).
     loop {
-        if let Err(e) = run(&endpoint, addr, &server_name, n_streams, interval).await {
+        if let Err(e) = run(
+            &endpoint,
+            addr,
+            &server_name,
+            n_streams,
+            interval,
+            migrate_ms,
+        )
+        .await
+        {
             eprintln!("quic-demo: session ended ({e}); reconnecting in 2s");
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
+}
+
+/// Rebind the endpoint's UDP socket to a fresh ephemeral port. quinn migrates the live
+/// connection to it — the next packet leaves from a new source address, which the broker sees as
+/// a path migration on the *same* connection (no reconnect). The same mechanism real clients hit
+/// on a Wi-Fi↔cellular handover or a NAT rebind.
+fn rebind(endpoint: &quinn::Endpoint) -> std::io::Result<()> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    endpoint.rebind(socket)
 }
 
 async fn run(
@@ -96,6 +120,7 @@ async fn run(
     server_name: &str,
     n_streams: usize,
     interval: Duration,
+    migrate_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = endpoint.connect(addr, server_name)?.await?;
     eprintln!("quic-demo: connected to {addr} over QUIC (mTLS)");
@@ -130,6 +155,7 @@ async fn run(
 
     let mut tick: u64 = 0;
     let mut s: usize = 0; // round-robin stream index
+    let mut since_migrate = Duration::ZERO;
     loop {
         let topic = format!("quic/demo/stream{s}/tick");
         let payload = format!("tick {tick} via QUIC data stream {s}");
@@ -148,5 +174,24 @@ async fn run(
         s = (s + 1) % streams.len();
         tick += 1;
         tokio::time::sleep(interval).await;
+
+        // Periodically shift the network path under the live connection (migration).
+        if migrate_ms > 0 {
+            since_migrate += interval;
+            if since_migrate >= Duration::from_millis(migrate_ms) {
+                since_migrate = Duration::ZERO;
+                match rebind(endpoint) {
+                    Ok(()) => {
+                        let local = endpoint
+                            .local_addr()
+                            .map_or_else(|_| "?".into(), |a| a.to_string());
+                        eprintln!(
+                            "quic-demo: rebound to {local} — migrating the live connection (same session)"
+                        );
+                    }
+                    Err(e) => eprintln!("quic-demo: rebind failed: {e}"),
+                }
+            }
+        }
     }
 }

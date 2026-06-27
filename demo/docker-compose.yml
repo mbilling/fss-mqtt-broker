@@ -174,6 +174,10 @@ services:
       QUIC_KEY: /certs/client.key
       QUIC_STREAMS: "3"
       QUIC_INTERVAL_MS: "700"
+      # Every 10s, rebind the client socket to simulate a network path change. The broker logs the
+      # connection migration and mqttd_quic_path_migrations_total ticks (ADR 0036 §3b) while this
+      # same quic/demo/* feed keeps flowing — no reconnect. Set to 0 to disable.
+      QUIC_MIGRATE_MS: "10000"
     volumes:
       - quic-certs:/certs:ro
     depends_on:

@@ -87,6 +87,7 @@ struct OtelInstruments {
     durable_append_failures: OtelCounter<u64>,
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
+    quic_path_migrations: OtelCounter<u64>,
 }
 
 impl OtelInstruments {
@@ -117,6 +118,7 @@ impl OtelInstruments {
             durable_append_failures: meter.u64_counter("durable_append_failures").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
+            quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
         }
     }
 }
@@ -158,6 +160,7 @@ pub struct Metrics {
     durable_append_failures_total: Family<ReasonLabel, Counter>,
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
+    quic_path_migrations_total: Counter,
 }
 
 impl Metrics {
@@ -307,6 +310,11 @@ impl Metrics {
             "security_reloads",
             "Hot reloads of the security policy, by outcome (ok, rejected)",
         );
+        let quic_path_migrations_total = register_counter(
+            &mut registry,
+            "quic_path_migrations",
+            "QUIC connection path migrations observed (client address changed; same connection and session kept)",
+        );
 
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
@@ -341,6 +349,7 @@ impl Metrics {
             durable_append_failures_total,
             gossip_rejected_total,
             security_reloads_total,
+            quic_path_migrations_total,
         }
     }
 
@@ -546,6 +555,14 @@ impl Metrics {
             .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
     }
 
+    /// A QUIC connection migrated to a new client path (ADR 0036 §3b): the peer's remote address
+    /// changed while the *same* connection — and its MQTT session and mTLS identity — continued,
+    /// with no new handshake or CONNECT (e.g. a Wi-Fi↔cellular handover or a NAT rebind).
+    pub fn quic_path_migrated(&self) {
+        self.quic_path_migrations_total.inc();
+        self.otel.quic_path_migrations.add(1, &[]);
+    }
+
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;
     /// used on graceful shutdown and in tests to flush deterministically.
     pub fn flush(&self) {
@@ -598,6 +615,13 @@ fn register_gauge(registry: &mut Registry, name: &'static str, help: &'static st
     let gauge = Gauge::default();
     registry.register(name, help, gauge.clone());
     gauge
+}
+
+/// Register a fresh unlabelled counter under `name`/`help` and return a handle to it.
+fn register_counter(registry: &mut Registry, name: &'static str, help: &'static str) -> Counter {
+    let counter = Counter::default();
+    registry.register(name, help, counter.clone());
+    counter
 }
 
 /// Register a fresh labelled counter family under `name`/`help` and return a handle.

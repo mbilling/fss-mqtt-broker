@@ -49,9 +49,14 @@ tasks:
     date: 2026-06-27
     evidence: "QuicMux outbound_writer task routes each outbound packet: PUBLISH → topic-hashed (FNV-1a, publish_topic + topic_slot, unit-tested) data stream from a fixed OUTBOUND_POOL of broker-opened streams; everything else (CONNACK, SUBACK, QoS acks, PINGRESP) stays on the control stream. Capability is observed, not advertised: the broker fans out only once the client has opened ≥1 data stream (capable flag set by the accept-side forwarder), so a single-control-stream client is never stranded — strictly additive. Symmetric mux: accept_mux (server) + connect_mux (client) both build via build_mux. tests/quic.rs quic_outbound_fans_publishes_across_streams: a connect_mux subscriber signals capability post-CONNECT, then receives all 6 publishes fanned across the pool; the 3 pre-existing control-stream tests still pass (backward-compatible)."
   - id: 0036-T10
-    title: Follow-on — connection-migration validation + 1-RTT resumption tuning
+    title: Connection-migration validation — prove a client path change (rebind) is carried on the SAME QUIC connection (no reconnect/handshake), observe it broker-side, and demo it
+    status: done
+    date: 2026-06-28
+    evidence: "tests/quic.rs quic_connection_migration_survives_path_change: rebinds the publisher's endpoint to a fresh UDP socket (new source address on the same connection) and asserts the session survived without re-establishing — Connection::stable_id() unchanged, local addr moved, and BOTH directions work on the new path (forward PUBLISH reaches the subscriber; a QoS-1 PUBLISH gets its PUBACK back). Broker-side: spawn_quic_migration_watch (main.rs) watches Connection::remote_address(); on change it logs from→to for the identity and bumps mqttd_quic_path_migrations_total (new metric + Grafana panel). Demo: quic_demo --migrate (QUIC_MIGRATE_MS=10000 in compose) rebinds every 10s so the counter ticks and the broker logs migrations while the quic/demo/* feed keeps flowing. quinn default allows migration (no disable_active_migration set). ADR §3b records the evidence model."
+  - id: 0036-T11
+    title: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection)
     status: deferred
-    notes: QUIC connection migration and 1-RTT resumption are quinn-provided; explicit validation/tuning is a follow-on, separate from the transport + multi-stream feature work.
+    notes: 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.
 ---
 
 # Delivery — ADR 0036: MQTT-over-QUIC transport (multi-stream)
@@ -79,7 +84,8 @@ that speak it; this is built test-first and staged.
 | **0036-T7** Docs | README + `MQTTD_QUIC_BIND`; non-standard note, no 0-RTT for CONNECT, peer bus stays mTLS/TCP. |
 | **0036-T8** Demo wiring | One-shot PKI + `MQTTD_QUIC_BIND` on every node + a `quic_demo` client publishing across data streams; visible in the playground (`quic/demo/#`) and Grafana (accepts-by-listener). |
 | **0036-T9** Outbound fan-out | Broker→client PUBLISH fans across broker-opened data streams (symmetric mux), capability-negotiated (single-control-stream clients never stranded), topic-affinity routed; control + acks stay on the control stream. |
-| **0036-T10** Follow-on | *(deferred)* Connection-migration validation + 1-RTT resumption tuning. |
+| **0036-T10** Migration validation | A client path change (endpoint rebind) is carried on the *same* QUIC connection — `stable_id` unchanged, both directions work on the new path — observed broker-side (`mqttd_quic_path_migrations_total` + log) and demoed (`quic_demo --migrate`). |
+| **0036-T11** Follow-on | *(deferred)* 1-RTT resumption tuning (ticket lifetime / policy). Distinct from migration. |
 
 ## Progress
 
@@ -95,7 +101,8 @@ that speak it; this is built test-first and staged.
 | 0036-T7 | ✅ done | 2026-06-27 | "README: MQTTD_QUIC_BIND row + the Security transport bullet (control stream today, multi-stream in progress; non-standard; no 0-RTT for CONNECT)." |
 | 0036-T8 | ✅ done | 2026-06-27 | "demo/quic/gen-certs.sh + quic-certs init service mint a throwaway PKI; the broker env enables MQTTD_QUIC_BIND on all nodes; crates/mqttd/examples/quic_demo.rs (built into the image) connects over QUIC (mTLS) and publishes across 3 data streams to quic/demo/stream{N}. Verified live: a plaintext subscriber sees the QUIC-originated ticks; mqttd_accepts_total{listener=quic} increments. Playground gained a '+ QUIC demo feed' button." |
 | 0036-T9 | ✅ done | 2026-06-27 | "QuicMux outbound_writer task routes each outbound packet: PUBLISH → topic-hashed (FNV-1a, publish_topic + topic_slot, unit-tested) data stream from a fixed OUTBOUND_POOL of broker-opened streams; everything else (CONNACK, SUBACK, QoS acks, PINGRESP) stays on the control stream. Capability is observed, not advertised: the broker fans out only once the client has opened ≥1 data stream (capable flag set by the accept-side forwarder), so a single-control-stream client is never stranded — strictly additive. Symmetric mux: accept_mux (server) + connect_mux (client) both build via build_mux. tests/quic.rs quic_outbound_fans_publishes_across_streams: a connect_mux subscriber signals capability post-CONNECT, then receives all 6 publishes fanned across the pool; the 3 pre-existing control-stream tests still pass (backward-compatible)." |
-| 0036-T10 | 💤 deferred | — | QUIC connection migration and 1-RTT resumption are quinn-provided; explicit validation/tuning is a follow-on, separate from the transport + multi-stream feature work. |
+| 0036-T10 | ✅ done | 2026-06-28 | "tests/quic.rs quic_connection_migration_survives_path_change: rebinds the publisher's endpoint to a fresh UDP socket (new source address on the same connection) and asserts the session survived without re-establishing — Connection::stable_id() unchanged, local addr moved, and BOTH directions work on the new path (forward PUBLISH reaches the subscriber; a QoS-1 PUBLISH gets its PUBACK back). Broker-side: spawn_quic_migration_watch (main.rs) watches Connection::remote_address(); on change it logs from→to for the identity and bumps mqttd_quic_path_migrations_total (new metric + Grafana panel). Demo: quic_demo --migrate (QUIC_MIGRATE_MS=10000 in compose) rebinds every 10s so the counter ticks and the broker logs migrations while the quic/demo/* feed keeps flowing. quinn default allows migration (no disable_active_migration set). ADR §3b records the evidence model." |
+| 0036-T11 | 💤 deferred | — | 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change. |
 <!-- /status-table:0036 -->
 
 ## Changelog

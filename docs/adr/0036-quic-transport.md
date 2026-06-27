@@ -96,6 +96,41 @@ The mux is therefore **symmetric**: each side accepts the peer's opened streams 
 opens its own for PUBLISH (outbound), so the demo/test clients run the same `QuicMux` as the
 broker. A single-stream client is never broken — it simply never triggers fan-out.
 
+### 3b. Connection migration: what it is, and what counts as evidence (added)
+
+QUIC names a connection by its **connection ID**, not by the 4-tuple, so a connection **survives a
+client path change** — Wi-Fi↔cellular handover, NAT rebind, a UDP source-port change — with no
+reconnect, no new TLS handshake, and no new MQTT CONNECT. The live connection state (keys,
+connection IDs, packet-number spaces, congestion + stream state) is **in-memory in one endpoint**;
+it is *not* serialisable, so migration cannot be modelled by handing state between two processes —
+that would be two connections (two handshakes), the opposite of what migration proves. (Sharing a
+blob between two clients models *session resumption*, the separate T11 concern, not migration.)
+
+We do **not** disable migration: neither side sets a `TransportConfig`, so quinn's default applies
+and `disable_active_migration` is unset — migration is permitted. A pure-infrastructure IP change
+(e.g. `docker network disconnect`) does **not** exercise it: that breaks the client's socket and
+yields a *drop*. Migration requires the client to keep its `Connection` and move its socket — the
+canonical trigger is **`Endpoint::rebind(new_udp_socket)`** (a new source address on the same
+connection; indistinguishable, server-side, from a NAT rebind).
+
+The address change is the *event*; the **evidence** is that the session survives it without
+re-establishing — the things a fast reconnect cannot fake:
+
+1. **Same connection** — `Connection::stable_id()` is unchanged across the rebind (a reconnect
+   would be a new object).
+2. **No new handshake / no new CONNECT** — the broker's session object is the same; subscriptions
+   stay intact.
+3. **Both directions work on the new path** — a post-migration QoS-1 PUBLISH gets its PUBACK back,
+   proving the broker→client return path followed the migration.
+4. **Identity unchanged** — the mTLS leaf CN is the same after the move (our security invariant
+   holds across paths; migration changes the path, not the certificate).
+5. **Server-observable** — the broker watches `Connection::remote_address()` and, on a change,
+   logs `from → to` for that identity and increments `mqttd_quic_path_migrations_total`.
+
+A loopback integration test asserts (1)–(3); the demo's `quic_demo --migrate` periodically rebinds
+so the broker logs the migration and the counter ticks in Grafana while the same `quic/demo/*` feed
+keeps flowing — turning T10 from "deferred, unproven" into "demonstrated".
+
 ### 4. Security and scope
 
 - **No 0-RTT for CONNECT initially.** QUIC 0-RTT early data is **replayable**; a replayed CONNECT

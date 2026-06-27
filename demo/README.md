@@ -117,6 +117,18 @@ See it from the browser playground: click **+ QUIC demo feed** on any session to
 lines), proving MQTT-over-QUIC interoperates end-to-end with WebSocket/TCP. In Grafana, the
 **accepts-by-listener** panel shows the `quic` connection alongside `tls`/`plaintext`.
 
+**Connection migration (ADR 0036 §3b).** The `quic-demo` client rebinds its UDP socket every 10s
+(`QUIC_MIGRATE_MS`), simulating a network path change — a Wi-Fi↔cellular handover or NAT rebind.
+QUIC keeps the **same** connection alive across it: no reconnect, no new TLS handshake, no new
+CONNECT. The broker logs each migration and the **QUIC path migrations** counter
+(`mqttd_quic_path_migrations_total`) ticks up — all while the `quic/demo/*` feed keeps flowing
+uninterrupted:
+
+```sh
+# the broker logs the path change (same session, new client address):
+docker compose logs -f mqttd-1 | grep "migrated to a new client path"
+```
+
 ```sh
 # the quic-demo client's log shows it connecting + publishing over QUIC:
 docker compose logs -f quic-demo

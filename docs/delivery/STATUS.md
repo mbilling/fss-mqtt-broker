@@ -43,7 +43,7 @@
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [6/7 done](0035-websocket-transport.md) | 1 deferred |
-| [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [9/10 done](0036-quic-transport.md) | 1 deferred |
+| [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 
 ## Open and deferred work
 
@@ -142,4 +142,4 @@
 
 **0036 — MQTT-over-QUIC transport (multi-stream)**
 
-- `0036-T10` 💤 deferred: Follow-on — connection-migration validation + 1-RTT resumption tuning — QUIC connection migration and 1-RTT resumption are quinn-provided; explicit validation/tuning is a follow-on, separate from the transport + multi-stream feature work.
+- `0036-T11` 💤 deferred: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection) — 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.

@@ -1348,6 +1348,11 @@ async fn serve_quic_clients(
             // mTLS identity (ADR 0004): the verified leaf cert's CN, from the QUIC handshake.
             let identity = mqtt_net::quic::peer_leaf_cert(&conn)
                 .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
+            // Connection-migration observation (ADR 0036 §3b): QUIC keeps a connection alive
+            // across a client path change (Wi-Fi↔cellular, NAT rebind). Watch the remote address
+            // on the *same* connection — a change is a migration, not a reconnect — and log +
+            // count it. The session, streams, and identity are untouched.
+            spawn_quic_migration_watch(conn.clone(), identity.clone(), policy.metrics.clone());
             // Multi-stream mux (ADR 0036): the control stream carries the session; any data
             // streams the client opens feed PUBLISH into the same session, no HoL blocking.
             match mqtt_net::quic::accept_mux(conn).await {
@@ -1358,6 +1363,41 @@ async fn serve_quic_clients(
             }
         });
     }
+}
+
+/// Watch one QUIC connection for **path migration** (ADR 0036 §3b). QUIC identifies a connection
+/// by its connection ID, not the 4-tuple, so it survives a client address change (Wi-Fi↔cellular,
+/// NAT rebind) on the *same* connection — no reconnect, no new handshake. Observing
+/// `remote_address()` change is how the broker sees it: on a change we log `from → to` for the
+/// identity and bump `mqttd_quic_path_migrations_total`. The session, streams, and mTLS identity
+/// are untouched. One slow timer per QUIC connection; it does nothing until the path actually moves
+/// and stops when the connection closes.
+fn spawn_quic_migration_watch(
+    conn: quinn::Connection,
+    identity: Option<mqtt_auth::Identity>,
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+) {
+    const POLL: Duration = Duration::from_millis(500);
+    let subject = identity.map_or_else(|| "<anonymous>".to_string(), |i| i.subject);
+    tokio::spawn(async move {
+        let mut last = conn.remote_address();
+        loop {
+            tokio::select! {
+                _ = conn.closed() => return,
+                () = tokio::time::sleep(POLL) => {
+                    let cur = conn.remote_address();
+                    if cur != last {
+                        info!(identity = %subject, from = %last, to = %cur,
+                            "QUIC connection migrated to a new client path");
+                        if let Some(m) = &metrics {
+                            m.quic_path_migrated();
+                        }
+                        last = cur;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Read an environment variable, treating unset or empty as absent.
