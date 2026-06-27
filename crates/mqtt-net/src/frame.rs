@@ -6,7 +6,7 @@
 //! via `tokio::select!` without aliasing the same stream.
 
 use crate::NetError;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use mqtt_codec::{Packet, ProtocolVersion};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -86,6 +86,74 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             }
         }
     }
+
+    /// Read the next packet's **raw bytes** (fixed header + remaining-length + payload) without
+    /// decoding it. Version-agnostic — the MQTT fixed-header framing is identical across 3.1.1
+    /// and 5. Used by the QUIC multi-stream mux (ADR 0036) to merge *complete* packets from
+    /// several streams into one byte stream without ever interleaving them at the byte level.
+    ///
+    /// Returns `Ok(None)` on a clean end-of-stream at a packet boundary.
+    ///
+    /// # Errors
+    /// As [`next_packet`](Self::next_packet): malformed framing, EOF mid-packet, or a packet
+    /// exceeding the buffer ceiling.
+    pub async fn next_raw_frame(&mut self) -> Result<Option<Bytes>, NetError> {
+        loop {
+            if let Some(frame) = take_raw_frame(&mut self.buf)? {
+                return Ok(Some(frame));
+            }
+            if self.buf.len() > MAX_BUFFERED_BYTES {
+                return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
+            }
+            let n = self.inner.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                return if self.buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(NetError::UnexpectedEof)
+                };
+            }
+        }
+    }
+}
+
+/// Split off one complete MQTT packet's raw bytes from `buf`, or `Ok(None)` if `buf` does not
+/// yet hold a whole packet. Parses the fixed header: the control byte plus the
+/// remaining-length varint (1–4 bytes), then `remaining_length` payload bytes.
+fn take_raw_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, NetError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    // Remaining-length varint starts at byte 1 (byte 0 is the packet-type/flags control byte).
+    let mut remaining = 0usize;
+    let mut multiplier = 1usize;
+    let mut header_len = 1usize; // control byte
+    loop {
+        if header_len >= buf.len() {
+            return Ok(None); // need more bytes to finish the length varint
+        }
+        let byte = buf[header_len];
+        header_len += 1;
+        remaining += (byte & 0x7f) as usize * multiplier;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        multiplier *= 128;
+        // A remaining-length is at most 4 bytes; a 5th continuation byte is malformed.
+        if header_len > 4 {
+            return Err(NetError::Codec(mqtt_codec::CodecError::MalformedPacket(
+                "remaining length exceeds 4 bytes",
+            )));
+        }
+    }
+    let total = header_len + remaining;
+    if total > MAX_BUFFERED_BYTES {
+        return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
+    }
+    if buf.len() < total {
+        return Ok(None); // whole packet not buffered yet
+    }
+    Ok(Some(buf.split_to(total).freeze()))
 }
 
 /// Writes framed MQTT packets to an [`AsyncWrite`].
@@ -202,6 +270,48 @@ mod tests {
             Err(NetError::Codec(CodecError::PacketTooLarge)) => {}
             other => panic!("expected PacketTooLarge, got {other:?}"),
         }
+    }
+
+    /// `next_raw_frame` returns each packet's exact bytes (no interleaving across packets), and
+    /// those bytes decode back to the original packet — the property the QUIC mux relies on.
+    #[tokio::test]
+    async fn next_raw_frame_returns_whole_decodable_packets() {
+        use bytes::BytesMut;
+        let (client, server) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client);
+        let (sr, _sw) = tokio::io::split(server);
+
+        let publish = Packet::Publish(mqtt_codec::packet::Publish {
+            properties: mqtt_codec::Properties::new(),
+            dup: false,
+            qos: mqtt_codec::QoS::AtMostOnce,
+            retain: false,
+            topic: "t/x".into(),
+            pkid: None,
+            payload: bytes::Bytes::from_static(b"hello raw frame"),
+        });
+        let mut writer = FrameWriter::new(cw, V4);
+        writer.send(&Packet::PingReq).await.unwrap();
+        writer.send(&publish).await.unwrap();
+        drop(writer);
+        drop(cr);
+
+        let mut reader = FrameReader::new(sr, V4);
+        // First raw frame is the 2-byte PINGREQ; it decodes back to PingReq.
+        let f1 = reader.next_raw_frame().await.unwrap().unwrap();
+        assert_eq!(&f1[..], &[0xC0, 0x00]);
+        assert_eq!(
+            Packet::decode(&mut BytesMut::from(&f1[..]), V4).unwrap(),
+            Some(Packet::PingReq)
+        );
+        // Second raw frame is the whole PUBLISH and decodes back to it.
+        let f2 = reader.next_raw_frame().await.unwrap().unwrap();
+        assert_eq!(
+            Packet::decode(&mut BytesMut::from(&f2[..]), V4).unwrap(),
+            Some(publish)
+        );
+        // Clean EOF at the packet boundary.
+        assert!(reader.next_raw_frame().await.unwrap().is_none());
     }
 
     /// A stream ending in the middle of a packet is an error, not a clean EOF —

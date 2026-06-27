@@ -1348,12 +1348,10 @@ async fn serve_quic_clients(
             // mTLS identity (ADR 0004): the verified leaf cert's CN, from the QUIC handshake.
             let identity = mqtt_net::quic::peer_leaf_cert(&conn)
                 .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
-            // The control stream — the first bidi stream — carries the MQTT session.
-            match conn.accept_bi().await {
-                Ok((send, recv)) => {
-                    let stream = mqtt_net::quic::byte_stream(send, recv);
-                    conn::handle_stream(stream, Some(peer), identity, policy, hub).await;
-                }
+            // Multi-stream mux (ADR 0036): the control stream carries the session; any data
+            // streams the client opens feed PUBLISH into the same session, no HoL blocking.
+            match mqtt_net::quic::accept_mux(conn).await {
+                Ok(mux) => conn::handle_stream(mux, Some(peer), identity, policy, hub).await,
                 Err(e) => {
                     debug!(%peer, error = %e, "QUIC connection opened no control stream");
                 }

@@ -1,7 +1,7 @@
 ---
 adr: "0036"
 title: MQTT-over-QUIC transport (multi-stream)
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0036-T1
     title: QUIC endpoint in mqtt-net — build a quinn Endpoint from cert/key/client-CA (rustls 0.23 ServerConfig, ring, TLS 1.3, ALPN `mqtt`, mTLS client-cert verify); quinn as a direct dep on ring (no aws-lc)
@@ -25,10 +25,14 @@ tasks:
     evidence: "tests/quic.rs (2 pass): quic_mtls_pubsub_roundtrip (real quinn client, ALPN mqtt, client cert, control stream, pub->sub delivery) and quic_without_client_cert_is_refused (mTLS enforced — a certless client never gets a CONNACK). Client reuses byte_stream + FrameReader/FrameWriter."
   - id: 0036-T5
     title: Multi-stream demux — accept additional bidi data streams and feed their PUBLISH packets into the SAME session; route outbound PUBLISH across streams (no cross-stream head-of-line blocking). The connection-model generalisation (one session, N streams), built on T1–T4
-    status: planned
+    status: done
+    date: 2026-06-27
+    evidence: "FrameReader::next_raw_frame (read one complete packet's raw bytes, version-agnostic; unit-tested). mqtt-net::quic::QuicMux + accept_mux: per-stream forwarder tasks read complete frames and merge them (never byte-interleaved) into one inbound stream via an mpsc channel; the control stream's send half carries all outbound; Drop closes the connection. serve_quic_clients uses accept_mux. Outbound multi-stream is a noted later enhancement (v1 writes on the control stream)."
   - id: 0036-T6
     title: Multi-stream test — two data streams carry independent PUBLISH flows into one session; a stalled/large publish on one stream does not block delivery on the other
-    status: planned
+    status: done
+    date: 2026-06-27
+    evidence: "quic::quic_multistream_demux_no_head_of_line_blocking: one publisher opens two QUIC data streams — an INCOMPLETE large publish on one and a complete small publish on the other; the complete one is delivered to a subscriber while the other is still mid-frame (no HoL blocking), then completing the large frame delivers it too (intact, 100 KB). Flake-checked 3x."
   - id: 0036-T7
     title: Docs — README transports + MQTTD_QUIC_BIND; note non-standard (EMQX-style), no 0-RTT for CONNECT, peer bus stays mTLS/TCP
     status: done
@@ -74,8 +78,8 @@ that speak it; this is built test-first and staged.
 | 0036-T2 | ✅ done | 2026-06-27 | "mqtt-net::quic::byte_stream = tokio::io::join(recv, send) (quinn streams are tokio AsyncRead/AsyncWrite); peer_leaf_cert extracts the mTLS leaf from conn.peer_identity(). handle_stream<S> unchanged." |
 | 0036-T3 | ✅ done | 2026-06-27 | "main.rs serve_quic_clients: endpoint.accept() per connection, identity = mtls::identity_from_cert(peer_leaf_cert), accept_bi() control stream -> byte_stream -> handle_stream. MQTTD_QUIC_BIND parsed as a UDP SocketAddr; reuses MQTTD_TLS_CERT/KEY/CLIENT_CA; graceful close on shutdown." |
 | 0036-T4 | ✅ done | 2026-06-27 | "tests/quic.rs (2 pass): quic_mtls_pubsub_roundtrip (real quinn client, ALPN mqtt, client cert, control stream, pub->sub delivery) and quic_without_client_cert_is_refused (mTLS enforced — a certless client never gets a CONNACK). Client reuses byte_stream + FrameReader/FrameWriter." |
-| 0036-T5 | ⬜ planned | — |  |
-| 0036-T6 | ⬜ planned | — |  |
+| 0036-T5 | ✅ done | 2026-06-27 | "FrameReader::next_raw_frame (read one complete packet's raw bytes, version-agnostic; unit-tested). mqtt-net::quic::QuicMux + accept_mux: per-stream forwarder tasks read complete frames and merge them (never byte-interleaved) into one inbound stream via an mpsc channel; the control stream's send half carries all outbound; Drop closes the connection. serve_quic_clients uses accept_mux. Outbound multi-stream is a noted later enhancement (v1 writes on the control stream)." |
+| 0036-T6 | ✅ done | 2026-06-27 | "quic::quic_multistream_demux_no_head_of_line_blocking: one publisher opens two QUIC data streams — an INCOMPLETE large publish on one and a complete small publish on the other; the complete one is delivered to a subscriber while the other is still mid-frame (no HoL blocking), then completing the large frame delivers it too (intact, 100 KB). Flake-checked 3x." |
 | 0036-T7 | ✅ done | 2026-06-27 | "README: MQTTD_QUIC_BIND row + the Security transport bullet (control stream today, multi-stream in progress; non-standard; no 0-RTT for CONNECT)." |
 | 0036-T8 | 💤 deferred | — | QUIC connection migration and resumption are quinn-provided; explicit validation/tuning and any demo exposure are a follow-on once the transport + multi-stream land. |
 <!-- /status-table:0036 -->
@@ -89,6 +93,13 @@ that speak it; this is built test-first and staged.
 - **2026-06-27** — **Foundation delivered: T1–T4 + T7.** A working, mTLS-authenticated,
   single-(control-)stream MQTT-over-QUIC: `mqtt-net::quic` (endpoint + byte-stream + leaf-cert),
   `MQTTD_QUIC_BIND` listener, and `tests/quic.rs` (round-trip + mTLS-refusal) all green; README
-  documents it. ADR stays **Proposed** — the chosen multi-stream mode (T5–T6, the one-session-
-  many-streams generalisation) is the next milestone, built on this foundation. `cargo deny`
-  accepts `quinn` as a direct dep.
+  documents it. ADR stays **Proposed** — the chosen multi-stream mode (T5–T6) is the next
+  milestone. `cargo deny` accepts `quinn` as a direct dep.
+- **2026-06-27** — **Multi-stream delivered: T5–T6; ADR Accepted.** `FrameReader::next_raw_frame`
+  reads one complete packet's raw bytes (version-agnostic; unit-tested), and
+  `mqtt-net::quic::QuicMux`/`accept_mux` merge complete packets from N QUIC streams — never
+  byte-interleaved — into one session via concurrent per-stream forwarder tasks (so a stalled
+  packet on one stream never blocks another). `serve_quic_clients` and the test harness use
+  `accept_mux`. `quic_multistream_demux_no_head_of_line_blocking` proves it (a mid-frame stall on
+  one data stream doesn't delay a complete publish on another; the large publish then arrives
+  intact), flake-checked 3×. Outbound stays on the control stream (a noted later enhancement).

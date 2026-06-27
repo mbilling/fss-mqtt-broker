@@ -1,6 +1,6 @@
 # ADR 0036 — MQTT-over-QUIC transport (multi-stream)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0036-quic-transport.md](../delivery/0036-quic-transport.md) — plan, progress, and changelog

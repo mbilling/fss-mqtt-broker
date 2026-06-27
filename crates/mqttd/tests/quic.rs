@@ -1,11 +1,12 @@
 //! MQTT-over-QUIC transport integration tests (ADR 0036): a real `quinn` client opens a QUIC
-//! connection (ALPN `mqtt`, presenting a client certificate) and a bidirectional control
-//! stream, then completes a pub/sub round-trip — its leaf-cert CN becoming the session
-//! identity. A client without a certificate is refused (QUIC mTLS).
+//! connection (ALPN `mqtt`, presenting a client certificate) and completes a pub/sub round-trip
+//! — its leaf-cert CN becoming the session identity; a certless client is refused (QUIC mTLS);
+//! and **multi-stream** publishes across two data streams feed one session without
+//! head-of-line blocking.
 //!
-//! The MQTT session runs over the QUIC bidi stream via `mqtt_net::quic::byte_stream`, driving
-//! the standard `FrameReader`/`FrameWriter` — exactly as a TCP client, proving the QUIC stream
-//! is transparent to the MQTT engine.
+//! The server serves each connection through `mqtt_net::quic::accept_mux`; the MQTT session runs
+//! over the standard `FrameReader`/`FrameWriter` — proving the QUIC streams are transparent to
+//! the MQTT engine.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -66,16 +67,10 @@ fn start_quic_node(cert: &Path, key: &Path, ca: &Path) -> SocketAddr {
                 let peer = conn.remote_address();
                 let identity = mqtt_net::quic::peer_leaf_cert(&conn)
                     .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
-                if let Ok((send, recv)) = conn.accept_bi().await {
-                    let stream = mqtt_net::quic::byte_stream(send, recv);
-                    mqttd::conn::handle_stream(
-                        stream,
-                        Some(peer),
-                        identity,
-                        permissive_policy(),
-                        hub,
-                    )
-                    .await;
+                // The multi-stream mux: control stream + any data streams feed one session.
+                if let Ok(mux) = mqtt_net::quic::accept_mux(conn).await {
+                    mqttd::conn::handle_stream(mux, Some(peer), identity, permissive_policy(), hub)
+                        .await;
                 }
             });
         }
@@ -164,6 +159,7 @@ type QuicStream = tokio::io::Join<quinn::RecvStream, quinn::SendStream>;
 struct Client {
     reader: mqtt_net::FrameReader<tokio::io::ReadHalf<QuicStream>>,
     writer: mqtt_net::FrameWriter<tokio::io::WriteHalf<QuicStream>>,
+    conn: quinn::Connection,
 }
 
 impl Client {
@@ -180,6 +176,7 @@ impl Client {
         let mut c = Client {
             reader: mqtt_net::FrameReader::new(rh, V4),
             writer: mqtt_net::FrameWriter::new(wh, V4),
+            conn: conn.clone(),
         };
         c.writer
             .send(&Packet::Connect(Connect {
@@ -231,6 +228,13 @@ impl Client {
             .unwrap();
     }
 
+    /// Open a new QUIC data stream on this connection and return its send half (for raw
+    /// PUBLISH bytes, exercising the multi-stream mux).
+    async fn open_data_stream(&self) -> quinn::SendStream {
+        let (send, _recv) = self.conn.open_bi().await.expect("open data stream");
+        send
+    }
+
     async fn recv(&mut self) -> Option<Packet> {
         timeout(Duration::from_millis(800), self.reader.next_packet())
             .await
@@ -238,6 +242,23 @@ impl Client {
             .and_then(Result::ok)
             .flatten()
     }
+}
+
+/// Encode a QoS-0 PUBLISH to its wire bytes (for writing raw onto a QUIC data stream).
+fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    Packet::Publish(Publish {
+        properties: mqtt_codec::Properties::new(),
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        topic: topic.to_string(),
+        pkid: None,
+        payload: bytes::Bytes::copy_from_slice(payload),
+    })
+    .encode(&mut out, V4)
+    .unwrap();
+    out
 }
 
 // --- tests -------------------------------------------------------------------
@@ -262,6 +283,62 @@ async fn quic_mtls_pubsub_roundtrip() {
             assert_eq!(&p.payload[..], b"over-quic");
         }
         other => panic!("expected the publish over QUIC, got {other:?}"),
+    }
+}
+
+/// Multi-stream demux (ADR 0036): two QUIC data streams carry independent PUBLISH flows into
+/// **one** MQTT session, and a stalled/incomplete publish on one stream does **not** block
+/// delivery of a complete publish on the other — QUIC's no-head-of-line-blocking benefit,
+/// which a single TCP/TLS byte stream cannot give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_multistream_demux_no_head_of_line_blocking() {
+    let pki = mint_pki("mux");
+    let addr = start_quic_node(&pki.cert, &pki.key, &pki.ca);
+    let client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
+
+    let mut sub = Client::connect(&client, addr, "mux-sub").await;
+    sub.subscribe("t/#").await;
+
+    // The publisher's CONNECT goes on its control stream; PUBLISHes go on data streams.
+    let publ = Client::connect(&client, addr, "mux-pub").await;
+
+    // Data stream A: a LARGE publish, but only its first bytes — an *incomplete* frame the mux's
+    // per-stream reader must buffer (the remaining-length header promises ~100 KB more).
+    let big = encode_publish("t/slow", &vec![b'x'; 100_000]);
+    let mut stream_a = publ.open_data_stream().await;
+    stream_a.write_all(&big[..32]).await.unwrap(); // header + topic + a little payload; rest held
+
+    // Data stream B: a COMPLETE small publish, sent while A is still mid-frame.
+    let mut stream_b = publ.open_data_stream().await;
+    stream_b
+        .write_all(&encode_publish("t/fast", b"fast"))
+        .await
+        .unwrap();
+    let _ = stream_b.finish();
+
+    // B must arrive even though A's frame is incomplete — independent streams, no HoL blocking.
+    match sub.recv().await {
+        Some(Packet::Publish(p)) => {
+            assert_eq!(p.topic, "t/fast", "the unstalled stream must deliver first");
+            assert_eq!(&p.payload[..], b"fast");
+        }
+        other => panic!("expected t/fast while the other stream is stalled, got {other:?}"),
+    }
+
+    // Completing A's frame demuxes its publish into the same session — proving N streams feed
+    // one session.
+    stream_a.write_all(&big[32..]).await.unwrap();
+    let _ = stream_a.finish();
+    match sub.recv().await {
+        Some(Packet::Publish(p)) => {
+            assert_eq!(p.topic, "t/slow");
+            assert_eq!(
+                p.payload.len(),
+                100_000,
+                "the large publish survives the demux intact"
+            );
+        }
+        other => panic!("expected t/slow after completion, got {other:?}"),
     }
 }
 
