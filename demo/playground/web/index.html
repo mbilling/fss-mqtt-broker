@@ -80,8 +80,10 @@
   <div id="log"></div>
   <p class="muted" style="margin-top:8px">
     Tip: open this page in several tabs / on several devices — they all share the cluster.
-    The orange <span class="feed">live feed</span> lines are the demo loadgen's real
-    cross-cluster traffic (<code>demo/#</code>).
+    The orange <span class="feed">live feed</span> lines are real cross-cluster traffic:
+    the loadgen (<code>demo/#</code>) and the native <b>MQTT-over-QUIC</b> demo client
+    (<code>quic/demo/#</code>, published across several QUIC data streams — click
+    <b>+ QUIC demo feed</b> to watch it arrive through the cluster).
   </p>
 </main>
 
@@ -94,6 +96,7 @@
   const WS_PORT = 8089;
   const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':' + WS_PORT + '/';
   const FEED = 'demo/#';
+  const QUIC_FEED = 'quic/demo/#';
 
   // --- a small connectivity probe client so the header reflects broker health -------
   const connDot = $('#conn'), connText = $('#connText');
@@ -144,6 +147,7 @@
         <input class="subf" placeholder="topic filter, e.g. room/1 or sensors/#" />
         <button class="tiny dosub">Subscribe</button>
         <button class="ghost tiny dofeed">+ live cluster feed</button>
+        <button class="ghost tiny doquic">+ QUIC demo feed</button>
       </div>
       <div class="subs"></div>
       <div class="pubrow row">
@@ -163,7 +167,8 @@
 
     client.on('message', (topic, payloadBuf, packet) => {
       const payload = payloadBuf.toString();
-      const feed = topic.startsWith('demo/'); // the loadgen's live cluster traffic
+      // The loadgen's live cluster traffic, or the native MQTT-over-QUIC demo client's stream.
+      const feed = topic.startsWith('demo/') || topic.startsWith('quic/demo/');
       log(clientId, color, topic, payload, packet.qos, feed);
     });
 
@@ -185,6 +190,10 @@
       if (subs.has('demo/# (cluster feed)')) return;
       client.subscribe(FEED, { qos: 0 }, err => { if (!err) { subs.set('demo/# (cluster feed)', FEED); renderSubs(); } });
     }
+    function subQuic() {
+      if (subs.has('quic/demo/# (over QUIC)')) return;
+      client.subscribe(QUIC_FEED, { qos: 0 }, err => { if (!err) { subs.set('quic/demo/# (over QUIC)', QUIC_FEED); renderSubs(); } });
+    }
     function unsub(filter) {
       const wire = subs.get(filter); if (!wire) return;
       client.unsubscribe(wire, () => { subs.delete(filter); renderSubs(); });
@@ -197,6 +206,7 @@
     $('.dosub', card).onclick = () => { sub($('.subf', card).value); $('.subf', card).value=''; };
     $('.subf', card).addEventListener('keydown', e => { if (e.key === 'Enter') $('.dosub', card).click(); });
     $('.dofeed', card).onclick = subFeed;
+    $('.doquic', card).onclick = subQuic;
     $('.dopub', card).onclick = () => pub($('.pubt', card).value, $('.pubm', card).value, $('.pubq', card).value);
     $('.pubm', card).addEventListener('keydown', e => { if (e.key === 'Enter') $('.dopub', card).click(); });
     $('.kill', card).onclick = () => { client.end(true); card.remove(); updateCount(); };

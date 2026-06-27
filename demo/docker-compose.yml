@@ -16,6 +16,11 @@ x-broker-env: &broker-env
   MQTTD_WS_BIND: 0.0.0.0:1890          # demo only — native MQTT-over-WebSocket (ADR 0035),
                                        # plaintext; lets the browser playground be real mqttd
                                        # sessions (no mosquitto gateway)
+  MQTTD_QUIC_BIND: 0.0.0.0:1894        # native MQTT-over-QUIC (ADR 0036, UDP). QUIC mandates
+                                       # TLS 1.3 + mTLS — material from the quic-certs volume.
+  MQTTD_TLS_CERT: /certs/server.pem    # used by the QUIC listener (not a TCP TLS listener)
+  MQTTD_TLS_KEY: /certs/server.key
+  MQTTD_TLS_CLIENT_CA: /certs/ca.pem   # QUIC clients present a cert; identity = its CN
   MQTTD_ALLOW_ANONYMOUS: "1"           # demo only — no auth configured; the broker is
                                        # deny-by-default, so anonymous clients (the loadgen)
                                        # must be explicitly permitted (ADR 0004)
@@ -43,9 +48,14 @@ services:
       MQTTD_NODE_ID: mqttd-1
       MQTTD_PEER_BIND: mqttd-1:7001    # advertised to peers -> must be resolvable
       MQTTD_SWIM_BIND: mqttd-1:7946    # founder: no SWIM seeds
-    ports: ["1883:1883", "8080:8080", "8089:1890"]   # 8089 -> native MQTT-over-WS (playground)
-    volumes: ["d1:/data"]
-    depends_on: [alloy]
+    # 8089 -> native MQTT-over-WS (playground); 8094/udp -> native MQTT-over-QUIC (ADR 0036).
+    ports: ["1883:1883", "8080:8080", "8089:1890", "8094:1894/udp"]
+    volumes: ["d1:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      alloy:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
 
   mqttd-2:
     image: mqttd-demo
@@ -57,8 +67,12 @@ services:
       MQTTD_SWIM_BIND: mqttd-2:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["1884:1883", "8081:8080"]
-    volumes: ["d2:/data"]
-    depends_on: [mqttd-1]
+    volumes: ["d2:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
 
   mqttd-3:
     image: mqttd-demo
@@ -70,8 +84,12 @@ services:
       MQTTD_SWIM_BIND: mqttd-3:7946
       MQTTD_SWIM_SEEDS: mqttd-1:7946
     ports: ["1885:1883", "8082:8080"]
-    volumes: ["d3:/data"]
-    depends_on: [mqttd-1]
+    volumes: ["d3:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
 
   alloy:
     image: grafana/alloy:latest
@@ -128,6 +146,42 @@ services:
     ports: ["8088:80"]
     depends_on: [mqttd-1]
 
+  # --- MQTT-over-QUIC showcase (ADR 0036) --------------------------------------------
+  # Browsers can't speak MQTT-over-QUIC, so a native QUIC client demonstrates it. First a
+  # one-shot generates a throwaway demo PKI (QUIC mandates TLS 1.3 + mTLS); then quic-demo
+  # connects to the cluster over QUIC and publishes across several QUIC DATA STREAMS
+  # (multi-stream). Those messages flow through the cluster, so the browser playground (over
+  # WebSocket) subscribed to `quic/demo/#` sees them, and Grafana's accepts-by-listener shows
+  # the `quic` connection.
+  quic-certs:
+    image: alpine:latest
+    command: ["sh", "-c", "apk add --no-cache openssl >/dev/null && sh /gen-certs.sh"]
+    environment:
+      CERT_DIR: /certs
+    volumes:
+      - ./quic/gen-certs.sh:/gen-certs.sh:ro
+      - quic-certs:/certs
+
+  quic-demo:
+    image: mqttd-demo
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/quic-demo"]
+    environment:
+      QUIC_TARGET: mqttd-1:1894
+      QUIC_SERVERNAME: mqttd-1
+      QUIC_CA: /certs/ca.pem
+      QUIC_CERT: /certs/client.pem
+      QUIC_KEY: /certs/client.key
+      QUIC_STREAMS: "3"
+      QUIC_INTERVAL_MS: "700"
+    volumes:
+      - quic-certs:/certs:ro
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
   # --- boundary bridge (ADR 0025) ----------------------------------------------------
   # A SEPARATE, isolated broker in a different "security zone" — a single standalone mqttd,
   # NOT joined to the cluster (no SWIM seeds, its own data volume). It stands in for a
@@ -167,3 +221,4 @@ volumes:
   d2:
   d3:
   bridge-spool:
+  quic-certs:   # throwaway demo PKI for the MQTT-over-QUIC listener (ADR 0036)

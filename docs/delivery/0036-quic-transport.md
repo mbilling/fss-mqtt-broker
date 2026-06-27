@@ -39,9 +39,9 @@ tasks:
     date: 2026-06-27
     evidence: "README: MQTTD_QUIC_BIND row + the Security transport bullet (control stream today, multi-stream in progress; non-standard; no 0-RTT for CONNECT)."
   - id: 0036-T8
-    title: Follow-on — connection migration validation + 1-RTT resumption tuning; optional demo wiring
-    status: deferred
-    notes: QUIC connection migration and resumption are quinn-provided; explicit validation/tuning and any demo exposure are a follow-on once the transport + multi-stream land.
+    title: Follow-on — connection migration validation + 1-RTT resumption tuning; outbound multi-stream fan-out; demo wiring
+    status: in-progress
+    notes: Demo wiring DONE — a quic-certs one-shot mints a throwaway PKI, every node runs MQTTD_QUIC_BIND, and a quic-demo client publishes over QUIC across data streams (visible in the browser playground via quic/demo/# and in Grafana's accepts-by-listener). Still open — outbound multi-stream fan-out (broker→client publishes across data streams), connection-migration validation, and 1-RTT resumption tuning.
 ---
 
 # Delivery — ADR 0036: MQTT-over-QUIC transport (multi-stream)
@@ -81,7 +81,7 @@ that speak it; this is built test-first and staged.
 | 0036-T5 | ✅ done | 2026-06-27 | "FrameReader::next_raw_frame (read one complete packet's raw bytes, version-agnostic; unit-tested). mqtt-net::quic::QuicMux + accept_mux: per-stream forwarder tasks read complete frames and merge them (never byte-interleaved) into one inbound stream via an mpsc channel; the control stream's send half carries all outbound; Drop closes the connection. serve_quic_clients uses accept_mux. Outbound multi-stream is a noted later enhancement (v1 writes on the control stream)." |
 | 0036-T6 | ✅ done | 2026-06-27 | "quic::quic_multistream_demux_no_head_of_line_blocking: one publisher opens two QUIC data streams — an INCOMPLETE large publish on one and a complete small publish on the other; the complete one is delivered to a subscriber while the other is still mid-frame (no HoL blocking), then completing the large frame delivers it too (intact, 100 KB). Flake-checked 3x." |
 | 0036-T7 | ✅ done | 2026-06-27 | "README: MQTTD_QUIC_BIND row + the Security transport bullet (control stream today, multi-stream in progress; non-standard; no 0-RTT for CONNECT)." |
-| 0036-T8 | 💤 deferred | — | QUIC connection migration and resumption are quinn-provided; explicit validation/tuning and any demo exposure are a follow-on once the transport + multi-stream land. |
+| 0036-T8 | 🚧 in-progress | — | Demo wiring DONE — a quic-certs one-shot mints a throwaway PKI, every node runs MQTTD_QUIC_BIND, and a quic-demo client publishes over QUIC across data streams (visible in the browser playground via quic/demo/# and in Grafana's accepts-by-listener). Still open — outbound multi-stream fan-out (broker→client publishes across data streams), connection-migration validation, and 1-RTT resumption tuning. |
 <!-- /status-table:0036 -->
 
 ## Changelog

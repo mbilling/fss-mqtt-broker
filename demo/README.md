@@ -103,6 +103,30 @@ to mqttd-1's WS listener (`MQTTD_WS_BIND`, host port `:8089`). Each browser tab 
 mosquitto gateway, no bridge. (In production use `wss://` via `MQTTD_WSS_BIND`; this demo uses
 plaintext `ws://` over the local network.)
 
+## MQTT-over-QUIC showcase (ADR 0036)
+
+Browsers can't speak MQTT-over-QUIC (no browser API exists), so a native QUIC client shows it
+off. Every node runs a **native MQTT-over-QUIC listener** (`MQTTD_QUIC_BIND`, UDP) — QUIC
+mandates TLS 1.3, so a one-shot `quic-certs` service mints a throwaway demo PKI (CA + server +
+client certs) first. The **`quic-demo`** service then connects to the cluster over QUIC
+(TLS 1.3 + mTLS, ALPN `mqtt`) and publishes a steady stream **across several QUIC data
+streams** — multi-stream in action (ADR 0036).
+
+See it from the browser playground: click **+ QUIC demo feed** on any session to subscribe to
+`quic/demo/#` and watch the QUIC-originated messages arrive **through the cluster** (orange
+lines), proving MQTT-over-QUIC interoperates end-to-end with WebSocket/TCP. In Grafana, the
+**accepts-by-listener** panel shows the `quic` connection alongside `tls`/`plaintext`.
+
+```sh
+# the quic-demo client's log shows it connecting + publishing over QUIC:
+docker compose logs -f quic-demo
+```
+
+mqttd-1's QUIC port is published on `localhost:8094/udp` for an external QUIC client (the demo
+server cert's SAN covers the node names + localhost/127.0.0.1). Everything here is **demo-only**
+(throwaway certs, plaintext for the other listeners); MQTT-over-QUIC is a non-standard,
+EMQX-style extension, so interop is limited to clients that speak it.
+
 ## Boundary bridge (ADR 0025)
 
 The demo also runs a **boundary bridge** between the cluster and a separate, isolated
