@@ -119,8 +119,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
 /// Split off one complete MQTT packet's raw bytes from `buf`, or `Ok(None)` if `buf` does not
 /// yet hold a whole packet. Parses the fixed header: the control byte plus the
-/// remaining-length varint (1–4 bytes), then `remaining_length` payload bytes.
-fn take_raw_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, NetError> {
+/// remaining-length varint (1–4 bytes), then `remaining_length` payload bytes. Shared with the
+/// QUIC mux (ADR 0036) for extracting complete outbound packets to route across streams.
+pub(crate) fn take_raw_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, NetError> {
     if buf.is_empty() {
         return Ok(None);
     }

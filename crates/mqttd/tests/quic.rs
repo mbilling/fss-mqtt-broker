@@ -156,15 +156,14 @@ fn quic_client(ca: &Path, client_identity: Option<(&Path, &Path)>) -> quinn::End
 
 type QuicStream = tokio::io::Join<quinn::RecvStream, quinn::SendStream>;
 
-struct Client {
-    reader: mqtt_net::FrameReader<tokio::io::ReadHalf<QuicStream>>,
-    writer: mqtt_net::FrameWriter<tokio::io::WriteHalf<QuicStream>>,
+struct Client<S> {
+    reader: mqtt_net::FrameReader<tokio::io::ReadHalf<S>>,
+    writer: mqtt_net::FrameWriter<tokio::io::WriteHalf<S>>,
     conn: quinn::Connection,
 }
 
-impl Client {
-    /// Connect over QUIC: open a connection + the control (bidi) stream, send CONNECT, assert
-    /// CONNACK 0x00.
+impl Client<QuicStream> {
+    /// Connect over a single control bidi stream (no multi-stream mux) — a plain client.
     async fn connect(endpoint: &quinn::Endpoint, addr: SocketAddr, id: &str) -> Self {
         let conn = endpoint
             .connect(addr, "127.0.0.1")
@@ -172,11 +171,34 @@ impl Client {
             .await
             .expect("QUIC connect");
         let (send, recv) = conn.open_bi().await.expect("open control stream");
-        let (rh, wh) = tokio::io::split(mqtt_net::quic::byte_stream(send, recv));
+        Self::handshake(conn.clone(), mqtt_net::quic::byte_stream(send, recv), id).await
+    }
+}
+
+impl Client<mqtt_net::quic::QuicMux> {
+    /// Connect over the symmetric multi-stream mux: signals capability and accepts broker-opened
+    /// data streams, so the broker may fan its deliveries back across streams.
+    async fn connect_mux(endpoint: &quinn::Endpoint, addr: SocketAddr, id: &str) -> Self {
+        let conn = endpoint
+            .connect(addr, "127.0.0.1")
+            .unwrap()
+            .await
+            .expect("QUIC connect");
+        let mux = mqtt_net::quic::connect_mux(&conn)
+            .await
+            .expect("connect mux");
+        Self::handshake(conn, mux, id).await
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Client<S> {
+    /// Send CONNECT over an already-open QUIC byte stream and assert CONNACK 0x00.
+    async fn handshake(conn: quinn::Connection, stream: S, id: &str) -> Self {
+        let (rh, wh) = tokio::io::split(stream);
         let mut c = Client {
             reader: mqtt_net::FrameReader::new(rh, V4),
             writer: mqtt_net::FrameWriter::new(wh, V4),
-            conn: conn.clone(),
+            conn,
         };
         c.writer
             .send(&Packet::Connect(Connect {
@@ -340,6 +362,56 @@ async fn quic_multistream_demux_no_head_of_line_blocking() {
         }
         other => panic!("expected t/slow after completion, got {other:?}"),
     }
+}
+
+/// Outbound multi-stream fan-out (ADR 0036 §3a): a capability-signalling subscriber (the
+/// symmetric mux) receives **every** broker→client delivery — fanned across broker-opened QUIC
+/// data streams and re-merged by the subscriber's mux. (A plain single-stream client is never
+/// stranded — it gets its publishes on the control stream, see `quic_mtls_pubsub_roundtrip`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_outbound_fans_publishes_across_streams() {
+    let pki = mint_pki("out");
+    let addr = start_quic_node(&pki.cert, &pki.key, &pki.ca);
+    let client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
+
+    let mut sub = Client::connect_mux(&client, addr, "out-sub").await;
+    sub.subscribe("t/#").await;
+    // Signal multi-stream capability AFTER connect (CONNECT must be the first packet): open a
+    // data stream and send a PINGREQ. The broker then fans this subscriber's deliveries across
+    // data streams (and the subscriber's mux accepts those broker-opened streams).
+    let mut sig = sub.open_data_stream().await;
+    sig.write_all(&[0xC0, 0x00]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut publ = Client::connect(&client, addr, "out-pub").await;
+    let topics = ["t/a", "t/b", "t/c", "t/d", "t/e", "t/f"];
+    for t in topics {
+        publ.publish(t, b"payload").await;
+    }
+
+    // Every publish must arrive intact at the subscriber — proving the broker fanned them across
+    // data streams and the subscriber's mux re-merged them (a delivery on an unaccepted stream
+    // would be lost). The PINGRESP from the capability signal is skipped.
+    let mut got = std::collections::HashSet::new();
+    for _ in 0..(topics.len() + 3) {
+        match sub.recv().await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(&p.payload[..], b"payload");
+                got.insert(p.topic);
+            }
+            Some(Packet::PingResp) => {}
+            None => break,
+            other => panic!("unexpected packet over the outbound mux: {other:?}"),
+        }
+        if got.len() == topics.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        got.len(),
+        topics.len(),
+        "every fanned-out publish arrives intact via the symmetric mux"
+    );
 }
 
 /// A client that presents no certificate is refused — QUIC mTLS is enforced. The server's

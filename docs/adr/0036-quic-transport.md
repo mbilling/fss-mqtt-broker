@@ -68,6 +68,34 @@ the one place the broker's "one stream = one session loop" assumption is general
 session fed by N streams." It follows EMQX's de-facto framing so an EMQX-style client interops;
 the control-stream mode (2) remains the fallback for clients that don't open data streams.
 
+### 3a. Outbound fan-out: capability-negotiated, topic-affinity (added)
+
+The inbound demux (§3) merges client→broker PUBLISH from many streams. The **outbound**
+direction is symmetric: broker→client PUBLISH fans across QUIC data streams the **broker
+opens**, so a large/slow delivery on one stream does not head-of-line-block another. Two
+constraints make this sound:
+
+1. **Capability negotiation — never strand a single-stream client.** A client that reads only
+   the control stream would *miss* publishes the broker fanned onto data streams. So the broker
+   fans outbound **only to a client that has demonstrated multi-stream capability** — concretely,
+   one that has itself opened ≥1 QUIC data stream (and therefore runs the symmetric mux that
+   accepts broker-opened streams). The capability is **observed, not advertised**: the broker
+   marks the connection capable the first time its mux reads a frame from a non-control stream.
+   Until then — and forever, for a plain single-control-stream client — **all** outbound stays
+   on the control stream. The control-stream mode remains the interoperable default; fan-out is
+   strictly additive and backward-compatible.
+
+2. **Topic affinity — preserve per-topic order.** MQTT guarantees ordering only **within a
+   topic** (for a given QoS, to a given subscriber) and makes no cross-topic promise. So each
+   outbound PUBLISH is routed to a data stream by **hashing its topic** — same topic → same
+   stream (order preserved); different topics may use different streams (the spec permits it).
+   Control packets and QoS acks (PUBACK/PUBREC/PUBREL/PUBCOMP) stay on the control stream. A
+   small fixed pool of outbound data streams bounds resource use.
+
+The mux is therefore **symmetric**: each side accepts the peer's opened streams (inbound) and
+opens its own for PUBLISH (outbound), so the demo/test clients run the same `QuicMux` as the
+broker. A single-stream client is never broken — it simply never triggers fan-out.
+
 ### 4. Security and scope
 
 - **No 0-RTT for CONNECT initially.** QUIC 0-RTT early data is **replayable**; a replayed CONNECT

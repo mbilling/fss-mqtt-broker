@@ -43,7 +43,7 @@
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [6/7 done](0035-websocket-transport.md) | 1 deferred |
-| [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [7/8 done](0036-quic-transport.md) | 1 open |
+| [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [9/10 done](0036-quic-transport.md) | 1 deferred |
 
 ## Open and deferred work
 
@@ -142,4 +142,4 @@
 
 **0036 — MQTT-over-QUIC transport (multi-stream)**
 
-- `0036-T8` 🚧 in-progress: Follow-on — connection migration validation + 1-RTT resumption tuning; outbound multi-stream fan-out; demo wiring — Demo wiring DONE — a quic-certs one-shot mints a throwaway PKI, every node runs MQTTD_QUIC_BIND, and a quic-demo client publishes over QUIC across data streams (visible in the browser playground via quic/demo/# and in Grafana's accepts-by-listener). Still open — outbound multi-stream fan-out (broker→client publishes across data streams), connection-migration validation, and 1-RTT resumption tuning.
+- `0036-T10` 💤 deferred: Follow-on — connection-migration validation + 1-RTT resumption tuning — QUIC connection migration and 1-RTT resumption are quinn-provided; explicit validation/tuning is a follow-on, separate from the transport + multi-stream feature work.

@@ -39,9 +39,19 @@ tasks:
     date: 2026-06-27
     evidence: "README: MQTTD_QUIC_BIND row + the Security transport bullet (control stream today, multi-stream in progress; non-standard; no 0-RTT for CONNECT)."
   - id: 0036-T8
-    title: Follow-on — connection migration validation + 1-RTT resumption tuning; outbound multi-stream fan-out; demo wiring
-    status: in-progress
-    notes: Demo wiring DONE — a quic-certs one-shot mints a throwaway PKI, every node runs MQTTD_QUIC_BIND, and a quic-demo client publishes over QUIC across data streams (visible in the browser playground via quic/demo/# and in Grafana's accepts-by-listener). Still open — outbound multi-stream fan-out (broker→client publishes across data streams), connection-migration validation, and 1-RTT resumption tuning.
+    title: Demo wiring — quic-certs one-shot PKI + MQTTD_QUIC_BIND on every node + a quic-demo client publishing over QUIC data streams; browser "+ QUIC demo feed" + Grafana accepts-by-listener show it
+    status: done
+    date: 2026-06-27
+    evidence: "demo/quic/gen-certs.sh + quic-certs init service mint a throwaway PKI; the broker env enables MQTTD_QUIC_BIND on all nodes; crates/mqttd/examples/quic_demo.rs (built into the image) connects over QUIC (mTLS) and publishes across 3 data streams to quic/demo/stream{N}. Verified live: a plaintext subscriber sees the QUIC-originated ticks; mqttd_accepts_total{listener=quic} increments. Playground gained a '+ QUIC demo feed' button."
+  - id: 0036-T9
+    title: Outbound multi-stream fan-out — broker→client PUBLISH fans across broker-opened QUIC data streams (symmetric mux), capability-negotiated (a single-control-stream client is never stranded) and topic-affinity routed (per-topic order preserved); control + acks stay on the control stream
+    status: done
+    date: 2026-06-27
+    evidence: "QuicMux outbound_writer task routes each outbound packet: PUBLISH → topic-hashed (FNV-1a, publish_topic + topic_slot, unit-tested) data stream from a fixed OUTBOUND_POOL of broker-opened streams; everything else (CONNACK, SUBACK, QoS acks, PINGRESP) stays on the control stream. Capability is observed, not advertised: the broker fans out only once the client has opened ≥1 data stream (capable flag set by the accept-side forwarder), so a single-control-stream client is never stranded — strictly additive. Symmetric mux: accept_mux (server) + connect_mux (client) both build via build_mux. tests/quic.rs quic_outbound_fans_publishes_across_streams: a connect_mux subscriber signals capability post-CONNECT, then receives all 6 publishes fanned across the pool; the 3 pre-existing control-stream tests still pass (backward-compatible)."
+  - id: 0036-T10
+    title: Follow-on — connection-migration validation + 1-RTT resumption tuning
+    status: deferred
+    notes: QUIC connection migration and 1-RTT resumption are quinn-provided; explicit validation/tuning is a follow-on, separate from the transport + multi-stream feature work.
 ---
 
 # Delivery — ADR 0036: MQTT-over-QUIC transport (multi-stream)
@@ -67,7 +77,9 @@ that speak it; this is built test-first and staged.
 | **0036-T5** Multi-stream demux | Additional bidi data streams feed PUBLISH into the *same* session; outbound PUBLISH routed across streams. The one-session-many-streams generalisation, on the T1–T4 base. |
 | **0036-T6** Multi-stream test | Two data streams carry independent flows into one session; a stalled publish on one does not block the other. |
 | **0036-T7** Docs | README + `MQTTD_QUIC_BIND`; non-standard note, no 0-RTT for CONNECT, peer bus stays mTLS/TCP. |
-| **0036-T8** Follow-on | *(deferred)* Connection-migration validation, resumption tuning, demo wiring. |
+| **0036-T8** Demo wiring | One-shot PKI + `MQTTD_QUIC_BIND` on every node + a `quic_demo` client publishing across data streams; visible in the playground (`quic/demo/#`) and Grafana (accepts-by-listener). |
+| **0036-T9** Outbound fan-out | Broker→client PUBLISH fans across broker-opened data streams (symmetric mux), capability-negotiated (single-control-stream clients never stranded), topic-affinity routed; control + acks stay on the control stream. |
+| **0036-T10** Follow-on | *(deferred)* Connection-migration validation + 1-RTT resumption tuning. |
 
 ## Progress
 
@@ -81,7 +93,9 @@ that speak it; this is built test-first and staged.
 | 0036-T5 | ✅ done | 2026-06-27 | "FrameReader::next_raw_frame (read one complete packet's raw bytes, version-agnostic; unit-tested). mqtt-net::quic::QuicMux + accept_mux: per-stream forwarder tasks read complete frames and merge them (never byte-interleaved) into one inbound stream via an mpsc channel; the control stream's send half carries all outbound; Drop closes the connection. serve_quic_clients uses accept_mux. Outbound multi-stream is a noted later enhancement (v1 writes on the control stream)." |
 | 0036-T6 | ✅ done | 2026-06-27 | "quic::quic_multistream_demux_no_head_of_line_blocking: one publisher opens two QUIC data streams — an INCOMPLETE large publish on one and a complete small publish on the other; the complete one is delivered to a subscriber while the other is still mid-frame (no HoL blocking), then completing the large frame delivers it too (intact, 100 KB). Flake-checked 3x." |
 | 0036-T7 | ✅ done | 2026-06-27 | "README: MQTTD_QUIC_BIND row + the Security transport bullet (control stream today, multi-stream in progress; non-standard; no 0-RTT for CONNECT)." |
-| 0036-T8 | 🚧 in-progress | — | Demo wiring DONE — a quic-certs one-shot mints a throwaway PKI, every node runs MQTTD_QUIC_BIND, and a quic-demo client publishes over QUIC across data streams (visible in the browser playground via quic/demo/# and in Grafana's accepts-by-listener). Still open — outbound multi-stream fan-out (broker→client publishes across data streams), connection-migration validation, and 1-RTT resumption tuning. |
+| 0036-T8 | ✅ done | 2026-06-27 | "demo/quic/gen-certs.sh + quic-certs init service mint a throwaway PKI; the broker env enables MQTTD_QUIC_BIND on all nodes; crates/mqttd/examples/quic_demo.rs (built into the image) connects over QUIC (mTLS) and publishes across 3 data streams to quic/demo/stream{N}. Verified live: a plaintext subscriber sees the QUIC-originated ticks; mqttd_accepts_total{listener=quic} increments. Playground gained a '+ QUIC demo feed' button." |
+| 0036-T9 | ✅ done | 2026-06-27 | "QuicMux outbound_writer task routes each outbound packet: PUBLISH → topic-hashed (FNV-1a, publish_topic + topic_slot, unit-tested) data stream from a fixed OUTBOUND_POOL of broker-opened streams; everything else (CONNACK, SUBACK, QoS acks, PINGRESP) stays on the control stream. Capability is observed, not advertised: the broker fans out only once the client has opened ≥1 data stream (capable flag set by the accept-side forwarder), so a single-control-stream client is never stranded — strictly additive. Symmetric mux: accept_mux (server) + connect_mux (client) both build via build_mux. tests/quic.rs quic_outbound_fans_publishes_across_streams: a connect_mux subscriber signals capability post-CONNECT, then receives all 6 publishes fanned across the pool; the 3 pre-existing control-stream tests still pass (backward-compatible)." |
+| 0036-T10 | 💤 deferred | — | QUIC connection migration and 1-RTT resumption are quinn-provided; explicit validation/tuning is a follow-on, separate from the transport + multi-stream feature work. |
 <!-- /status-table:0036 -->
 
 ## Changelog
