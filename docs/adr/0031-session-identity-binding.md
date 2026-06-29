@@ -14,8 +14,8 @@
 > This record states the decision only. How it is being built and how far along it is live
 > in the [delivery doc](../delivery/0031-session-identity-binding.md). **Accepted — the
 > secure-by-default takeover/resume guard (option C) is built and proven; the open questions
-> below are resolved in "Decision". The optional connect ACL (option B) remains a tracked,
-> opt-in refinement.**
+> below are resolved in "Decision". The optional connect ACL (option B) is also implemented
+> as an opt-in refinement.**
 
 ## Context
 

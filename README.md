@@ -63,6 +63,10 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 - **Authorization**: deny-by-default TOML topic ACLs with `%i` identity
   substitution and asymmetric allow-covers / deny-overlaps semantics so a narrow
   grant can't widen and a broad subscription can't tunnel past a deny.
+- **Session-identity binding** (ADR 0031): a persistent session is bound to the
+  authenticated identity that created it — a different principal cannot resume or
+  take it over (CONNACK Not-authorized + audit). Secure by default; an optional
+  `connect` ACL rule can additionally namespace client ids per identity.
 - **Hot-reloadable security policy**: `SIGHUP` re-reads the ACL, the
   authenticator chain, and the TLS cert/key/client-CA and swaps them on **live**
   connections — no restart, no dropped sessions. The reload is **validate-before-swap**:

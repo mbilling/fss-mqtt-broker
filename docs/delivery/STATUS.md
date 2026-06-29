@@ -38,7 +38,7 @@
 | [0028](../adr/0028-link-gated-voter-admission.md) | Link-gated lease-group voter admission | Accepted | [3/3 done](0028-link-gated-voter-admission.md) | — |
 | [0029](../adr/0029-durable-by-default.md) | Durable sessions by default | Accepted | [3/3 done](0029-durable-by-default.md) | — |
 | [0030](../adr/0030-user-property-forwarding.md) | Forward MQTT 5 User Properties through delivery | Accepted | [5/5 done](0030-user-property-forwarding.md) | — |
-| [0031](../adr/0031-session-identity-binding.md) | Bind the session to the authenticated identity | Accepted | [5/6 done](0031-session-identity-binding.md) | 1 open |
+| [0031](../adr/0031-session-identity-binding.md) | Bind the session to the authenticated identity | Accepted | [6/6 done](0031-session-identity-binding.md) | — |
 | [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
@@ -102,10 +102,6 @@
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
 - `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
-
-**0031 — Bind the session to the authenticated identity**
-
-- `0031-T5` ⬜ planned: Optional authorize_connect(identity, client_id) Authorizer hook + ACL syntax for id-namespacing policy — "The optional, opt-in refinement (ADR option B), layered on the shipped secure-by-default guard. Not required for the decision; deferred until a deployment needs per-identity client-id namespacing as policy. Will add Authorizer::authorize_connect (default-allow) + ACL connect-rule syntax + a CONNECT-time check."
 
 **0032 — Hot-reloadable security policy**
 
