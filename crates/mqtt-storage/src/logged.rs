@@ -41,7 +41,7 @@
 //! never materializes the whole queue.
 
 use crate::repl::{ReplError, ReplicatedLog};
-use crate::{Enqueued, QueueLimits, QueuedMessage, SessionStore, StorageError};
+use crate::{Enqueued, QueueLimits, QueuedMessage, SessionClaim, SessionStore, StorageError};
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
 use std::collections::BTreeSet;
@@ -136,6 +136,44 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             self.store_meta(client, &SessionMeta::default()).await?;
         }
         Ok(existed)
+    }
+
+    async fn claim_session(
+        &self,
+        client: &ClientId,
+        owner: &str,
+    ) -> Result<SessionClaim, StorageError> {
+        // The owner lives in the metadata snapshot, so a claim replicates through the same
+        // log as every other session write — the binding holds across restart and cross-node
+        // takeover. Read-modify-write of the single meta record (ADR 0031).
+        match self.load_meta(client).await? {
+            None => {
+                // No snapshot yet. A queue could exist from an edge case; mirror
+                // `ensure_session`'s presence rule, and record the claiming owner.
+                let qkey = Self::queue_key(client);
+                let present = !self.log.read(&qkey, 0, 1).await?.is_empty();
+                let meta = SessionMeta {
+                    owner: Some(owner.to_string()),
+                    ..SessionMeta::default()
+                };
+                self.store_meta(client, &meta).await?;
+                Ok(SessionClaim::Granted { present })
+            }
+            Some(mut meta) => match &meta.owner {
+                // Legacy snapshot with no recorded owner adopts the claimant.
+                None => {
+                    meta.owner = Some(owner.to_string());
+                    self.store_meta(client, &meta).await?;
+                    Ok(SessionClaim::Granted { present: true })
+                }
+                // Same owner reconnecting/taking over: grant without an extra write.
+                Some(existing) if existing == owner => Ok(SessionClaim::Granted { present: true }),
+                // A different identity owns it: refuse the claim.
+                Some(existing) => Ok(SessionClaim::Denied {
+                    owner: existing.clone(),
+                }),
+            },
+        }
     }
 
     async fn set_subscriptions(
@@ -340,6 +378,10 @@ struct SessionMeta {
     /// new owner expire the session at the right wall-clock time after a takeover, instead
     /// of restarting the clock.
     session_expiry_at: Option<u64>,
+    /// The authenticated identity that owns this session (ADR 0031) — its stable subject.
+    /// `None` for a record written before owner binding; the next claim adopts it. Travels
+    /// with the snapshot, so the binding survives restart and cross-node takeover.
+    owner: Option<String>,
 }
 
 fn qos_to_u8(q: QoS) -> u8 {
@@ -454,6 +496,15 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
         Some(deadline) => {
             out.push(1);
             out.extend_from_slice(&deadline.to_be_bytes());
+        }
+        None => out.push(0),
+    }
+    // Appended after the expiry field (ADR 0031): an older record ends before this, so it
+    // decodes with `owner = None` and adopts its claimant on the next attach.
+    match &m.owner {
+        Some(subject) => {
+            out.push(1);
+            put_str(&mut out, subject);
         }
         None => out.push(0),
     }
@@ -594,11 +645,21 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
     } else {
         None
     };
+    // Backward-compatible (ADR 0031): a record written before owner binding ends here, so an
+    // empty remainder means "no recorded owner".
+    let owner = if r.is_empty() {
+        None
+    } else if r.u8()? == 1 {
+        Some(r.string()?)
+    } else {
+        None
+    };
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
         last_packet_id,
         session_expiry_at,
+        owner,
     })
 }
 
@@ -606,7 +667,7 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
 mod tests {
     use super::{decode_session_meta, ReplicatedSessionStore};
     use crate::repl::InMemoryReplicatedLog;
-    use crate::{Enqueued, Offset, OverflowPolicy, QueueLimits, SessionStore};
+    use crate::{Enqueued, Offset, OverflowPolicy, QueueLimits, SessionClaim, SessionStore};
     use mqtt_core::{ClientId, Message, QoS, Subscription};
     use std::sync::Arc;
 
@@ -994,6 +1055,53 @@ mod tests {
         let meta = decode_session_meta(&legacy).unwrap();
         assert_eq!(meta.session_expiry_at, None);
         assert!(meta.subscriptions.is_empty());
+        // A pre-0031 record carries no owner; it decodes as `None` and adopts on next claim.
+        assert_eq!(meta.owner, None);
+    }
+
+    /// A record written after the expiry field but before owner binding (expiry present,
+    /// no owner appended) still decodes — `owner` reads as `None` (ADR 0031 backward compat).
+    #[test]
+    fn decodes_pre_owner_meta_records() {
+        let pre_owner = {
+            let mut out = Vec::new();
+            out.extend_from_slice(&0u32.to_be_bytes()); // no subscriptions
+            out.extend_from_slice(&0u32.to_be_bytes()); // no received qos2
+            out.extend_from_slice(&0u16.to_be_bytes()); // last_packet_id
+            out.push(0); // session_expiry_at absent — record ends here (pre-0031)
+            out
+        };
+        let meta = decode_session_meta(&pre_owner).unwrap();
+        assert_eq!(meta.owner, None);
+    }
+
+    /// The owner travels in the metadata snapshot, so a second store over the **same log**
+    /// (a takeover by a new owner node, or a restart) sees the binding and refuses a claim by
+    /// a different identity — the durable, cross-node half of the ADR 0031 guard.
+    #[tokio::test]
+    async fn the_session_owner_is_durable_across_the_log() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let c = cid("shared");
+
+        // Node A: alice claims the session.
+        let a = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            a.claim_session(&c, "alice").await.unwrap(),
+            SessionClaim::Granted { present: false }
+        );
+
+        // Node B over the same replicated log: mallory is refused, alice still owns it.
+        let b = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            b.claim_session(&c, "mallory").await.unwrap(),
+            SessionClaim::Denied {
+                owner: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            b.claim_session(&c, "alice").await.unwrap(),
+            SessionClaim::Granted { present: true }
+        );
     }
 
     /// The layering proof: a second store over the **same log** sees the first

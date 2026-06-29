@@ -1,6 +1,6 @@
 # ADR 0031 — Bind the session to the authenticated identity
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0031-session-identity-binding.md](../delivery/0031-session-identity-binding.md) — plan, progress, and changelog
@@ -12,9 +12,10 @@
   identity mid-session)
 
 > This record states the decision only. How it is being built and how far along it is live
-> in the [delivery doc](../delivery/0031-session-identity-binding.md). **Proposed — up for
-> review; the chosen mechanism (and its secure-by-default posture) is the main open
-> question.**
+> in the [delivery doc](../delivery/0031-session-identity-binding.md). **Accepted — the
+> secure-by-default takeover/resume guard (option C) is built and proven; the open questions
+> below are resolved in "Decision". The optional connect ACL (option B) remains a tracked,
+> opt-in refinement.**
 
 ## Context
 
@@ -78,20 +79,32 @@ A complementary, **opt-in** policy lever (option B) may be layered on top: an
 deployments that want id-namespacing as policy rather than only first-claim binding. The
 guard (1–3) is the secure-by-default core; the connect ACL is the configurable refinement.
 
-### Open questions (to refine before ratifying)
+### Open questions — resolved on ratification
 
-- **Identity rotation.** A legitimate identity change (cert CN change / re-issue, a username
-  change) would make an existing session unrecoverable under a strict match. Do we key on the
-  CN, a stable subject claim, or allow an operator-defined equivalence? (Interacts with ADR
-  0013 v5 re-auth, which can change identity mid-session.)
-- **Key vs guard.** The guard (C) defends the hijack with minimal blast radius. **Namespacing
-  the key** itself — making the effective session key `(identity, client_id)` everywhere
-  (store keys, hub maps, the placement HRW hash) — is *stronger* (two identities with the
-  same id are simply different sessions, never even a conflict) but reshapes the same
-  cross-cutting surface ADR 0021/0030 touched. Which do we want as the end state?
-- **Failure mode on mismatch.** Reject the CONNECT, or silently start a *fresh* clean session
-  for the new identity (never touching the existing one)? Reject is louder and auditable;
-  fresh-session is friendlier to clients that reuse a default id.
+- **Failure mode on mismatch → reject.** A mismatch **rejects the CONNECT** (CONNACK `0x87` /
+  3.1.1 code 5) and records a `session.bind.mismatch` audit event. Reject is louder and
+  auditable than silently substituting a fresh session, matching the deny-by-default,
+  everything-is-logged posture.
+- **Identity rotation → strict subject match (documented).** The owner is the authenticated
+  `principal.subject` (the mTLS CN / username / token subject); a *changed* subject does not
+  match and so cannot resume — a deliberate, secure default. Operators who rotate the
+  underlying credential while keeping a stable subject claim are unaffected; an
+  operator-defined equivalence (or v5 re-auth-driven rebinding, ADR 0013) is a future
+  refinement, not a v1 requirement.
+- **Key vs guard → guard now, key-namespacing as the recorded end state.** The shipped
+  mechanism is the takeover/resume **guard** (option C): minimal blast radius, secure by
+  default. Namespacing the session key by `(identity, client_id)` everywhere (store keys, hub
+  maps, the placement HRW hash) remains the stronger candidate end state if first-claim
+  binding proves insufficient.
+
+### Boundaries (v1)
+
+- The guard covers **resume and takeover** of a *persistent* session — the data-inheritance /
+  hijack threat the ADR targets. A `clean_start=true` CONNECT by a different identity discards
+  the prior session and starts fresh under the new owner: it inherits no data or
+  subscriptions, so it is not a takeover; hardening that eviction is a separate follow-on.
+- **Anonymous** is one shared identity: under `allow_anonymous`, anonymous clients share a
+  session namespace (no isolation promised — the existing insecure-by-toggle mode, ADR 0004).
 
 ## Consequences
 

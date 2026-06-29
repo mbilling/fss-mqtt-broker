@@ -133,6 +133,28 @@ pub enum Enqueued {
     Rejected,
 }
 
+/// Outcome of [`claim_session`](SessionStore::claim_session): whether the connecting
+/// identity may use this client id's persistent session ([ADR 0031]).
+///
+/// [ADR 0031]: ../../../docs/adr/0031-session-identity-binding.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionClaim {
+    /// The identity owns the session and may resume/take it over: a fresh session was
+    /// created for it (`present = false`), or an existing session is owned by the same
+    /// identity — or a legacy record carrying no owner, which adopts it (`present = true`).
+    Granted {
+        /// Mirrors [`ensure_session`](SessionStore::ensure_session): `true` if a session
+        /// already existed (drives the CONNACK `session_present` flag).
+        present: bool,
+    },
+    /// The persistent session already belongs to a **different** identity; the connect must
+    /// be rejected — the claimant may not resume, take over, or inherit it.
+    Denied {
+        /// The stable subject of the identity that currently owns the session (for audit).
+        owner: String,
+    },
+}
+
 /// Durable storage for MQTT persistent sessions.
 ///
 /// Implementations must be safe to shard by [`ClientId`]. The durability contract
@@ -267,6 +289,34 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
         Ok(Vec::new())
     }
+
+    /// Ensure a persistent session for `client` and bind/verify its **owning identity** in
+    /// one atomic step ([ADR 0031]). `owner` is the connecting principal's stable subject
+    /// (the mTLS CN, username, or token subject; the shared `"anonymous"` principal under
+    /// `allow_anonymous`).
+    ///
+    /// - No session yet → create it, record `owner`, return [`SessionClaim::Granted`] with
+    ///   `present = false`.
+    /// - Session exists owned by `owner` (or a legacy record with no recorded owner, which
+    ///   adopts it) → `Granted { present: true }`.
+    /// - Session exists owned by a *different* identity → [`SessionClaim::Denied`].
+    ///
+    /// This is the secure-by-default takeover/resume guard: it must be atomic so two racing
+    /// principals cannot both believe they own a freshly-created session. The default
+    /// implementation (stores without durable owner metadata — single-tenant/test stubs)
+    /// delegates to [`ensure_session`](Self::ensure_session) and always grants, preserving
+    /// pre-0031 behavior.
+    ///
+    /// [ADR 0031]: ../../../docs/adr/0031-session-identity-binding.md
+    async fn claim_session(
+        &self,
+        client: &ClientId,
+        _owner: &str,
+    ) -> Result<SessionClaim, StorageError> {
+        Ok(SessionClaim::Granted {
+            present: self.ensure_session(client).await?,
+        })
+    }
 }
 
 /// Stores retained messages keyed by topic.
@@ -308,6 +358,9 @@ struct SessionEntry {
     /// Absolute expiry deadline (Unix epoch secs) for a disconnected session, or `None`
     /// while connected / never-expiring (ADR 0009 §3).
     session_expiry_at: Option<u64>,
+    /// The authenticated identity that owns this session (ADR 0031). `None` only for a
+    /// legacy entry created before owner binding; the next claim adopts it.
+    owner: Option<String>,
 }
 
 /// A non-durable, single-process [`SessionStore`] backed by in-memory maps.
@@ -354,6 +407,32 @@ impl SessionStore for MemorySessionStore {
         let existed = map.contains_key(client);
         map.entry(client.clone()).or_default();
         Ok(existed)
+    }
+
+    async fn claim_session(
+        &self,
+        client: &ClientId,
+        owner: &str,
+    ) -> Result<SessionClaim, StorageError> {
+        let mut map = self.lock();
+        match map.get_mut(client) {
+            None => {
+                // Fresh session: create it and record the claiming owner.
+                map.entry(client.clone()).or_default().owner = Some(owner.to_string());
+                Ok(SessionClaim::Granted { present: false })
+            }
+            Some(entry) => match &entry.owner {
+                // Legacy entry with no recorded owner adopts the claimant.
+                None => {
+                    entry.owner = Some(owner.to_string());
+                    Ok(SessionClaim::Granted { present: true })
+                }
+                Some(existing) if existing == owner => Ok(SessionClaim::Granted { present: true }),
+                Some(existing) => Ok(SessionClaim::Denied {
+                    owner: existing.clone(),
+                }),
+            },
+        }
     }
 
     async fn set_subscriptions(
@@ -580,7 +659,7 @@ impl RetainedStore for MemoryRetainedStore {
 mod tests {
     use super::{
         Enqueued, MemoryRetainedStore, MemorySessionStore, Offset, OverflowPolicy, QueueLimits,
-        RetainedStore, SessionStore,
+        RetainedStore, SessionClaim, SessionStore,
     };
     use mqtt_core::{ClientId, Message, QoS};
 
@@ -639,6 +718,50 @@ mod tests {
 
         // Limit is honored.
         assert_eq!(store.pending(&c, 0, 2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn claim_session_binds_then_guards_the_owner() {
+        let store = MemorySessionStore::new();
+        let c = cid("client");
+
+        // First claim creates the session and records the owner.
+        assert_eq!(
+            store.claim_session(&c, "alice").await.unwrap(),
+            SessionClaim::Granted { present: false }
+        );
+        // The owner reclaims it (present).
+        assert_eq!(
+            store.claim_session(&c, "alice").await.unwrap(),
+            SessionClaim::Granted { present: true }
+        );
+        // A different identity is denied, and told who owns it (for audit).
+        assert_eq!(
+            store.claim_session(&c, "mallory").await.unwrap(),
+            SessionClaim::Denied {
+                owner: "alice".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_session_without_an_owner_adopts_its_next_claimant() {
+        let store = MemorySessionStore::new();
+        let c = cid("client");
+        // A session created before owner binding (no owner recorded).
+        assert!(!store.ensure_session(&c).await.unwrap());
+        // The next claim adopts the claimant as owner...
+        assert_eq!(
+            store.claim_session(&c, "alice").await.unwrap(),
+            SessionClaim::Granted { present: true }
+        );
+        // ...and thereafter guards against a different identity.
+        assert_eq!(
+            store.claim_session(&c, "mallory").await.unwrap(),
+            SessionClaim::Denied {
+                owner: "alice".to_string()
+            }
+        );
     }
 
     #[tokio::test]

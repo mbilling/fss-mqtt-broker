@@ -40,7 +40,8 @@ use mqtt_core::{
     Subscription, SubscriptionTable,
 };
 use mqtt_storage::{
-    Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionStore, StorageError,
+    Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionClaim, SessionStore,
+    StorageError,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -236,6 +237,10 @@ pub enum AttachOutcome {
     /// unreachable) past the recovery deadline. The connection must reject the CONNECT
     /// with Server-unavailable and let the client retry; the session is left intact.
     Unavailable,
+    /// The persistent session is owned by a *different* authenticated identity, so this
+    /// connection may not resume or take it over (ADR 0031). The connection must reject the
+    /// CONNACK as Not-authorized; the existing session is left untouched.
+    OwnerMismatch,
 }
 
 /// The outcome of the off-loop durable recovery for a persistent attach (ADR 0017).
@@ -254,6 +259,12 @@ pub enum SessionRecovery {
     Cleaned,
     /// The store could not give an authoritative answer within the deadline.
     Unavailable,
+    /// The persistent session is owned by a different authenticated identity; the claim was
+    /// refused (ADR 0031). Carries the existing owner's subject for the audit record.
+    Denied {
+        /// The stable subject of the identity that owns the session.
+        owner: String,
+    },
 }
 
 /// The connection context carried across the off-loop session-recovery wait so the hub
@@ -264,6 +275,8 @@ pub enum SessionRecovery {
 pub struct PendingAttach {
     /// The client identifier.
     client: ClientId,
+    /// The authenticated principal's stable subject — the owner to bind/verify (ADR 0031).
+    owner: String,
     /// Unique id for this physical connection (guards last-writer-wins on overlap).
     conn_id: u64,
     /// MQTT 5.0 Session Expiry Interval (seconds).
@@ -286,6 +299,9 @@ pub enum HubCommand {
     Attach {
         /// The client identifier.
         client: ClientId,
+        /// The authenticated principal's stable subject (mTLS CN / username / token subject,
+        /// or the shared `"anonymous"` principal). Binds the session to its owner (ADR 0031).
+        owner: String,
         /// Unique id for this physical connection.
         conn_id: u64,
         /// MQTT 5.0 Clean Start: discard any existing session before attaching
@@ -682,6 +698,7 @@ impl Hub {
         match cmd {
             HubCommand::Attach {
                 client,
+                owner,
                 conn_id,
                 clean_start,
                 session_expiry,
@@ -693,6 +710,7 @@ impl Hub {
                 self.attach(
                     PendingAttach {
                         client,
+                        owner,
                         conn_id,
                         session_expiry,
                         receive_maximum,
@@ -971,12 +989,23 @@ impl Hub {
                 );
                 let _ = pending.reply.send(AttachOutcome::Unavailable);
             }
+            SessionRecovery::Denied { owner } => {
+                warn!(
+                    client = %pending.client.0,
+                    claimant = %pending.owner,
+                    owner = %owner,
+                    "session-identity mismatch: a different principal may not resume/take over \
+                     this persistent session; rejecting CONNECT (ADR 0031)"
+                );
+                let _ = pending.reply.send(AttachOutcome::OwnerMismatch);
+            }
         }
     }
 
     /// Finish a recovered (or clean-start) attach on the hub loop: reconcile
     /// subscriptions, register the connection (honoring takeover), reply so the
     /// connection can CONNACK, then resume in-flight `QoS` and replay queued messages.
+    #[allow(clippy::too_many_lines)]
     async fn finish_attach(
         &mut self,
         pending: PendingAttach,
@@ -986,6 +1015,8 @@ impl Hub {
     ) {
         let PendingAttach {
             client,
+            // The owner was bound/verified during recovery (claim_session); not needed here.
+            owner: _,
             conn_id,
             session_expiry,
             receive_maximum,
@@ -2119,7 +2150,7 @@ async fn recover_session(
     self_tx: mpsc::UnboundedSender<HubCommand>,
     pending: PendingAttach,
 ) {
-    let recovery = recover_until_ready(&store, &pending.client).await;
+    let recovery = recover_until_ready(&store, &pending.client, &pending.owner).await;
     let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
 }
 
@@ -2146,11 +2177,15 @@ async fn discard_session(
 /// momentarily unreachable) is retried with capped backoff; a terminal error, or the
 /// deadline, yields `Unavailable` so the attach rejects the CONNECT rather than
 /// fabricate a clean session over a recoverable one.
-async fn recover_until_ready(store: &Arc<dyn SessionStore>, client: &ClientId) -> SessionRecovery {
+async fn recover_until_ready(
+    store: &Arc<dyn SessionStore>,
+    client: &ClientId,
+    owner: &str,
+) -> SessionRecovery {
     let deadline = Instant::now() + ATTACH_RECOVERY_TIMEOUT;
     let mut backoff = ATTACH_RECOVERY_BACKOFF_START;
     loop {
-        match recover_once(store, client).await {
+        match recover_once(store, client, owner).await {
             Ok(ready) => return ready,
             // Transient and time remaining: back off and retry.
             Err(e) if e.is_transient() && Instant::now() < deadline => {}
@@ -2162,14 +2197,20 @@ async fn recover_until_ready(store: &Arc<dyn SessionStore>, client: &ClientId) -
     }
 }
 
-/// One recovery attempt: `ensure_session` then `subscriptions`, both authoritative
-/// durable reads. Surfaces the [`StorageError`] so the caller can distinguish a
-/// transient condition from a terminal one.
+/// One recovery attempt: `claim_session` (bind/verify the owning identity, ADR 0031) then
+/// `subscriptions`, both authoritative durable reads. Surfaces the [`StorageError`] so the
+/// caller can distinguish a transient condition from a terminal one. A claim refused because
+/// the session belongs to another identity returns [`SessionRecovery::Denied`] — an
+/// authoritative answer, not retried.
 async fn recover_once(
     store: &Arc<dyn SessionStore>,
     client: &ClientId,
+    owner: &str,
 ) -> Result<SessionRecovery, StorageError> {
-    let present = store.ensure_session(client).await?;
+    let present = match store.claim_session(client, owner).await? {
+        SessionClaim::Granted { present } => present,
+        SessionClaim::Denied { owner } => return Ok(SessionRecovery::Denied { owner }),
+    };
     let subscriptions = store.subscriptions(client).await?;
     // Warm (and confirm the availability of) the offline-queue key as well, so the
     // inline replay in `finish_attach` reads a recovered queue and is never silently
@@ -2258,6 +2299,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
+            owner: client.to_string(),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -2268,6 +2310,103 @@ mod tests {
         })
         .unwrap();
         reply_rx.await.unwrap()
+    }
+
+    /// Send a persistent (resume) `Attach` under an explicit owning identity `owner` — for
+    /// the ADR 0031 session-identity-binding tests, which attach the *same* client id under
+    /// *different* identities.
+    async fn attach_outcome_as(
+        tx: &HubTx,
+        client: &str,
+        owner: &str,
+        conn_id: u64,
+    ) -> AttachOutcome {
+        let (out_tx, _out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.into()),
+            owner: owner.to_string(),
+            conn_id,
+            clean_start: false,
+            session_expiry: u32::MAX,
+            receive_maximum: u16::MAX,
+            will: None,
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        reply_rx.await.unwrap()
+    }
+
+    // --- ADR 0031: session bound to the authenticated identity ---------------------
+
+    /// A different authenticated identity may not resume another's persistent session; the
+    /// owner can; the rejected identity inherits nothing.
+    #[tokio::test]
+    async fn a_different_identity_cannot_resume_a_persistent_session() {
+        let tx = start_hub();
+
+        // alice creates a persistent session for client id "shared".
+        let first = attach_outcome_as(&tx, "shared", "alice", 1).await;
+        assert!(
+            matches!(first, AttachOutcome::Present(false)),
+            "fresh: {first:?}"
+        );
+        detach(&tx, "shared", 1);
+
+        // mallory, a different identity, may not resume it.
+        let stolen = attach_outcome_as(&tx, "shared", "mallory", 2).await;
+        assert!(
+            matches!(stolen, AttachOutcome::OwnerMismatch),
+            "a different identity must be refused, got {stolen:?}"
+        );
+
+        // alice, the owner, resumes it (session present).
+        let resumed = attach_outcome_as(&tx, "shared", "alice", 3).await;
+        assert!(
+            matches!(resumed, AttachOutcome::Present(true)),
+            "the owner must resume its own session, got {resumed:?}"
+        );
+    }
+
+    /// A different identity may not take over a session that is *currently online*.
+    #[tokio::test]
+    async fn a_different_identity_cannot_take_over_an_online_session() {
+        let tx = start_hub();
+
+        // alice is online with "shared".
+        let online = attach_outcome_as(&tx, "shared", "alice", 1).await;
+        assert!(matches!(online, AttachOutcome::Present(false)));
+
+        // mallory's takeover attempt (no detach — alice is still connected) is refused.
+        let takeover = attach_outcome_as(&tx, "shared", "mallory", 2).await;
+        assert!(
+            matches!(takeover, AttachOutcome::OwnerMismatch),
+            "a live session must not be seized by another identity, got {takeover:?}"
+        );
+
+        // alice can still take over her own session (legitimate reconnect).
+        let reconnect = attach_outcome_as(&tx, "shared", "alice", 3).await;
+        assert!(matches!(reconnect, AttachOutcome::Present(true)));
+    }
+
+    /// Under `allow_anonymous`, anonymous clients share one identity namespace (the documented
+    /// insecure-by-toggle mode): the shared `"anonymous"` principal resumes its own session.
+    #[tokio::test]
+    async fn anonymous_clients_share_one_identity_namespace() {
+        let tx = start_hub();
+
+        let first = attach_outcome_as(&tx, "shared", "anonymous", 1).await;
+        assert!(matches!(first, AttachOutcome::Present(false)));
+        detach(&tx, "shared", 1);
+
+        // Another anonymous connection is the *same* principal, so it resumes (no isolation
+        // promised in this mode — ADR 0031 / ADR 0004).
+        let second = attach_outcome_as(&tx, "shared", "anonymous", 2).await;
+        assert!(
+            matches!(second, AttachOutcome::Present(true)),
+            "anonymous shares one namespace, got {second:?}"
+        );
     }
 
     /// A `SessionStore` that fails the first `fail_ensure` `ensure_session` calls with
@@ -2440,6 +2579,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
+            owner: client.to_string(),
             conn_id,
             clean_start,
             session_expiry,
@@ -2453,6 +2593,9 @@ mod tests {
             AttachOutcome::Present(present) => present,
             AttachOutcome::Unavailable => {
                 panic!("in-memory store attach is never Unavailable")
+            }
+            AttachOutcome::OwnerMismatch => {
+                panic!("same-owner attach is never an ownership mismatch")
             }
         };
         (out_rx, session_present)
@@ -3688,6 +3831,7 @@ mod tests {
         let (reply_tx, mut a_reply) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("a".into()),
+            owner: "a".to_string(),
             conn_id: 1,
             clean_start: false,
             session_expiry: u32::MAX,
