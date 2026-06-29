@@ -48,8 +48,9 @@ tasks:
     notes: TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work
   - id: 0002-T10
     title: WebSocket-over-TLS listener
-    status: deferred
-    notes: Transport::WebSocketTls enum variant exists but no listener/upgrade path; scheduled for Phase 4
+    status: done
+    date: 2026-06-29
+    evidence: "Delivered with the native WebSocket transport (ADR 0035). main.rs serve_wss_clients (gated on MQTTD_WSS_BIND) terminates TLS first with the reloadable ADR 0002 acceptor — so the mTLS client-cert CN identity is extracted exactly as for a TCP TLS client (ADR 0004) — then runs the WebSocket handshake over the TLS stream; a SIGHUP cert reload is picked up on the next handshake. tests/ws.rs wss_mtls_pubsub_roundtrip proves a pub/sub round-trip over wss:// with mutual TLS."
 ---
 
 # Delivery — ADR 0002: Transport security: TLS 1.3 everywhere, mTLS on the cluster bus
@@ -89,11 +90,15 @@ tests, and the dashboard.
 | 0002-T7 | ✅ done | 2026-06-11 | swim_auth.rs HMAC-SHA256 seal/open; keyed_cluster_ignores_nodes_without_the_key (realized by ADR 0003) |
 | 0002-T8 | 💤 deferred | — | no revocation checking in tree (rg crl|ocsp|revocation -> none); pairs with hot-reloadable policy, Capability Plan §3 |
 | 0002-T9 | 💤 deferred | — | TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work |
-| 0002-T10 | 💤 deferred | — | Transport::WebSocketTls enum variant exists but no listener/upgrade path; scheduled for Phase 4 |
+| 0002-T10 | ✅ done | 2026-06-29 | "Delivered with the native WebSocket transport (ADR 0035). main.rs serve_wss_clients (gated on MQTTD_WSS_BIND) terminates TLS first with the reloadable ADR 0002 acceptor — so the mTLS client-cert CN identity is extracted exactly as for a TCP TLS client (ADR 0004) — then runs the WebSocket handshake over the TLS stream; a SIGHUP cert reload is picked up on the next handshake. tests/ws.rs wss_mtls_pubsub_roundtrip proves a pub/sub round-trip over wss:// with mutual TLS." |
 <!-- /status-table:0002 -->
 
 ## Changelog
 
+- **2026-06-29** — T10 (WebSocket-over-TLS) reconciled to **done**: it was delivered by the
+  native WebSocket transport (ADR 0035) — `serve_wss_clients` (TLS-first via the reloadable
+  acceptor, then the WS upgrade, mTLS CN as identity), proven by `wss_mtls_pubsub_roundtrip` —
+  but this ADR's frontmatter still read "no listener/upgrade path exists". Status corrected.
 - **2026-06-22** — T6 node-id ↔ certificate-CN binding landed via ADR 0004 step 5
   (`peer.rs` CN-vs-Hello check), closing a deferred item from this ADR.
 - **2026-06-11** — Core transport security landed: rustls/ring (T1), TLS 1.3 only (T2),
