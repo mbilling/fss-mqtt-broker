@@ -21,7 +21,7 @@ tasks:
   - id: 0016-T4
     title: Failure-domain-aware voter selection (interaction with ADR 0021)
     status: planned
-    notes: bounded-voter work (ADR 0021) should pick voters across failure domains; revisit when 0021 is built
+    notes: "Unblocked — ADR 0021 (bounded lease-consensus voter set) is now done (9/9), so the voter-selection seam it introduced exists. Next step: spread voters across failure domains (rack/zone) rather than selecting purely by id hash, so a single domain loss cannot take quorum. No domain-topology input or domain-aware selection logic in tree yet."
 ---
 
 # Delivery — ADR 0016: SWIM membership stability
@@ -50,7 +50,7 @@ risk note.
 | 0016-P1 | ✅ done | 2026-06-18 | a_tombstoned_dead_node_stays_dead; a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin |
 | 0016-P2 | ✅ done | 2026-06-19 | awareness_rises_on_self_refutation_and_decays_on_a_clean_probe |
 | 0016-P3 | ✅ done | 2026-06-19 | independent_suspicions_shrink_the_window_to_the_floor; one_probers_suspicion_alone_holds_the_full_window |
-| 0016-T4 | ⬜ planned | — | bounded-voter work (ADR 0021) should pick voters across failure domains; revisit when 0021 is built |
+| 0016-T4 | ⬜ planned | — | "Unblocked — ADR 0021 (bounded lease-consensus voter set) is now done (9/9), so the voter-selection seam it introduced exists. Next step: spread voters across failure domains (rack/zone) rather than selecting purely by id hash, so a single domain loss cannot take quorum. No domain-topology input or domain-aware selection logic in tree yet." |
 <!-- /status-table:0016 -->
 
 **Deliberate deviation (P2):** awareness is bumped **only on self-refutation**, not on a

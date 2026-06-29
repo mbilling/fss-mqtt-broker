@@ -9,7 +9,7 @@
 | ADR | Title | Decision | Tasks | Open / deferred |
 |-----|-------|----------|-------|-----------------|
 | [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [10/11 done](0001-session-durability.md) | 1 deferred |
-| [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [7/10 done](0002-transport-security.md) | 3 deferred |
+| [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [8/10 done](0002-transport-security.md) | 2 deferred |
 | [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
 | [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [8/11 done](0004-identity-and-authentication.md) | 3 deferred |
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [3/6 done](0005-session-affinity.md) | 3 deferred |
@@ -42,7 +42,7 @@
 | [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
-| [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [6/7 done](0035-websocket-transport.md) | 1 deferred |
+| [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 
 ## Open and deferred work
@@ -55,7 +55,6 @@
 
 - `0002-T8` 💤 deferred: CRL / OCSP stapling — no revocation checking in tree (rg crl|ocsp|revocation -> none); pairs with hot-reloadable policy, Capability Plan §3
 - `0002-T9` 💤 deferred: Certificate rotation / hot-reload without dropping connections — TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work
-- `0002-T10` 💤 deferred: WebSocket-over-TLS listener — Transport::WebSocketTls enum variant exists but no listener/upgrade path; scheduled for Phase 4
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 
@@ -89,7 +88,7 @@
 
 **0016 — SWIM membership stability (dead-node fencing + false-positive resistance)**
 
-- `0016-T4` ⬜ planned: Failure-domain-aware voter selection (interaction with ADR 0021) — bounded-voter work (ADR 0021) should pick voters across failure domains; revisit when 0021 is built
+- `0016-T4` ⬜ planned: Failure-domain-aware voter selection (interaction with ADR 0021) — "Unblocked — ADR 0021 (bounded lease-consensus voter set) is now done (9/9), so the voter-selection seam it introduced exists. Next step: spread voters across failure domains (rack/zone) rather than selecting purely by id hash, so a single domain loss cannot take quorum. No domain-topology input or domain-aware selection logic in tree yet."
 
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
@@ -135,10 +134,6 @@
 **0034 — Foreign-client interop conformance testing**
 
 - `0034-T7` 💤 deferred: Follow-on — a second foreign client (Paho Python) behind the same harness for richer assertions (reason codes, properties, flow control) — start with one independent oracle (Mosquitto) to bound CI surface and flake sources; a second client adds coverage on the same harness once the first is stable in CI.
-
-**0035 — Native MQTT-over-WebSocket transport**
-
-- `0035-T7` 💤 deferred: Follow-on — MQTT-over-QUIC (separate ADR) reuses the same handle_stream<S> seam — QUIC is its own ADR (multi-stream mapping, quinn — already in the lock file); sequenced after WebSocket per the maintainer's call.
 
 **0036 — MQTT-over-QUIC transport (multi-stream)**
 

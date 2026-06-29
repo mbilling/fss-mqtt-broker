@@ -35,8 +35,9 @@ tasks:
     evidence: "README: MQTTD_WSS_BIND / MQTTD_WS_BIND rows + the Security transport bullet; demo/README playground section rewritten for native WS. ADR documents no permessage-deflate and peer bus stays mTLS/TCP."
   - id: 0035-T7
     title: Follow-on — MQTT-over-QUIC (separate ADR) reuses the same handle_stream<S> seam
-    status: deferred
-    notes: QUIC is its own ADR (multi-stream mapping, quinn — already in the lock file); sequenced after WebSocket per the maintainer's call.
+    status: done
+    date: 2026-06-29
+    evidence: "Delivered as ADR 0036 (MQTT-over-QUIC, 10/11 done). quic::byte_stream joins a quinn bidi stream into AsyncRead+AsyncWrite so the unchanged handle_stream<S> runs over it — the exact seam this follow-on predicted. The multi-stream mapping, mTLS identity, and connection migration all build on that seam; see docs/delivery/0036-quic-transport.md."
 ---
 
 # Delivery — ADR 0035: Native MQTT-over-WebSocket transport
@@ -73,7 +74,7 @@ the ADR 0032 reloadable acceptor); the MQTT engine (`handle_stream<S>`) is uncha
 | 0035-T4 | ✅ done | 2026-06-27 | "tests/ws.rs (3 tests, all pass): ws_pubsub_roundtrip (plaintext ws), wss_mtls_pubsub_roundtrip (client cert presented, CN identity, WS over TLS), ws_without_mqtt_subprotocol_is_refused. Client reuses WsByteStream::wrap + FrameReader/FrameWriter — same path as a TCP client." |
 | 0035-T5 | ✅ done | 2026-06-27 | "demo: MQTTD_WS_BIND=0.0.0.0:1890 on every node (host 8089 -> mqttd-1); playground-gw (mosquitto) + mosquitto.conf + entrypoint.sh relay removed; page connects ws://host:8089 directly and drops the play/up/down indirection. Verified end to end: native WS round-trip (paho -> mqttd-1:1890) RESULT OK; WS handshake over Tailscale returns 101 with sec-websocket-protocol: mqtt from mqttd itself." |
 | 0035-T6 | ✅ done | 2026-06-27 | "README: MQTTD_WSS_BIND / MQTTD_WS_BIND rows + the Security transport bullet; demo/README playground section rewritten for native WS. ADR documents no permessage-deflate and peer bus stays mTLS/TCP." |
-| 0035-T7 | 💤 deferred | — | QUIC is its own ADR (multi-stream mapping, quinn — already in the lock file); sequenced after WebSocket per the maintainer's call. |
+| 0035-T7 | ✅ done | 2026-06-29 | "Delivered as ADR 0036 (MQTT-over-QUIC, 10/11 done). quic::byte_stream joins a quinn bidi stream into AsyncRead+AsyncWrite so the unchanged handle_stream<S> runs over it — the exact seam this follow-on predicted. The multi-stream mapping, mTLS identity, and connection migration all build on that seam; see docs/delivery/0036-quic-transport.md." |
 <!-- /status-table:0035 -->
 
 ## Changelog
@@ -89,3 +90,7 @@ the ADR 0032 reloadable acceptor); the MQTT engine (`handle_stream<S>`) is uncha
   playground now connects to mqttd's native WS directly — the mosquitto gateway + relay are
   deleted; verified end to end (paho→mqttd-1:1890 RESULT OK, `101` + `mqtt` subprotocol over
   Tailscale from mqttd itself). QUIC (multi-stream) remains the deferred follow-on (its own ADR).
+- **2026-06-29** — T7 (the QUIC follow-on) marked **done**: delivered as ADR 0036
+  (MQTT-over-QUIC, 10/11). `quic::byte_stream` joins a quinn bidi stream into
+  `AsyncRead + AsyncWrite` over the same `handle_stream<S>` seam this task predicted, with
+  multi-stream demux, mTLS identity, and connection migration on top.
