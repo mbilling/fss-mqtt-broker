@@ -87,6 +87,17 @@ pub trait Authorizer: Send + Sync {
     fn authorize_publish(&self, identity: &Identity, topic: &TopicName) -> bool;
     /// Returns `true` if subscribing to `filter` is permitted.
     fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool;
+
+    /// Returns `true` if `identity` may connect with `client_id` (ADR 0031 option B — the
+    /// optional connect ACL that constrains *which* client ids an identity may claim, e.g. a
+    /// per-tenant prefix). This is layered **on top of** the secure-by-default session-owner
+    /// guard, not a replacement: the guard already binds a session to its owner with no
+    /// configuration. The default permits every connect, so the hook is purely opt-in and
+    /// existing authorizers are unaffected.
+    fn authorize_connect(&self, identity: &Identity, client_id: &ClientId) -> bool {
+        let _ = (identity, client_id);
+        true
+    }
 }
 
 /// Permits every action. Used only when no ACL policy is configured at all —

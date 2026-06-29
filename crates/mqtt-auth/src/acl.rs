@@ -10,12 +10,26 @@
 //! groups = ["ops"]              # any-of group names; a rule matches a
 //!                               # principal if EITHER list hits (both empty
 //!                               # or omitted = everyone)
-//! actions = ["publish"]         # non-empty subset of publish|subscribe
+//! actions = ["publish"]         # publish|subscribe (topic rule) OR connect
+//!                               # (client-id rule); the two kinds don't mix
 //! effect = "allow"              # optional; "allow" (default) or "deny"
 //! topics = ["devices/%i/#"]     # MQTT filter patterns; %i substitutes the
 //!                               # identity subject (%c is deferred until the
 //!                               # Authorizer trait carries the client id)
+//!
+//! [[rules]]                     # a connect rule (ADR 0031): which client ids
+//! identities = ["tenant-a-*"]   # an identity may claim
+//! actions = ["connect"]
+//! clients = ["tenant-a/%i/*"]   # client-id globs; %i substitutes the subject
+//! effect = "allow"
 //! ```
+//!
+//! ## Connect rules (ADR 0031, opt-in)
+//! `connect` rules constrain which **client ids** an identity may use, via `clients` globs
+//! (not `topics`). They are **opt-in**: with no `connect` rule, every connect is permitted;
+//! once any exists, a connect needs a matching allow (deny wins), so an operator can namespace
+//! client ids per tenant. This is layered on top of the secure-by-default session-owner guard
+//! (which binds a session to its creator with no configuration).
 //!
 //! ## Decision semantics
 //! Among the rules matching the principal and action: any matching **deny**
@@ -64,6 +78,10 @@ struct RawRule {
     effect: Option<String>,
     #[serde(default)]
     topics: Vec<String>,
+    /// Client-id glob patterns for a `connect` rule (ADR 0031 option B); `%i` substitutes the
+    /// identity subject. Mutually exclusive with `topics`.
+    #[serde(default)]
+    clients: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +97,12 @@ struct Rule {
     groups: Vec<String>,
     publish: bool,
     subscribe: bool,
+    /// A `connect` rule (ADR 0031): constrains which client ids the principal may claim. Uses
+    /// `clients` (glob patterns) rather than `topics`, so it is evaluated on its own path.
+    connect: bool,
     effect: Effect,
     topics: Vec<String>,
+    clients: Vec<String>,
 }
 
 impl Rule {
@@ -222,6 +244,47 @@ impl AclPolicy {
         }
         allow_hit || self.default_allow
     }
+
+    /// Decide a connect against the `connect` rules (ADR 0031 option B). Connect enforcement is
+    /// **opt-in**: if the policy declares no `connect` rules, every connect is permitted (the
+    /// secure-by-default session-owner guard still applies independently). Once any `connect`
+    /// rule exists, the usual order applies among matching ones — a deny wins, else an allow
+    /// permits, else the connect is refused (deny-by-default within the connect namespace).
+    fn evaluate_connect(&self, identity: &Identity, client_id: &str) -> bool {
+        // Enforcement is keyed on whether the *policy* declares any connect rule — not on
+        // whether one matches this principal — so defining connect rules for known tenants
+        // denies every identity that matches none (deny-by-default within the namespace).
+        let has_connect_rules = self.rules.iter().any(|r| r.connect);
+        let mut allow_hit = false;
+        for rule in &self.rules {
+            if !rule.connect || !rule.matches_principal(identity) {
+                continue;
+            }
+            for pattern in &rule.clients {
+                // `%i` substitution fails closed, as for topics: an unsubstitutable subject
+                // grants nothing on an allow and refuses outright on a deny.
+                let pattern = if pattern.contains("%i") {
+                    if subject_safe_for_substitution(&identity.subject) {
+                        pattern.replace("%i", &identity.subject)
+                    } else if rule.effect == Effect::Deny {
+                        return false;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    pattern.clone()
+                };
+                if glob_match(&pattern, client_id) {
+                    match rule.effect {
+                        Effect::Deny => return false,
+                        Effect::Allow => allow_hit = true,
+                    }
+                }
+            }
+        }
+        // No connect rules at all → unrestricted; otherwise require an allow hit.
+        allow_hit || !has_connect_rules
+    }
 }
 
 /// Whether `subject` is a single, wildcard-free topic level safe to substitute
@@ -247,24 +310,50 @@ fn validate_rule(index: usize, raw: RawRule) -> Result<Rule, AclError> {
             "rule {index}: `actions` must not be empty"
         )));
     }
-    let (mut publish, mut subscribe) = (false, false);
+    let (mut publish, mut subscribe, mut connect) = (false, false, false);
     for action in &raw.actions {
         match action.as_str() {
             "publish" => publish = true,
             "subscribe" => subscribe = true,
+            "connect" => connect = true,
             other => {
                 return Err(AclError::Invalid(format!(
                     "rule {index}: unknown action \"{other}\" \
-                     (expected \"publish\" or \"subscribe\")"
+                     (expected \"publish\", \"subscribe\", or \"connect\")"
                 )));
             }
         }
     }
 
-    if raw.topics.is_empty() {
-        return Err(AclError::Invalid(format!(
-            "rule {index}: `topics` must not be empty"
-        )));
+    // A `connect` rule matches client ids (`clients`); a publish/subscribe rule matches topics
+    // (`topics`). They are kept separate so each rule is unambiguous about what it constrains.
+    if connect {
+        if publish || subscribe {
+            return Err(AclError::Invalid(format!(
+                "rule {index}: `connect` cannot be combined with publish/subscribe in one rule"
+            )));
+        }
+        if !raw.topics.is_empty() {
+            return Err(AclError::Invalid(format!(
+                "rule {index}: a `connect` rule uses `clients`, not `topics`"
+            )));
+        }
+        if raw.clients.is_empty() {
+            return Err(AclError::Invalid(format!(
+                "rule {index}: a `connect` rule must list `clients`"
+            )));
+        }
+    } else {
+        if !raw.clients.is_empty() {
+            return Err(AclError::Invalid(format!(
+                "rule {index}: `clients` is only valid on a `connect` rule"
+            )));
+        }
+        if raw.topics.is_empty() {
+            return Err(AclError::Invalid(format!(
+                "rule {index}: `topics` must not be empty"
+            )));
+        }
     }
 
     Ok(Rule {
@@ -272,8 +361,10 @@ fn validate_rule(index: usize, raw: RawRule) -> Result<Rule, AclError> {
         groups: raw.groups,
         publish,
         subscribe,
+        connect,
         effect,
         topics: raw.topics,
+        clients: raw.clients,
     })
 }
 
@@ -283,6 +374,9 @@ impl Authorizer for AclPolicy {
     }
     fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool {
         self.evaluate(identity, Action::Subscribe, filter)
+    }
+    fn authorize_connect(&self, identity: &Identity, client_id: &mqtt_core::ClientId) -> bool {
+        self.evaluate_connect(identity, &client_id.0)
     }
 }
 
@@ -742,5 +836,115 @@ mod tests {
         assert!(can_sub(&p, &id, "devices/+/state"));
         assert!(!can_sub(&p, &id, "devices/#"));
         assert!(!can_sub(&p, &id, "devices/d1/#"));
+    }
+
+    // ----- connect rules (ADR 0031 option B) -----
+
+    fn can_connect(p: &AclPolicy, id: &Identity, client_id: &str) -> bool {
+        p.authorize_connect(id, &mqtt_core::ClientId(client_id.to_string()))
+    }
+
+    #[test]
+    fn connect_is_unrestricted_without_connect_rules() {
+        // A policy with only topic rules does not gate connect at all (opt-in).
+        let p = AclPolicy::from_toml_str(
+            r#"
+            default = "deny"
+            [[rules]]
+            actions = ["publish"]
+            topics = ["t/#"]
+            "#,
+        )
+        .unwrap();
+        assert!(can_connect(&p, &ident("anyone", &[]), "any-client-id"));
+    }
+
+    #[test]
+    fn connect_rules_namespace_client_ids_per_identity() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            identities = ["tenant-a-*"]
+            actions = ["connect"]
+            clients = ["tenant-a/%i/*"]
+            "#,
+        )
+        .unwrap();
+        let a = ident("tenant-a-alice", &[]);
+        // The identity may claim its own namespaced ids...
+        assert!(can_connect(&p, &a, "tenant-a/tenant-a-alice/sensor1"));
+        // ...but not another tenant's, nor an unprefixed id.
+        assert!(!can_connect(&p, &a, "tenant-b/x"));
+        assert!(!can_connect(&p, &a, "tenant-a/someone-else/x"));
+        // An identity that matches no connect rule, once any connect rule exists, is denied.
+        assert!(!can_connect(&p, &ident("outsider", &[]), "whatever"));
+    }
+
+    #[test]
+    fn a_connect_deny_rule_wins() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["connect"]
+            clients = ["*"]
+            effect = "allow"
+            [[rules]]
+            identities = ["banned"]
+            actions = ["connect"]
+            clients = ["*"]
+            effect = "deny"
+            "#,
+        )
+        .unwrap();
+        assert!(can_connect(&p, &ident("alice", &[]), "anything"));
+        assert!(!can_connect(&p, &ident("banned", &[]), "anything"));
+    }
+
+    #[test]
+    fn connect_cannot_mix_with_topic_actions() {
+        let msg = err_msg(
+            r#"
+            [[rules]]
+            actions = ["connect", "publish"]
+            clients = ["*"]
+            topics = ["t"]
+            "#,
+        );
+        assert!(msg.contains("connect"), "should name the conflict: {msg}");
+    }
+
+    #[test]
+    fn a_connect_rule_requires_clients_not_topics() {
+        assert!(err_msg(
+            r#"
+            [[rules]]
+            actions = ["connect"]
+            topics = ["t"]
+            "#,
+        )
+        .contains("clients"));
+        assert!(err_msg(
+            r#"
+            [[rules]]
+            actions = ["connect"]
+            "#,
+        )
+        .contains("clients"));
+    }
+
+    #[test]
+    fn clients_is_rejected_on_a_topic_rule() {
+        let msg = err_msg(
+            r#"
+            [[rules]]
+            actions = ["publish"]
+            topics = ["t"]
+            clients = ["x"]
+            "#,
+        );
+        assert!(
+            msg.contains("clients"),
+            "should reject clients on topic rule: {msg}"
+        );
     }
 }

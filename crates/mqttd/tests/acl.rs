@@ -366,3 +366,33 @@ async fn narrow_allow_does_not_cover_broad_subscription() {
 async fn sub_silence(c: &mut Client) -> Option<Packet> {
     c.recv().await
 }
+
+/// A connect ACL (ADR 0031 option B) namespaces client ids per identity: the identity may
+/// connect with a permitted client id but is rejected (CONNACK 0x05) with any other.
+#[tokio::test]
+async fn connect_acl_namespaces_client_ids_per_identity() {
+    let (addr, ids) = start_acl_node(
+        r#"
+        [[rules]]
+        identities = ["tenant-a"]
+        actions = ["connect"]
+        clients = ["tenant-a/%i/*"]
+        "#,
+    )
+    .await;
+
+    // A client id inside the identity's namespace connects.
+    ids.send(identity("tenant-a")).unwrap();
+    let _ok = Client::connect(addr, "tenant-a/tenant-a/sensor").await;
+
+    // A client id outside it is rejected at CONNECT with Not-authorized.
+    ids.send(identity("tenant-a")).unwrap();
+    let mut bad = Client::connect_raw(addr, "tenant-b/intruder", None).await;
+    match bad.recv().await {
+        Some(Packet::ConnAck(ack)) => {
+            assert_eq!(ack.code, 0x05, "connect ACL must reject Not-authorized");
+            assert!(!ack.session_present);
+        }
+        other => panic!("expected CONNACK 0x05, got {other:?}"),
+    }
+}

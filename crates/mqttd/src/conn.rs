@@ -459,6 +459,23 @@ where
         return Ok(()); // rejected; CONNACK/close already handled
     };
 
+    // Optional connect ACL (ADR 0031 option B): the policy may constrain which client ids this
+    // identity may claim. Checked before relocation/attach so a refused connect never touches
+    // session state. Default policy permits every connect, so this is a no-op unless configured.
+    if !policy.authorizer().authorize_connect(&principal, &client) {
+        info!(
+            client = %client.0, identity = %principal.subject,
+            "rejecting CONNECT: connect ACL denies this client id for the identity (ADR 0031)"
+        );
+        policy.audit.record(
+            "acl.deny.connect",
+            Some(&principal.subject),
+            &format!("client {}", client.0),
+        );
+        let code = connack_code(CONNACK_NOT_AUTHORIZED, connect.protocol);
+        return reject_connack(&mut writer, code).await;
+    }
+
     // Version-agnostic session policy (ADR 0009): clean-start + retention interval.
     let (clean_start, session_expiry) = session_policy(&connect);
 
