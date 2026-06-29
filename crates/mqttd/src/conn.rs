@@ -410,6 +410,9 @@ async fn read_connect<R: AsyncRead + Unpin>(
     }
 }
 
+// A flat CONNECT→serve sequence: long by the number of handshake/attach outcomes it maps,
+// not by branching complexity.
+#[allow(clippy::too_many_lines)]
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
@@ -487,6 +490,7 @@ where
     if hub
         .send(HubCommand::Attach {
             client: client.clone(),
+            owner: principal.subject.clone(),
             conn_id,
             clean_start,
             session_expiry,
@@ -507,6 +511,22 @@ where
             // clean session over a recoverable one (ADR 0017).
             info!(client = %client.0, "rejecting CONNECT: durable session unavailable, retry");
             let code = connack_code(CONNACK_SERVER_UNAVAILABLE, connect.protocol);
+            return reject_connack(&mut writer, code).await;
+        }
+        Ok(AttachOutcome::OwnerMismatch) => {
+            // The persistent session belongs to a different authenticated identity; this
+            // principal may not resume or take it over (ADR 0031). Reject Not-authorized
+            // and record it in the tamper-evident audit chain.
+            info!(
+                client = %client.0, identity = %principal.subject,
+                "rejecting CONNECT: session bound to a different identity (ADR 0031)"
+            );
+            policy.audit.record(
+                "session.bind.mismatch",
+                Some(&principal.subject),
+                &format!("client {} is owned by another identity", client.0),
+            );
+            let code = connack_code(CONNACK_NOT_AUTHORIZED, connect.protocol);
             return reject_connack(&mut writer, code).await;
         }
         Err(_) => return Ok(()), // hub dropped the reply (shutdown or superseded)
