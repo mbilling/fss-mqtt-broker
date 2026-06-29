@@ -76,37 +76,80 @@ pub struct RaftView {
     pub nodes: BTreeSet<RaftNodeId>,
 }
 
-/// The bounded, sticky target voter set (ADR 0021 §1): keep every still-eligible current
-/// voter, fill vacancies up to `cap` with the **lowest-id** eligible non-voters, and — on
-/// the upgrade path from an all-voters cluster — shrink an over-large live voter set down
-/// to the lowest-id `cap`. A deterministic function of *(cap, eligible, current voters)*,
-/// so every node and every successive leader computes the same target and reconcilers do
-/// not disagree. Effective voters = `min(cap, eligible.len())`.
+/// A node's **failure domain** — an operator-supplied rack / zone / availability-zone label
+/// (ADR 0016 T4). Voter selection spreads the bounded set across distinct domains so losing a
+/// whole domain cannot, on its own, take quorum. A node with no label is treated as its **own
+/// singleton domain**, so an entirely unlabelled cluster behaves exactly as the id-ordered
+/// vacancy-fill did before domains existed.
+pub type FailureDomain = String;
+
+/// How many members of `set` already share `id`'s failure domain. An unlabelled node is its own
+/// singleton domain (load 0), which is what makes the unlabelled case fall straight back to the
+/// lowest-id ordering.
+fn domain_load(
+    set: &BTreeSet<RaftNodeId>,
+    id: RaftNodeId,
+    domains: &BTreeMap<RaftNodeId, FailureDomain>,
+) -> usize {
+    match domains.get(&id) {
+        None => 0,
+        Some(d) => set.iter().filter(|m| domains.get(m) == Some(d)).count(),
+    }
+}
+
+/// Greedily grow `seed` up to `cap` by repeatedly taking the pool candidate whose failure
+/// domain is **least represented** in the set so far, breaking ties by lowest id. With no
+/// domain labels every load is 0, so this reduces exactly to "take the lowest-id candidates".
+fn pick_balanced(
+    cap: usize,
+    pool: &BTreeSet<RaftNodeId>,
+    seed: &BTreeSet<RaftNodeId>,
+    domains: &BTreeMap<RaftNodeId, FailureDomain>,
+) -> BTreeSet<RaftNodeId> {
+    let mut result: BTreeSet<RaftNodeId> = seed.clone();
+    let mut remaining: BTreeSet<RaftNodeId> = pool.difference(&result).copied().collect();
+    while result.len() < cap {
+        let Some(next) = remaining
+            .iter()
+            .copied()
+            .min_by_key(|id| (domain_load(&result, *id, domains), *id))
+        else {
+            break; // pool exhausted before the cap was reached
+        };
+        result.insert(next);
+        remaining.remove(&next);
+    }
+    result
+}
+
+/// The bounded, sticky target voter set (ADR 0021 §1), spread across failure domains (ADR 0016
+/// T4): keep every still-eligible current voter, then fill vacancies up to `cap` preferring the
+/// **least-represented failure domain** (lowest-id tie-break) so one domain's loss never costs
+/// quorum; on the upgrade path from an all-voters cluster, shrink an over-large live voter set
+/// to `cap` the same domain-balanced way. A deterministic function of *(cap, eligible, current
+/// voters, domains)* — every node and every successive leader computes the same target, so
+/// reconcilers do not disagree (they must therefore see the same `domains`). With no domain
+/// labels it is identical to the prior lowest-id behaviour. Effective voters =
+/// `min(cap, eligible.len())`.
 #[must_use]
 fn target_voters(
     cap: usize,
     eligible: &BTreeSet<RaftNodeId>,
     current: &BTreeSet<RaftNodeId>,
+    domains: &BTreeMap<RaftNodeId, FailureDomain>,
 ) -> BTreeSet<RaftNodeId> {
     let cap = cap.max(1);
     // Still-eligible current voters are sticky — they never lose a seat to a join.
     let live: BTreeSet<RaftNodeId> = current.intersection(eligible).copied().collect();
     if live.len() >= cap {
-        // Shrink (e.g. a pre-0021 all-voters cluster adopting the cap): keep lowest-id `cap`;
-        // the rest become learners via `change_membership(.., retain = true)`.
-        return live.iter().take(cap).copied().collect();
+        // Shrink (e.g. a pre-0021 all-voters cluster adopting the cap): keep a domain-balanced
+        // `cap` of the live voters; the rest become learners via `change_membership(retain)`.
+        return pick_balanced(cap, &live, &BTreeSet::new(), domains);
     }
-    // Grow / vacancy-fill: promote the lowest-id eligible non-voters until `cap` is reached
-    // (or the eligible set is exhausted). `BTreeSet::difference` yields ascending ids.
-    let mut target = live;
-    let vacancies = cap - target.len();
-    let fills: Vec<RaftNodeId> = eligible
-        .difference(&target)
-        .take(vacancies)
-        .copied()
-        .collect();
-    target.extend(fills);
-    target
+    // Grow / vacancy-fill: keep all sticky live voters, then fill from the eligible non-voters
+    // choosing domains under-represented among the voters already chosen.
+    let candidates: BTreeSet<RaftNodeId> = eligible.difference(&live).copied().collect();
+    pick_balanced(cap, &candidates, &live, domains)
 }
 
 /// Errors from applying a [`MembershipAction`].
@@ -150,8 +193,27 @@ impl MembershipReconciler {
     /// Decide the action to take given the current `view` and the `eligible` member set
     /// (alive, admitted members mapped to [`RaftNodeId`]). Pure — see the module docs and
     /// [ADR 0021](../../../docs/adr/0021-bounded-lease-voters.md) for the policy.
+    ///
+    /// Voter selection is failure-domain-unaware here (every node its own singleton domain);
+    /// use [`decide_with_domains`](Self::decide_with_domains) to spread the voter set across
+    /// failure domains (ADR 0016 T4).
     #[must_use]
     pub fn decide(&self, view: &RaftView, eligible: &BTreeSet<RaftNodeId>) -> MembershipAction {
+        self.decide_with_domains(view, eligible, &BTreeMap::new())
+    }
+
+    /// Like [`decide`](Self::decide), but spreads the bounded voter set across failure domains
+    /// (ADR 0016 T4): `domains` maps each eligible member to its rack/zone label, so vacancy
+    /// fill (and the upgrade-path shrink) prefer under-represented domains. `domains` must be
+    /// consistent across nodes — it is derived from the same replicated membership view — so
+    /// every successive leader computes the same target and reconcilers do not disagree.
+    #[must_use]
+    pub fn decide_with_domains(
+        &self,
+        view: &RaftView,
+        eligible: &BTreeSet<RaftNodeId>,
+        domains: &BTreeMap<RaftNodeId, FailureDomain>,
+    ) -> MembershipAction {
         if eligible.is_empty() {
             return MembershipAction::None;
         }
@@ -184,7 +246,7 @@ impl MembershipReconciler {
         }
         // Reshape the voter set first: bring every eligible member into the group (as a
         // learner) and drive the voters toward the bounded sticky target.
-        let target_voters = target_voters(self.voter_cap, eligible, &view.voters);
+        let target_voters = target_voters(self.voter_cap, eligible, &view.voters, domains);
         let add_as_learner: BTreeSet<RaftNodeId> =
             eligible.difference(&view.nodes).copied().collect();
         if target_voters != view.voters || !add_as_learner.is_empty() {
@@ -559,6 +621,126 @@ mod tests {
                 &set(&[1, 2, 3, 4, 5])
             ),
             MembershipAction::None,
+        );
+    }
+
+    // ---- failure-domain-aware voter selection (ADR 0016 T4) ----
+
+    /// Build a `RaftNodeId -> failure domain` map from `(id, domain)` pairs.
+    fn dom(pairs: &[(RaftNodeId, &str)]) -> std::collections::BTreeMap<RaftNodeId, String> {
+        pairs
+            .iter()
+            .map(|(id, d)| (*id, (*d).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn no_domains_matches_the_lowest_id_fill() {
+        // An empty domain map must reproduce the prior id-ordered behaviour exactly — the
+        // domain-aware path is a strict superset, so existing clusters are unaffected.
+        let r = MembershipReconciler::new(1, true, 3);
+        let eligible = set(&[1, 2, 3, 4, 5]);
+        let view = leader(&[1], &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            r.decide_with_domains(&view, &eligible, &dom(&[])),
+            r.decide(&view, &eligible),
+        );
+    }
+
+    #[test]
+    fn vacancy_fill_spreads_across_failure_domains() {
+        // cap 3, founder voter {1} in zone a; learners 2 (a), 3 (b), 4 (c). The id-ordered
+        // fill would pick 2,3 → zones {a,a,b}; the domain-aware fill picks 3,4 → {a,b,c}, so no
+        // single zone holds a quorum.
+        let r = MembershipReconciler::new(1, true, 3);
+        let domains = dom(&[(1, "a"), (2, "a"), (3, "b"), (4, "c")]);
+        assert_eq!(
+            r.decide_with_domains(&leader(&[1], &[1, 2, 3, 4]), &set(&[1, 2, 3, 4]), &domains,),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 3, 4]),
+                add_as_learner: set(&[]),
+            },
+        );
+        // Contrast: without the labels the same view fills with the lowest ids (zones ignored).
+        assert_eq!(
+            r.decide(&leader(&[1], &[1, 2, 3, 4]), &set(&[1, 2, 3, 4])),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2, 3]),
+                add_as_learner: set(&[]),
+            },
+        );
+    }
+
+    #[test]
+    fn within_a_domain_ties_break_by_lowest_id() {
+        // cap 2, voter {1} in zone a; learners 2 and 3 both in zone b. The vacancy prefers
+        // zone b (under-represented), and ties within it go to the lowest id (2).
+        let r = MembershipReconciler::new(1, true, 2);
+        assert_eq!(
+            r.decide_with_domains(
+                &leader(&[1], &[1, 2, 3]),
+                &set(&[1, 2, 3]),
+                &dom(&[(1, "a"), (2, "b"), (3, "b")]),
+            ),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2]),
+                add_as_learner: set(&[]),
+            },
+        );
+    }
+
+    #[test]
+    fn the_upgrade_shrink_is_also_domain_balanced() {
+        // Upgrade path: an all-voters {1(a),2(a),3(b),4(c)} cluster adopts cap 3. The id-ordered
+        // shrink keeps {1,2,3} (zones a,a,b); the domain-aware shrink keeps {1,3,4} (a,b,c).
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide_with_domains(
+                &leader(&[1, 2, 3, 4], &[1, 2, 3, 4]),
+                &set(&[1, 2, 3, 4]),
+                &dom(&[(1, "a"), (2, "a"), (3, "b"), (4, "c")]),
+            ),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 3, 4]),
+                add_as_learner: set(&[]),
+            },
+        );
+    }
+
+    #[test]
+    fn a_live_voter_stays_even_if_its_domain_is_over_represented() {
+        // Stickiness (ADR 0021 §1) wins over spread: voters {1,2} are both zone a and at cap 2;
+        // a new zone-b learner 3 does NOT displace a live voter — it joins as a learner.
+        let r = MembershipReconciler::new(1, true, 2);
+        assert_eq!(
+            r.decide_with_domains(
+                &leader(&[1, 2], &[1, 2]),
+                &set(&[1, 2, 3]),
+                &dom(&[(1, "a"), (2, "a"), (3, "b")]),
+            ),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 2]),
+                add_as_learner: set(&[3]),
+            },
+        );
+    }
+
+    #[test]
+    fn a_dead_voter_is_replaced_preferring_a_fresh_domain() {
+        // cap 3, voters {1(a),2(a),3(b)}, learners {4(c),5(a)}. Voter 2 dies. The vacancy is
+        // filled by zone c (4) over the lower-id zone-a learner 5 — restoring domain spread
+        // rather than clustering two voters in zone a again.
+        let r = MembershipReconciler::new(1, true, 3);
+        assert_eq!(
+            r.decide_with_domains(
+                &leader(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+                &set(&[1, 3, 4, 5]), // 2 gone
+                &dom(&[(1, "a"), (2, "a"), (3, "b"), (4, "c"), (5, "a")]),
+            ),
+            MembershipAction::Reconcile {
+                target_voters: set(&[1, 3, 4]),
+                add_as_learner: set(&[]),
+            },
         );
     }
 
