@@ -210,6 +210,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
 | `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
 | `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN |
+| `MQTTD_TLS_CRL` | Certificate revocation list (PEM; needs `…_CLIENT_CA`). A client whose cert is listed is refused at the TLS handshake; re-read on `SIGHUP`, so a published CRL applies with no restart (ADR 0002) |
 | `MQTTD_WSS_BIND` | MQTT-over-WebSocket **over TLS** (`wss://`), e.g. `0.0.0.0:8884` (ADR 0035; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA` — same TLS 1.3 + mTLS + hot reload as the TLS listener) |
 | `MQTTD_WS_BIND` | **Insecure** plaintext MQTT-over-WebSocket (`ws://`) — for browsers in local/dev only (ADR 0035) |
 | `MQTTD_QUIC_BIND` | MQTT-over-QUIC (UDP), e.g. `0.0.0.0:8885` (ADR 0036; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA`). QUIC mandates TLS 1.3 (no plaintext mode); **multi-stream** (one session across many streams, no head-of-line blocking); **non-standard** (EMQX-style), identity = leaf CN, no 0-RTT for CONNECT |
@@ -269,8 +270,9 @@ The broker re-reads the configured files in place and swaps them on **live** con
   publish/subscribe; a loosened rule takes effect immediately.
 - **Authenticators** (`MQTTD_PASSWORD_FILE`, `MQTTD_JWT_*`) — a rotated password file or JWT
   key authenticates the new credential and rejects the old on the next CONNECT.
-- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA`) — a renewed certificate is
-  served on the next handshake; **in-flight TLS sessions are undisturbed**.
+- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA` / `…_CRL`) — a renewed
+  certificate, or an updated **CRL**, is served on the next handshake; **in-flight TLS
+  sessions are undisturbed**. A newly-revoked client cert is refused from the next handshake.
 
 The reload is **validate-before-swap and all-or-nothing**: every file is parsed first, and
 the swap is applied only if *all* succeed. A missing or unparseable file is **rejected** —
@@ -278,7 +280,7 @@ the running policy is kept exactly as it was (the broker never fails open and ne
 itself on a typo). Every reload, success or rejection, emits a `security.reload` audit event
 and increments the `mqttd_security_reloads_total{outcome}` metric. To rotate paths (not just
 file contents) restart the broker. On non-Unix platforms `SIGHUP` is unavailable, so reload
-requires a restart. *(Cert revocation/CRL and peer-bus TLS reload are tracked follow-ons.)*
+requires a restart. *(Peer-bus TLS reload is a tracked follow-on.)*
 
 ### Metrics
 

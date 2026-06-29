@@ -637,3 +637,268 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
         other => panic!("expected the connection to close, got {other:?}"),
     }
 }
+
+// --- CRL (certificate revocation) tests (ADR 0002 T8) ---------------------------
+
+/// A CRL-capable PKI: a CA that signs CRLs, a server leaf, two client leaves (one of
+/// which the CRL revokes), and the CRL itself. Each leaf gets an explicit serial so the
+/// CRL can name it.
+struct CrlPki {
+    ca: PathBuf,
+    server_cert: PathBuf,
+    server_key: PathBuf,
+    revoked_cert: PathBuf,
+    revoked_key: PathBuf,
+    valid_cert: PathBuf,
+    valid_key: PathBuf,
+    crl: PathBuf,
+}
+
+/// Issue a client leaf for `127.0.0.1` (clientAuth) with serial `serial`, signed by `ca`.
+fn client_leaf(
+    dir: &Path,
+    name: &str,
+    serial: u64,
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+) -> (PathBuf, PathBuf) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+    params.serial_number = Some(rcgen::SerialNumber::from(serial));
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert_path = dir.join(format!("{name}.pem"));
+    let key_path = dir.join(format!("{name}.key"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    (cert_path, key_path)
+}
+
+fn mint_crl_pki(tag: &str) -> CrlPki {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+    let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mqttd-crl-{}-{tag}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // CA must carry CrlSign (rcgen refuses to sign a CRL otherwise) plus KeyCertSign.
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_path = dir.join("ca.pem");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+    // Server leaf.
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let mut sp = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+    sp.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let server_cert = sp.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+    let server_cert_path = dir.join("server.pem");
+    let server_key_path = dir.join("server.key");
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+
+    // Two client leaves with distinct serials; the CRL revokes the first.
+    let revoked_serial = 0x1001;
+    let (revoked_cert, revoked_key) =
+        client_leaf(&dir, "revoked", revoked_serial, &ca_cert, &ca_key);
+    let (valid_cert, valid_key) = client_leaf(&dir, "valid", 0x1002, &ca_cert, &ca_key);
+
+    // CRL listing the revoked serial, signed by the CA. Wide validity window so the test is
+    // time-independent (webpki checks list membership, not wall-clock expiry, but keep it sane).
+    let crl_params = rcgen::CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2020, 1, 1),
+        next_update: rcgen::date_time_ymd(2099, 1, 1),
+        crl_number: rcgen::SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![rcgen::RevokedCertParams {
+            serial_number: rcgen::SerialNumber::from(revoked_serial),
+            revocation_time: rcgen::date_time_ymd(2020, 1, 2),
+            reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let crl = crl_params.signed_by(&ca_cert, &ca_key).unwrap();
+    let crl_path = dir.join("crl.pem");
+    std::fs::write(&crl_path, crl.pem().unwrap()).unwrap();
+
+    CrlPki {
+        ca: dir.join("ca.pem"),
+        server_cert: server_cert_path,
+        server_key: server_key_path,
+        revoked_cert,
+        revoked_key,
+        valid_cert,
+        valid_key,
+        crl: crl_path,
+    }
+}
+
+/// Assert that presenting `connector`'s client cert yields no MQTT session: the TLS 1.3
+/// rejection can surface at handshake or as a closed stream with no CONNACK.
+async fn assert_no_session(addr: SocketAddr, connector: &TlsConnector) {
+    match tls_connect(addr, connector).await {
+        Err(_) => {} // rejected at handshake
+        Ok(stream) => {
+            let (rh, wh) = tokio::io::split(stream);
+            let mut writer = mqtt_net::FrameWriter::new(wh, V4);
+            let _ = writer
+                .send(&Packet::Connect(Connect {
+                    properties: mqtt_codec::Properties::new(),
+                    protocol: V4,
+                    clean_session: true,
+                    keep_alive: 30,
+                    client_id: "revoked".into(),
+                    last_will: None,
+                    username: None,
+                    password: None,
+                }))
+                .await;
+            let mut reader = mqtt_net::FrameReader::new(rh, V4);
+            let got_connack = matches!(
+                timeout(Duration::from_millis(500), reader.next_packet()).await,
+                Ok(Ok(Some(Packet::ConnAck(_))))
+            );
+            assert!(!got_connack, "a revoked client certificate got a CONNACK");
+        }
+    }
+}
+
+/// A client whose certificate is on the CRL is rejected at the TLS handshake — before any
+/// MQTT bytes — while a non-revoked certificate from the same CA still connects normally.
+#[tokio::test]
+async fn crl_rejects_a_revoked_client_certificate() {
+    let pki = mint_crl_pki("reject");
+    let acceptor = mqtt_net::tls::server_acceptor_with_crl(
+        &pki.server_cert,
+        &pki.server_key,
+        Some(&pki.ca),
+        Some(&pki.crl),
+    )
+    .unwrap();
+    let addr = start_tls_node(acceptor).await;
+
+    // Revoked: no session forms.
+    let revoked = test_connector(&pki.ca, Some((&pki.revoked_cert, &pki.revoked_key)));
+    assert_no_session(addr, &revoked).await;
+
+    // Valid (same CA, not revoked): connects and can subscribe.
+    let valid = test_connector(&pki.ca, Some((&pki.valid_cert, &pki.valid_key)));
+    let mut c = Client::connect(tls_connect(addr, &valid).await.unwrap(), "valid").await;
+    c.subscribe("ok/#").await;
+}
+
+/// Without a CRL configured, the very same revoked certificate is accepted — proving the
+/// rejection above is the CRL's doing, not some unrelated property of the cert.
+#[tokio::test]
+async fn without_a_crl_the_same_certificate_is_accepted() {
+    let pki = mint_crl_pki("baseline");
+    let acceptor =
+        mqtt_net::tls::server_acceptor(&pki.server_cert, &pki.server_key, Some(&pki.ca)).unwrap();
+    let addr = start_tls_node(acceptor).await;
+
+    let connector = test_connector(&pki.ca, Some((&pki.revoked_cert, &pki.revoked_key)));
+    let mut c = Client::connect(tls_connect(addr, &connector).await.unwrap(), "no-crl").await;
+    c.subscribe("ok/#").await;
+}
+
+/// Start an mTLS node whose acceptor is rebuilt by a [`reload::Reloader`]; the CRL is applied
+/// only when `crl_active` is set, so a reload can switch revocation on in place (ADR 0032 §5).
+async fn start_reloadable_mtls_node(
+    pki: &CrlPki,
+    crl_active: Arc<std::sync::atomic::AtomicBool>,
+) -> (SocketAddr, mqttd::reload::Reloader) {
+    use std::sync::atomic::Ordering;
+    let make_policy = || -> mqttd::reload::BuildResult {
+        Ok((
+            Arc::new(mqtt_auth::AllowAll) as Arc<dyn mqtt_auth::Authorizer>,
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }) as Arc<dyn mqtt_auth::Authenticator>,
+        ))
+    };
+    let audit = Arc::new(mqtt_observability::AuditLog::new());
+    let (mut reloader, handles) =
+        mqttd::reload::Reloader::new(make_policy().unwrap(), audit, make_policy);
+
+    let (cert, key, ca, crl) = (
+        pki.server_cert.clone(),
+        pki.server_key.clone(),
+        pki.ca.clone(),
+        pki.crl.clone(),
+    );
+    let build = move || {
+        let crl_opt = crl_active.load(Ordering::SeqCst).then_some(crl.as_path());
+        mqtt_net::tls::server_acceptor_with_crl(&cert, &key, Some(&ca), crl_opt)
+            .map_err(|e| e.to_string())
+    };
+    let acceptor = build().expect("initial acceptor");
+    let acceptor_rx = reloader.attach_tls(acceptor, build);
+
+    let (hub, hub_tx) = Hub::with_config(
+        NodeId("crlreload-node".into()),
+        std::sync::Arc::new(MemorySessionStore::new()),
+    );
+    tokio::spawn(hub.run());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let acceptor = acceptor_rx.borrow().clone();
+            let auth = mqttd::conn::auth_handle(handles.auth.borrow().clone());
+            let authz = mqttd::conn::authz_handle(handles.authz.borrow().clone());
+            let hub = hub_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let policy = Arc::new(mqttd::conn::ConnPolicy {
+                        auth,
+                        authz,
+                        audit: Arc::new(mqtt_observability::AuditLog::new()),
+                        proxy: None,
+                        store: None,
+                        connect_timeout: Duration::from_secs(10),
+                        shutdown: None,
+                        metrics: None,
+                        enhanced: None,
+                    });
+                    mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
+                }
+            });
+        }
+    });
+    (addr, reloader)
+}
+
+/// Publishing a CRL via reload takes effect on the next handshake: a client cert that
+/// connected fine before the reload is rejected after, with no restart (ADR 0032 §5).
+#[tokio::test]
+async fn reloading_a_crl_revokes_a_client_in_place() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pki = mint_crl_pki("reload");
+    let crl_active = Arc::new(AtomicBool::new(false));
+    let (addr, reloader) = start_reloadable_mtls_node(&pki, crl_active.clone()).await;
+
+    // Before the CRL is active, the to-be-revoked cert connects normally.
+    let revoked = test_connector(&pki.ca, Some((&pki.revoked_cert, &pki.revoked_key)));
+    let mut c = Client::connect(tls_connect(addr, &revoked).await.unwrap(), "pre").await;
+    c.subscribe("ok/#").await;
+    drop(c);
+
+    // Activate the CRL and reload in place.
+    crl_active.store(true, Ordering::SeqCst);
+    assert!(reloader.reload(), "the CRL reload should apply");
+
+    // The same cert is now rejected on a fresh handshake...
+    assert_no_session(addr, &revoked).await;
+    // ...while a non-revoked cert from the same CA still connects.
+    let valid = test_connector(&pki.ca, Some((&pki.valid_cert, &pki.valid_key)));
+    let mut ok = Client::connect(tls_connect(addr, &valid).await.unwrap(), "post").await;
+    ok.subscribe("ok/#").await;
+}

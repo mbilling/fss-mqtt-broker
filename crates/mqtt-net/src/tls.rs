@@ -9,7 +9,7 @@
 
 use crate::NetError;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::path::Path;
@@ -44,8 +44,29 @@ pub fn server_acceptor(
     key: &Path,
     client_ca: Option<&Path>,
 ) -> Result<TlsAcceptor, NetError> {
-    Ok(TlsAcceptor::from(Arc::new(server_config(
-        cert_chain, key, client_ca,
+    server_acceptor_with_crl(cert_chain, key, client_ca, None)
+}
+
+/// Like [`server_acceptor`], but also feeds a **certificate revocation list** into the mTLS
+/// client-cert verifier (ADR 0002 T8 / 0032 §5). A client presenting a certificate listed in
+/// `crl` is rejected at the TLS handshake — before any MQTT bytes are read. Built on the same
+/// reloadable acceptor seam (ADR 0032), so a renewed CRL is served on the next handshake when
+/// re-read on `SIGHUP`.
+///
+/// `crl` is only meaningful with `client_ca` (mTLS): a CRL without client-certificate auth is a
+/// configuration error and fails loudly rather than being silently ignored.
+///
+/// # Errors
+/// [`NetError::Tls`] on the same conditions as [`server_acceptor`], plus an unreadable/empty
+/// CRL file, or a CRL supplied without `client_ca`.
+pub fn server_acceptor_with_crl(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+) -> Result<TlsAcceptor, NetError> {
+    Ok(TlsAcceptor::from(Arc::new(server_config_with_crl(
+        cert_chain, key, client_ca, crl,
     )?)))
 }
 
@@ -61,23 +82,59 @@ pub fn server_config(
     key: &Path,
     client_ca: Option<&Path>,
 ) -> Result<ServerConfig, NetError> {
+    server_config_with_crl(cert_chain, key, client_ca, None)
+}
+
+/// Build the rustls [`ServerConfig`] with an optional **certificate revocation list** fed into
+/// the mTLS client-cert verifier (ADR 0002 T8). See [`server_acceptor_with_crl`] for the
+/// posture; this is the shared builder so the QUIC listener (ADR 0036) can revoke client certs
+/// through the very same path.
+///
+/// Revocation is checked **end-entity only** (the presented client leaf): the operational use
+/// is revoking a compromised client credential, and end-entity-only checking does not require
+/// a CRL for every issuer in the chain. Unknown revocation status for the leaf is an **error**
+/// (rustls' default) — a deny-by-default broker treats "cannot determine" as "reject".
+///
+/// # Errors
+/// [`NetError::Tls`] on the same conditions as [`server_config`], plus an unreadable/empty CRL
+/// file, or a CRL supplied without `client_ca` (a meaningless, likely-mistaken configuration).
+pub fn server_config_with_crl(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+) -> Result<ServerConfig, NetError> {
+    // A CRL is only meaningful with mTLS; reject the meaningless (likely-mistaken) combination
+    // up front rather than silently ignoring it.
+    if client_ca.is_none() && crl.is_some() {
+        return Err(NetError::Tls(
+            "a CRL (MQTTD_TLS_CRL) requires client-certificate auth (set MQTTD_TLS_CLIENT_CA)"
+                .to_string(),
+        ));
+    }
     let certs = load_certs(cert_chain)?;
     let key = load_key(key)?;
     let builder = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(TLS_VERSIONS)
         .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?;
-    let config = match client_ca {
-        Some(ca) => {
-            let roots = load_roots(ca)?;
-            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
-                .build()
-                .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
-            builder.with_client_cert_verifier(verifier)
+    let configured = if let Some(ca) = client_ca {
+        let roots = load_roots(ca)?;
+        let mut verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider());
+        if let Some(crl_path) = crl {
+            verifier = verifier
+                .with_crls(load_crls(crl_path)?)
+                .only_check_end_entity_revocation();
         }
-        None => builder.with_no_client_auth(),
-    }
-    .with_single_cert(certs, key)
-    .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
+        let verifier = verifier
+            .build()
+            .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+    let config = configured
+        .with_single_cert(certs, key)
+        .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
     Ok(config)
 }
 
@@ -160,6 +217,20 @@ pub fn private_key_der(path: &Path) -> Result<Vec<u8>, NetError> {
     Ok(load_key(path)?.secret_der().to_vec())
 }
 
+fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, NetError> {
+    let crls: Vec<_> = CertificateRevocationListDer::pem_file_iter(path)
+        .map_err(|e| tls_err("CRL file", path, &e))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| tls_err("CRL PEM", path, &e))?;
+    if crls.is_empty() {
+        return Err(NetError::Tls(format!(
+            "no CRLs found in {}",
+            path.display()
+        )));
+    }
+    Ok(crls)
+}
+
 fn load_roots(path: &Path) -> Result<RootCertStore, NetError> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(path)? {
@@ -226,6 +297,26 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("mqtt-net-tls-empty-{}", std::process::id()));
         std::fs::write(&empty, "").unwrap();
         assert!(server_acceptor(&cert, &key, Some(&empty)).is_err());
+    }
+
+    #[test]
+    fn a_crl_without_client_auth_is_rejected() {
+        // A CRL only makes sense with mTLS; supplying one without a client CA is a likely
+        // misconfiguration and must fail loudly, not be silently ignored (ADR 0002 T8).
+        let (_ca, cert, key) = mint_pki("crl-no-ca");
+        let bogus_crl = PathBuf::from("/nonexistent/crl.pem");
+        assert!(super::server_acceptor_with_crl(&cert, &key, None, Some(&bogus_crl)).is_err());
+    }
+
+    #[test]
+    fn an_empty_or_missing_crl_file_is_rejected() {
+        // An empty CRL bundle must fail rather than silently disabling revocation checking.
+        let (ca, cert, key) = mint_pki("crl-empty");
+        let missing = PathBuf::from("/nonexistent/crl.pem");
+        assert!(super::server_acceptor_with_crl(&cert, &key, Some(&ca), Some(&missing)).is_err());
+        let empty = std::env::temp_dir().join(format!("mqtt-net-crl-empty-{}", std::process::id()));
+        std::fs::write(&empty, "").unwrap();
+        assert!(super::server_acceptor_with_crl(&cert, &key, Some(&ca), Some(&empty)).is_err());
     }
 
     #[test]

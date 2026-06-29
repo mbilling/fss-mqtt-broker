@@ -9,7 +9,7 @@
 | ADR | Title | Decision | Tasks | Open / deferred |
 |-----|-------|----------|-------|-----------------|
 | [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [10/11 done](0001-session-durability.md) | 1 deferred |
-| [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [8/10 done](0002-transport-security.md) | 2 deferred |
+| [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [10/10 done](0002-transport-security.md) | — |
 | [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
 | [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [8/11 done](0004-identity-and-authentication.md) | 3 deferred |
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [3/6 done](0005-session-affinity.md) | 3 deferred |
@@ -50,11 +50,6 @@
 **0001 — Session durability in a horizontally-scalable cluster**
 
 - `0001-T11` 💤 deferred: Client-facing reconnect during promotion + spec-legal QoS-1 redelivery bounds (takeover hardening) — takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass
-
-**0002 — Transport security: TLS 1.3 everywhere, mTLS on the cluster bus**
-
-- `0002-T8` 💤 deferred: CRL / OCSP stapling — no revocation checking in tree (rg crl|ocsp|revocation -> none); pairs with hot-reloadable policy, Capability Plan §3
-- `0002-T9` 💤 deferred: Certificate rotation / hot-reload without dropping connections — TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 
@@ -119,7 +114,7 @@
 
 **0032 — Hot-reloadable security policy**
 
-- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — enabled by the T1/T6 reloadable verifier; tracked separately to avoid bundling a client-facing change with the consensus bus and the larger revocation surface (CRL parsing/distribution, OCSP).
+- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum."
 
 **0033 — Filesystem-watch auto-reload of the security policy**
 
