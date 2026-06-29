@@ -29,6 +29,10 @@
 //!   and replicated log on-disk, so sessions survive a full-cluster restart (the
 //!   recommended production setup). With durable opted out, it stores single-node
 //!   sessions in `<dir>/sessions.redb` (restart-safe, not replicated). Unset → in-memory.
+//! - `MQTTD_FAILURE_DOMAINS` — failure-domain topology (ADR 0016 T4): `node-id=domain`
+//!   pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`) so the bounded lease-voter set is spread
+//!   across racks/zones and one domain's loss cannot take quorum. **Must be cluster-uniform.**
+//!   Unset → no spread (id-ordered voter selection, as before).
 //! - `MQTTD_TLS_BIND`       — TLS client listener bind, e.g. `0.0.0.0:8883`
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
@@ -587,6 +591,37 @@ fn lease_voters() -> Result<usize, Box<dyn std::error::Error>> {
     }
 }
 
+/// The failure-domain topology from `MQTTD_FAILURE_DOMAINS` (ADR 0016 T4): a comma-separated
+/// list of `node-id=domain` pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`) mapping each cluster
+/// node to its rack/zone label, so the bounded lease-voter set is spread across domains and one
+/// domain's loss cannot take quorum. **Must be cluster-uniform** — every node needs the same map
+/// so each successive leader's reconciler computes the same voter target. Empty/unset disables
+/// the spread (every node is its own singleton domain — the prior id-ordered selection). A
+/// malformed entry is a startup error, not a silent skip — a deny-by-default broker does not
+/// quietly ignore a misconfigured security/availability control.
+fn failure_domains(
+) -> Result<std::collections::BTreeMap<NodeId, String>, Box<dyn std::error::Error>> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(raw) = non_empty_env("MQTTD_FAILURE_DOMAINS") else {
+        return Ok(map);
+    };
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (node, domain) = entry.split_once('=').ok_or_else(|| {
+            format!("MQTTD_FAILURE_DOMAINS entry {entry:?} is not `node-id=domain`")
+        })?;
+        let (node, domain) = (node.trim(), domain.trim());
+        if node.is_empty() || domain.is_empty() {
+            return Err(format!("MQTTD_FAILURE_DOMAINS entry {entry:?} has an empty side").into());
+        }
+        map.insert(NodeId(node.to_string()), domain.to_string());
+    }
+    Ok(map)
+}
+
 async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
@@ -613,10 +648,13 @@ async fn start_hub(
         // rest join as learners that still receive the lease log. Default 5 (recommend
         // odd); decouples consensus cost from cluster size.
         let voter_cap = lease_voters()?;
+        // Failure-domain topology (ADR 0016 T4): spread the bounded voter set across racks/zones.
+        let domains = failure_domains()?;
         info!(
             founder,
             persistent = data_dir.is_some(),
             voter_cap,
+            failure_domains = domains.len(),
             "DURABLE sessions enabled: consensus-backed replicated store"
         );
         let (store, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
@@ -624,6 +662,7 @@ async fn start_hub(
             placement.clone(),
             founder,
             voter_cap,
+            &domains,
             data_dir.as_deref().map(Path::new),
             None, // no commit-latency fault injection in production (ADR 0026)
         )

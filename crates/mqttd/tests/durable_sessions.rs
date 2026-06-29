@@ -128,6 +128,7 @@ async fn start_durable_node_capped(
         placement.clone(),
         can_bootstrap,
         voter_cap,
+        &std::collections::BTreeMap::new(),
         None,
         commit_delay,
     )

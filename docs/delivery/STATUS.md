@@ -23,7 +23,7 @@
 | [0013](../adr/0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [8/9 done](0013-enhanced-authentication.md) | 1 deferred |
 | [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [6/9 done](0014-cross-node-retained.md) | 3 deferred |
 | [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [8/8 done](0015-cluster-shared-subscriptions.md) | — |
-| [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [3/4 done](0016-swim-membership-stability.md) | 1 open |
+| [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [4/5 done](0016-swim-membership-stability.md) | 1 deferred |
 | [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
 | [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [7/8 done](0018-on-disk-persistence.md) | 1 deferred |
 | [0019](../adr/0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [7/9 done](0019-graceful-shutdown.md) | 2 deferred |
@@ -83,7 +83,7 @@
 
 **0016 — SWIM membership stability (dead-node fencing + false-positive resistance)**
 
-- `0016-T4` ⬜ planned: Failure-domain-aware voter selection (interaction with ADR 0021) — "Unblocked — ADR 0021 (bounded lease-consensus voter set) is now done (9/9), so the voter-selection seam it introduced exists. Next step: spread voters across failure domains (rack/zone) rather than selecting purely by id hash, so a single domain loss cannot take quorum. No domain-topology input or domain-aware selection logic in tree yet."
+- `0016-T5` 💤 deferred: Follow-on — gossip a node's own failure-domain label so the topology auto-propagates (no cluster-uniform static map) — "T4 ships the domain-aware selection with a static, cluster-uniform MQTTD_FAILURE_DOMAINS map (every node configured with the same node-id=domain table). A nicer operational model has each node advertise only its own MQTTD_FAILURE_DOMAIN, propagated via the authenticated SWIM gossip payload (the carrier placement is already built from) or the mTLS peer Hello, so the topology assembles itself and tracks membership. Deferred to keep T4 off the anti-replay-sensitive gossip wire format (ADR 0023); the selection algorithm is unchanged when the source is swapped (decide_with_domains takes any domain map)."
 
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 

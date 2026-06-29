@@ -25,7 +25,7 @@ use crate::cluster_store::{GroupRoutedLog, LocalLeaseSource};
 use crate::durable_plane::DurablePlane;
 use crate::lease_assign::LeaseAssigner;
 use crate::lease_group::{config as lease_config, LeaseRaft};
-use crate::lease_membership::{apply_action, raft_view, MembershipReconciler};
+use crate::lease_membership::{apply_action, raft_view, FailureDomain, MembershipReconciler};
 use crate::lease_raft::RaftNodeId;
 use crate::lease_store::LeaseStore;
 use crate::node_registry::raft_id;
@@ -37,7 +37,7 @@ use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::SessionStore;
 use openraft::storage::Adaptor;
 use openraft::Raft;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -87,11 +87,13 @@ async fn open_retrying<T, E: std::fmt::Display>(
 ///
 /// # Panics
 /// Panics if the lease `Raft` fails to start (a programming/config error at boot).
+#[allow(clippy::too_many_arguments)]
 pub async fn build_durable_node(
     node_id: NodeId,
     placement: Arc<RwLock<Placement>>,
     can_bootstrap: bool,
     voter_cap: usize,
+    failure_domains: &BTreeMap<NodeId, FailureDomain>,
     data_dir: Option<&std::path::Path>,
     commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> (
@@ -164,6 +166,13 @@ pub async fn build_durable_node(
     // The handle is returned so the caller can stop the driver on shutdown (otherwise
     // the loop outlives `raft`, spinning against a shut-down consensus handle) and so a
     // restart can release the on-disk lease/replica locks (ADR 0018 phase 5).
+    // Re-key the operator-supplied failure-domain topology by raft id (ADR 0016 T4). It must
+    // be cluster-uniform so every successive leader's reconciler computes the same target; a
+    // node absent from the map is its own singleton domain (no spread constraint).
+    let domains: BTreeMap<RaftNodeId, FailureDomain> = failure_domains
+        .iter()
+        .map(|(node, dom)| (raft_id(node), dom.clone()))
+        .collect();
     let driver = tokio::spawn(run_driver(
         raft,
         network,
@@ -172,6 +181,7 @@ pub async fn build_durable_node(
         placement.clone(),
         MembershipReconciler::new(local, can_bootstrap, voter_cap),
         LeaseAssigner::new(placement),
+        domains,
     ));
 
     (store, plane, driver)
@@ -202,6 +212,7 @@ fn admit_desired(
 
 /// The lease-group control loop: on each tick, reconcile the voter set toward the
 /// live membership and (as leader) keep each group's lease on its placement owner.
+#[allow(clippy::too_many_arguments)]
 async fn run_driver(
     raft: LeaseRaft,
     network: MeshRaftNetwork,
@@ -210,6 +221,7 @@ async fn run_driver(
     placement: Arc<RwLock<Placement>>,
     reconciler: MembershipReconciler,
     assigner: LeaseAssigner,
+    domains: BTreeMap<RaftNodeId, FailureDomain>,
 ) {
     // A one-tick debounce: only act once the desired set is stable across a tick, so
     // a flapping member does not churn the voter set.
@@ -228,7 +240,7 @@ async fn run_driver(
         let desired = admit_desired(&members, local, &view.voters, |id| network.is_connected(id));
 
         if desired == prev_desired {
-            let action = reconciler.decide(&view, &desired);
+            let action = reconciler.decide_with_domains(&view, &desired, &domains);
             if let Err(e) = apply_action(&raft, &action).await {
                 warn!(error = %e, "lease-group membership reconcile failed");
             }
@@ -250,6 +262,7 @@ mod tests {
     use crate::NodeId;
     use mqtt_core::{ClientId, Message, QoS};
     use mqtt_storage::SessionStore;
+    use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
@@ -304,7 +317,7 @@ mod tests {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
         let (store, _plane, _driver) =
-            build_durable_node(node, placement, true, 5, None, None).await;
+            build_durable_node(node, placement, true, 5, &BTreeMap::new(), None, None).await;
 
         let client = ClientId("c".to_string());
         let msg = Message::new(
@@ -366,8 +379,16 @@ mod tests {
 
         // --- lifetime #1: bootstrap on disk, become writable ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, plane, driver) =
-            build_durable_node(node.clone(), placement, true, 5, Some(dir.path()), None).await;
+        let (store, plane, driver) = build_durable_node(
+            node.clone(),
+            placement,
+            true,
+            5,
+            &BTreeMap::new(),
+            Some(dir.path()),
+            None,
+        )
+        .await;
         wait_writable(&store, &client, &msg).await;
 
         // --- teardown: release the on-disk locks (the part ADR 0019 unblocks) ---
@@ -382,8 +403,16 @@ mod tests {
 
         // --- lifetime #2: a fresh node over the SAME directory recovers and re-leads ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, plane, driver) =
-            build_durable_node(node, placement, true, 5, Some(dir.path()), None).await;
+        let (store, plane, driver) = build_durable_node(
+            node,
+            placement,
+            true,
+            5,
+            &BTreeMap::new(),
+            Some(dir.path()),
+            None,
+        )
+        .await;
         // Becoming writable again proves the persisted lease store reopened (no
         // "Database already open" lock, no double-init panic) and the node re-led.
         wait_writable(&store, &client, &msg).await;
