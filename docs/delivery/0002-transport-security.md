@@ -40,12 +40,14 @@ tasks:
     evidence: swim_auth.rs HMAC-SHA256 seal/open; keyed_cluster_ignores_nodes_without_the_key (realized by ADR 0003)
   - id: 0002-T8
     title: CRL / OCSP stapling
-    status: deferred
-    notes: no revocation checking in tree (rg crl|ocsp|revocation -> none); pairs with hot-reloadable policy, Capability Plan §3
+    status: done
+    date: 2026-06-29
+    evidence: "CRL revocation delivered. mqtt-net::tls::server_config_with_crl feeds an optional CRL PEM into the mTLS WebPkiClientVerifier (with_crls + only_check_end_entity_revocation; unknown leaf revocation status is an error — deny-by-default). MQTTD_TLS_CRL wires it into the client listener through the ADR 0032 reloadable acceptor, so a freshly-published CRL takes effect on the next handshake with no restart. Tests: tls.rs unit (CRL-without-client-auth and empty/missing CRL rejected); tests/tls.rs crl_rejects_a_revoked_client_certificate (revoked leaf gets no session; a non-revoked leaf from the same CA connects), without_a_crl_the_same_certificate_is_accepted (isolates the cause), reloading_a_crl_revokes_a_client_in_place (revocation applied via reload, no restart). OCSP stapling intentionally not pursued: stapling attests a *server's* cert to clients, whereas the broker's revocation need is rejecting compromised *client* certs on the mTLS path — which the CRL covers; stapling can be added later if a deployment needs server-cert status delivered to clients."
   - id: 0002-T9
     title: Certificate rotation / hot-reload without dropping connections
-    status: deferred
-    notes: TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work
+    status: done
+    date: 2026-06-29
+    evidence: "Delivered by the hot-reloadable security policy (ADR 0032). The client-listener TLS acceptor lives behind a reload::Reloader watch channel and is read per accept; SIGHUP rebuilds it from the renewed cert/key/client-CA (and CRL) via attach_tls, served on the next handshake while in-flight TLS sessions are undisturbed. Proven by tests/reload_tls.rs renewed_cert_is_served_on_the_next_handshake (two-CA swap; the in-flight session keeps flowing) and malformed_cert_reload_is_rejected_and_keeps_serving (validate-before-swap)."
   - id: 0002-T10
     title: WebSocket-over-TLS listener
     status: done
@@ -88,13 +90,22 @@ tests, and the dashboard.
 | 0002-T5 | ✅ done | 2026-06-11 | peer.rs PeerTls{acceptor,connector}; publish_routes_across_mtls_peer_links; plaintext_peer_is_rejected_by_mtls_listener |
 | 0002-T6 | ✅ done | 2026-06-22 | peer.rs CN-vs-Hello-id check; cert_cn_mismatch_with_hello_node_id_is_rejected (realized by ADR 0004) |
 | 0002-T7 | ✅ done | 2026-06-11 | swim_auth.rs HMAC-SHA256 seal/open; keyed_cluster_ignores_nodes_without_the_key (realized by ADR 0003) |
-| 0002-T8 | 💤 deferred | — | no revocation checking in tree (rg crl|ocsp|revocation -> none); pairs with hot-reloadable policy, Capability Plan §3 |
-| 0002-T9 | 💤 deferred | — | TLS contexts built once at startup; no reload path exists; unblocks with hot-reloadable policy work |
+| 0002-T8 | ✅ done | 2026-06-29 | "CRL revocation delivered. mqtt-net::tls::server_config_with_crl feeds an optional CRL PEM into the mTLS WebPkiClientVerifier (with_crls + only_check_end_entity_revocation; unknown leaf revocation status is an error — deny-by-default). MQTTD_TLS_CRL wires it into the client listener through the ADR 0032 reloadable acceptor, so a freshly-published CRL takes effect on the next handshake with no restart. Tests: tls.rs unit (CRL-without-client-auth and empty/missing CRL rejected); tests/tls.rs crl_rejects_a_revoked_client_certificate (revoked leaf gets no session; a non-revoked leaf from the same CA connects), without_a_crl_the_same_certificate_is_accepted (isolates the cause), reloading_a_crl_revokes_a_client_in_place (revocation applied via reload, no restart). OCSP stapling intentionally not pursued: stapling attests a *server's* cert to clients, whereas the broker's revocation need is rejecting compromised *client* certs on the mTLS path — which the CRL covers; stapling can be added later if a deployment needs server-cert status delivered to clients." |
+| 0002-T9 | ✅ done | 2026-06-29 | "Delivered by the hot-reloadable security policy (ADR 0032). The client-listener TLS acceptor lives behind a reload::Reloader watch channel and is read per accept; SIGHUP rebuilds it from the renewed cert/key/client-CA (and CRL) via attach_tls, served on the next handshake while in-flight TLS sessions are undisturbed. Proven by tests/reload_tls.rs renewed_cert_is_served_on_the_next_handshake (two-CA swap; the in-flight session keeps flowing) and malformed_cert_reload_is_rejected_and_keeps_serving (validate-before-swap)." |
 | 0002-T10 | ✅ done | 2026-06-29 | "Delivered with the native WebSocket transport (ADR 0035). main.rs serve_wss_clients (gated on MQTTD_WSS_BIND) terminates TLS first with the reloadable ADR 0002 acceptor — so the mTLS client-cert CN identity is extracted exactly as for a TCP TLS client (ADR 0004) — then runs the WebSocket handshake over the TLS stream; a SIGHUP cert reload is picked up on the next handshake. tests/ws.rs wss_mtls_pubsub_roundtrip proves a pub/sub round-trip over wss:// with mutual TLS." |
 <!-- /status-table:0002 -->
 
 ## Changelog
 
+- **2026-06-29** — T8 (revocation) and T9 (cert rotation) landed/reconciled. **T8**: CRL
+  revocation added — `server_config_with_crl` feeds a CRL into the mTLS verifier, wired via
+  `MQTTD_TLS_CRL` through the ADR 0032 reloadable acceptor (so a published CRL applies on the
+  next handshake, no restart); revoked client certs are refused at the handshake. OCSP stapling
+  is intentionally out of scope (it attests *server* certs to clients; the broker's need is
+  rejecting compromised *client* certs, which the CRL covers). **T9**: cert rotation without
+  dropping connections was already delivered by ADR 0032 (the reloadable acceptor +
+  `reload_tls.rs`), but this ADR's frontmatter still read "no reload path exists"; status
+  corrected.
 - **2026-06-29** — T10 (WebSocket-over-TLS) reconciled to **done**: it was delivered by the
   native WebSocket transport (ADR 0035) — `serve_wss_clients` (TLS-first via the reloadable
   acceptor, then the WS upgrade, mTLS CN as identity), proven by `wss_mtls_pubsub_roundtrip` —

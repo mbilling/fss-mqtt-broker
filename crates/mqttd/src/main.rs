@@ -33,6 +33,9 @@
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
 //!   certificate it issued (mTLS)
+//! - `MQTTD_TLS_CRL`        — PEM certificate revocation list (requires
+//!   `MQTTD_TLS_CLIENT_CA`); a client whose cert is listed is refused at the TLS
+//!   handshake. Re-read on `SIGHUP`, so a published CRL applies without a restart
 //! - `MQTTD_ACL_FILE`       — TOML topic-ACL policy (deny by default); without
 //!   it authorization is not enforced and loudly logged
 //! - `MQTTD_PLAINTEXT_BIND` — insecure client listener bind, e.g. `127.0.0.1:1883`
@@ -286,18 +289,25 @@ async fn start_client_listeners(
             );
         };
         let client_ca = non_empty_env("MQTTD_TLS_CLIENT_CA");
-        let acceptor = tls::server_acceptor(
+        // Optional certificate revocation list (ADR 0002 T8): a client whose cert is listed is
+        // rejected at the TLS handshake. Reloadable on SIGHUP via the same closure below, so a
+        // freshly-published CRL takes effect on the next handshake with no restart (ADR 0032 §5).
+        let crl = non_empty_env("MQTTD_TLS_CRL");
+        let acceptor = tls::server_acceptor_with_crl(
             Path::new(&cert),
             Path::new(&key),
             client_ca.as_deref().map(Path::new),
+            crl.as_deref().map(Path::new),
         )?;
         // Register the acceptor for SIGHUP reload (ADR 0032 T6): the closure re-reads the
-        // same paths so a renewed cert/key/client-CA is served on the next handshake.
+        // same paths so a renewed cert/key/client-CA — and an updated CRL — is served on the
+        // next handshake.
         Some(reloader.attach_tls(acceptor, move || {
-            tls::server_acceptor(
+            tls::server_acceptor_with_crl(
                 Path::new(&cert),
                 Path::new(&key),
                 client_ca.as_deref().map(Path::new),
+                crl.as_deref().map(Path::new),
             )
             .map_err(|e| e.to_string())
         }))
