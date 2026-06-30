@@ -62,21 +62,33 @@ pub struct Opened<'a> {
 }
 
 /// Seals and opens SWIM datagrams: always a cluster-shared-key HMAC (ADR 0003), and — when
-/// a signer/verifier is configured — an additional per-node signature layer (ADR 0022).
+/// a signer/verifier is configured — an additional per-node signature layer (ADR 0022) and an
+/// anti-replay sequence (ADR 0023).
+///
+/// A node speaks **exactly one** wire posture, and accepts **only that posture** on the wire
+/// (strict). The posture is a function of the configured layers:
+///
+/// - shared-key only (`signer` unset) → **v1** `[1][tag][payload]`;
+/// - signed (`signer` set, `sequenced` false) → **v2** `[2][tag][cert][sig][payload]`;
+/// - signed + sequenced (`signer` set, `sequenced` true) → **v3** `[3][tag][seq][cert][sig][payload]`.
+///
+/// There is no cross-posture acceptance: a uniformly-configured cluster never sends a node a
+/// datagram of a different posture, so anything but its own format is rejected. (The
+/// per-node rollout coexistence the wire versions originally carried was removed before any
+/// release — see ADR 0022/0023.)
 pub struct SwimAuth {
     /// Shared HMAC keys: `keys[0]` is the primary (used to seal), and any further keys are
     /// additional keys an incoming datagram may have been sealed with — the dual-key window
     /// that rotates the gossip key without downtime (ADR 0003).
     keys: Vec<hmac::Key>,
-    /// When set, outgoing datagrams are signed (v2).
+    /// When set, this node signs outgoing datagrams (v2/v3) and **requires** a verified
+    /// signature on every incoming one — an unsigned (v1) datagram is rejected.
     signer: Option<Arc<dyn GossipSign>>,
-    /// When set, an incoming v2 datagram's signature is verified and its identity returned.
+    /// Verifies the inline certificate + signature on an incoming signed datagram.
     verifier: Option<Arc<dyn GossipVerify>>,
-    /// When true, an unsigned (v1) datagram is rejected — the strict signed end state.
-    require_signed: bool,
-    /// When true, anything that is not signed *and* sequenced (v3) is rejected — the strict
-    /// anti-replay end state (ADR 0023). Implies `require_signed`.
-    require_sequenced: bool,
+    /// When true (implies `signer` is set), this node is in the anti-replay posture: it
+    /// sequences its outgoing datagrams (v3) and accepts **only** v3 (ADR 0023).
+    sequenced: bool,
 }
 
 impl std::fmt::Debug for SwimAuth {
@@ -84,8 +96,7 @@ impl std::fmt::Debug for SwimAuth {
         // Never expose key material, even via Debug.
         f.debug_struct("SwimAuth")
             .field("signed", &self.signer.is_some())
-            .field("require_signed", &self.require_signed)
-            .field("require_sequenced", &self.require_sequenced)
+            .field("sequenced", &self.sequenced)
             .finish_non_exhaustive()
     }
 }
@@ -98,8 +109,7 @@ impl SwimAuth {
             keys: vec![hmac::Key::new(hmac::HMAC_SHA256, key)],
             signer: None,
             verifier: None,
-            require_signed: false,
-            require_sequenced: false,
+            sequenced: false,
         }
     }
 
@@ -139,40 +149,36 @@ impl SwimAuth {
         Ok(Self::new(&key))
     }
 
-    /// Add the per-node signature layer (ADR 0022): sign outgoing datagrams, and verify the
-    /// signature on incoming ones. `require_signed` rejects unsigned (v1) datagrams — the
-    /// strict mode; `false` keeps accepting v1 for a node-by-node rollout.
+    /// Add the per-node signature layer (ADR 0022): sign outgoing datagrams (v2), and require a
+    /// verified signature on every incoming one — an unsigned (v1) datagram is rejected.
     #[must_use]
     pub fn with_signing(
         mut self,
         signer: Arc<dyn GossipSign>,
         verifier: Arc<dyn GossipVerify>,
-        require_signed: bool,
     ) -> Self {
         self.signer = Some(signer);
         self.verifier = Some(verifier);
-        self.require_signed = require_signed;
         self
     }
 
-    /// Add the anti-replay layer (ADR 0023): incoming datagrams must be signed *and* carry a
-    /// fresh sequence (the receiver windows them); `require_sequenced` rejects anything that
-    /// is not v3 (the strict end state), while `false` keeps accepting v1/v2 during rollout.
-    /// Outgoing v3 datagrams are produced by [`seal_sequenced`](Self::seal_sequenced); the
-    /// driver supplies the monotonic sequence. Sequencing implies signing, so call after
-    /// [`with_signing`](Self::with_signing).
+    /// Add the anti-replay layer (ADR 0023): sequence outgoing datagrams (v3) and require a
+    /// fresh sequence on every incoming one (the receiver windows them) — anything that is not
+    /// v3 is rejected. Outgoing v3 datagrams are produced by
+    /// [`seal_sequenced`](Self::seal_sequenced); the driver supplies the monotonic sequence.
+    /// Sequencing implies signing, so call after [`with_signing`](Self::with_signing).
     #[must_use]
-    pub fn with_sequencing(mut self, require_sequenced: bool) -> Self {
-        self.require_sequenced = require_sequenced;
+    pub fn with_sequencing(mut self) -> Self {
+        self.sequenced = true;
         self
     }
 
-    /// Whether incoming datagrams must be signed + sequenced (v3) — i.e. the receiver windows
-    /// every accepted datagram. The driver consults this to decide whether to sequence its
-    /// own outgoing datagrams.
+    /// Whether this node is in the signed + sequenced (v3) posture — i.e. it windows every
+    /// accepted datagram. The driver consults this to decide whether to sequence its own
+    /// outgoing datagrams.
     #[must_use]
     pub fn sequenced(&self) -> bool {
-        self.require_sequenced
+        self.sequenced
     }
 
     /// Wrap a serialized SWIM message for the wire. With a signer, produces a v2 (signed)
@@ -237,10 +243,11 @@ impl SwimAuth {
         out
     }
 
-    /// Verify a received datagram and return its payload (plus authenticated identity for a
-    /// signed datagram), or `None` if it is malformed, the wrong version, or fails any
-    /// check. The shared-key HMAC is always required; the signature is required when
-    /// `require_signed`, and verified whenever a verifier is configured.
+    /// Verify a received datagram and return its payload (plus authenticated identity and
+    /// sequence for a signed datagram), or `None` if it is malformed or not **this node's own
+    /// posture**. The shared-key HMAC is always required first; then the datagram's version
+    /// must match the configured posture exactly — a v1 node accepts only v1, a signed node
+    /// only v2, a sequenced node only v3 (no cross-posture acceptance; ADR 0022/0023).
     #[must_use]
     pub fn open<'a>(&self, datagram: &'a [u8]) -> Option<Opened<'a>> {
         if datagram.len() < 1 + TAG_LEN {
@@ -255,59 +262,34 @@ impl SwimAuth {
         }
 
         match version {
-            VERSION_V1 => {
-                // Unsigned/un-sequenced: only acceptable when neither is required.
-                if self.require_signed || self.require_sequenced {
-                    return None;
-                }
-                Some(Opened {
-                    payload: body,
-                    identity: None,
-                    seq: None,
-                })
-            }
-            VERSION_V2 => {
-                // Signed but un-sequenced: rejected when we require sequencing.
-                if self.require_sequenced {
-                    return None;
-                }
-                let (cert, sig, payload) = parse_v2(body)?;
-                Some(self.verify_signed(cert, sig, payload, None)?)
-            }
-            VERSION_V3 => {
-                let (seq, cert, sig, payload) = parse_v3(body)?;
-                Some(self.verify_signed(cert, sig, payload, Some(seq))?)
-            }
-            _ => None,
-        }
-    }
-
-    /// Verify a signed body's certificate + signature and bind the authenticated identity,
-    /// carrying `seq` through. With no verifier (signatures off) the HMAC already
-    /// authenticated the datagram as cluster-internal: accept the payload, but expose neither
-    /// an identity nor the sequence (it cannot be safely windowed without an authenticated
-    /// sender).
-    fn verify_signed<'a>(
-        &self,
-        cert: &[u8],
-        sig: &[u8],
-        payload: &'a [u8],
-        seq: Option<u64>,
-    ) -> Option<Opened<'a>> {
-        match &self.verifier {
-            Some(v) => {
-                let cn = v.verify(cert, payload, sig)?;
-                Some(Opened {
-                    payload,
-                    identity: Some(cn),
-                    seq,
-                })
-            }
-            None => Some(Opened {
-                payload,
+            // Shared-key-only posture: accept v1 only.
+            VERSION_V1 if self.signer.is_none() => Some(Opened {
+                payload: body,
                 identity: None,
                 seq: None,
             }),
+            // Signed posture: accept v2 only (verify the signature, bind the identity).
+            VERSION_V2 if self.signer.is_some() && !self.sequenced => {
+                let (cert, sig, payload) = parse_v2(body)?;
+                let cn = self.verifier.as_ref()?.verify(cert, payload, sig)?;
+                Some(Opened {
+                    payload,
+                    identity: Some(cn),
+                    seq: None,
+                })
+            }
+            // Signed + sequenced posture: accept v3 only (verify + carry the windowed sequence).
+            VERSION_V3 if self.sequenced => {
+                let (seq, cert, sig, payload) = parse_v3(body)?;
+                let cn = self.verifier.as_ref()?.verify(cert, payload, sig)?;
+                Some(Opened {
+                    payload,
+                    identity: Some(cn),
+                    seq: Some(seq),
+                })
+            }
+            // Any other (version, posture) pair is a foreign format — rejected.
+            _ => None,
         }
     }
 }
@@ -385,8 +367,9 @@ mod tests {
         }
     }
 
-    /// A signing auth (v2) keyed `byte`, claiming CN `cn`, optionally requiring signatures.
-    fn signing_auth(byte: u8, cn: &str, require: bool) -> SwimAuth {
+    /// A signing auth (v2 posture) keyed `byte`, claiming CN `cn`. Signed posture is now always
+    /// strict (it rejects unsigned v1), so there is no longer a leniency parameter.
+    fn signing_auth(byte: u8, cn: &str) -> SwimAuth {
         let cert = format!("cert-of-{cn}").into_bytes();
         SwimAuth::new(&[byte; KEY_LEN]).with_signing(
             Arc::new(FakeSigner { cert: cert.clone() }),
@@ -394,7 +377,6 @@ mod tests {
                 cert,
                 cn: cn.to_string(),
             }),
-            require,
         )
     }
 
@@ -500,7 +482,7 @@ mod tests {
         // radix or formatting (the two booleans are configuration, not secret).
         assert_eq!(
             format!("{:?}", auth(0x42)),
-            "SwimAuth { signed: false, require_signed: false, require_sequenced: false, .. }"
+            "SwimAuth { signed: false, sequenced: false, .. }"
         );
     }
 
@@ -508,7 +490,7 @@ mod tests {
 
     #[test]
     fn signed_seal_open_roundtrips_and_returns_the_identity() {
-        let a = signing_auth(7, "node-a", false);
+        let a = signing_auth(7, "node-a");
         let sealed = a.seal(b"membership update");
         assert_eq!(sealed[0], VERSION_V2);
         let opened = a.open(&sealed).expect("opens");
@@ -520,7 +502,7 @@ mod tests {
     /// certificate, signature, and payload in that order.
     #[test]
     fn v2_body_framing_is_pinned() {
-        let a = signing_auth(7, "node-a", false);
+        let a = signing_auth(7, "node-a");
         let sealed = a.seal(b"PAYLOAD");
         assert_eq!(sealed[0], VERSION_V2);
         let body = &sealed[1 + TAG_LEN..];
@@ -531,34 +513,26 @@ mod tests {
     }
 
     #[test]
-    fn require_signed_rejects_an_unsigned_v1_datagram() {
-        // Same key, but the v1 sender does not sign.
+    fn a_signed_node_rejects_an_unsigned_v1_datagram() {
+        // The signed posture is strict: a v1 (shared-key-only) datagram on the same key is
+        // rejected, not accepted — there is no rollout leniency.
         let v1 = auth(7).seal(b"unsigned");
-        let strict = signing_auth(7, "node-a", true);
-        assert!(strict.open(&v1).is_none(), "strict mode must reject v1");
-    }
-
-    #[test]
-    fn prefer_mode_still_accepts_a_v1_datagram_during_rollout() {
-        let v1 = auth(7).seal(b"unsigned");
-        let lenient = signing_auth(7, "node-a", false);
-        let opened = lenient.open(&v1).expect("prefer mode accepts v1");
-        assert_eq!(opened.payload, b"unsigned");
-        assert_eq!(opened.identity, None);
+        let signed = signing_auth(7, "node-a");
+        assert!(signed.open(&v1).is_none(), "a signed node must reject v1");
     }
 
     #[test]
     fn a_signature_that_fails_verification_is_rejected() {
         // Seal as node-a, but open with a verifier expecting node-b's cert: verify() → None.
-        let sender = signing_auth(7, "node-a", false);
+        let sender = signing_auth(7, "node-a");
         let sealed = sender.seal(b"msg");
-        let receiver = signing_auth(7, "node-b", true); // expects cert-of-node-b
+        let receiver = signing_auth(7, "node-b"); // expects cert-of-node-b
         assert!(receiver.open(&sealed).is_none());
     }
 
     #[test]
     fn tampering_any_v2_byte_is_rejected_by_the_hmac() {
-        let a = signing_auth(7, "node-a", false);
+        let a = signing_auth(7, "node-a");
         let sealed = a.seal(b"payload");
         for i in 0..sealed.len() {
             let mut t = sealed.clone();
@@ -568,14 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn an_off_mode_node_interoperates_with_a_signed_datagram() {
-        // A node with no verifier (ADR 0003 behaviour) still accepts a v2 datagram from a
-        // signing peer on the same key — it just cannot authenticate the identity.
-        let signed = signing_auth(7, "node-a", false).seal(b"hello");
+    fn a_shared_key_node_rejects_a_signed_datagram() {
+        // Strict posture, the other direction: an off (v1) node rejects a v2 datagram even on
+        // the same key — a uniform cluster never mixes postures, so a foreign format is dropped.
+        let signed = signing_auth(7, "node-a").seal(b"hello");
         let off = auth(7);
-        let opened = off.open(&signed).expect("off mode opens v2 via the HMAC");
-        assert_eq!(opened.payload, b"hello");
-        assert_eq!(opened.identity, None);
+        assert!(off.open(&signed).is_none(), "a v1 node must reject v2");
     }
 
     // --- ADR 0003: dual-key rotation window ---
@@ -631,8 +603,8 @@ mod tests {
     fn a_signed_v2_datagram_sealed_with_a_secondary_key_opens() {
         // The rotation window covers signed datagrams too: the HMAC tries the ring, then
         // the (key-independent) signature is verified.
-        let sealed = signing_auth(0xBB, "node-a", false).seal(b"signed-roll");
-        let receiver = signing_auth(0xAA, "node-a", true).accept_also(&[0xBB; KEY_LEN]);
+        let sealed = signing_auth(0xBB, "node-a").seal(b"signed-roll");
+        let receiver = signing_auth(0xAA, "node-a").accept_also(&[0xBB; KEY_LEN]);
         let opened = receiver.open(&sealed).expect("opens");
         assert_eq!(opened.payload, b"signed-roll");
         assert_eq!(opened.identity.as_deref(), Some("node-a"));
@@ -642,7 +614,7 @@ mod tests {
 
     #[test]
     fn sequenced_seal_open_roundtrips_with_seq_and_identity() {
-        let a = signing_auth(7, "node-a", false).with_sequencing(true);
+        let a = signing_auth(7, "node-a").with_sequencing();
         let sealed = a.seal_sequenced(b"update", 42);
         assert_eq!(sealed[0], VERSION_V3);
         let opened = a.open(&sealed).expect("opens");
@@ -653,7 +625,7 @@ mod tests {
 
     #[test]
     fn v3_body_framing_is_pinned() {
-        let a = signing_auth(7, "node-a", false);
+        let a = signing_auth(7, "node-a");
         let sealed = a.seal_sequenced(b"PAYLOAD", 7);
         assert_eq!(sealed[0], VERSION_V3);
         let body = &sealed[1 + TAG_LEN..];
@@ -665,27 +637,23 @@ mod tests {
     }
 
     #[test]
-    fn require_sequenced_rejects_v1_and_v2_but_accepts_v3() {
-        let strict = signing_auth(7, "node-a", true).with_sequencing(true);
+    fn a_sequenced_node_rejects_v1_and_v2_but_accepts_v3() {
+        // The sequenced posture is strict: it accepts only v3, rejecting both a v1 and a v2
+        // datagram on the same key.
+        let sequenced = signing_auth(7, "node-a").with_sequencing();
         let v1 = auth(7).seal(b"x");
-        let v2 = signing_auth(7, "node-a", false).seal(b"x");
-        assert!(
-            strict.open(&v1).is_none(),
-            "v1 rejected under require_sequenced"
-        );
-        assert!(
-            strict.open(&v2).is_none(),
-            "v2 rejected under require_sequenced"
-        );
-        let v3 = signing_auth(7, "node-a", false)
-            .with_sequencing(true)
+        let v2 = signing_auth(7, "node-a").seal(b"x");
+        assert!(sequenced.open(&v1).is_none(), "a sequenced node rejects v1");
+        assert!(sequenced.open(&v2).is_none(), "a sequenced node rejects v2");
+        let v3 = signing_auth(7, "node-a")
+            .with_sequencing()
             .seal_sequenced(b"x", 1);
-        assert_eq!(strict.open(&v3).expect("opens").seq, Some(1));
+        assert_eq!(sequenced.open(&v3).expect("opens").seq, Some(1));
     }
 
     #[test]
     fn tampering_any_v3_byte_is_rejected_by_the_hmac() {
-        let a = signing_auth(7, "node-a", false).with_sequencing(true);
+        let a = signing_auth(7, "node-a").with_sequencing();
         let sealed = a.seal_sequenced(b"payload", 9);
         for i in 0..sealed.len() {
             let mut t = sealed.clone();
@@ -695,16 +663,16 @@ mod tests {
     }
 
     #[test]
-    fn an_off_mode_node_opens_v3_without_seq_or_identity() {
-        // A node with no verifier accepts a v3 datagram via the HMAC, but exposes neither the
-        // identity nor the sequence (it cannot window an unauthenticated sender).
-        let v3 = signing_auth(7, "node-a", false)
-            .with_sequencing(true)
+    fn a_non_sequenced_node_rejects_a_v3_datagram() {
+        // Strict posture: a v2 (signed-only) node rejects a v3 datagram, and an off (v1) node
+        // does too — only a sequenced node accepts v3.
+        let v3 = signing_auth(7, "node-a")
+            .with_sequencing()
             .seal_sequenced(b"hello", 5);
-        let off = auth(7);
-        let opened = off.open(&v3).expect("off mode opens v3 via the HMAC");
-        assert_eq!(opened.payload, b"hello");
-        assert_eq!(opened.identity, None);
-        assert_eq!(opened.seq, None);
+        assert!(
+            signing_auth(7, "node-a").open(&v3).is_none(),
+            "a signed-only node rejects v3"
+        );
+        assert!(auth(7).open(&v3).is_none(), "a shared-key node rejects v3");
     }
 }

@@ -62,14 +62,17 @@ A replay window keyed by an **unauthenticated** `from` is itself a denial of ser
 node signature**, and the window is keyed by the certificate-verified Common Name. Without
 X's private key an attacker cannot advance X's window.
 
-### 4. Wire format v3, additive, with a rollout mode
+### 4. Wire format v3, strict posture
 
 `[VERSION=3][HMAC tag][seq u64][cert_len][cert][sig_len][sig][payload]`, the tag covering
-everything after it. v1 (ADR 0003) and v2 (ADR 0022) remain understood. Selected by
-`MQTTD_SWIM_REPLAY` = `require` (emit v3, reject anything without a valid fresh sequence) /
-`prefer` (emit v3, still accept v2/v1 during rollout) / `off`. `require` implies signed
-`require` and needs a writable `MQTTD_DATA_DIR` for the persisted counter; absent either it
-is a **startup error**, not a silent downgrade.
+everything after it. v1 (ADR 0003) and v2 (ADR 0022) remain understood as distinct
+postures. Selected by `MQTTD_SWIM_REPLAY` = `require` (emit v3, reject anything without a
+valid fresh sequence) / `off`. The posture is **strict**: a `require` node accepts only v3.
+`require` implies signed `require` and needs a writable `MQTTD_DATA_DIR` for the persisted
+counter; absent either it is a **startup error**, not a silent downgrade. (A transitional
+`prefer` mode — emit v3 but still accept v2/v1 during a node-by-node rollout — existed
+earlier but was **removed before any production release**: the mainline was never deployed,
+so no zero-downtime upgrade path was ever needed.)
 
 ### 5. Failure modes, by construction
 
@@ -88,7 +91,8 @@ is a **startup error**, not a silent downgrade.
   with ADR 0022 to make a forged *or* replayed membership claim equally impossible.
 - **Cost:** a persisted per-node counter (one fsync per reserved block — negligible at
   gossip volume) requiring a data dir; per-sender receiver state (a few bytes); +8 bytes
-  per datagram plus the v2 signature overhead; a node-by-node rollout via the mode flag.
+  per datagram plus the v2 signature overhead; the posture is a uniform deployment-time
+  choice (no per-node rollout coexistence).
 - **Risk:** correctness-critical security and distributed code. Built **test-first**: the
   sliding window and the block allocator are pure and exhaustively unit-tested (including
   restart-resumes-above-last-block and out-of-order/duplicate sequences); the wire format is

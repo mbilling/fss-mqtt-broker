@@ -51,13 +51,10 @@ impl GossipVerify for StubVerifier {
     }
 }
 
-/// A signing `SwimAuth` (require mode) for node `cn`, on the shared key `key`.
+/// A signing `SwimAuth` (the strict signed posture) for node `cn`, on the shared key `key`.
 fn signed_auth(key: u8, cn: &str) -> SwimAuth {
-    SwimAuth::new(&[key; KEY_LEN]).with_signing(
-        Arc::new(StubSigner::new(cn)),
-        Arc::new(StubVerifier),
-        true,
-    )
+    SwimAuth::new(&[key; KEY_LEN])
+        .with_signing(Arc::new(StubSigner::new(cn)), Arc::new(StubVerifier))
 }
 
 /// An in-memory `SeqStore` for tests (anti-replay needs no real persistence here).
@@ -144,7 +141,7 @@ async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, No
 /// Spawn a node that signs **and sequences** its gossip (ADR 0023, require mode), with an
 /// in-memory sequence allocator — so the driver windows inbound sequenced datagrams.
 async fn spawn_sequenced_node(id: &str, seeds: Vec<String>, key: u8) -> (String, Node) {
-    let auth = signed_auth(key, id).with_sequencing(true);
+    let auth = signed_auth(key, id).with_sequencing();
     let alloc = SequenceAllocator::open(Box::new(MemSeqStore::default()) as Box<dyn SeqStore>, 64);
     spawn_node_inner(id, seeds, Some(auth), Some(alloc), std::future::pending()).await
 }
@@ -488,7 +485,7 @@ async fn sequenced_nodes_converge() {
 async fn a_replayed_v3_datagram_is_dropped() {
     let key = 0x66;
     let (victim_addr, victim) = spawn_sequenced_node("victim", vec![], key).await;
-    let sender = signed_auth(key, "sender").with_sequencing(true);
+    let sender = signed_auth(key, "sender").with_sequencing();
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     let ping = Message {
@@ -500,7 +497,9 @@ async fn a_replayed_v3_datagram_is_dropped() {
     };
     // One datagram at anti-replay sequence 1.
     let datagram = sender.seal_sequenced(&bincode::serialize(&ping).unwrap(), 1);
-    let opener = signed_auth(key, "x"); // its verifier opens the victim's v3 replies
+    // A sequenced (v3) opener: under strict postures only a v3 node opens the victim's v3
+    // replies (its own CN is irrelevant — the stub verifier recovers the signer's CN).
+    let opener = signed_auth(key, "x").with_sequencing();
     let mut buf = vec![0u8; 64 * 1024];
 
     // Deliver the fresh Ping and wait for the victim's Ack. The Ack is the causal
