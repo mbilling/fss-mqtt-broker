@@ -70,16 +70,16 @@
 //!   by staging the new key here cluster-wide, promoting it to `MQTTD_SWIM_KEY`,
 //!   then dropping the old one. Requires `MQTTD_SWIM_KEY`.
 //! - `MQTTD_SWIM_SIGNED`    — per-node gossip signatures (ADR 0022): `require`
-//!   (sign + reject unsigned), `prefer` (sign + still accept unsigned, for rollout),
-//!   or `off`. Defaults to `prefer` when both `MQTTD_SWIM_KEY` and the peer-TLS
-//!   material are present, else `off`. `require`/`prefer` need both; otherwise a
-//!   startup error. Signs with the cluster-bus leaf key, verified against the CA.
+//!   (sign + reject unsigned) or `off`. Defaults to `require` when both
+//!   `MQTTD_SWIM_KEY` and the peer-TLS material are present, else `off`. `require`
+//!   needs both; otherwise a startup error. Signs with the cluster-bus leaf key,
+//!   verified against the CA. A signed node accepts only signed gossip — each
+//!   posture is strict (no mixed-version coexistence).
 //! - `MQTTD_SWIM_REPLAY`    — gossip anti-replay (ADR 0023): `require` (sequence +
-//!   reject un-sequenced), `prefer` (sequence + still accept un-sequenced, for rollout),
-//!   or `off` (default). Needs `MQTTD_SWIM_SIGNED` (the sequence binds to the per-node
-//!   signature) and `MQTTD_DATA_DIR` (a restart-safe, clock-free sequence counter persists
-//!   in `<dir>/gossip-seq`); `require` needs `MQTTD_SWIM_SIGNED=require`. Otherwise a
-//!   startup error.
+//!   reject un-sequenced) or `off` (default). Needs `MQTTD_SWIM_SIGNED=require`
+//!   (the sequence binds to the per-node signature) and `MQTTD_DATA_DIR` (a
+//!   restart-safe, clock-free sequence counter persists in `<dir>/gossip-seq`).
+//!   Otherwise a startup error. A sequenced node accepts only sequenced gossip.
 //! - `MQTTD_HEALTH_BIND`    — HTTP health-probe bind for orchestrators, e.g.
 //!   `0.0.0.0:8080`; serves `GET /livez` (hub responsive), `GET /readyz`
 //!   (mesh + durable-store ready), and `GET /metrics` (Prometheus, ADR 0020).
@@ -930,34 +930,32 @@ impl mqtt_cluster::swim_auth::GossipVerify for CaGossipVerifier {
     }
 }
 
-/// Signed-gossip posture (ADR 0022), from `MQTTD_SWIM_SIGNED`.
+/// Signed-gossip posture (ADR 0022), from `MQTTD_SWIM_SIGNED`. A strict on/off choice: a
+/// signed node signs outgoing gossip and accepts only signed gossip (no mixed-version
+/// coexistence — the pre-release rollout `prefer` mode was removed).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SignedGossip {
     /// Shared-key MAC only (ADR 0003).
     Off,
-    /// Sign outgoing and verify signatures, but still accept unsigned v1 (rollout).
-    Prefer,
-    /// Sign outgoing and reject any unsigned v1 datagram (strict end state).
+    /// Sign outgoing and reject any unsigned v1 datagram.
     Require,
 }
 
-/// Resolve the signed-gossip mode. Defaults to `Prefer` when both the shared key and the
-/// cluster-bus TLS material are present (the security win, with a safe rollout), else `Off`.
+/// Resolve the signed-gossip mode. Defaults to `Require` when both the shared key and the
+/// cluster-bus TLS material are present (the security win), else `Off`.
 fn signed_gossip_from_env(
     has_tls: bool,
     has_key: bool,
 ) -> Result<SignedGossip, Box<dyn std::error::Error>> {
     Ok(match non_empty_env("MQTTD_SWIM_SIGNED").as_deref() {
         Some("require") => SignedGossip::Require,
-        Some("prefer") => SignedGossip::Prefer,
         Some("off") => SignedGossip::Off,
         Some(other) => {
-            return Err(format!(
-                "MQTTD_SWIM_SIGNED must be one of require|prefer|off (got {other:?})"
-            )
-            .into());
+            return Err(
+                format!("MQTTD_SWIM_SIGNED must be one of require|off (got {other:?})").into(),
+            );
         }
-        None if has_tls && has_key => SignedGossip::Prefer,
+        None if has_tls && has_key => SignedGossip::Require,
         None => SignedGossip::Off,
     })
 }
@@ -994,15 +992,8 @@ fn apply_signed_gossip(
     let verifier = Arc::new(CaGossipVerifier {
         ca_der: tls.ca_der.clone(),
     });
-    let require = mode == SignedGossip::Require;
-    if mode == SignedGossip::Prefer {
-        warn!(
-            "SWIM gossip signing is in PREFER mode (transitional): unsigned v1 datagrams \
-             are still accepted for rollout — set MQTTD_SWIM_SIGNED=require once every node signs"
-        );
-    }
-    info!(require, "SWIM gossip is SIGNED per-node (ADR 0022)");
-    Ok(Some(base.with_signing(signer, verifier, require)))
+    info!("SWIM gossip is SIGNED per-node (ADR 0022)");
+    Ok(Some(base.with_signing(signer, verifier)))
 }
 
 /// How many gossip sequence numbers to reserve per fsync (ADR 0023). At gossip's
@@ -1052,11 +1043,12 @@ impl mqtt_cluster::replay::SeqStore for FileSeqStore {
     }
 }
 
-/// Anti-replay posture (ADR 0023), from `MQTTD_SWIM_REPLAY`.
+/// Anti-replay posture (ADR 0023), from `MQTTD_SWIM_REPLAY`. A strict on/off choice: a
+/// sequenced node sequences outgoing gossip and accepts only sequenced gossip (the
+/// pre-release rollout `prefer` mode was removed).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayMode {
     Off,
-    Prefer,
     Require,
 }
 
@@ -1071,13 +1063,11 @@ fn apply_anti_replay(
 ) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
     let mode = match non_empty_env("MQTTD_SWIM_REPLAY").as_deref() {
         Some("require") => ReplayMode::Require,
-        Some("prefer") => ReplayMode::Prefer,
         Some("off") | None => ReplayMode::Off,
         Some(other) => {
-            return Err(format!(
-                "MQTTD_SWIM_REPLAY must be one of require|prefer|off (got {other:?})"
-            )
-            .into());
+            return Err(
+                format!("MQTTD_SWIM_REPLAY must be one of require|off (got {other:?})").into(),
+            );
         }
     };
     if mode == ReplayMode::Off {
@@ -1088,13 +1078,10 @@ fn apply_anti_replay(
     };
     if signed == SignedGossip::Off {
         return Err(
-            "MQTTD_SWIM_REPLAY requires MQTTD_SWIM_SIGNED: anti-replay binds the \
+            "MQTTD_SWIM_REPLAY requires MQTTD_SWIM_SIGNED=require: anti-replay binds the \
                     sequence to the per-node signature"
                 .into(),
         );
-    }
-    if mode == ReplayMode::Require && signed != SignedGossip::Require {
-        return Err("MQTTD_SWIM_REPLAY=require needs MQTTD_SWIM_SIGNED=require".into());
     }
     let Some(dir) = non_empty_env("MQTTD_DATA_DIR") else {
         return Err(
@@ -1108,15 +1095,8 @@ fn apply_anti_replay(
         Box::new(store) as Box<dyn mqtt_cluster::replay::SeqStore>,
         SEQ_BLOCK,
     );
-    let require = mode == ReplayMode::Require;
-    if mode == ReplayMode::Prefer {
-        warn!(
-            "SWIM gossip anti-replay is in PREFER mode (transitional): un-sequenced datagrams \
-             are still accepted for rollout — set MQTTD_SWIM_REPLAY=require once every node sequences"
-        );
-    }
-    info!(require, "SWIM gossip anti-replay enabled (ADR 0023)");
-    Ok((Some(auth.with_sequencing(require)), Some(alloc)))
+    info!("SWIM gossip anti-replay enabled (ADR 0023)");
+    Ok((Some(auth.with_sequencing()), Some(alloc)))
 }
 
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and

@@ -65,7 +65,7 @@ cluster" to "impersonate one node."
 The HMAC covers everything after the tag (`cert_len … payload`), so tampering with the
 cert, signature, or payload also fails the HMAC. The signature covers `payload`. ADR 0003's
 v1 (`[VERSION=1][tag][payload]`) remains a valid wire format for clusters without mTLS
-material and during rollout.
+material; a `require` node, however, accepts only v2 (each posture is strict — see §4).
 
 ### 3. Reuse the cluster PKI; supported key types
 
@@ -77,21 +77,26 @@ broker's own certificates are ECDSA P-256 (the `rcgen` default); the implementat
 fails closed with a clear error on an unsupported key type. The pure `swim` state machine
 stays crypto-free; signing/verifying live at the I/O boundary, like the ADR 0003 MAC.
 
-### 4. Rollout mode
+### 4. Posture (strict)
 
 Selected by `MQTTD_SWIM_SIGNED`:
 
 - **`require`** — outgoing gossip is signed and incoming gossip **must** carry a valid
-  signature (v1 datagrams are rejected). The secure end state; requires every node to have
-  cluster-bus TLS material.
-- **`prefer`** (transitional) — sign outgoing; verify a signature when present, but still
-  accept valid v1 (shared-key-only) datagrams. Lets a cluster roll from ADR 0003 to signed
-  gossip node-by-node without an availability gap. Loudly logged as transitional.
+  signature (v1 datagrams are rejected). Requires every node to have cluster-bus TLS
+  material.
 - **`off`** — ADR 0003 behaviour (shared-key MAC only).
+
+Each posture is **strict**: a `require` node emits and accepts only v2, an `off` node only
+v1. There is no mixed-version coexistence — a node accepts only its own wire format. (A
+transitional `prefer` mode — sign outgoing but still accept v1 during a node-by-node
+rollout — existed earlier but was **removed before any production release**, since the
+mainline was never deployed and so never needed a zero-downtime upgrade path. The cluster's
+posture is now a single, uniform deployment-time choice.)
 
 `require` needs `MQTTD_PEER_TLS_{CA,CERT,KEY}`; absent them it is a startup error rather
 than a silent downgrade. The standing rule holds: any weaker-than-strict posture is
-explicit and loudly logged.
+explicit and loudly logged. It also defaults to `require` when both the shared key and the
+cluster-bus TLS material are present.
 
 ## Consequences
 
