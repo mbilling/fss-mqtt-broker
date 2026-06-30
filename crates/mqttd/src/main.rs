@@ -48,6 +48,10 @@
 //! - `MQTTD_PASSWORD_FILE`  — Argon2id `username:phc-hash` file (ADR 0004 step 6)
 //! - `MQTTD_JWT_HS256_SECRET` / `MQTTD_JWT_RS256_PEM` — JWT verification key;
 //!   optional `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` constraints
+//! - `MQTTD_CONFIG_WATCH`   — opt-in filesystem auto-reload (ADR 0033): poll interval in
+//!   seconds; when a configured policy file (ACL, password, JWT PEM, TLS cert/key/CA/CRL)
+//!   changes on disk, reload through the same fail-safe routine as `SIGHUP` (no restart).
+//!   Unset/`0` = disabled (signal-only, the default). For declarative/Kubernetes-ConfigMap use
 //! - `MQTTD_PEER_BIND`      — inter-node listener bind, e.g. `127.0.0.1:7001`
 //! - `MQTTD_PEER_TLS_CA` / `MQTTD_PEER_TLS_CERT` / `MQTTD_PEER_TLS_KEY` —
 //!   cluster-bus mTLS material (set all three); without them peer links are
@@ -106,7 +110,7 @@ use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::persistent_log::PersistentLog;
 use mqtt_storage::persistent_retained::PersistentRetainedStore;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
-use mqttd::{cluster, conn, hub, peer, reload};
+use mqttd::{cluster, config_watch, conn, hub, peer, reload};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -245,9 +249,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // branch registers its acceptor with the reloader so SIGHUP also rotates cert/key/CA.
     start_client_listeners(hub_tx, policy, &mut reloader, &shutdown, &connections).await?;
 
+    // Share the (now fully-configured) reloader between the SIGHUP handler and the optional
+    // filesystem watcher; both drive the same validate-before-swap routine.
+    let reloader = std::sync::Arc::new(reloader);
+
     // SIGHUP reloads the security policy (ACL + authenticator + TLS material) in place
     // (ADR 0032) — no restart, no dropped connections; a bad file keeps the running policy.
-    spawn_reload_handler(reloader);
+    spawn_reload_handler(reloader.clone());
+
+    // Optional filesystem watcher (ADR 0033): MQTTD_CONFIG_WATCH=<seconds> auto-reloads when a
+    // configured policy file changes on disk (the Kubernetes ConfigMap case), through the same
+    // fail-safe reload. Off by default — signal-driven reload stays the default.
+    spawn_config_watcher(reloader, &shutdown)?;
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
     graceful_shutdown(
@@ -474,7 +487,7 @@ fn authorizer_from_env() -> Result<Arc<dyn Authorizer>, Box<dyn std::error::Erro
 /// Install the SIGHUP handler that drives [`reload::Reloader::reload`] for the process
 /// lifetime (ADR 0032). Non-Unix has no SIGHUP, so reload is unavailable there (logged).
 #[cfg(unix)]
-fn spawn_reload_handler(reloader: reload::Reloader) {
+fn spawn_reload_handler(reloader: std::sync::Arc<reload::Reloader>) {
     use tokio::signal::unix::{signal, SignalKind};
     tokio::spawn(async move {
         let mut hup = match signal(SignalKind::hangup()) {
@@ -486,14 +499,73 @@ fn spawn_reload_handler(reloader: reload::Reloader) {
         };
         while hup.recv().await.is_some() {
             info!("SIGHUP received — reloading security policy");
-            reloader.reload();
+            reloader.reload("signal");
         }
     });
 }
 
 #[cfg(not(unix))]
-fn spawn_reload_handler(_reloader: reload::Reloader) {
+fn spawn_reload_handler(_reloader: std::sync::Arc<reload::Reloader>) {
     warn!("security policy reload (SIGHUP) is unavailable on this platform");
+}
+
+/// The configured policy file paths the reload closures read — the set the filesystem watcher
+/// stats (ADR 0033 T1). Only file-backed material: the JWT HS256 secret is an inline env value,
+/// not a file, so it is not watchable. A path is included only when its env var is set.
+fn watched_policy_paths() -> Vec<std::path::PathBuf> {
+    [
+        "MQTTD_ACL_FILE",
+        "MQTTD_PASSWORD_FILE",
+        "MQTTD_JWT_RS256_PEM",
+        "MQTTD_TLS_CERT",
+        "MQTTD_TLS_KEY",
+        "MQTTD_TLS_CLIENT_CA",
+        "MQTTD_TLS_CRL",
+    ]
+    .iter()
+    .filter_map(|var| non_empty_env(var))
+    .map(std::path::PathBuf::from)
+    .collect()
+}
+
+/// Spawn the opt-in filesystem watcher (ADR 0033) when `MQTTD_CONFIG_WATCH=<seconds>` is set
+/// (unset / `0` = disabled, the signal-only default). Polls the configured policy files and
+/// auto-reloads through the same fail-safe routine as `SIGHUP`.
+///
+/// # Errors
+/// Returns an error if `MQTTD_CONFIG_WATCH` is set but not a non-negative integer.
+fn spawn_config_watcher(
+    reloader: std::sync::Arc<reload::Reloader>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(raw) = non_empty_env("MQTTD_CONFIG_WATCH") else {
+        return Ok(());
+    };
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| format!("MQTTD_CONFIG_WATCH must be a number of seconds (got {raw:?})"))?;
+    if secs == 0 {
+        return Ok(()); // explicitly disabled
+    }
+    let paths = watched_policy_paths();
+    if paths.is_empty() {
+        warn!(
+            "MQTTD_CONFIG_WATCH is set but no watchable policy files are configured — watcher idle"
+        );
+        return Ok(());
+    }
+    info!(
+        interval_secs = secs,
+        files = paths.len(),
+        "config-file watcher enabled (ADR 0033): auto-reload on change"
+    );
+    tokio::spawn(config_watch::watch(
+        reloader,
+        paths,
+        std::time::Duration::from_secs(secs),
+        shutdown.clone(),
+    ));
+    Ok(())
 }
 
 /// Build the CONNECT authenticator (ADR 0004 steps 2 + 6): a certificate /

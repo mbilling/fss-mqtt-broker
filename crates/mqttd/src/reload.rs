@@ -128,15 +128,19 @@ impl Reloader {
     /// first; publish them only if **every** build succeeded. On any failure nothing is
     /// swapped and the running policy is left untouched (never fail open, never brick). Every
     /// outcome is audited (`security.reload`) and metered. Returns whether the swap applied.
-    pub fn reload(&self) -> bool {
+    ///
+    /// `trigger` records *why* the reload fired — `"signal"` for `SIGHUP`, `"watch"` for the
+    /// filesystem watcher (ADR 0033) — carried into the audit event and the metric label so an
+    /// operator can tell a manual reload from an auto-applied one.
+    pub fn reload(&self, trigger: &str) -> bool {
         // Build everything up front; only an all-clean build is allowed to publish.
         let policy = (self.build)();
         let tls = self.tls_build.as_ref().map(|b| b());
         match (policy, tls) {
             // A configured TLS build failed: reject the whole reload, swap nothing.
-            (_, Some(Err(e))) => self.reject(&format!("tls: {e}")),
+            (_, Some(Err(e))) => self.reject(trigger, &format!("tls: {e}")),
             // The ACL/authenticator build failed: reject, swap nothing.
-            (Err(e), _) => self.reject(&e),
+            (Err(e), _) => self.reject(trigger, &e),
             // Everything built cleanly: publish atomically. The connection/accept loop reads
             // whichever it reaches first on its next check; all are mutually consistent.
             (Ok((authz, auth)), tls_ok) => {
@@ -145,10 +149,14 @@ impl Reloader {
                 if let (Some(tx), Some(Ok(acceptor))) = (&self.tls_tx, tls_ok) {
                     let _ = tx.send(acceptor);
                 }
-                info!("security policy reloaded: ACL + authenticator (+ TLS) swapped");
-                self.audit.record("security.reload", None, "ok");
+                info!(
+                    trigger,
+                    "security policy reloaded: ACL + authenticator (+ TLS) swapped"
+                );
+                self.audit
+                    .record("security.reload", None, &format!("ok (trigger={trigger})"));
                 if let Some(m) = &self.metrics {
-                    m.security_reload("ok");
+                    m.security_reload("ok", trigger);
                 }
                 true
             }
@@ -156,12 +164,15 @@ impl Reloader {
     }
 
     /// Record a rejected reload (audit + metric + log) and report it as not applied.
-    fn reject(&self, error: &str) -> bool {
-        warn!(%error, "security reload REJECTED — keeping the running policy");
-        self.audit
-            .record("security.reload", None, &format!("rejected: {error}"));
+    fn reject(&self, trigger: &str, error: &str) -> bool {
+        warn!(trigger, %error, "security reload REJECTED — keeping the running policy");
+        self.audit.record(
+            "security.reload",
+            None,
+            &format!("rejected (trigger={trigger}): {error}"),
+        );
         if let Some(m) = &self.metrics {
-            m.security_reload("rejected");
+            m.security_reload("rejected", trigger);
         }
         false
     }
@@ -202,7 +213,7 @@ mod tests {
             .borrow()
             .authorize_publish(&id(), &"t".to_string()));
 
-        assert!(reloader.reload(), "the reload should apply");
+        assert!(reloader.reload("signal"), "the reload should apply");
 
         // After reload: the live receiver now sees DenyAll.
         assert!(!handles
@@ -227,7 +238,7 @@ mod tests {
             Err("acl file: parse error at line 3".to_string())
         });
 
-        assert!(!reloader.reload(), "a failed build must not apply");
+        assert!(!reloader.reload("signal"), "a failed build must not apply");
         assert!(attempted.load(Ordering::SeqCst), "the build was attempted");
         // The running policy is still the permissive initial one — not swapped, not emptied.
         assert!(handles
@@ -263,16 +274,16 @@ mod tests {
                 }
             });
 
-        assert!(reloader.reload());
-        assert!(!reloader.reload());
+        assert!(reloader.reload("signal"));
+        assert!(!reloader.reload("signal"));
 
         let text = metrics.render();
         assert!(
-            text.contains("security_reloads_total{outcome=\"ok\"} 1"),
+            text.contains("security_reloads_total{outcome=\"ok\",trigger=\"signal\"} 1"),
             "a successful reload counts under outcome=ok:\n{text}"
         );
         assert!(
-            text.contains("security_reloads_total{outcome=\"rejected\"} 1"),
+            text.contains("security_reloads_total{outcome=\"rejected\",trigger=\"signal\"} 1"),
             "a rejected reload counts under outcome=rejected:\n{text}"
         );
     }

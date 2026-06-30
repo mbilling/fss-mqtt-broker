@@ -7,6 +7,7 @@
 pub mod aliases;
 pub mod clock;
 pub mod cluster;
+pub mod config_watch;
 pub mod conn;
 pub mod health;
 pub mod hub;

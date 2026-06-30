@@ -56,10 +56,12 @@ struct StateLabel {
     state: String,
 }
 
-/// `{outcome}` label — a bounded set for hot reloads: `ok`, `rejected`.
+/// `{outcome, trigger}` label for hot reloads — a bounded set: outcome `ok`/`rejected`,
+/// trigger `signal` (SIGHUP) / `watch` (filesystem auto-reload, ADR 0033).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OutcomeLabel {
     outcome: String,
+    trigger: String,
 }
 
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
@@ -308,7 +310,7 @@ impl Metrics {
         let security_reloads_total = register_family(
             &mut registry,
             "security_reloads",
-            "Hot reloads of the security policy, by outcome (ok, rejected)",
+            "Hot reloads of the security policy, by outcome (ok, rejected) and trigger (signal, watch)",
         );
         let quic_path_migrations_total = register_counter(
             &mut registry,
@@ -543,16 +545,23 @@ impl Metrics {
     }
 
     /// A hot reload of the security policy completed with `outcome` (`"ok"` for an applied
-    /// swap, `"rejected"` for a validate-before-swap failure that kept the running policy).
-    pub fn security_reload(&self, outcome: &str) {
+    /// swap, `"rejected"` for a validate-before-swap failure that kept the running policy),
+    /// fired by `trigger` (`"signal"` for SIGHUP, `"watch"` for the filesystem watcher,
+    /// ADR 0033).
+    pub fn security_reload(&self, outcome: &str, trigger: &str) {
         self.security_reloads_total
             .get_or_create(&OutcomeLabel {
                 outcome: outcome.to_string(),
+                trigger: trigger.to_string(),
             })
             .inc();
-        self.otel
-            .security_reloads
-            .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
+        self.otel.security_reloads.add(
+            1,
+            &[
+                KeyValue::new("outcome", outcome.to_string()),
+                KeyValue::new("trigger", trigger.to_string()),
+            ],
+        );
     }
 
     /// A QUIC connection migrated to a new client path (ADR 0036 §3b): the peer's remote address

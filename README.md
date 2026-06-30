@@ -229,6 +229,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_JWT_HS256_SECRET` / `MQTTD_JWT_RS256_PEM` | JWT verification key |
 | `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` | Optional JWT `iss`/`aud` constraints |
 | `MQTTD_ACL_FILE` | TOML topic-ACL policy (deny by default) |
+| `MQTTD_CONFIG_WATCH` | Opt-in filesystem auto-reload (ADR 0033): poll interval in **seconds**. When a configured policy file changes on disk, reload via the same validate-before-swap routine as `SIGHUP` (no restart) — the Kubernetes ConfigMap case. Unset/`0` = disabled (signal-only default) |
 
 ### Cluster transport & membership
 | Variable | Purpose |
@@ -283,9 +284,16 @@ The reload is **validate-before-swap and all-or-nothing**: every file is parsed 
 the swap is applied only if *all* succeed. A missing or unparseable file is **rejected** —
 the running policy is kept exactly as it was (the broker never fails open and never bricks
 itself on a typo). Every reload, success or rejection, emits a `security.reload` audit event
-and increments the `mqttd_security_reloads_total{outcome}` metric. To rotate paths (not just
-file contents) restart the broker. On non-Unix platforms `SIGHUP` is unavailable, so reload
-requires a restart. *(Peer-bus TLS reload is a tracked follow-on.)*
+and increments the `mqttd_security_reloads_total{outcome,trigger}` metric. To rotate paths (not
+just file contents) restart the broker.
+
+**Filesystem auto-reload (opt-in, ADR 0033).** For declarative/GitOps operation — a Kubernetes
+ConfigMap/Secret is updated **on disk** with no process signal — set `MQTTD_CONFIG_WATCH=<seconds>`
+to poll the configured policy files and reload automatically when one changes, through the **same**
+validate-before-swap routine (a partial write is rejected and retried until it parses cleanly, so
+no torn config is ever applied). It is **off by default**; `SIGHUP` stays the default trigger and
+both can run at once. The reload audit/metric carry a `trigger` of `signal` or `watch`. On non-Unix
+platforms (no `SIGHUP`) the watcher is the only reload mechanism.
 
 ### Metrics
 

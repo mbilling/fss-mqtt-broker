@@ -240,7 +240,10 @@ async fn tightening_acl_reload_denies_a_live_publisher() {
 
     // Tighten the file on disk and reload — the swap must reach the live connections.
     acl.write(TIGHTENED);
-    assert!(reloader.reload(), "a valid tightened ACL must apply");
+    assert!(
+        reloader.reload("signal"),
+        "a valid tightened ACL must apply"
+    );
 
     // The same already-connected publisher is now denied; nothing is delivered.
     publ.publish_qos1("room/a", 2, b"after").await;
@@ -273,7 +276,7 @@ async fn malformed_acl_reload_is_rejected_and_keeps_the_running_policy() {
     // Corrupt the file and reload — the build fails and the swap must be aborted.
     acl.write("this is not valid TOML [[[");
     assert!(
-        !reloader.reload(),
+        !reloader.reload("signal"),
         "a malformed ACL must be rejected, not applied"
     );
 
