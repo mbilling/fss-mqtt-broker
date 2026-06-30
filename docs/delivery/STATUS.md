@@ -40,7 +40,7 @@
 | [0030](../adr/0030-user-property-forwarding.md) | Forward MQTT 5 User Properties through delivery | Accepted | [5/5 done](0030-user-property-forwarding.md) | — |
 | [0031](../adr/0031-session-identity-binding.md) | Bind the session to the authenticated identity | Accepted | [6/6 done](0031-session-identity-binding.md) | — |
 | [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |
-| [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Proposed | [0/7 done](0033-config-file-watch-reload.md) | 6 open, 1 deferred |
+| [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Accepted | [6/7 done](0033-config-file-watch-reload.md) | 1 deferred |
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
@@ -109,12 +109,6 @@
 
 **0033 — Filesystem-watch auto-reload of the security policy**
 
-- `0033-T1` ⬜ planned: Expose the watched path set — the configured policy file paths (ACL, password, JWT PEM, TLS cert/key/CA) the binary built the reload closures from
-- `0033-T2` ⬜ planned: Stat-stamp poller task — tokio interval; stamp = (mtime, len, inode) per file; on any change call Reloader::reload(); record the last *applied* stamp so a rejected (partial/malformed) read is retried until it parses
-- `0033-T3` ⬜ planned: Opt-in wiring — MQTTD_CONFIG_WATCH=<seconds> enables it (unset/0 = disabled, signal-only default); spawn the poller; on non-unix it is the only reload trigger
-- `0033-T4` ⬜ planned: Trigger attribution — security.reload audit + security_reloads_total carry trigger=signal|watch
-- `0033-T5` ⬜ planned: Tests — a file edit auto-applies live (ACL tighten with no SIGHUP); a partial-then-whole write applies exactly once (retry-until-parse, never a torn apply); the watcher is inert when disabled
-- `0033-T6` ⬜ planned: Operator docs + README — MQTTD_CONFIG_WATCH, opt-in/off-by-default, the Kubernetes ConfigMap use case, polling latency, and that it shares the ADR 0032 validate-before-swap fail-safe
 - `0033-T7` 💤 deferred: Follow-on — optional notify-backed (inotify/FSEvents/kqueue) event-driven backend behind the same seam, if sub-second reaction is ever needed — polling covers the config-rollout use case with no new dependency; an event-driven backend is a latency optimisation that still needs the same retry-until-parse/debounce, so it is parked behind the watcher seam rather than bundled.
 
 **0034 — Foreign-client interop conformance testing**

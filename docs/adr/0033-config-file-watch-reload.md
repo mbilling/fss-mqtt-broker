@@ -1,6 +1,6 @@
 # ADR 0033 — Filesystem-watch auto-reload of the security policy
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-26
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0033-config-file-watch-reload.md](../delivery/0033-config-file-watch-reload.md) — plan, progress, and changelog

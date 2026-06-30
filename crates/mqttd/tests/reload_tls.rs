@@ -299,7 +299,10 @@ async fn renewed_cert_is_served_on_the_next_handshake() {
 
     // Renew the served material to cert-B and reload.
     live.install(&b);
-    assert!(reloader.reload(), "a valid renewed cert/key must apply");
+    assert!(
+        reloader.reload("signal"),
+        "a valid renewed cert/key must apply"
+    );
 
     // After the reload: cert-B is served. CA-B now validates; CA-A no longer does.
     assert!(
@@ -333,7 +336,7 @@ async fn malformed_cert_reload_is_rejected_and_keeps_serving() {
     // Corrupt the cert file and reload — the acceptor build must fail.
     std::fs::write(live.cert(), "-----BEGIN CERTIFICATE-----\ngarbage\n").unwrap();
     assert!(
-        !reloader.reload(),
+        !reloader.reload("signal"),
         "a malformed cert must be rejected, not applied"
     );
 

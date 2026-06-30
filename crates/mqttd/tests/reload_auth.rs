@@ -153,7 +153,7 @@ async fn rotated_password_file_reload_authenticates_the_new_credential() {
     // Rotate the password and reload.
     pw.write(&format!("alice:{}", hash("secret-two")));
     assert!(
-        reloader.reload(),
+        reloader.reload("signal"),
         "a valid rotated password file must apply"
     );
 
@@ -177,7 +177,7 @@ async fn malformed_password_file_reload_is_rejected_and_keeps_the_running_authen
     // A line with no ':' separator is a parse error.
     pw.write("this-line-has-no-separator");
     assert!(
-        !reloader.reload(),
+        !reloader.reload("signal"),
         "a malformed password file must be rejected, not applied"
     );
 

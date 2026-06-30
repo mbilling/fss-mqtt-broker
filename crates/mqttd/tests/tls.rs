@@ -893,7 +893,7 @@ async fn reloading_a_crl_revokes_a_client_in_place() {
 
     // Activate the CRL and reload in place.
     crl_active.store(true, Ordering::SeqCst);
-    assert!(reloader.reload(), "the CRL reload should apply");
+    assert!(reloader.reload("signal"), "the CRL reload should apply");
 
     // The same cert is now rejected on a fresh handshake...
     assert_no_session(addr, &revoked).await;
