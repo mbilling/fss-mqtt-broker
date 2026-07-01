@@ -43,6 +43,8 @@ pub struct MembershipEvent {
     pub peer_addr: String,
     /// Its new state.
     pub state: MemberState,
+    /// Its self-advertised failure-domain label (ADR 0016 T5); `None` if not yet learned.
+    pub domain: Option<String>,
 }
 
 /// Drive SWIM over `socket` until `shutdown` resolves.
@@ -180,12 +182,14 @@ async fn apply(
             addr,
             peer_addr,
             state,
+            domain,
         } => {
             let _ = events.send(MembershipEvent {
                 id,
                 addr,
                 peer_addr,
                 state,
+                domain,
             });
         }
     }

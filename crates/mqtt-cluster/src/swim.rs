@@ -121,6 +121,10 @@ pub struct Member {
     pub incarnation: Incarnation,
     /// Its current state in our view.
     pub state: MemberState,
+    /// Its self-advertised failure-domain label (rack/zone), learned from gossip
+    /// (ADR 0016 T5). `None` until the node advertises one; once learned it is not
+    /// erased by a claimant that never learned it (same rule as `peer_addr`).
+    pub failure_domain: Option<String>,
     /// Clock time (ms) when it entered `state`; drives the suspicion timeout.
     state_since: u64,
     /// When this member's `Dead` tombstone is pruned (ADR 0016 phase 1). `Some` iff
@@ -150,6 +154,11 @@ pub struct Update {
     /// of the same peer. `None` for `Alive`/`Dead` and for full-state relays.
     #[serde(default)]
     pub suspecter: Option<String>,
+    /// The subject node's self-advertised failure-domain label (ADR 0016 T5), carried
+    /// so the cluster topology auto-propagates without a static cluster-uniform map.
+    /// `None` when the claimant has not (yet) learned the subject's label.
+    #[serde(default)]
+    pub failure_domain: Option<String>,
 }
 
 /// The kind of a SWIM datagram.
@@ -192,6 +201,10 @@ pub struct Message {
     pub from_addr: String,
     /// Sender routing (peer-link) address, so first contact teaches it.
     pub from_peer_addr: String,
+    /// Sender's self-advertised failure-domain label (ADR 0016 T5), so first contact
+    /// teaches it directly — the same reason `from_peer_addr` rides here.
+    #[serde(default)]
+    pub from_domain: Option<String>,
     /// The message kind.
     pub kind: Kind,
     /// Piggybacked membership updates.
@@ -218,6 +231,10 @@ pub enum Action {
         peer_addr: String,
         /// Its new state.
         state: MemberState,
+        /// Its self-advertised failure-domain label (ADR 0016 T5); `None` if not yet
+        /// learned. Carried to the routing/placement layer so the domain map tracks
+        /// membership.
+        domain: Option<String>,
     },
 }
 
@@ -239,6 +256,9 @@ pub struct Swim {
     local_addr: String,
     /// This node's routing (peer-link) address, advertised via gossip.
     local_peer_addr: String,
+    /// This node's own failure-domain label (ADR 0016 T5), stamped onto every
+    /// self-update it emits so peers learn the cluster topology from gossip.
+    local_domain: Option<String>,
     incarnation: Incarnation,
     cfg: Config,
     members: BTreeMap<NodeId, Member>,
@@ -273,6 +293,7 @@ impl Swim {
         local: NodeId,
         local_addr: String,
         local_peer_addr: String,
+        local_domain: Option<String>,
         cfg: Config,
         seeds: Vec<String>,
     ) -> Self {
@@ -287,6 +308,7 @@ impl Swim {
             local,
             local_addr,
             local_peer_addr,
+            local_domain,
             incarnation: 1,
             cfg,
             members: BTreeMap::new(),
@@ -413,6 +435,7 @@ impl Swim {
             from: self.local.0.clone(),
             from_addr: self.local_addr.clone(),
             from_peer_addr: self.local_peer_addr.clone(),
+            from_domain: self.local_domain.clone(),
             kind,
             gossip: self.take_gossip(),
         }
@@ -422,6 +445,7 @@ impl Swim {
     ///
     /// Handles self-refutation: a `Suspect`/`Dead` claim about us at an incarnation
     /// `>=` ours triggers a bump-and-`Alive` to override it everywhere.
+    #[allow(clippy::too_many_lines)]
     fn apply_update(&mut self, u: &Update, now: u64, out: &mut Vec<Action>) {
         if u.id == self.local.0 {
             // Once we have announced a graceful leave we do not refute `Dead` about
@@ -435,6 +459,7 @@ impl Swim {
                     incarnation: self.incarnation,
                     state: MemberState::Alive,
                     suspecter: None,
+                    failure_domain: self.local_domain.clone(),
                 };
                 self.enqueue_gossip(refute);
                 // Having to refute ourselves signals we are the slow one (ADR 0016 §2).
@@ -477,6 +502,12 @@ impl Swim {
             if !u.peer_addr.is_empty() {
                 m.peer_addr.clone_from(&u.peer_addr);
             }
+            // Same rule for the failure-domain label (ADR 0016 T5): a relay that never
+            // learned the subject's label must not blank out one we already hold.
+            let domain_changed = u.failure_domain.is_some() && u.failure_domain != m.failure_domain;
+            if domain_changed {
+                m.failure_domain.clone_from(&u.failure_domain);
+            }
             // The `(incarnation, state)` identity changed: reset the suspecter set,
             // seeding it from this update if it is a fresh `Suspect` (ADR 0016 §3).
             if changed || inc_advanced {
@@ -495,11 +526,17 @@ impl Swim {
                 } else {
                     None
                 };
+            }
+            // Surface the change to the routing/placement layer when the state changed
+            // *or* only the failure-domain label did (ADR 0016 T5) — otherwise a label
+            // learned after the member is already known would never reach placement.
+            if changed || domain_changed {
                 out.push(Action::StateChange {
                     id: id.clone(),
                     addr: u.addr.clone(),
                     peer_addr: m.peer_addr.clone(),
-                    state: u.state,
+                    state: m.state,
+                    domain: m.failure_domain.clone(),
                 });
             }
         } else {
@@ -511,6 +548,7 @@ impl Swim {
                     peer_addr: u.peer_addr.clone(),
                     incarnation: u.incarnation,
                     state: u.state,
+                    failure_domain: u.failure_domain.clone(),
                     state_since: now,
                     tombstone_deadline: if u.state == MemberState::Dead {
                         Some(now + self.cfg.dead_ttl_ms)
@@ -532,6 +570,7 @@ impl Swim {
                 addr: u.addr.clone(),
                 peer_addr: u.peer_addr.clone(),
                 state: u.state,
+                domain: u.failure_domain.clone(),
             });
         }
         self.enqueue_gossip(u.clone());
@@ -555,6 +594,8 @@ impl Swim {
             } else {
                 None
             },
+            // Relay the subject's known label so a suspicion/death does not blank it.
+            failure_domain: m.failure_domain.clone(),
         };
         self.apply_update(&update, now, out);
     }
@@ -582,6 +623,7 @@ impl Swim {
             incarnation: self.incarnation,
             state: MemberState::Dead,
             suspecter: None,
+            failure_domain: self.local_domain.clone(),
         };
         // Announce directly to every peer we are not already treating as gone, carrying
         // the departure as the message's gossip (a `Sync` is a pure state-merge on the
@@ -597,6 +639,7 @@ impl Swim {
                     from: self.local.0.clone(),
                     from_addr: self.local_addr.clone(),
                     from_peer_addr: self.local_peer_addr.clone(),
+                    from_domain: self.local_domain.clone(),
                     kind: Kind::Sync,
                     gossip: vec![departure.clone()],
                 },
@@ -766,6 +809,8 @@ impl Swim {
                 incarnation: 0,
                 state: MemberState::Alive,
                 suspecter: None,
+                // First contact teaches the sender's label directly (ADR 0016 T5).
+                failure_domain: msg.from_domain.clone(),
             };
             self.apply_update(&update, now, &mut out);
         }
@@ -851,6 +896,7 @@ impl Swim {
             incarnation: self.incarnation,
             state: MemberState::Alive,
             suspecter: None,
+            failure_domain: self.local_domain.clone(),
         }];
         for m in self.members.values() {
             updates.push(Update {
@@ -862,6 +908,7 @@ impl Swim {
                 // A full-state relay does not assert independent suspicion (ADR 0016 §3);
                 // real suspecters propagate via the normal gossip re-broadcast path.
                 suspecter: None,
+                failure_domain: m.failure_domain.clone(),
             });
         }
         for u in updates {
@@ -900,6 +947,19 @@ mod tests {
             NodeId(id.to_string()),
             addr.to_string(),
             peer_addr_of(addr),
+            None,
+            fast_cfg(),
+            seeds.iter().map(|s| (*s).to_string()).collect(),
+        )
+    }
+
+    /// A node that advertises its own failure-domain label (ADR 0016 T5).
+    fn node_in_domain(id: &str, addr: &str, seeds: &[&str], domain: &str) -> Swim {
+        Swim::new(
+            NodeId(id.to_string()),
+            addr.to_string(),
+            peer_addr_of(addr),
+            Some(domain.to_string()),
             fast_cfg(),
             seeds.iter().map(|s| (*s).to_string()).collect(),
         )
@@ -913,6 +973,7 @@ mod tests {
             incarnation: inc,
             state: MemberState::Alive,
             suspecter: None,
+            failure_domain: None,
         }
     }
 
@@ -943,6 +1004,7 @@ mod tests {
             from: from.to_string(),
             from_addr: from_addr.to_string(),
             from_peer_addr: peer_addr_of(from_addr),
+            from_domain: None,
             kind,
             gossip,
         }
@@ -991,6 +1053,7 @@ mod tests {
                 incarnation: 5,
                 state: MemberState::Alive,
                 suspecter: None,
+                failure_domain: None,
             },
             1,
             &mut out,
@@ -1017,6 +1080,7 @@ mod tests {
                 incarnation: 0,
                 state: MemberState::Suspect,
                 suspecter: None,
+                failure_domain: None,
             },
             1,
             &mut out,
@@ -1041,6 +1105,7 @@ mod tests {
                 incarnation: start_inc,
                 state: MemberState::Suspect,
                 suspecter: None,
+                failure_domain: None,
             },
             0,
             &mut out,
@@ -1324,6 +1389,7 @@ mod tests {
             incarnation: 5,
             state,
             suspecter: None,
+            failure_domain: None,
         };
 
         s.apply_update(&claim(MemberState::Alive), 0, &mut out);
@@ -1368,6 +1434,7 @@ mod tests {
                 incarnation: 0,
                 state: MemberState::Dead,
                 suspecter: None,
+                failure_domain: None,
             },
             0,
             &mut out,
@@ -1595,5 +1662,91 @@ mod tests {
             },
             Action::StateChange { .. } => None,
         })
+    }
+
+    /// The failure-domain label held for member `id`, if any (ADR 0016 T5).
+    fn member_domain(s: &Swim, id: &str) -> Option<String> {
+        s.members()
+            .into_iter()
+            .find(|m| m.id.0 == id)
+            .and_then(|m| m.failure_domain)
+    }
+
+    #[test]
+    fn a_receiver_learns_a_peers_gossiped_failure_domain() {
+        let mut b = node("b", "b:1", &[]);
+        let update = Update {
+            failure_domain: Some("rack-a".into()),
+            ..alive_update("a", "a:1", 1)
+        };
+        let actions = b.handle(m("a", "a:1", Kind::Sync, vec![update]), 0);
+        assert_eq!(member_domain(&b, "a").as_deref(), Some("rack-a"));
+        // The label reaches the routing/placement layer via a StateChange (placement
+        // applies last-wins, so the *final* event for "a" must carry it).
+        let learned = actions
+            .iter()
+            .filter_map(|act| match act {
+                Action::StateChange { id, domain, .. } if id.0 == "a" => Some(domain.clone()),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(learned, Some(Some("rack-a".into())));
+    }
+
+    #[test]
+    fn an_unlabelled_relay_does_not_erase_a_known_domain() {
+        let mut b = node("b", "b:1", &[]);
+        b.handle(
+            m(
+                "a",
+                "a:1",
+                Kind::Sync,
+                vec![Update {
+                    failure_domain: Some("rack-a".into()),
+                    ..alive_update("a", "a:1", 1)
+                }],
+            ),
+            0,
+        );
+        // A later, superseding claim about "a" that never learned the label must not blank it.
+        b.handle(
+            m("c", "c:1", Kind::Sync, vec![alive_update("a", "a:1", 5)]),
+            1,
+        );
+        assert_eq!(member_domain(&b, "a").as_deref(), Some("rack-a"));
+    }
+
+    #[test]
+    fn first_contact_teaches_the_senders_domain() {
+        let mut b = node("b", "b:1", &[]);
+        // A bare Ping from a labelled sender with no piggybacked gossip: the sender's
+        // label rides in `from_domain`, learned on first contact (ADR 0016 T5).
+        let ping = Message {
+            from: "a".into(),
+            from_addr: "a:1".into(),
+            from_peer_addr: peer_addr_of("a:1"),
+            from_domain: Some("rack-a".into()),
+            kind: Kind::Ping { seq: 7 },
+            gossip: vec![],
+        };
+        b.handle(ping, 0);
+        assert_eq!(member_domain(&b, "a").as_deref(), Some("rack-a"));
+    }
+
+    #[test]
+    fn a_node_advertises_its_own_domain_on_outgoing_gossip() {
+        let mut a = node_in_domain("a", "a:1", &[], "rack-a");
+        // A Join from "b" makes "a" answer with a full-state Sync.
+        let actions = a.handle(m("b", "b:1", Kind::Join, vec![]), 0);
+        let sync = actions.iter().find_map(|act| match act {
+            Action::Send { msg, .. } if matches!(msg.kind, Kind::Sync) => Some(msg),
+            _ => None,
+        });
+        let sync = sync.expect("a Join is answered with a Sync");
+        // The message header carries the sender's own label...
+        assert_eq!(sync.from_domain.as_deref(), Some("rack-a"));
+        // ...and its self-update in the piggybacked gossip does too.
+        let self_update = sync.gossip.iter().find(|u| u.id == "a").unwrap();
+        assert_eq!(self_update.failure_domain.as_deref(), Some("rack-a"));
     }
 }

@@ -29,10 +29,17 @@
 //!   and replicated log on-disk, so sessions survive a full-cluster restart (the
 //!   recommended production setup). With durable opted out, it stores single-node
 //!   sessions in `<dir>/sessions.redb` (restart-safe, not replicated). Unset → in-memory.
-//! - `MQTTD_FAILURE_DOMAINS` — failure-domain topology (ADR 0016 T4): `node-id=domain`
+//! - `MQTTD_FAILURE_DOMAIN`  — this node's own failure-domain label (ADR 0016 T5), e.g.
+//!   `rack-a`. Advertised over the authenticated SWIM gossip payload so the cluster's
+//!   failure-domain topology **self-assembles** (the bounded lease-voter set spreads across
+//!   racks/zones without a static map). The preferred mechanism — each node sets only its own
+//!   label. Unset → this node is unlabelled (its own singleton domain) unless a peer or the
+//!   static map below supplies one.
+//! - `MQTTD_FAILURE_DOMAINS` — static failure-domain topology (ADR 0016 T4): `node-id=domain`
 //!   pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`) so the bounded lease-voter set is spread
-//!   across racks/zones and one domain's loss cannot take quorum. **Must be cluster-uniform.**
-//!   Unset → no spread (id-ordered voter selection, as before).
+//!   across racks/zones and one domain's loss cannot take quorum. A cluster-uniform seed/
+//!   fallback; gossip-advertised labels (`MQTTD_FAILURE_DOMAIN`) override it per node.
+//!   Unset → no static spread (id-ordered voter selection unless labels are gossiped).
 //! - `MQTTD_TLS_BIND`       — TLS client listener bind, e.g. `0.0.0.0:8883`
 //!   (requires `MQTTD_TLS_CERT` + `MQTTD_TLS_KEY`, PEM paths)
 //! - `MQTTD_TLS_CLIENT_CA`  — PEM CA bundle; when set, clients must present a
@@ -147,10 +154,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Session-placement ring (ADR 0005), kept in step with SWIM membership and
     // read by the hub to identify each persistent session's owner node.
-    let placement = Arc::new(RwLock::new(Placement::new(
-        node_id.clone(),
-        placement::DEFAULT_REPLICAS,
-    )));
+    let placement = Arc::new(RwLock::new(
+        Placement::new(node_id.clone(), placement::DEFAULT_REPLICAS)
+            // This node's own failure-domain label (ADR 0016 T5), so placement reports it
+            // in the topology map without waiting for gossip to round-trip.
+            .with_local_domain(this_node_failure_domain()),
+    ));
 
     // Graceful-shutdown plumbing (ADR 0019): a cancellation token that stops the accept
     // loops and drains live connections, and a tracker that lets us wait for them.
@@ -694,6 +703,15 @@ fn failure_domains(
     Ok(map)
 }
 
+/// This node's own failure-domain label from `MQTTD_FAILURE_DOMAIN` (singular, ADR 0016 T5):
+/// the node advertises it over the authenticated SWIM gossip payload so the cluster topology
+/// **self-assembles** — no static, cluster-uniform `MQTTD_FAILURE_DOMAINS` map required. Unset
+/// leaves this node unlabelled (its own singleton domain, unless a peer/static map supplies a
+/// label). When both are set, the self-advertised label wins for this node.
+fn this_node_failure_domain() -> Option<String> {
+    non_empty_env("MQTTD_FAILURE_DOMAIN")
+}
+
 async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
@@ -1181,6 +1199,8 @@ async fn start_swim_from_env(
         node_id.clone(),
         bind,
         peer_addr,
+        // Advertise this node's own failure-domain label over gossip (ADR 0016 T5).
+        this_node_failure_domain(),
         mqtt_cluster::swim::Config::default(),
         seeds,
     );

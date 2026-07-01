@@ -94,6 +94,9 @@ struct Node {
     handle: JoinHandle<()>,
     view: Arc<Mutex<HashMap<String, MemberState>>>,
     rejects: Arc<Mutex<HashMap<String, u64>>>,
+    /// The failure-domain label this node has learned for each peer via gossip
+    /// (ADR 0016 T5).
+    domains: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Node {
@@ -106,6 +109,11 @@ impl Node {
             .copied()
             .unwrap_or(0)
     }
+
+    /// The failure-domain label this node has learned for peer `id` (ADR 0016 T5).
+    fn domain_of(&self, id: &str) -> Option<String> {
+        self.domains.lock().unwrap().get(id).cloned()
+    }
 }
 
 /// Spawn a node whose driver performs a **graceful SWIM leave** when the returned
@@ -115,7 +123,7 @@ async fn spawn_leavable_node(
     seeds: Vec<String>,
 ) -> (String, Node, tokio::sync::oneshot::Sender<()>) {
     let (leave_tx, leave_rx) = tokio::sync::oneshot::channel::<()>();
-    let (addr, node) = spawn_node_inner(id, seeds, None, None, async move {
+    let (addr, node) = spawn_node_inner(id, seeds, None, None, None, async move {
         let _ = leave_rx.await;
     })
     .await;
@@ -123,7 +131,12 @@ async fn spawn_leavable_node(
 }
 
 async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (String, Node) {
-    spawn_node_inner(id, seeds, auth, None, std::future::pending()).await
+    spawn_node_inner(id, seeds, auth, None, None, std::future::pending()).await
+}
+
+/// Spawn a node that advertises its own failure-domain label over gossip (ADR 0016 T5).
+async fn spawn_node_in_domain(id: &str, seeds: Vec<String>, domain: &str) -> (String, Node) {
+    spawn_node_inner(id, seeds, None, None, Some(domain), std::future::pending()).await
 }
 
 /// Spawn a node that signs its gossip as itself (ADR 0022, require mode).
@@ -132,6 +145,7 @@ async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, No
         id,
         seeds,
         Some(signed_auth(key, id)),
+        None,
         None,
         std::future::pending(),
     )
@@ -143,7 +157,15 @@ async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, No
 async fn spawn_sequenced_node(id: &str, seeds: Vec<String>, key: u8) -> (String, Node) {
     let auth = signed_auth(key, id).with_sequencing();
     let alloc = SequenceAllocator::open(Box::new(MemSeqStore::default()) as Box<dyn SeqStore>, 64);
-    spawn_node_inner(id, seeds, Some(auth), Some(alloc), std::future::pending()).await
+    spawn_node_inner(
+        id,
+        seeds,
+        Some(auth),
+        Some(alloc),
+        None,
+        std::future::pending(),
+    )
+    .await
 }
 
 async fn spawn_node_inner(
@@ -151,6 +173,7 @@ async fn spawn_node_inner(
     seeds: Vec<String>,
     auth: Option<SwimAuth>,
     seq_alloc: Option<SeqAlloc>,
+    domain: Option<&str>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (String, Node) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -161,15 +184,21 @@ async fn spawn_node_inner(
         NodeId(id.to_string()),
         addr.clone(),
         peer_addr,
+        domain.map(str::to_string),
         cfg(),
         seeds,
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<MembershipEvent>();
     let view: Arc<Mutex<HashMap<String, MemberState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let domains: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let view2 = view.clone();
+    let domains2 = domains.clone();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            if let Some(d) = ev.domain {
+                domains2.lock().unwrap().insert(ev.id.0.clone(), d);
+            }
             view2.lock().unwrap().insert(ev.id.0, ev.state);
         }
     });
@@ -202,6 +231,7 @@ async fn spawn_node_inner(
             handle,
             view,
             rejects,
+            domains,
         },
     )
 }
@@ -313,6 +343,30 @@ async fn two_nodes_discover_each_other() {
     n2.handle.abort();
 }
 
+/// ADR 0016 T5: each node advertises its own failure-domain label over the gossip
+/// plane, and its peer learns it — so the failure-domain topology self-assembles over
+/// the real wire, with no static cluster-uniform map.
+#[tokio::test]
+async fn a_nodes_failure_domain_propagates_over_gossip() {
+    let (addr1, n1) = spawn_node_in_domain("d1", vec![], "rack-a").await;
+    let (_addr2, n2) = spawn_node_in_domain("d2", vec![addr1], "rack-b").await;
+
+    let converged = wait_for(Duration::from_secs(6), || {
+        n1.domain_of("d2").as_deref() == Some("rack-b")
+            && n2.domain_of("d1").as_deref() == Some("rack-a")
+    })
+    .await;
+    assert!(
+        converged,
+        "failure-domain labels did not propagate: d1 sees d2={:?}, d2 sees d1={:?}",
+        n1.domain_of("d2"),
+        n2.domain_of("d1"),
+    );
+
+    n1.handle.abort();
+    n2.handle.abort();
+}
+
 /// ADR 0003: nodes sharing the gossip key converge; a node with the wrong key
 /// (or none) is invisible to the cluster and sees nothing of it.
 #[tokio::test]
@@ -395,6 +449,7 @@ async fn a_forged_sender_identity_is_rejected() {
         from: "evil".into(),
         from_addr: sock.local_addr().unwrap().to_string(),
         from_peer_addr: String::new(),
+        from_domain: None,
         kind: Kind::Join,
         gossip: vec![],
     };
@@ -409,6 +464,7 @@ async fn a_forged_sender_identity_is_rejected() {
         from: "ghost".into(),
         from_addr: "10.0.0.9:1".into(),
         from_peer_addr: String::new(),
+        from_domain: None,
         kind: Kind::Join,
         gossip: vec![],
     };
@@ -492,6 +548,7 @@ async fn a_replayed_v3_datagram_is_dropped() {
         from: "sender".into(),
         from_addr: sock.local_addr().unwrap().to_string(),
         from_peer_addr: String::new(),
+        from_domain: None,
         kind: Kind::Ping { seq: 1 },
         gossip: vec![],
     };

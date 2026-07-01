@@ -116,6 +116,7 @@ impl Sim {
                 NodeId(format!("n{i}")),
                 a.clone(),
                 format!("{a}-peer"),
+                None,
                 cfg.clone(),
                 seeds,
             ));

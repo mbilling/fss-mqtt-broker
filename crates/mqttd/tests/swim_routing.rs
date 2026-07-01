@@ -87,6 +87,7 @@ async fn start_node(
         node_id.clone(),
         swim_addr.clone(),
         peer_addr,
+        None,
         swim_cfg(),
         swim_seeds,
     );
@@ -337,6 +338,7 @@ async fn start_proxy_node(
         node_id.clone(),
         swim_addr.clone(),
         peer_addr,
+        None,
         swim_cfg(),
         swim_seeds,
     );

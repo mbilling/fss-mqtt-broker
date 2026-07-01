@@ -422,8 +422,8 @@ mod tests {
         let owner = nid("owner");
         // A 3-node ring (R=3, quorum=2): owner + two followers.
         let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
-        p.observe(&nid("f1"), MemberState::Alive, "f1:7000");
-        p.observe(&nid("f2"), MemberState::Alive, "f2:7000");
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
         let placement = Arc::new(RwLock::new(p));
 
         // Owner's transport, wired to two in-process followers.
@@ -537,8 +537,8 @@ mod tests {
     async fn foreign_group_is_not_owned() {
         let owner = nid("owner");
         let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
-        p.observe(&nid("f1"), MemberState::Alive, "f1:7000");
-        p.observe(&nid("f2"), MemberState::Alive, "f2:7000");
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
         let placement = Arc::new(RwLock::new(p));
 
         let store = ReplicatedSessionStore::new(GroupRoutedLog::new(
@@ -622,8 +622,8 @@ mod tests {
         let owner = nid("owner");
         // A 3-node ring (R=3, quorum=2): owner + two followers that are NOT reachable.
         let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
-        p.observe(&nid("f1"), MemberState::Alive, "f1:7000");
-        p.observe(&nid("f2"), MemberState::Alive, "f2:7000");
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
         let placement = Arc::new(RwLock::new(p));
         let (_group, client) = owned_group_and_client(&placement.read().unwrap());
         let qkey = format!("q/{}", client.0);

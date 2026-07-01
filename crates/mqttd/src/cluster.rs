@@ -53,7 +53,7 @@ pub async fn maintain_peer_links(
         // Keep the placement ring in step with membership before routing reacts.
         if let Some(placement) = &placement {
             if let Ok(mut p) = placement.write() {
-                p.observe(&ev.id, ev.state, &ev.peer_addr);
+                p.observe(&ev.id, ev.state, &ev.peer_addr, ev.domain.as_deref());
             }
         }
         if let Some(m) = &metrics {
@@ -138,6 +138,7 @@ mod tests {
             addr: format!("{id}-swim"),
             peer_addr: peer_addr.into(),
             state,
+            domain: None,
         }
     }
 

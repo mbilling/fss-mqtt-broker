@@ -316,6 +316,7 @@ mod tests {
                 &NodeId(format!("peer-{i}")),
                 mqtt_cluster::swim::MemberState::Alive,
                 &format!("peer-{i}:7000"),
+                None,
             );
         }
         Arc::new(RwLock::new(p))
