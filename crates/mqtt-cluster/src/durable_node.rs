@@ -166,9 +166,11 @@ pub async fn build_durable_node(
     // The handle is returned so the caller can stop the driver on shutdown (otherwise
     // the loop outlives `raft`, spinning against a shut-down consensus handle) and so a
     // restart can release the on-disk lease/replica locks (ADR 0018 phase 5).
-    // Re-key the operator-supplied failure-domain topology by raft id (ADR 0016 T4). It must
-    // be cluster-uniform so every successive leader's reconciler computes the same target; a
-    // node absent from the map is its own singleton domain (no spread constraint).
+    // Re-key the operator-supplied failure-domain topology by raft id (ADR 0016 T4). This is
+    // the static *seed*: `run_driver` overlays it each tick with the labels nodes advertise
+    // over gossip (ADR 0016 T5), so the map self-assembles and a static cluster-uniform table
+    // is no longer required. A node absent from both is its own singleton domain (no spread
+    // constraint).
     let domains: BTreeMap<RaftNodeId, FailureDomain> = failure_domains
         .iter()
         .map(|(node, dom)| (raft_id(node), dom.clone()))
@@ -231,16 +233,27 @@ async fn run_driver(
 
         let view = raft_view(&raft);
 
-        let members: Vec<RaftNodeId> = {
+        let (members, live_domains): (Vec<RaftNodeId>, BTreeMap<RaftNodeId, FailureDomain>) = {
             let p = placement
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.members().iter().map(raft_id).collect()
+            let members = p.members().iter().map(raft_id).collect();
+            // Gossip-propagated labels (ADR 0016 T5), re-keyed by raft id.
+            let live = p
+                .domains()
+                .into_iter()
+                .map(|(node, dom)| (raft_id(&node), dom))
+                .collect();
+            (members, live)
         };
         let desired = admit_desired(&members, local, &view.voters, |id| network.is_connected(id));
 
         if desired == prev_desired {
-            let action = reconciler.decide_with_domains(&view, &desired, &domains);
+            // Effective topology = the static seed (ADR 0016 T4, cluster-uniform config)
+            // overlaid with self-advertised labels learned from gossip (T5), which win.
+            let mut effective = domains.clone();
+            effective.extend(live_domains);
+            let action = reconciler.decide_with_domains(&view, &desired, &effective);
             if let Err(e) = apply_action(&raft, &action).await {
                 warn!(error = %e, "lease-group membership reconcile failed");
             }

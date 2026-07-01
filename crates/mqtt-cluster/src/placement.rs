@@ -63,6 +63,13 @@ pub struct Placement {
     /// Each peer's inter-node (peer-link) address, so the owner of a session can
     /// be reached for session relocation (ADR 0005).
     addrs: BTreeMap<NodeId, String>,
+    /// This node's own failure-domain label (ADR 0016 T5), if configured. Kept here
+    /// so [`domains`](Self::domains) reports it without waiting for gossip to round-trip.
+    local_domain: Option<String>,
+    /// Each peer's self-advertised failure-domain label, learned from gossip
+    /// (ADR 0016 T5). Populated from membership observations so the lease-voter
+    /// selection topology assembles itself instead of a static cluster-uniform map.
+    domains: BTreeMap<NodeId, String>,
 }
 
 impl Placement {
@@ -77,14 +84,25 @@ impl Placement {
             replicas: replicas.max(1),
             eligible,
             addrs: BTreeMap::new(),
+            local_domain: None,
+            domains: BTreeMap::new(),
         }
+    }
+
+    /// Set this node's own failure-domain label (ADR 0016 T5), reported by
+    /// [`domains`](Self::domains) alongside the gossip-learned peer labels. Builder-style
+    /// so it can be chained onto [`new`](Self::new) at startup.
+    #[must_use]
+    pub fn with_local_domain(mut self, domain: Option<String>) -> Self {
+        self.local_domain = domain;
+        self
     }
 
     /// Apply an observed membership state. A non-`Dead` peer becomes eligible
     /// for placement (recording its peer-link `addr` for relocation); a `Dead`
     /// peer is removed. This node is always eligible and is never removed — it
     /// cannot hand off its own participation.
-    pub fn observe(&mut self, id: &NodeId, state: MemberState, addr: &str) {
+    pub fn observe(&mut self, id: &NodeId, state: MemberState, addr: &str, domain: Option<&str>) {
         if id == &self.local {
             return;
         }
@@ -92,14 +110,35 @@ impl Placement {
             MemberState::Dead => {
                 self.eligible.remove(id);
                 self.addrs.remove(id);
+                self.domains.remove(id);
             }
             MemberState::Alive | MemberState::Suspect => {
                 self.eligible.insert(id.clone());
                 if !addr.is_empty() {
                     self.addrs.insert(id.clone(), addr.to_string());
                 }
+                // Learn the peer's failure-domain label; a membership event that never
+                // carried one must not erase a label we already learned (ADR 0016 T5).
+                if let Some(d) = domain {
+                    if !d.is_empty() {
+                        self.domains.insert(id.clone(), d.to_string());
+                    }
+                }
             }
         }
+    }
+
+    /// The current failure-domain topology (ADR 0016 T5): this node's own label plus
+    /// every peer label learned from gossip. Feeds the lease-voter domain-balancing
+    /// (ADR 0016 T4) with a *live*, self-assembling map — a node with no known label is
+    /// simply absent (treated as its own singleton domain by the selector).
+    #[must_use]
+    pub fn domains(&self) -> BTreeMap<NodeId, String> {
+        let mut out = self.domains.clone();
+        if let Some(d) = &self.local_domain {
+            out.insert(self.local.clone(), d.clone());
+        }
+        out
     }
 
     fn nodes(&self) -> Vec<NodeId> {
@@ -195,7 +234,12 @@ mod tests {
     fn ring(local: &str, peers: &[&str]) -> Placement {
         let mut p = Placement::new(node(local), DEFAULT_REPLICAS);
         for peer in peers {
-            p.observe(&node(peer), MemberState::Alive, &format!("{peer}:7000"));
+            p.observe(
+                &node(peer),
+                MemberState::Alive,
+                &format!("{peer}:7000"),
+                None,
+            );
         }
         p
     }
@@ -217,15 +261,15 @@ mod tests {
         assert_eq!(p.member_count(), 3);
 
         // Suspect keeps the node in the ring (no churn on a transient blip).
-        p.observe(&node("b"), MemberState::Suspect, "b:7000");
+        p.observe(&node("b"), MemberState::Suspect, "b:7000", None);
         assert_eq!(p.member_count(), 3);
 
         // Dead removes it.
-        p.observe(&node("c"), MemberState::Dead, "");
+        p.observe(&node("c"), MemberState::Dead, "", None);
         assert_eq!(p.member_count(), 2);
 
         // A node first seen as Suspect is still a member.
-        p.observe(&node("d"), MemberState::Suspect, "d:7000");
+        p.observe(&node("d"), MemberState::Suspect, "d:7000", None);
         assert_eq!(p.member_count(), 3);
     }
 
@@ -233,7 +277,7 @@ mod tests {
     fn this_node_is_never_removed() {
         let mut p = ring("a", &["b"]);
         // Even a (spurious) Dead about ourselves must not drop us.
-        p.observe(&node("a"), MemberState::Dead, "");
+        p.observe(&node("a"), MemberState::Dead, "", None);
         assert_eq!(p.member_count(), 2);
         // We can still own keys.
         assert!(["x", "y", "z", "w"].iter().any(|c| p.owns(c)));
@@ -266,7 +310,7 @@ mod tests {
         // A peer eligible for placement but with no address yet cannot be a relay
         // target — serve locally rather than guess.
         let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
-        p.observe(&node("b"), MemberState::Alive, ""); // eligible, address unknown
+        p.observe(&node("b"), MemberState::Alive, "", None); // eligible, address unknown
         for i in 0..200 {
             let c = format!("client-{i}");
             if p.owner(&c) == node("b") {
@@ -307,7 +351,7 @@ mod tests {
     fn a_dead_node_only_moves_the_keys_it_owned() {
         let before = ring("a", &["b", "c", "d"]); // 4 members
         let mut after = before.clone();
-        after.observe(&node("d"), MemberState::Dead, ""); // 3 members
+        after.observe(&node("d"), MemberState::Dead, "", None); // 3 members
 
         let mut moved = 0;
         let mut moved_were_ds = 0;
@@ -338,7 +382,7 @@ mod tests {
     fn a_joining_node_moves_only_a_minority() {
         let before = ring("a", &["b", "c", "d"]);
         let mut after = before.clone();
-        after.observe(&node("e"), MemberState::Alive, "e:7000");
+        after.observe(&node("e"), MemberState::Alive, "e:7000", None);
 
         let total = 2_000;
         let moved = (0..total)
@@ -409,5 +453,45 @@ mod tests {
         let c = "client-123";
         assert_eq!(p.owner(c), p.group_owner(group_of(c)));
         assert_eq!(p.owns(c), p.owns_group(group_of(c)));
+    }
+
+    #[test]
+    fn domains_reports_local_and_gossip_learned_labels() {
+        let mut p =
+            Placement::new(node("a"), DEFAULT_REPLICAS).with_local_domain(Some("z1".into()));
+        p.observe(&node("b"), MemberState::Alive, "b:7000", Some("z2"));
+        p.observe(&node("c"), MemberState::Suspect, "c:7000", Some("z2"));
+        let d = p.domains();
+        assert_eq!(d.get(&node("a")).map(String::as_str), Some("z1")); // own label
+        assert_eq!(d.get(&node("b")).map(String::as_str), Some("z2"));
+        assert_eq!(d.get(&node("c")).map(String::as_str), Some("z2")); // Suspect still counts
+    }
+
+    #[test]
+    fn a_dead_peer_drops_its_domain() {
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
+        p.observe(&node("b"), MemberState::Alive, "b:7000", Some("z2"));
+        assert_eq!(p.domains().get(&node("b")).map(String::as_str), Some("z2"));
+        p.observe(&node("b"), MemberState::Dead, "", None);
+        assert!(!p.domains().contains_key(&node("b")));
+    }
+
+    #[test]
+    fn an_unlabelled_observation_does_not_erase_a_known_domain() {
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
+        p.observe(&node("b"), MemberState::Alive, "b:7000", Some("z2"));
+        // A later membership event with no label (e.g. a relay that never learned it)
+        // must not blank the label we already hold.
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert_eq!(p.domains().get(&node("b")).map(String::as_str), Some("z2"));
+    }
+
+    #[test]
+    fn an_unlabelled_node_is_absent_from_the_domain_map() {
+        // No own label, no peer labels: the map is empty (each node its own singleton
+        // domain, reproducing the pre-T5 id-ordered selection).
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert!(p.domains().is_empty());
     }
 }
