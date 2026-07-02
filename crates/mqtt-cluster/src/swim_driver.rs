@@ -24,9 +24,10 @@ use tracing::{debug, trace};
 pub type SeqAlloc = SequenceAllocator<Box<dyn SeqStore>>;
 
 /// A sink for **dropped-gossip** events, called with a bounded reason class (`"auth"`,
-/// `"decode"`, `"identity"`, `"replay"`) each time an inbound datagram is rejected
-/// (ADR 0003). A callback rather than a metrics handle keeps this crate free of any
-/// observability backend — the broker passes a closure that bumps its counter.
+/// `"decode"`, `"identity"`, `"replay"`, `"expired"`, `"revoked"`, `"domain"`) each time an
+/// inbound datagram is rejected (ADR 0003). A callback rather than a metrics handle keeps
+/// this crate free of any observability backend — the broker passes a closure that bumps
+/// its counter.
 pub type RejectCounter = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
 
 /// Maximum SWIM datagram size we are willing to receive.
@@ -108,14 +109,17 @@ pub async fn run(
                 let Ok((n, src)) = recv else { continue };
                 // Authenticate before a single byte is deserialized.
                 let opened = if let Some(a) = &auth {
-                    let Some(o) = a.open(&buf[..n]) else {
-                        debug!(%src, "dropping SWIM datagram failing authentication");
-                        count_reject("auth");
-                        continue;
-                    };
-                    o
+                    match a.open(&buf[..n]) {
+                        Ok(o) => o,
+                        Err(reject) => {
+                            debug!(%src, reason = reject.reason(),
+                                "dropping SWIM datagram failing authentication");
+                            count_reject(reject.reason());
+                            continue;
+                        }
+                    }
                 } else {
-                    Opened { payload: &buf[..n], identity: None, seq: None }
+                    Opened { payload: &buf[..n], identity: None, seq: None, domain: None }
                 };
                 let Ok(msg) = bincode::deserialize::<Message>(opened.payload) else {
                     trace!(%src, "dropping undecodable SWIM datagram");
@@ -133,6 +137,20 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Failure-domain attestation (ADR 0016 T6): in the signed posture a
+                // member's label is accepted only from the member itself, and when the
+                // sender's certificate attests a label it is authoritative — a
+                // disagreeing self-claim is a lie and the datagram is dropped.
+                let msg = match enforce_domain(msg, opened.identity.as_deref(), opened.domain.as_deref()) {
+                    Ok(m) => m,
+                    Err(claimed) => {
+                        debug!(%src, claimed = %claimed,
+                            attested = opened.domain.as_deref().unwrap_or(""),
+                            "dropping SWIM datagram whose claimed failure domain contradicts its certificate");
+                        count_reject("domain");
+                        continue;
+                    }
+                };
                 // Anti-replay (ADR 0023): a sequenced datagram (always authenticated, so the
                 // window cannot be poisoned) is dropped if its sequence is a replay for that
                 // sender. The first sequence per sender seeds the window.
@@ -192,5 +210,134 @@ async fn apply(
                 domain,
             });
         }
+    }
+}
+
+/// Apply the failure-domain trust rules (ADR 0016 T6) to an inbound, already
+/// identity-bound message (`identity`, when present, equals `msg.from`).
+///
+/// In the signed posture (`identity` present):
+/// - a label claimed **about a third party** is stripped — a member's label is accepted
+///   only from the member itself, so a relay cannot forge topology for its peers;
+/// - when the sender's certificate **attests** a label, it is authoritative: a
+///   disagreeing self-claim (message header or self-update) rejects the message
+///   (returning the offending claim), and the attested label replaces the self-claims —
+///   so a relabel needs only a reissued certificate, no env change.
+///
+/// Unsigned (v1) messages pass through unchanged: the shared-key posture has no per-node
+/// identity to bind labels to (its trust model already trusts any key holder for
+/// everything, addresses included).
+fn enforce_domain(
+    mut msg: Message,
+    identity: Option<&str>,
+    attested: Option<&str>,
+) -> Result<Message, String> {
+    if identity.is_none() {
+        return Ok(msg);
+    }
+    if let Some(att) = attested {
+        if msg.from_domain.as_deref().is_some_and(|d| d != att) {
+            return Err(msg.from_domain.unwrap_or_default());
+        }
+        msg.from_domain = Some(att.to_string());
+    }
+    for u in &mut msg.gossip {
+        if u.id == msg.from {
+            if let Some(att) = attested {
+                if u.failure_domain.as_deref().is_some_and(|d| d != att) {
+                    return Err(u.failure_domain.clone().unwrap_or_default());
+                }
+                u.failure_domain = Some(att.to_string());
+            }
+        } else {
+            u.failure_domain = None;
+        }
+    }
+    Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enforce_domain;
+    use crate::swim::{Kind, MemberState, Message, Update};
+
+    fn update(id: &str, domain: Option<&str>) -> Update {
+        Update {
+            id: id.to_string(),
+            addr: format!("{id}:1"),
+            peer_addr: String::new(),
+            incarnation: 1,
+            state: MemberState::Alive,
+            suspecter: None,
+            failure_domain: domain.map(str::to_string),
+        }
+    }
+
+    fn msg(from: &str, from_domain: Option<&str>, gossip: Vec<Update>) -> Message {
+        Message {
+            from: from.to_string(),
+            from_addr: format!("{from}:1"),
+            from_peer_addr: String::new(),
+            from_domain: from_domain.map(str::to_string),
+            kind: Kind::Sync,
+            gossip,
+        }
+    }
+
+    #[test]
+    fn an_unsigned_message_passes_through_unchanged() {
+        let m = msg("a", Some("z1"), vec![update("b", Some("z2"))]);
+        let out = enforce_domain(m.clone(), None, None).unwrap();
+        assert_eq!(out, m);
+    }
+
+    #[test]
+    fn a_signed_relay_cannot_assert_a_third_partys_domain() {
+        let m = msg(
+            "a",
+            None,
+            vec![update("b", Some("forged")), update("a", None)],
+        );
+        let out = enforce_domain(m, Some("a"), None).unwrap();
+        assert_eq!(
+            out.gossip[0].failure_domain, None,
+            "third-party label stripped"
+        );
+    }
+
+    #[test]
+    fn an_attested_domain_overrides_and_fills_the_self_claims() {
+        // No self-claim at all: the cert alone labels the sender (relabel-by-reissue).
+        let m = msg("a", None, vec![update("a", None)]);
+        let out = enforce_domain(m, Some("a"), Some("rack-a")).unwrap();
+        assert_eq!(out.from_domain.as_deref(), Some("rack-a"));
+        assert_eq!(out.gossip[0].failure_domain.as_deref(), Some("rack-a"));
+    }
+
+    #[test]
+    fn a_self_claim_contradicting_the_certificate_is_rejected() {
+        let m = msg("a", Some("liar"), vec![]);
+        assert_eq!(
+            enforce_domain(m, Some("a"), Some("rack-a")),
+            Err("liar".to_string())
+        );
+        // The same lie inside the self-update is equally rejected.
+        let m = msg("a", None, vec![update("a", Some("liar"))]);
+        assert_eq!(
+            enforce_domain(m, Some("a"), Some("rack-a")),
+            Err("liar".to_string())
+        );
+    }
+
+    #[test]
+    fn an_agreeing_self_claim_passes_and_an_unattested_one_is_kept() {
+        // Claim matches the cert: fine.
+        let m = msg("a", Some("rack-a"), vec![]);
+        assert!(enforce_domain(m, Some("a"), Some("rack-a")).is_ok());
+        // No attestation in the cert: the self-claim is kept (documented residual trust).
+        let m = msg("a", Some("rack-b"), vec![update("a", Some("rack-b"))]);
+        let out = enforce_domain(m, Some("a"), None).unwrap();
+        assert_eq!(out.from_domain.as_deref(), Some("rack-b"));
+        assert_eq!(out.gossip[0].failure_domain.as_deref(), Some("rack-b"));
     }
 }

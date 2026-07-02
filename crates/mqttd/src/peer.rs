@@ -63,6 +63,12 @@ pub struct PeerTls {
     pub cert_der: Vec<u8>,
     /// This node's private key (DER) — signs outgoing gossip.
     pub key_der: Vec<u8>,
+    /// The live cluster-bus revocation list the gossip verifier consults per datagram
+    /// (ADR 0022 T7): `None` when `MQTTD_PEER_TLS_CRL` is unset. Shared with the reloader,
+    /// which swaps a freshly-parsed list in on SIGHUP/watch reload.
+    pub gossip_crl: crate::reload::SwimCrlSlot,
+    /// The configured CRL path, kept so the reload closure and the file watcher re-read it.
+    pub crl_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for PeerTls {

@@ -217,6 +217,15 @@ pub fn private_key_der(path: &Path) -> Result<Vec<u8>, NetError> {
     Ok(load_key(path)?.secret_der().to_vec())
 }
 
+/// The first CRL in a PEM file as raw DER — for the signed-gossip revocation check
+/// (ADR 0022 T7), which parses it with `x509-parser` rather than rustls.
+///
+/// # Errors
+/// [`NetError::Tls`] if the file cannot be read or contains no CRL.
+pub fn first_crl_der(path: &Path) -> Result<Vec<u8>, NetError> {
+    Ok(load_crls(path)?[0].as_ref().to_vec())
+}
+
 fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, NetError> {
     let crls: Vec<_> = CertificateRevocationListDer::pem_file_iter(path)
         .map_err(|e| tls_err("CRL file", path, &e))?

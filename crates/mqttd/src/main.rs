@@ -34,7 +34,10 @@
 //!   failure-domain topology **self-assembles** (the bounded lease-voter set spreads across
 //!   racks/zones without a static map). The preferred mechanism — each node sets only its own
 //!   label. Unset → this node is unlabelled (its own singleton domain) unless a peer or the
-//!   static map below supplies one.
+//!   static map below supplies one. When the cluster-bus certificate **attests** a label
+//!   (ADR 0016 T6, see `MQTTD_PEER_TLS_*`), the certificate is authoritative: this value
+//!   must match it or peers reject this node's gossip, and it may be omitted entirely
+//!   (the cert alone labels the node).
 //! - `MQTTD_FAILURE_DOMAINS` — static failure-domain topology (ADR 0016 T4): `node-id=domain`
 //!   pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`) so the bounded lease-voter set is spread
 //!   across racks/zones and one domain's loss cannot take quorum. A cluster-uniform seed/
@@ -62,7 +65,15 @@
 //! - `MQTTD_PEER_BIND`      — inter-node listener bind, e.g. `127.0.0.1:7001`
 //! - `MQTTD_PEER_TLS_CA` / `MQTTD_PEER_TLS_CERT` / `MQTTD_PEER_TLS_KEY` —
 //!   cluster-bus mTLS material (set all three); without them peer links are
-//!   plaintext and loudly logged
+//!   plaintext and loudly logged. A leaf whose SANs carry
+//!   `URI:urn:fss:failure-domain:<label>` has its failure domain **CA-attested**
+//!   (ADR 0016 T6): the label is authoritative on the gossip plane and a
+//!   disagreeing self-claim is rejected.
+//! - `MQTTD_PEER_TLS_CRL`   — PEM CRL for the **cluster bus** (ADR 0022 T7; requires the
+//!   three above): signed gossip from a revoked certificate is dropped. The CRL must be
+//!   signed by the cluster CA; it hot-reloads via SIGHUP / `MQTTD_CONFIG_WATCH` (ADR
+//!   0032/0033), so publishing a new CRL evicts a compromised node without a restart.
+//!   Expired/not-yet-valid certificates are rejected on the gossip plane regardless.
 //! - `MQTTD_PEERS`          — comma-separated peer addresses to dial (static mesh)
 //! - `MQTTD_SWIM_BIND`      — SWIM gossip UDP bind, e.g. `127.0.0.1:7946`
 //!   (requires `MQTTD_PEER_BIND`; peer links are then established from
@@ -129,6 +140,9 @@ use tracing::{debug, info, warn};
 /// SWIM driver tick; must stay below the ack timeout (250ms default config).
 const SWIM_TICK: Duration = Duration::from_millis(100);
 
+// Startup is a linear wiring sequence; splitting it would only scatter the order it
+// documents.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -211,6 +225,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (policy, mut reloader) =
         client_policy_from_env(Some(proxy), store, shutdown.clone(), metrics.clone())?;
+
+    // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
+    // reload as the client policy: a republished CRL revokes a node's gossip on the next
+    // datagram after SIGHUP (or the ADR 0033 watcher), with no restart.
+    if let Some(tls) = &peer_tls {
+        if let Some(path) = tls.crl_path.clone() {
+            let ca_der = tls.ca_der.clone();
+            reloader.attach_swim_crl(tls.gossip_crl.clone(), move || {
+                load_gossip_crl(&path, &ca_der)
+            });
+        }
+    }
 
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
@@ -530,6 +556,7 @@ fn watched_policy_paths() -> Vec<std::path::PathBuf> {
         "MQTTD_TLS_KEY",
         "MQTTD_TLS_CLIENT_CA",
         "MQTTD_TLS_CRL",
+        "MQTTD_PEER_TLS_CRL",
     ]
     .iter()
     .filter_map(|var| non_empty_env(var))
@@ -893,7 +920,10 @@ fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
 
 /// Build the cluster-bus mTLS context from `MQTTD_PEER_TLS_{CA,CERT,KEY}`.
 /// All three must be set together; none means a (loudly logged) plaintext mesh.
+/// `MQTTD_PEER_TLS_CRL` (optional, requires the other three) loads a cluster-CA-signed
+/// CRL checked on every inbound signed-gossip datagram (ADR 0022 T7).
 fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Error>> {
+    let crl_path = non_empty_env("MQTTD_PEER_TLS_CRL");
     match (
         non_empty_env("MQTTD_PEER_TLS_CA"),
         non_empty_env("MQTTD_PEER_TLS_CERT"),
@@ -901,23 +931,54 @@ fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Erro
     ) {
         (Some(ca), Some(cert), Some(key)) => {
             let (ca, cert, key) = (Path::new(&ca), Path::new(&cert), Path::new(&key));
+            let ca_der = tls::first_cert_der(ca)?;
+            // Cluster-bus CRL (ADR 0022 T7): parsed and CA-verified up front — a bad CRL
+            // is a startup error, not a silently-skipped revocation check.
+            let crl_path = crl_path.map(std::path::PathBuf::from);
+            let gossip_crl = match &crl_path {
+                Some(p) => {
+                    let list = load_gossip_crl(p, &ca_der)?;
+                    info!(path = %p.display(), revoked = list.len(),
+                        "cluster-bus CRL loaded: revoked certs are rejected on the gossip plane");
+                    Some(list)
+                }
+                None => None,
+            };
             Ok(Some(peer::PeerTls {
                 acceptor: tls::server_acceptor(cert, key, Some(ca))?,
                 connector: tls::client_connector(ca, cert, key)?,
                 // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound certs,
                 // and our leaf + key sign outbound datagrams.
-                ca_der: tls::first_cert_der(ca)?,
                 cert_der: tls::first_cert_der(cert)?,
                 key_der: tls::private_key_der(key)?,
+                ca_der,
+                gossip_crl: Arc::new(std::sync::RwLock::new(gossip_crl)),
+                crl_path,
             }))
         }
-        (None, None, None) => Ok(None),
+        (None, None, None) if crl_path.is_none() => Ok(None),
+        (None, None, None) => Err(
+            "MQTTD_PEER_TLS_CRL requires MQTTD_PEER_TLS_CA/CERT/KEY: a CRL revokes \
+             cluster-bus certificates, so there must be a cluster bus to revoke from"
+                .into(),
+        ),
         _ => Err(
             "MQTTD_PEER_TLS_CA, MQTTD_PEER_TLS_CERT and MQTTD_PEER_TLS_KEY \
              must be set together"
                 .into(),
         ),
     }
+}
+
+/// Read + parse + CA-verify the cluster-bus CRL (ADR 0022 T7). Used at startup and by the
+/// reload closure, so a republished CRL takes effect without a restart.
+fn load_gossip_crl(
+    path: &Path,
+    ca_der: &[u8],
+) -> Result<mqtt_auth::signed_gossip::RevocationList, String> {
+    let der = tls::first_crl_der(path).map_err(|e| format!("cluster-bus CRL: {e}"))?;
+    mqtt_auth::signed_gossip::RevocationList::from_der(&der, ca_der)
+        .map_err(|e| format!("cluster-bus CRL {}: {e}", path.display()))
 }
 
 /// Signs outgoing gossip with this node's cluster-bus key, embedding its leaf cert so
@@ -940,11 +1001,46 @@ impl mqtt_cluster::swim_auth::GossipSign for NodeGossipSigner {
 /// returning the authenticated Common Name (ADR 0022).
 struct CaGossipVerifier {
     ca_der: Vec<u8>,
+    /// The live revocation list (ADR 0022 T7), shared with the reloader so a republished
+    /// CRL revokes a node's gossip on the very next datagram — no restart.
+    crl: reload::SwimCrlSlot,
 }
 
 impl mqtt_cluster::swim_auth::GossipVerify for CaGossipVerifier {
-    fn verify(&self, cert_der: &[u8], payload: &[u8], sig: &[u8]) -> Option<String> {
-        mqtt_auth::signed_gossip::verify(&self.ca_der, cert_der, payload, sig).ok()
+    fn verify(
+        &self,
+        cert_der: &[u8],
+        payload: &[u8],
+        sig: &[u8],
+    ) -> Result<mqtt_cluster::swim_auth::VerifiedIdentity, mqtt_cluster::swim_auth::OpenReject>
+    {
+        use mqtt_auth::signed_gossip::VerifyError;
+        use mqtt_cluster::swim_auth::{OpenReject, VerifiedIdentity};
+        // Real wall-clock time, like rustls' own validity checks on the TLS paths; an
+        // unrepresentable clock fails closed inside `verify`.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let crl = self
+            .crl
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match mqtt_auth::signed_gossip::verify(
+            &self.ca_der,
+            cert_der,
+            payload,
+            sig,
+            now,
+            crl.as_ref(),
+        ) {
+            Ok(v) => Ok(VerifiedIdentity {
+                cn: v.cn,
+                failure_domain: v.failure_domain,
+            }),
+            Err(VerifyError::Expired) => Err(OpenReject::Expired),
+            Err(VerifyError::Revoked) => Err(OpenReject::Revoked),
+            Err(_) => Err(OpenReject::Auth),
+        }
     }
 }
 
@@ -1009,6 +1105,7 @@ fn apply_signed_gossip(
     });
     let verifier = Arc::new(CaGossipVerifier {
         ca_der: tls.ca_der.clone(),
+        crl: tls.gossip_crl.clone(),
     });
     info!("SWIM gossip is SIGNED per-node (ADR 0022)");
     Ok(Some(base.with_signing(signer, verifier)))
