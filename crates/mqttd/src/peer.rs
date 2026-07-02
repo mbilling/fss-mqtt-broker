@@ -352,7 +352,17 @@ where
             }
             maybe_out = out_rx.recv() => {
                 match maybe_out {
-                    Some(msg) => write_frame(wh, &msg).await?,
+                    // An oversized frame is dropped with a warning rather than killing
+                    // the link: losing one best-effort message is strictly better than
+                    // severing every message on the link (and a link-up back-fill that
+                    // dies on send would die again on every reconnect). Other I/O
+                    // errors still end the link as before.
+                    Some(msg) => match write_frame(wh, &msg).await {
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            warn!(error = %e, "dropping oversized/unencodable peer frame");
+                        }
+                        other => other?,
+                    },
                     None => return Ok(()), // taken over or hub gone
                 }
             }
@@ -361,6 +371,8 @@ where
 }
 
 /// Translate an inbound peer message into a hub command.
+// One arm per wire variant — a flat dispatch table, not a refactor smell.
+#[allow(clippy::too_many_lines)]
 fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, remote: &NodeId) {
     match msg {
         PeerMessage::Interest { filters } => {
@@ -438,6 +450,18 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 })
                 .collect();
             let _ = hub.send(HubCommand::RemoteRetainedSnapshot { messages });
+        }
+        PeerMessage::RetainedDigest { count, hash } => {
+            let _ = hub.send(HubCommand::RemoteRetainedDigest {
+                node: remote.clone(),
+                count,
+                hash,
+            });
+        }
+        PeerMessage::RetainedRequest => {
+            let _ = hub.send(HubCommand::RemoteRetainedRequest {
+                node: remote.clone(),
+            });
         }
         PeerMessage::Hello { .. } => {
             warn!("unexpected duplicate Hello on established peer link");

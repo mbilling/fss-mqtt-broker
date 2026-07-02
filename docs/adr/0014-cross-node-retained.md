@@ -57,20 +57,37 @@ node sees it *eventually*, not synchronously — the test re-subscribes until it
 arrives.
 
 A node that joins the cluster **after** a retained message was published is
-**back-filled on link establishment**: a node sends its full retained set
-(`PeerMessage::RetainedSnapshot`, via `RetainedStore::all`) to each new peer, and the
-receiver applies it **gap-fill** — it sets a retained message only for a topic it
-does not already hold, so a peer's snapshot never clobbers our own (possibly newer)
-value. A fresh joiner therefore catches up on the whole existing retained set; an
-established node ignores topics it already has. This is a full-snapshot exchange, not
-a digest diff — simpler, and correct for the join case; a digest-based diff (to avoid
-re-sending the whole set on every link-up) is a possible later optimization.
+**back-filled on link establishment**, in two steps (as revised by T6/T8 — the
+original design sent the full set unconditionally in one frame):
+
+1. **Digest offer (T6).** On link-up each side sends an order-independent digest of
+   its retained *topic set* (`PeerMessage::RetainedDigest`: topic count + XOR of each
+   topic's stable 64-bit hash). If the receiver's own digest matches, the sets are
+   identical and **nothing further is transferred** — the common steady-state link-up
+   (or link flap) costs one small frame instead of the whole retained set. Topics
+   only: under the gap-fill rule below a receiver can only ever accept topics it
+   lacks, so payload digests would add no information. If the digests differ, the
+   receiver pulls with `PeerMessage::RetainedRequest`.
+2. **Chunked snapshot (T8).** The pulled set is sent as **bounded chunks** (each well
+   under the peer frame limit), because chunks are independent and idempotent under
+   gap-fill — no ordering or completion marker is needed. One unbounded frame was a
+   latent outage: a retained set beyond the 16 MiB frame limit would be rejected by
+   the *receiver*, tearing down the link, and the link-up back-fill would then re-kill
+   it on every reconnect — a permanent, data-volume-triggered link flap severing all
+   peer traffic. The frame bound is now also enforced at *encode* (sender side), and
+   the peer write loop drops an oversized frame with a warning rather than dying; a
+   single retained message that could never fit a frame is skipped with a warning,
+   not sent.
+
+The receiver applies a snapshot **gap-fill** — it sets a retained message only for a
+topic it does not already hold, so a peer's snapshot never clobbers our own (possibly
+newer) value. A fresh joiner therefore catches up on the whole existing retained set;
+an established node ignores topics it already has.
 
 **Conflict on partition heal** (two nodes holding *different* values for the same
 topic) is left unresolved: gap-fill keeps each side's own value, so they stay
 divergent until the next publish. Resolving that needs per-message timestamps /
-version vectors and is out of scope. Snapshot size is bounded by the peer frame
-limit; chunking a very large retained set is deferred.
+version vectors and is out of scope (tracked as T7).
 
 ## Consequences
 
@@ -79,11 +96,11 @@ limit; chunking a very large retained set is deferred.
   `deliver` path for local and remote application; clears propagate; no relay loops;
   non-retained forwarding is unchanged.
 - **Cost / limits:** every retained publish fans out to all peers (O(nodes); retained
-  publishes are typically infrequent); back-fill re-sends the full retained set on
-  each link-up (a digest diff is a later optimization, §3); partition-heal divergence
-  on the same topic is not reconciled (§3); cross-node delivery still carries no
-  message-expiry deadline (the peer link does not yet carry the interval — pre-existing
-  carried limitation).
+  publishes are typically infrequent); a link-up between *differing* sets still
+  transfers the sender's whole set, chunked (topic-level diffing is a possible further
+  refinement of §3's digest step); partition-heal divergence on the same topic is not
+  reconciled (§3, T7); a single retained message too large for a peer frame is skipped
+  from back-fill (loudly) rather than sent.
 
 ## Alternatives considered
 

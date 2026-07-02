@@ -428,12 +428,31 @@ pub enum HubCommand {
         /// That node's shared groups with members.
         groups: Vec<RemoteSharedGroup>,
     },
-    /// A peer's retained-message snapshot, sent on link-up to back-fill a node that
-    /// joined after a retained publish (ADR 0014 §3). Applied gap-fill (topics we do
-    /// not already retain), never overwriting our own.
+    /// A chunk of a peer's retained-message snapshot, back-filling a node that joined
+    /// after a retained publish (ADR 0014 §3, chunked per 0014-T8). Applied gap-fill
+    /// (topics we do not already retain), never overwriting our own — so chunks are
+    /// independent and idempotent.
     RemoteRetainedSnapshot {
         /// Each retained message as `(topic, payload, QoS)`.
         messages: Vec<(String, Bytes, QoS)>,
+    },
+    /// A peer's retained topic-set digest, sent on link-up instead of the full
+    /// snapshot (0014-T6). If it matches our own set's digest there is nothing to
+    /// back-fill in either direction of the gap-fill rule we enforce; otherwise we
+    /// pull with [`PeerMessage::RetainedRequest`].
+    RemoteRetainedDigest {
+        /// The peer that sent its digest.
+        node: NodeId,
+        /// Number of retained topics the peer holds.
+        count: u64,
+        /// Order-independent hash of the peer's retained topic set.
+        hash: u64,
+    },
+    /// A peer asked for our retained set (its digest comparison found a difference);
+    /// answer with chunked [`PeerMessage::RetainedSnapshot`]s (0014-T6/T8).
+    RemoteRetainedRequest {
+        /// The peer to send the snapshot to.
+        node: NodeId,
     },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
@@ -584,6 +603,61 @@ fn qos_num(qos: QoS) -> u8 {
         QoS::AtLeastOnce => 1,
         QoS::ExactlyOnce => 2,
     }
+}
+
+/// Per-chunk byte budget for a retained-snapshot frame (0014-T8): well under the peer
+/// frame limit (16 MiB, `mqtt_cluster::peer`), with headroom for bincode framing — a
+/// frame at the limit would be rejected by the receiver and tear down the link.
+const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// The order-independent digest of a retained **topic set** (0014-T6): the topic count
+/// plus the XOR of each topic's stable 64-bit hash. Independent of iteration order and
+/// cheap to compare; equal digests ⇒ identical topic sets (up to hash collision, which
+/// merely skips a best-effort back-fill). Topics only — under the gap-fill rule a
+/// receiver can only accept topics it lacks, so payloads add no information.
+fn retained_digest<'a>(topics: impl Iterator<Item = &'a str>) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut hash = 0u64;
+    for t in topics {
+        count += 1;
+        hash ^= mqtt_cluster::hrw::stable_id(t.as_bytes());
+    }
+    (count, hash)
+}
+
+/// Split retained entries into chunks whose summed (topic + payload) size stays under
+/// [`RETAINED_CHUNK_BYTES`] (0014-T8). A single entry larger than the whole budget is
+/// skipped with a warning — it could never fit a frame, and sending it would sever the
+/// link instead of just missing one back-fill.
+fn chunk_retained(
+    entries: impl Iterator<Item = (String, Vec<u8>, u8)>,
+) -> Vec<Vec<(String, Vec<u8>, u8)>> {
+    // Fixed per-entry overhead estimate for bincode length prefixes and the QoS byte.
+    const ENTRY_OVERHEAD: usize = 32;
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0usize;
+    for (topic, payload, qos) in entries {
+        let size = topic.len() + payload.len() + ENTRY_OVERHEAD;
+        if size > RETAINED_CHUNK_BYTES {
+            warn!(
+                topic = %topic,
+                bytes = size,
+                "retained message exceeds the snapshot chunk budget; skipping back-fill for it"
+            );
+            continue;
+        }
+        if current_bytes + size > RETAINED_CHUNK_BYTES && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += size;
+        current.push((topic, payload, qos));
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 impl Hub {
@@ -788,9 +862,11 @@ impl Hub {
             }
             HubCommand::PeerConnected { node, conn_id, tx } => {
                 self.peer_connected(node.clone(), conn_id, tx);
-                // Back-fill the new peer with our retained state so a node that
-                // joined after a retained publish catches up (ADR 0014 §3).
-                self.send_retained_snapshot(&node).await;
+                // Offer the new peer our retained topic-set digest (ADR 0014 §3,
+                // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
+                // so a steady-state link-up or flap costs one small frame, not the
+                // whole retained set.
+                self.send_retained_digest(&node).await;
             }
             HubCommand::PeerDisconnected { node, conn_id } => {
                 self.peer_disconnected(&node, conn_id);
@@ -817,6 +893,12 @@ impl Hub {
             }
             HubCommand::RemoteRetainedSnapshot { messages } => {
                 self.apply_retained_snapshot(messages).await;
+            }
+            HubCommand::RemoteRetainedDigest { node, count, hash } => {
+                self.handle_retained_digest(&node, count, hash).await;
+            }
+            HubCommand::RemoteRetainedRequest { node } => {
+                self.send_retained_snapshot(&node).await;
             }
             HubCommand::RemoteSharedDeliver {
                 client,
@@ -1887,9 +1969,50 @@ impl Hub {
         }
     }
 
+    /// Offer `node` our retained topic-set digest (ADR 0014 §3, 0014-T6): the peer
+    /// pulls the snapshot only if its own digest differs, so a link-up (or flap)
+    /// between already-synced nodes transfers one small frame instead of the whole
+    /// set. A no-op when we have no retained messages or the peer link is gone.
+    async fn send_retained_digest(&self, node: &NodeId) {
+        let Some(peer) = self.peers.get(node) else {
+            return;
+        };
+        let Ok(retained) = self.retained.all().await else {
+            return;
+        };
+        if retained.is_empty() {
+            return;
+        }
+        let (count, hash) = retained_digest(retained.iter().map(|m| m.topic.as_str()));
+        let _ = peer.tx.send(PeerMessage::RetainedDigest { count, hash });
+    }
+
+    /// Compare a peer's retained topic-set digest against our own (0014-T6). Equal
+    /// digests mean identical topic sets — under the gap-fill rule there is nothing
+    /// the peer's snapshot could add, so nothing is transferred. Different digests:
+    /// pull the peer's (chunked) snapshot.
+    async fn handle_retained_digest(&self, node: &NodeId, count: u64, hash: u64) {
+        let Some(peer) = self.peers.get(node) else {
+            return;
+        };
+        let Ok(retained) = self.retained.all().await else {
+            return;
+        };
+        let (our_count, our_hash) = retained_digest(retained.iter().map(|m| m.topic.as_str()));
+        if (our_count, our_hash) == (count, hash) {
+            debug!(node = %node.0, topics = count, "retained sets already match; skipping back-fill");
+            return;
+        }
+        let _ = peer.tx.send(PeerMessage::RetainedRequest);
+    }
+
     /// Send our full retained set to `node` so it can back-fill any retained
-    /// messages published before it joined (ADR 0014 §3). A no-op when we have no
-    /// retained messages or the peer link is gone.
+    /// messages published before it joined (ADR 0014 §3), split into bounded
+    /// chunks (0014-T8) so no frame can approach the peer frame limit — one
+    /// oversized frame would kill the link on the receiving side, and the link-up
+    /// back-fill would then re-kill it on every reconnect. Chunks are independent
+    /// under the receiver's gap-fill rule, so no ordering or completion marker is
+    /// needed. A no-op when we have no retained messages or the peer link is gone.
     async fn send_retained_snapshot(&self, node: &NodeId) {
         let Some(peer) = self.peers.get(node) else {
             return;
@@ -1900,11 +2023,12 @@ impl Hub {
         if retained.is_empty() {
             return;
         }
-        let messages = retained
+        let entries = retained
             .into_iter()
-            .map(|m| (m.topic, m.payload.to_vec(), m.qos as u8))
-            .collect();
-        let _ = peer.tx.send(PeerMessage::RetainedSnapshot { messages });
+            .map(|m| (m.topic, m.payload.to_vec(), m.qos as u8));
+        for messages in chunk_retained(entries) {
+            let _ = peer.tx.send(PeerMessage::RetainedSnapshot { messages });
+        }
     }
 
     /// Apply a peer's retained snapshot, **gap-fill** only: set a retained message
@@ -2947,19 +3071,33 @@ mod tests {
         assert_eq!(payload_of(&recv_packet(&mut ra).await.unwrap()), b"m2");
     }
 
-    /// On link-up the hub sends its retained set to the new peer, so a node that
+    /// On link-up the hub offers its retained topic-set **digest** (0014-T6), and a
+    /// peer that pulls (its set differed) gets the retained snapshot, so a node that
     /// joined after a retained publish is back-filled (ADR 0014 §3).
     #[tokio::test]
-    async fn retained_snapshot_is_sent_to_a_new_peer() {
+    async fn retained_digest_is_offered_and_a_request_pulls_the_snapshot() {
         let tx = start_hub();
         publish_retained(&tx, "t", b"r");
         let mut peer = connect_peer(&tx, "n", 1);
 
-        // The peer gets our interest snapshot, then our retained snapshot.
+        // The peer gets our interest snapshot, then our retained digest.
         assert!(matches!(
             recv_peer(&mut peer).await,
             Some(PeerMessage::Interest { .. })
         ));
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedDigest { count, hash }) => {
+                assert_eq!(count, 1);
+                assert_ne!(hash, 0, "one topic hashes to a non-zero digest");
+            }
+            other => panic!("expected RetainedDigest, got {other:?}"),
+        }
+
+        // The peer's set differed, so it pulls — and gets the snapshot.
+        tx.send(HubCommand::RemoteRetainedRequest {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
         match recv_peer(&mut peer).await {
             Some(PeerMessage::RetainedSnapshot { messages }) => {
                 assert_eq!(messages.len(), 1);
@@ -2968,6 +3106,118 @@ mod tests {
             }
             other => panic!("expected RetainedSnapshot, got {other:?}"),
         }
+    }
+
+    /// A peer whose digest matches ours is already in sync: no request, no snapshot —
+    /// a steady-state link-up (or flap) transfers nothing (0014-T6).
+    #[tokio::test]
+    async fn a_matching_retained_digest_skips_the_back_fill() {
+        let tx = start_hub();
+        publish_retained(&tx, "t", b"r");
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::RetainedDigest { .. })
+        ));
+
+        // The peer claims the same single-topic set we hold: same digest, no pull.
+        let (count, hash) = super::retained_digest(std::iter::once("t"));
+        tx.send(HubCommand::RemoteRetainedDigest {
+            node: NodeId("n".into()),
+            count,
+            hash,
+        })
+        .unwrap();
+        // Nothing further arrives on the link (probe with a bounded wait).
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(200), recv_peer(&mut peer)).await;
+        assert!(quiet.is_err(), "matching digests must transfer nothing");
+    }
+
+    /// A digest that does NOT match ours makes us pull the peer's set (0014-T6).
+    #[tokio::test]
+    async fn a_differing_retained_digest_pulls_the_peers_set() {
+        let tx = start_hub();
+        publish_retained(&tx, "t", b"r");
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::RetainedDigest { .. })
+        ));
+
+        // The peer holds a different set: we answer its digest with a pull.
+        let (count, hash) = super::retained_digest(["t", "other"].into_iter());
+        tx.send(HubCommand::RemoteRetainedDigest {
+            node: NodeId("n".into()),
+            count,
+            hash,
+        })
+        .unwrap();
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::RetainedRequest)
+        ));
+    }
+
+    /// The snapshot is split into bounded chunks (0014-T8): a set larger than one
+    /// chunk budget arrives as multiple frames, each under the budget, covering
+    /// every topic exactly once. One oversized frame would kill the link on the
+    /// receiving side — and the link-up back-fill would then re-kill every reconnect.
+    #[test]
+    fn a_large_retained_set_is_chunked_under_the_frame_budget() {
+        // 9 entries of ~1 MiB against a 4 MiB budget → at least 3 chunks.
+        let payload = vec![0u8; 1024 * 1024];
+        let entries = (0..9).map(|i| (format!("t/{i}"), payload.clone(), 0u8));
+        let chunks = super::chunk_retained(entries);
+        assert!(chunks.len() >= 3, "9 MiB must not fit 2 chunks of 4 MiB");
+        for chunk in &chunks {
+            let bytes: usize = chunk.iter().map(|(t, p, _)| t.len() + p.len() + 32).sum();
+            assert!(bytes <= super::RETAINED_CHUNK_BYTES, "chunk over budget");
+        }
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        assert_eq!(total, 9, "every entry appears in exactly one chunk");
+    }
+
+    /// A single retained message that could never fit a frame is skipped (with a
+    /// warning), not sent — sending it would sever the link instead of just missing
+    /// one back-fill (0014-T8).
+    #[test]
+    fn an_oversized_single_retained_message_is_skipped_not_sent() {
+        let huge = vec![0u8; super::RETAINED_CHUNK_BYTES + 1];
+        let entries = vec![
+            ("ok".to_string(), vec![1u8; 8], 0u8),
+            ("huge".to_string(), huge, 0u8),
+        ];
+        let chunks = super::chunk_retained(entries.into_iter());
+        let all: Vec<&str> = chunks
+            .iter()
+            .flatten()
+            .map(|(t, _, _)| t.as_str())
+            .collect();
+        assert_eq!(
+            all,
+            vec!["ok"],
+            "the oversized entry is dropped, the rest kept"
+        );
+    }
+
+    /// The digest is order-independent and topic-set-sensitive (0014-T6).
+    #[test]
+    fn the_retained_digest_is_order_independent_and_set_sensitive() {
+        let a = super::retained_digest(["x", "y", "z"].into_iter());
+        let b = super::retained_digest(["z", "x", "y"].into_iter());
+        assert_eq!(a, b, "order must not matter");
+        let c = super::retained_digest(["x", "y"].into_iter());
+        assert_ne!(a, c, "a different set must differ");
+        assert_eq!(super::retained_digest(std::iter::empty()), (0, 0));
     }
 
     /// A received retained snapshot back-fills the store, so a later local

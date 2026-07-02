@@ -82,13 +82,36 @@ pub enum PeerMessage {
         /// Each shared group: `(ShareName, filter, [(client id, granted QoS u8)])`.
         groups: SharedGroupsWire,
     },
-    /// The sender's full retained-message set, sent once on link establishment so a
-    /// node that joined after a retained publish is back-filled (ADR 0014 §3). The
-    /// receiver fills only topics it does not already have (gap-fill, not overwrite).
+    /// A **chunk** of the sender's retained-message set (ADR 0014 §3). Sent on link
+    /// establishment when the digest exchange (see
+    /// [`RetainedDigest`](PeerMessage::RetainedDigest)) shows the sets differ, split
+    /// into bounded chunks so no snapshot can approach the frame limit (0014-T8; one
+    /// oversized frame would kill the link on the receiving side, and the link-up
+    /// back-fill would then kill every reconnect). The receiver fills only topics it
+    /// does not already have (gap-fill, not overwrite), so chunks are independent and
+    /// idempotent — no ordering or completion marker is needed.
     RetainedSnapshot {
         /// Each retained message: `(topic, payload, QoS u8)`.
         messages: Vec<(String, Vec<u8>, u8)>,
     },
+    /// An order-independent digest of the sender's retained **topic set**, sent on link
+    /// establishment instead of the full snapshot (0014-T6). If the receiver's own
+    /// digest matches, the sets are identical and nothing is transferred — the common
+    /// steady-state link-up (or flap) costs one small frame instead of the whole set.
+    /// If it differs, the receiver pulls with
+    /// [`RetainedRequest`](PeerMessage::RetainedRequest). Topics only: under gap-fill
+    /// the receiver can only ever accept topics it lacks, so payload digests would add
+    /// nothing (value divergence is 0014-T7's separate concern).
+    RetainedDigest {
+        /// Number of retained topics the sender holds.
+        count: u64,
+        /// XOR of a stable 64-bit hash of each retained topic (order-independent).
+        hash: u64,
+    },
+    /// Pull the sender's retained set (sent back when a received
+    /// [`RetainedDigest`](PeerMessage::RetainedDigest) did not match the local set);
+    /// answered with chunked [`RetainedSnapshot`](PeerMessage::RetainedSnapshot)s.
+    RetainedRequest,
     /// A targeted shared-subscription delivery (ADR 0015 §1): the sending node chose
     /// this `client` (a member on the receiver) for a shared group; the receiver
     /// delivers to exactly that client, with no further selection.
@@ -204,7 +227,13 @@ pub enum PeerCodecError {
 /// Returns [`PeerCodecError::Serde`] if serialization fails.
 pub fn encode(msg: &PeerMessage, out: &mut Vec<u8>) -> Result<(), PeerCodecError> {
     let body = bincode::serialize(msg).map_err(|e| PeerCodecError::Serde(e.to_string()))?;
-    // `body.len()` is bounded by the message we built, so the cast is safe.
+    // Enforce the frame bound on the SENDING side too: an oversized frame would not
+    // fail here but on the receiver, which tears down the link — and a sender that
+    // retries on reconnect (e.g. a link-up back-fill) would then kill the link in a
+    // loop. Failing the send keeps the link (and every other message on it) alive.
+    if body.len() > MAX_FRAME {
+        return Err(PeerCodecError::FrameTooLarge);
+    }
     let len = u32::try_from(body.len()).map_err(|_| PeerCodecError::FrameTooLarge)?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&body);
@@ -236,7 +265,7 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, PeerMessage, WireAppProps};
+    use super::{decode, encode, PeerCodecError, PeerMessage, WireAppProps, MAX_FRAME};
     use bytes::BytesMut;
 
     fn roundtrip(msg: &PeerMessage) {
@@ -293,6 +322,11 @@ mod tests {
                 ("$SYS/x".into(), b"w".to_vec(), 0),
             ],
         });
+        roundtrip(&PeerMessage::RetainedDigest {
+            count: 42,
+            hash: 0xdead_beef_cafe_f00d,
+        });
+        roundtrip(&PeerMessage::RetainedRequest);
         roundtrip(&PeerMessage::ProxyHello {
             identity: Some("device-7".into()),
             via: Some("node-a".into()),
@@ -331,6 +365,25 @@ mod tests {
             watermark: 4,
             entries: vec![(1, vec![1, 2]), (2, vec![3, 4])],
         });
+    }
+
+    /// The frame bound is enforced on the SENDING side (0014-T8): a message that
+    /// would exceed [`MAX_FRAME`] fails `encode` instead of being written and
+    /// killing the link at the receiver.
+    #[test]
+    fn an_oversized_frame_is_rejected_at_encode() {
+        let msg = PeerMessage::RetainedSnapshot {
+            messages: vec![("t".into(), vec![0u8; MAX_FRAME + 1], 0)],
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            encode(&msg, &mut out),
+            Err(PeerCodecError::FrameTooLarge)
+        ));
+        assert!(
+            out.is_empty(),
+            "nothing may be emitted for a rejected frame"
+        );
     }
 
     #[test]
