@@ -23,13 +23,13 @@
 | [0013](../adr/0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [8/9 done](0013-enhanced-authentication.md) | 1 deferred |
 | [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [6/9 done](0014-cross-node-retained.md) | 3 deferred |
 | [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [8/8 done](0015-cluster-shared-subscriptions.md) | — |
-| [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [5/6 done](0016-swim-membership-stability.md) | 1 deferred |
+| [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [6/6 done](0016-swim-membership-stability.md) | — |
 | [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
 | [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [7/8 done](0018-on-disk-persistence.md) | 1 deferred |
 | [0019](../adr/0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [7/9 done](0019-graceful-shutdown.md) | 2 deferred |
 | [0020](../adr/0020-metrics-and-observability.md) | Metrics and runtime observability | Accepted | [9/9 done](0020-metrics-and-observability.md) | — |
 | [0021](../adr/0021-bounded-lease-voters.md) | Bounded lease-consensus voter set | Accepted | [9/9 done](0021-bounded-lease-voters.md) | — |
-| [0022](../adr/0022-signed-gossip.md) | Per-node signed gossip (authenticated SWIM identity) | Accepted | [5/7 done](0022-signed-gossip.md) | 2 deferred |
+| [0022](../adr/0022-signed-gossip.md) | Per-node signed gossip (authenticated SWIM identity) | Accepted | [6/7 done](0022-signed-gossip.md) | 1 deferred |
 | [0023](../adr/0023-gossip-anti-replay.md) | Gossip anti-replay: persisted monotonic sequence + sliding window | Accepted | [6/6 done](0023-gossip-anti-replay.md) | — |
 | [0024](../adr/0024-deterministic-testing.md) | Deterministic testing: inject time, synchronize causally, gate in CI | Accepted | [7/7 done](0024-deterministic-testing.md) | — |
 | [0025](../adr/0025-boundary-bridge.md) | Boundary MQTT bridge to brokers in other security zones | Accepted | [11/11 done](0025-boundary-bridge.md) | — |
@@ -81,10 +81,6 @@
 - `0014-T7` 💤 deferred: Partition-heal conflict reconciliation (two nodes holding different values for the same topic) — ADR §3 leaves divergence unresolved — gap-fill keeps each side's own value; reconciling needs per-message timestamps / version vectors, out of scope.
 - `0014-T8` 💤 deferred: Chunking a very large retained snapshot beyond the peer frame limit — ADR §3 — snapshot size is bounded by the peer frame limit; chunking is deferred.
 
-**0016 — SWIM membership stability (dead-node fencing + false-positive resistance)**
-
-- `0016-T6` 💤 deferred: Harden self-asserted failure-domain labels — attested (CA-embedded) labels, plus mismatch loudness — "T5 labels are self-asserted: ADR 0022 signing authenticates WHICH node claimed a domain, not that the claim is TRUE, so a compromised-but-certified node can claim a unique fake rack to become the balancer's most attractive voter pick (impact bounded to placement skew/availability — consensus safety still needs a quorum; consistent with the plane's trust model, which already trusts a member for its own address). Candidate hardenings, by strength/cost: (1) CA-attested labels — embed the domain in the cluster-bus certificate (custom extension or SAN URI, SPIFFE-selector style); the ADR 0022 verifier already chain-verifies the cert, so it would extract the label from the cert and reject or ignore a gossiped label that disagrees; strongest fit for this codebase (reuses the existing verify path and 0002-T8 CRL revocation for relabels) at the cost of coupling PKI issuance to topology and making a relabel a reissue+revoke ceremony. (2) Authoritative controller-set labels (the Kubernetes NodeRestriction precedent: kubelets are forbidden from self-setting topology labels) — keep the static operator map authoritative and demote gossip to a drift-detection hint; zero new mechanism but reintroduces exactly the cluster-uniform-config friction T5 removed. (3) Platform attestation — validate claims against signed cloud instance-identity documents (AWS IID / GCP identity JWT carry the zone); strong but environment-specific, adds an external trust root, useless on bare metal. (4) Corroboration heuristics (RTT/coordinate sanity checks) — probabilistic, false-positive-prone, detect-only; poor fit for a security-first broker. (5) Damage limiting without verification — warn on gossip-vs-static mismatch (currently silent; cheap, should land regardless), audit label changes, and/or cooldown before a never-before-seen domain can win a voter seat; cheap but partial. Deferred: the exposure is availability-shaped and requires an already-certified insider; revisit alongside 0022-T7 (gossip cert revocation), since (1) shares its PKI surface."
-
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
 - `0017-T9` 💤 deferred: Make recovery deadline/backoff configurable (currently constants) — ATTACH_RECOVERY_TIMEOUT/BACKOFF are constants for now; ADR defers promoting them to config until an operator need appears
@@ -101,7 +97,6 @@
 **0022 — Per-node signed gossip (authenticated SWIM identity)**
 
 - `0022-T6` 💤 deferred: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams — size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
-- `0022-T7` 💤 deferred: Certificate expiry / revocation handling for gossip certs — same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
 
 **0032 — Hot-reloadable security policy**
 

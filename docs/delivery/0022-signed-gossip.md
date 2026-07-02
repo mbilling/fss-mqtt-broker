@@ -34,8 +34,9 @@ tasks:
     notes: size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
   - id: 0022-T7
     title: Certificate expiry / revocation handling for gossip certs
-    status: deferred
-    notes: same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide
+    status: done
+    date: 2026-07-02
+    evidence: "signed_gossip::verify now checks the leaf's validity window (notBefore/notAfter at an injected epoch-seconds clock; an unrepresentable clock fails closed) and its serial against a cluster CRL. RevocationList::from_der parses the DER CRL, VERIFIES IT IS SIGNED BY THE CLUSTER CA (an unauthenticated CRL could revoke healthy nodes), and extracts revoked serials. MQTTD_PEER_TLS_CRL (requires the peer-TLS trio; bad CRL = startup error) loads it into a shared slot (reload::SwimCrlSlot) the CaGossipVerifier consults per datagram and the ADR 0032 Reloader swaps on SIGHUP / the ADR 0033 watcher (path added to watched_policy_paths) — revocation lands without restart, all-or-nothing with the rest of the policy. The ADR 0003-T6 drop counter gains bounded reasons expired/revoked (OpenReject). Tests: mqtt-auth an_expired_certificate_is_rejected, a_not_yet_valid_certificate_is_rejected, a_revoked_certificate_is_rejected, an_unlisted_certificate_passes_with_a_crl_loaded, a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load, garbage_crl_bytes_do_not_panic; reload a_reload_swaps_the_gossip_crl_into_the_live_slot, a_bad_gossip_crl_rejects_the_whole_reload."
 ---
 
 # Delivery — ADR 0022: Per-node signed gossip
@@ -69,11 +70,20 @@ adversarial tests for each forgery vector.
 | 0022-P4 | ✅ done | 2026-06-22 | main.rs apply_signed_gossip + NodeGossipSigner/CaGossipVerifier; PeerTls ca_der/cert_der/key_der; tls::first_cert_der/private_key_der; MQTTD_SWIM_SIGNED require/off (strict postures) with startup guards |
 | 0022-P5 | ✅ done | 2026-06-22 | swim_cluster.rs signed_gossip_converges; a_forged_sender_identity_is_rejected (forged-from over real UDP); swim_auth a_signed_node_rejects_an_unsigned_v1_datagram |
 | 0022-T6 | 💤 deferred | — | size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger |
-| 0022-T7 | 💤 deferred | — | same deferred concern as peer-bus mTLS (ADR 0002); a CA-chained cert is trusted for gossip until revocation lands cluster-wide |
+| 0022-T7 | ✅ done | 2026-07-02 | "signed_gossip::verify now checks the leaf's validity window (notBefore/notAfter at an injected epoch-seconds clock; an unrepresentable clock fails closed) and its serial against a cluster CRL. RevocationList::from_der parses the DER CRL, VERIFIES IT IS SIGNED BY THE CLUSTER CA (an unauthenticated CRL could revoke healthy nodes), and extracts revoked serials. MQTTD_PEER_TLS_CRL (requires the peer-TLS trio; bad CRL = startup error) loads it into a shared slot (reload::SwimCrlSlot) the CaGossipVerifier consults per datagram and the ADR 0032 Reloader swaps on SIGHUP / the ADR 0033 watcher (path added to watched_policy_paths) — revocation lands without restart, all-or-nothing with the rest of the policy. The ADR 0003-T6 drop counter gains bounded reasons expired/revoked (OpenReject). Tests: mqtt-auth an_expired_certificate_is_rejected, a_not_yet_valid_certificate_is_rejected, a_revoked_certificate_is_rejected, an_unlisted_certificate_passes_with_a_crl_loaded, a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load, garbage_crl_bytes_do_not_panic; reload a_reload_swaps_the_gossip_crl_into_the_live_slot, a_bad_gossip_crl_rejects_the_whole_reload." |
 <!-- /status-table:0022 -->
 
 ## Changelog
 
+- **2026-07-02** — T7 (certificate expiry + revocation on the gossip plane) landed.
+  `signed_gossip::verify` rejects a leaf outside its validity window and one whose serial
+  is on the cluster CRL; the CRL itself must be **signed by the cluster CA** to load (an
+  unauthenticated revocation list could deny service to healthy nodes). `MQTTD_PEER_TLS_CRL`
+  wires it in, hot-reloadable through the ADR 0032/0033 validate-before-swap path — so
+  publishing a new CRL evicts a compromised node's gossip on the next datagram, no restart.
+  The drop counter gains bounded `expired`/`revoked` reasons. In the same change the
+  certificate became the carrier for **CA-attested failure-domain labels** (ADR 0016 T6,
+  `urn:fss:failure-domain:<label>` SAN URI) — see the 0016 delivery doc.
 - **2026-06-30** — Pre-release cleanup: the transitional `prefer` rollout mode was **removed**.
   The mainline was never deployed to production, so the zero-downtime, node-by-node upgrade
   path (sign outgoing but still accept unsigned v1) was never needed. `MQTTD_SWIM_SIGNED` is
