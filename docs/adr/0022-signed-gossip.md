@@ -112,9 +112,31 @@ cluster-bus TLS material are present.
 - **Risk:** this is correctness-critical security code. It is built **test-first**, with
   known-answer tests pinning the wire format and signing, adversarial tests (forged `from`,
   cert not chaining to the CA, swapped signature, tampered fields), and a two-node
-  over-the-wire integration test — the same bar as ADR 0003/0016. Certificate **expiry and
-  revocation** are out of scope here (as in ADR 0002's peer mTLS); a cert that chains to the
-  CA is trusted for gossip, and revocation is the same deferred concern as on the bus.
+  over-the-wire integration test — the same bar as ADR 0003/0016.
+
+## Certificate lifecycle (T7, added after acceptance)
+
+Chain-verification alone trusted a CA-issued certificate *forever* — a compromised node
+kept a valid gossip identity until its cert file was rotated everywhere. T7 closes both
+lifecycle gaps on the verify path:
+
+- **Validity window:** a leaf outside its `notBefore`/`notAfter` is rejected (bounded drop
+  reason `expired`). The check takes an injected epoch-seconds clock, so it is
+  deterministic under test; an unrepresentable clock fails closed.
+- **Revocation:** `MQTTD_PEER_TLS_CRL` (requires the peer-TLS trio) loads a CRL whose
+  revoked serials are checked on every inbound signed datagram (drop reason `revoked`).
+  The CRL must itself be **signed by the cluster CA** — an unauthenticated revocation
+  list would be a denial-of-service lever against healthy nodes. A malformed/unsigned CRL
+  is a **startup error**, never a silently-skipped check. The list is hot-reloadable
+  through the ADR 0032 validate-before-swap reload (SIGHUP or the ADR 0033 file watcher),
+  so publishing a new CRL evicts a compromised node's gossip on the next datagram with no
+  restart — pairing with the client-listener CRL (ADR 0002 T8) to give both planes the
+  same revocation story.
+
+The certificate is also the carrier for **CA-attested failure-domain labels**
+(ADR 0016 T6): a SAN of `URI:urn:fss:failure-domain:<label>` makes the CA the authority
+for the holder's topology label; the verify path surfaces it and the gossip driver
+enforces it over any self-claim.
 
 ## Alternatives considered
 

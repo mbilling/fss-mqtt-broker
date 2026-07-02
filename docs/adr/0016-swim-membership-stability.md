@@ -129,18 +129,27 @@ delivered):
    reconciler is leader-only, debounced, vacancy-driven and sticky — divergence yields at
    worst a transient extra membership proposal, never a safety violation (Raft joint
    consensus owns safety) — and the views converge as gossip settles.
-4. **Domain labels are self-asserted.** ADR 0022 signing authenticates *which node* made
-   a claim, not that the claim is *true*: a compromised (but validly-certified) node can
-   claim any domain — e.g. a unique fake rack to make itself the balancing algorithm's
-   most attractive voter pick, or a victim domain's label to dilute its representation.
-   Impact is bounded (voter placement skew → availability degradation, not a safety/
-   forgery issue, since consensus safety still needs a quorum), and it matches the plane's
-   trust model: an authenticated member is trusted for its own metadata, exactly as it is
-   for its own address. Hardening options and their costs are recorded as **0016-T6**
-   (deferred) in the delivery doc.
-5. **A gossiped label silently overrides the static seed.** When both sources are set and
-   disagree, gossip wins without a warning today — a one-line `warn!` on mismatch would
-   fit the "weaker/surprising states are loud" house rule and is noted in 0016-T6's scope.
+4. **Domain labels were self-asserted — hardened by T6 (CA attestation).** ADR 0022
+   signing authenticates *which node* made a claim, not that the claim is *true*: a
+   compromised (but validly-certified) node could claim any domain — a unique fake rack to
+   make itself the balancing algorithm's most attractive voter pick, or a victim domain's
+   label to dilute its representation. (Impact bounded to voter-placement skew /
+   availability, since consensus safety still needs a quorum.) **T6 closes this for
+   attested clusters:** a cluster-bus certificate carrying
+   `URI:urn:fss:failure-domain:<label>` makes the **CA** the authority for the label — a
+   self-claim contradicting the certificate drops the datagram, and in the signed posture
+   a member's label is accepted **only from the member itself** (third-party claims in
+   relayed gossip are stripped, closing relay-forged topology as well; labels then
+   converge via SWIM's direct probes). A certificate without the URN keeps the
+   self-assertion residual trust — adopt incrementally by reissuing certs with the label;
+   relabeling is a reissue(+revoke, ADR 0022 T7) ceremony, the accepted cost of coupling
+   PKI to topology. The alternatives considered (authoritative controller labels, platform
+   attestation, corroboration heuristics, damage-limiting only) and their costs are
+   recorded in the delivery doc's T6 entry.
+5. **A gossiped label overriding the static seed is loud (T6).** When both sources are
+   set and disagree, gossip wins and the lease driver `warn!`s once per label — one of
+   the two configs is stale, and silent divergence would let an operator trust a map that
+   is not the one being enforced.
 
 ## Consequences
 
