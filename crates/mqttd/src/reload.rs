@@ -11,8 +11,9 @@
 //! The `build` closure is injected (the binary supplies one that re-reads the `MQTTD_*`
 //! files), so the swap logic is testable without touching the filesystem or environment.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use mqtt_auth::signed_gossip::RevocationList;
 use mqtt_auth::{Authenticator, Authorizer};
 use mqtt_observability::metrics::Metrics;
 use mqtt_observability::AuditSink;
@@ -27,6 +28,15 @@ pub type BuildResult = Result<(Arc<dyn Authorizer>, Arc<dyn Authenticator>), Str
 /// What a TLS `build` closure returns: a freshly-built acceptor from the renewed
 /// cert/key/client-CA, or an error string (a missing/unparseable file) that aborts the swap.
 pub type TlsBuildResult = Result<TlsAcceptor, String>;
+
+/// The live cluster-bus revocation list the gossip verifier consults per datagram
+/// (ADR 0022 T7): `None` until a CRL is configured. Shared between the verifier and the
+/// [`Reloader`], which swaps a freshly-parsed list in on reload.
+pub type SwimCrlSlot = Arc<RwLock<Option<RevocationList>>>;
+
+/// What a gossip-CRL `build` closure returns: the freshly-parsed, CA-verified revocation
+/// list, or an error string (a missing/unparseable/unsigned CRL) that aborts the swap.
+pub type SwimCrlBuildResult = Result<RevocationList, String>;
 
 /// The `watch` receivers to wire into [`crate::conn::ConnPolicy`].
 pub struct Handles {
@@ -56,6 +66,10 @@ pub struct Reloader {
     /// is rebuilt and swapped as part of the same atomic, validate-before-swap reload.
     tls_tx: Option<watch::Sender<TlsAcceptor>>,
     tls_build: Option<Box<dyn Fn() -> TlsBuildResult + Send + Sync>>,
+    /// Set by [`attach_swim_crl`](Self::attach_swim_crl) when a cluster-bus CRL is
+    /// configured (ADR 0022 T7); rebuilt and swapped in the same atomic reload.
+    swim_crl: Option<SwimCrlSlot>,
+    swim_crl_build: Option<Box<dyn Fn() -> SwimCrlBuildResult + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -95,6 +109,8 @@ impl Reloader {
                 build: Box::new(build),
                 tls_tx: None,
                 tls_build: None,
+                swim_crl: None,
+                swim_crl_build: None,
             },
             Handles {
                 authz,
@@ -123,6 +139,20 @@ impl Reloader {
         rx
     }
 
+    /// Register the cluster-bus gossip CRL (ADR 0022 T7) so a reload re-reads and swaps it
+    /// through the same atomic, validate-before-swap path. `slot` is the live list the
+    /// gossip verifier consults per datagram; `build` re-reads and CA-verifies the CRL
+    /// file. A freshly-published CRL therefore revokes a node's gossip on the next
+    /// datagram after the reload — no restart.
+    pub fn attach_swim_crl(
+        &mut self,
+        slot: SwimCrlSlot,
+        build: impl Fn() -> SwimCrlBuildResult + Send + Sync + 'static,
+    ) {
+        self.swim_crl = Some(slot);
+        self.swim_crl_build = Some(Box::new(build));
+    }
+
     /// Re-read the sources and swap the policy in place — **validate-before-swap**: build the
     /// new authorizer, authenticator, *and* (if a TLS listener is attached) the TLS acceptor
     /// first; publish them only if **every** build succeeded. On any failure nothing is
@@ -136,22 +166,33 @@ impl Reloader {
         // Build everything up front; only an all-clean build is allowed to publish.
         let policy = (self.build)();
         let tls = self.tls_build.as_ref().map(|b| b());
-        match (policy, tls) {
-            // A configured TLS build failed: reject the whole reload, swap nothing.
-            (_, Some(Err(e))) => self.reject(trigger, &format!("tls: {e}")),
+        let crl = self.swim_crl_build.as_ref().map(|b| b());
+        // A configured TLS or gossip-CRL build failed: reject the whole reload, swap nothing.
+        if let Some(Err(e)) = &tls {
+            return self.reject(trigger, &format!("tls: {e}"));
+        }
+        if let Some(Err(e)) = &crl {
+            return self.reject(trigger, &format!("gossip crl: {e}"));
+        }
+        match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
-            (Err(e), _) => self.reject(trigger, &e),
+            Err(e) => self.reject(trigger, &e),
             // Everything built cleanly: publish atomically. The connection/accept loop reads
             // whichever it reaches first on its next check; all are mutually consistent.
-            (Ok((authz, auth)), tls_ok) => {
+            Ok((authz, auth)) => {
                 let _ = self.authz_tx.send(authz);
                 let _ = self.auth_tx.send(auth);
-                if let (Some(tx), Some(Ok(acceptor))) = (&self.tls_tx, tls_ok) {
+                if let (Some(tx), Some(Ok(acceptor))) = (&self.tls_tx, tls) {
                     let _ = tx.send(acceptor);
+                }
+                if let (Some(slot), Some(Ok(list))) = (&self.swim_crl, crl) {
+                    *slot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(list);
                 }
                 info!(
                     trigger,
-                    "security policy reloaded: ACL + authenticator (+ TLS) swapped"
+                    "security policy reloaded: ACL + authenticator (+ TLS, gossip CRL) swapped"
                 );
                 self.audit
                     .record("security.reload", None, &format!("ok (trigger={trigger})"));
@@ -286,6 +327,67 @@ mod tests {
             text.contains("security_reloads_total{outcome=\"rejected\",trigger=\"signal\"} 1"),
             "a rejected reload counts under outcome=rejected:\n{text}"
         );
+    }
+
+    /// A reload swaps a freshly-built gossip CRL into the shared slot (ADR 0022 T7).
+    #[test]
+    fn a_reload_swaps_the_gossip_crl_into_the_live_slot() {
+        let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = (
+            Arc::new(AllowAll),
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+        );
+        let (mut reloader, _handles) = Reloader::new(initial, audit(), || {
+            Ok((
+                Arc::new(AllowAll) as Arc<dyn Authorizer>,
+                Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                    allow_anonymous: true,
+                }) as Arc<dyn Authenticator>,
+            ))
+        });
+        let slot: SwimCrlSlot = Arc::new(RwLock::new(None));
+        reloader.attach_swim_crl(slot.clone(), || Ok(RevocationList::default()));
+
+        assert!(slot.read().unwrap().is_none(), "empty before the reload");
+        assert!(reloader.reload("signal"));
+        assert!(
+            slot.read().unwrap().is_some(),
+            "the reload must publish the freshly-built CRL"
+        );
+    }
+
+    /// A CRL that fails to build rejects the whole reload — the live list is untouched
+    /// and the ACL/authenticator are not swapped either (all-or-nothing).
+    #[test]
+    fn a_bad_gossip_crl_rejects_the_whole_reload() {
+        let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = (
+            Arc::new(AllowAll),
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+        );
+        let (mut reloader, handles) = Reloader::new(initial, audit(), || {
+            Ok((
+                Arc::new(DenyAll) as Arc<dyn Authorizer>,
+                Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                    allow_anonymous: false,
+                }) as Arc<dyn Authenticator>,
+            ))
+        });
+        let slot: SwimCrlSlot = Arc::new(RwLock::new(None));
+        reloader.attach_swim_crl(slot.clone(), || Err("crl: not signed by the CA".into()));
+
+        assert!(
+            !reloader.reload("signal"),
+            "a bad CRL must reject the reload"
+        );
+        assert!(slot.read().unwrap().is_none(), "the slot is untouched");
+        // The authorizer was not swapped either — all-or-nothing held.
+        assert!(handles
+            .authz
+            .borrow()
+            .authorize_publish(&id(), &"t".to_string()));
     }
 
     fn id() -> mqtt_auth::Identity {

@@ -39,13 +39,57 @@ pub trait GossipSign: Send + Sync {
     fn sign(&self, payload: &[u8]) -> Vec<u8>;
 }
 
-/// Verifies an inbound signed datagram: the inline certificate must chain to the cluster CA
-/// and the signature must be valid over the payload (ADR 0022). Returns the certificate's
-/// authenticated identity (Common Name) on success, `None` to reject.
+/// Why an inbound datagram was rejected — a **bounded** reason set the driver feeds its
+/// drop counter (ADR 0003-T6). `Auth` covers every parse/HMAC/chain/signature failure;
+/// `Expired` and `Revoked` are distinct because they are the certificate-lifecycle drops
+/// an operator acts on (renew / investigate) rather than noise (ADR 0022 T7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenReject {
+    /// Malformed, wrong posture, bad HMAC, bad chain/signature, or unusable identity.
+    Auth,
+    /// The sender's certificate is outside its validity window.
+    Expired,
+    /// The sender's certificate is revoked by the cluster CRL.
+    Revoked,
+}
+
+impl OpenReject {
+    /// The bounded metric label for this rejection.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+/// A verified sender identity: the certificate's Common Name and, when the certificate
+/// carries one, the CA-attested failure-domain label (ADR 0016 T6).
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifiedIdentity {
+    /// The authenticated node identity (the leaf certificate's Common Name).
+    pub cn: String,
+    /// The failure-domain label the cluster CA attested in the certificate, if any.
+    pub failure_domain: Option<String>,
+}
+
+/// Verifies an inbound signed datagram: the inline certificate must chain to the cluster CA,
+/// be within its validity window, not be revoked, and the signature must be valid over the
+/// payload (ADR 0022/0016-T6/0022-T7). Returns the authenticated identity (plus any
+/// CA-attested failure domain) on success, a bounded [`OpenReject`] to reject.
 pub trait GossipVerify: Send + Sync {
-    /// Verify `cert_der` chains to the cluster CA and `sig` is valid over `payload`;
-    /// return the certificate's Common Name (the authenticated sender identity).
-    fn verify(&self, cert_der: &[u8], payload: &[u8], sig: &[u8]) -> Option<String>;
+    /// Verify `cert_der` chains to the cluster CA and `sig` is valid over `payload`.
+    ///
+    /// # Errors
+    /// An [`OpenReject`] naming the bounded rejection class.
+    fn verify(
+        &self,
+        cert_der: &[u8],
+        payload: &[u8],
+        sig: &[u8],
+    ) -> Result<VerifiedIdentity, OpenReject>;
 }
 
 /// A successfully opened datagram: its payload and, when the datagram was signed and
@@ -59,6 +103,9 @@ pub struct Opened<'a> {
     /// The anti-replay sequence number, when the datagram was sequenced *and* its identity
     /// was authenticated (so the receiver can safely window it by sender — ADR 0023).
     pub seq: Option<u64>,
+    /// The sender's CA-attested failure-domain label, when its verified certificate
+    /// carries one (ADR 0016 T6) — authoritative over any self-claimed label.
+    pub domain: Option<String>,
 }
 
 /// Seals and opens SWIM datagrams: always a cluster-shared-key HMAC (ADR 0003), and — when
@@ -243,53 +290,69 @@ impl SwimAuth {
         out
     }
 
-    /// Verify a received datagram and return its payload (plus authenticated identity and
-    /// sequence for a signed datagram), or `None` if it is malformed or not **this node's own
-    /// posture**. The shared-key HMAC is always required first; then the datagram's version
-    /// must match the configured posture exactly — a v1 node accepts only v1, a signed node
-    /// only v2, a sequenced node only v3 (no cross-posture acceptance; ADR 0022/0023).
-    #[must_use]
-    pub fn open<'a>(&self, datagram: &'a [u8]) -> Option<Opened<'a>> {
+    /// Verify a received datagram and return its payload (plus authenticated identity,
+    /// sequence, and CA-attested domain for a signed datagram), or a bounded
+    /// [`OpenReject`] if it is malformed or not **this node's own posture**. The shared-key
+    /// HMAC is always required first; then the datagram's version must match the configured
+    /// posture exactly — a v1 node accepts only v1, a signed node only v2, a sequenced node
+    /// only v3 (no cross-posture acceptance; ADR 0022/0023).
+    ///
+    /// # Errors
+    /// [`OpenReject::Auth`] for any malformed/foreign/unverifiable datagram;
+    /// [`OpenReject::Expired`]/[`OpenReject::Revoked`] when the sender's certificate
+    /// failed its lifecycle checks (ADR 0022 T7).
+    pub fn open<'a>(&self, datagram: &'a [u8]) -> Result<Opened<'a>, OpenReject> {
         if datagram.len() < 1 + TAG_LEN {
-            return None;
+            return Err(OpenReject::Auth);
         }
         let version = datagram[0];
         let (tag, body) = datagram[1..].split_at(TAG_LEN);
         // Shared-key gate + whole-datagram integrity (each verify constant-time), before any
         // parsing. Any key in the ring may have sealed it (the rotation window, ADR 0003).
         if !self.keys.iter().any(|k| hmac::verify(k, body, tag).is_ok()) {
-            return None;
+            return Err(OpenReject::Auth);
         }
 
         match version {
             // Shared-key-only posture: accept v1 only.
-            VERSION_V1 if self.signer.is_none() => Some(Opened {
+            VERSION_V1 if self.signer.is_none() => Ok(Opened {
                 payload: body,
                 identity: None,
                 seq: None,
+                domain: None,
             }),
             // Signed posture: accept v2 only (verify the signature, bind the identity).
             VERSION_V2 if self.signer.is_some() && !self.sequenced => {
-                let (cert, sig, payload) = parse_v2(body)?;
-                let cn = self.verifier.as_ref()?.verify(cert, payload, sig)?;
-                Some(Opened {
+                let (cert, sig, payload) = parse_v2(body).ok_or(OpenReject::Auth)?;
+                let v = self
+                    .verifier
+                    .as_ref()
+                    .ok_or(OpenReject::Auth)?
+                    .verify(cert, payload, sig)?;
+                Ok(Opened {
                     payload,
-                    identity: Some(cn),
+                    identity: Some(v.cn),
                     seq: None,
+                    domain: v.failure_domain,
                 })
             }
             // Signed + sequenced posture: accept v3 only (verify + carry the windowed sequence).
             VERSION_V3 if self.sequenced => {
-                let (seq, cert, sig, payload) = parse_v3(body)?;
-                let cn = self.verifier.as_ref()?.verify(cert, payload, sig)?;
-                Some(Opened {
+                let (seq, cert, sig, payload) = parse_v3(body).ok_or(OpenReject::Auth)?;
+                let v = self
+                    .verifier
+                    .as_ref()
+                    .ok_or(OpenReject::Auth)?
+                    .verify(cert, payload, sig)?;
+                Ok(Opened {
                     payload,
-                    identity: Some(cn),
+                    identity: Some(v.cn),
                     seq: Some(seq),
+                    domain: v.failure_domain,
                 })
             }
             // Any other (version, posture) pair is a foreign format — rejected.
-            _ => None,
+            _ => Err(OpenReject::Auth),
         }
     }
 }
@@ -331,8 +394,8 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_v2, parse_v3, GossipSign, GossipVerify, SwimAuth, KEY_LEN, TAG_LEN, VERSION_V2,
-        VERSION_V3,
+        parse_v2, parse_v3, GossipSign, GossipVerify, OpenReject, SwimAuth, VerifiedIdentity,
+        KEY_LEN, TAG_LEN, VERSION_V2, VERSION_V3,
     };
     use std::fmt::Write as _;
     use std::sync::Arc;
@@ -359,11 +422,24 @@ mod tests {
     struct FakeVerifier {
         cert: Vec<u8>,
         cn: String,
+        domain: Option<String>,
     }
     impl GossipVerify for FakeVerifier {
-        fn verify(&self, cert_der: &[u8], payload: &[u8], sig: &[u8]) -> Option<String> {
+        fn verify(
+            &self,
+            cert_der: &[u8],
+            payload: &[u8],
+            sig: &[u8],
+        ) -> Result<VerifiedIdentity, OpenReject> {
             let expected: Vec<u8> = [b"SIG:".as_ref(), payload].concat();
-            (cert_der == self.cert && sig == expected).then(|| self.cn.clone())
+            if cert_der == self.cert && sig == expected {
+                Ok(VerifiedIdentity {
+                    cn: self.cn.clone(),
+                    failure_domain: self.domain.clone(),
+                })
+            } else {
+                Err(OpenReject::Auth)
+            }
         }
     }
 
@@ -376,6 +452,7 @@ mod tests {
             Arc::new(FakeVerifier {
                 cert,
                 cn: cn.to_string(),
+                domain: None,
             }),
         )
     }
@@ -432,14 +509,14 @@ mod tests {
         for i in 0..sealed.len() {
             let mut tampered = sealed.clone();
             tampered[i] ^= 0x01;
-            assert!(a.open(&tampered).is_none(), "bit flip at {i} accepted");
+            assert!(a.open(&tampered).is_err(), "bit flip at {i} accepted");
         }
     }
 
     #[test]
     fn wrong_key_is_rejected() {
         let sealed = auth(7).seal(b"payload");
-        assert!(auth(8).open(&sealed).is_none());
+        assert!(auth(8).open(&sealed).is_err());
     }
 
     #[test]
@@ -447,12 +524,12 @@ mod tests {
         let a = auth(7);
         let sealed = a.seal(b"payload");
         // Below the minimum length: rejected by the length guard.
-        assert!(a.open(&[]).is_none());
-        assert!(a.open(&sealed[..TAG_LEN]).is_none());
+        assert!(a.open(&[]).is_err());
+        assert!(a.open(&sealed[..TAG_LEN]).is_err());
         // At or above the minimum length but with the payload cut: the length
         // guard passes, so rejection must come from the MAC itself.
-        assert!(a.open(&sealed[..=TAG_LEN]).is_none()); // payload fully cut
-        assert!(a.open(&sealed[..sealed.len() - 1]).is_none()); // short by one
+        assert!(a.open(&sealed[..=TAG_LEN]).is_err()); // payload fully cut
+        assert!(a.open(&sealed[..sealed.len() - 1]).is_err()); // short by one
     }
 
     #[test]
@@ -518,7 +595,7 @@ mod tests {
         // rejected, not accepted — there is no rollout leniency.
         let v1 = auth(7).seal(b"unsigned");
         let signed = signing_auth(7, "node-a");
-        assert!(signed.open(&v1).is_none(), "a signed node must reject v1");
+        assert!(signed.open(&v1).is_err(), "a signed node must reject v1");
     }
 
     #[test]
@@ -527,7 +604,7 @@ mod tests {
         let sender = signing_auth(7, "node-a");
         let sealed = sender.seal(b"msg");
         let receiver = signing_auth(7, "node-b"); // expects cert-of-node-b
-        assert!(receiver.open(&sealed).is_none());
+        assert!(receiver.open(&sealed).is_err());
     }
 
     #[test]
@@ -537,7 +614,7 @@ mod tests {
         for i in 0..sealed.len() {
             let mut t = sealed.clone();
             t[i] ^= 0x01;
-            assert!(a.open(&t).is_none(), "v2 bit flip at {i} accepted");
+            assert!(a.open(&t).is_err(), "v2 bit flip at {i} accepted");
         }
     }
 
@@ -547,7 +624,7 @@ mod tests {
         // the same key — a uniform cluster never mixes postures, so a foreign format is dropped.
         let signed = signing_auth(7, "node-a").seal(b"hello");
         let off = auth(7);
-        assert!(off.open(&signed).is_none(), "a v1 node must reject v2");
+        assert!(off.open(&signed).is_err(), "a v1 node must reject v2");
     }
 
     // --- ADR 0003: dual-key rotation window ---
@@ -573,7 +650,7 @@ mod tests {
     fn a_key_outside_the_ring_is_rejected() {
         let receiver = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
         let sealed_with_c = SwimAuth::new(&[0xCC; KEY_LEN]).seal(b"intruder");
-        assert!(receiver.open(&sealed_with_c).is_none());
+        assert!(receiver.open(&sealed_with_c).is_err());
     }
 
     #[test]
@@ -581,8 +658,8 @@ mod tests {
         let node = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
         let sealed = node.seal(b"x");
         // A peer holding only the secondary must not open it; the primary must.
-        assert!(SwimAuth::new(&[0xBB; KEY_LEN]).open(&sealed).is_none());
-        assert!(SwimAuth::new(&[0xAA; KEY_LEN]).open(&sealed).is_some());
+        assert!(SwimAuth::new(&[0xBB; KEY_LEN]).open(&sealed).is_err());
+        assert!(SwimAuth::new(&[0xAA; KEY_LEN]).open(&sealed).is_ok());
     }
 
     #[test]
@@ -643,8 +720,8 @@ mod tests {
         let sequenced = signing_auth(7, "node-a").with_sequencing();
         let v1 = auth(7).seal(b"x");
         let v2 = signing_auth(7, "node-a").seal(b"x");
-        assert!(sequenced.open(&v1).is_none(), "a sequenced node rejects v1");
-        assert!(sequenced.open(&v2).is_none(), "a sequenced node rejects v2");
+        assert!(sequenced.open(&v1).is_err(), "a sequenced node rejects v1");
+        assert!(sequenced.open(&v2).is_err(), "a sequenced node rejects v2");
         let v3 = signing_auth(7, "node-a")
             .with_sequencing()
             .seal_sequenced(b"x", 1);
@@ -658,7 +735,7 @@ mod tests {
         for i in 0..sealed.len() {
             let mut t = sealed.clone();
             t[i] ^= 0x01;
-            assert!(a.open(&t).is_none(), "v3 bit flip at {i} accepted");
+            assert!(a.open(&t).is_err(), "v3 bit flip at {i} accepted");
         }
     }
 
@@ -670,9 +747,9 @@ mod tests {
             .with_sequencing()
             .seal_sequenced(b"hello", 5);
         assert!(
-            signing_auth(7, "node-a").open(&v3).is_none(),
+            signing_auth(7, "node-a").open(&v3).is_err(),
             "a signed-only node rejects v3"
         );
-        assert!(auth(7).open(&v3).is_none(), "a shared-key node rejects v3");
+        assert!(auth(7).open(&v3).is_err(), "a shared-key node rejects v3");
     }
 }

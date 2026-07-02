@@ -99,6 +99,8 @@ impl ClusterPki {
             ca_der: mqtt_net::tls::first_cert_der(&self.ca_path).unwrap(),
             cert_der: mqtt_net::tls::first_cert_der(&cert).unwrap(),
             key_der: mqtt_net::tls::private_key_der(&key).unwrap(),
+            gossip_crl: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            crl_path: None,
         }
     }
 }

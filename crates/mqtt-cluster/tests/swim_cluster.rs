@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use mqtt_cluster::replay::{SeqStore, SequenceAllocator};
 use mqtt_cluster::swim::{Config, Kind, MemberState, Message, Swim};
-use mqtt_cluster::swim_auth::{GossipSign, GossipVerify, SwimAuth, KEY_LEN};
+use mqtt_cluster::swim_auth::{
+    GossipSign, GossipVerify, OpenReject, SwimAuth, VerifiedIdentity, KEY_LEN,
+};
 use mqtt_cluster::swim_driver::{run, MembershipEvent, SeqAlloc};
 use mqtt_cluster::NodeId;
 use tokio::net::UdpSocket;
@@ -16,7 +18,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// A deterministic stand-in for the real PKI signer (ADR 0022): its certificate encodes its
-/// CN as `cert:<cn>` and its signature as `sig:<cn>:<payload>`, so the verifier can recover
+/// CN as `cert:<cn>` (or `cert:<cn>@<domain>` when it carries a CA-attested failure-domain
+/// label, ADR 0016 T6) and its signature as `sig:<cn>:<payload>`, so the verifier can recover
 /// the signer's identity. The real crypto is exercised in `mqtt-auth`; here we test the
 /// driver's identity binding (a datagram's authenticated CN must equal its SWIM `from`).
 struct StubSigner {
@@ -28,6 +31,14 @@ impl StubSigner {
         Self {
             cn: cn.to_string(),
             cert: format!("cert:{cn}").into_bytes(),
+        }
+    }
+
+    /// A signer whose stub certificate also attests failure domain `domain`.
+    fn in_domain(cn: &str, domain: &str) -> Self {
+        Self {
+            cn: cn.to_string(),
+            cert: format!("cert:{cn}@{domain}").into_bytes(),
         }
     }
 }
@@ -44,10 +55,29 @@ impl GossipSign for StubSigner {
 
 struct StubVerifier;
 impl GossipVerify for StubVerifier {
-    fn verify(&self, cert_der: &[u8], payload: &[u8], sig: &[u8]) -> Option<String> {
-        let cn = std::str::from_utf8(cert_der).ok()?.strip_prefix("cert:")?;
+    fn verify(
+        &self,
+        cert_der: &[u8],
+        payload: &[u8],
+        sig: &[u8],
+    ) -> Result<VerifiedIdentity, OpenReject> {
+        let subject = std::str::from_utf8(cert_der)
+            .ok()
+            .and_then(|s| s.strip_prefix("cert:"))
+            .ok_or(OpenReject::Auth)?;
+        let (cn, domain) = match subject.split_once('@') {
+            Some((cn, d)) => (cn, Some(d.to_string())),
+            None => (subject, None),
+        };
         let expected: Vec<u8> = [format!("sig:{cn}:").as_bytes(), payload].concat();
-        (sig == expected).then(|| cn.to_string())
+        if sig == expected {
+            Ok(VerifiedIdentity {
+                cn: cn.to_string(),
+                failure_domain: domain,
+            })
+        } else {
+            Err(OpenReject::Auth)
+        }
     }
 }
 
@@ -55,6 +85,14 @@ impl GossipVerify for StubVerifier {
 fn signed_auth(key: u8, cn: &str) -> SwimAuth {
     SwimAuth::new(&[key; KEY_LEN])
         .with_signing(Arc::new(StubSigner::new(cn)), Arc::new(StubVerifier))
+}
+
+/// A signing `SwimAuth` whose stub certificate attests failure domain `domain` (ADR 0016 T6).
+fn attested_auth(key: u8, cn: &str, domain: &str) -> SwimAuth {
+    SwimAuth::new(&[key; KEY_LEN]).with_signing(
+        Arc::new(StubSigner::in_domain(cn, domain)),
+        Arc::new(StubVerifier),
+    )
 }
 
 /// An in-memory `SeqStore` for tests (anti-replay needs no real persistence here).
@@ -367,6 +405,83 @@ async fn a_nodes_failure_domain_propagates_over_gossip() {
     n2.handle.abort();
 }
 
+/// ADR 0016 T6: a CA-attested failure-domain label (carried by the node's certificate)
+/// propagates with **no** self-configured label at all — relabeling a node needs only a
+/// reissued certificate.
+#[tokio::test]
+async fn a_cert_attested_domain_propagates_without_any_self_claim() {
+    let key = 3;
+    let (addr1, n1) = spawn_node_inner(
+        "c1",
+        vec![],
+        Some(attested_auth(key, "c1", "rack-a")),
+        None,
+        None, // no MQTTD_FAILURE_DOMAIN-style self claim — the cert alone labels the node
+        std::future::pending(),
+    )
+    .await;
+    let (_addr2, n2) = spawn_node_inner(
+        "c2",
+        vec![addr1],
+        Some(attested_auth(key, "c2", "rack-b")),
+        None,
+        None,
+        std::future::pending(),
+    )
+    .await;
+
+    let converged = wait_for(Duration::from_secs(6), || {
+        n1.domain_of("c2").as_deref() == Some("rack-b")
+            && n2.domain_of("c1").as_deref() == Some("rack-a")
+    })
+    .await;
+    assert!(
+        converged,
+        "attested labels did not propagate: c1 sees c2={:?}, c2 sees c1={:?}",
+        n1.domain_of("c2"),
+        n2.domain_of("c1"),
+    );
+
+    n1.handle.abort();
+    n2.handle.abort();
+}
+
+/// ADR 0016 T6: a node whose self-claimed failure domain contradicts its certificate is a
+/// liar — its datagrams are dropped (reject reason `domain`) and the false label never
+/// enters a peer's view.
+#[tokio::test]
+async fn a_domain_claim_contradicting_the_certificate_is_rejected() {
+    let key = 4;
+    let (addr1, n1) = spawn_node_inner(
+        "h1",
+        vec![],
+        Some(attested_auth(key, "h1", "rack-a")),
+        None,
+        None,
+        std::future::pending(),
+    )
+    .await;
+    // The liar's cert attests rack-a, but it self-advertises rack-z.
+    let (_addr2, liar) = spawn_node_inner(
+        "liar",
+        vec![addr1],
+        Some(attested_auth(key, "liar", "rack-a")),
+        None,
+        Some("rack-z"),
+        std::future::pending(),
+    )
+    .await;
+
+    // The honest node drops the liar's datagrams under the bounded `domain` reason.
+    let rejected = wait_for(Duration::from_secs(6), || n1.reject_count("domain") > 0).await;
+    assert!(rejected, "no datagram was rejected for a domain mismatch");
+    // The forged label never appears in the honest node's view.
+    assert_ne!(n1.domain_of("liar").as_deref(), Some("rack-z"));
+
+    n1.handle.abort();
+    liar.handle.abort();
+}
+
 /// ADR 0003: nodes sharing the gossip key converge; a node with the wrong key
 /// (or none) is invisible to the cluster and sees nothing of it.
 #[tokio::test]
@@ -599,7 +714,7 @@ async fn recv_ack(sock: &UdpSocket, opener: &SwimAuth, buf: &mut [u8], within: D
         let Ok(Ok((n, _))) = tokio::time::timeout(remaining, sock.recv_from(buf)).await else {
             return false; // window elapsed with no datagram
         };
-        if let Some(o) = opener.open(&buf[..n]) {
+        if let Ok(o) = opener.open(&buf[..n]) {
             if let Ok(m) = bincode::deserialize::<Message>(o.payload) {
                 if matches!(m.kind, Kind::Ack { .. }) {
                     return true;

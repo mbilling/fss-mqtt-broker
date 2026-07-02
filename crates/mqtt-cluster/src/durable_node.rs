@@ -228,6 +228,9 @@ async fn run_driver(
     // A one-tick debounce: only act once the desired set is stable across a tick, so
     // a flapping member does not churn the voter set.
     let mut prev_desired: BTreeSet<RaftNodeId> = BTreeSet::new();
+    // Static-seed overrides already warned about, so the mismatch is loud once per
+    // (node, label) rather than per tick (ADR 0016 T6 loudness rule).
+    let mut warned_overrides: BTreeSet<(RaftNodeId, FailureDomain)> = BTreeSet::new();
     loop {
         tokio::time::sleep(DRIVER_TICK).await;
 
@@ -251,6 +254,21 @@ async fn run_driver(
         if desired == prev_desired {
             // Effective topology = the static seed (ADR 0016 T4, cluster-uniform config)
             // overlaid with self-advertised labels learned from gossip (T5), which win.
+            // A live label that contradicts the static seed is loud (once per label):
+            // one of the two configs is stale, and silent divergence would let an
+            // operator trust a map that is not the one being enforced.
+            for (id, live) in &live_domains {
+                if let Some(seed) = domains.get(id) {
+                    if seed != live && warned_overrides.insert((*id, live.clone())) {
+                        warn!(
+                            node = *id,
+                            static_label = %seed,
+                            gossiped_label = %live,
+                            "gossiped failure domain overrides the static MQTTD_FAILURE_DOMAINS entry"
+                        );
+                    }
+                }
+            }
             let mut effective = domains.clone();
             effective.extend(live_domains);
             let action = reconciler.decide_with_domains(&view, &desired, &effective);

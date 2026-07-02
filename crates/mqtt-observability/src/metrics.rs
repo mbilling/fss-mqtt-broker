@@ -305,7 +305,8 @@ impl Metrics {
         let gossip_rejected_total = register_family(
             &mut registry,
             "gossip_rejected",
-            "SWIM gossip datagrams dropped, by reason (auth, decode, identity, replay)",
+            "SWIM gossip datagrams dropped, by reason (auth, decode, identity, replay, \
+             expired, revoked, domain)",
         );
         let security_reloads_total = register_family(
             &mut registry,
