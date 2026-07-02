@@ -8,7 +8,10 @@
   [ADR 0005](0005-session-affinity.md) (placement owns relocation),
   [ADR 0006](0006-consensus-and-replication.md) / [ADR 0007](0007-durable-store-integration.md)
   (durable sessions whose recovery depends on a correct replica set),
-  [ADR 0017](0017-durable-attach-readiness.md) (the attach-path half of the failover gap)
+  [ADR 0017](0017-durable-attach-readiness.md) (the attach-path half of the failover gap),
+  [ADR 0021](0021-bounded-lease-voters.md) (the bounded voter set §5 spreads across
+  failure domains), [ADR 0022](0022-signed-gossip.md) (the authenticated gossip that
+  carries §5's domain labels)
 
 > This record states the decision only. The phased rollout and how far along it is live
 > in the [delivery doc](../delivery/0016-swim-membership-stability.md).
@@ -80,6 +83,64 @@ still overrides a false suspicion outright.)
 Incarnation precedence and self-refutation are correct and stay. The changes are
 *additive*: a terminal/tombstoned `Dead`, awareness-scaled timeouts, and
 confirmation-scaled suspicion.
+
+### 5. Failure-domain-aware voter placement (T4/T5, added after acceptance)
+
+[ADR 0021](0021-bounded-lease-voters.md)'s bounded voter set introduced a concentration
+risk the full-membership model never had: a topology-blind (lowest-id) fill can put a
+quorum of the N voters in one rack/zone, so that domain's loss halts lease consensus for
+the whole cluster. Two additive tasks close this:
+
+- **Selection (T4):** voter selection is **sticky first, balanced second**. A live,
+  eligible voter is never demoted to improve the spread (voter changes are Raft membership
+  changes — churn there costs more than an imperfect spread); only *free* decisions —
+  filling a vacancy, or the one-time shrink when adopting the cap — pick from the
+  **least-represented failure domain**, tie-breaking by lowest id so every successive
+  leader computes the same target deterministically. An unlabelled node is its own
+  singleton domain; with no labels at all the selection is bit-for-bit the prior
+  id-ordered fill.
+- **Topology source (T5):** each node advertises **only its own** `MQTTD_FAILURE_DOMAIN`
+  label inside the authenticated SWIM gossip payload (HMAC + per-node signature +
+  anti-replay, ADR 0003/0022/0023), learned non-erasingly like the routing address. The
+  lease driver reads the assembled map live each reconcile tick, overlaid on the optional
+  static `MQTTD_FAILURE_DOMAINS` seed (gossip wins) — the topology self-assembles and
+  tracks membership. The selection algorithm is source-agnostic (`decide_with_domains`
+  takes any map), which is the seam that let T5 swap the source without touching T4.
+
+This mirrors proven operational designs — Consul autopilot's redundancy zones (Serf-tag
+driven zone-aware voters) and Kubernetes zone-spread — rather than inventing new theory.
+
+**Honest limits of §5** (stated so operators do not assume stronger properties than are
+delivered):
+
+1. **The spread is eventual, not an invariant.** Stickiness means an already-concentrated
+   voter set (e.g. 3-of-5 voters in one rack because those nodes joined first) *stays*
+   concentrated until natural churn opens vacancies. The system converges toward balance;
+   it never forces it. Do not read "voters spread across domains" as a guarantee that
+   holds from the moment labels are configured.
+2. **Arithmetic beats topology at fewer than 3 domains.** Spreading 5 voters over 2 racks
+   still leaves ≥3 in one rack, so that rack's loss still takes quorum. Domain-loss
+   tolerance requires **≥ 3 failure domains** (just as Raft needs ≥ 3 voters for one node
+   loss). The mechanism spreads voters; it cannot beat the majority arithmetic.
+3. **T5 trades "identical map by construction" for eventual consistency.** T4's static
+   cluster-uniform map guaranteed every leader computed the same target from the same
+   input. Gossip-learned labels can transiently differ between nodes, so a leadership
+   change mid-propagation may briefly produce a different target. Accepted because the
+   reconciler is leader-only, debounced, vacancy-driven and sticky — divergence yields at
+   worst a transient extra membership proposal, never a safety violation (Raft joint
+   consensus owns safety) — and the views converge as gossip settles.
+4. **Domain labels are self-asserted.** ADR 0022 signing authenticates *which node* made
+   a claim, not that the claim is *true*: a compromised (but validly-certified) node can
+   claim any domain — e.g. a unique fake rack to make itself the balancing algorithm's
+   most attractive voter pick, or a victim domain's label to dilute its representation.
+   Impact is bounded (voter placement skew → availability degradation, not a safety/
+   forgery issue, since consensus safety still needs a quorum), and it matches the plane's
+   trust model: an authenticated member is trusted for its own metadata, exactly as it is
+   for its own address. Hardening options and their costs are recorded as **0016-T6**
+   (deferred) in the delivery doc.
+5. **A gossiped label silently overrides the static seed.** When both sources are set and
+   disagree, gossip wins without a warning today — a one-line `warn!` on mismatch would
+   fit the "weaker/surprising states are loud" house rule and is noted in 0016-T6's scope.
 
 ## Consequences
 
