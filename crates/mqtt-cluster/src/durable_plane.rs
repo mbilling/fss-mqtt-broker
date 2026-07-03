@@ -560,9 +560,10 @@ mod tests {
         // (Scoped so the guard is dropped before the await below.)
         {
             let replicas = p.replicas.lock().unwrap();
-            assert_eq!(replicas.fence(), 1);
             for i in 0..50u8 {
-                let entries = replicas.entries(&format!("q/{i}"));
+                let key = format!("q/{i}");
+                assert_eq!(replicas.fence_for_key(&key), 1);
+                let entries = replicas.entries(&key);
                 assert_eq!(entries.len(), 1, "key q/{i} applied exactly once");
                 assert_eq!(entries[0].record, vec![i]);
             }

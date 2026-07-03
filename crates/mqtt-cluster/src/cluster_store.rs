@@ -28,7 +28,7 @@ use crate::cluster_log::{merge_replica_logs, ClusterLog, ReplicaState, ReplicaTr
 use crate::lease::{Epoch, OwnershipLease};
 use crate::lease_raft::{GroupId, RaftNodeId};
 use crate::lease_store::LeaseStore;
-use crate::placement::{group_of, Placement};
+use crate::placement::{group_of_key, Placement};
 use crate::NodeId;
 use async_trait::async_trait;
 use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
@@ -158,9 +158,8 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     /// [`ReplError::NotOwner`] if this node does not own the group, or
     /// [`ReplError::NoQuorum`] if recovery cannot reach a quorum of replicas.
     async fn log_for_key(&self, key: &str) -> Result<Arc<ClusterLog<T>>, ReplError> {
-        // Keys are `q/<client>` / `m/<client>`; the client follows the 2-byte prefix.
-        let client = key.get(2..).unwrap_or(key);
-        let group = group_of(client);
+        // Keys carry a 2-byte kind prefix (`q/`/`m/`/`r/`) ahead of the placement key.
+        let group = group_of_key(key);
 
         // Resolve ownership + replica set without holding a lock across an await.
         let replica_set = {
@@ -865,15 +864,19 @@ mod tests {
         p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
         let placement = Arc::new(RwLock::new(p));
 
-        // Both followers already learned epoch 9 (a newer owner wrote through them),
-        // so this owner's epoch-1 appends are fenced and cannot reach quorum.
+        let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
+
+        // Both followers already learned epoch 9 **for this topic's group** (a newer
+        // owner wrote through them — fences are group-scoped), so this owner's
+        // epoch-1 appends are fenced and cannot reach quorum. The marker key shares
+        // the topic's placement key, hence its group.
         let transport = Arc::new(PeerReplicaTransport::new());
         for node in [nid("f1"), nid("f2")] {
             let state = Arc::new(Mutex::new(ReplicaState::new()));
             state.lock().unwrap().apply(
                 9,
                 &ReplOp::Append {
-                    key: "q/fence-marker".to_string(),
+                    key: format!("q/{topic}"),
                     offset: 1,
                     record: b"newer-owner".to_vec(),
                 },
@@ -890,8 +893,6 @@ mod tests {
             FixedLease(1),
             Arc::new(Mutex::new(ReplicaState::new())),
         ));
-
-        let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
         let err = retained.set(&topic, b"stale", 0).await.unwrap_err();
         assert!(
             matches!(err, mqtt_storage::StorageError::NoQuorum),
