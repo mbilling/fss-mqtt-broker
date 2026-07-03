@@ -44,6 +44,7 @@
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
+| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Proposed | [0/7 done](0037-durable-retained-messages.md) | 7 open |
 
 ## Open and deferred work
 
@@ -76,7 +77,7 @@
 
 **0014 — Cross-node retained-message replication**
 
-- `0014-T7` 💤 deferred: Partition-heal conflict reconciliation (two nodes holding different values for the same topic) — ADR §3 leaves divergence unresolved — gap-fill keeps each side's own value; reconciling needs per-message timestamps / version vectors — an ADR-level design decision (retained-value versioning), queued as the next 0014 follow-on now that T6/T8 are done.
+- `0014-T7` 💤 deferred: Partition-heal conflict reconciliation (two nodes holding different values for the same topic) — "Resolved by decision in ADR 0037 (Proposed): divergence is PREVENTED rather than reconciled — retained mutations commit through the topic's placement-group lease-owner with clock-free (epoch, offset) convergence tokens; LWW/HLC timestamp reconciliation was considered and rejected (clocks in the trust base, silently dropped acked writes). This task closes when 0037-P5/P6 land (offset-aware back-fill + heal-convergence integration tests)."
 
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
@@ -106,3 +107,13 @@
 **0036 — MQTT-over-QUIC transport (multi-stream)**
 
 - `0036-T11` 💤 deferred: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection) — 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.
+
+**0037 — Durable single-owner retained messages (clock-free convergence)**
+
+- `0037-P1` ⬜ planned: Divergence detection — value hash in the retained digest; warn + retained_divergence_total metric
+- `0037-P2` ⬜ planned: Retained keyspace in the group log — ret/<topic> set/clear ops, last-value compaction, versioned tombstones; quorum/fencing/takeover/restart unit tests on the pure cores
+- `0037-P3` ⬜ planned: Write path — retained mutations route through the group lease-owner (live delivery unchanged); durable-off falls back to ADR 0014 behaviour
+- `0037-P4` ⬜ planned: Commit fan-out — post-commit broadcast carries (epoch, offset); node caches apply monotonically per topic (idempotent, order-insensitive)
+- `0037-P5` ⬜ planned: Offset-aware back-fill — digest entries carry the token; higher (epoch, offset) wins per topic on link-up (replaces gap-fill-only), chunking (0014-T8) retained
+- `0037-P6` ⬜ planned: Partition semantics — bounded queue-until-heal for minority-side retained writes, loud drop counter at the bound; heal-convergence integration tests with divergent writes
+- `0037-P7` ⬜ planned: Docs + closure — README/operator docs (CP trade, queue bound, durable-off caveat), ADR 0014 revision notes, close 0014-T7 on this evidence
