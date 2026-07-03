@@ -306,7 +306,7 @@ impl Metrics {
             &mut registry,
             "gossip_rejected",
             "SWIM gossip datagrams dropped, by reason (auth, decode, identity, replay, \
-             expired, revoked, domain)",
+             expired, revoked, domain, cert-miss)",
         );
         let security_reloads_total = register_family(
             &mut registry,

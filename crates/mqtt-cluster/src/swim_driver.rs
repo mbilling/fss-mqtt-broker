@@ -10,7 +10,7 @@
 //! never reach the protocol state machine.
 
 use crate::replay::{ReplayWindow, SeqStore, SequenceAllocator};
-use crate::swim::{Action, MemberState, Message, Swim};
+use crate::swim::{Action, Kind, MemberState, Message, Swim};
 use crate::swim_auth::{Opened, SwimAuth};
 use crate::NodeId;
 use std::collections::HashMap;
@@ -24,10 +24,10 @@ use tracing::{debug, trace};
 pub type SeqAlloc = SequenceAllocator<Box<dyn SeqStore>>;
 
 /// A sink for **dropped-gossip** events, called with a bounded reason class (`"auth"`,
-/// `"decode"`, `"identity"`, `"replay"`, `"expired"`, `"revoked"`, `"domain"`) each time an
-/// inbound datagram is rejected (ADR 0003). A callback rather than a metrics handle keeps
-/// this crate free of any observability backend — the broker passes a closure that bumps
-/// its counter.
+/// `"decode"`, `"identity"`, `"replay"`, `"expired"`, `"revoked"`, `"domain"`,
+/// `"cert-miss"`) each time an inbound datagram is rejected (ADR 0003). A callback rather
+/// than a metrics handle keeps this crate free of any observability backend — the broker
+/// passes a closure that bumps its counter.
 pub type RejectCounter = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
 
 /// Maximum SWIM datagram size we are willing to receive.
@@ -184,12 +184,15 @@ async fn apply(
 ) {
     match action {
         Action::Send { to, msg } => {
+            // First-contact / full-state kinds carry the full certificate (0022-T6
+            // priming); routine probe traffic rides on the fingerprint.
+            let prime = matches!(msg.kind, Kind::Join | Kind::Sync);
             if let Ok(bytes) = bincode::serialize(&msg) {
                 // With a sequence allocator configured, seal a signed+sequenced v3 datagram
                 // (ADR 0023); otherwise the signed/plain seal (ADR 0022/0003).
                 let datagram = match (auth, seq_alloc.as_mut()) {
-                    (Some(a), Some(alloc)) => a.seal_sequenced(&bytes, alloc.allocate()),
-                    (Some(a), None) => a.seal(&bytes),
+                    (Some(a), Some(alloc)) => a.seal_sequenced(&bytes, alloc.allocate(), prime),
+                    (Some(a), None) => a.seal(&bytes, prime),
                     (None, _) => bytes,
                 };
                 let _ = socket.send_to(&datagram, &to).await;

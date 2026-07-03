@@ -557,7 +557,7 @@ async fn a_forged_sender_identity_is_rejected() {
     let (victim_addr, victim) = spawn_signed_node("victim", vec![], key).await;
     let evil = signed_auth(key, "evil");
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let seal = |m: &Message| evil.seal(&bincode::serialize(m).unwrap());
+    let seal = |m: &Message| evil.seal(&bincode::serialize(m).unwrap(), true);
 
     // Control: a Join honestly attributed to "evil" is accepted (the victim learns it).
     let honest = Message {
@@ -668,7 +668,7 @@ async fn a_replayed_v3_datagram_is_dropped() {
         gossip: vec![],
     };
     // One datagram at anti-replay sequence 1.
-    let datagram = sender.seal_sequenced(&bincode::serialize(&ping).unwrap(), 1);
+    let datagram = sender.seal_sequenced(&bincode::serialize(&ping).unwrap(), 1, true);
     // A sequenced (v3) opener: under strict postures only a v3 node opens the victim's v3
     // replies (its own CN is irrelevant — the stub verifier recovers the signer's CN).
     let opener = signed_auth(key, "x").with_sequencing();

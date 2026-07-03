@@ -104,11 +104,13 @@ cluster-bus TLS material are present.
   "a key-holder"; a compromised node can no longer impersonate peers or forge third-party
   `Dead`/`Suspect` claims; the `suspecter` confirmation signal (ADR 0016) becomes
   trustworthy. The shared key is retained as a second, independent factor.
-- **Cost:** larger datagrams — an inline P-256 cert (~0.4–0.6 KiB) plus a signature
-  (~64–72 B) per datagram, well under the 64 KiB bound but a real bandwidth increase on the
-  gossip plane. A per-datagram asymmetric verify and chain check replaces a single HMAC;
-  negligible at gossip's few-datagrams-per-second-per-node volume. Requires cluster-bus
-  mTLS material to be provisioned.
+- **Cost:** larger datagrams — a signature (~64–72 B) per datagram plus the certificate
+  reference: since T6 (below), most datagrams carry a **32-byte fingerprint** rather than
+  the inline ~0.4–0.6 KiB certificate, keeping routine signed gossip under a typical
+  1500-byte MTU; the full certificate rides only first-contact (Join/Sync) and periodic
+  refresh datagrams. A per-datagram asymmetric verify and chain check replaces a single
+  HMAC; negligible at gossip's few-datagrams-per-second-per-node volume. Requires
+  cluster-bus mTLS material to be provisioned.
 - **Risk:** this is correctness-critical security code. It is built **test-first**, with
   known-answer tests pinning the wire format and signing, adversarial tests (forged `from`,
   cert not chaining to the CA, swapped signature, tampered fields), and a two-node
@@ -137,6 +139,26 @@ The certificate is also the carrier for **CA-attested failure-domain labels**
 (ADR 0016 T6): a SAN of `URI:urn:fss:failure-domain:<label>` makes the CA the authority
 for the holder's topology label; the verify path surfaces it and the gossip driver
 enforces it over any self-claim.
+
+## Certificate fingerprinting (T6, added after acceptance)
+
+Inlining the full leaf certificate in **every** datagram — correct and bootstrap-safe —
+made each signed datagram ~0.5 KiB heavier, pushing gossip with piggybacked updates past
+a typical 1500-byte MTU (UDP fragmentation amplifies loss on lossy networks). T6 replaces
+the always-inline certificate with a **cert-ref**: the full certificate on **priming**
+datagrams (Join/Sync — the first-contact and full-state moments, chosen by the driver
+from the message kind) and on every 16th datagram as a loss-recovery bound; a **32-byte
+SHA-256 fingerprint** otherwise.
+
+The receiver caches certificates by fingerprint — but **only certificates that passed the
+full verification** enter the cache, and fingerprinting is *pure wire compression*, not a
+trust change: every datagram, fingerprint-form included, still runs the complete
+verification (CA chain, validity window, CRL revocation, signature) against the cached
+DER — so a CRL published mid-stream (T7) applies to fingerprint datagrams immediately. A
+fingerprint that misses the cache is a bounded, recoverable drop (`cert-miss`): the
+sender's next priming or periodic full-cert datagram re-primes it. The cache is bounded
+(128 entries — far above any real cluster; cleared and re-primed on overflow, which only
+fully-verified certificates can reach).
 
 ## Alternatives considered
 
