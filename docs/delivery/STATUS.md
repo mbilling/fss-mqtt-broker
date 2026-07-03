@@ -44,7 +44,7 @@
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
-| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Proposed | [1/7 done](0037-durable-retained-messages.md) | 6 open |
+| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Proposed | [2/7 done](0037-durable-retained-messages.md) | 5 open |
 
 ## Open and deferred work
 
@@ -110,7 +110,6 @@
 
 **0037 — Durable single-owner retained messages (clock-free convergence)**
 
-- `0037-P2` ⬜ planned: Retained keyspace in the group log — ret/<topic> set/clear ops, last-value compaction, versioned tombstones; quorum/fencing/takeover/restart unit tests on the pure cores
 - `0037-P3` ⬜ planned: Write path — retained mutations route through the group lease-owner (live delivery unchanged); durable-off falls back to ADR 0014 behaviour
 - `0037-P4` ⬜ planned: Commit fan-out — post-commit broadcast carries (epoch, offset); node caches apply monotonically per topic (idempotent, order-insensitive)
 - `0037-P5` ⬜ planned: Offset-aware back-fill — digest entries carry the token; higher (epoch, offset) wins per topic on link-up (replaces gap-fill-only), chunking (0014-T8) retained

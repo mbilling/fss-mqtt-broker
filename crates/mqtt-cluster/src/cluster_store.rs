@@ -318,6 +318,12 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys())
     }
+
+    async fn epoch_for(&self, key: &String) -> Result<u64, ReplError> {
+        // The routed log is rebuilt per lease epoch, so this is exactly the epoch an
+        // `append` through the same route would stamp its ops with (ADR 0037 token).
+        Ok(self.log_for_key(key).await?.epoch())
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +341,7 @@ mod tests {
     use mqtt_core::{ClientId, Message, QoS};
     use mqtt_storage::logged::ReplicatedSessionStore;
     use mqtt_storage::repl::ReplicatedLog;
+    use mqtt_storage::retained_log::ReplicatedRetained;
     use mqtt_storage::SessionStore;
     use std::sync::{Arc, Mutex, RwLock};
     use tokio::sync::mpsc;
@@ -351,6 +358,17 @@ mod tests {
     impl LeaseSource for FixedLease {
         async fn epoch_for(&self, _group: GroupId) -> Result<Epoch, mqtt_storage::repl::ReplError> {
             Ok(self.0)
+        }
+    }
+
+    /// A lease source whose epoch can be bumped to simulate ownership lost + regained.
+    #[derive(Clone)]
+    struct BumpableLease(Arc<std::sync::atomic::AtomicU64>);
+
+    #[async_trait]
+    impl LeaseSource for BumpableLease {
+        async fn epoch_for(&self, _group: GroupId) -> Result<Epoch, mqtt_storage::repl::ReplError> {
+            Ok(self.0.load(std::sync::atomic::Ordering::Relaxed))
         }
     }
 
@@ -669,19 +687,6 @@ mod tests {
     async fn a_higher_lease_epoch_rebuilds_and_re_recovers_the_log() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        /// A lease source whose epoch can be bumped to simulate a regain.
-        #[derive(Clone)]
-        struct BumpableLease(Arc<AtomicU64>);
-        #[async_trait]
-        impl LeaseSource for BumpableLease {
-            async fn epoch_for(
-                &self,
-                _group: GroupId,
-            ) -> Result<Epoch, mqtt_storage::repl::ReplError> {
-                Ok(self.0.load(Ordering::Relaxed))
-            }
-        }
-
         let owner = nid("owner");
         // Single-node group (quorum 1): recovery reads only this node's own copy.
         let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
@@ -737,5 +742,203 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(&got[2].record, b"m3");
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0037 P2: the retained keyspace (`r/<topic>`) over the group log.
+    // Topics route by the same string hashing as client ids (the router recovers
+    // the placement key from `key[2..]`), so the owned/foreign pickers above
+    // double as topic pickers via the client string.
+    // -----------------------------------------------------------------------
+
+    /// A retained set commits through the topic's group: quorum-replicated to the
+    /// followers, compacted to the last value (on the followers too — the truncate
+    /// propagates), and reporting the `(epoch, offset)` convergence token of the
+    /// lease it committed under.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retained_set_commits_through_the_group_and_replicates() {
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two followers.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
+        for (node, state) in [(nid("f1"), &f1_state), (nid("f2"), &f2_state)] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx);
+            spawn_follower(transport.clone(), state.clone(), rx);
+        }
+
+        let log = Arc::new(GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(1),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        ));
+        let retained = ReplicatedRetained::new(log.clone());
+        let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
+
+        assert_eq!(
+            retained.set(&topic, b"v1", 1).await.unwrap(),
+            (1, 1),
+            "the token is the committing lease epoch and the assigned offset"
+        );
+        assert_eq!(retained.set(&topic, b"v2", 1).await.unwrap(), (1, 2));
+
+        // The owner serves exactly the compacted last value, under its token.
+        let e = retained.get(&topic).await.unwrap().unwrap();
+        assert_eq!(e.payload, b"v2");
+        assert_eq!(e.token(), (1, 2));
+        let rkey = format!("r/{topic}");
+        assert_eq!(log.live_range(&rkey).await.unwrap(), Some((2, 2)));
+
+        // Durable and compacted on the followers too: each holds exactly the last
+        // record (the awaited truncate delivery dropped the superseded one).
+        for (name, state) in [("f1", &f1_state), ("f2", &f2_state)] {
+            let entries = state.lock().unwrap().entries(&rkey);
+            assert_eq!(
+                entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
+                vec![2],
+                "{name} should hold exactly the compacted retained record"
+            );
+        }
+    }
+
+    /// The conflict-prevention invariant at the storage boundary: a retained write
+    /// for a topic whose group this node does not own is refused as `NotOwner`
+    /// (transient — route/queue per ADR 0037 §5), never applied locally where it
+    /// could diverge from the owner's committed value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_topics_retained_write_is_refused_not_diverged() {
+        let owner = nid("owner");
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+
+        let retained = ReplicatedRetained::new(GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            Arc::new(PeerReplicaTransport::new()),
+            FixedLease(1),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        ));
+
+        let topic = foreign_client(&placement.read().unwrap()).0;
+        let err = retained.set(&topic, b"x", 0).await.unwrap_err();
+        assert!(
+            matches!(err, mqtt_storage::StorageError::NotOwner),
+            "a foreign topic must refuse as NotOwner, got {err:?}"
+        );
+    }
+
+    /// Stale-epoch fencing: a superseded lease-holder — its followers have moved to
+    /// a newer epoch — cannot commit a retained write. The set fails (`NoQuorum`,
+    /// transient) instead of committing a value a fenced owner could never converge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stale_epoch_retained_write_is_fenced_not_committed() {
+        let owner = nid("owner");
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+
+        // Both followers already learned epoch 9 (a newer owner wrote through them),
+        // so this owner's epoch-1 appends are fenced and cannot reach quorum.
+        let transport = Arc::new(PeerReplicaTransport::new());
+        for node in [nid("f1"), nid("f2")] {
+            let state = Arc::new(Mutex::new(ReplicaState::new()));
+            state.lock().unwrap().apply(
+                9,
+                &ReplOp::Append {
+                    key: "q/fence-marker".to_string(),
+                    offset: 1,
+                    record: b"newer-owner".to_vec(),
+                },
+            );
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx);
+            spawn_follower(transport.clone(), state, rx);
+        }
+
+        let retained = ReplicatedRetained::new(GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport,
+            FixedLease(1),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        ));
+
+        let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
+        let err = retained.set(&topic, b"stale", 0).await.unwrap_err();
+        assert!(
+            matches!(err, mqtt_storage::StorageError::NoQuorum),
+            "a fenced owner must fail the retained write with NoQuorum, got {err:?}"
+        );
+    }
+
+    /// Owner takeover recovers the retained high-water: after the lease epoch
+    /// advances (ownership lost and regained), the rebuilt log re-recovers the
+    /// compacted retained value **with its original token** from the replica set,
+    /// and the next write's token is strictly higher — no offset reuse, no token
+    /// regression across the takeover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_takeover_recovers_the_retained_value_and_its_token() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two followers.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        for node in [nid("f1"), nid("f2")] {
+            let state = Arc::new(Mutex::new(ReplicaState::new()));
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx);
+            spawn_follower(transport.clone(), state, rx);
+        }
+
+        let epoch = Arc::new(AtomicU64::new(2));
+        let retained = ReplicatedRetained::new(GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport,
+            BumpableLease(epoch.clone()),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        ));
+        let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
+
+        retained.set(&topic, b"v1", 1).await.unwrap();
+        assert_eq!(retained.set(&topic, b"v2", 1).await.unwrap(), (2, 2));
+
+        // Ownership lost and regained at a higher epoch: the cached group log is
+        // rebuilt and the key re-recovered from the followers' committed copies
+        // (this node's own follower copy is empty — the old owner state is gone).
+        epoch.store(5, Ordering::Relaxed);
+
+        let e = retained.get(&topic).await.unwrap().unwrap();
+        assert_eq!(
+            e.payload, b"v2",
+            "the committed value survives the takeover"
+        );
+        assert_eq!(
+            e.token(),
+            (2, 2),
+            "with its original token, not a reissued one"
+        );
+
+        // The next write commits under the new epoch, after the recovered
+        // high-water: strictly increasing tokens across the takeover.
+        let tok = retained.set(&topic, b"v3", 1).await.unwrap();
+        assert_eq!(tok, (5, 3));
+        assert!(tok > e.token());
     }
 }

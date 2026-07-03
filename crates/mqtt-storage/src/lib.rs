@@ -23,6 +23,7 @@ pub mod logged;
 pub mod persistent_log;
 pub mod persistent_retained;
 pub mod repl;
+pub mod retained_log;
 
 /// A monotonically increasing position within a single session's queue log.
 ///
