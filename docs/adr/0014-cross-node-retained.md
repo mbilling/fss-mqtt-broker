@@ -108,9 +108,13 @@ version vectors and is out of scope (tracked as T7).
   trigger a cross-node query and wait, adding latency to the common case to serve the
   rare late-join; broadcasting on publish keeps subscribe local and fast.
 - **Replicate the retained store via the durable plane (consensus).** Rejected as the
-  default: retained messages do not need linearizable consensus, and routing every
-  retained publish through raft would be far heavier than a best-effort broadcast.
+  default *at the time*: retained messages do not need linearizable consensus, and routing
+  every retained publish through raft would be far heavier than a best-effort broadcast.
   The durable plane remains the right home for the *back-fill digest* (§3) when that
-  lands.
+  lands. **Revised by [ADR 0037](0037-durable-retained-messages.md):** the T7 divergence
+  analysis (permanent post-heal divergence *and* an everyday concurrent-publish race) plus
+  the decision to keep clocks out of correctness reversed this verdict — retained
+  *mutations* now commit through the group lease-owner, while this ADR's live delivery and
+  local-read model stand.
 - **Leave it node-local.** Rejected: it silently violates retained semantics in a
   cluster, which is the whole point of the feature.

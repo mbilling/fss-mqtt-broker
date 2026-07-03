@@ -1,0 +1,74 @@
+---
+adr: "0037"
+title: Durable single-owner retained messages (clock-free convergence)
+adr_status: Proposed
+tasks:
+  - id: 0037-P1
+    title: Divergence detection — value hash in the retained digest; warn + retained_divergence_total metric
+    status: planned
+  - id: 0037-P2
+    title: Retained keyspace in the group log — ret/<topic> set/clear ops, last-value compaction, versioned tombstones; quorum/fencing/takeover/restart unit tests on the pure cores
+    status: planned
+  - id: 0037-P3
+    title: Write path — retained mutations route through the group lease-owner (live delivery unchanged); durable-off falls back to ADR 0014 behaviour
+    status: planned
+  - id: 0037-P4
+    title: Commit fan-out — post-commit broadcast carries (epoch, offset); node caches apply monotonically per topic (idempotent, order-insensitive)
+    status: planned
+  - id: 0037-P5
+    title: Offset-aware back-fill — digest entries carry the token; higher (epoch, offset) wins per topic on link-up (replaces gap-fill-only), chunking (0014-T8) retained
+    status: planned
+  - id: 0037-P6
+    title: Partition semantics — bounded queue-until-heal for minority-side retained writes, loud drop counter at the bound; heal-convergence integration tests with divergent writes
+    status: planned
+  - id: 0037-P7
+    title: Docs + closure — README/operator docs (CP trade, queue bound, durable-off caveat), ADR 0014 revision notes, close 0014-T7 on this evidence
+    status: planned
+---
+
+# Delivery — ADR 0037: Durable single-owner retained messages
+
+Decision: [docs/adr/0037-durable-retained-messages.md](../adr/0037-durable-retained-messages.md).
+
+Retained-message conflicts are **prevented, not resolved**: every retained mutation commits
+through its topic's placement-group lease-owner into the quorum-replicated group log, and
+all cache/back-fill decisions reduce to a consensus-issued `(epoch, offset)` token — no
+wall-clock anywhere. Detection lands first (P1) as the baseline and the after-proof; each
+phase lands test-first and independently green.
+
+## Plan
+
+| Task | Acceptance criterion |
+|------|----------------------|
+| **0037-P1** Detect divergence | The link-up retained digest carries a value hash; peers holding different values for the same topic produce a `warn!` and increment `retained_divergence_total`. No behavioural change to what is stored. Lands independently of the migration and keeps working after it (post-migration the counter staying at zero is the convergence proof). |
+| **0037-P2** Log keyspace | The group log supports `ret/<topic>` set/clear ops with last-value compaction; a zero-length clear is a **versioned tombstone**. Pure-core unit tests: quorum commit, stale-epoch fencing, owner-takeover recovery of the retained high-water, restart recovery from the persisted log (ADR 0018). |
+| **0037-P3** Owner write path | A retained publish landing on any node routes its retained mutation to the group lease-owner (live delivery to subscribers unchanged and undelayed); with durable off, retained behaves exactly as ADR 0014 today (documented caveat). |
+| **0037-P4** Commit fan-out | After commit, the owner broadcasts `(topic, value, epoch, offset)`; each node's local retained cache applies it only when the token exceeds the held one — monotonic per topic, idempotent, order-insensitive. Subscribe-time replay stays a local read. |
+| **0037-P5** Token back-fill | Digest entries carry the token; on link-up the receiver pulls and takes the higher-token value per topic (gap-fill-only rule replaced). Two nodes holding divergent values converge deterministically to the committed one; chunked snapshots (0014-T8) unchanged. |
+| **0037-P6** Partition semantics | On the quorum-less side a retained mutation queues (bounded per node); the bound drops oldest **loudly** (counter). On heal the queue submits to the owner in order and commits. Integration: divergent retained writes across a partition converge after heal on **every** node; the 0014-T7 scenario closes. |
+| **0037-P7** Docs + closure | README/operator docs state the CP trade (minority staleness, never divergence), the queue bound, and the durable-off fallback; ADR 0014 gains revision notes; 0014-T7 closes citing this delivery. |
+
+## Progress
+
+<!-- status-table:0037 -->
+| Task | Status | When | Evidence / notes |
+|------|--------|------|------------------|
+| 0037-P1 | ⬜ planned | — |  |
+| 0037-P2 | ⬜ planned | — |  |
+| 0037-P3 | ⬜ planned | — |  |
+| 0037-P4 | ⬜ planned | — |  |
+| 0037-P5 | ⬜ planned | — |  |
+| 0037-P6 | ⬜ planned | — |  |
+| 0037-P7 | ⬜ planned | — |  |
+<!-- /status-table:0037 -->
+
+## Changelog
+
+- **2026-07-03** — ADR proposed and delivery opened, resolving the 0014-T7 question
+  (partition-heal retained divergence) by **prevention**: single-owner writes through the
+  existing lease/group-log machinery with clock-free `(epoch, offset)` convergence tokens,
+  local caches warmed by commit fan-out, offset-aware back-fill, and bounded
+  queue-until-heal partition semantics. LWW/HLC resolution rejected (clocks in the trust
+  base; silently dropped acked writes). Detection (P1) sequenced first as baseline and
+  after-proof. Revises ADR 0014's earlier "rejected as the default" verdict on
+  durable-plane retained with the post-T6/T7 analysis.
