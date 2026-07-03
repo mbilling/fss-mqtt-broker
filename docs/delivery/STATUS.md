@@ -44,7 +44,7 @@
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
-| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Proposed | [4/7 done](0037-durable-retained-messages.md) | 3 open |
+| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Proposed | [5/7 done](0037-durable-retained-messages.md) | 2 open |
 
 ## Open and deferred work
 
@@ -110,6 +110,5 @@
 
 **0037 — Durable single-owner retained messages (clock-free convergence)**
 
-- `0037-P5` ⬜ planned: Offset-aware back-fill — digest entries carry the token; higher (epoch, offset) wins per topic on link-up (replaces gap-fill-only), chunking (0014-T8) retained
 - `0037-P6` ⬜ planned: Partition semantics — bounded queue-until-heal for minority-side retained writes, loud drop counter at the bound; heal-convergence integration tests with divergent writes
 - `0037-P7` ⬜ planned: Docs + closure — README/operator docs (CP trade, queue bound, durable-off caveat), ADR 0014 revision notes, close 0014-T7 on this evidence
