@@ -39,6 +39,7 @@ use mqtt_core::{
     parse_shared, topic_matches, AppProperties, ClientId, Message, SharedSubscriptionTable,
     Subscription, SubscriptionTable,
 };
+use mqtt_storage::retained_log::DurableRetained;
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionClaim, SessionStore,
     StorageError,
@@ -459,6 +460,19 @@ pub enum HubCommand {
         /// The peer to send the snapshot to.
         node: NodeId,
     },
+    /// A retained mutation a peer routed here because this node owns the topic's
+    /// placement group (ADR 0037 §1): commit it into the durable retained keyspace.
+    /// Live delivery already happened on the landing node (and its broadcast rides
+    /// [`RemotePublish`](Self::RemotePublish) as before) — this is only the authority
+    /// write.
+    RemoteRetainedCommit {
+        /// Destination topic.
+        topic: String,
+        /// The retained payload; empty = clear (versioned tombstone).
+        payload: Bytes,
+        /// The publish `QoS` as its 2-bit wire value.
+        qos: u8,
+    },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
     RemoteSharedDeliver {
@@ -569,6 +583,11 @@ pub struct Hub {
     durable_plane: Option<DurablePlane>,
     /// Retained message storage.
     retained: Box<dyn RetainedStore>,
+    /// The durable retained keyspace (ADR 0037), when durable sessions are on: the
+    /// owner-routed, quorum-committed **authority** for retained state, written in
+    /// addition to the local cache above. `None` (durable off) keeps ADR 0014
+    /// best-effort behaviour unchanged.
+    durable_retained: Option<Arc<dyn DurableRetained>>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -729,6 +748,7 @@ impl Hub {
                 store,
                 durable_plane: None,
                 retained: Box::new(MemoryRetainedStore::new()),
+                durable_retained: None,
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -751,6 +771,14 @@ impl Hub {
     /// phase 4).
     pub fn attach_retained_store(&mut self, retained: Box<dyn RetainedStore>) {
         self.retained = retained;
+    }
+
+    /// Attach the durable retained keyspace before [`run`](Self::run) (ADR 0037): every
+    /// locally-originated retained mutation is then also routed to its topic's group
+    /// lease-owner and quorum-committed. Only set when durable sessions are on; left
+    /// unset, retained keeps the ADR 0014 best-effort behaviour unchanged.
+    pub fn attach_durable_retained(&mut self, retained: Arc<dyn DurableRetained>) {
+        self.durable_retained = Some(retained);
     }
 
     /// Attach the Prometheus metrics registry before [`run`](Self::run) so the hub records
@@ -924,6 +952,17 @@ impl Hub {
             HubCommand::RemoteRetainedRequest { node } => {
                 self.send_retained_snapshot(&node).await;
             }
+            HubCommand::RemoteRetainedCommit {
+                topic,
+                payload,
+                qos,
+            } => {
+                // A peer routed a retained mutation here because this node owns the
+                // topic's group (ADR 0037 §1): commit it into the durable keyspace.
+                // The owner check is enforced by the keyspace itself (a moved lease
+                // fails with NotOwner rather than committing off-owner).
+                self.commit_retained_local(&topic, &payload, qos);
+            }
             HubCommand::RemoteSharedDeliver {
                 client,
                 topic,
@@ -963,6 +1002,14 @@ impl Hub {
         self.deliver_shared(topic, payload, qos, message_expiry, app)
             .await;
         self.forward_to_peers(topic, payload, qos, retain, message_expiry, app);
+        // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
+        // route the retained mutation to its topic's group lease-owner for the
+        // quorum-committed authority write. Only the **landing** node routes (a
+        // forwarded publish enters via `RemotePublish` → `deliver`, never here), so one
+        // publish is exactly one authority commit.
+        if retain {
+            self.route_retained_commit(topic, payload, qos_num(qos));
+        }
     }
 
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
@@ -2244,6 +2291,77 @@ impl Hub {
         }
     }
 
+    /// Route a locally-originated retained mutation to its topic's group lease-owner
+    /// (ADR 0037 §1). With durable off (`durable_retained` unset) this is a no-op and
+    /// retained keeps the ADR 0014 best-effort behaviour. Owner-local mutations commit
+    /// off-loop; a peer-owned topic gets a targeted, fire-and-forget
+    /// [`PeerMessage::RetainedCommit`] — live delivery already happened either way.
+    fn route_retained_commit(&self, topic: &str, payload: &Bytes, qos: u8) {
+        if self.durable_retained.is_none() {
+            return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
+        }
+        // The owner of the topic's placement group; with no ring (single node /
+        // no cluster), this node is trivially the owner.
+        let owner = self.placement.as_ref().map_or_else(
+            || self.node_id.clone(),
+            |p| {
+                p.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .owner(topic)
+            },
+        );
+        if owner == self.node_id {
+            self.commit_retained_local(topic, payload, qos);
+        } else if let Some(peer) = self.peers.get(&owner) {
+            let _ = peer.tx.send(PeerMessage::RetainedCommit {
+                topic: topic.to_string(),
+                payload: payload.to_vec(),
+                qos,
+            });
+        } else {
+            // The owner is not linked (partitioned or dead): the mutation cannot reach
+            // the authority. Loud, so the gap is visible until the bounded
+            // queue-until-heal lands (ADR 0037 §5, 0037-P6). Caches still carry the
+            // broadcast value; back-fill reconciles them once P5 makes tokens flow.
+            warn!(
+                topic = %topic,
+                owner = %owner.0,
+                "retained mutation could not reach its group owner; durable commit skipped (0037-P6 adds the queue)"
+            );
+        }
+    }
+
+    /// Commit a retained mutation into the durable keyspace on this (owner) node,
+    /// **off-loop**: the quorum round-trip must not stall the hub actor. A zero-length
+    /// payload is the MQTT clear [MQTT-3.3.1-10] → a versioned tombstone (ADR 0037 P2).
+    fn commit_retained_local(&self, topic: &str, payload: &Bytes, qos: u8) {
+        let Some(durable) = self.durable_retained.clone() else {
+            return;
+        };
+        let topic = topic.to_string();
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            let result = if payload.is_empty() {
+                durable.clear(&topic).await
+            } else {
+                durable.set(&topic, &payload, qos).await
+            };
+            match result {
+                Ok((epoch, offset)) => {
+                    debug!(topic = %topic, epoch, offset, "retained mutation committed");
+                }
+                // NotOwner here means the lease moved after routing (or the sender's
+                // ring was stale); NoQuorum that the commit could not be made durable.
+                // Loud until P5/P6 give these a repair path (token back-fill / queue).
+                Err(e) => warn!(
+                    topic = %topic,
+                    error = %e,
+                    "retained durable commit failed; caches keep the broadcast value (0037-P5/P6 add repair)"
+                ),
+            }
+        });
+    }
+
     /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
     #[allow(clippy::too_many_arguments)] // mirrors the SharedDeliver wire fields
     fn send_shared_to_peer(
@@ -2425,10 +2543,14 @@ mod tests {
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::PeerMessage;
+    use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
+    use mqtt_cluster::swim::MemberState;
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
     use mqtt_core::{AppProperties, ClientId};
+    use mqtt_storage::repl::InMemoryReplicatedLog;
     use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
+    use std::sync::{Arc, RwLock};
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
@@ -3785,6 +3907,192 @@ mod tests {
             app: AppProperties::default(),
         })
         .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0037 P3: the owner write path — a locally-originated retained mutation
+    // also commits into the durable retained keyspace, routed to the topic's
+    // placement-group owner. Durable off (no keyspace attached) keeps the ADR 0014
+    // best-effort behaviour byte-for-byte.
+    // -----------------------------------------------------------------------
+
+    type TestDurableRetained =
+        std::sync::Arc<mqtt_storage::retained_log::ReplicatedRetained<InMemoryReplicatedLog>>;
+
+    /// A hub with the durable retained keyspace attached (over an in-memory log —
+    /// epoch 0) and a placement ring of this node plus `peers`. Returns the handle so
+    /// tests can observe what was durably committed.
+    fn start_hub_with_durable_retained(
+        peers: &[&str],
+    ) -> (HubTx, TestDurableRetained, Arc<RwLock<Placement>>) {
+        let local = NodeId("hub-test".into());
+        let mut p = Placement::new(local.clone(), DEFAULT_REPLICAS);
+        for n in peers {
+            p.observe(&NodeId((*n).into()), MemberState::Alive, "peer:7000", None);
+        }
+        let placement = Arc::new(RwLock::new(p));
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            local,
+            Arc::new(MemorySessionStore::new()),
+            Some(placement.clone()),
+        );
+        let handle = Arc::new(mqtt_storage::retained_log::ReplicatedRetained::new(
+            InMemoryReplicatedLog::new(),
+        ));
+        hub.attach_durable_retained(handle.clone());
+        tokio::spawn(hub.run());
+        (tx, handle, placement)
+    }
+
+    /// Poll the durable keyspace until `topic`'s committed entry satisfies `pred`
+    /// (the commit runs off-loop), or fail after a bounded wait.
+    async fn wait_durable_retained(
+        handle: &TestDurableRetained,
+        topic: &str,
+        pred: impl Fn(&mqtt_storage::retained_log::RetainedEntry) -> bool,
+    ) -> mqtt_storage::retained_log::RetainedEntry {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(e) = handle.get(topic).await.unwrap() {
+                if pred(&e) {
+                    return e;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "durable retained commit never landed for {topic}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A retained publish landing on the topic's group owner commits into the durable
+    /// keyspace with its `(epoch, offset)` token — and live delivery to a subscriber
+    /// happens as before (undelayed by the off-loop commit). A zero-length retained
+    /// publish commits a **versioned tombstone**, not an absence.
+    #[tokio::test]
+    async fn a_local_retained_publish_commits_to_the_durable_keyspace() {
+        // Single-node ring: this node owns every group.
+        let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
+
+        let (mut sub, _) = attach(&tx, "s", 1, true).await;
+        subscribe(&tx, "s", "dev/1/state");
+
+        publish_retained(&tx, "dev/1/state", b"open");
+        // Live delivery is untouched by the authority write.
+        assert_eq!(payload_of(&recv_packet(&mut sub).await.unwrap()), b"open");
+        // The mutation committed durably with its token (in-memory log: epoch 0).
+        let e = wait_durable_retained(&durable, "dev/1/state", |_| true).await;
+        assert_eq!(e.payload, b"open");
+        assert!(!e.tombstone);
+        assert_eq!(e.token(), (0, 1));
+
+        // The MQTT clear is a committed tombstone with the next token — versioned,
+        // so a heal can order it against any concurrent value (ADR 0037 P2).
+        publish_retained(&tx, "dev/1/state", b"");
+        let e = wait_durable_retained(&durable, "dev/1/state", |e| e.tombstone).await;
+        assert_eq!(e.token(), (0, 2));
+    }
+
+    /// A retained publish for a topic whose group a PEER owns routes the mutation to
+    /// that owner as a targeted `RetainedCommit` — no local durable write (a non-owner
+    /// append would diverge; the owner is the single writer, ADR 0037 §1). The
+    /// ordinary ADR 0014 broadcast still precedes it on the same link.
+    #[tokio::test]
+    async fn a_foreign_topics_retained_publish_routes_the_commit_to_its_owner() {
+        let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let mut peer = connect_peer(&tx, "n", 1);
+
+        // A topic whose placement group "n" owns.
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+
+        tx.send(HubCommand::Publish {
+            topic: topic.clone(),
+            payload: Bytes::from_static(b"v"),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+
+        // The link carries the ADR 0014 broadcast first, then the authority routing.
+        let mut saw_broadcast = false;
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::Publish { retain, .. }) => saw_broadcast = retain,
+                Some(PeerMessage::RetainedCommit {
+                    topic: t,
+                    payload,
+                    qos,
+                }) => {
+                    assert_eq!(t, topic);
+                    assert_eq!(payload, b"v");
+                    assert_eq!(qos, 1);
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        assert!(saw_broadcast, "the ADR 0014 broadcast still happens");
+        // No local durable write for a foreign topic: the owner is the single writer.
+        assert!(durable.get(&topic).await.unwrap().is_none());
+    }
+
+    /// The owner side of the routed write: a peer's `RetainedCommit` commits into
+    /// this node's durable keyspace (value, then a zero-length clear as a tombstone).
+    #[tokio::test]
+    async fn a_remote_retained_commit_is_committed_by_the_owner() {
+        let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
+
+        tx.send(HubCommand::RemoteRetainedCommit {
+            topic: "dev/9/state".into(),
+            payload: Bytes::from_static(b"shut"),
+            qos: 1,
+        })
+        .unwrap();
+        let e = wait_durable_retained(&durable, "dev/9/state", |_| true).await;
+        assert_eq!(e.payload, b"shut");
+        assert_eq!(e.qos, 1);
+        assert_eq!(e.token(), (0, 1));
+
+        tx.send(HubCommand::RemoteRetainedCommit {
+            topic: "dev/9/state".into(),
+            payload: Bytes::new(),
+            qos: 0,
+        })
+        .unwrap();
+        let e = wait_durable_retained(&durable, "dev/9/state", |e| e.tombstone).await;
+        assert_eq!(e.token(), (0, 2));
+    }
+
+    /// Durable off (no keyspace attached): a retained publish behaves exactly as
+    /// ADR 0014 today — the broadcast goes out, and no `RetainedCommit` ever does
+    /// (the documented §6 fallback caveat).
+    #[tokio::test]
+    async fn durable_off_keeps_the_adr_0014_behaviour_with_no_retained_commit() {
+        let tx = start_hub();
+        let mut peer = connect_peer(&tx, "n", 1);
+        publish_retained(&tx, "t", b"v");
+
+        let mut saw_broadcast = false;
+        while let Some(msg) = recv_peer(&mut peer).await {
+            match msg {
+                PeerMessage::Publish { retain, .. } => saw_broadcast = retain,
+                PeerMessage::RetainedCommit { .. } => {
+                    panic!("durable off must never route a RetainedCommit")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_broadcast, "the ADR 0014 broadcast is unchanged");
     }
 
     /// A shared subscription (ADR 0010) delivers each matching message to exactly

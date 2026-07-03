@@ -123,7 +123,7 @@ async fn start_durable_node_capped(
         DEFAULT_REPLICAS,
     )));
 
-    let (store, plane, driver) = build_durable_node(
+    let (store, durable_retained, plane, driver) = build_durable_node(
         node_id.clone(),
         placement.clone(),
         can_bootstrap,
@@ -137,6 +137,9 @@ async fn start_durable_node_capped(
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()));
     hub.attach_durable_plane(plane);
+    // Durable retained (ADR 0037 P3): retained mutations route to the group owner,
+    // exactly as production wires it.
+    hub.attach_durable_retained(durable_retained);
     // Killing a node aborts its hub, accept loop, and lease-group driver together.
     let mut aborts = vec![
         tokio::spawn(hub.run()).abort_handle(),

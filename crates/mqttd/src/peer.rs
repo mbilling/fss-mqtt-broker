@@ -471,6 +471,17 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 node: remote.clone(),
             });
         }
+        PeerMessage::RetainedCommit {
+            topic,
+            payload,
+            qos,
+        } => {
+            let _ = hub.send(HubCommand::RemoteRetainedCommit {
+                topic,
+                payload: payload.into(),
+                qos,
+            });
+        }
         PeerMessage::Hello { .. } => {
             warn!("unexpected duplicate Hello on established peer link");
         }

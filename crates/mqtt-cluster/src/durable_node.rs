@@ -17,8 +17,10 @@
 //!
 //! The replication transport is **shared** between the plane (which the broker
 //! registers peers on) and the store (which replicates over it), so a session-log
-//! append fans out to the same peer links the consensus RPCs use. Returns the store
-//! (to hand the hub) and the plane (to attach to the hub).
+//! append fans out to the same peer links the consensus RPCs use. The group-routed
+//! log is shared too: the **durable retained keyspace** (ADR 0037) commits through
+//! the same leases and replica links as the session keys. Returns the store and the
+//! retained handle (to hand the hub) and the plane (to attach to the hub).
 
 use crate::cluster_log::ReplicaState;
 use crate::cluster_store::{GroupRoutedLog, LocalLeaseSource};
@@ -34,6 +36,7 @@ use crate::raft_mesh::MeshRaftNetwork;
 use crate::repl_net::PeerReplicaTransport;
 use crate::NodeId;
 use mqtt_storage::logged::ReplicatedSessionStore;
+use mqtt_storage::retained_log::{DurableRetained, ReplicatedRetained};
 use mqtt_storage::SessionStore;
 use openraft::storage::Adaptor;
 use openraft::Raft;
@@ -74,9 +77,10 @@ async fn open_retrying<T, E: std::fmt::Display>(
     panic!("{what}: still locked after retrying: {last}");
 }
 
-/// Build a node's durable session store, lease-group endpoint, and background
-/// driver. Returns the store (for the hub) and the [`DurablePlane`] (to attach to
-/// the hub so it routes peer consensus/replication frames).
+/// Build a node's durable session store, durable retained keyspace, lease-group
+/// endpoint, and background driver. Returns the store and retained handle (for the
+/// hub) and the [`DurablePlane`] (to attach to the hub so it routes peer
+/// consensus/replication frames).
 ///
 /// `can_bootstrap` marks this node a **founder** (started with no SWIM seeds): only
 /// a founder creates the lease group; joiners wait to be added by the founder's
@@ -98,6 +102,7 @@ pub async fn build_durable_node(
     commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> (
     Arc<dyn SessionStore>,
+    Arc<dyn DurableRetained>,
     DurablePlane,
     tokio::task::JoinHandle<()>,
 ) {
@@ -153,14 +158,18 @@ pub async fn build_durable_node(
 
     // --- durable store over the shared transport ---
     let lease_source = LocalLeaseSource::new(lease_store.clone(), local);
-    let group_log = GroupRoutedLog::new(
+    // One group-routed log, shared: the session store replicates queue/meta keys
+    // through it, and the retained keyspace (ADR 0037) commits `r/<topic>` keys through
+    // the same leases, epochs, and replica links — one durable plane, two keyspaces.
+    let group_log = Arc::new(GroupRoutedLog::new(
         node_id,
         placement.clone(),
         transport,
         lease_source,
         replicas,
-    );
-    let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::new(group_log));
+    ));
+    let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::new(group_log.clone()));
+    let retained: Arc<dyn DurableRetained> = Arc::new(ReplicatedRetained::new(group_log));
 
     // --- driver: membership + lease assignment over the live placement ---
     // The handle is returned so the caller can stop the driver on shutdown (otherwise
@@ -186,7 +195,7 @@ pub async fn build_durable_node(
         domains,
     ));
 
-    (store, plane, driver)
+    (store, retained, plane, driver)
 }
 
 /// The desired lease-group voter set: placement `members`, with a member **admitted** only
@@ -342,12 +351,14 @@ mod tests {
 
     /// A single node's durable stack bootstraps itself (the driver elects the lease
     /// group and assigns leases), after which an enqueue commits and replays — the
-    /// whole assembly wired together end to end on one node.
+    /// whole assembly wired together end to end on one node. The shared group log
+    /// serves the retained keyspace too (ADR 0037 P3): a retained commit through the
+    /// returned handle lands under the real, consensus-minted lease epoch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, _plane, _driver) =
+        let (store, retained, _plane, _driver) =
             build_durable_node(node, placement, true, 5, &BTreeMap::new(), None, None).await;
 
         let client = ClientId("c".to_string());
@@ -366,6 +377,19 @@ mod tests {
         let pending = store.pending(&client, 0, 100).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(&pending[0].message.payload[..], b"durable");
+
+        // The retained keyspace commits through the same plane: the token's epoch is
+        // the group's real lease epoch (consensus-minted, ≥ 1 — never the 0 of an
+        // un-leased backend), and the committed value reads back.
+        let (epoch, offset) = retained.set("dev/1/state", b"open", 1).await.unwrap();
+        assert!(
+            epoch >= 1,
+            "the epoch is minted by the lease plane, got {epoch}"
+        );
+        assert_eq!(offset, 1, "first write to the topic's retained key");
+        let e = retained.get("dev/1/state").await.unwrap().unwrap();
+        assert_eq!(e.payload, b"open");
+        assert_eq!(e.token(), (epoch, offset));
     }
 
     /// Poll an enqueue until the durable store is writable (lease bootstrapped and
@@ -410,7 +434,7 @@ mod tests {
 
         // --- lifetime #1: bootstrap on disk, become writable ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, plane, driver) = build_durable_node(
+        let (store, retained, plane, driver) = build_durable_node(
             node.clone(),
             placement,
             true,
@@ -427,6 +451,9 @@ mod tests {
         let _ = driver.await;
         plane.raft().shutdown().await.unwrap();
         drop(store);
+        // The retained handle shares the group log (and with it the lease/replica
+        // database handles), so it must drop too before the files can reopen.
+        drop(retained);
         drop(plane);
         // The last `Database` handle drops synchronously above; give any in-flight
         // blocking apply a moment to release before reopening the same files.
@@ -434,7 +461,7 @@ mod tests {
 
         // --- lifetime #2: a fresh node over the SAME directory recovers and re-leads ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, plane, driver) = build_durable_node(
+        let (store, _retained, plane, driver) = build_durable_node(
             node,
             placement,
             true,
