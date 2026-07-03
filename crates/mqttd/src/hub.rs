@@ -429,15 +429,18 @@ pub enum HubCommand {
         /// That node's shared groups with members.
         groups: Vec<RemoteSharedGroup>,
     },
-    /// A chunk of a peer's retained-message snapshot, back-filling a node that joined
-    /// after a retained publish (ADR 0014 §3, chunked per 0014-T8). Applied gap-fill
-    /// (topics we do not already retain), never overwriting our own — so chunks are
-    /// independent and idempotent.
+    /// A chunk of a peer's retained-message snapshot, back-filling a node on link-up
+    /// (ADR 0014 §3, chunked per 0014-T8). Under durable retained each entry carries
+    /// its `(epoch, offset)` token and applies only above the held one (ADR 0037 P5)
+    /// — divergent caches converge to the committed value; an empty payload is a
+    /// committed clear. Durable off keeps gap-fill (topics we do not already retain).
+    /// Chunks are independent and idempotent either way.
     RemoteRetainedSnapshot {
         /// The peer the snapshot came from (divergence attribution, ADR 0037 P1).
         node: NodeId,
-        /// Each retained message as `(topic, payload, QoS)`.
-        messages: Vec<(String, Bytes, QoS)>,
+        /// Each entry as `(topic, payload, QoS, epoch, offset)`; token `(0, 0)` =
+        /// uncommitted (gap-fill only).
+        messages: Vec<(String, Bytes, QoS, u64, u64)>,
     },
     /// A peer's retained digest, sent on link-up instead of the full snapshot
     /// (0014-T6). If both the topic-set hash and the value hash match our own there is
@@ -704,15 +707,18 @@ fn retained_value_id(topic: &str, payload: &[u8], qos: u8) -> u64 {
 /// [`RETAINED_CHUNK_BYTES`] (0014-T8). A single entry larger than the whole budget is
 /// skipped with a warning — it could never fit a frame, and sending it would sever the
 /// link instead of just missing one back-fill.
-fn chunk_retained(
-    entries: impl Iterator<Item = (String, Vec<u8>, u8)>,
-) -> Vec<Vec<(String, Vec<u8>, u8)>> {
-    // Fixed per-entry overhead estimate for bincode length prefixes and the QoS byte.
-    const ENTRY_OVERHEAD: usize = 32;
+/// One retained snapshot wire entry: `(topic, payload, qos, epoch, offset)` — the
+/// token halves per ADR 0037 P5; an empty payload is a committed clear.
+type RetainedWireEntry = (String, Vec<u8>, u8, u64, u64);
+
+fn chunk_retained(entries: impl Iterator<Item = RetainedWireEntry>) -> Vec<Vec<RetainedWireEntry>> {
+    // Fixed per-entry overhead estimate for bincode length prefixes, the QoS byte,
+    // and the two u64 token halves (ADR 0037 P5).
+    const ENTRY_OVERHEAD: usize = 48;
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
-    for (topic, payload, qos) in entries {
+    for (topic, payload, qos, epoch, offset) in entries {
         let size = topic.len() + payload.len() + ENTRY_OVERHEAD;
         if size > RETAINED_CHUNK_BYTES {
             warn!(
@@ -727,7 +733,7 @@ fn chunk_retained(
             current_bytes = 0;
         }
         current_bytes += size;
-        current.push((topic, payload, qos));
+        current.push((topic, payload, qos, epoch, offset));
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -2134,7 +2140,11 @@ impl Hub {
         let Ok(retained) = self.retained.all().await else {
             return;
         };
-        if retained.is_empty() {
+        // With no values AND no tombstone tokens there is nothing a peer could learn
+        // from us. A tombstone-only state still offers its digest: a peer holding a
+        // value for a topic we committed a clear for must see a difference and pull
+        // the tombstone (ADR 0037 P5) — going silent would strand its stale value.
+        if retained.is_empty() && self.retained_tokens.is_empty() {
             return;
         }
         let (count, hash, value_hash) = retained_digest(
@@ -2187,29 +2197,59 @@ impl Hub {
         let Ok(retained) = self.retained.all().await else {
             return;
         };
-        if retained.is_empty() {
+        // Cached values carry their commit token (ADR 0037 P5); `(0, 0)` marks an
+        // uncommitted (durable-off / pre-migration) value, which the receiver only
+        // ever gap-fills with.
+        let mut entries: Vec<RetainedWireEntry> = retained
+            .into_iter()
+            .map(|m| {
+                let (epoch, offset) = self
+                    .retained_tokens
+                    .get(&m.topic)
+                    .copied()
+                    .unwrap_or((0, 0));
+                (m.topic, m.payload.to_vec(), m.qos as u8, epoch, offset)
+            })
+            .collect();
+        // Committed clears back-fill too: a token held for a topic no longer cached
+        // is a tombstone, sent as an empty-payload entry so a peer that missed the
+        // clear drops the topic instead of keeping it forever (ADR 0037 P5).
+        let cached: HashSet<&str> = entries.iter().map(|(t, ..)| t.as_str()).collect();
+        let tombstones: Vec<RetainedWireEntry> = self
+            .retained_tokens
+            .iter()
+            .filter(|(topic, _)| !cached.contains(topic.as_str()))
+            .map(|(topic, (epoch, offset))| (topic.clone(), Vec::new(), 0, *epoch, *offset))
+            .collect();
+        entries.extend(tombstones);
+        if entries.is_empty() {
             return;
         }
-        let entries = retained
-            .into_iter()
-            .map(|m| (m.topic, m.payload.to_vec(), m.qos as u8));
-        for messages in chunk_retained(entries) {
+        for messages in chunk_retained(entries.into_iter()) {
             let _ = peer.tx.send(PeerMessage::RetainedSnapshot { messages });
         }
     }
 
-    /// Apply a peer's retained snapshot, **gap-fill** only: set a retained message
-    /// for a topic only if we do not already retain that topic, so we never clobber
-    /// our own (possibly newer) value with a peer's (ADR 0014 §3).
+    /// Apply a peer's retained snapshot.
     ///
-    /// Divergence detection (ADR 0037 P1): a topic both sides hold with **different**
-    /// values is counted (`retained_divergence_total`) and surfaced with one `warn!` per
-    /// snapshot chunk. Detection only — storage still follows the gap-fill rule until
-    /// single-owner retained (ADR 0037) lands and makes divergence impossible.
+    /// Under **durable retained** (ADR 0037 P5) each entry applies only when its
+    /// `(epoch, offset)` token beats what we hold for the topic — the same monotonic
+    /// rule as the commit fan-out, so divergent caches converge deterministically to
+    /// the committed value on link-up. An empty payload is a committed clear
+    /// (tombstone): it drops the topic and its token fences staler values. An
+    /// **untokened** entry (`(0, 0)`, from an uncommitted cache) only gap-fills an
+    /// absent topic — it never overwrites anything.
+    ///
+    /// **Durable off** keeps the ADR 0014 §3 gap-fill rule verbatim: set a topic only
+    /// if we do not already retain it, never clobbering our own value.
+    ///
+    /// Divergence detection (ADR 0037 P1) runs in both modes: a topic both sides hold
+    /// differently is counted (`retained_divergence_total`) and surfaced with one
+    /// `warn!` per snapshot chunk — under durable the same pass now also *resolves* it.
     async fn apply_retained_snapshot(
         &mut self,
         node: &NodeId,
-        messages: Vec<(String, Bytes, QoS)>,
+        messages: Vec<(String, Bytes, QoS, u64, u64)>,
     ) {
         let have: HashMap<String, u64> = match self.retained.all().await {
             Ok(all) => all
@@ -2221,22 +2261,42 @@ impl Hub {
                 .collect(),
             Err(_) => return,
         };
+        let durable = self.durable_retained.is_some();
         let mut filled = 0;
         let mut diverged = 0u64;
-        for (topic, payload, qos) in messages {
-            if let Some(ours) = have.get(&topic) {
-                if *ours != retained_value_id(&topic, payload.as_ref(), qos as u8) {
-                    diverged += 1;
-                    debug!(node = %node.0, %topic, "retained value diverges from peer");
-                    if let Some(m) = &self.metrics {
-                        m.retained_divergence();
-                    }
+        for (topic, payload, qos, epoch, offset) in messages {
+            let held_value = have.get(&topic);
+            // Detection (P1): both sides hold the topic, with different values (an
+            // incoming committed clear against our value counts too).
+            if held_value
+                .is_some_and(|ours| *ours != retained_value_id(&topic, payload.as_ref(), qos as u8))
+            {
+                diverged += 1;
+                debug!(node = %node.0, %topic, "retained value diverges from peer");
+                if let Some(m) = &self.metrics {
+                    m.retained_divergence();
                 }
+            }
+            if durable {
+                // Token rule (P5): strictly-higher wins; an untokened local value
+                // (no held token) loses to any committed token but an untokened
+                // entry only gap-fills an absent topic.
+                let token = (epoch, offset);
+                let apply = match self.retained_tokens.get(&topic) {
+                    Some(held) => token > *held,
+                    None => token > (0, 0) || held_value.is_none(),
+                };
+                if !apply {
+                    continue;
+                }
+                self.retained_tokens.insert(topic.clone(), token);
+            } else if held_value.is_some() || payload.is_empty() {
+                // Gap-fill only (ADR 0014 §3); a tombstone entry has nothing to fill.
                 continue;
             }
             // The retained-snapshot wire does not carry application properties (a narrow
             // gap, like the persistent-retained codec); a back-filled retained message
-            // has none.
+            // has none. An empty payload clears the topic [MQTT-3.3.1-10].
             let message = Message {
                 topic,
                 payload,
@@ -2254,12 +2314,21 @@ impl Hub {
         if diverged > 0 {
             // One warn per chunk, not per topic — the per-topic detail is at debug and
             // the count is on the metric (bounded logging, ADR 0003-T6 style).
-            warn!(
-                node = %node.0,
-                topics = diverged,
-                "retained values DIVERGE from peer (same topic, different value) — \
-                 best-effort replication kept each side's own value (ADR 0037 P1 detection)"
-            );
+            if durable {
+                warn!(
+                    node = %node.0,
+                    topics = diverged,
+                    "retained values DIVERGED from peer (same topic, different value) — \
+                     converged to the higher-token committed value (ADR 0037 P5)"
+                );
+            } else {
+                warn!(
+                    node = %node.0,
+                    topics = diverged,
+                    "retained values DIVERGE from peer (same topic, different value) — \
+                     best-effort replication kept each side's own value (ADR 0037 P1 detection)"
+                );
+            }
         }
     }
 
@@ -3530,11 +3599,11 @@ mod tests {
     fn a_large_retained_set_is_chunked_under_the_frame_budget() {
         // 9 entries of ~1 MiB against a 4 MiB budget → at least 3 chunks.
         let payload = vec![0u8; 1024 * 1024];
-        let entries = (0..9).map(|i| (format!("t/{i}"), payload.clone(), 0u8));
+        let entries = (0..9).map(|i| (format!("t/{i}"), payload.clone(), 0u8, 0u64, 0u64));
         let chunks = super::chunk_retained(entries);
         assert!(chunks.len() >= 3, "9 MiB must not fit 2 chunks of 4 MiB");
         for chunk in &chunks {
-            let bytes: usize = chunk.iter().map(|(t, p, _)| t.len() + p.len() + 32).sum();
+            let bytes: usize = chunk.iter().map(|(t, p, ..)| t.len() + p.len() + 48).sum();
             assert!(bytes <= super::RETAINED_CHUNK_BYTES, "chunk over budget");
         }
         let total: usize = chunks.iter().map(Vec::len).sum();
@@ -3548,15 +3617,11 @@ mod tests {
     fn an_oversized_single_retained_message_is_skipped_not_sent() {
         let huge = vec![0u8; super::RETAINED_CHUNK_BYTES + 1];
         let entries = vec![
-            ("ok".to_string(), vec![1u8; 8], 0u8),
-            ("huge".to_string(), huge, 0u8),
+            ("ok".to_string(), vec![1u8; 8], 0u8, 0u64, 0u64),
+            ("huge".to_string(), huge, 0u8, 0u64, 0u64),
         ];
         let chunks = super::chunk_retained(entries.into_iter());
-        let all: Vec<&str> = chunks
-            .iter()
-            .flatten()
-            .map(|(t, _, _)| t.as_str())
-            .collect();
+        let all: Vec<&str> = chunks.iter().flatten().map(|(t, ..)| t.as_str()).collect();
         assert_eq!(
             all,
             vec!["ok"],
@@ -3594,7 +3659,13 @@ mod tests {
         let tx = start_hub();
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![("room/t".into(), Bytes::from_static(b"v"), QoS::AtMostOnce)],
+            messages: vec![(
+                "room/t".into(),
+                Bytes::from_static(b"v"),
+                QoS::AtMostOnce,
+                0,
+                0,
+            )],
         })
         .unwrap();
 
@@ -3628,13 +3699,23 @@ mod tests {
                     "dev/1".into(),
                     Bytes::from_static(b"theirs"),
                     QoS::AtMostOnce,
+                    0,
+                    0,
                 ),
                 (
                     "dev/same".into(),
                     Bytes::from_static(b"agreed"),
                     QoS::AtMostOnce,
+                    0,
+                    0,
                 ),
-                ("dev/new".into(), Bytes::from_static(b"x"), QoS::AtMostOnce),
+                (
+                    "dev/new".into(),
+                    Bytes::from_static(b"x"),
+                    QoS::AtMostOnce,
+                    0,
+                    0,
+                ),
             ],
         })
         .unwrap();
@@ -3668,6 +3749,8 @@ mod tests {
                 "t".into(),
                 Bytes::from_static(b"peer-stale"),
                 QoS::AtMostOnce,
+                0,
+                0,
             )],
         })
         .unwrap();
@@ -4348,6 +4431,212 @@ mod tests {
         assert_eq!(payload_of(&recv_packet(&mut live).await.unwrap()), b"x");
         // ...but the cache was not warmed: a fresh subscriber replays nothing.
         assert!(retained_replay(&tx, "late", "t").await.is_none());
+    }
+
+    /// ADR 0037 P5: a snapshot entry applies through the same token gate as the
+    /// fan-out — the higher token wins per topic, a stale one is dropped — so two
+    /// divergent caches converge deterministically to the committed value on link-up.
+    #[tokio::test]
+    async fn back_fill_takes_the_higher_token_value_per_topic() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        // We hold a committed value at (1, 2).
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"ours"),
+            qos: 0,
+            epoch: 1,
+            offset: 2,
+        })
+        .unwrap();
+
+        // The peer's snapshot carries a HIGHER-token value: it wins (divergence
+        // resolved, not just detected).
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"newer"),
+                QoS::AtMostOnce,
+                1,
+                5,
+            )],
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"newer");
+
+        // A STALER snapshot entry is rejected — back-fill can never regress a topic.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"old"),
+                QoS::AtMostOnce,
+                1,
+                3,
+            )],
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"newer");
+    }
+
+    /// ADR 0037 P5: a committed clear back-fills as an empty-payload tombstone entry —
+    /// the topic drops from the cache, and the tombstone's token keeps fencing staler
+    /// values, so the cleared topic cannot be resurrected by a later stale snapshot.
+    #[tokio::test]
+    async fn a_committed_clear_back_fills_as_a_tombstone_and_fences() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: 0,
+            epoch: 1,
+            offset: 3,
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
+
+        // The peer committed a clear at (1, 6): our value drops.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![("t".into(), Bytes::new(), QoS::AtMostOnce, 1, 6)],
+        })
+        .unwrap();
+        assert!(retained_replay(&tx, "c2", "t").await.is_none());
+
+        // A staler value (from a peer that missed the clear) cannot resurrect it.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"zombie"),
+                QoS::AtMostOnce,
+                1,
+                5,
+            )],
+        })
+        .unwrap();
+        assert!(retained_replay(&tx, "c3", "t").await.is_none());
+    }
+
+    /// ADR 0037 P5: the outgoing snapshot carries each cached value's commit token,
+    /// **and** a tombstone entry (empty payload + token) for every committed clear —
+    /// a peer that missed the clear must see it, or it keeps the value forever.
+    #[tokio::test]
+    async fn the_snapshot_carries_tokens_and_tombstone_entries() {
+        let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
+        // Commit a value on "alive" ((0,1)); commit then clear "dead" ((0,1)→(0,2)).
+        publish_retained(&tx, "alive", b"v");
+        publish_retained(&tx, "dead", b"x");
+        publish_retained(&tx, "dead", b"");
+        // Wait for the off-loop commits to land (the clear leaves only the token).
+        wait_durable_retained(&durable, "dead", |e| e.tombstone).await;
+        wait_durable_retained(&durable, "alive", |_| true).await;
+
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::RetainedDigest { .. })
+        ));
+
+        tx.send(HubCommand::RemoteRetainedRequest {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedSnapshot { mut messages }) => {
+                messages.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    messages.len(),
+                    2,
+                    "the value AND the tombstone: {messages:?}"
+                );
+                let (t, payload, _, epoch, offset) = &messages[0];
+                assert_eq!((t.as_str(), &payload[..]), ("alive", b"v".as_ref()));
+                assert_eq!((*epoch, *offset), (0, 1), "the value carries its token");
+                let (t, payload, _, epoch, offset) = &messages[1];
+                assert_eq!(t, "dead");
+                assert!(payload.is_empty(), "the clear rides as a tombstone entry");
+                assert_eq!((*epoch, *offset), (0, 2), "with the clear's token");
+            }
+            other => panic!("expected the retained snapshot, got {other:?}"),
+        }
+    }
+
+    /// ADR 0037 P5: an **untokened** entry (`(0,0)`, an uncommitted / pre-migration
+    /// cache value) gap-fills an absent topic but never overwrites anything — only
+    /// committed tokens can replace state.
+    #[tokio::test]
+    async fn an_untokened_snapshot_entry_gap_fills_but_never_overwrites() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        // Absent topic: the untokened entry gap-fills.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"first"),
+                QoS::AtMostOnce,
+                0,
+                0,
+            )],
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"first");
+
+        // Present topic: another untokened entry cannot overwrite it.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"second"),
+                QoS::AtMostOnce,
+                0,
+                0,
+            )],
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"first");
+
+        // A committed token, however, beats the uncommitted value.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![(
+                "t".into(),
+                Bytes::from_static(b"committed"),
+                QoS::AtMostOnce,
+                2,
+                1,
+            )],
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c3", "t").await.unwrap(), b"committed");
+    }
+
+    /// ADR 0037 P5: a node whose retained state is **only tombstones** (every value
+    /// cleared) still offers its digest on link-up — going silent would strand a
+    /// peer's stale value with nothing to pull the clear from.
+    #[tokio::test]
+    async fn a_tombstone_only_node_still_offers_its_digest() {
+        let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
+        publish_retained(&tx, "t", b"v");
+        publish_retained(&tx, "t", b"");
+        wait_durable_retained(&durable, "t", |e| e.tombstone).await;
+
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(
+            matches!(
+                recv_peer(&mut peer).await,
+                Some(PeerMessage::RetainedDigest { .. })
+            ),
+            "the digest must be offered even with an empty cache (tombstones held)"
+        );
     }
 
     /// Durable off (no keyspace attached): a retained publish behaves exactly as

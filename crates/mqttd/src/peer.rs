@@ -441,11 +441,13 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
         PeerMessage::RetainedSnapshot { messages } => {
             let messages = messages
                 .into_iter()
-                .map(|(topic, payload, qos)| {
+                .map(|(topic, payload, qos, epoch, offset)| {
                     (
                         topic,
                         payload.into(),
                         mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                        epoch,
+                        offset,
                     )
                 })
                 .collect();

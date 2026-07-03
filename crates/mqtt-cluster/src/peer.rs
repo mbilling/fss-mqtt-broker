@@ -87,12 +87,22 @@ pub enum PeerMessage {
     /// [`RetainedDigest`](PeerMessage::RetainedDigest)) shows the sets differ, split
     /// into bounded chunks so no snapshot can approach the frame limit (0014-T8; one
     /// oversized frame would kill the link on the receiving side, and the link-up
-    /// back-fill would then kill every reconnect). The receiver fills only topics it
-    /// does not already have (gap-fill, not overwrite), so chunks are independent and
+    /// back-fill would then kill every reconnect). Chunks are independent and
     /// idempotent — no ordering or completion marker is needed.
+    ///
+    /// Each entry carries its `(epoch, offset)` convergence token (ADR 0037 P5): a
+    /// receiver with durable retained applies an entry only when its token exceeds
+    /// the one held for that topic — divergent caches converge deterministically to
+    /// the committed value on link-up, replacing the earlier gap-fill-only rule. A
+    /// **committed clear** back-fills as an empty-payload entry with its tombstone's
+    /// token, so a peer that missed the clear drops the topic instead of keeping it
+    /// forever. Token `(0, 0)` marks an uncommitted (durable-off / pre-migration)
+    /// value: it gap-fills an absent topic but never overwrites, and a durable-off
+    /// receiver keeps exactly the ADR 0014 gap-fill behaviour.
     RetainedSnapshot {
-        /// Each retained message: `(topic, payload, QoS u8)`.
-        messages: Vec<(String, Vec<u8>, u8)>,
+        /// Each entry: `(topic, payload, QoS u8, epoch, offset)`; an empty payload
+        /// is a committed clear (tombstone).
+        messages: Vec<(String, Vec<u8>, u8, u64, u64)>,
     },
     /// An order-independent digest of the sender's retained **topic set**, sent on link
     /// establishment instead of the full snapshot (0014-T6). If the receiver's own
@@ -110,9 +120,8 @@ pub enum PeerMessage {
         /// XOR of a stable 64-bit hash of each retained `(topic, payload, qos)` value
         /// (order-independent; ADR 0037 P1). Equal topic sets with differing value hashes
         /// mean **divergence** — same topics, different values — which triggers a pull so
-        /// the receiver can detect and count it (`retained_divergence_total`). Detection
-        /// only: storage still follows the gap-fill rule until single-owner retained
-        /// (ADR 0037) lands.
+        /// the receiver can detect and count it (`retained_divergence_total`) and, under
+        /// durable retained, resolve it by token from the pulled snapshot (ADR 0037 P5).
         value_hash: u64,
     },
     /// Pull the sender's retained set (sent back when a received
@@ -362,8 +371,9 @@ mod tests {
         });
         roundtrip(&PeerMessage::RetainedSnapshot {
             messages: vec![
-                ("t/a".into(), b"v".to_vec(), 1),
-                ("$SYS/x".into(), b"w".to_vec(), 0),
+                ("t/a".into(), b"v".to_vec(), 1, 7, 42),
+                ("$SYS/x".into(), b"w".to_vec(), 0, 0, 0),
+                ("t/cleared".into(), Vec::new(), 0, 7, 43), // a committed clear
             ],
         });
         roundtrip(&PeerMessage::RetainedDigest {
@@ -442,7 +452,7 @@ mod tests {
     #[test]
     fn an_oversized_frame_is_rejected_at_encode() {
         let msg = PeerMessage::RetainedSnapshot {
-            messages: vec![("t".into(), vec![0u8; MAX_FRAME + 1], 0)],
+            messages: vec![("t".into(), vec![0u8; MAX_FRAME + 1], 0, 0, 0)],
         };
         let mut out = Vec::new();
         assert!(matches!(
