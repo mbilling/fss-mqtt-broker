@@ -30,6 +30,8 @@
 //!   best-effort, never gated on a cross-node round-trip.
 
 use crate::lease::{Epoch, OwnershipLease};
+use crate::lease_raft::GroupId;
+use crate::placement::group_of_key;
 use crate::NodeId;
 use async_trait::async_trait;
 use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
@@ -73,16 +75,31 @@ const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
 /// phase 3b): entries at or below it are already-acked, so a recovery must not resurrect
 /// them from a stale replica that missed the truncation.
 const R_TRUNC: TableDefinition<&str, u64> = TableDefinition::new("replica_trunc");
-const R_FENCE: &str = "fence";
+/// `R_META` key prefix for a placement group's fence row (`fence/<group>`). The fence
+/// is **per group**: lease epochs are minted from one globally-monotonic counter, so
+/// two healthy groups hold different epochs at all times — a single cross-group fence
+/// would let whichever group carries the highest epoch permanently fence out every
+/// other group's (perfectly current) lease-holder on this replica.
+const R_FENCE_PREFIX: &str = "fence/";
 
 /// A replica's stored entries: per logical key, an offset → record map.
 type ReplicaLogs = BTreeMap<String, BTreeMap<Offset, Vec<u8>>>;
 
+/// Per placement group, the highest leadership epoch this replica has acknowledged.
+type Fences = BTreeMap<GroupId, Epoch>;
+
 /// The state recovered from a persistent replica's tables.
 struct Loaded {
-    fence: Epoch,
+    fences: Fences,
     logs: ReplicaLogs,
     truncated: BTreeMap<String, Offset>,
+}
+
+/// The logical key an op addresses (every op carries exactly one).
+fn op_key(op: &ReplOp) -> &str {
+    match op {
+        ReplOp::Append { key, .. } | ReplOp::Truncate { key, .. } | ReplOp::Remove { key } => key,
+    }
 }
 
 /// Map a `redb` error into the storage backend error.
@@ -130,17 +147,22 @@ fn r_decode_key(bytes: &[u8]) -> (String, Offset) {
     (key, Offset::from_be_bytes(o))
 }
 
-/// The follower side of replication: a replica's stored copy plus its fence epoch.
+/// The follower side of replication: a replica's stored copy plus its fence epochs.
 ///
 /// [`apply`](ReplicaState::apply) is the entire follower protocol. The in-memory `logs`
-/// map and `fence` are the source of truth for reads; when opened with
+/// map and `fences` are the source of truth for reads; when opened with
 /// [`open`](ReplicaState::open) (ADR 0018 phase 3) every accepted `apply` is also
 /// **write-through fsync'd** to a `redb` database (persist-before-mutate), so the
 /// follower's committed copy survives a restart — what a clustered durable session needs
 /// to survive a *full-cluster* restart, not only a single-node failure.
+///
+/// The fence is **per placement group** (the group derived from the op's key): an
+/// epoch is a *group's* leadership term, and terms from one shared, globally-monotonic
+/// counter mean two healthy groups always hold different epochs — fencing across
+/// groups would reject a current lease-holder because an unrelated group is newer.
 #[derive(Debug, Default)]
 pub struct ReplicaState {
-    fence: Epoch,
+    fences: Fences,
     logs: ReplicaLogs,
     /// Per-key truncation low-water (ADR 0018 phase 3b): the highest acked offset this
     /// replica knows was dropped. Propagated on recovery so a stale replica cannot
@@ -172,12 +194,12 @@ impl ReplicaState {
         }
         txn.commit().map_err(rdb)?;
         let Loaded {
-            fence,
+            fences,
             logs,
             truncated,
         } = Self::load(&db)?;
         Ok(Self {
-            fence,
+            fences,
             logs,
             truncated,
             db: Some(Arc::new(db)),
@@ -187,12 +209,20 @@ impl ReplicaState {
     /// Reconstruct the in-memory cache from the on-disk tables.
     fn load(db: &Database) -> Result<Loaded, ReplError> {
         let txn = db.begin_read().map_err(rdb)?;
-        let fence = txn
+        let mut fences = Fences::new();
+        for item in txn
             .open_table(R_META)
             .map_err(rdb)?
-            .get(R_FENCE)
+            .range::<&str>(..)
             .map_err(rdb)?
-            .map_or(0, |g| g.value());
+        {
+            let (k, v) = item.map_err(rdb)?;
+            if let Some(group) = k.value().strip_prefix(R_FENCE_PREFIX) {
+                if let Ok(group) = group.parse::<GroupId>() {
+                    fences.insert(group, v.value());
+                }
+            }
+        }
         let mut logs: ReplicaLogs = BTreeMap::new();
         let entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
         for item in entries.range::<&[u8]>(..).map_err(rdb)? {
@@ -209,17 +239,17 @@ impl ReplicaState {
             truncated.insert(k.value().to_string(), v.value());
         }
         Ok(Loaded {
-            fence,
+            fences,
             logs,
             truncated,
         })
     }
 
-    /// Durably apply a batch of ops at `final_fence` in **one** fsync'd transaction — the
-    /// on-disk mirror of the in-memory mutations, coalesced so a burst of replicated
-    /// messages costs a single fsync rather than one each (ADR 0027). Ops apply in slice
-    /// order. No-op (`Ok`) when in-memory.
-    fn persist_batch(&self, final_fence: Epoch, ops: &[&ReplOp]) -> Result<(), ReplError> {
+    /// Durably apply a batch of ops (with the per-group fences they advanced to) in
+    /// **one** fsync'd transaction — the on-disk mirror of the in-memory mutations,
+    /// coalesced so a burst of replicated messages costs a single fsync rather than one
+    /// each (ADR 0027). Ops apply in slice order. No-op (`Ok`) when in-memory.
+    fn persist_batch(&self, fences: &Fences, ops: &[&ReplOp]) -> Result<(), ReplError> {
         let Some(db) = &self.db else {
             return Ok(());
         };
@@ -227,7 +257,10 @@ impl ReplicaState {
         txn.set_durability(Durability::Immediate); // one fsync for the whole batch (ADR 0018/0027)
         {
             let mut meta = txn.open_table(R_META).map_err(rdb)?;
-            meta.insert(R_FENCE, final_fence).map_err(rdb)?;
+            for (group, epoch) in fences {
+                meta.insert(format!("{R_FENCE_PREFIX}{group}").as_str(), *epoch)
+                    .map_err(rdb)?;
+            }
             let mut entries = txn.open_table(R_ENTRIES).map_err(rdb)?;
             let mut trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
             // Running per-key truncation low-water across this batch, overlaying the
@@ -294,52 +327,65 @@ impl ReplicaState {
         }
     }
 
-    /// The highest leadership epoch this replica has acknowledged.
+    /// The highest leadership epoch this replica has acknowledged **for `key`'s
+    /// placement group** (`0` if it has accepted nothing for that group). Fences are
+    /// group-scoped because epochs are group-scoped leadership terms minted from one
+    /// shared counter — see the type docs.
     #[must_use]
-    pub fn fence(&self) -> Epoch {
-        self.fence
+    pub fn fence_for_key(&self, key: &str) -> Epoch {
+        self.fences.get(&group_of_key(key)).copied().unwrap_or(0)
     }
 
     /// Apply a lease-holder's `op` sent at `epoch`.
     ///
-    /// Returns `false` (fenced) without mutating if `epoch` is stale (`<` the
-    /// replica's acknowledged epoch). Otherwise it durably persists the op (when
-    /// persistent, **before** mutating the in-memory copy), learns `epoch`
-    /// (monotonically), applies the op, and returns `true`. A persist failure also
-    /// returns `false` (the op was not durably stored, so the follower must not ack it).
+    /// Returns `false` (fenced) without mutating if `epoch` is stale (`<` the epoch
+    /// this replica has acknowledged **for the op's placement group**). Otherwise it
+    /// durably persists the op (when persistent, **before** mutating the in-memory
+    /// copy), learns `epoch` (monotonically, for that group), applies the op, and
+    /// returns `true`. A persist failure also returns `false` (the op was not durably
+    /// stored, so the follower must not ack it).
     pub fn apply(&mut self, epoch: Epoch, op: &ReplOp) -> bool {
-        if epoch < self.fence {
+        let group = group_of_key(op_key(op));
+        if epoch < self.fences.get(&group).copied().unwrap_or(0) {
             return false;
         }
         // Persist-before-mutate: a `true` ack means the op is on disk (ADR 0018 phase 3).
-        if let Err(e) = self.persist_batch(epoch, &[op]) {
+        let advanced = Fences::from([(group, epoch)]);
+        if let Err(e) = self.persist_batch(&advanced, &[op]) {
             tracing::warn!(error = %e, "replica persist failed; not acking the replication op");
             return false;
         }
-        self.fence = epoch;
+        self.fences.insert(group, epoch);
         self.apply_in_memory(op);
         true
     }
 
     /// Durably apply a **batch** of `(epoch, op)` in one fsync'd transaction (ADR 0027).
     ///
-    /// Each op is fence-checked in slice order with exactly the semantics of [`apply`]: an
-    /// op whose `epoch` is older than the fence reached so far is rejected (its slot in the
-    /// returned vec is `false`) and not persisted; an accepted op advances the fence. All
-    /// accepted ops are persisted in a **single** `Durability::Immediate` transaction, so
-    /// the per-message fsync cost collapses to one per batch under load. The
-    /// persist-before-ack invariant holds at batch granularity: every `true` means the op
-    /// is on disk (the batch transaction committed); if that commit fails the whole batch
-    /// is rejected (all `false`), since nothing was durably stored.
+    /// Each op is fence-checked in slice order with exactly the semantics of [`apply`]:
+    /// an op whose `epoch` is older than the fence reached so far **for its group** is
+    /// rejected (its slot in the returned vec is `false`) and not persisted; an accepted
+    /// op advances its group's fence. All accepted ops are persisted in a **single**
+    /// `Durability::Immediate` transaction, so the per-message fsync cost collapses to
+    /// one per batch under load. The persist-before-ack invariant holds at batch
+    /// granularity: every `true` means the op is on disk (the batch transaction
+    /// committed); if that commit fails the whole batch is rejected (all `false`), since
+    /// nothing was durably stored.
     pub fn apply_batch(&mut self, batch: &[(Epoch, ReplOp)]) -> Vec<bool> {
         let mut accepted = Vec::with_capacity(batch.len());
-        let mut running_fence = self.fence;
+        let mut advanced = Fences::new();
         let mut to_persist: Vec<&ReplOp> = Vec::new();
         for (epoch, op) in batch {
-            if *epoch < running_fence {
+            let group = group_of_key(op_key(op));
+            let running = advanced
+                .get(&group)
+                .or_else(|| self.fences.get(&group))
+                .copied()
+                .unwrap_or(0);
+            if *epoch < running {
                 accepted.push(false);
             } else {
-                running_fence = *epoch;
+                advanced.insert(group, *epoch);
                 to_persist.push(op);
                 accepted.push(true);
             }
@@ -348,11 +394,11 @@ impl ReplicaState {
             return accepted;
         }
         // One fsync for every accepted op in the batch (persist-before-mutate).
-        if let Err(e) = self.persist_batch(running_fence, &to_persist) {
+        if let Err(e) = self.persist_batch(&advanced, &to_persist) {
             tracing::warn!(error = %e, "replica batch persist failed; not acking the batch");
             return vec![false; batch.len()];
         }
-        self.fence = running_fence;
+        self.fences.extend(advanced);
         for ((_, op), ok) in batch.iter().zip(&accepted) {
             if *ok {
                 self.apply_in_memory(op);
@@ -815,7 +861,7 @@ mod tests {
                     up_to: 1
                 }
             )); // drop offset 1, keep 2
-            assert_eq!(r.fence(), 2);
+            assert_eq!(r.fence_for_key("q/c"), 2);
             // drop closes the database
         }
 
@@ -857,7 +903,8 @@ mod tests {
                 (5, ap("q/b", 1, b"b1")),
             ];
             assert_eq!(r.apply_batch(&batch), vec![true, true, true]);
-            assert_eq!(r.fence(), 5);
+            assert_eq!(r.fence_for_key("q/a"), 5);
+            assert_eq!(r.fence_for_key("q/b"), 5);
         }
         // All three survive the reopen, on their respective keys.
         let r = ReplicaState::open(&path).unwrap();
@@ -869,7 +916,9 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(r.entries("q/b").len(), 1);
-        assert_eq!(r.fence(), 5);
+        // Both groups' fences survive the reopen.
+        assert_eq!(r.fence_for_key("q/a"), 5);
+        assert_eq!(r.fence_for_key("q/b"), 5);
     }
 
     /// Per-op fencing inside a batch matches sequential `apply`: an op older than the
@@ -884,7 +933,7 @@ mod tests {
             (4, ap("k", 3, b"z")), // accept, fence -> 4
         ];
         assert_eq!(r.apply_batch(&batch), vec![true, false, true]);
-        assert_eq!(r.fence(), 4);
+        assert_eq!(r.fence_for_key("k"), 4);
         // Only the accepted offsets are present (the rejected one never applied).
         assert_eq!(
             r.entries("k").iter().map(|e| e.offset).collect::<Vec<_>>(),
@@ -935,6 +984,41 @@ mod tests {
         assert_eq!(r.watermark("q/c"), 2);
     }
 
+    /// Fences are **per placement group**. Lease epochs are minted from ONE
+    /// globally-monotonic counter, so two healthy groups always run at different
+    /// epochs — a shared cross-group fence would let whichever group carries the
+    /// highest epoch permanently reject every other group's (perfectly current)
+    /// lease-holder on this replica. This is the regression test for exactly that
+    /// bug, exposed by the first workload replicating two groups through one
+    /// follower (ADR 0037 P4's everyday-race test).
+    #[test]
+    fn a_groups_fence_does_not_reject_another_groups_older_epoch() {
+        use crate::placement::group_of_key;
+        // Two keys in different placement groups.
+        let ka = "q/k0".to_string();
+        let kb = (1..10_000)
+            .map(|i| format!("q/k{i}"))
+            .find(|k| group_of_key(k) != group_of_key(&ka))
+            .expect("some key lands in another group");
+
+        let mut r = ReplicaState::new();
+        // Group A's holder writes at a late epoch (minted after many assignments)...
+        assert!(r.apply(200, &ap(&ka, 1, b"hot")));
+        // ...which must NOT fence group B's current holder at its own, older epoch.
+        assert!(
+            r.apply(60, &ap(&kb, 1, b"current")),
+            "another group's current lease-holder must not be fenced"
+        );
+        // Within one group the fence still holds exactly as before.
+        assert!(
+            !r.apply(199, &ap(&ka, 2, b"stale")),
+            "same-group fence holds"
+        );
+        assert!(r.apply(201, &ap(&ka, 2, b"newer")));
+        assert_eq!(r.fence_for_key(&ka), 201);
+        assert_eq!(r.fence_for_key(&kb), 60);
+    }
+
     /// A single-element `apply_batch` is exactly `apply` — same accept and same fence.
     #[test]
     fn apply_batch_of_one_equals_apply() {
@@ -944,7 +1028,7 @@ mod tests {
             a.apply(9, &ap("k", 1, b"v")),
             b.apply_batch(&[(9, ap("k", 1, b"v"))])[0]
         );
-        assert_eq!(a.fence(), b.fence());
+        assert_eq!(a.fence_for_key("k"), b.fence_for_key("k"));
         assert_eq!(a.entries("k"), b.entries("k"));
     }
 

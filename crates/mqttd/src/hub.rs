@@ -473,6 +473,37 @@ pub enum HubCommand {
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
     },
+    /// **Internal**: this (owner) node's off-loop durable commit finished — apply the
+    /// committed value to the local cache and fan it out to every peer with its token
+    /// (ADR 0037 §3). Posted back to the loop by the spawned commit task, like
+    /// [`SessionRecovered`](Self::SessionRecovered).
+    RetainedCommitted {
+        /// The committed topic.
+        topic: String,
+        /// The committed payload; empty = cleared (tombstone).
+        payload: Bytes,
+        /// The publish `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The lease epoch the value committed under (token high half).
+        epoch: u64,
+        /// The committed log offset (token low half).
+        offset: u64,
+    },
+    /// A committed retained value fanned out by its topic's group owner
+    /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
+    /// exceeds the held one — monotonic per topic, idempotent, order-insensitive.
+    RemoteRetainedUpdate {
+        /// The committed topic.
+        topic: String,
+        /// The committed payload; empty = cleared (tombstone).
+        payload: Bytes,
+        /// The publish `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The lease epoch the value committed under (token high half).
+        epoch: u64,
+        /// The committed log offset (token low half).
+        offset: u64,
+    },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
     RemoteSharedDeliver {
@@ -588,6 +619,13 @@ pub struct Hub {
     /// addition to the local cache above. `None` (durable off) keeps ADR 0014
     /// best-effort behaviour unchanged.
     durable_retained: Option<Arc<dyn DurableRetained>>,
+    /// The `(epoch, offset)` convergence token each cached retained topic was applied
+    /// at (ADR 0037 §3): a fan-out/back-fill value is applied only when its token
+    /// exceeds the held one — monotonic per topic, idempotent, order-insensitive. A
+    /// cleared topic keeps its tombstone's token here so a staler value cannot
+    /// resurrect it. Only populated under durable retained; bounded by topic count
+    /// (like the cache itself).
+    retained_tokens: HashMap<String, (u64, u64)>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -749,6 +787,7 @@ impl Hub {
                 durable_plane: None,
                 retained: Box::new(MemoryRetainedStore::new()),
                 durable_retained: None,
+                retained_tokens: HashMap::new(),
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -888,6 +927,8 @@ impl Hub {
     /// Dispatch a peer-/cluster-facing command (forwarded publishes, peer link
     /// (de)registration, gossiped interest, durable frames). Split from
     /// [`dispatch`](Self::dispatch) to keep each handler focused.
+    // One arm per cluster command — a flat dispatch table, not a refactor smell.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_cluster(&mut self, cmd: HubCommand) {
         match cmd {
             HubCommand::RemotePublish {
@@ -963,6 +1004,39 @@ impl Hub {
                 // fails with NotOwner rather than committing off-owner).
                 self.commit_retained_local(&topic, &payload, qos);
             }
+            HubCommand::RetainedCommitted {
+                topic,
+                payload,
+                qos,
+                epoch,
+                offset,
+            } => {
+                // This (owner) node's durable commit finished: warm the local cache
+                // and fan the tokened value out to every peer (ADR 0037 §3). The
+                // fan-out is best-effort — a peer that misses it converges via the
+                // token-aware back-fill (P5) on the next link-up.
+                self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                    .await;
+                for peer in self.peers.values() {
+                    let _ = peer.tx.send(PeerMessage::RetainedUpdate {
+                        topic: topic.clone(),
+                        payload: payload.to_vec(),
+                        qos,
+                        epoch,
+                        offset,
+                    });
+                }
+            }
+            HubCommand::RemoteRetainedUpdate {
+                topic,
+                payload,
+                qos,
+                epoch,
+                offset,
+            } => {
+                self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                    .await;
+            }
             HubCommand::RemoteSharedDeliver {
                 client,
                 topic,
@@ -1033,7 +1107,10 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
     ) {
-        if retain {
+        // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
+        // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
+        // untokened) flag here is exactly the everyday-race divergence the ADR removes.
+        if retain && self.durable_retained.is_none() {
             // A zero-length retained payload clears the retained message
             // [MQTT-3.3.1-10]; `RetainedStore::set` implements both cases.
             let message = Message {
@@ -2013,6 +2090,11 @@ impl Hub {
     /// message goes to *every* peer regardless of current interest, so each node
     /// stores it for its future subscribers (ADR 0014). Receivers apply it locally
     /// only, so there is no relay/loop.
+    ///
+    /// Under durable retained (ADR 0037 §3) the retain flag no longer forces the
+    /// broadcast: caches are warmed by the owner's post-commit fan-out instead, so a
+    /// retained publish forwards like any other — to interested peers, for live
+    /// delivery only.
     fn forward_to_peers(
         &self,
         topic: &str,
@@ -2022,12 +2104,13 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
     ) {
+        let retain_broadcasts = retain && self.durable_retained.is_none();
         for (node, peer) in &self.peers {
             let interested = self
                 .remote_interest
                 .get(node)
                 .is_some_and(|filters| filters.iter().any(|f| topic_matches(f, topic)));
-            if retain || interested {
+            if retain_broadcasts || interested {
                 let _ = peer.tx.send(PeerMessage::Publish {
                     topic: topic.to_string(),
                     payload: payload.to_vec(),
@@ -2334,10 +2417,13 @@ impl Hub {
     /// Commit a retained mutation into the durable keyspace on this (owner) node,
     /// **off-loop**: the quorum round-trip must not stall the hub actor. A zero-length
     /// payload is the MQTT clear [MQTT-3.3.1-10] → a versioned tombstone (ADR 0037 P2).
+    /// A successful commit posts [`HubCommand::RetainedCommitted`] back to the loop,
+    /// which warms the local cache and fans the tokened value out to every peer (§3).
     fn commit_retained_local(&self, topic: &str, payload: &Bytes, qos: u8) {
         let Some(durable) = self.durable_retained.clone() else {
             return;
         };
+        let self_tx = self.self_tx.clone();
         let topic = topic.to_string();
         let payload = payload.clone();
         tokio::spawn(async move {
@@ -2349,6 +2435,13 @@ impl Hub {
             match result {
                 Ok((epoch, offset)) => {
                     debug!(topic = %topic, epoch, offset, "retained mutation committed");
+                    let _ = self_tx.send(HubCommand::RetainedCommitted {
+                        topic,
+                        payload,
+                        qos,
+                        epoch,
+                        offset,
+                    });
                 }
                 // NotOwner here means the lease moved after routing (or the sender's
                 // ring was stale); NoQuorum that the commit could not be made durable.
@@ -2356,10 +2449,42 @@ impl Hub {
                 Err(e) => warn!(
                     topic = %topic,
                     error = %e,
-                    "retained durable commit failed; caches keep the broadcast value (0037-P5/P6 add repair)"
+                    "retained durable commit failed; caches not warmed (0037-P5/P6 add repair)"
                 ),
             }
         });
+    }
+
+    /// Apply a **committed** retained value to the local cache iff its token exceeds
+    /// the held one (ADR 0037 §3): monotonic per topic, idempotent, order-insensitive.
+    /// An empty payload is a committed clear — the cache drops the topic, but the
+    /// tombstone's token is kept so a staler value cannot resurrect it.
+    async fn apply_retained_update(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: u8,
+        token: (u64, u64),
+    ) {
+        if self
+            .retained_tokens
+            .get(topic)
+            .is_some_and(|held| token <= *held)
+        {
+            debug!(topic = %topic, ?token, "stale/duplicate retained update skipped");
+            return;
+        }
+        self.retained_tokens.insert(topic.to_string(), token);
+        let message = Message {
+            topic: topic.to_string(),
+            payload: payload.clone(),
+            qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
+            retain: true,
+            app: AppProperties::default(),
+        };
+        if let Err(e) = self.retained.set(&message).await {
+            warn!(topic = %topic, error = %e, "failed to apply committed retained update");
+        }
     }
 
     /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
@@ -3997,7 +4122,8 @@ mod tests {
     /// A retained publish for a topic whose group a PEER owns routes the mutation to
     /// that owner as a targeted `RetainedCommit` — no local durable write (a non-owner
     /// append would diverge; the owner is the single writer, ADR 0037 §1). The
-    /// ordinary ADR 0014 broadcast still precedes it on the same link.
+    /// live-delivery forward to an interested peer still precedes it on the same link
+    /// (under durable the raw broadcast is interest-only — P4's fan-out warms caches).
     #[tokio::test]
     async fn a_foreign_topics_retained_publish_routes_the_commit_to_its_owner() {
         let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
@@ -4011,6 +4137,8 @@ mod tests {
                 .find(|t| p.owner(t) == NodeId("n".into()))
                 .expect("some topic is owned by the peer")
         };
+        // The peer has a live subscriber for the topic, so the ordinary forward flows.
+        remote_interest(&tx, "n", &[&topic]);
 
         tx.send(HubCommand::Publish {
             topic: topic.clone(),
@@ -4022,11 +4150,11 @@ mod tests {
         })
         .unwrap();
 
-        // The link carries the ADR 0014 broadcast first, then the authority routing.
-        let mut saw_broadcast = false;
+        // The link carries the live-delivery forward first, then the authority routing.
+        let mut saw_forward = false;
         loop {
             match recv_peer(&mut peer).await {
-                Some(PeerMessage::Publish { retain, .. }) => saw_broadcast = retain,
+                Some(PeerMessage::Publish { retain, .. }) => saw_forward = retain,
                 Some(PeerMessage::RetainedCommit {
                     topic: t,
                     payload,
@@ -4041,7 +4169,10 @@ mod tests {
                 other => panic!("unexpected peer frame {other:?}"),
             }
         }
-        assert!(saw_broadcast, "the ADR 0014 broadcast still happens");
+        assert!(
+            saw_forward,
+            "the interested peer still gets the live forward"
+        );
         // No local durable write for a foreign topic: the owner is the single writer.
         assert!(durable.get(&topic).await.unwrap().is_none());
     }
@@ -4071,6 +4202,152 @@ mod tests {
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |e| e.tombstone).await;
         assert_eq!(e.token(), (0, 2));
+    }
+
+    /// The retained value a fresh subscriber replays for `topic`, or `None` if the
+    /// local cache holds nothing (bounded wait). Client names must be unique per test.
+    async fn retained_replay(tx: &HubTx, client: &str, topic: &str) -> Option<Vec<u8>> {
+        let (mut rx, _) = attach(tx, client, 99, true).await;
+        subscribe(tx, client, topic);
+        recv_packet(&mut rx).await.map(|p| payload_of(&p).to_vec())
+    }
+
+    /// ADR 0037 P4: a peer-fanned committed retained value applies to the local cache
+    /// **monotonically per topic** — a higher token wins, a stale or duplicate token
+    /// is skipped — so caches converge no matter the arrival order.
+    #[tokio::test]
+    async fn a_remote_retained_update_applies_monotonically_per_topic() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let update = |payload: &'static [u8], epoch: u64, offset: u64| {
+            tx.send(HubCommand::RemoteRetainedUpdate {
+                topic: "t".into(),
+                payload: Bytes::from_static(payload),
+                qos: 0,
+                epoch,
+                offset,
+            })
+            .unwrap();
+        };
+
+        update(b"v1", 1, 1);
+        assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v1");
+
+        // A higher token replaces the value.
+        update(b"v3", 1, 3);
+        assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"v3");
+
+        // A stale (lower-token) arrival is skipped — order-insensitive convergence.
+        update(b"v2", 1, 2);
+        assert_eq!(retained_replay(&tx, "c3", "t").await.unwrap(), b"v3");
+
+        // A duplicate token is idempotent (redelivery cannot regress the cache).
+        update(b"dup", 1, 3);
+        assert_eq!(retained_replay(&tx, "c4", "t").await.unwrap(), b"v3");
+
+        // A higher epoch outranks any offset (lexicographic token order).
+        update(b"new-owner", 2, 1);
+        assert_eq!(retained_replay(&tx, "c5", "t").await.unwrap(), b"new-owner");
+    }
+
+    /// ADR 0037 P4: a committed clear (empty payload) drops the topic from the cache
+    /// but its token still fences — a staler value cannot resurrect the topic.
+    #[tokio::test]
+    async fn a_stale_value_cannot_resurrect_a_committed_clear() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: 0,
+            epoch: 1,
+            offset: 4,
+        })
+        .unwrap();
+        assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
+
+        // The committed clear wins by token...
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::new(),
+            qos: 0,
+            epoch: 1,
+            offset: 5,
+        })
+        .unwrap();
+        assert!(retained_replay(&tx, "c2", "t").await.is_none());
+
+        // ...and a stale value arriving late cannot bring the topic back.
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"zombie"),
+            qos: 0,
+            epoch: 1,
+            offset: 4,
+        })
+        .unwrap();
+        assert!(retained_replay(&tx, "c3", "t").await.is_none());
+    }
+
+    /// ADR 0037 P4: after the owner's off-loop commit, the tokened value fans out to
+    /// peers as `RetainedUpdate` — and under durable the raw broadcast no longer goes
+    /// to a non-interested peer (the fan-out IS the cache warmer now). The owner's own
+    /// cache warms from the same commit, so a later local subscriber replays it.
+    #[tokio::test]
+    async fn a_committed_retained_publish_fans_out_with_its_token() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        publish_retained(&tx, "t", b"v");
+
+        // The non-interested peer gets the post-commit fan-out — and ONLY that (no
+        // raw Publish broadcast under durable).
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedUpdate {
+                topic,
+                payload,
+                qos,
+                epoch,
+                offset,
+            }) => {
+                assert_eq!(topic, "t");
+                assert_eq!(payload, b"v");
+                assert_eq!(qos, 0);
+                assert_eq!((epoch, offset), (0, 1), "the commit's token rides along");
+            }
+            other => panic!("expected the tokened RetainedUpdate, got {other:?}"),
+        }
+
+        // The owner's own cache warmed from the commit: a late subscriber replays it.
+        assert_eq!(retained_replay(&tx, "late", "t").await.unwrap(), b"v");
+    }
+
+    /// ADR 0037 P4: under durable retained, a peer's raw forwarded publish still
+    /// live-delivers to local subscribers but no longer warms the retained cache —
+    /// applying the raw (uncommitted, untokened) value is exactly the everyday-race
+    /// divergence the fan-out replaces.
+    #[tokio::test]
+    async fn the_raw_broadcast_no_longer_warms_caches_under_durable() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (mut live, _) = attach(&tx, "live", 1, true).await;
+        subscribe(&tx, "live", "t");
+
+        tx.send(HubCommand::RemotePublish {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"x"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+
+        // Live delivery is unchanged...
+        assert_eq!(payload_of(&recv_packet(&mut live).await.unwrap()), b"x");
+        // ...but the cache was not warmed: a fresh subscriber replays nothing.
+        assert!(retained_replay(&tx, "late", "t").await.is_none());
     }
 
     /// Durable off (no keyspace attached): a retained publish behaves exactly as

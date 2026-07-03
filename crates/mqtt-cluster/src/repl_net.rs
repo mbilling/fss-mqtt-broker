@@ -400,7 +400,7 @@ mod tests {
         assert!(transport.deliver(&b, 5, &append("c", 1)).await);
         // A delivery at epoch 4 is fenced.
         assert!(!transport.deliver(&b, 4, &append("c", 2)).await);
-        assert_eq!(state.lock().unwrap().fence(), 5);
+        assert_eq!(state.lock().unwrap().fence_for_key("c"), 5);
     }
 
     /// Delivering to a replica that was never registered fails immediately (no ack

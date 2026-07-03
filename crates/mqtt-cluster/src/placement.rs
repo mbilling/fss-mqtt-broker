@@ -46,6 +46,16 @@ pub fn group_of(client: &str) -> GroupId {
     hrw::stable_id(client.as_bytes()) % NUM_GROUPS
 }
 
+/// The placement group a durable **log key** belongs to. Log keys carry a 2-byte
+/// kind prefix (`q/`/`m/` session keys, `r/` retained keys) ahead of the placement
+/// key; this strips it and hashes what follows. The single derivation shared by the
+/// group router and the replica fence, so they can never disagree about a key's
+/// group (a prefix-less key hashes as itself).
+#[must_use]
+pub fn group_of_key(key: &str) -> GroupId {
+    group_of(key.get(2..).unwrap_or(key))
+}
+
 /// The HRW key for a placement group (so groups hash independently of any client).
 fn group_key(group: GroupId) -> String {
     format!("group/{group}")

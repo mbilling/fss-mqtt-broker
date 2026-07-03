@@ -230,6 +230,26 @@ pub enum PeerMessage {
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
     },
+    /// The post-commit retained fan-out (ADR 0037 §3): the topic's group owner
+    /// broadcasts every **committed** retained value with its `(epoch, offset)`
+    /// convergence token; each node's local cache applies it only when the token
+    /// exceeds the one it holds for the topic — monotonic per topic, idempotent,
+    /// order-insensitive. This replaces the raw ADR 0014 broadcast as the cache
+    /// warmer when durable retained is on. A zero-length payload is a committed
+    /// clear (versioned tombstone): the cache drops the topic but its token still
+    /// fences out any staler value.
+    RetainedUpdate {
+        /// The committed topic.
+        topic: String,
+        /// The committed payload; empty = cleared (tombstone).
+        payload: Vec<u8>,
+        /// The publish `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The lease epoch the value committed under (token high half).
+        epoch: u64,
+        /// The committed log offset (token low half).
+        offset: u64,
+    },
 }
 
 /// Errors from peer-frame coding.
@@ -298,6 +318,8 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    // One roundtrip per wire variant — the length tracks the enum, not complexity.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn roundtrips_all_variants() {
         roundtrip(&PeerMessage::Hello {
@@ -397,6 +419,20 @@ mod tests {
             topic: "dev/1/state".into(),
             payload: Vec::new(), // a clear (versioned tombstone)
             qos: 0,
+        });
+        roundtrip(&PeerMessage::RetainedUpdate {
+            topic: "dev/1/state".into(),
+            payload: b"open".to_vec(),
+            qos: 1,
+            epoch: 7,
+            offset: 42,
+        });
+        roundtrip(&PeerMessage::RetainedUpdate {
+            topic: "dev/1/state".into(),
+            payload: Vec::new(), // a committed clear
+            qos: 0,
+            epoch: 7,
+            offset: 43,
         });
     }
 

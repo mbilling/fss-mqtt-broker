@@ -73,6 +73,9 @@ struct DurableNode {
     /// A clone of this node's durable plane, kept only to observe lease-group
     /// readiness (`voter_count`) from the test.
     plane: mqtt_cluster::durable_plane::DurablePlane,
+    /// This node's metrics registry, so tests can read counters (e.g. the retained
+    /// divergence meter, ADR 0037).
+    metrics: Arc<mqtt_observability::metrics::Metrics>,
     /// Abort handles for every task this node spawned — aborting them all crashes
     /// the node (it stops gossiping, serving, and replicating), so peers detect it
     /// dead and re-elect. Used by the takeover test (workstream F).
@@ -110,6 +113,8 @@ async fn start_durable_node_cfg(
 
 /// As [`start_durable_node_cfg`], but with an explicit bounded voter cap `N` (ADR 0021)
 /// so a larger cluster can be brought up with only `N` voters and the rest as learners.
+// The one-stop node assembly deliberately mirrors production wiring end to end.
+#[allow(clippy::too_many_lines)]
 async fn start_durable_node_capped(
     id: &str,
     swim_seeds: Vec<String>,
@@ -140,6 +145,10 @@ async fn start_durable_node_capped(
     // Durable retained (ADR 0037 P3): retained mutations route to the group owner,
     // exactly as production wires it.
     hub.attach_durable_retained(durable_retained);
+    // Metrics, so tests can read the divergence counter (ADR 0037 P4 convergence
+    // proof). One registry per node ("dur" is just the namespace).
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("dur"));
+    hub.attach_metrics(metrics.clone());
     // Killing a node aborts its hub, accept loop, and lease-group driver together.
     let mut aborts = vec![
         tokio::spawn(hub.run()).abort_handle(),
@@ -222,6 +231,7 @@ async fn start_durable_node_capped(
         swim_addr,
         client_addr,
         plane: plane_observer,
+        metrics,
         aborts,
     }
 }
@@ -419,6 +429,108 @@ async fn a_clean_session_client_connects_promptly_on_the_group_owner() {
 
     let p = sub.expect_publish().await;
     assert_eq!(&p.payload[..], b"hello");
+}
+
+/// The retained value a fresh clean subscriber replays for `topic` on the node at
+/// `addr`, or `None` if that node's cache holds nothing. `client_id` must be unique
+/// per call.
+async fn retained_seen(addr: SocketAddr, client_id: &str, topic: &str) -> Option<Vec<u8>> {
+    let mut c = common::Client::connect(addr, client_id).await;
+    c.subscribe(1, topic, QoS::AtMostOnce).await;
+    match c.try_recv().await {
+        Some(mqtt_codec::Packet::Publish(p)) => Some(p.payload.to_vec()),
+        _ => None,
+    }
+}
+
+/// ADR 0037 P4 — the **everyday race**: two clients publish *different* retained
+/// values to the SAME topic concurrently on two different nodes, with no partition.
+/// Under ADR 0014's raw broadcast each node could apply the other's value last —
+/// silent, permanent divergence. Under single-owner retained both mutations commit
+/// through the topic's group owner (serialized, tokened) and the post-commit fan-out
+/// warms every cache monotonically — so the cluster converges to ONE committed value
+/// and the divergence meter stays at zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_retained_publishes_on_two_nodes_converge_cluster_wide() {
+    let a = start_durable_node("race-a", vec![]).await; // founder
+    let b = start_durable_node("race-b", vec![a.swim_addr.clone()]).await;
+    let nodes = [&a, &b];
+
+    wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 2)
+    })
+    .await;
+    wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 2)
+    })
+    .await;
+
+    // A topic whose group node A owns (HRW — identical from every node's view).
+    let topic = (0..10_000)
+        .map(|i| format!("race/dev/{i}"))
+        .find(|t| a.placement.read().unwrap().owner(t) == a.node_id)
+        .unwrap();
+
+    // Prime the pipeline from the NON-owner: B's publish must route to A (owner
+    // commit) and fan back out before a fresh subscriber on A replays it. Polling
+    // this gates the race on the whole P3+P4 path being up (lease assigned, peer
+    // mesh linked, fan-out flowing) without racing the cluster bring-up.
+    let mut prime = common::Client::connect(b.client_addr, "race-prime").await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        prime.publish_retained(&topic, b"prime").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if retained_seen(a.client_addr, &format!("race-up-{tick}"), &topic).await
+            == Some(b"prime".to_vec())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the retained owner-commit + fan-out pipeline never came up"
+        );
+    }
+
+    // THE RACE: different values for the same topic, published concurrently on the
+    // owner (A) and the non-owner (B).
+    let mut pub_a = common::Client::connect(a.client_addr, "race-pub-a").await;
+    let mut pub_b = common::Client::connect(b.client_addr, "race-pub-b").await;
+    tokio::join!(
+        pub_a.publish_retained(&topic, b"from-a"),
+        pub_b.publish_retained(&topic, b"from-b"),
+    );
+
+    // Convergence: fresh subscribers on BOTH nodes replay the SAME committed value,
+    // and it is one of the two racing writes (the prime value superseded everywhere).
+    // Under ADR 0014 this loop would never exit with crossed broadcasts applied last.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut round = 0;
+    loop {
+        round += 1;
+        let on_a = retained_seen(a.client_addr, &format!("conv-a{round}"), &topic).await;
+        let on_b = retained_seen(b.client_addr, &format!("conv-b{round}"), &topic).await;
+        let racing_value = on_a == Some(b"from-a".to_vec()) || on_a == Some(b"from-b".to_vec());
+        if on_a.is_some() && on_a == on_b && racing_value {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "caches never converged to one committed racing value: A={on_a:?} B={on_b:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // No divergence was detected anywhere along the way.
+    for n in nodes {
+        assert!(
+            n.metrics.render().contains("retained_divergence_total 0"),
+            "the divergence meter must stay at zero"
+        );
+    }
 }
 
 /// Client-observable durable failover (ADR 0016 phase 1 + ADR 0017): a **persistent**
