@@ -5,7 +5,9 @@ adr_status: Proposed
 tasks:
   - id: 0037-P1
     title: Divergence detection — value hash in the retained digest; warn + retained_divergence_total metric
-    status: planned
+    status: done
+    date: 2026-07-03
+    evidence: "PeerMessage::RetainedDigest gains value_hash (XOR of a stable 64-bit hash per (topic, payload, qos); the topic is length-prefixed against boundary collisions). handle_retained_digest pulls when EITHER the topic-set hash or the value hash differs — the value-only case is exactly what the topics-only digest was blind to. apply_retained_snapshot compares values for topics both sides hold: a difference increments retained_divergence_total (Prometheus + OTLP) and warns once per chunk (per-topic detail at debug — bounded logging); RemoteRetainedSnapshot gained the source node for attribution. Storage unchanged: gap-fill still keeps the local value (detection only, per the ADR's migration sequencing). Tests: a_value_only_digest_difference_triggers_a_pull, a_divergent_retained_value_is_detected_and_counted (metric increments exactly once for one divergent topic; agreeing and gap-filled topics do not count; local value proven kept via subscriber replay), digest order-independence extended to value hashes; codec roundtrip updated."
   - id: 0037-P2
     title: Retained keyspace in the group log — ret/<topic> set/clear ops, last-value compaction, versioned tombstones; quorum/fencing/takeover/restart unit tests on the pure cores
     status: planned
@@ -53,7 +55,7 @@ phase lands test-first and independently green.
 <!-- status-table:0037 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0037-P1 | ⬜ planned | — |  |
+| 0037-P1 | ✅ done | 2026-07-03 | "PeerMessage::RetainedDigest gains value_hash (XOR of a stable 64-bit hash per (topic, payload, qos); the topic is length-prefixed against boundary collisions). handle_retained_digest pulls when EITHER the topic-set hash or the value hash differs — the value-only case is exactly what the topics-only digest was blind to. apply_retained_snapshot compares values for topics both sides hold: a difference increments retained_divergence_total (Prometheus + OTLP) and warns once per chunk (per-topic detail at debug — bounded logging); RemoteRetainedSnapshot gained the source node for attribution. Storage unchanged: gap-fill still keeps the local value (detection only, per the ADR's migration sequencing). Tests: a_value_only_digest_difference_triggers_a_pull, a_divergent_retained_value_is_detected_and_counted (metric increments exactly once for one divergent topic; agreeing and gap-filled topics do not count; local value proven kept via subscriber replay), digest order-independence extended to value hashes; codec roundtrip updated." |
 | 0037-P2 | ⬜ planned | — |  |
 | 0037-P3 | ⬜ planned | — |  |
 | 0037-P4 | ⬜ planned | — |  |
@@ -64,6 +66,12 @@ phase lands test-first and independently green.
 
 ## Changelog
 
+- **2026-07-03** — P1 (divergence detection) landed: the retained digest carries a value
+  hash, a value-only difference now triggers the pull the topics-only digest missed, and a
+  peer value differing from ours on a shared topic increments `retained_divergence_total`
+  and warns (once per chunk) — with storage behaviour deliberately unchanged (gap-fill
+  keeps the local value). This is the baseline meter: it quantifies real-world divergence
+  before the migration and must read zero after P2–P6 land.
 - **2026-07-03** — ADR proposed and delivery opened, resolving the 0014-T7 question
   (partition-heal retained divergence) by **prevention**: single-owner writes through the
   existing lease/group-log machinery with clock-free `(epoch, offset)` convergence tokens,

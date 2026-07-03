@@ -90,6 +90,7 @@ struct OtelInstruments {
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
     quic_path_migrations: OtelCounter<u64>,
+    retained_divergence: OtelCounter<u64>,
 }
 
 impl OtelInstruments {
@@ -121,6 +122,7 @@ impl OtelInstruments {
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
+            retained_divergence: meter.u64_counter("retained_divergence").build(),
         }
     }
 }
@@ -163,6 +165,7 @@ pub struct Metrics {
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
     quic_path_migrations_total: Counter,
+    retained_divergence_total: Counter,
 }
 
 impl Metrics {
@@ -318,6 +321,12 @@ impl Metrics {
             "quic_path_migrations",
             "QUIC connection path migrations observed (client address changed; same connection and session kept)",
         );
+        let retained_divergence_total = register_counter(
+            &mut registry,
+            "retained_divergence",
+            "Retained-message divergences detected between peers (same topic, different value \
+             — ADR 0037 P1); should stay at zero once single-owner retained lands",
+        );
 
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
@@ -353,6 +362,7 @@ impl Metrics {
             gossip_rejected_total,
             security_reloads_total,
             quic_path_migrations_total,
+            retained_divergence_total,
         }
     }
 
@@ -571,6 +581,16 @@ impl Metrics {
     pub fn quic_path_migrated(&self) {
         self.quic_path_migrations_total.inc();
         self.otel.quic_path_migrations.add(1, &[]);
+    }
+
+    /// A retained-message divergence was detected: a peer holds a **different value** for a
+    /// topic this node also retains (ADR 0037 P1). Divergence is possible under the
+    /// best-effort ADR 0014 replication (concurrent publishes, partition heals); once
+    /// single-owner retained (ADR 0037) lands this counter staying at zero is the
+    /// convergence proof.
+    pub fn retained_divergence(&self) {
+        self.retained_divergence_total.inc();
+        self.otel.retained_divergence.add(1, &[]);
     }
 
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;

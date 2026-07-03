@@ -449,13 +449,21 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                     )
                 })
                 .collect();
-            let _ = hub.send(HubCommand::RemoteRetainedSnapshot { messages });
+            let _ = hub.send(HubCommand::RemoteRetainedSnapshot {
+                node: remote.clone(),
+                messages,
+            });
         }
-        PeerMessage::RetainedDigest { count, hash } => {
+        PeerMessage::RetainedDigest {
+            count,
+            hash,
+            value_hash,
+        } => {
             let _ = hub.send(HubCommand::RemoteRetainedDigest {
                 node: remote.clone(),
                 count,
                 hash,
+                value_hash,
             });
         }
         PeerMessage::RetainedRequest => {
