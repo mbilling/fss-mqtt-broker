@@ -9,21 +9,48 @@
 //! The pure [`crate::swim`] module stays crypto-free; this seals/opens at the
 //! I/O boundary only ([`crate::swim_driver`]).
 
-use ring::hmac;
-use std::sync::Arc;
+use ring::{digest, hmac};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Shared-key-only datagram (ADR 0003): `[1][tag][payload]`.
 const VERSION_V1: u8 = 1;
-/// Signed datagram (ADR 0022): `[2][tag][cert_len][cert][sig_len][sig][payload]`, the tag
-/// covering everything after it.
+/// Signed datagram (ADR 0022): `[2][tag][cert_ref][sig_len][sig][payload]`, the tag
+/// covering everything after it. The cert-ref is the full leaf certificate or its
+/// SHA-256 fingerprint (0022-T6).
 const VERSION_V2: u8 = 2;
-/// Signed + sequenced datagram (ADR 0023): `[3][tag][seq(8)][cert_len][cert][sig_len][sig][payload]`,
+/// Signed + sequenced datagram (ADR 0023): `[3][tag][seq(8)][cert_ref][sig_len][sig][payload]`,
 /// the tag covering everything after it. Anti-replay builds on the v2 signature.
 const VERSION_V3: u8 = 3;
 /// HMAC-SHA256 tag length.
 const TAG_LEN: usize = 32;
 /// Required key length in bytes (64 hex characters).
 pub const KEY_LEN: usize = 32;
+
+/// Cert-ref marker: the full leaf certificate follows (`[len u16][cert]`), 0022-T6.
+const CERT_REF_FULL: u8 = 1;
+/// Cert-ref marker: a SHA-256 fingerprint of the leaf certificate follows (32 bytes).
+const CERT_REF_FP: u8 = 2;
+/// SHA-256 fingerprint length.
+const FP_LEN: usize = 32;
+/// Send the full certificate every Nth sealed datagram even between priming moments
+/// (0022-T6): recovery bound for a receiver that lost the priming datagram (UDP) or
+/// restarted its cache. Every other datagram carries only the 32-byte fingerprint,
+/// keeping signed gossip under a typical 1500-byte MTU.
+const FULL_CERT_EVERY: u64 = 16;
+/// Bound on cached peer certificates: comfortably above any real cluster size, small
+/// enough that a key-holding flooder cannot balloon memory. On overflow the cache is
+/// cleared and re-primes from the periodic full-cert datagrams.
+const CERT_CACHE_CAP: usize = 128;
+
+/// SHA-256 fingerprint of a certificate's DER bytes (0022-T6).
+fn fingerprint(cert_der: &[u8]) -> [u8; FP_LEN] {
+    digest::digest(&digest::SHA256, cert_der)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 yields 32 bytes")
+}
 
 /// A gossip key failed validation at startup.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +78,10 @@ pub enum OpenReject {
     Expired,
     /// The sender's certificate is revoked by the cluster CRL.
     Revoked,
+    /// A fingerprint-only datagram referenced a certificate this node has not cached yet
+    /// (0022-T6). Recoverable, not adversarial: the sender's next priming (Join/Sync) or
+    /// periodic full-cert datagram re-primes the cache and gossip converges.
+    UnknownCert,
 }
 
 impl OpenReject {
@@ -61,6 +92,7 @@ impl OpenReject {
             Self::Auth => "auth",
             Self::Expired => "expired",
             Self::Revoked => "revoked",
+            Self::UnknownCert => "cert-miss",
         }
     }
 }
@@ -136,6 +168,17 @@ pub struct SwimAuth {
     /// When true (implies `signer` is set), this node is in the anti-replay posture: it
     /// sequences its outgoing datagrams (v3) and accepts **only** v3 (ADR 0023).
     sequenced: bool,
+    /// This node's certificate fingerprint, precomputed at
+    /// [`with_signing`](Self::with_signing) (0022-T6).
+    own_fp: Option<[u8; FP_LEN]>,
+    /// Outgoing-datagram counter driving the periodic full-cert refresh (0022-T6).
+    sends: AtomicU64,
+    /// Verified peer certificates by fingerprint (0022-T6). Only certificates from
+    /// datagrams that passed the **full** verification (chain, validity, revocation,
+    /// signature) are inserted, so a key-holder cannot stuff the cache with garbage.
+    /// Fingerprinting is pure wire compression: every datagram — fingerprint-form
+    /// included — still runs the full verification against the (cached) DER.
+    cert_cache: Mutex<HashMap<[u8; FP_LEN], Vec<u8>>>,
 }
 
 impl std::fmt::Debug for SwimAuth {
@@ -157,6 +200,9 @@ impl SwimAuth {
             signer: None,
             verifier: None,
             sequenced: false,
+            own_fp: None,
+            sends: AtomicU64::new(0),
+            cert_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -204,6 +250,7 @@ impl SwimAuth {
         signer: Arc<dyn GossipSign>,
         verifier: Arc<dyn GossipVerify>,
     ) -> Self {
+        self.own_fp = Some(fingerprint(signer.cert_der()));
         self.signer = Some(signer);
         self.verifier = Some(verifier);
         self
@@ -231,22 +278,25 @@ impl SwimAuth {
     /// Wrap a serialized SWIM message for the wire. With a signer, produces a v2 (signed)
     /// datagram; otherwise the v1 shared-key-only datagram.
     ///
+    /// `prime` forces the **full certificate** into the datagram (0022-T6). The driver
+    /// sets it on first-contact/full-state message kinds (Join/Sync), so a peer is primed
+    /// deterministically before it sees fingerprint-only datagrams; between priming
+    /// moments the full cert still rides every [`FULL_CERT_EVERY`]th datagram as a
+    /// loss-recovery bound, and everything else carries the 32-byte fingerprint —
+    /// keeping signed gossip under a typical MTU. Ignored in the v1 posture.
+    ///
     /// # Panics
     /// Panics if the leaf certificate or signature exceeds 64 KiB (a `u16` length field) —
     /// far beyond any real certificate, so this is a provisioning invariant, not input.
     #[must_use]
-    pub fn seal(&self, payload: &[u8]) -> Vec<u8> {
+    pub fn seal(&self, payload: &[u8], prime: bool) -> Vec<u8> {
         let Some(signer) = &self.signer else {
             return self.frame(VERSION_V1, payload);
         };
-        // v2 body: [cert_len][cert][sig_len][sig][payload], tag computed over the whole body.
-        let cert = signer.cert_der();
+        // v2 body: [cert_ref][sig_len][sig][payload], tag computed over the whole body.
         let sig = signer.sign(payload);
-        let cert_len = u16::try_from(cert.len()).expect("leaf certificate fits u16");
         let sig_len = u16::try_from(sig.len()).expect("signature fits u16");
-        let mut body = Vec::with_capacity(2 + cert.len() + 2 + sig.len() + payload.len());
-        body.extend_from_slice(&cert_len.to_be_bytes());
-        body.extend_from_slice(cert);
+        let mut body = self.cert_ref(signer.as_ref(), prime);
         body.extend_from_slice(&sig_len.to_be_bytes());
         body.extend_from_slice(&sig);
         body.extend_from_slice(payload);
@@ -254,30 +304,53 @@ impl SwimAuth {
     }
 
     /// Wrap a serialized SWIM message as a signed + sequenced v3 datagram (ADR 0023), the
-    /// sequence supplied by the driver's monotonic allocator. Falls back to [`seal`](Self::seal)
-    /// if no signer is configured (a misconfiguration — sequencing requires signing — that the
-    /// receiver's `require_sequenced` would reject anyway).
+    /// sequence supplied by the driver's monotonic allocator. `prime` as in
+    /// [`seal`](Self::seal). Falls back to [`seal`](Self::seal) if no signer is configured
+    /// (a misconfiguration — sequencing requires signing — that a sequenced receiver
+    /// would reject anyway).
     ///
     /// # Panics
     /// Panics if the certificate or signature exceeds 64 KiB (a `u16` length field).
     #[must_use]
-    pub fn seal_sequenced(&self, payload: &[u8], seq: u64) -> Vec<u8> {
+    pub fn seal_sequenced(&self, payload: &[u8], seq: u64, prime: bool) -> Vec<u8> {
         let Some(signer) = &self.signer else {
-            return self.seal(payload);
+            return self.seal(payload, prime);
         };
-        // v3 body: [seq(8)][cert_len][cert][sig_len][sig][payload].
-        let cert = signer.cert_der();
+        // v3 body: [seq(8)][cert_ref][sig_len][sig][payload].
         let sig = signer.sign(payload);
-        let cert_len = u16::try_from(cert.len()).expect("leaf certificate fits u16");
         let sig_len = u16::try_from(sig.len()).expect("signature fits u16");
-        let mut body = Vec::with_capacity(8 + 2 + cert.len() + 2 + sig.len() + payload.len());
+        let mut body = Vec::with_capacity(8);
         body.extend_from_slice(&seq.to_be_bytes());
-        body.extend_from_slice(&cert_len.to_be_bytes());
-        body.extend_from_slice(cert);
+        body.extend_from_slice(&self.cert_ref(signer.as_ref(), prime));
         body.extend_from_slice(&sig_len.to_be_bytes());
         body.extend_from_slice(&sig);
         body.extend_from_slice(payload);
         self.frame(VERSION_V3, &body)
+    }
+
+    /// The cert-ref field for an outgoing signed datagram (0022-T6): the full leaf
+    /// certificate when `prime` is set or on every [`FULL_CERT_EVERY`]th send, else the
+    /// 32-byte SHA-256 fingerprint.
+    fn cert_ref(&self, signer: &dyn GossipSign, prime: bool) -> Vec<u8> {
+        let nth = self.sends.fetch_add(1, Ordering::Relaxed);
+        if prime || nth % FULL_CERT_EVERY == 0 {
+            let cert = signer.cert_der();
+            let cert_len = u16::try_from(cert.len()).expect("leaf certificate fits u16");
+            let mut out = Vec::with_capacity(3 + cert.len());
+            out.push(CERT_REF_FULL);
+            out.extend_from_slice(&cert_len.to_be_bytes());
+            out.extend_from_slice(cert);
+            out
+        } else {
+            let fp = self
+                .own_fp
+                .as_ref()
+                .expect("signer set implies fingerprint");
+            let mut out = Vec::with_capacity(1 + FP_LEN);
+            out.push(CERT_REF_FP);
+            out.extend_from_slice(fp);
+            out
+        }
     }
 
     /// `[version][HMAC(body)][body]`, sealed with the primary key.
@@ -323,12 +396,8 @@ impl SwimAuth {
             }),
             // Signed posture: accept v2 only (verify the signature, bind the identity).
             VERSION_V2 if self.signer.is_some() && !self.sequenced => {
-                let (cert, sig, payload) = parse_v2(body).ok_or(OpenReject::Auth)?;
-                let v = self
-                    .verifier
-                    .as_ref()
-                    .ok_or(OpenReject::Auth)?
-                    .verify(cert, payload, sig)?;
+                let (cref, sig, payload) = parse_v2(body).ok_or(OpenReject::Auth)?;
+                let v = self.verify_ref(&cref, payload, sig)?;
                 Ok(Opened {
                     payload,
                     identity: Some(v.cn),
@@ -338,12 +407,8 @@ impl SwimAuth {
             }
             // Signed + sequenced posture: accept v3 only (verify + carry the windowed sequence).
             VERSION_V3 if self.sequenced => {
-                let (seq, cert, sig, payload) = parse_v3(body).ok_or(OpenReject::Auth)?;
-                let v = self
-                    .verifier
-                    .as_ref()
-                    .ok_or(OpenReject::Auth)?
-                    .verify(cert, payload, sig)?;
+                let (seq, cref, sig, payload) = parse_v3(body).ok_or(OpenReject::Auth)?;
+                let v = self.verify_ref(&cref, payload, sig)?;
                 Ok(Opened {
                     payload,
                     identity: Some(v.cn),
@@ -355,29 +420,95 @@ impl SwimAuth {
             _ => Err(OpenReject::Auth),
         }
     }
+
+    /// Resolve a cert-ref and run the **full** verification against it (0022-T6). A full
+    /// certificate that verifies is cached under its fingerprint; a fingerprint resolves
+    /// through the cache (miss ⇒ [`OpenReject::UnknownCert`], recoverable) and the cached
+    /// DER is then verified exactly like an inline one — chain, validity window,
+    /// revocation, and signature all run per datagram, so a CRL/expiry change applies to
+    /// fingerprint-form datagrams immediately.
+    fn verify_ref(
+        &self,
+        cref: &CertRef<'_>,
+        payload: &[u8],
+        sig: &[u8],
+    ) -> Result<VerifiedIdentity, OpenReject> {
+        let verifier = self.verifier.as_ref().ok_or(OpenReject::Auth)?;
+        match cref {
+            CertRef::Full(cert) => {
+                let v = verifier.verify(cert, payload, sig)?;
+                let mut cache = self
+                    .cert_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let fp = fingerprint(cert);
+                if cache.len() >= CERT_CACHE_CAP && !cache.contains_key(&fp) {
+                    // Overflow: clear and re-prime from periodic full-cert datagrams.
+                    // Only fully-verified certs get here, so this is churn control, not
+                    // a poisoning vector.
+                    cache.clear();
+                }
+                cache.insert(fp, cert.to_vec());
+                Ok(v)
+            }
+            CertRef::Fp(fp) => {
+                let cert = {
+                    let cache = self
+                        .cert_cache
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    cache.get(fp).cloned()
+                }
+                .ok_or(OpenReject::UnknownCert)?;
+                verifier.verify(&cert, payload, sig)
+            }
+        }
+    }
 }
 
-/// Parse a v2 body `[cert_len u16][cert][sig_len u16][sig][payload]`. Any short/overrunning
-/// field yields `None` (rejected). Lengths are bounds-checked against the remaining slice.
-fn parse_v2(body: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
-    let cert_len = u16::from_be_bytes(body.get(0..2)?.try_into().ok()?) as usize;
-    let rest = body.get(2..)?;
-    let cert = rest.get(..cert_len)?;
-    let rest = rest.get(cert_len..)?;
+/// How a signed datagram identifies its sender's certificate (0022-T6).
+enum CertRef<'a> {
+    /// The full leaf certificate DER, inline.
+    Full(&'a [u8]),
+    /// A SHA-256 fingerprint of a previously-seen certificate.
+    Fp([u8; FP_LEN]),
+}
+
+/// Parse the leading cert-ref of a v2/v3 body: `[1][cert_len u16][cert]` (full) or
+/// `[2][fp; 32]` (fingerprint). Returns the ref and the remaining bytes.
+fn parse_cert_ref(body: &[u8]) -> Option<(CertRef<'_>, &[u8])> {
+    match *body.first()? {
+        CERT_REF_FULL => {
+            let cert_len = u16::from_be_bytes(body.get(1..3)?.try_into().ok()?) as usize;
+            let cert = body.get(3..3 + cert_len)?;
+            Some((CertRef::Full(cert), body.get(3 + cert_len..)?))
+        }
+        CERT_REF_FP => {
+            let fp: [u8; FP_LEN] = body.get(1..1 + FP_LEN)?.try_into().ok()?;
+            Some((CertRef::Fp(fp), body.get(1 + FP_LEN..)?))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a v2 body `[cert_ref][sig_len u16][sig][payload]`. Any short/overrunning field
+/// yields `None` (rejected). Lengths are bounds-checked against the remaining slice.
+fn parse_v2(body: &[u8]) -> Option<(CertRef<'_>, &[u8], &[u8])> {
+    let (cref, rest) = parse_cert_ref(body)?;
     let sig_len = u16::from_be_bytes(rest.get(0..2)?.try_into().ok()?) as usize;
     let rest = rest.get(2..)?;
     let sig = rest.get(..sig_len)?;
     let payload = rest.get(sig_len..)?;
-    Some((cert, sig, payload))
+    Some((cref, sig, payload))
 }
 
-/// Parse a v3 body `[seq u64][cert_len u16][cert][sig_len u16][sig][payload]`: the 8-byte
+/// Parse a v3 body `[seq u64][cert_ref][sig_len u16][sig][payload]`: the 8-byte
 /// sequence prefix, then the v2 body. `None` on any short/overrunning field.
-#[allow(clippy::type_complexity)] // (seq, cert, sig, payload) — a flat parse result, not nested
-fn parse_v3(body: &[u8]) -> Option<(u64, &[u8], &[u8], &[u8])> {
+#[allow(clippy::type_complexity)] // (seq, cref, sig, payload) — a flat parse result, not nested
+fn parse_v3(body: &[u8]) -> Option<(u64, CertRef<'_>, &[u8], &[u8])> {
     let seq = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
-    let (cert, sig, payload) = parse_v2(body.get(8..)?)?;
-    Some((seq, cert, sig, payload))
+    let (cref, sig, payload) = parse_v2(body.get(8..)?)?;
+    Some((seq, cref, sig, payload))
 }
 
 /// Minimal hex decoder (avoids a dependency for one call site).
@@ -394,8 +525,8 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_v2, parse_v3, GossipSign, GossipVerify, OpenReject, SwimAuth, VerifiedIdentity,
-        KEY_LEN, TAG_LEN, VERSION_V2, VERSION_V3,
+        parse_v2, parse_v3, CertRef, GossipSign, GossipVerify, OpenReject, SwimAuth,
+        VerifiedIdentity, KEY_LEN, TAG_LEN, VERSION_V2, VERSION_V3,
     };
     use std::fmt::Write as _;
     use std::sync::Arc;
@@ -460,7 +591,7 @@ mod tests {
     #[test]
     fn seal_then_open_roundtrips() {
         let a = auth(7);
-        let sealed = a.seal(b"membership update");
+        let sealed = a.seal(b"membership update", false);
         let opened = a.open(&sealed).expect("opens");
         assert_eq!(opened.payload, b"membership update");
         assert_eq!(opened.identity, None); // v1: no authenticated identity
@@ -478,7 +609,7 @@ mod tests {
             *b = u8::try_from(i).unwrap();
         }
         let a = SwimAuth::new(&key);
-        let sealed = a.seal(b"swim wire format v1");
+        let sealed = a.seal(b"swim wire format v1", false);
 
         let expected = "01\
              339e989207e2b8bf79837d88e29490ed95e4e3a5b08219301b4033b966d49509\
@@ -496,7 +627,7 @@ mod tests {
     #[test]
     fn empty_payload_is_the_minimum_valid_datagram() {
         let a = auth(7);
-        let sealed = a.seal(b"");
+        let sealed = a.seal(b"", false);
         assert_eq!(sealed.len(), 1 + TAG_LEN);
         assert_eq!(a.open(&sealed).expect("opens").payload, b"");
     }
@@ -504,7 +635,7 @@ mod tests {
     #[test]
     fn any_flipped_bit_is_rejected() {
         let a = auth(7);
-        let sealed = a.seal(b"payload");
+        let sealed = a.seal(b"payload", false);
         // Version, every tag byte, and every payload byte.
         for i in 0..sealed.len() {
             let mut tampered = sealed.clone();
@@ -515,14 +646,14 @@ mod tests {
 
     #[test]
     fn wrong_key_is_rejected() {
-        let sealed = auth(7).seal(b"payload");
+        let sealed = auth(7).seal(b"payload", false);
         assert!(auth(8).open(&sealed).is_err());
     }
 
     #[test]
     fn truncated_and_empty_datagrams_are_rejected() {
         let a = auth(7);
-        let sealed = a.seal(b"payload");
+        let sealed = a.seal(b"payload", false);
         // Below the minimum length: rejected by the length guard.
         assert!(a.open(&[]).is_err());
         assert!(a.open(&sealed[..TAG_LEN]).is_err());
@@ -568,7 +699,7 @@ mod tests {
     #[test]
     fn signed_seal_open_roundtrips_and_returns_the_identity() {
         let a = signing_auth(7, "node-a");
-        let sealed = a.seal(b"membership update");
+        let sealed = a.seal(b"membership update", false);
         assert_eq!(sealed[0], VERSION_V2);
         let opened = a.open(&sealed).expect("opens");
         assert_eq!(opened.payload, b"membership update");
@@ -576,14 +707,19 @@ mod tests {
     }
 
     /// Pin the v2 framing: after the version byte and tag, the body parses to the embedded
-    /// certificate, signature, and payload in that order.
+    /// cert-ref (the first datagram carries the full certificate), signature, and payload
+    /// in that order.
     #[test]
     fn v2_body_framing_is_pinned() {
         let a = signing_auth(7, "node-a");
-        let sealed = a.seal(b"PAYLOAD");
+        let sealed = a.seal(b"PAYLOAD", false);
         assert_eq!(sealed[0], VERSION_V2);
         let body = &sealed[1 + TAG_LEN..];
-        let (cert, sig, payload) = parse_v2(body).expect("v2 body parses");
+        assert_eq!(body[0], super::CERT_REF_FULL, "first datagram: full cert");
+        let (cref, sig, payload) = parse_v2(body).expect("v2 body parses");
+        let CertRef::Full(cert) = cref else {
+            panic!("first datagram must carry the full certificate");
+        };
         assert_eq!(cert, b"cert-of-node-a");
         assert_eq!(sig, b"SIG:PAYLOAD");
         assert_eq!(payload, b"PAYLOAD");
@@ -593,7 +729,7 @@ mod tests {
     fn a_signed_node_rejects_an_unsigned_v1_datagram() {
         // The signed posture is strict: a v1 (shared-key-only) datagram on the same key is
         // rejected, not accepted — there is no rollout leniency.
-        let v1 = auth(7).seal(b"unsigned");
+        let v1 = auth(7).seal(b"unsigned", false);
         let signed = signing_auth(7, "node-a");
         assert!(signed.open(&v1).is_err(), "a signed node must reject v1");
     }
@@ -602,7 +738,7 @@ mod tests {
     fn a_signature_that_fails_verification_is_rejected() {
         // Seal as node-a, but open with a verifier expecting node-b's cert: verify() → None.
         let sender = signing_auth(7, "node-a");
-        let sealed = sender.seal(b"msg");
+        let sealed = sender.seal(b"msg", false);
         let receiver = signing_auth(7, "node-b"); // expects cert-of-node-b
         assert!(receiver.open(&sealed).is_err());
     }
@@ -610,7 +746,7 @@ mod tests {
     #[test]
     fn tampering_any_v2_byte_is_rejected_by_the_hmac() {
         let a = signing_auth(7, "node-a");
-        let sealed = a.seal(b"payload");
+        let sealed = a.seal(b"payload", false);
         for i in 0..sealed.len() {
             let mut t = sealed.clone();
             t[i] ^= 0x01;
@@ -622,7 +758,7 @@ mod tests {
     fn a_shared_key_node_rejects_a_signed_datagram() {
         // Strict posture, the other direction: an off (v1) node rejects a v2 datagram even on
         // the same key — a uniform cluster never mixes postures, so a foreign format is dropped.
-        let signed = signing_auth(7, "node-a").seal(b"hello");
+        let signed = signing_auth(7, "node-a").seal(b"hello", false);
         let off = auth(7);
         assert!(off.open(&signed).is_err(), "a v1 node must reject v2");
     }
@@ -633,13 +769,13 @@ mod tests {
     fn a_datagram_sealed_with_an_accepted_secondary_key_opens() {
         // Receiver: primary A, also accepts B (the old key being rotated out).
         let receiver = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
-        let sealed_with_b = SwimAuth::new(&[0xBB; KEY_LEN]).seal(b"rolling");
+        let sealed_with_b = SwimAuth::new(&[0xBB; KEY_LEN]).seal(b"rolling", false);
         assert_eq!(
             receiver.open(&sealed_with_b).expect("opens").payload,
             b"rolling"
         );
         // ...and the primary still opens during the window.
-        let sealed_with_a = SwimAuth::new(&[0xAA; KEY_LEN]).seal(b"primary");
+        let sealed_with_a = SwimAuth::new(&[0xAA; KEY_LEN]).seal(b"primary", false);
         assert_eq!(
             receiver.open(&sealed_with_a).expect("opens").payload,
             b"primary"
@@ -649,14 +785,14 @@ mod tests {
     #[test]
     fn a_key_outside_the_ring_is_rejected() {
         let receiver = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
-        let sealed_with_c = SwimAuth::new(&[0xCC; KEY_LEN]).seal(b"intruder");
+        let sealed_with_c = SwimAuth::new(&[0xCC; KEY_LEN]).seal(b"intruder", false);
         assert!(receiver.open(&sealed_with_c).is_err());
     }
 
     #[test]
     fn seal_always_uses_the_primary_key_not_a_secondary() {
         let node = SwimAuth::new(&[0xAA; KEY_LEN]).accept_also(&[0xBB; KEY_LEN]);
-        let sealed = node.seal(b"x");
+        let sealed = node.seal(b"x", false);
         // A peer holding only the secondary must not open it; the primary must.
         assert!(SwimAuth::new(&[0xBB; KEY_LEN]).open(&sealed).is_err());
         assert!(SwimAuth::new(&[0xAA; KEY_LEN]).open(&sealed).is_ok());
@@ -668,7 +804,7 @@ mod tests {
             .unwrap()
             .accept_also_hex(&"cd".repeat(KEY_LEN))
             .unwrap();
-        let sealed = SwimAuth::new(&[0xCD; KEY_LEN]).seal(b"hi");
+        let sealed = SwimAuth::new(&[0xCD; KEY_LEN]).seal(b"hi", false);
         assert_eq!(receiver.open(&sealed).expect("opens").payload, b"hi");
         assert!(SwimAuth::from_hex_key(&"ab".repeat(KEY_LEN))
             .unwrap()
@@ -680,7 +816,7 @@ mod tests {
     fn a_signed_v2_datagram_sealed_with_a_secondary_key_opens() {
         // The rotation window covers signed datagrams too: the HMAC tries the ring, then
         // the (key-independent) signature is verified.
-        let sealed = signing_auth(0xBB, "node-a").seal(b"signed-roll");
+        let sealed = signing_auth(0xBB, "node-a").seal(b"signed-roll", false);
         let receiver = signing_auth(0xAA, "node-a").accept_also(&[0xBB; KEY_LEN]);
         let opened = receiver.open(&sealed).expect("opens");
         assert_eq!(opened.payload, b"signed-roll");
@@ -692,7 +828,7 @@ mod tests {
     #[test]
     fn sequenced_seal_open_roundtrips_with_seq_and_identity() {
         let a = signing_auth(7, "node-a").with_sequencing();
-        let sealed = a.seal_sequenced(b"update", 42);
+        let sealed = a.seal_sequenced(b"update", 42, false);
         assert_eq!(sealed[0], VERSION_V3);
         let opened = a.open(&sealed).expect("opens");
         assert_eq!(opened.payload, b"update");
@@ -703,11 +839,14 @@ mod tests {
     #[test]
     fn v3_body_framing_is_pinned() {
         let a = signing_auth(7, "node-a");
-        let sealed = a.seal_sequenced(b"PAYLOAD", 7);
+        let sealed = a.seal_sequenced(b"PAYLOAD", 7, false);
         assert_eq!(sealed[0], VERSION_V3);
         let body = &sealed[1 + TAG_LEN..];
-        let (seq, cert, sig, payload) = parse_v3(body).expect("v3 body parses");
+        let (seq, cref, sig, payload) = parse_v3(body).expect("v3 body parses");
         assert_eq!(seq, 7);
+        let CertRef::Full(cert) = cref else {
+            panic!("first datagram must carry the full certificate");
+        };
         assert_eq!(cert, b"cert-of-node-a");
         assert_eq!(sig, b"SIG:PAYLOAD");
         assert_eq!(payload, b"PAYLOAD");
@@ -718,20 +857,20 @@ mod tests {
         // The sequenced posture is strict: it accepts only v3, rejecting both a v1 and a v2
         // datagram on the same key.
         let sequenced = signing_auth(7, "node-a").with_sequencing();
-        let v1 = auth(7).seal(b"x");
-        let v2 = signing_auth(7, "node-a").seal(b"x");
+        let v1 = auth(7).seal(b"x", false);
+        let v2 = signing_auth(7, "node-a").seal(b"x", false);
         assert!(sequenced.open(&v1).is_err(), "a sequenced node rejects v1");
         assert!(sequenced.open(&v2).is_err(), "a sequenced node rejects v2");
         let v3 = signing_auth(7, "node-a")
             .with_sequencing()
-            .seal_sequenced(b"x", 1);
+            .seal_sequenced(b"x", 1, false);
         assert_eq!(sequenced.open(&v3).expect("opens").seq, Some(1));
     }
 
     #[test]
     fn tampering_any_v3_byte_is_rejected_by_the_hmac() {
         let a = signing_auth(7, "node-a").with_sequencing();
-        let sealed = a.seal_sequenced(b"payload", 9);
+        let sealed = a.seal_sequenced(b"payload", 9, false);
         for i in 0..sealed.len() {
             let mut t = sealed.clone();
             t[i] ^= 0x01;
@@ -745,11 +884,130 @@ mod tests {
         // does too — only a sequenced node accepts v3.
         let v3 = signing_auth(7, "node-a")
             .with_sequencing()
-            .seal_sequenced(b"hello", 5);
+            .seal_sequenced(b"hello", 5, false);
         assert!(
             signing_auth(7, "node-a").open(&v3).is_err(),
             "a signed-only node rejects v3"
         );
         assert!(auth(7).open(&v3).is_err(), "a shared-key node rejects v3");
+    }
+
+    // --- fingerprint cert caching (0022-T6) ---
+
+    /// A signing auth over a realistically-sized (600-byte) stub certificate, so the
+    /// size assertions reflect the real MTU win rather than the tiny default stub.
+    fn fat_cert_auth(byte: u8) -> SwimAuth {
+        let cert = vec![0xC5; 600];
+        SwimAuth::new(&[byte; KEY_LEN]).with_signing(
+            Arc::new(FakeSigner { cert: cert.clone() }),
+            Arc::new(FakeVerifier {
+                cert,
+                cn: "node-a".to_string(),
+                domain: None,
+            }),
+        )
+    }
+
+    /// After a full-cert datagram primes the receiver, a fingerprint-form datagram opens
+    /// with the identity intact — and it is materially smaller (the MTU win).
+    #[test]
+    fn a_primed_receiver_opens_a_fingerprint_datagram() {
+        let sender = fat_cert_auth(7);
+        let receiver = fat_cert_auth(7); // fresh instance = unprimed cache
+        let full = sender.seal(b"first", false); // send #0: full cert
+        let fp = sender.seal(b"second", false); // send #1: fingerprint
+        assert!(
+            fp.len() + 500 < full.len(),
+            "the fingerprint form must shed the ~600-byte certificate"
+        );
+
+        assert_eq!(
+            receiver
+                .open(&full)
+                .expect("full form opens")
+                .identity
+                .as_deref(),
+            Some("node-a")
+        );
+        let opened = receiver
+            .open(&fp)
+            .expect("fingerprint form opens once primed");
+        assert_eq!(opened.identity.as_deref(), Some("node-a"));
+        assert_eq!(opened.payload, b"second");
+    }
+
+    /// An unprimed receiver rejects a fingerprint-form datagram under the bounded,
+    /// recoverable `cert-miss` reason — and recovers as soon as a full-cert datagram
+    /// arrives.
+    #[test]
+    fn an_unprimed_receiver_misses_then_recovers() {
+        let sender = signing_auth(7, "node-a");
+        let _burn = sender.seal(b"0", false); // send #0: full (not delivered)
+        let fp = sender.seal(b"1", false); // send #1: fingerprint
+        let receiver = signing_auth(7, "node-a"); // fresh instance = unprimed cache
+        let err = receiver
+            .open(&fp)
+            .expect_err("unprimed fingerprint must miss");
+        assert_eq!(err, OpenReject::UnknownCert);
+        assert_eq!(err.reason(), "cert-miss");
+
+        // A priming datagram arrives (Join/Sync in the driver, `prime` here) — after
+        // which the same fingerprint datagram opens.
+        let priming = sender.seal(b"2", true);
+        assert!(receiver.open(&priming).is_ok());
+        assert!(receiver.open(&fp).is_ok(), "primed now; the fp form opens");
+    }
+
+    /// The full certificate rides every [`super::FULL_CERT_EVERY`]th datagram as the
+    /// loss-recovery bound; everything between is fingerprint-form.
+    #[test]
+    fn the_full_cert_recurs_periodically() {
+        let period = usize::try_from(super::FULL_CERT_EVERY).unwrap();
+        let sender = signing_auth(7, "node-a");
+        let mut kinds = Vec::new();
+        for i in 0..=period {
+            let sealed = sender.seal(format!("{i}").as_bytes(), false);
+            kinds.push(sealed[1 + TAG_LEN]); // first body byte = cert-ref marker
+        }
+        assert_eq!(kinds[0], super::CERT_REF_FULL, "send #0 is full");
+        for (i, k) in kinds.iter().enumerate().take(period).skip(1) {
+            assert_eq!(*k, super::CERT_REF_FP, "send #{i} is fingerprint-form");
+        }
+        assert_eq!(
+            kinds[period],
+            super::CERT_REF_FULL,
+            "the cycle restarts with a full cert"
+        );
+    }
+
+    /// `prime` forces the full certificate regardless of the counter (the driver sets it
+    /// on Join/Sync — the first-contact moments).
+    #[test]
+    fn priming_forces_the_full_certificate() {
+        let sender = signing_auth(7, "node-a");
+        let _burn = sender.seal(b"0", false); // counter now off the full slot
+        let primed = sender.seal(b"1", true);
+        assert_eq!(primed[1 + TAG_LEN], super::CERT_REF_FULL);
+    }
+
+    /// The fingerprint path still runs the FULL verification per datagram: a tampered
+    /// fingerprint-form datagram is rejected, and the sequenced (v3) form carries the
+    /// sequence through the fingerprint path too.
+    #[test]
+    fn the_fingerprint_path_verifies_and_sequences_like_the_full_path() {
+        let sender = signing_auth(7, "node-a").with_sequencing();
+        let receiver = signing_auth(7, "node-a").with_sequencing(); // fresh cache
+        let full = sender.seal_sequenced(b"first", 1, false);
+        let fp = sender.seal_sequenced(b"second", 2, false);
+        assert!(receiver.open(&full).is_ok());
+        let opened = receiver.open(&fp).expect("fp v3 opens");
+        assert_eq!(opened.seq, Some(2));
+
+        // Tamper with every byte of the fingerprint-form datagram: all rejected (HMAC).
+        for i in 0..fp.len() {
+            let mut t = fp.clone();
+            t[i] ^= 0x01;
+            assert!(receiver.open(&t).is_err(), "fp bit flip at {i} accepted");
+        }
     }
 }

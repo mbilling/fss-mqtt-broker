@@ -30,8 +30,9 @@ tasks:
     evidence: swim_cluster.rs signed_gossip_converges; a_forged_sender_identity_is_rejected (forged-from over real UDP); swim_auth a_signed_node_rejects_an_unsigned_v1_datagram
   - id: 0022-T6
     title: Cert caching by fingerprint (send full cert periodically, fingerprint otherwise) to shrink datagrams
-    status: deferred
-    notes: size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger
+    status: done
+    date: 2026-07-02
+    evidence: "v2/v3 bodies now carry a cert-ref instead of an always-inline certificate: the full leaf on PRIMING datagrams (Join/Sync — first-contact/full-state moments, selected by the driver from the message kind, seal/seal_sequenced gain a prime flag) and on every FULL_CERT_EVERY-th (16) send as a UDP-loss/restart recovery bound; a 32-byte SHA-256 fingerprint otherwise — routine signed gossip drops ~0.5 KiB per datagram and stays under a 1500-byte MTU. The receiver caches by fingerprint with ONLY fully-verified certificates admitted (bounded at 128, clear-and-reprime on overflow), and fingerprinting is pure wire compression: every datagram, fingerprint-form included, re-runs the complete verification (chain, validity, CRL, signature) against the cached DER, so T7 revocation applies to fingerprint datagrams immediately. A cache miss is the bounded recoverable drop reason cert-miss. Tests: a_primed_receiver_opens_a_fingerprint_datagram (incl. ~600B-cert size assertion), an_unprimed_receiver_misses_then_recovers, the_full_cert_recurs_periodically, priming_forces_the_full_certificate, the_fingerprint_path_verifies_and_sequences_like_the_full_path (v3 + full per-byte tamper sweep); v2/v3 framing KATs pin the cert-ref layout; the signed/sequenced over-UDP convergence suite now runs on fingerprint-form routine traffic."
   - id: 0022-T7
     title: Certificate expiry / revocation handling for gossip certs
     status: done
@@ -69,12 +70,20 @@ adversarial tests for each forgery vector.
 | 0022-P3 | ✅ done | 2026-06-22 | swim_driver.rs drops authenticated CN != msg.from; proven end-to-end by a_forged_sender_identity_is_rejected |
 | 0022-P4 | ✅ done | 2026-06-22 | main.rs apply_signed_gossip + NodeGossipSigner/CaGossipVerifier; PeerTls ca_der/cert_der/key_der; tls::first_cert_der/private_key_der; MQTTD_SWIM_SIGNED require/off (strict postures) with startup guards |
 | 0022-P5 | ✅ done | 2026-06-22 | swim_cluster.rs signed_gossip_converges; a_forged_sender_identity_is_rejected (forged-from over real UDP); swim_auth a_signed_node_rejects_an_unsigned_v1_datagram |
-| 0022-T6 | 💤 deferred | — | size optimisation only; inline self-contained certs are correct and bootstrap-safe, just larger |
+| 0022-T6 | ✅ done | 2026-07-02 | "v2/v3 bodies now carry a cert-ref instead of an always-inline certificate: the full leaf on PRIMING datagrams (Join/Sync — first-contact/full-state moments, selected by the driver from the message kind, seal/seal_sequenced gain a prime flag) and on every FULL_CERT_EVERY-th (16) send as a UDP-loss/restart recovery bound; a 32-byte SHA-256 fingerprint otherwise — routine signed gossip drops ~0.5 KiB per datagram and stays under a 1500-byte MTU. The receiver caches by fingerprint with ONLY fully-verified certificates admitted (bounded at 128, clear-and-reprime on overflow), and fingerprinting is pure wire compression: every datagram, fingerprint-form included, re-runs the complete verification (chain, validity, CRL, signature) against the cached DER, so T7 revocation applies to fingerprint datagrams immediately. A cache miss is the bounded recoverable drop reason cert-miss. Tests: a_primed_receiver_opens_a_fingerprint_datagram (incl. ~600B-cert size assertion), an_unprimed_receiver_misses_then_recovers, the_full_cert_recurs_periodically, priming_forces_the_full_certificate, the_fingerprint_path_verifies_and_sequences_like_the_full_path (v3 + full per-byte tamper sweep); v2/v3 framing KATs pin the cert-ref layout; the signed/sequenced over-UDP convergence suite now runs on fingerprint-form routine traffic." |
 | 0022-T7 | ✅ done | 2026-07-02 | "signed_gossip::verify now checks the leaf's validity window (notBefore/notAfter at an injected epoch-seconds clock; an unrepresentable clock fails closed) and its serial against a cluster CRL. RevocationList::from_der parses the DER CRL, VERIFIES IT IS SIGNED BY THE CLUSTER CA (an unauthenticated CRL could revoke healthy nodes), and extracts revoked serials. MQTTD_PEER_TLS_CRL (requires the peer-TLS trio; bad CRL = startup error) loads it into a shared slot (reload::SwimCrlSlot) the CaGossipVerifier consults per datagram and the ADR 0032 Reloader swaps on SIGHUP / the ADR 0033 watcher (path added to watched_policy_paths) — revocation lands without restart, all-or-nothing with the rest of the policy. The ADR 0003-T6 drop counter gains bounded reasons expired/revoked (OpenReject). Tests: mqtt-auth an_expired_certificate_is_rejected, a_not_yet_valid_certificate_is_rejected, a_revoked_certificate_is_rejected, an_unlisted_certificate_passes_with_a_crl_loaded, a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load, garbage_crl_bytes_do_not_panic; reload a_reload_swaps_the_gossip_crl_into_the_live_slot, a_bad_gossip_crl_rejects_the_whole_reload." |
 <!-- /status-table:0022 -->
 
 ## Changelog
 
+- **2026-07-02** — T6 (certificate fingerprinting) landed, closing ADR 0022 completely
+  (7/7). The always-inline leaf certificate becomes a cert-ref: full cert on Join/Sync
+  priming datagrams and every 16th send; a 32-byte SHA-256 fingerprint otherwise — routine
+  signed gossip sheds ~0.5 KiB/datagram and stays under a 1500-byte MTU (no UDP
+  fragmentation). Pure wire compression, not a trust change: only fully-verified certs are
+  cached, and every fingerprint-form datagram re-runs the complete verification (chain,
+  validity, CRL, signature) against the cached DER; a cache miss is the bounded,
+  recoverable `cert-miss` drop.
 - **2026-07-02** — T7 (certificate expiry + revocation on the gossip plane) landed.
   `signed_gossip::verify` rejects a leaf outside its validity window and one whose serial
   is on the cluster CRL; the CRL itself must be **signed by the cluster CA** to load (an
