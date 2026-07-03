@@ -774,16 +774,17 @@ async fn start_hub(
             failure_domains = domains.len(),
             "DURABLE sessions enabled: consensus-backed replicated store"
         );
-        let (store, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
-            node_id.clone(),
-            placement.clone(),
-            founder,
-            voter_cap,
-            &domains,
-            data_dir.as_deref().map(Path::new),
-            None, // no commit-latency fault injection in production (ADR 0026)
-        )
-        .await;
+        let (store, durable_retained, plane, driver) =
+            mqtt_cluster::durable_node::build_durable_node(
+                node_id.clone(),
+                placement.clone(),
+                founder,
+                voter_cap,
+                &domains,
+                data_dir.as_deref().map(Path::new),
+                None, // no commit-latency fault injection in production (ADR 0026)
+            )
+            .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
             node_id.clone(),
             store.clone(),
@@ -792,6 +793,9 @@ async fn start_hub(
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
         hub.attach_durable_plane(plane);
+        // Durable retained (ADR 0037): retained mutations also commit through the
+        // topic's group lease-owner, so retained state converges instead of diverging.
+        hub.attach_durable_retained(durable_retained);
         if let Some(dir) = &data_dir {
             hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
         }

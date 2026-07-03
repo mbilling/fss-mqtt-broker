@@ -16,6 +16,7 @@
 
 use crate::repl::ReplicatedLog;
 use crate::{Offset, StorageError};
+use async_trait::async_trait;
 
 /// One committed retained value (or tombstone) with its convergence token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,59 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedRetained<L> {
         let key = retained_key(topic);
         let last = self.log.read(&key, 0, usize::MAX).await?.into_iter().last();
         Ok(last.and_then(|e| decode_retained(&e.record, e.offset)))
+    }
+}
+
+/// Object-safe handle to the durable retained keyspace (ADR 0037), so the broker can
+/// hold the authority without naming the backend log type — the same seam
+/// [`RetainedStore`](crate::RetainedStore) provides for the node-local cache.
+///
+/// Implemented by [`ReplicatedRetained`] over any log; the broker routes a retained
+/// mutation here (on the topic's group lease-owner) *in addition to* the local cache
+/// write, and gets back the `(epoch, offset)` convergence token.
+#[async_trait]
+pub trait DurableRetained: Send + Sync + std::fmt::Debug {
+    /// Commit `topic`'s retained value; returns its `(epoch, offset)` token.
+    ///
+    /// # Errors
+    /// As [`ReplicatedRetained::set`].
+    async fn set(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+    ) -> Result<(u64, Offset), StorageError>;
+
+    /// Commit a versioned tombstone for `topic`; returns its token.
+    ///
+    /// # Errors
+    /// As [`ReplicatedRetained::clear`].
+    async fn clear(&self, topic: &str) -> Result<(u64, Offset), StorageError>;
+
+    /// The committed retained state of `topic` (value, tombstone, or never written).
+    ///
+    /// # Errors
+    /// As [`ReplicatedRetained::get`].
+    async fn get(&self, topic: &str) -> Result<Option<RetainedEntry>, StorageError>;
+}
+
+#[async_trait]
+impl<L: ReplicatedLog<Key = String>> DurableRetained for ReplicatedRetained<L> {
+    async fn set(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+    ) -> Result<(u64, Offset), StorageError> {
+        Self::set(self, topic, payload, qos).await
+    }
+
+    async fn clear(&self, topic: &str) -> Result<(u64, Offset), StorageError> {
+        Self::clear(self, topic).await
+    }
+
+    async fn get(&self, topic: &str) -> Result<Option<RetainedEntry>, StorageError> {
+        Self::get(self, topic).await
     }
 }
 

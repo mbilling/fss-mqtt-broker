@@ -215,6 +215,21 @@ pub enum PeerMessage {
         /// The stored entries, in offset order.
         entries: Vec<(u64, Vec<u8>)>,
     },
+    /// A retained mutation routed to the topic's placement-group lease-owner
+    /// (ADR 0037 §1): the sender is the node the publish landed on, the receiver owns
+    /// the topic's group and commits the mutation into the durable retained keyspace.
+    /// Fire-and-forget — live delivery already happened on the sender (and its
+    /// broadcast rides [`Publish`](PeerMessage::Publish) as before); this frame carries
+    /// only the *authority* write. A zero-length payload is the MQTT clear
+    /// [MQTT-3.3.1-10], committed as a versioned tombstone.
+    RetainedCommit {
+        /// Destination topic (no wildcards).
+        topic: String,
+        /// The retained payload; empty = clear (versioned tombstone).
+        payload: Vec<u8>,
+        /// The publish `QoS` as its 2-bit wire value.
+        qos: u8,
+    },
 }
 
 /// Errors from peer-frame coding.
@@ -372,6 +387,16 @@ mod tests {
             req_id: 3,
             watermark: 4,
             entries: vec![(1, vec![1, 2]), (2, vec![3, 4])],
+        });
+        roundtrip(&PeerMessage::RetainedCommit {
+            topic: "dev/1/state".into(),
+            payload: b"open".to_vec(),
+            qos: 1,
+        });
+        roundtrip(&PeerMessage::RetainedCommit {
+            topic: "dev/1/state".into(),
+            payload: Vec::new(), // a clear (versioned tombstone)
+            qos: 0,
         });
     }
 
