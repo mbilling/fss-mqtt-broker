@@ -766,6 +766,12 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         }
         Ok(())
     }
+
+    async fn epoch_for(&self, _key: &String) -> Result<u64, ReplError> {
+        // One `ClusterLog` instance exists per lease epoch; every op it fans out is
+        // stamped with exactly this value (ADR 0037 token).
+        Ok(self.lease.epoch)
+    }
 }
 
 #[cfg(test)]

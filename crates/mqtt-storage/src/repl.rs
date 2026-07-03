@@ -132,6 +132,16 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
     async fn keys(&self) -> Result<Vec<Self::Key>, ReplError> {
         Ok(Vec::new())
     }
+
+    /// The lease epoch a write to `key` would commit under **now** — the epoch half of
+    /// the `(epoch, offset)` retained-convergence token (ADR 0037). A clustered backend
+    /// answers with the group lease-holder's epoch (and `NotOwner` off the owner);
+    /// single-node backends with no lease plane keep the default `0` — their offsets
+    /// alone totally order writes.
+    async fn epoch_for(&self, key: &Self::Key) -> Result<u64, ReplError> {
+        let _ = key;
+        Ok(0)
+    }
 }
 
 /// Forward [`ReplicatedLog`] through an [`Arc`](std::sync::Arc) so a single log
@@ -168,6 +178,10 @@ impl<L: ReplicatedLog + ?Sized> ReplicatedLog for std::sync::Arc<L> {
 
     async fn keys(&self) -> Result<Vec<Self::Key>, ReplError> {
         (**self).keys().await
+    }
+
+    async fn epoch_for(&self, key: &Self::Key) -> Result<u64, ReplError> {
+        (**self).epoch_for(key).await
     }
 }
 
