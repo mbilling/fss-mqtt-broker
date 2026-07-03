@@ -797,16 +797,33 @@ mod tests {
         let rkey = format!("r/{topic}");
         assert_eq!(log.live_range(&rkey).await.unwrap(), Some((2, 2)));
 
-        // Durable and compacted on the followers too: each holds exactly the last
-        // record (the awaited truncate delivery dropped the superseded one).
+        // Durable on the followers: the commit reached a quorum — the leader plus at
+        // least ONE follower — so at least one follower holds the compacted record.
+        // The other copy is best-effort spread: the fan-out abandons leftover
+        // deliveries once quorum is met, so that follower's append frame may never
+        // have been sent, and the (awaited, FIFO-ordered) truncate then leaves its
+        // copy empty. What can never happen is a follower holding only the stale
+        // superseded record: any append frame that WAS sent precedes the truncate on
+        // its link, so the truncate always lands after it.
+        let mut holders = 0;
         for (name, state) in [("f1", &f1_state), ("f2", &f2_state)] {
-            let entries = state.lock().unwrap().entries(&rkey);
-            assert_eq!(
-                entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
-                vec![2],
-                "{name} should hold exactly the compacted retained record"
-            );
+            let offsets: Vec<_> = state
+                .lock()
+                .unwrap()
+                .entries(&rkey)
+                .iter()
+                .map(|e| e.offset)
+                .collect();
+            match offsets.as_slice() {
+                [2] => holders += 1,
+                [] => {} // missed the abandoned append; truncate emptied the copy
+                other => panic!("{name} holds a stale/uncompacted copy: {other:?}"),
+            }
         }
+        assert!(
+            holders >= 1,
+            "the committed compacted record must be on at least one follower"
+        );
     }
 
     /// The conflict-prevention invariant at the storage boundary: a retained write
