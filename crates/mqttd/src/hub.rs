@@ -433,13 +433,16 @@ pub enum HubCommand {
     /// (topics we do not already retain), never overwriting our own — so chunks are
     /// independent and idempotent.
     RemoteRetainedSnapshot {
+        /// The peer the snapshot came from (divergence attribution, ADR 0037 P1).
+        node: NodeId,
         /// Each retained message as `(topic, payload, QoS)`.
         messages: Vec<(String, Bytes, QoS)>,
     },
-    /// A peer's retained topic-set digest, sent on link-up instead of the full
-    /// snapshot (0014-T6). If it matches our own set's digest there is nothing to
-    /// back-fill in either direction of the gap-fill rule we enforce; otherwise we
-    /// pull with [`PeerMessage::RetainedRequest`].
+    /// A peer's retained digest, sent on link-up instead of the full snapshot
+    /// (0014-T6). If both the topic-set hash and the value hash match our own there is
+    /// nothing to back-fill *and* nothing diverges; otherwise we pull with
+    /// [`PeerMessage::RetainedRequest`] — to gap-fill missing topics and to detect
+    /// divergent values (ADR 0037 P1).
     RemoteRetainedDigest {
         /// The peer that sent its digest.
         node: NodeId,
@@ -447,6 +450,8 @@ pub enum HubCommand {
         count: u64,
         /// Order-independent hash of the peer's retained topic set.
         hash: u64,
+        /// Order-independent hash of the peer's retained `(topic, payload, qos)` values.
+        value_hash: u64,
     },
     /// A peer asked for our retained set (its digest comparison found a difference);
     /// answer with chunked [`PeerMessage::RetainedSnapshot`]s (0014-T6/T8).
@@ -610,19 +615,32 @@ fn qos_num(qos: QoS) -> u8 {
 /// frame at the limit would be rejected by the receiver and tear down the link.
 const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-/// The order-independent digest of a retained **topic set** (0014-T6): the topic count
-/// plus the XOR of each topic's stable 64-bit hash. Independent of iteration order and
-/// cheap to compare; equal digests ⇒ identical topic sets (up to hash collision, which
-/// merely skips a best-effort back-fill). Topics only — under the gap-fill rule a
-/// receiver can only accept topics it lacks, so payloads add no information.
-fn retained_digest<'a>(topics: impl Iterator<Item = &'a str>) -> (u64, u64) {
+/// The order-independent digest of a retained set (0014-T6 + ADR 0037 P1): the topic
+/// count, the XOR of each topic's stable 64-bit hash, and the XOR of each
+/// `(topic, payload, qos)` **value** hash. Independent of iteration order and cheap to
+/// compare (a collision merely skips a best-effort back-fill / detection). Equal topic
+/// hashes with **differing value hashes** mean divergence: same topics, different values.
+fn retained_digest<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8], u8)>) -> (u64, u64, u64) {
     let mut count = 0u64;
     let mut hash = 0u64;
-    for t in topics {
+    let mut value_hash = 0u64;
+    for (topic, payload, qos) in entries {
         count += 1;
-        hash ^= mqtt_cluster::hrw::stable_id(t.as_bytes());
+        hash ^= mqtt_cluster::hrw::stable_id(topic.as_bytes());
+        value_hash ^= retained_value_id(topic, payload, qos);
     }
-    (count, hash)
+    (count, hash, value_hash)
+}
+
+/// A stable 64-bit hash of one retained `(topic, payload, qos)` value (ADR 0037 P1).
+/// The topic is length-prefixed so `("a", "bc")` and `("ab", "c")` cannot collide.
+fn retained_value_id(topic: &str, payload: &[u8], qos: u8) -> u64 {
+    let mut bytes = Vec::with_capacity(8 + topic.len() + payload.len() + 1);
+    bytes.extend_from_slice(&(topic.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(topic.as_bytes());
+    bytes.extend_from_slice(payload);
+    bytes.push(qos);
+    mqtt_cluster::hrw::stable_id(&bytes)
 }
 
 /// Split retained entries into chunks whose summed (topic + payload) size stays under
@@ -891,11 +909,17 @@ impl Hub {
                 debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
                 self.remote_shared.insert(node, groups);
             }
-            HubCommand::RemoteRetainedSnapshot { messages } => {
-                self.apply_retained_snapshot(messages).await;
+            HubCommand::RemoteRetainedSnapshot { node, messages } => {
+                self.apply_retained_snapshot(&node, messages).await;
             }
-            HubCommand::RemoteRetainedDigest { node, count, hash } => {
-                self.handle_retained_digest(&node, count, hash).await;
+            HubCommand::RemoteRetainedDigest {
+                node,
+                count,
+                hash,
+                value_hash,
+            } => {
+                self.handle_retained_digest(&node, count, hash, value_hash)
+                    .await;
             }
             HubCommand::RemoteRetainedRequest { node } => {
                 self.send_retained_snapshot(&node).await;
@@ -1983,23 +2007,36 @@ impl Hub {
         if retained.is_empty() {
             return;
         }
-        let (count, hash) = retained_digest(retained.iter().map(|m| m.topic.as_str()));
-        let _ = peer.tx.send(PeerMessage::RetainedDigest { count, hash });
+        let (count, hash, value_hash) = retained_digest(
+            retained
+                .iter()
+                .map(|m| (m.topic.as_str(), m.payload.as_ref(), m.qos as u8)),
+        );
+        let _ = peer.tx.send(PeerMessage::RetainedDigest {
+            count,
+            hash,
+            value_hash,
+        });
     }
 
-    /// Compare a peer's retained topic-set digest against our own (0014-T6). Equal
-    /// digests mean identical topic sets — under the gap-fill rule there is nothing
-    /// the peer's snapshot could add, so nothing is transferred. Different digests:
-    /// pull the peer's (chunked) snapshot.
-    async fn handle_retained_digest(&self, node: &NodeId, count: u64, hash: u64) {
+    /// Compare a peer's retained digest against our own (0014-T6 + ADR 0037 P1). Equal
+    /// topic *and* value hashes mean the sets are identical — nothing to back-fill,
+    /// nothing diverging, nothing transferred. Any difference: pull the peer's (chunked)
+    /// snapshot — to gap-fill missing topics and to detect (count, warn) divergent
+    /// values on topics both sides hold.
+    async fn handle_retained_digest(&self, node: &NodeId, count: u64, hash: u64, value_hash: u64) {
         let Some(peer) = self.peers.get(node) else {
             return;
         };
         let Ok(retained) = self.retained.all().await else {
             return;
         };
-        let (our_count, our_hash) = retained_digest(retained.iter().map(|m| m.topic.as_str()));
-        if (our_count, our_hash) == (count, hash) {
+        let ours = retained_digest(
+            retained
+                .iter()
+                .map(|m| (m.topic.as_str(), m.payload.as_ref(), m.qos as u8)),
+        );
+        if ours == (count, hash, value_hash) {
             debug!(node = %node.0, topics = count, "retained sets already match; skipping back-fill");
             return;
         }
@@ -2034,14 +2071,37 @@ impl Hub {
     /// Apply a peer's retained snapshot, **gap-fill** only: set a retained message
     /// for a topic only if we do not already retain that topic, so we never clobber
     /// our own (possibly newer) value with a peer's (ADR 0014 §3).
-    async fn apply_retained_snapshot(&mut self, messages: Vec<(String, Bytes, QoS)>) {
-        let have: HashSet<String> = match self.retained.all().await {
-            Ok(all) => all.into_iter().map(|m| m.topic).collect(),
+    ///
+    /// Divergence detection (ADR 0037 P1): a topic both sides hold with **different**
+    /// values is counted (`retained_divergence_total`) and surfaced with one `warn!` per
+    /// snapshot chunk. Detection only — storage still follows the gap-fill rule until
+    /// single-owner retained (ADR 0037) lands and makes divergence impossible.
+    async fn apply_retained_snapshot(
+        &mut self,
+        node: &NodeId,
+        messages: Vec<(String, Bytes, QoS)>,
+    ) {
+        let have: HashMap<String, u64> = match self.retained.all().await {
+            Ok(all) => all
+                .into_iter()
+                .map(|m| {
+                    let id = retained_value_id(&m.topic, m.payload.as_ref(), m.qos as u8);
+                    (m.topic, id)
+                })
+                .collect(),
             Err(_) => return,
         };
         let mut filled = 0;
+        let mut diverged = 0u64;
         for (topic, payload, qos) in messages {
-            if have.contains(&topic) {
+            if let Some(ours) = have.get(&topic) {
+                if *ours != retained_value_id(&topic, payload.as_ref(), qos as u8) {
+                    diverged += 1;
+                    debug!(node = %node.0, %topic, "retained value diverges from peer");
+                    if let Some(m) = &self.metrics {
+                        m.retained_divergence();
+                    }
+                }
                 continue;
             }
             // The retained-snapshot wire does not carry application properties (a narrow
@@ -2060,6 +2120,16 @@ impl Hub {
         }
         if filled > 0 {
             debug!(filled, "back-filled retained messages from a peer snapshot");
+        }
+        if diverged > 0 {
+            // One warn per chunk, not per topic — the per-topic detail is at debug and
+            // the count is on the metric (bounded logging, ADR 0003-T6 style).
+            warn!(
+                node = %node.0,
+                topics = diverged,
+                "retained values DIVERGE from peer (same topic, different value) — \
+                 best-effort replication kept each side's own value (ADR 0037 P1 detection)"
+            );
         }
     }
 
@@ -3086,7 +3156,7 @@ mod tests {
             Some(PeerMessage::Interest { .. })
         ));
         match recv_peer(&mut peer).await {
-            Some(PeerMessage::RetainedDigest { count, hash }) => {
+            Some(PeerMessage::RetainedDigest { count, hash, .. }) => {
                 assert_eq!(count, 1);
                 assert_ne!(hash, 0, "one topic hashes to a non-zero digest");
             }
@@ -3124,12 +3194,14 @@ mod tests {
             Some(PeerMessage::RetainedDigest { .. })
         ));
 
-        // The peer claims the same single-topic set we hold: same digest, no pull.
-        let (count, hash) = super::retained_digest(std::iter::once("t"));
+        // The peer claims the same single (topic, value, qos) we hold: same digest, no pull.
+        let (count, hash, value_hash) =
+            super::retained_digest(std::iter::once(("t", b"r".as_ref(), 0u8)));
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
             count,
             hash,
+            value_hash,
         })
         .unwrap();
         // Nothing further arrives on the link (probe with a bounded wait).
@@ -3154,11 +3226,47 @@ mod tests {
         ));
 
         // The peer holds a different set: we answer its digest with a pull.
-        let (count, hash) = super::retained_digest(["t", "other"].into_iter());
+        let (count, hash, value_hash) = super::retained_digest(
+            [("t", b"r".as_ref(), 0u8), ("other", b"x".as_ref(), 0u8)].into_iter(),
+        );
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
             count,
             hash,
+            value_hash,
+        })
+        .unwrap();
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::RetainedRequest)
+        ));
+    }
+
+    /// ADR 0037 P1: identical topic *sets* but a differing **value** hash still triggers
+    /// a pull — that is exactly the divergence case the old topics-only digest was blind
+    /// to (and the pulled snapshot is what detection counts against).
+    #[tokio::test]
+    async fn a_value_only_digest_difference_triggers_a_pull() {
+        let tx = start_hub();
+        publish_retained(&tx, "t", b"ours");
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::RetainedDigest { .. })
+        ));
+
+        // Same single topic, different value: set hash matches, value hash differs.
+        let (count, hash, value_hash) =
+            super::retained_digest(std::iter::once(("t", b"THEIRS".as_ref(), 0u8)));
+        tx.send(HubCommand::RemoteRetainedDigest {
+            node: NodeId("n".into()),
+            count,
+            hash,
+            value_hash,
         })
         .unwrap();
         assert!(matches!(
@@ -3209,15 +3317,27 @@ mod tests {
         );
     }
 
-    /// The digest is order-independent and topic-set-sensitive (0014-T6).
+    /// The digest is order-independent and topic-set-sensitive (0014-T6), and its value
+    /// hash sees payload changes the topic-set hash ignores (ADR 0037 P1).
     #[test]
     fn the_retained_digest_is_order_independent_and_set_sensitive() {
-        let a = super::retained_digest(["x", "y", "z"].into_iter());
-        let b = super::retained_digest(["z", "x", "y"].into_iter());
-        assert_eq!(a, b, "order must not matter");
-        let c = super::retained_digest(["x", "y"].into_iter());
-        assert_ne!(a, c, "a different set must differ");
-        assert_eq!(super::retained_digest(std::iter::empty()), (0, 0));
+        let one = ("x", b"1".as_ref(), 0u8);
+        let two = ("y", b"2".as_ref(), 1u8);
+        let three = ("z", b"3".as_ref(), 0u8);
+        let full = super::retained_digest([one, two, three].into_iter());
+        let shuffled = super::retained_digest([three, one, two].into_iter());
+        assert_eq!(full, shuffled, "order must not matter");
+        let subset = super::retained_digest([one, two].into_iter());
+        assert_ne!(full, subset, "a different set must differ");
+        // Same topics, different value: topic hash equal, value hash different.
+        let two_changed = ("y", b"CHANGED".as_ref(), 1u8);
+        let diverged = super::retained_digest([one, two_changed, three].into_iter());
+        assert_eq!(full.1, diverged.1, "topic-set hash ignores values");
+        assert_ne!(
+            full.2, diverged.2,
+            "value hash must see the changed payload"
+        );
+        assert_eq!(super::retained_digest(std::iter::empty()), (0, 0, 0));
     }
 
     /// A received retained snapshot back-fills the store, so a later local
@@ -3226,6 +3346,7 @@ mod tests {
     async fn received_retained_snapshot_replays_on_subscribe() {
         let tx = start_hub();
         tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
             messages: vec![("room/t".into(), Bytes::from_static(b"v"), QoS::AtMostOnce)],
         })
         .unwrap();
@@ -3236,6 +3357,58 @@ mod tests {
         assert_eq!(payload_of(&p), b"v");
     }
 
+    /// ADR 0037 P1: a peer snapshot holding a **different value** for a topic we also
+    /// retain is detected — `retained_divergence_total` increments — while storage still
+    /// follows the gap-fill rule (our value is kept, detection only).
+    #[tokio::test]
+    async fn a_divergent_retained_value_is_detected_and_counted() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        publish_retained(&tx, "dev/1", b"ours");
+        // The peer's snapshot: one divergent value, one identical-topic-same-value
+        // (no count), one new topic (gap-fill, no count).
+        publish_retained(&tx, "dev/same", b"agreed");
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![
+                (
+                    "dev/1".into(),
+                    Bytes::from_static(b"theirs"),
+                    QoS::AtMostOnce,
+                ),
+                (
+                    "dev/same".into(),
+                    Bytes::from_static(b"agreed"),
+                    QoS::AtMostOnce,
+                ),
+                ("dev/new".into(), Bytes::from_static(b"x"), QoS::AtMostOnce),
+            ],
+        })
+        .unwrap();
+
+        // Our value is kept (gap-fill unchanged) — proving via a subscriber replay.
+        let (mut rx, _) = attach(&tx, "c", 1, true).await;
+        subscribe(&tx, "c", "dev/1");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"ours",
+            "detection must not change storage"
+        );
+
+        // Exactly one divergence was counted (dev/1) — not the agreeing or new topics.
+        let text = metrics.render();
+        assert!(
+            text.contains("retained_divergence_total 1"),
+            "one divergent topic must count exactly once:\n{text}"
+        );
+    }
+
     /// Back-fill is gap-fill: a snapshot never overwrites a retained message we
     /// already hold with the peer's (possibly stale) value (ADR 0014 §3).
     #[tokio::test]
@@ -3243,6 +3416,7 @@ mod tests {
         let tx = start_hub();
         publish_retained(&tx, "t", b"local");
         tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
             messages: vec![(
                 "t".into(),
                 Bytes::from_static(b"peer-stale"),

@@ -107,6 +107,13 @@ pub enum PeerMessage {
         count: u64,
         /// XOR of a stable 64-bit hash of each retained topic (order-independent).
         hash: u64,
+        /// XOR of a stable 64-bit hash of each retained `(topic, payload, qos)` value
+        /// (order-independent; ADR 0037 P1). Equal topic sets with differing value hashes
+        /// mean **divergence** — same topics, different values — which triggers a pull so
+        /// the receiver can detect and count it (`retained_divergence_total`). Detection
+        /// only: storage still follows the gap-fill rule until single-owner retained
+        /// (ADR 0037) lands.
+        value_hash: u64,
     },
     /// Pull the sender's retained set (sent back when a received
     /// [`RetainedDigest`](PeerMessage::RetainedDigest) did not match the local set);
@@ -325,6 +332,7 @@ mod tests {
         roundtrip(&PeerMessage::RetainedDigest {
             count: 42,
             hash: 0xdead_beef_cafe_f00d,
+            value_hash: 0x0123_4567_89ab_cdef,
         });
         roundtrip(&PeerMessage::RetainedRequest);
         roundtrip(&PeerMessage::ProxyHello {
