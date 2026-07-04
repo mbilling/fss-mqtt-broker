@@ -464,17 +464,31 @@ pub enum HubCommand {
         node: NodeId,
     },
     /// A retained mutation a peer routed here because this node owns the topic's
-    /// placement group (ADR 0037 §1): commit it into the durable retained keyspace.
-    /// Live delivery already happened on the landing node (and its broadcast rides
-    /// [`RemotePublish`](Self::RemotePublish) as before) — this is only the authority
-    /// write.
+    /// placement group (ADR 0037 §1): commit it into the durable retained keyspace
+    /// and answer with a commit-gated ack (T8). Live delivery already happened on the
+    /// landing node — this is only the authority write.
     RemoteRetainedCommit {
+        /// The routing peer (where the ack goes, and the dedup key half).
+        node: NodeId,
         /// Destination topic.
         topic: String,
         /// The retained payload; empty = clear (versioned tombstone).
         payload: Bytes,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The sender's handoff sequence (echoed in the ack; dedup key).
+        seq: u64,
+    },
+    /// The owner's commit-gated answer to a handoff this node sent (ADR 0037 T8):
+    /// `Some(token)` = committed (drop the held mutation), `None` = the receiver no
+    /// longer owns the group (re-queue and re-resolve).
+    RemoteRetainedCommitAck {
+        /// The peer that answered.
+        node: NodeId,
+        /// The handoff sequence being answered.
+        seq: u64,
+        /// The commit token, or `None` for a not-owner NACK.
+        token: Option<(u64, u64)>,
     },
     /// **Internal**: this (owner) node's off-loop durable retained commit finished —
     /// posted back to the loop by the spawned commit task, like
@@ -492,6 +506,9 @@ pub enum HubCommand {
         /// `Some((epoch, offset))` on success; `None` = the commit failed and the
         /// mutation is re-queued.
         token: Option<(u64, u64)>,
+        /// Set when a peer routed this mutation here (T8): the `(node, seq)` to send
+        /// the commit-gated ack back to on success.
+        reply: Option<(NodeId, u64)>,
     },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
@@ -637,11 +654,27 @@ pub struct Hub {
     /// dead owner, no quorum — simply waits for a heal trigger instead of being
     /// dropped. Bounded at [`RETAINED_QUEUE_CAP`]; the bound drops the **oldest**,
     /// loudly (`retained_queue_dropped_total`).
-    retained_queue: VecDeque<(String, Bytes, u8)>,
+    retained_queue: VecDeque<RetainedMutation>,
     /// Whether an owner-local durable retained commit is currently in flight
     /// (off-loop). The queue head advances only when it completes, preserving
     /// per-node commit order.
     retained_commit_inflight: bool,
+    /// The one peer handoff currently awaiting its commit-gated ack (ADR 0037 T8):
+    /// `(owner, seq, mutation)`. Held **outside** the queue; the mutation is dropped
+    /// only on `Some(token)`, returned to the queue front on NACK or a lost link,
+    /// and retransmitted (same `seq`) by the sweep tick while unanswered.
+    retained_handoff: Option<(NodeId, u64, RetainedMutation)>,
+    /// Per-node monotonic handoff sequence (the retransmission dedup key, T8).
+    retained_handoff_seq: u64,
+    /// Owner side (T8): the last handoff **committed** per routing peer, as
+    /// `(seq, token)` — a retransmission of that seq re-sends the ack without
+    /// recommitting. One entry per peer (senders hold one handoff in flight);
+    /// cleared when the peer's link drops (a restarted peer restarts its counter —
+    /// the worst case is then a benign idempotent re-commit, never a wrong dedup).
+    retained_handoff_seen: HashMap<NodeId, (u64, (u64, u64))>,
+    /// Owner side (T8): the handoff currently queued/committing per routing peer, so
+    /// a retransmission that overtakes the commit is not enqueued twice.
+    retained_handoff_pending: HashMap<NodeId, u64>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -695,6 +728,20 @@ const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// divergence. Count-bounded (like the session queue cap): retained values are
 /// last-value device state, typically small and infrequent.
 const RETAINED_QUEUE_CAP: usize = 1024;
+
+/// A retained mutation awaiting its authority commit (ADR 0037 §5/T8).
+#[derive(Debug, Clone)]
+struct RetainedMutation {
+    /// Destination topic.
+    topic: String,
+    /// The retained payload; empty = clear (versioned tombstone).
+    payload: Bytes,
+    /// The publish `QoS` as its 2-bit wire value.
+    qos: u8,
+    /// Set when a peer routed this mutation here (T8): the `(node, seq)` its
+    /// commit-gated ack goes back to.
+    reply: Option<(NodeId, u64)>,
+}
 
 /// The order-independent digest of a retained set (0014-T6 + ADR 0037 P1): the topic
 /// count, the XOR of each topic's stable 64-bit hash, and the XOR of each
@@ -817,6 +864,10 @@ impl Hub {
                 retained_tokens: HashMap::new(),
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
+                retained_handoff: None,
+                retained_handoff_seq: 0,
+                retained_handoff_seen: HashMap::new(),
+                retained_handoff_pending: HashMap::new(),
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -876,9 +927,11 @@ impl Hub {
                 _ = sweep.tick() => {
                     self.sweep_expired_sessions().await;
                     self.refresh_gauges().await;
-                    // Retry queued retained mutations (ADR 0037 §5): covers heals with
-                    // no link event — a lease landing locally, or quorum returning on
-                    // links that never dropped. A no-op when the queue is idle.
+                    // Retransmit an unanswered retained handoff (T8 — same seq, the
+                    // owner dedups), then retry queued retained mutations (ADR 0037
+                    // §5): covers heals with no link event — a lease landing locally,
+                    // or quorum returning on links that never dropped. No-ops when idle.
+                    self.retry_retained_handoff();
                     self.kick_retained_queue();
                 }
             }
@@ -1030,21 +1083,47 @@ impl Hub {
                 self.send_retained_snapshot(&node).await;
             }
             HubCommand::RemoteRetainedCommit {
+                node,
                 topic,
                 payload,
                 qos,
+                seq,
             } => {
                 // A peer routed a retained mutation here because this node owns the
-                // topic's group (ADR 0037 §1): run it through the same queue as local
-                // mutations — serialized commit order, retry-until-heal, and a
-                // re-route if the lease has moved on (the drain re-resolves owners).
-                self.route_retained_commit(&topic, &payload, qos);
+                // topic's group (ADR 0037 §1): dedup retransmissions, then run it
+                // through the same queue as local mutations — serialized commit
+                // order, retry-until-heal, and a NACK back if the lease moved (T8).
+                self.accept_routed_retained(node, topic, payload, qos, seq);
+            }
+            HubCommand::RemoteRetainedCommitAck { node, seq, token } => {
+                // The commit-gated answer to our in-flight handoff (T8). A stale or
+                // foreign ack (link flap re-delivery, a dropped-at-cap entry) is
+                // ignored: it must match exactly what we are holding.
+                let Some((owner, held_seq, mutation)) = self.retained_handoff.take() else {
+                    return;
+                };
+                if owner != node || held_seq != seq {
+                    self.retained_handoff = Some((owner, held_seq, mutation));
+                    return;
+                }
+                if token.is_some() {
+                    // Committed by the owner (its fan-out warms the caches): the
+                    // mutation is finally done — drive the next one.
+                    self.kick_retained_queue();
+                } else {
+                    // NACK: the owner's lease moved. Re-queue at the front and wait
+                    // for the next trigger — placement catches up within a gossip
+                    // round, and kicking immediately would hot-loop against the
+                    // same stale owner.
+                    self.retained_queue.push_front(mutation);
+                }
             }
             HubCommand::RetainedCommitDone {
                 topic,
                 payload,
                 qos,
                 token,
+                reply,
             } => {
                 self.retained_commit_inflight = false;
                 if let Some((epoch, offset)) = token {
@@ -1063,13 +1142,30 @@ impl Hub {
                             offset,
                         });
                     }
+                    // A peer-routed mutation gets its commit-gated ack (T8); the
+                    // committed (seq, token) is recorded so a retransmission whose
+                    // ack was lost is re-acked without recommitting.
+                    if let Some((node, seq)) = reply {
+                        self.retained_handoff_seen
+                            .insert(node.clone(), (seq, (epoch, offset)));
+                        if self.retained_handoff_pending.get(&node) == Some(&seq) {
+                            self.retained_handoff_pending.remove(&node);
+                        }
+                        self.send_retained_ack(&node, seq, Some((epoch, offset)));
+                    }
                     self.kick_retained_queue();
                 } else {
                     // Failed (no quorum / lease moved): back to the queue FRONT —
-                    // order kept — and wait for a heal trigger rather than
-                    // hot-retrying. The front slot may transiently exceed the cap by
-                    // one (the entry was already counted when first admitted).
-                    self.retained_queue.push_front((topic, payload, qos));
+                    // order kept, reply tag kept (the ack flows once it commits) —
+                    // and wait for a heal trigger rather than hot-retrying. The
+                    // front slot may transiently exceed the cap by one (the entry
+                    // was already counted when first admitted).
+                    self.retained_queue.push_front(RetainedMutation {
+                        topic,
+                        payload,
+                        qos,
+                        reply,
+                    });
                 }
             }
             HubCommand::RemoteRetainedUpdate {
@@ -2401,6 +2497,7 @@ impl Hub {
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
         }
+        self.drop_retained_handoff_state(node);
     }
 
     /// Drop all routing state for a node the failure detector confirmed dead.
@@ -2417,6 +2514,28 @@ impl Hub {
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
         }
+        self.drop_retained_handoff_state(node);
+    }
+
+    /// The retained-handoff bookkeeping tied to a peer's **link session** (T8),
+    /// dropped when the link goes: a handoff awaiting that peer's ack returns to the
+    /// queue (the queue-until-heal path takes over), and the owner-side dedup state
+    /// for the peer is cleared — a restarted peer restarts its seq counter, and a
+    /// stale dedup entry could wrongly swallow its first new handoff. The cost of
+    /// clearing is bounded and benign: a retransmission across the flap may commit
+    /// the same value twice (idempotent, higher token).
+    fn drop_retained_handoff_state(&mut self, node: &NodeId) {
+        if self
+            .retained_handoff
+            .as_ref()
+            .is_some_and(|(owner, ..)| owner == node)
+        {
+            if let Some((_, _, mutation)) = self.retained_handoff.take() {
+                self.retained_queue.push_front(mutation);
+            }
+        }
+        self.retained_handoff_seen.remove(node);
+        self.retained_handoff_pending.remove(node);
     }
 
     /// Route a durable-plane frame from `node`: spawn its handling (so a slow raft
@@ -2493,32 +2612,98 @@ impl Hub {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
         }
+        self.enqueue_retained_mutation(RetainedMutation {
+            topic: topic.to_string(),
+            payload: payload.clone(),
+            qos,
+            reply: None,
+        });
+        self.kick_retained_queue();
+    }
+
+    /// Admit a mutation to the bounded queue, dropping the **oldest** loudly at the
+    /// cap (ADR 0037 §5). A dropped peer-routed mutation also clears its pending
+    /// marker, so the sender's retransmission can be admitted again later.
+    fn enqueue_retained_mutation(&mut self, mutation: RetainedMutation) {
         if self.retained_queue.len() >= RETAINED_QUEUE_CAP {
-            if let Some((dropped, ..)) = self.retained_queue.pop_front() {
+            if let Some(dropped) = self.retained_queue.pop_front() {
                 warn!(
-                    topic = %dropped,
+                    topic = %dropped.topic,
                     cap = RETAINED_QUEUE_CAP,
                     "retained mutation queue full; dropped the OLDEST queued mutation \
                      (ADR 0037 §5 — the partition has outlasted the queue bound)"
                 );
+                if let Some((node, seq)) = dropped.reply {
+                    if self.retained_handoff_pending.get(&node) == Some(&seq) {
+                        self.retained_handoff_pending.remove(&node);
+                    }
+                }
             }
             if let Some(m) = &self.metrics {
                 m.retained_queue_dropped();
             }
         }
-        self.retained_queue
-            .push_back((topic.to_string(), payload.clone(), qos));
+        self.retained_queue.push_back(mutation);
+    }
+
+    /// Accept a retained mutation a peer routed to this node (ADR 0037 §1/T8):
+    /// dedup retransmissions against the last committed handoff (re-ack, don't
+    /// recommit) and against one still queued/committing, then run it through the
+    /// same queue as local mutations.
+    fn accept_routed_retained(
+        &mut self,
+        node: NodeId,
+        topic: String,
+        payload: Bytes,
+        qos: u8,
+        seq: u64,
+    ) {
+        if self.durable_retained.is_none() {
+            return;
+        }
+        // The commit landed but the ack was lost: answer again, commit nothing.
+        if let Some((last_seq, token)) = self.retained_handoff_seen.get(&node) {
+            if *last_seq == seq {
+                let token = *token;
+                self.send_retained_ack(&node, seq, Some(token));
+                return;
+            }
+        }
+        // The original is still queued or committing: ignore the retransmission.
+        if self.retained_handoff_pending.get(&node) == Some(&seq) {
+            return;
+        }
+        self.retained_handoff_pending.insert(node.clone(), seq);
+        self.enqueue_retained_mutation(RetainedMutation {
+            topic,
+            payload,
+            qos,
+            reply: Some((node, seq)),
+        });
         self.kick_retained_queue();
     }
 
-    /// Drive the retained mutation queue (ADR 0037 §5): drain entries in order —
-    /// owner-local heads start the (single) off-loop commit, peer-owned heads are
-    /// handed to their linked owner — and stop at an entry whose owner is
-    /// unreachable, leaving it queued for the next heal trigger (a peer link coming
-    /// up, the sweep tick, or the next enqueue).
+    /// Send a commit-gated handoff ack (T8) back to `node`, if its link is up. A
+    /// missing link is fine: the committed `(seq, token)` stays recorded in
+    /// `retained_handoff_seen`, so the sender's retransmission gets the ack then.
+    fn send_retained_ack(&self, node: &NodeId, seq: u64, token: Option<(u64, u64)>) {
+        if let Some(peer) = self.peers.get(node) {
+            let _ = peer.tx.send(PeerMessage::RetainedCommitAck { seq, token });
+        }
+    }
+
+    /// Drive the retained mutation queue (ADR 0037 §5/T8): drain entries in order —
+    /// an owner-local head starts the (single) off-loop commit; a peer-owned head is
+    /// handed to its linked owner and **held until the commit-gated ack** (one
+    /// handoff in flight, retransmitted by the sweep tick) — and stop at an entry
+    /// whose owner is unreachable, leaving it queued for the next heal trigger (a
+    /// peer link coming up, the sweep tick, or the next enqueue).
     fn kick_retained_queue(&mut self) {
+        if self.retained_handoff.is_some() {
+            return; // a handoff is awaiting its ack: order requires we wait
+        }
         while !self.retained_commit_inflight {
-            let Some((topic, payload, qos)) = self.retained_queue.pop_front() else {
+            let Some(mutation) = self.retained_queue.pop_front() else {
                 return;
             };
             // The owner of the topic's placement group; with no ring (single node /
@@ -2529,34 +2714,72 @@ impl Hub {
                 |p| {
                     p.read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .owner(&topic)
+                        .owner(&mutation.topic)
                 },
             );
             if owner == self.node_id {
                 self.retained_commit_inflight = true;
-                self.spawn_retained_commit(topic, payload, qos);
-            } else if let Some(peer) = self.peers.get(&owner) {
-                // Hand the mutation to its owner, in queue order (the link channel is
-                // FIFO; the owner serializes through its own queue). Fire-and-forget:
-                // a link that dies with the frame in flight loses it — the P5
-                // token back-fill still converges the caches on the next link-up.
-                let _ = peer.tx.send(PeerMessage::RetainedCommit {
-                    topic,
-                    payload: payload.to_vec(),
-                    qos,
-                });
-            } else {
-                // Owner unreachable (partitioned or dead): queue-until-heal. Put the
-                // entry back and wait for a trigger — never dropped silently.
-                debug!(
-                    topic = %topic,
-                    owner = %owner.0,
-                    queued = self.retained_queue.len() + 1,
-                    "retained mutation owner unreachable; queued until heal (ADR 0037 §5)"
-                );
-                self.retained_queue.push_front((topic, payload, qos));
+                self.spawn_retained_commit(mutation);
                 return;
             }
+            // Peer-owned. A mutation a peer routed HERE for a group this node no
+            // longer owns is NACKed back so the sender re-resolves (T8) — this node
+            // must not relay it onward (the ack chain would break).
+            if let Some((node, seq)) = mutation.reply {
+                if self.retained_handoff_pending.get(&node) == Some(&seq) {
+                    self.retained_handoff_pending.remove(&node);
+                }
+                self.send_retained_ack(&node, seq, None);
+                continue;
+            }
+            if self.peers.contains_key(&owner) {
+                // Hand the mutation to its owner and hold it until the commit-gated
+                // ack (T8): a frame lost to a dying link is retransmitted, never
+                // silently lost. One in flight keeps per-node publish order.
+                self.retained_handoff_seq += 1;
+                let seq = self.retained_handoff_seq;
+                self.send_retained_handoff(&owner, seq, &mutation);
+                self.retained_handoff = Some((owner, seq, mutation));
+                return;
+            }
+            // Owner unreachable (partitioned or dead): queue-until-heal. Put the
+            // entry back and wait for a trigger — never dropped silently.
+            debug!(
+                topic = %mutation.topic,
+                owner = %owner.0,
+                queued = self.retained_queue.len() + 1,
+                "retained mutation owner unreachable; queued until heal (ADR 0037 §5)"
+            );
+            self.retained_queue.push_front(mutation);
+            return;
+        }
+    }
+
+    /// Write one handoff frame toward `owner` (first send and retransmissions alike).
+    fn send_retained_handoff(&self, owner: &NodeId, seq: u64, mutation: &RetainedMutation) {
+        if let Some(peer) = self.peers.get(owner) {
+            let _ = peer.tx.send(PeerMessage::RetainedCommit {
+                topic: mutation.topic.clone(),
+                payload: mutation.payload.to_vec(),
+                qos: mutation.qos,
+                seq,
+            });
+        }
+    }
+
+    /// The sweep-tick half of the handoff protocol (T8): retransmit an unanswered
+    /// handoff (same `seq` — the owner dedups), or reclaim it into the queue if the
+    /// owner's link is gone (the regular queue-until-heal path takes over).
+    fn retry_retained_handoff(&mut self) {
+        let Some((owner, seq, mutation)) = self.retained_handoff.take() else {
+            return;
+        };
+        if self.peers.contains_key(&owner) {
+            debug!(topic = %mutation.topic, owner = %owner.0, seq, "retransmitting unanswered retained handoff");
+            self.send_retained_handoff(&owner, seq, &mutation);
+            self.retained_handoff = Some((owner, seq, mutation));
+        } else {
+            self.retained_queue.push_front(mutation);
         }
     }
 
@@ -2565,11 +2788,17 @@ impl Hub {
     /// (`retained_commit_inflight`) so commits keep queue order. A zero-length
     /// payload is the MQTT clear [MQTT-3.3.1-10] → a versioned tombstone (ADR 0037
     /// P2). Completion posts [`HubCommand::RetainedCommitDone`] back to the loop.
-    fn spawn_retained_commit(&self, topic: String, payload: Bytes, qos: u8) {
+    fn spawn_retained_commit(&self, mutation: RetainedMutation) {
         let Some(durable) = self.durable_retained.clone() else {
             return;
         };
         let self_tx = self.self_tx.clone();
+        let RetainedMutation {
+            topic,
+            payload,
+            qos,
+            reply,
+        } = mutation;
         tokio::spawn(async move {
             let result = if payload.is_empty() {
                 durable.clear(&topic).await
@@ -2598,6 +2827,7 @@ impl Hub {
                 payload,
                 qos,
                 token,
+                reply,
             });
         });
     }
@@ -4320,6 +4550,7 @@ mod tests {
                     topic: t,
                     payload,
                     qos,
+                    ..
                 }) => {
                     assert_eq!(t, topic);
                     assert_eq!(payload, b"v");
@@ -4345,9 +4576,11 @@ mod tests {
         let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
 
         tx.send(HubCommand::RemoteRetainedCommit {
+            node: NodeId("n".into()),
             topic: "dev/9/state".into(),
             payload: Bytes::from_static(b"shut"),
             qos: 1,
+            seq: 1,
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |_| true).await;
@@ -4356,9 +4589,11 @@ mod tests {
         assert_eq!(e.token(), (0, 1));
 
         tx.send(HubCommand::RemoteRetainedCommit {
+            node: NodeId("n".into()),
             topic: "dev/9/state".into(),
             payload: Bytes::new(),
             qos: 0,
+            seq: 2,
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |e| e.tombstone).await;
@@ -4811,16 +5046,28 @@ mod tests {
         // No local durable write for a foreign topic while queued.
         assert!(durable.get(&topic).await.unwrap().is_none());
 
-        // HEAL: the owner's link comes up — the queue drains to it, in order.
+        // HEAL: the owner's link comes up — the queue drains to it in order, one
+        // handoff at a time: each next mutation flows only after the previous one's
+        // commit-gated ack (T8 keep-until-ack pacing).
         let mut peer = connect_peer(&tx, "n", 1);
         let mut got = Vec::new();
         while got.len() < 2 {
             match recv_peer(&mut peer).await {
                 Some(PeerMessage::RetainedCommit {
-                    topic: t, payload, ..
+                    topic: t,
+                    payload,
+                    seq,
+                    ..
                 }) => {
                     assert_eq!(t, topic);
                     got.push(payload);
+                    // Acknowledge the commit so the sender releases the next one.
+                    tx.send(HubCommand::RemoteRetainedCommitAck {
+                        node: NodeId("n".into()),
+                        seq,
+                        token: Some((1, got.len() as u64)),
+                    })
+                    .unwrap();
                 }
                 Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
                 other => panic!("unexpected peer frame {other:?}"),
@@ -4951,6 +5198,276 @@ mod tests {
             (Vec::new(), 3),
             "the clear fans out last, tokened"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0037 T8: the acknowledged handoff.
+    // -----------------------------------------------------------------------
+
+    /// T8: a handoff is kept by the sender and retransmitted (same seq) until the
+    /// owner's commit-gated ack arrives — a frame lost to a dying link is retried,
+    /// never silently lost — and the next mutation flows only after the ack.
+    #[tokio::test(start_paused = true)]
+    async fn a_handoff_is_retransmitted_until_the_owner_acks() {
+        let (tx, _durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let mut peer = connect_peer(&tx, "n", 1);
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+
+        // Two mutations; only the FIRST is handed off (one in flight).
+        for payload in [b"v1".as_ref(), b"v2".as_ref()] {
+            tx.send(HubCommand::Publish {
+                topic: topic.clone(),
+                payload: Bytes::copy_from_slice(payload),
+                qos: QoS::AtMostOnce,
+                retain: true,
+                message_expiry: None,
+                app: AppProperties::default(),
+            })
+            .unwrap();
+        }
+        let first_seq = loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
+                    assert_eq!(payload, b"v1");
+                    break seq;
+                }
+                Some(PeerMessage::Interest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        };
+        assert!(
+            recv_peer(&mut peer).await.is_none(),
+            "the second mutation must wait for the first ack"
+        );
+
+        // Unanswered: the sweep tick retransmits with the SAME seq.
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
+                assert_eq!(payload, b"v1");
+                assert_eq!(
+                    seq, first_seq,
+                    "retransmission must reuse the seq (dedup key)"
+                );
+            }
+            other => panic!("expected the retransmission, got {other:?}"),
+        }
+
+        // Ack releases the next mutation, with a fresh seq.
+        tx.send(HubCommand::RemoteRetainedCommitAck {
+            node: NodeId("n".into()),
+            seq: first_seq,
+            token: Some((1, 1)),
+        })
+        .unwrap();
+        loop {
+            match recv_peer(&mut peer).await {
+                // Late retransmissions of the acked handoff may already be in the
+                // channel (one per elapsed sweep) — the owner-side dedup would
+                // swallow them; the test just skips past.
+                Some(PeerMessage::RetainedCommit { seq, .. }) if seq == first_seq => {}
+                Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
+                    assert_eq!(payload, b"v2");
+                    assert_ne!(seq, first_seq);
+                    break;
+                }
+                other => panic!("expected the second handoff, got {other:?}"),
+            }
+        }
+    }
+
+    /// T8 (owner side): a retransmitted handoff is deduped — committed exactly once,
+    /// re-acked with the recorded token, whether the duplicate overtakes the commit
+    /// (pending) or arrives after it (seen).
+    #[tokio::test]
+    async fn an_owner_dedups_a_retransmitted_handoff() {
+        let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+
+        let send = |seq: u64| {
+            tx.send(HubCommand::RemoteRetainedCommit {
+                node: NodeId("n".into()),
+                topic: "t".into(),
+                payload: Bytes::from_static(b"v"),
+                qos: 0,
+                seq,
+            })
+            .unwrap();
+        };
+        // The duplicate overtakes the commit: pending-dedup swallows it.
+        send(7);
+        send(7);
+        let e = wait_durable_retained(&durable, "t", |_| true).await;
+        assert_eq!(e.token(), (0, 1), "committed exactly once");
+
+        // The committed handoff answers: fan-out first, then the commit-gated ack.
+        let mut acked = 0;
+        for _ in 0..2 {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedUpdate { offset, .. }) => assert_eq!(offset, 1),
+                Some(PeerMessage::RetainedCommitAck { seq, token }) => {
+                    assert_eq!((seq, token), (7, Some((0, 1))));
+                    acked += 1;
+                }
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        assert_eq!(acked, 1);
+
+        // A late retransmission (ack was lost): re-acked from `seen`, no recommit.
+        send(7);
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedCommitAck { seq, token }) => {
+                assert_eq!((seq, token), (7, Some((0, 1))));
+            }
+            other => panic!("expected the replayed ack, got {other:?}"),
+        }
+        let e = durable.get("t").await.unwrap().unwrap();
+        assert_eq!(e.token(), (0, 1), "the duplicate must not have recommitted");
+    }
+
+    /// T8 (owner side): a routed mutation for a group this node does NOT own is
+    /// answered with a NACK (`token = None`) and never committed locally — the
+    /// sender re-resolves the owner; the ack chain never relays.
+    #[tokio::test]
+    async fn a_moved_lease_owner_nacks_a_routed_commit() {
+        let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let mut peer = connect_peer(&tx, "n", 1);
+        assert!(matches!(
+            recv_peer(&mut peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        // A topic the PEER owns: this node must refuse the authority write.
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+        tx.send(HubCommand::RemoteRetainedCommit {
+            node: NodeId("n".into()),
+            topic: topic.clone(),
+            payload: Bytes::from_static(b"v"),
+            qos: 0,
+            seq: 3,
+        })
+        .unwrap();
+        match recv_peer(&mut peer).await {
+            Some(PeerMessage::RetainedCommitAck { seq, token }) => {
+                assert_eq!((seq, token), (3, None), "a moved lease must NACK");
+            }
+            other => panic!("expected the NACK, got {other:?}"),
+        }
+        assert!(durable.get(&topic).await.unwrap().is_none());
+    }
+
+    /// T8: a NACK re-queues the mutation, and once placement catches up (the old
+    /// owner died; this node now owns the group) the sweep retries and commits it
+    /// locally — the moved-lease handoff self-heals.
+    #[tokio::test(start_paused = true)]
+    async fn a_nacked_handoff_re_routes_once_placement_catches_up() {
+        let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let mut peer = connect_peer(&tx, "n", 1);
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+        publish_retained_dynamic(&tx, &topic, b"v");
+        let seq = loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedCommit { seq, .. }) => break seq,
+                Some(PeerMessage::Interest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        };
+        // The peer answers NACK (its lease moved away).
+        tx.send(HubCommand::RemoteRetainedCommitAck {
+            node: NodeId("n".into()),
+            seq,
+            token: None,
+        })
+        .unwrap();
+        // Placement catches up: the peer is dead, this node owns the group now.
+        placement
+            .write()
+            .unwrap()
+            .observe(&NodeId("n".into()), MemberState::Dead, "", None);
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        let e = wait_durable_retained(&durable, &topic, |_| true).await;
+        assert_eq!(
+            e.payload, b"v",
+            "the NACKed mutation must commit on the new owner"
+        );
+    }
+
+    /// T8: a lost owner link reclaims the in-flight handoff into the queue; the next
+    /// link-up hands it off again — nothing is lost across the flap.
+    #[tokio::test]
+    async fn a_lost_link_reclaims_the_handoff_and_the_next_link_resends() {
+        let (tx, _durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let mut peer1 = connect_peer(&tx, "n", 1);
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+        publish_retained_dynamic(&tx, &topic, b"v");
+        loop {
+            match recv_peer(&mut peer1).await {
+                Some(PeerMessage::RetainedCommit { payload, .. }) => {
+                    assert_eq!(payload, b"v");
+                    break;
+                }
+                Some(PeerMessage::Interest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        // The link dies unanswered: the handoff is reclaimed, not lost.
+        tx.send(HubCommand::PeerDead {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
+        // The owner relinks: the mutation is handed off again.
+        let mut peer2 = connect_peer(&tx, "n", 2);
+        loop {
+            match recv_peer(&mut peer2).await {
+                Some(PeerMessage::RetainedCommit { payload, .. }) => {
+                    assert_eq!(payload, b"v", "the handoff survives the link flap");
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+    }
+
+    /// A retained publish for a dynamic (non-static) topic string.
+    fn publish_retained_dynamic(tx: &HubTx, topic: &str, payload: &[u8]) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::copy_from_slice(payload),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .unwrap();
     }
 
     /// Durable off (no keyspace attached): a retained publish behaves exactly as
