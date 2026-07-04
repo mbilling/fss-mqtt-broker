@@ -5241,10 +5241,23 @@ mod tests {
                 other => panic!("unexpected peer frame {other:?}"),
             }
         };
-        assert!(
-            recv_peer(&mut peer).await.is_none(),
-            "the second mutation must wait for the first ack"
-        );
+        // Until the ack, nothing but retransmissions of the FIRST handoff may
+        // appear — v2 must wait. (Under paused time, empty receives auto-advance
+        // the clock, so sweep-tick retransmissions of v1 can legitimately land in
+        // this window; what must never appear is a different seq.)
+        loop {
+            match recv_peer(&mut peer).await {
+                None => break,
+                Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
+                    assert_eq!(payload, b"v1");
+                    assert_eq!(
+                        seq, first_seq,
+                        "the second mutation must wait for the first ack"
+                    );
+                }
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
 
         // Unanswered: the sweep tick retransmits with the SAME seq.
         tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
