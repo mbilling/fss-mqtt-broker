@@ -153,6 +153,22 @@ impl Client {
             .flatten()
     }
 
+    /// Publish a retained message (`QoS` 0).
+    async fn publish_retained(&mut self, topic: &str, payload: &[u8]) {
+        self.writer
+            .send(&Packet::Publish(Publish {
+                properties: mqtt_codec::Properties::new(),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: true,
+                topic: topic.to_string(),
+                pkid: None,
+                payload: bytes::Bytes::copy_from_slice(payload),
+            }))
+            .await
+            .unwrap();
+    }
+
     /// Connect as an MQTT 5 client (so User Properties traverse the wire).
     async fn connect_v5(addr: SocketAddr, id: &str) -> Self {
         let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
@@ -287,4 +303,184 @@ async fn non_matching_topic_is_not_forwarded_across_nodes() {
         sub.recv().await.is_none(),
         "non-matching topic should not cross nodes"
     );
+}
+
+/// The retained value a fresh subscriber replays for `topic` on the node at `addr`,
+/// or `None` if that node's cache holds nothing. `id` must be unique per call.
+async fn retained_on(addr: SocketAddr, id: &str, topic: &str) -> Option<Vec<u8>> {
+    let mut c = Client::connect(addr, id).await;
+    c.subscribe(topic).await;
+    match c.recv().await {
+        Some(Packet::Publish(p)) => Some(p.payload.to_vec()),
+        _ => None,
+    }
+}
+
+/// The 0014-T7 scenario, closed (ADR 0037 §5, P6): **divergent retained writes across
+/// a partition converge after heal on every node.**
+///
+/// Node A owns the topic's group. During the partition A's own retained write commits
+/// (the majority side keeps working), while B's write cannot reach the owner and
+/// **queues** — bounded queue-until-heal, never a divergent local commit. B stays on
+/// the last committed value meanwhile: retained **staleness** on the minority side,
+/// never divergence (the CP trade, ADR 0037 §5). On heal, B's queue submits to the
+/// owner, which commits it *after* A's write — and the commit fan-out plus the
+/// token-aware back-fill converge every node to that one committed value.
+///
+/// The durable authority here is the always-owner in-memory log; the real plane's
+/// quorum, fencing, and lease behaviour are proven in the mqtt-cluster and
+/// `durable_sessions` suites. What this test pins is partition-time queueing and
+/// heal-time convergence over real, severable TCP peer links.
+// Prime, partition, diverge, heal, converge — one scenario, deliberately linear.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn divergent_retained_writes_across_a_partition_converge_after_heal() {
+    use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
+    use mqtt_cluster::swim::MemberState;
+    use mqtt_storage::repl::InMemoryReplicatedLog;
+    use mqtt_storage::retained_log::ReplicatedRetained;
+    use std::sync::{Arc, RwLock};
+
+    // Two durable-retained nodes sharing the same two-member ring view.
+    async fn build(
+        name: &str,
+        other: &str,
+    ) -> (
+        NodeId,
+        SocketAddr, // client addr
+        SocketAddr, // peer addr
+        tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+        Arc<RwLock<Placement>>,
+    ) {
+        let id = NodeId(name.to_string());
+        let mut p = Placement::new(id.clone(), DEFAULT_REPLICAS);
+        p.observe(&NodeId(other.to_string()), MemberState::Alive, "x:1", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            id.clone(),
+            Arc::new(MemorySessionStore::new()),
+            Some(placement.clone()),
+        );
+        hub.attach_durable_retained(Arc::new(ReplicatedRetained::new(
+            InMemoryReplicatedLog::new(),
+        )));
+        tokio::spawn(hub.run());
+
+        let cli = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = cli.local_addr().unwrap();
+        spawn_client_loop(cli, tx.clone());
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        tokio::spawn(mqttd::peer::serve_listener(
+            peer,
+            id.clone(),
+            tx.clone(),
+            None,
+            None,
+        ));
+        (id, client_addr, peer_addr, tx, placement)
+    }
+
+    let (id_a, cli_a, peer_a, tx_a, placement_a) = build("part-a", "part-b").await;
+    let (id_b, cli_b, peer_b, tx_b, _) = build("part-b", "part-a").await;
+
+    // A severable full-mesh link (mirrors common::link/sever).
+    let link = |tx_a: &tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+                tx_b: &tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>| {
+        vec![
+            tokio::spawn(mqttd::peer::dial_forever(
+                peer_b.to_string(),
+                id_a.clone(),
+                tx_a.clone(),
+                None,
+            )),
+            tokio::spawn(mqttd::peer::dial_forever(
+                peer_a.to_string(),
+                id_b.clone(),
+                tx_b.clone(),
+                None,
+            )),
+        ]
+    };
+
+    // A topic whose group node A owns (HRW — identical from both views).
+    let topic = (0..100_000)
+        .map(|i| format!("dev/{i}/state"))
+        .find(|t| placement_a.read().unwrap().owner(t) == id_a)
+        .expect("some topic is owned by A");
+
+    // Link up and prime through the full path: B's publish routes to owner A,
+    // commits, and fans back out — a fresh subscriber on EACH node replays it.
+    let dials = link(&tx_a, &tx_b);
+    let mut prime = Client::connect(cli_b, "prime").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        prime.publish_retained(&topic, b"prime").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if retained_on(cli_a, &format!("up-a{tick}"), &topic).await == Some(b"prime".to_vec())
+            && retained_on(cli_b, &format!("up-b{tick}"), &topic).await == Some(b"prime".to_vec())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner-commit + fan-out pipeline never came up"
+        );
+    }
+
+    // PARTITION: sever the mesh; give both sides a moment to observe the EOFs.
+    for d in dials {
+        d.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Divergent writes: A's commits on the majority side; B's cannot reach the
+    // owner and queues (ADR 0037 §5) — B keeps serving the last committed value.
+    let mut pub_a = Client::connect(cli_a, "pub-a").await;
+    pub_a.publish_retained(&topic, b"from-a").await;
+    let mut pub_b = Client::connect(cli_b, "pub-b").await;
+    pub_b.publish_retained(&topic, b"from-b").await;
+
+    // A converges to its own committed write...
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        if retained_on(cli_a, &format!("pa{tick}"), &topic).await == Some(b"from-a".to_vec()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A never committed its majority-side write"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // ...while B is STALE, not divergent: it still serves the committed prime value
+    // (its own write is queued, not applied — the CP trade in action).
+    assert_eq!(
+        retained_on(cli_b, "stale-b", &topic).await,
+        Some(b"prime".to_vec()),
+        "the minority side must serve the last committed value, not its queued write"
+    );
+
+    // HEAL: relink. B's queue submits to the owner (committing AFTER A's write),
+    // and fan-out + token back-fill converge every node to that value.
+    let _dials = link(&tx_a, &tx_b);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        let on_a = retained_on(cli_a, &format!("ca{tick}"), &topic).await;
+        let on_b = retained_on(cli_b, &format!("cb{tick}"), &topic).await;
+        if on_a == Some(b"from-b".to_vec()) && on_b == Some(b"from-b".to_vec()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nodes never converged to the heal-committed write: A={on_a:?} B={on_b:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
