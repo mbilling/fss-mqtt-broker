@@ -484,3 +484,70 @@ async fn divergent_retained_writes_across_a_partition_converge_after_heal() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// ADR 0038: the peer handshake negotiates a protocol range. A node announcing a
+/// disjoint range is rejected at `Hello` — closed before it half-joins the mesh,
+/// with no Hello reply — while a compatible node completes the handshake.
+#[tokio::test]
+async fn an_incompatible_peer_protocol_range_is_rejected_at_hello() {
+    use mqtt_cluster::peer::{encode, PeerMessage, PROTO_MAX, PROTO_MIN};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (hub, tx) = Hub::with_config(
+        NodeId("proto-a".into()),
+        std::sync::Arc::new(MemorySessionStore::new()),
+    );
+    tokio::spawn(hub.run());
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = peer.local_addr().unwrap();
+    tokio::spawn(mqttd::peer::serve_listener(
+        peer,
+        NodeId("proto-a".into()),
+        tx,
+        None,
+        None,
+    ));
+
+    // A "future" build speaking only versions far beyond ours: the listener must
+    // close the link without announcing itself.
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut frame = Vec::new();
+    encode(
+        &PeerMessage::Hello {
+            node_id: "future".into(),
+            proto_min: 99,
+            proto_max: 99,
+        },
+        &mut frame,
+    )
+    .unwrap();
+    s.write_all(&frame).await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("the listener must close an incompatible link promptly")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "an incompatible peer must get no Hello reply, just a close"
+    );
+
+    // Control: the same handshake at our version completes (Hello comes back).
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut frame = Vec::new();
+    encode(
+        &PeerMessage::Hello {
+            node_id: "peer-ok".into(),
+            proto_min: PROTO_MIN,
+            proto_max: PROTO_MAX,
+        },
+        &mut frame,
+    )
+    .unwrap();
+    s.write_all(&frame).await.unwrap();
+    let n = timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("a compatible peer must receive the Hello reply")
+        .unwrap();
+    assert!(n > 0, "a compatible peer completes the handshake");
+}
