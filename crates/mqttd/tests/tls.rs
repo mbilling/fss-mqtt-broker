@@ -457,6 +457,8 @@ async fn plaintext_peer_is_rejected_by_mtls_listener() {
     mqtt_cluster::peer::encode(
         &mqtt_cluster::peer::PeerMessage::Hello {
             node_id: "intruder".into(),
+            proto_min: mqtt_cluster::peer::PROTO_MIN,
+            proto_max: mqtt_cluster::peer::PROTO_MAX,
         },
         &mut hello,
     )

@@ -201,6 +201,23 @@ enum LinkOutcome {
     Redundant,
 }
 
+/// Whether the peer's announced protocol range overlaps ours (ADR 0038). A
+/// disjoint range is logged loudly and the link must be dropped — a node that
+/// cannot agree on a protocol version must not half-join the mesh.
+fn proto_compatible(node_id: &str, proto_min: u32, proto_max: u32) -> bool {
+    if peer::negotiate_proto((peer::PROTO_MIN, peer::PROTO_MAX), (proto_min, proto_max)).is_some() {
+        true
+    } else {
+        warn!(
+            peer = %node_id,
+            ours = ?(peer::PROTO_MIN, peer::PROTO_MAX),
+            theirs = ?(proto_min, proto_max),
+            "peer speaks an incompatible peer-bus protocol range; dropping link (ADR 0038)"
+        );
+        false
+    }
+}
+
 /// Run a single peer link: handshake, dedup, register, then pump until it closes.
 ///
 /// `initiated` is true when we dialed (vs. accepted). To guarantee exactly one
@@ -213,6 +230,9 @@ enum LinkOutcome {
 /// certificate), otherwise the link is dropped — a cluster-CA cert no longer
 /// admits a node under an arbitrary id. `None` (plaintext mesh, or a CN-less
 /// cert) applies no binding, keeping the unauthenticated mesh working.
+// The handshake/dedup ladder is one linear flow; splitting it would scatter the
+// link-rejection cases.
+#[allow(clippy::too_many_lines)]
 async fn handle<S>(
     stream: S,
     local: NodeId,
@@ -235,11 +255,22 @@ where
             &mut wh,
             &PeerMessage::Hello {
                 node_id: local.0.clone(),
+                proto_min: peer::PROTO_MIN,
+                proto_max: peer::PROTO_MAX,
             },
         )
         .await?;
         match read_frame(&mut rh, &mut buf).await? {
-            Some(PeerMessage::Hello { node_id }) => NodeId(node_id),
+            Some(PeerMessage::Hello {
+                node_id,
+                proto_min,
+                proto_max,
+            }) => {
+                if !proto_compatible(&node_id, proto_min, proto_max) {
+                    return Ok(LinkOutcome::Closed);
+                }
+                NodeId(node_id)
+            }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
                 return Ok(LinkOutcome::Closed);
@@ -264,11 +295,22 @@ where
                 crate::conn::serve_proxied(rh, wh, None, identity, policy, hub, buf, via).await;
                 return Ok(LinkOutcome::Closed);
             }
-            Some(PeerMessage::Hello { node_id }) => {
+            Some(PeerMessage::Hello {
+                node_id,
+                proto_min,
+                proto_max,
+            }) => {
+                // Reject BEFORE announcing ourselves: an incompatible build gets a
+                // clean close, not half a handshake.
+                if !proto_compatible(&node_id, proto_min, proto_max) {
+                    return Ok(LinkOutcome::Closed);
+                }
                 write_frame(
                     &mut wh,
                     &PeerMessage::Hello {
                         node_id: local.0.clone(),
+                        proto_min: peer::PROTO_MIN,
+                        proto_max: peer::PROTO_MAX,
                     },
                 )
                 .await?;

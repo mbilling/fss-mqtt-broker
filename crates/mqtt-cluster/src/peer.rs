@@ -16,6 +16,22 @@ use serde::{Deserialize, Serialize};
 /// Maximum size of a single peer frame body, to bound memory from a bad peer.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// The oldest peer-bus protocol version this build can speak (ADR 0038).
+pub const PROTO_MIN: u32 = 1;
+/// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
+/// negotiated version is `min(proto_max_a, proto_max_b)`; every frame shape change
+/// after the first release bumps this.
+pub const PROTO_MAX: u32 = 1;
+
+/// Negotiate a link's protocol version from both sides' announced ranges
+/// (ADR 0038): the newest version both can speak, or `None` when the ranges are
+/// disjoint — the link must then be rejected (fail closed) rather than half-joined.
+#[must_use]
+pub fn negotiate_proto(local: (u32, u32), remote: (u32, u32)) -> Option<u32> {
+    let candidate = local.1.min(remote.1);
+    (candidate >= local.0 && candidate >= remote.0).then_some(candidate)
+}
+
 /// Wire form of a shared-subscription membership snapshot (ADR 0015 §2): each entry
 /// is `(ShareName, filter, [(client id, granted QoS u8, online-on-this-node)])`. The
 /// per-member liveness lets a peer's selector skip a member offline on its home node
@@ -43,10 +59,19 @@ pub struct WireAppProps {
 /// A message exchanged between broker nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerMessage {
-    /// Sent first on a new link to announce the sender's node id.
+    /// Sent first on a new link to announce the sender's node id and the peer-bus
+    /// protocol range it speaks (ADR 0038). Ranges with no overlap reject the link.
+    ///
+    /// **Frozen frame**: `Hello`'s encoding must never change again — it is the
+    /// bootstrap frame any two builds, of any future versions, must be able to
+    /// exchange to discover disagreement. Everything after it is versioned.
     Hello {
         /// The sending node's identifier.
         node_id: String,
+        /// The oldest protocol version the sender speaks.
+        proto_min: u32,
+        /// The newest protocol version the sender speaks.
+        proto_max: u32,
     },
     /// A full snapshot of the sending node's local subscription interest.
     ///
@@ -147,6 +172,11 @@ pub enum PeerMessage {
         app: WireAppProps,
     },
     /// First frame of a **session proxy** (ADR 0005): instead of a peer link,
+    /// **Frozen frame** (ADR 0038): like [`Hello`](PeerMessage::Hello), this is a
+    /// bootstrap frame read before any version is negotiated; its encoding must
+    /// never change again. (The raw MQTT stream that follows carries its own
+    /// protocol versioning.)
+    ///
     /// this connection relocates a persistent client session to its placement
     /// owner. The remaining bytes on the connection are the raw MQTT stream of
     /// the proxied client, which the owner serves as a normal session.
@@ -336,7 +366,10 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, PeerCodecError, PeerMessage, WireAppProps, MAX_FRAME};
+    use super::{
+        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, WireAppProps, MAX_FRAME,
+        PROTO_MAX, PROTO_MIN,
+    };
     use bytes::BytesMut;
 
     fn roundtrip(msg: &PeerMessage) {
@@ -353,6 +386,8 @@ mod tests {
     fn roundtrips_all_variants() {
         roundtrip(&PeerMessage::Hello {
             node_id: "node-a".into(),
+            proto_min: PROTO_MIN,
+            proto_max: PROTO_MAX,
         });
         roundtrip(&PeerMessage::Interest {
             filters: vec!["a/#".into(), "b/+/c".into()],
@@ -476,6 +511,27 @@ mod tests {
         });
     }
 
+    /// ADR 0038: version negotiation picks the newest version both sides speak,
+    /// and disjoint ranges yield `None` — the caller rejects the link, fail closed.
+    #[test]
+    fn proto_negotiation_picks_the_newest_common_version_or_rejects() {
+        // Identical single-version builds (today's fleet).
+        assert_eq!(negotiate_proto((1, 1), (1, 1)), Some(1));
+        // Overlapping ranges: newest common wins.
+        assert_eq!(negotiate_proto((1, 3), (2, 5)), Some(3));
+        assert_eq!(negotiate_proto((2, 5), (1, 3)), Some(3));
+        // Touching at one version.
+        assert_eq!(negotiate_proto((1, 2), (2, 4)), Some(2));
+        // Disjoint: an old build meets a too-new build (or vice versa).
+        assert_eq!(negotiate_proto((1, 1), (2, 3)), None);
+        assert_eq!(negotiate_proto((4, 6), (1, 3)), None);
+        // This build's own constants form a valid range.
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(PROTO_MAX)
+        );
+    }
+
     /// The frame bound is enforced on the SENDING side (0014-T8): a message that
     /// would exceed [`MAX_FRAME`] fails `encode` instead of being written and
     /// killing the link at the receiver.
@@ -501,6 +557,8 @@ mod tests {
         encode(
             &PeerMessage::Hello {
                 node_id: "x".into(),
+                proto_min: PROTO_MIN,
+                proto_max: PROTO_MAX,
             },
             &mut out,
         )
@@ -520,6 +578,8 @@ mod tests {
         encode(
             &PeerMessage::Hello {
                 node_id: "a".into(),
+                proto_min: PROTO_MIN,
+                proto_max: PROTO_MAX,
             },
             &mut out,
         )
