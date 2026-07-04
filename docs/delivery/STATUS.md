@@ -21,7 +21,7 @@
 | [0011](../adr/0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted | [7/7 done](0011-topic-aliases.md) | — |
 | [0012](../adr/0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | [6/6 done](0012-flow-control.md) | — |
 | [0013](../adr/0013-enhanced-authentication.md) | MQTT 5.0 enhanced authentication (AUTH exchange) | Accepted | [8/9 done](0013-enhanced-authentication.md) | 1 deferred |
-| [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [8/9 done](0014-cross-node-retained.md) | 1 deferred |
+| [0014](../adr/0014-cross-node-retained.md) | Cross-node retained-message replication | Accepted | [9/9 done](0014-cross-node-retained.md) | — |
 | [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [8/8 done](0015-cluster-shared-subscriptions.md) | — |
 | [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [6/6 done](0016-swim-membership-stability.md) | — |
 | [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
@@ -44,7 +44,7 @@
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [6/7 done](0034-foreign-client-interop-conformance.md) | 1 deferred |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
-| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Proposed | [6/7 done](0037-durable-retained-messages.md) | 1 open |
+| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [7/7 done](0037-durable-retained-messages.md) | — |
 
 ## Open and deferred work
 
@@ -75,10 +75,6 @@
 
 - `0013-T8` 💤 deferred: Server-initiated re-auth (server sends AUTH 0x19 to demand re-authentication) — ADR section 4 explicitly defers this — needs a trigger mechanism and interacts with the select-loop outbound path; only client-initiated re-auth is implemented (no server-side AUTH 0x19 send exists in conn.rs).
 
-**0014 — Cross-node retained-message replication**
-
-- `0014-T7` 💤 deferred: Partition-heal conflict reconciliation (two nodes holding different values for the same topic) — "Resolved by decision in ADR 0037 (Proposed): divergence is PREVENTED rather than reconciled — retained mutations commit through the topic's placement-group lease-owner with clock-free (epoch, offset) convergence tokens; LWW/HLC timestamp reconciliation was considered and rejected (clocks in the trust base, silently dropped acked writes). This task closes when 0037-P5/P6 land (offset-aware back-fill + heal-convergence integration tests)."
-
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
 - `0017-T9` 💤 deferred: Make recovery deadline/backoff configurable (currently constants) — ATTACH_RECOVERY_TIMEOUT/BACKOFF are constants for now; ADR defers promoting them to config until an operator need appears
@@ -107,7 +103,3 @@
 **0036 — MQTT-over-QUIC transport (multi-stream)**
 
 - `0036-T11` 💤 deferred: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection) — 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.
-
-**0037 — Durable single-owner retained messages (clock-free convergence)**
-
-- `0037-P7` ⬜ planned: Docs + closure — README/operator docs (CP trade, queue bound, durable-off caveat), ADR 0014 revision notes, close 0014-T7 on this evidence
