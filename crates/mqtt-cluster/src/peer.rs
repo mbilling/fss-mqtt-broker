@@ -227,10 +227,15 @@ pub enum PeerMessage {
     /// A retained mutation routed to the topic's placement-group lease-owner
     /// (ADR 0037 §1): the sender is the node the publish landed on, the receiver owns
     /// the topic's group and commits the mutation into the durable retained keyspace.
-    /// Fire-and-forget — live delivery already happened on the sender (and its
-    /// broadcast rides [`Publish`](PeerMessage::Publish) as before); this frame carries
-    /// only the *authority* write. A zero-length payload is the MQTT clear
-    /// [MQTT-3.3.1-10], committed as a versioned tombstone.
+    /// Live delivery already happened on the sender; this frame carries only the
+    /// *authority* write. A zero-length payload is the MQTT clear [MQTT-3.3.1-10],
+    /// committed as a versioned tombstone.
+    ///
+    /// **Acknowledged** (ADR 0037 T8): the sender keeps the mutation until the owner
+    /// answers with [`RetainedCommitAck`](PeerMessage::RetainedCommitAck), and
+    /// retransmits (same `seq`) if no answer arrives — so a frame lost to a dying
+    /// link is retried instead of silently lost. `seq` is a per-sender monotonic
+    /// counter; the owner dedups on it, making retransmission idempotent.
     RetainedCommit {
         /// Destination topic (no wildcards).
         topic: String,
@@ -238,6 +243,8 @@ pub enum PeerMessage {
         payload: Vec<u8>,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// Per-sender monotonic handoff sequence (dedup key for retransmissions).
+        seq: u64,
     },
     /// The post-commit retained fan-out (ADR 0037 §3): the topic's group owner
     /// broadcasts every **committed** retained value with its `(epoch, offset)`
@@ -258,6 +265,19 @@ pub enum PeerMessage {
         epoch: u64,
         /// The committed log offset (token low half).
         offset: u64,
+    },
+    /// The owner's **commit-gated** answer to a
+    /// [`RetainedCommit`](PeerMessage::RetainedCommit) (ADR 0037 T8). Sent only once
+    /// the mutation is quorum-committed (`token = Some`), or as a NACK
+    /// (`token = None`) when the receiver no longer owns the topic's group — the
+    /// sender then re-resolves the owner from placement and resends. Never sent
+    /// optimistically: an ack means the write is durable.
+    RetainedCommitAck {
+        /// The `seq` of the [`RetainedCommit`](PeerMessage::RetainedCommit) answered.
+        seq: u64,
+        /// `Some((epoch, offset))` = committed with this token; `None` = not the
+        /// owner (re-route).
+        token: Option<(u64, u64)>,
     },
 }
 
@@ -424,11 +444,21 @@ mod tests {
             topic: "dev/1/state".into(),
             payload: b"open".to_vec(),
             qos: 1,
+            seq: 9,
         });
         roundtrip(&PeerMessage::RetainedCommit {
             topic: "dev/1/state".into(),
             payload: Vec::new(), // a clear (versioned tombstone)
             qos: 0,
+            seq: 10,
+        });
+        roundtrip(&PeerMessage::RetainedCommitAck {
+            seq: 9,
+            token: Some((7, 42)),
+        });
+        roundtrip(&PeerMessage::RetainedCommitAck {
+            seq: 10,
+            token: None, // NACK: not the owner, re-route
         });
         roundtrip(&PeerMessage::RetainedUpdate {
             topic: "dev/1/state".into(),

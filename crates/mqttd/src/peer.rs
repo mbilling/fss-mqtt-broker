@@ -477,11 +477,21 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             topic,
             payload,
             qos,
+            seq,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedCommit {
+                node: remote.clone(),
                 topic,
                 payload: payload.into(),
                 qos,
+                seq,
+            });
+        }
+        PeerMessage::RetainedCommitAck { seq, token } => {
+            let _ = hub.send(HubCommand::RemoteRetainedCommitAck {
+                node: remote.clone(),
+                seq,
+                token,
             });
         }
         PeerMessage::RetainedUpdate {
