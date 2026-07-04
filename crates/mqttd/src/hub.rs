@@ -476,21 +476,22 @@ pub enum HubCommand {
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
     },
-    /// **Internal**: this (owner) node's off-loop durable commit finished — apply the
-    /// committed value to the local cache and fan it out to every peer with its token
-    /// (ADR 0037 §3). Posted back to the loop by the spawned commit task, like
-    /// [`SessionRecovered`](Self::SessionRecovered).
-    RetainedCommitted {
+    /// **Internal**: this (owner) node's off-loop durable retained commit finished —
+    /// posted back to the loop by the spawned commit task, like
+    /// [`SessionRecovered`](Self::SessionRecovered). On success the committed value
+    /// warms the local cache and fans out to every peer with its token (ADR 0037 §3),
+    /// and the queue head advances; on failure the mutation returns to the queue
+    /// front and waits for a heal trigger (ADR 0037 §5).
+    RetainedCommitDone {
         /// The committed topic.
         topic: String,
-        /// The committed payload; empty = cleared (tombstone).
+        /// The payload the commit was attempted with; empty = clear (tombstone).
         payload: Bytes,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
-        /// The lease epoch the value committed under (token high half).
-        epoch: u64,
-        /// The committed log offset (token low half).
-        offset: u64,
+        /// `Some((epoch, offset))` on success; `None` = the commit failed and the
+        /// mutation is re-queued.
+        token: Option<(u64, u64)>,
     },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
@@ -629,6 +630,18 @@ pub struct Hub {
     /// resurrect it. Only populated under durable retained; bounded by topic count
     /// (like the cache itself).
     retained_tokens: HashMap<String, (u64, u64)>,
+    /// Retained mutations awaiting their authority commit (ADR 0037 §5), in arrival
+    /// order: every mutation passes through here, so commits are **serialized per
+    /// node** (one in flight at a time — two rapid publishes to one topic can never
+    /// commit out of order), and one that cannot reach its group owner — partition,
+    /// dead owner, no quorum — simply waits for a heal trigger instead of being
+    /// dropped. Bounded at [`RETAINED_QUEUE_CAP`]; the bound drops the **oldest**,
+    /// loudly (`retained_queue_dropped_total`).
+    retained_queue: VecDeque<(String, Bytes, u8)>,
+    /// Whether an owner-local durable retained commit is currently in flight
+    /// (off-loop). The queue head advances only when it completes, preserving
+    /// per-node commit order.
+    retained_commit_inflight: bool,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -674,6 +687,14 @@ fn qos_num(qos: QoS) -> u8 {
 /// frame limit (16 MiB, `mqtt_cluster::peer`), with headroom for bincode framing — a
 /// frame at the limit would be rejected by the receiver and tear down the link.
 const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// The per-node bound on retained mutations queued awaiting their authority commit
+/// (ADR 0037 §5, queue-until-heal). At the bound the **oldest** mutation is dropped,
+/// loudly (`retained_queue_dropped_total`) — the explicit CP trade: a partition that
+/// outlasts the queue costs the oldest minority-side retained writes, never silent
+/// divergence. Count-bounded (like the session queue cap): retained values are
+/// last-value device state, typically small and infrequent.
+const RETAINED_QUEUE_CAP: usize = 1024;
 
 /// The order-independent digest of a retained set (0014-T6 + ADR 0037 P1): the topic
 /// count, the XOR of each topic's stable 64-bit hash, and the XOR of each
@@ -794,6 +815,8 @@ impl Hub {
                 retained: Box::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 retained_tokens: HashMap::new(),
+                retained_queue: VecDeque::new(),
+                retained_commit_inflight: false,
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -853,6 +876,10 @@ impl Hub {
                 _ = sweep.tick() => {
                     self.sweep_expired_sessions().await;
                     self.refresh_gauges().await;
+                    // Retry queued retained mutations (ADR 0037 §5): covers heals with
+                    // no link event — a lease landing locally, or quorum returning on
+                    // links that never dropped. A no-op when the queue is idle.
+                    self.kick_retained_queue();
                 }
             }
         }
@@ -960,6 +987,9 @@ impl Hub {
                 // so a steady-state link-up or flap costs one small frame, not the
                 // whole retained set.
                 self.send_retained_digest(&node).await;
+                // A heal trigger (ADR 0037 §5): the new link may be — or reach — the
+                // owner that queued retained mutations have been waiting for.
+                self.kick_retained_queue();
             }
             HubCommand::PeerDisconnected { node, conn_id } => {
                 self.peer_disconnected(&node, conn_id);
@@ -1005,32 +1035,41 @@ impl Hub {
                 qos,
             } => {
                 // A peer routed a retained mutation here because this node owns the
-                // topic's group (ADR 0037 §1): commit it into the durable keyspace.
-                // The owner check is enforced by the keyspace itself (a moved lease
-                // fails with NotOwner rather than committing off-owner).
-                self.commit_retained_local(&topic, &payload, qos);
+                // topic's group (ADR 0037 §1): run it through the same queue as local
+                // mutations — serialized commit order, retry-until-heal, and a
+                // re-route if the lease has moved on (the drain re-resolves owners).
+                self.route_retained_commit(&topic, &payload, qos);
             }
-            HubCommand::RetainedCommitted {
+            HubCommand::RetainedCommitDone {
                 topic,
                 payload,
                 qos,
-                epoch,
-                offset,
+                token,
             } => {
-                // This (owner) node's durable commit finished: warm the local cache
-                // and fan the tokened value out to every peer (ADR 0037 §3). The
-                // fan-out is best-effort — a peer that misses it converges via the
-                // token-aware back-fill (P5) on the next link-up.
-                self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
-                    .await;
-                for peer in self.peers.values() {
-                    let _ = peer.tx.send(PeerMessage::RetainedUpdate {
-                        topic: topic.clone(),
-                        payload: payload.to_vec(),
-                        qos,
-                        epoch,
-                        offset,
-                    });
+                self.retained_commit_inflight = false;
+                if let Some((epoch, offset)) = token {
+                    // Committed: warm the local cache, fan the tokened value out to
+                    // every peer (ADR 0037 §3 — best-effort; a peer that misses it
+                    // converges via the P5 back-fill on the next link-up), and drive
+                    // the next queued mutation.
+                    self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                        .await;
+                    for peer in self.peers.values() {
+                        let _ = peer.tx.send(PeerMessage::RetainedUpdate {
+                            topic: topic.clone(),
+                            payload: payload.to_vec(),
+                            qos,
+                            epoch,
+                            offset,
+                        });
+                    }
+                    self.kick_retained_queue();
+                } else {
+                    // Failed (no quorum / lease moved): back to the queue FRONT —
+                    // order kept — and wait for a heal trigger rather than
+                    // hot-retrying. The front slot may transiently exceed the cap by
+                    // one (the entry was already counted when first admitted).
+                    self.retained_queue.push_front((topic, payload, qos));
                 }
             }
             HubCommand::RemoteRetainedUpdate {
@@ -2443,84 +2482,123 @@ impl Hub {
         }
     }
 
-    /// Route a locally-originated retained mutation to its topic's group lease-owner
-    /// (ADR 0037 §1). With durable off (`durable_retained` unset) this is a no-op and
-    /// retained keeps the ADR 0014 best-effort behaviour. Owner-local mutations commit
-    /// off-loop; a peer-owned topic gets a targeted, fire-and-forget
-    /// [`PeerMessage::RetainedCommit`] — live delivery already happened either way.
-    fn route_retained_commit(&self, topic: &str, payload: &Bytes, qos: u8) {
+    /// Enqueue a retained mutation for its authority commit (ADR 0037 §1/§5). With
+    /// durable off (`durable_retained` unset) this is a no-op and retained keeps the
+    /// ADR 0014 best-effort behaviour. Every mutation — locally published or routed
+    /// here by a peer — passes through the bounded per-node queue, which serializes
+    /// commits (per-node order holds even for rapid same-topic publishes) and lets a
+    /// mutation that cannot reach its owner wait for a heal instead of being dropped.
+    /// At the bound the **oldest** is dropped, loudly.
+    fn route_retained_commit(&mut self, topic: &str, payload: &Bytes, qos: u8) {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
         }
-        // The owner of the topic's placement group; with no ring (single node /
-        // no cluster), this node is trivially the owner.
-        let owner = self.placement.as_ref().map_or_else(
-            || self.node_id.clone(),
-            |p| {
-                p.read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .owner(topic)
-            },
-        );
-        if owner == self.node_id {
-            self.commit_retained_local(topic, payload, qos);
-        } else if let Some(peer) = self.peers.get(&owner) {
-            let _ = peer.tx.send(PeerMessage::RetainedCommit {
-                topic: topic.to_string(),
-                payload: payload.to_vec(),
-                qos,
-            });
-        } else {
-            // The owner is not linked (partitioned or dead): the mutation cannot reach
-            // the authority. Loud, so the gap is visible until the bounded
-            // queue-until-heal lands (ADR 0037 §5, 0037-P6). Caches still carry the
-            // broadcast value; back-fill reconciles them once P5 makes tokens flow.
-            warn!(
-                topic = %topic,
-                owner = %owner.0,
-                "retained mutation could not reach its group owner; durable commit skipped (0037-P6 adds the queue)"
+        if self.retained_queue.len() >= RETAINED_QUEUE_CAP {
+            if let Some((dropped, ..)) = self.retained_queue.pop_front() {
+                warn!(
+                    topic = %dropped,
+                    cap = RETAINED_QUEUE_CAP,
+                    "retained mutation queue full; dropped the OLDEST queued mutation \
+                     (ADR 0037 §5 — the partition has outlasted the queue bound)"
+                );
+            }
+            if let Some(m) = &self.metrics {
+                m.retained_queue_dropped();
+            }
+        }
+        self.retained_queue
+            .push_back((topic.to_string(), payload.clone(), qos));
+        self.kick_retained_queue();
+    }
+
+    /// Drive the retained mutation queue (ADR 0037 §5): drain entries in order —
+    /// owner-local heads start the (single) off-loop commit, peer-owned heads are
+    /// handed to their linked owner — and stop at an entry whose owner is
+    /// unreachable, leaving it queued for the next heal trigger (a peer link coming
+    /// up, the sweep tick, or the next enqueue).
+    fn kick_retained_queue(&mut self) {
+        while !self.retained_commit_inflight {
+            let Some((topic, payload, qos)) = self.retained_queue.pop_front() else {
+                return;
+            };
+            // The owner of the topic's placement group; with no ring (single node /
+            // no cluster), this node is trivially the owner. Resolved at drain time,
+            // not enqueue time, so a lease that moved while queued re-routes.
+            let owner = self.placement.as_ref().map_or_else(
+                || self.node_id.clone(),
+                |p| {
+                    p.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .owner(&topic)
+                },
             );
+            if owner == self.node_id {
+                self.retained_commit_inflight = true;
+                self.spawn_retained_commit(topic, payload, qos);
+            } else if let Some(peer) = self.peers.get(&owner) {
+                // Hand the mutation to its owner, in queue order (the link channel is
+                // FIFO; the owner serializes through its own queue). Fire-and-forget:
+                // a link that dies with the frame in flight loses it — the P5
+                // token back-fill still converges the caches on the next link-up.
+                let _ = peer.tx.send(PeerMessage::RetainedCommit {
+                    topic,
+                    payload: payload.to_vec(),
+                    qos,
+                });
+            } else {
+                // Owner unreachable (partitioned or dead): queue-until-heal. Put the
+                // entry back and wait for a trigger — never dropped silently.
+                debug!(
+                    topic = %topic,
+                    owner = %owner.0,
+                    queued = self.retained_queue.len() + 1,
+                    "retained mutation owner unreachable; queued until heal (ADR 0037 §5)"
+                );
+                self.retained_queue.push_front((topic, payload, qos));
+                return;
+            }
         }
     }
 
-    /// Commit a retained mutation into the durable keyspace on this (owner) node,
-    /// **off-loop**: the quorum round-trip must not stall the hub actor. A zero-length
-    /// payload is the MQTT clear [MQTT-3.3.1-10] → a versioned tombstone (ADR 0037 P2).
-    /// A successful commit posts [`HubCommand::RetainedCommitted`] back to the loop,
-    /// which warms the local cache and fans the tokened value out to every peer (§3).
-    fn commit_retained_local(&self, topic: &str, payload: &Bytes, qos: u8) {
+    /// Start the off-loop durable commit for an owner-local retained mutation: the
+    /// quorum round-trip must not stall the hub actor, and exactly one runs at a time
+    /// (`retained_commit_inflight`) so commits keep queue order. A zero-length
+    /// payload is the MQTT clear [MQTT-3.3.1-10] → a versioned tombstone (ADR 0037
+    /// P2). Completion posts [`HubCommand::RetainedCommitDone`] back to the loop.
+    fn spawn_retained_commit(&self, topic: String, payload: Bytes, qos: u8) {
         let Some(durable) = self.durable_retained.clone() else {
             return;
         };
         let self_tx = self.self_tx.clone();
-        let topic = topic.to_string();
-        let payload = payload.clone();
         tokio::spawn(async move {
             let result = if payload.is_empty() {
                 durable.clear(&topic).await
             } else {
                 durable.set(&topic, &payload, qos).await
             };
-            match result {
+            let token = match result {
                 Ok((epoch, offset)) => {
                     debug!(topic = %topic, epoch, offset, "retained mutation committed");
-                    let _ = self_tx.send(HubCommand::RetainedCommitted {
-                        topic,
-                        payload,
-                        qos,
-                        epoch,
-                        offset,
-                    });
+                    Some((epoch, offset))
                 }
-                // NotOwner here means the lease moved after routing (or the sender's
-                // ring was stale); NoQuorum that the commit could not be made durable.
-                // Loud until P5/P6 give these a repair path (token back-fill / queue).
-                Err(e) => warn!(
-                    topic = %topic,
-                    error = %e,
-                    "retained durable commit failed; caches not warmed (0037-P5/P6 add repair)"
-                ),
-            }
+                // NotOwner: the lease moved after routing (the re-queued entry
+                // re-resolves its owner on the next drain). NoQuorum: this side of a
+                // partition cannot commit durably — queue until it heals.
+                Err(e) => {
+                    warn!(
+                        topic = %topic,
+                        error = %e,
+                        "retained durable commit failed; mutation queued until heal (ADR 0037 §5)"
+                    );
+                    None
+                }
+            };
+            let _ = self_tx.send(HubCommand::RetainedCommitDone {
+                topic,
+                payload,
+                qos,
+                token,
+            });
         });
     }
 
@@ -4636,6 +4714,242 @@ mod tests {
                 Some(PeerMessage::RetainedDigest { .. })
             ),
             "the digest must be offered even with an empty cache (tombstones held)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0037 P6: bounded queue-until-heal for retained mutations.
+    // -----------------------------------------------------------------------
+
+    /// A durable retained authority that fails every commit until healed — the
+    /// minority side of a partition (`NoQuorum`), from the hub's point of view.
+    #[derive(Debug, Default)]
+    struct FlakyRetained {
+        healthy: std::sync::atomic::AtomicBool,
+        /// Every successful commit, in order: `(topic, payload, tombstone)`.
+        committed: std::sync::Mutex<Vec<(String, Vec<u8>, bool)>>,
+    }
+
+    impl FlakyRetained {
+        fn heal(&self) {
+            self.healthy
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn commit(
+            &self,
+            topic: &str,
+            payload: &[u8],
+            tombstone: bool,
+        ) -> Result<(u64, u64), mqtt_storage::StorageError> {
+            if !self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
+            let mut log = self.committed.lock().unwrap();
+            log.push((topic.to_string(), payload.to_vec(), tombstone));
+            Ok((0, log.len() as u64))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::retained_log::DurableRetained for FlakyRetained {
+        async fn set(
+            &self,
+            topic: &str,
+            payload: &[u8],
+            _qos: u8,
+        ) -> Result<(u64, u64), mqtt_storage::StorageError> {
+            self.commit(topic, payload, false)
+        }
+
+        async fn clear(&self, topic: &str) -> Result<(u64, u64), mqtt_storage::StorageError> {
+            self.commit(topic, &[], true)
+        }
+
+        async fn get(
+            &self,
+            _topic: &str,
+        ) -> Result<Option<mqtt_storage::retained_log::RetainedEntry>, mqtt_storage::StorageError>
+        {
+            Ok(None)
+        }
+    }
+
+    /// ADR 0037 §5: a retained mutation whose group owner is unreachable **queues**
+    /// (never silently dropped); when the owner's link comes up the queue drains to
+    /// it in publish order.
+    #[tokio::test]
+    async fn an_unreachable_owner_queues_mutations_until_the_link_heals() {
+        let (tx, durable, placement) = start_hub_with_durable_retained(&["n"]);
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+
+        // The owner is NOT linked: both mutations queue (nothing to observe yet).
+        tx.send(HubCommand::Publish {
+            topic: topic.clone(),
+            payload: Bytes::from_static(b"v1"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        tx.send(HubCommand::Publish {
+            topic: topic.clone(),
+            payload: Bytes::from_static(b"v2"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        // No local durable write for a foreign topic while queued.
+        assert!(durable.get(&topic).await.unwrap().is_none());
+
+        // HEAL: the owner's link comes up — the queue drains to it, in order.
+        let mut peer = connect_peer(&tx, "n", 1);
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedCommit {
+                    topic: t, payload, ..
+                }) => {
+                    assert_eq!(t, topic);
+                    got.push(payload);
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![b"v1".to_vec(), b"v2".to_vec()],
+            "queue order held"
+        );
+    }
+
+    /// ADR 0037 §5: the queue bound drops the **oldest** mutation loudly — the drop
+    /// counter moves and the survivors drain in order on heal.
+    #[tokio::test]
+    async fn the_retained_queue_bound_drops_the_oldest_loudly() {
+        // Manual assembly (the shared helper attaches no metrics).
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let local = NodeId("hub-test".into());
+        let mut p = Placement::new(local.clone(), DEFAULT_REPLICAS);
+        p.observe(&NodeId("n".into()), MemberState::Alive, "peer:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            local,
+            Arc::new(MemorySessionStore::new()),
+            Some(placement.clone()),
+        );
+        hub.attach_durable_retained(Arc::new(
+            mqtt_storage::retained_log::ReplicatedRetained::new(InMemoryReplicatedLog::new()),
+        ));
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let topic = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("dev/{i}/state"))
+                .find(|t| p.owner(t) == NodeId("n".into()))
+                .expect("some topic is owned by the peer")
+        };
+
+        // Overfill the queue by 3 while the owner is unreachable.
+        for i in 0..(super::RETAINED_QUEUE_CAP + 3) {
+            tx.send(HubCommand::Publish {
+                topic: topic.clone(),
+                payload: Bytes::from(format!("m{i}").into_bytes()),
+                qos: QoS::AtMostOnce,
+                retain: true,
+                message_expiry: None,
+                app: AppProperties::default(),
+            })
+            .unwrap();
+        }
+
+        // Heal and read the first drained mutation: the 3 oldest were dropped.
+        let mut peer = connect_peer(&tx, "n", 1);
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedCommit { payload, .. }) => {
+                    assert_eq!(payload, b"m3", "the oldest three must have been dropped");
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        let text = metrics.render();
+        assert!(
+            text.contains("retained_queue_dropped_total 3"),
+            "exactly three loud drops:\n{text}"
+        );
+    }
+
+    /// ADR 0037 §5: an owner-local commit that fails (no quorum — the minority side)
+    /// re-queues and retries on the sweep tick; once quorum returns the whole queue
+    /// commits **in publish order** and the committed values fan out.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_local_commit_retries_until_heal_and_keeps_order() {
+        let flaky = Arc::new(FlakyRetained::default());
+        let local = NodeId("hub-test".into());
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            local,
+            Arc::new(MemorySessionStore::new()),
+            Some(placement),
+        );
+        hub.attach_durable_retained(flaky.clone());
+        tokio::spawn(hub.run());
+        let mut peer = connect_peer(&tx, "n", 1);
+
+        // Three mutations while the authority has no quorum: value, value, clear.
+        publish_retained(&tx, "t", b"v1");
+        publish_retained(&tx, "t", b"v2");
+        publish_retained(&tx, "t", b"");
+        // Let the loop attempt (and fail) — nothing commits, nothing fans out.
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+        assert!(flaky.committed.lock().unwrap().is_empty());
+
+        // HEAL: quorum returns; the sweep tick retries and the queue drains in order.
+        flaky.heal();
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 3).await;
+        let committed = flaky.committed.lock().unwrap().clone();
+        assert_eq!(
+            committed,
+            vec![
+                ("t".to_string(), b"v1".to_vec(), false),
+                ("t".to_string(), b"v2".to_vec(), false),
+                ("t".to_string(), Vec::new(), true),
+            ],
+            "all queued mutations commit, in publish order"
+        );
+
+        // Each commit fanned out with its token; the last is the clear.
+        let mut updates = Vec::new();
+        while updates.len() < 3 {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedUpdate {
+                    payload, offset, ..
+                }) => {
+                    updates.push((payload, offset));
+                }
+                Some(PeerMessage::Interest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        assert_eq!(
+            updates[2],
+            (Vec::new(), 3),
+            "the clear fans out last, tokened"
         );
     }
 

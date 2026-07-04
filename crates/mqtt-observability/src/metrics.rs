@@ -91,6 +91,7 @@ struct OtelInstruments {
     security_reloads: OtelCounter<u64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
+    retained_queue_dropped: OtelCounter<u64>,
 }
 
 impl OtelInstruments {
@@ -123,6 +124,7 @@ impl OtelInstruments {
             security_reloads: meter.u64_counter("security_reloads").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
+            retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
         }
     }
 }
@@ -166,6 +168,7 @@ pub struct Metrics {
     security_reloads_total: Family<OutcomeLabel, Counter>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
+    retained_queue_dropped_total: Counter,
 }
 
 impl Metrics {
@@ -328,6 +331,14 @@ impl Metrics {
              — ADR 0037 P1); should stay at zero once single-owner retained lands",
         );
 
+        let retained_queue_dropped_total = register_counter(
+            &mut registry,
+            "retained_queue_dropped",
+            "Retained mutations dropped because the queue-until-heal bound was hit \
+             (ADR 0037 §5): the oldest queued mutation discarded, loudly — non-zero \
+             means a partition outlasted the queue's capacity",
+        );
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         build_info
@@ -363,6 +374,7 @@ impl Metrics {
             security_reloads_total,
             quic_path_migrations_total,
             retained_divergence_total,
+            retained_queue_dropped_total,
         }
     }
 
@@ -591,6 +603,13 @@ impl Metrics {
     pub fn retained_divergence(&self) {
         self.retained_divergence_total.inc();
         self.otel.retained_divergence.add(1, &[]);
+    }
+
+    /// A queued retained mutation was dropped at the queue-until-heal bound
+    /// (ADR 0037 §5) — the loud half of the CP trade.
+    pub fn retained_queue_dropped(&self) {
+        self.retained_queue_dropped_total.inc();
+        self.otel.retained_queue_dropped.add(1, &[]);
     }
 
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;
