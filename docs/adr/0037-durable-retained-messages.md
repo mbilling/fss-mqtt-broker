@@ -1,7 +1,7 @@
 # ADR 0037 — Durable single-owner retained messages (clock-free convergence)
 
-- **Status:** Proposed
-- **Date:** 2026-07-03
+- **Status:** Accepted
+- **Date:** 2026-07-03 (accepted 2026-07-04 — all phases delivered)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0037-durable-retained-messages.md](../delivery/0037-durable-retained-messages.md) — plan, progress, and changelog
 - **Related:** [ADR 0014](0014-cross-node-retained.md) (the best-effort broadcast model this

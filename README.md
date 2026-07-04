@@ -109,6 +109,22 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   [0028](docs/adr/0028-link-gated-voter-admission.md)). Opt out with
   `MQTTD_DURABLE_SESSIONS=0` for the bounded in-memory store. Proven by a 3-node
   integration test (an enqueue is quorum-durable across the real peer mesh).
+- **Durable single-owner retained messages** ([ADR 0037](docs/adr/0037-durable-retained-messages.md),
+  on whenever durable sessions are — the default). Retained conflicts are **prevented,
+  not resolved**: every retained mutation commits through its topic's group lease-owner
+  into the quorum-replicated log, and all cache/back-fill decisions reduce to a
+  consensus-issued `(epoch, offset)` token — **no wall-clock in correctness**, and no
+  acknowledged write is ever silently discarded. Subscribe-time replay stays a local
+  read; caches are warmed by the owner's post-commit fan-out and healed by
+  token-aware back-fill on link-up (committed clears propagate as tombstones). The
+  **CP trade, explicitly**: during a partition the quorum-less side serves the last
+  *committed* value (staleness, never divergence) while its own retained writes
+  **queue until heal** — bounded per node (1024), oldest dropped loudly
+  (`retained_queue_dropped_total`) if the partition outlasts the queue. With durable
+  off, retained falls back to ADR 0014's best-effort broadcast, divergence caveat
+  included. Proven end to end: concurrent same-topic writes on two nodes and
+  divergent writes across a severed-and-healed partition both converge cluster-wide
+  (`retained_divergence_total` stays 0).
 
 ### In progress / planned
 - **MQTT 5.0**: session/message expiry, topic aliases, flow control, shared
@@ -116,8 +132,7 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   v5 **wire codec is complete** and the broker **negotiates v5 at CONNECT** — a v5
   client connects, gets a v5 CONNACK with v5 reason codes, and exchanges v5-framed
   packets. The v5 *semantics* listed above are the remaining work.)
-- Subscription digests (bloom) for sub-linear fan-out; retained-state
-  replication across nodes.
+- Subscription digests (bloom) for sub-linear fan-out.
 - WebSocket/WSS listener; Prometheus metrics; admin/management API. (Kubernetes-style
   `GET /livez` + `/readyz` health probes already ship — see `MQTTD_HEALTH_BIND`.)
 - Bounded outbound queues, rate limits, connection caps.
@@ -300,8 +315,10 @@ platforms (no `SIGHUP`) the watcher is the only reload mechanism.
 ### Metrics
 
 The broker exports Prometheus-style metrics (connections, publish/deliver, sessions,
-retained, cluster membership, lease role/epoch, durable-append latency/failures, gossip
-rejects, security reloads) with bounded label sets — no per-client or per-topic labels. Two ways to consume
+retained — including the `retained_divergence_total` convergence meter and the
+`retained_queue_dropped_total` queue-until-heal bound counter (ADR 0037) — cluster
+membership, lease role/epoch, durable-append latency/failures, gossip rejects,
+security reloads) with bounded label sets — no per-client or per-topic labels. Two ways to consume
 them, both from the one registry (ADR 0020):
 
 - **Prometheus (pull)** — `GET /metrics` on the health server (`MQTTD_HEALTH_BIND`), or on a

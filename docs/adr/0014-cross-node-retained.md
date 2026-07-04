@@ -6,6 +6,11 @@
 - **Delivery:** [docs/delivery/0014-cross-node-retained.md](../delivery/0014-cross-node-retained.md) — plan, progress, and changelog
 - **Related:** [ADR 0001](0001-session-durability.md) (cluster routing model),
   [ADR 0010](0010-shared-subscriptions.md) (the other cross-node routing limitation)
+- **Revised by:** [ADR 0037](0037-durable-retained-messages.md) — under durable
+  sessions (the default) retained *writes* commit through the group lease-owner and
+  caches converge by token; this ADR's read model and back-fill machinery stand, and
+  its full behaviour remains the explicit durable-off fallback (see the revision
+  notes at the end)
 
 > This record states the decision only. How it is being built and how far along it is
 > live in the [delivery doc](../delivery/0014-cross-node-retained.md).
@@ -85,9 +90,9 @@ newer) value. A fresh joiner therefore catches up on the whole existing retained
 an established node ignores topics it already has.
 
 **Conflict on partition heal** (two nodes holding *different* values for the same
-topic) is left unresolved: gap-fill keeps each side's own value, so they stay
-divergent until the next publish. Resolving that needs per-message timestamps /
-version vectors and is out of scope (tracked as T7).
+topic) was originally left unresolved: gap-fill kept each side's own value, so they
+stayed divergent until the next publish (tracked as T7). **Resolved by
+[ADR 0037](0037-durable-retained-messages.md)** — see the revision notes below.
 
 ## Consequences
 
@@ -96,11 +101,42 @@ version vectors and is out of scope (tracked as T7).
   `deliver` path for local and remote application; clears propagate; no relay loops;
   non-retained forwarding is unchanged.
 - **Cost / limits:** every retained publish fans out to all peers (O(nodes); retained
-  publishes are typically infrequent); a link-up between *differing* sets still
-  transfers the sender's whole set, chunked (topic-level diffing is a possible further
-  refinement of §3's digest step); partition-heal divergence on the same topic is not
-  reconciled (§3, T7); a single retained message too large for a peer frame is skipped
-  from back-fill (loudly) rather than sent.
+  publishes are typically infrequent) — under durable retained (ADR 0037) this
+  broadcast is interest-only and cache warming rides the post-commit fan-out instead;
+  a link-up between *differing* sets still transfers the sender's whole set, chunked
+  (topic-level diffing is a possible further refinement of §3's digest step); a single
+  retained message too large for a peer frame is skipped from back-fill (loudly)
+  rather than sent.
+
+## Revision notes — ADR 0037 (durable single-owner retained)
+
+[ADR 0037](0037-durable-retained-messages.md) (Accepted, delivered) revises this
+record's **write model** for the durable-by-default configuration; with durable
+sessions explicitly opted out (`MQTTD_DURABLE_SESSIONS=0`) everything in this ADR
+applies unchanged.
+
+**What stands from this ADR** (and what 0037 builds on):
+
+- The **read model**: subscribe-time replay is a local cache read on every node —
+  fetch-on-subscribe stays rejected.
+- The **back-fill machinery** (§3): the link-up digest offer (T6) and the chunked
+  snapshot (T8) carry the convergence data; 0037 extends the digest with a value hash
+  (divergence detection) and the snapshot entries with `(epoch, offset)` tokens.
+- Live delivery of a retained publish to current subscribers: unchanged, undelayed.
+
+**What 0037 revises** (durable mode):
+
+- Retained *mutations* commit through the topic's placement-group **lease-owner**
+  into the quorum-replicated group log — conflicts are prevented, not resolved; a
+  non-owner queues (bounded, loud at the cap) rather than writing divergently.
+- Node caches are warmed by the owner's **post-commit fan-out** carrying a clock-free
+  `(epoch, offset)` token, applied monotonically per topic; the raw §1 broadcast no
+  longer writes caches (it forwards for live delivery only, interest-filtered).
+- The §3 **gap-fill rule is replaced by higher-token-wins**: on link-up divergent
+  caches converge deterministically to the committed value, and committed clears
+  back-fill as tombstone entries so a peer that missed a clear drops the topic.
+- **T7 is closed**: divergence across a partition heals — proven by the everyday-race
+  and partition heal-convergence integration tests (0037 P4/P6).
 
 ## Alternatives considered
 
