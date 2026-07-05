@@ -1366,8 +1366,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             .audit
             .record("acl.deny.publish", Some(&principal.subject), &topic);
     }
-    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| {
+    // Forward to the hub; the returned receiver resolves once the hub's fan-out —
+    // including any durable (fsync'd) offline-queue appends — has completed, so a
+    // QoS ≥ 1 acknowledgement can be released only for a message the broker durably
+    // owns (ADR 0018). `None` when the publish was dropped by the ACL.
+    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| -> Option<oneshot::Receiver<()>> {
         if authorized {
+            let (done_tx, done_rx) = oneshot::channel();
             let _ = hub.send(HubCommand::Publish {
                 topic,
                 payload,
@@ -1375,13 +1380,26 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 retain,
                 message_expiry,
                 app,
+                done: Some(done_tx),
             });
+            Some(done_rx)
+        } else {
+            None
         }
     };
     match (qos, pkid) {
-        (QoS::AtMostOnce, _) => forward(hub),
+        (QoS::AtMostOnce, _) => {
+            let _ = forward(hub); // nothing to acknowledge, nothing to gate
+        }
         (QoS::AtLeastOnce, Some(id)) => {
-            forward(hub);
+            if let Some(done) = forward(hub) {
+                // The hub disappearing mid-shutdown means the message may never be
+                // stored: close without a PUBACK (the publisher retries) rather than
+                // acknowledge a message that could be lost.
+                if done.await.is_err() {
+                    return Ok(true);
+                }
+            }
             writer.send(&Packet::PubAck(id.into())).await?;
         }
         (QoS::ExactlyOnce, Some(id)) => {
@@ -1407,7 +1425,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     return Ok(true);
                 }
                 *qos2_inflight += 1;
-                forward(hub);
+                if let Some(done) = forward(hub) {
+                    // As for QoS 1: PUBREC promises the broker owns the message, so
+                    // it is released only after the durable fan-out completes.
+                    if done.await.is_err() {
+                        return Ok(true);
+                    }
+                }
             }
             writer.send(&Packet::PubRec(id.into())).await?;
         }
@@ -1810,16 +1834,24 @@ mod tests {
         tokio::spawn(async move {
             let mut keep_alive = Vec::new();
             while let Some(cmd) = hub_rx.recv().await {
-                if let HubCommand::Attach {
-                    client,
-                    outbound,
-                    reply,
-                    ..
-                } = cmd
-                {
-                    record.lock().unwrap().push(client.0.clone());
-                    keep_alive.push(outbound);
-                    let _ = reply.send(AttachOutcome::Present(false));
+                match cmd {
+                    HubCommand::Attach {
+                        client,
+                        outbound,
+                        reply,
+                        ..
+                    } => {
+                        record.lock().unwrap().push(client.0.clone());
+                        keep_alive.push(outbound);
+                        let _ = reply.send(AttachOutcome::Present(false));
+                    }
+                    // Release any gated acknowledgement, as the real hub would.
+                    HubCommand::Publish {
+                        done: Some(done), ..
+                    } => {
+                        let _ = done.send(());
+                    }
+                    _ => {}
                 }
             }
         });
@@ -1947,8 +1979,12 @@ mod tests {
                         keep_alive.push(outbound);
                         let _ = reply.send(AttachOutcome::Present(false));
                     }
-                    HubCommand::Publish { topic, .. } => {
+                    HubCommand::Publish { topic, done, .. } => {
                         let _ = tx.send(topic);
+                        // Release any gated acknowledgement, as the real hub would.
+                        if let Some(done) = done {
+                            let _ = done.send(());
+                        }
                     }
                     _ => {}
                 }

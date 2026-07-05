@@ -360,6 +360,11 @@ pub enum HubCommand {
         message_expiry: Option<u32>,
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
+        /// Signalled once the on-loop fan-out — including any durable (fsync'd)
+        /// offline-queue appends — has completed, so the connection releases a
+        /// `QoS` ≥ 1 acknowledgement only for a message the broker durably owns
+        /// (ADR 0018). `None` when no acknowledgement is gated on the fan-out.
+        done: Option<oneshot::Sender<()>>,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -998,6 +1003,7 @@ impl Hub {
                 retain,
                 message_expiry,
                 app,
+                done,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
@@ -1009,6 +1015,11 @@ impl Hub {
                     .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
+                }
+                // The fan-out (and its durable appends) is complete: release any
+                // acknowledgement gated on it (ADR 0018).
+                if let Some(done) = done {
+                    let _ = done.send(());
                 }
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
@@ -3537,6 +3548,7 @@ mod tests {
             retain: false,
             message_expiry,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
     }
@@ -3630,6 +3642,7 @@ mod tests {
             retain: false,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
     }
@@ -4496,6 +4509,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
     }
@@ -4613,6 +4627,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
 
@@ -5081,6 +5096,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
         tx.send(HubCommand::Publish {
@@ -5090,6 +5106,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
         // No local durable write for a foreign topic while queued.
@@ -5167,6 +5184,7 @@ mod tests {
                 retain: true,
                 message_expiry: None,
                 app: AppProperties::default(),
+                done: None,
             })
             .unwrap();
         }
@@ -5277,6 +5295,7 @@ mod tests {
                 retain: true,
                 message_expiry: None,
                 app: AppProperties::default(),
+                done: None,
             })
             .unwrap();
         }
@@ -5530,6 +5549,7 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
         })
         .unwrap();
     }
