@@ -47,6 +47,7 @@
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [8/8 done](0037-durable-retained-messages.md) | — |
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
+| [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Proposed | [0/5 done](0040-revocation-reaches-live-state.md) | 5 open |
 
 ## Open and deferred work
 
@@ -92,7 +93,7 @@
 
 **0032 — Hot-reloadable security policy**
 
-- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum."
+- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum. Now tracked as ADR 0040 T4 (revocation reaches live state)."
 
 **0033 — Filesystem-watch auto-reload of the security policy**
 
@@ -109,3 +110,11 @@
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
+
+**0040 — Revocation reaches live state (eviction on reload)**
+
+- `0040-T1` ⬜ planned: Admission metadata + eviction primitive — connections record principal source and client-cert leaf serial; hub can terminate a session by client id (v5 DISCONNECT 0x87, v3.1.1 close)
+- `0040-T2` ⬜ planned: Identity sweep — a successful reload disconnects live clients whose cert serial is CRL'd, whose password user was removed, or whose principal the new connect-ACL denies; untouched sessions keep flowing
+- `0040-T3` ⬜ planned: Grant sweep — a tightened subscribe-ACL removes matching grants from live routing and durable subscription sets (online and offline sessions) and stops queued replay; no disconnect for permission-only changes
+- `0040-T4` ⬜ planned: Peer-bus revocation — peer acceptor/connector become reloadable (the ADR 0032 deferred item); links record the remote leaf serial and a cluster-CRL reload tears down revoked links; mesh reacts as to link loss
+- `0040-T5` ⬜ planned: Audit/metrics + closure — security.evict audit events and revocation_evictions_total{kind}; reload audit gains the sweep summary; admission-side durable-resume block pinned by test; README ops note
