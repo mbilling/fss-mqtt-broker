@@ -352,6 +352,26 @@ under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
 [0027](docs/adr/0027-replica-group-commit.md) /
 [0028](docs/adr/0028-link-gated-voter-admission.md)).
 
+## Upgrades & versioning
+
+From **1.0.0** ([ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md); until then
+the pre-release freeze regime of [ADR 0038](docs/adr/0038-prerelease-compatibility-freeze.md)
+applies — formats may change freely, wipe-and-rejoin on schema bumps):
+
+- **Semantic versioning, defined by what breaks**: MAJOR = wire/disk/config breaking;
+  MINOR = additive and fully compatible (a mixed cluster of adjacent minors works);
+  PATCH = fixes only, no format changes.
+- **Adjacent version skew only**: a cluster may mix release N and N+1 — the rolling
+  upgrade state — and nothing wider. Enforced mechanically: the peer handshake
+  negotiates a protocol range and fails closed (loudly) on disjoint ranges.
+- **Sequential major upgrades** (1 → 2 → 3, no skipping): each major migrates store
+  layouts from exactly one major back, dispatched on the per-store schema stamp; the
+  gate's error names the version to route through.
+- **Three supported lines**: patches and security fixes land on the latest three minor
+  lines; older lines are EOL.
+- **MQTT clients are exempt**: client compatibility is governed by the MQTT
+  specifications (3.1.1 / 5.0), not by this policy — clients of any age keep working.
+
 ## Architecture decisions
 
 Every significant decision is recorded as an ADR. See
