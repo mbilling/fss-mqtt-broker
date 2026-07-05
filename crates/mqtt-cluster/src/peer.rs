@@ -18,14 +18,20 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// The oldest peer-bus protocol version this build can speak (ADR 0038).
 ///
-/// **Release rule (ADR 0039)**: from 1.0, every release sets this to the *previous*
-/// release's proto — that window IS the adjacent-only version-skew policy. Raising it
-/// further drops rolling-upgrade support from the version before; never do that in a
-/// minor.
+/// **Release rule (ADR 0039)**: raising this is a MAJOR-release act — it is frozen
+/// for the lifetime of a major, so every minor of a major negotiates with every
+/// other. A new major sets it to the **gateway minor's** proto (the designated last
+/// minor of the previous major, where known upgrade issues are fixed first); that is
+/// what makes "upgrade to the gateway before rolling to the next major" fail closed
+/// at `Hello` instead of being release-notes prose.
 pub const PROTO_MIN: u32 = 1;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
-/// negotiated version is `min(proto_max_a, proto_max_b)`; every frame shape change
-/// after the first release bumps this (a MAJOR release, per ADR 0039).
+/// negotiated version is `min(proto_max_a, proto_max_b)`.
+///
+/// **Release rule (ADR 0039)**: minors may bump this **additively** — new frames or
+/// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
+/// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
+/// raise: a MAJOR release.
 pub const PROTO_MAX: u32 = 1;
 
 /// Negotiate a link's protocol version from both sides' announced ranges

@@ -28,6 +28,9 @@ The proven models to draw from:
 - **etcd / Cassandra**: mixed versions allowed **only transiently during a rolling
   upgrade**, one version step at a time, no skipping. The narrowest — and therefore
   most testable — contract that still gives zero-downtime upgrades.
+- **Elasticsearch**: rolling into a new major is supported **only from the final minor
+  of the previous major** (5.6 → 6.x, 6.8 → 7.x); that gateway release is where the
+  deprecation checks and known upgrade fixes ship before the jump.
 - **Kafka**: fully negotiated per-API version ranges; nearly any-to-any broker skew.
   The most flexible — at the cost of keeping every historical frame shape alive and
   tested indefinitely.
@@ -38,30 +41,38 @@ The proven models to draw from:
 ## Decision
 
 **Semantic versioning with compatibility defined at the wire/disk layer; adjacent-only
-version skew enforced by the peer handshake; sequential major upgrades enforced by the
-schema gate; patches for the three most recent minor lines. Applies from 1.0.0 — until
-then, ADR 0038's freeze-and-break regime stands.**
+version skew enforced by the peer handshake; sequential major upgrades that roll only
+from a designated gateway minor of the previous major, enforced by the handshake and
+the schema gate; patches for the three most recent minor lines. Applies from 1.0.0 —
+until then, ADR 0038's freeze-and-break regime stands.**
 
 ### 1. Semantic versioning, defined by what actually breaks
 
-- **MAJOR** — any breaking change: a peer-bus frame shape (peer proto bump), a store
-  layout (schema-version bump), or removed/changed config and client-visible behavior.
-- **MINOR** — additive and fully compatible: new frames/fields behind the negotiated
-  proto, new tables/columns readable by the previous minor, new config with safe
-  defaults. A mixed cluster of adjacent minors must work — indefinitely, not just
-  mid-roll.
+- **MAJOR** — any breaking change: dropping support for an old peer proto (a
+  `proto_min` raise), a store layout change (schema-version bump), or removed/changed
+  config and client-visible behavior.
+- **MINOR** — additive and fully compatible: new frames/fields may ship under a new
+  negotiated proto (a `proto_max` bump) **so long as every proto back to the major's
+  floor is still spoken in full**; new tables/columns readable by the previous minor;
+  new config with safe defaults. A mixed cluster of adjacent minors must work —
+  indefinitely, not just mid-roll.
 - **PATCH** — fixes only. **No format changes of any kind.**
 
 The semver label *communicates* compatibility; the peer proto range and schema stamps
-*define* it. A release that touches neither is minor/patch by construction.
+*define* it: minors may raise `proto_max` (additive), only majors may raise
+`proto_min` (breaking). A release that touches neither store layouts nor the proto
+floor is minor/patch by construction.
 
 ### 2. Version skew: adjacent releases only
 
 A cluster may mix release N and N+1 (one step, major or minor) — the state every
 rolling upgrade passes through, and the only mixed state that is **supported and
-tested**. Enforcement is ADR 0038's handshake: each release sets `proto_min` to the
-previous release's proto, so a two-step-apart pair has disjoint ranges and fails
-closed at `Hello` with an error naming both.
+tested**. Within a major the handshake is deliberately permissive (`proto_min` is
+frozen for the major's lifetime, so any minor pair negotiates); the adjacent-only rule
+there is a support-and-testing promise. Across a major boundary it is mechanical: the
+gateway rule (§3) sets the new major's `proto_min` so that only the gateway minor's
+range overlaps — anything older has a disjoint range and fails closed at `Hello` with
+an error naming both.
 
 Chosen over Kubernetes' wider window deliberately: every supported skew pair is test
 matrix that must genuinely run (the durable plane's history shows untested pairs are
@@ -69,13 +80,26 @@ where latent bugs live). **Widening later is a compatible policy change; narrowi
 never is** — so start at the provable minimum and widen when the stress/simulation
 harness (pre-release area ④) can carry the load.
 
-### 3. Major upgrades are sequential: 1 → 2 → 3
+### 3. Major upgrades are sequential — and roll through a gateway minor
 
-Each major ships migrations from **exactly one major back**: version N+1 reads/migrates
-N's store layouts (dispatched on the schema stamp) and speaks N's peer proto during the
-roll (`proto_min = N`). Skipping fails closed twice — at the handshake (disjoint proto)
-and at the schema gate, whose error names the version to route through. This is the
-etcd/Cassandra path; it keeps the migration surface exactly one transition wide.
+Rolling into major N+1 is supported **only from a designated gateway minor of major
+N** — by default N's latest minor, pinned in N+1's release notes ("2.0 upgrades from
+1.4 or later"). The gateway is where known upgrade issues are fixed *before* the jump
+(deprecation checks, migration preconditions — the Elasticsearch 6.8 → 7.x model): an
+operator first rolls to the gateway, an ordinary compatible minor roll, then rolls to
+N+1.
+
+Enforcement is twofold and fail-closed:
+
+- **Handshake**: major N+1 sets `proto_min` to the gateway minor's proto, so a
+  pre-gateway node's range is disjoint and the link is refused at `Hello`.
+- **Schema gate**: each major ships migrations from **exactly one major back**
+  (dispatched on the schema stamp); skipping a major fails at the gate, whose error
+  names the version to route through.
+
+Sequential majors (1 → 2 → 3, no skipping) keep the migration surface one transition
+wide; the gateway requirement keeps the *tested* cross-major pair exactly one pair
+wide — (gateway of N) ↔ N+1 — instead of one per from-minor.
 
 ### 4. Supported lines: the three most recent minors
 
@@ -93,12 +117,16 @@ working; that is the protocol's promise, not this policy's.
 
 ## Consequences
 
-- **Good:** operators get one memorable contract (adjacent rolls, sequential majors,
-  three patched lines); the test matrix stays exactly as wide as what is promised; the
-  enforcement is mechanical (handshake + gate), not documentation-only; the pre-1.0
-  freeze regime has a defined end.
-- **Cost:** clusters more than one step behind take multiple rolls to catch up; three
-  patched lines means up to three release branches receiving backports.
+- **Good:** operators get one memorable contract (adjacent rolls, majors via the
+  gateway minor, three patched lines); the test matrix stays exactly as wide as what
+  is promised — one cross-major pair per transition; known upgrade issues have a
+  designated place to be fixed (the gateway) instead of a matrix of from-versions;
+  the enforcement is mechanical (handshake + gate), not documentation-only; the
+  pre-1.0 freeze regime has a defined end.
+- **Cost:** a major upgrade is two rolls when the cluster is not already on the
+  gateway minor (roll to gateway, then to N+1); clusters more than one step behind
+  take multiple rolls to catch up; three patched lines means up to three release
+  branches receiving backports.
 - **Trade-off accepted:** less skew flexibility than Kubernetes/Kafka in exchange for
   a matrix a small project can actually test. The proto-range mechanism already
   supports widening per-release if that trade ever flips.
@@ -111,6 +139,10 @@ working; that is the protocol's promise, not this policy's.
 - **Kafka-style any-to-any negotiation.** Rejected: keeping every historical frame
   alive indefinitely is the single most expensive compatibility posture; adjacent
   stepping bounds it to one version.
+- **Major rolls from *any* minor of the previous major.** Rejected: every from-minor
+  becomes its own upgrade path to test and its own place for latent issues; the
+  gateway pins the cross-major surface to one pair, and reaching the gateway is an
+  ordinary compatible roll.
 - **Postgres-style skip-major offline migration.** Rejected: an offline tool is the
   wrong shape for a clustered broker whose whole point is rolling everything.
 - **CalVer.** Rejected: dates say when, not whether an upgrade is safe; semver's

@@ -11,7 +11,9 @@
 //! **Release rule (ADR 0039)**: store versions bump only in MAJOR releases, and each
 //! major ships migrations from exactly **one** major back — sequential upgrades
 //! (1 → 2 → 3, no skipping). A gate mismatch more than one version old means the
-//! operator must upgrade through the intermediate major first.
+//! operator must upgrade through the intermediate major first. The rolling path into
+//! a new major additionally starts from the previous major's **gateway minor** (its
+//! designated last minor) — enforced by the peer handshake, not this gate.
 
 use redb::{Database, ReadableTable, TableDefinition};
 
