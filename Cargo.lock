@@ -1316,9 +1316,11 @@ name = "mqtt-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "bytes",
  "mqtt-core",
  "redb",
+ "serde",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

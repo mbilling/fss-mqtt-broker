@@ -71,7 +71,9 @@ pub enum ReplOp {
 
 /// The replica store's on-disk layout version (ADR 0038 T2). v1 includes the
 /// per-group fence rows (ADR 0037 P4).
-const R_SCHEMA_VERSION: u32 = 1;
+/// v2: retained rows (`r/` keys) carry application properties (ADR 0038 T3) —
+/// the row bytes' meaning changed, so a v1 file fails closed at the gate.
+const R_SCHEMA_VERSION: u32 = 2;
 
 const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
 const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
@@ -850,13 +852,14 @@ mod tests {
     fn a_foreign_replica_schema_version_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replicas.redb");
-        drop(ReplicaState::open(&path).unwrap()); // stamped v1
+        drop(ReplicaState::open(&path).unwrap()); // stamped with the current version
         {
             let db = redb::Database::create(&path).unwrap();
             mqtt_storage::schema::force_version(&db, 999).unwrap();
         }
         let err = ReplicaState::open(&path).unwrap_err().to_string();
-        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+        let expected = format!("expects v{}", super::R_SCHEMA_VERSION);
+        assert!(err.contains("v999") && err.contains(&expected), "{err}");
     }
 
     /// ADR 0018 phase 3: a persistent replica's stored entries and fence epoch survive

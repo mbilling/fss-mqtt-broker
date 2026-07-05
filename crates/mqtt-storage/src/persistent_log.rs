@@ -32,7 +32,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// The session store's on-disk layout version (ADR 0038 T2).
-const SCHEMA_VERSION: u32 = 1;
+/// v2: retained records (`r/` keys) carry application properties (ADR 0038 T3) —
+/// the row bytes' meaning changed, so a v1 file fails closed at the gate.
+const SCHEMA_VERSION: u32 = 2;
 
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const NEXT_OFFSET: TableDefinition<&str, u64> = TableDefinition::new("next_offset");
@@ -270,13 +272,14 @@ mod tests {
     fn a_foreign_schema_version_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.redb");
-        drop(PersistentLog::open(&path).unwrap()); // stamped v1
+        drop(PersistentLog::open(&path).unwrap()); // stamped with the current version
         {
             let db = redb::Database::create(&path).unwrap();
             crate::schema::force_version(&db, 999).unwrap();
         }
         let err = PersistentLog::open(&path).unwrap_err().to_string();
-        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+        let expected = format!("expects v{}", super::SCHEMA_VERSION);
+        assert!(err.contains("v999") && err.contains(&expected), "{err}");
     }
 
     fn temp_log() -> (tempfile::TempDir, PersistentLog) {

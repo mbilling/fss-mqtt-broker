@@ -481,18 +481,6 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             });
         }
         PeerMessage::RetainedSnapshot { messages } => {
-            let messages = messages
-                .into_iter()
-                .map(|(topic, payload, qos, epoch, offset)| {
-                    (
-                        topic,
-                        payload.into(),
-                        mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
-                        epoch,
-                        offset,
-                    )
-                })
-                .collect();
             let _ = hub.send(HubCommand::RemoteRetainedSnapshot {
                 node: remote.clone(),
                 messages,
@@ -519,6 +507,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             topic,
             payload,
             qos,
+            props,
             seq,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedCommit {
@@ -526,6 +515,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 topic,
                 payload: payload.into(),
                 qos,
+                app: crate::hub::app_from_wire(props),
                 seq,
             });
         }
@@ -542,6 +532,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             qos,
             epoch,
             offset,
+            props,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedUpdate {
                 topic,
@@ -549,6 +540,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 qos,
                 epoch,
                 offset,
+                app: crate::hub::app_from_wire(props),
             });
         }
         PeerMessage::Hello { .. } => {

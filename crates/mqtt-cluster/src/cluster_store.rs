@@ -783,11 +783,30 @@ mod tests {
         let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
 
         assert_eq!(
-            retained.set(&topic, b"v1", 1).await.unwrap(),
+            retained
+                .set(
+                    &topic,
+                    b"v1",
+                    1,
+                    &mqtt_storage::app_props::AppProps::default()
+                )
+                .await
+                .unwrap(),
             (1, 1),
             "the token is the committing lease epoch and the assigned offset"
         );
-        assert_eq!(retained.set(&topic, b"v2", 1).await.unwrap(), (1, 2));
+        assert_eq!(
+            retained
+                .set(
+                    &topic,
+                    b"v2",
+                    1,
+                    &mqtt_storage::app_props::AppProps::default()
+                )
+                .await
+                .unwrap(),
+            (1, 2)
+        );
 
         // The owner serves exactly the compacted last value, under its token.
         let e = retained.get(&topic).await.unwrap().unwrap();
@@ -846,7 +865,15 @@ mod tests {
         ));
 
         let topic = foreign_client(&placement.read().unwrap()).0;
-        let err = retained.set(&topic, b"x", 0).await.unwrap_err();
+        let err = retained
+            .set(
+                &topic,
+                b"x",
+                0,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, mqtt_storage::StorageError::NotOwner),
             "a foreign topic must refuse as NotOwner, got {err:?}"
@@ -893,7 +920,15 @@ mod tests {
             FixedLease(1),
             Arc::new(Mutex::new(ReplicaState::new())),
         ));
-        let err = retained.set(&topic, b"stale", 0).await.unwrap_err();
+        let err = retained
+            .set(
+                &topic,
+                b"stale",
+                0,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, mqtt_storage::StorageError::NoQuorum),
             "a fenced owner must fail the retained write with NoQuorum, got {err:?}"
@@ -934,8 +969,27 @@ mod tests {
         ));
         let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
 
-        retained.set(&topic, b"v1", 1).await.unwrap();
-        assert_eq!(retained.set(&topic, b"v2", 1).await.unwrap(), (2, 2));
+        retained
+            .set(
+                &topic,
+                b"v1",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retained
+                .set(
+                    &topic,
+                    b"v2",
+                    1,
+                    &mqtt_storage::app_props::AppProps::default()
+                )
+                .await
+                .unwrap(),
+            (2, 2)
+        );
 
         // Ownership lost and regained at a higher epoch: the cached group log is
         // rebuilt and the key re-recovered from the followers' committed copies
@@ -955,7 +1009,15 @@ mod tests {
 
         // The next write commits under the new epoch, after the recovered
         // high-water: strictly increasing tokens across the takeover.
-        let tok = retained.set(&topic, b"v3", 1).await.unwrap();
+        let tok = retained
+            .set(
+                &topic,
+                b"v3",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(tok, (5, 3));
         assert!(tok > e.token());
     }

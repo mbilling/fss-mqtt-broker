@@ -31,7 +31,7 @@
 
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
-use mqtt_cluster::peer::PeerMessage;
+use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{packet::Publish, Packet, QoS};
@@ -39,6 +39,7 @@ use mqtt_core::{
     parse_shared, topic_matches, AppProperties, ClientId, Message, SharedSubscriptionTable,
     Subscription, SubscriptionTable,
 };
+use mqtt_storage::app_props::AppProps;
 use mqtt_storage::retained_log::DurableRetained;
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionClaim, SessionStore,
@@ -438,9 +439,9 @@ pub enum HubCommand {
     RemoteRetainedSnapshot {
         /// The peer the snapshot came from (divergence attribution, ADR 0037 P1).
         node: NodeId,
-        /// Each entry as `(topic, payload, QoS, epoch, offset)`; token `(0, 0)` =
-        /// uncommitted (gap-fill only).
-        messages: Vec<(String, Bytes, QoS, u64, u64)>,
+        /// The wire entries as received; token `(0, 0)` = uncommitted (gap-fill
+        /// only). Application properties ride each entry (ADR 0038 T3).
+        messages: Vec<RetainedWireEntry>,
     },
     /// A peer's retained digest, sent on link-up instead of the full snapshot
     /// (0014-T6). If both the topic-set hash and the value hash match our own there is
@@ -476,6 +477,9 @@ pub enum HubCommand {
         payload: Bytes,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The publisher's forwardable application properties (ADR 0038 T3),
+        /// committed with the value.
+        app: AppProperties,
         /// The sender's handoff sequence (echoed in the ack; dedup key).
         seq: u64,
     },
@@ -503,6 +507,9 @@ pub enum HubCommand {
         payload: Bytes,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The application properties the commit carried (ADR 0038 T3) — fanned out
+        /// with the value on success, kept with the re-queued mutation on failure.
+        app: AppProperties,
         /// `Some((epoch, offset))` on success; `None` = the commit failed and the
         /// mutation is re-queued.
         token: Option<(u64, u64)>,
@@ -524,6 +531,8 @@ pub enum HubCommand {
         epoch: u64,
         /// The committed log offset (token low half).
         offset: u64,
+        /// The committed application properties (ADR 0038 T3).
+        app: AppProperties,
     },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
@@ -738,6 +747,9 @@ struct RetainedMutation {
     payload: Bytes,
     /// The publish `QoS` as its 2-bit wire value.
     qos: u8,
+    /// The publisher's forwardable application properties (ADR 0038 T3), committed
+    /// into the durable record with the value.
+    app: AppProperties,
     /// Set when a peer routed this mutation here (T8): the `(node, seq)` its
     /// commit-gated ack goes back to.
     reply: Option<(NodeId, u64)>,
@@ -748,26 +760,32 @@ struct RetainedMutation {
 /// `(topic, payload, qos)` **value** hash. Independent of iteration order and cheap to
 /// compare (a collision merely skips a best-effort back-fill / detection). Equal topic
 /// hashes with **differing value hashes** mean divergence: same topics, different values.
-fn retained_digest<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8], u8)>) -> (u64, u64, u64) {
+fn retained_digest<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a [u8], u8, Vec<u8>)>,
+) -> (u64, u64, u64) {
     let mut count = 0u64;
     let mut hash = 0u64;
     let mut value_hash = 0u64;
-    for (topic, payload, qos) in entries {
+    for (topic, payload, qos, props) in entries {
         count += 1;
         hash ^= mqtt_cluster::hrw::stable_id(topic.as_bytes());
-        value_hash ^= retained_value_id(topic, payload, qos);
+        value_hash ^= retained_value_id(topic, payload, qos, &props);
     }
     (count, hash, value_hash)
 }
 
-/// A stable 64-bit hash of one retained `(topic, payload, qos)` value (ADR 0037 P1).
-/// The topic is length-prefixed so `("a", "bc")` and `("ab", "c")` cannot collide.
-fn retained_value_id(topic: &str, payload: &[u8], qos: u8) -> u64 {
-    let mut bytes = Vec::with_capacity(8 + topic.len() + payload.len() + 1);
+/// A stable 64-bit hash of one retained `(topic, payload, qos, props)` value
+/// (ADR 0037 P1). The topic is length-prefixed so `("a", "bc")` and `("ab", "c")`
+/// cannot collide; the canonical props encoding (ADR 0038 T3) is folded in so two
+/// caches holding the same payload with different application properties still read
+/// as divergent and reconcile by token.
+fn retained_value_id(topic: &str, payload: &[u8], qos: u8, props: &[u8]) -> u64 {
+    let mut bytes = Vec::with_capacity(8 + topic.len() + payload.len() + 1 + props.len());
     bytes.extend_from_slice(&(topic.len() as u64).to_be_bytes());
     bytes.extend_from_slice(topic.as_bytes());
     bytes.extend_from_slice(payload);
     bytes.push(qos);
+    bytes.extend_from_slice(props);
     mqtt_cluster::hrw::stable_id(&bytes)
 }
 
@@ -775,22 +793,20 @@ fn retained_value_id(topic: &str, payload: &[u8], qos: u8) -> u64 {
 /// [`RETAINED_CHUNK_BYTES`] (0014-T8). A single entry larger than the whole budget is
 /// skipped with a warning — it could never fit a frame, and sending it would sever the
 /// link instead of just missing one back-fill.
-/// One retained snapshot wire entry: `(topic, payload, qos, epoch, offset)` — the
-/// token halves per ADR 0037 P5; an empty payload is a committed clear.
-type RetainedWireEntry = (String, Vec<u8>, u8, u64, u64);
-
 fn chunk_retained(entries: impl Iterator<Item = RetainedWireEntry>) -> Vec<Vec<RetainedWireEntry>> {
     // Fixed per-entry overhead estimate for bincode length prefixes, the QoS byte,
-    // and the two u64 token halves (ADR 0037 P5).
+    // and the two u64 token halves (ADR 0037 P5); the variable-length application
+    // properties (ADR 0038 T3) are sized per entry.
     const ENTRY_OVERHEAD: usize = 48;
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
-    for (topic, payload, qos, epoch, offset) in entries {
-        let size = topic.len() + payload.len() + ENTRY_OVERHEAD;
+    for entry in entries {
+        let size =
+            entry.topic.len() + entry.payload.len() + entry.props.size_hint() + ENTRY_OVERHEAD;
         if size > RETAINED_CHUNK_BYTES {
             warn!(
-                topic = %topic,
+                topic = %entry.topic,
                 bytes = size,
                 "retained message exceeds the snapshot chunk budget; skipping back-fill for it"
             );
@@ -801,7 +817,7 @@ fn chunk_retained(entries: impl Iterator<Item = RetainedWireEntry>) -> Vec<Vec<R
             current_bytes = 0;
         }
         current_bytes += size;
-        current.push((topic, payload, qos, epoch, offset));
+        current.push(entry);
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -1087,13 +1103,14 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                app,
                 seq,
             } => {
                 // A peer routed a retained mutation here because this node owns the
                 // topic's group (ADR 0037 §1): dedup retransmissions, then run it
                 // through the same queue as local mutations — serialized commit
                 // order, retry-until-heal, and a NACK back if the lease moved (T8).
-                self.accept_routed_retained(node, topic, payload, qos, seq);
+                self.accept_routed_retained(node, topic, payload, qos, app, seq);
             }
             HubCommand::RemoteRetainedCommitAck { node, seq, token } => {
                 // The commit-gated answer to our in-flight handoff (T8). A stale or
@@ -1122,6 +1139,7 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                app,
                 token,
                 reply,
             } => {
@@ -1130,8 +1148,9 @@ impl Hub {
                     // Committed: warm the local cache, fan the tokened value out to
                     // every peer (ADR 0037 §3 — best-effort; a peer that misses it
                     // converges via the P5 back-fill on the next link-up), and drive
-                    // the next queued mutation.
-                    self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                    // the next queued mutation. Application properties travel with
+                    // the value everywhere (ADR 0038 T3).
+                    self.apply_retained_update(&topic, &payload, qos, &app, (epoch, offset))
                         .await;
                     for peer in self.peers.values() {
                         let _ = peer.tx.send(PeerMessage::RetainedUpdate {
@@ -1140,6 +1159,7 @@ impl Hub {
                             qos,
                             epoch,
                             offset,
+                            props: app_to_wire(&app),
                         });
                     }
                     // A peer-routed mutation gets its commit-gated ack (T8); the
@@ -1164,6 +1184,7 @@ impl Hub {
                         topic,
                         payload,
                         qos,
+                        app,
                         reply,
                     });
                 }
@@ -1174,8 +1195,9 @@ impl Hub {
                 qos,
                 epoch,
                 offset,
+                app,
             } => {
-                self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                self.apply_retained_update(&topic, &payload, qos, &app, (epoch, offset))
                     .await;
             }
             HubCommand::RemoteSharedDeliver {
@@ -1223,7 +1245,7 @@ impl Hub {
         // forwarded publish enters via `RemotePublish` → `deliver`, never here), so one
         // publish is exactly one authority commit.
         if retain {
-            self.route_retained_commit(topic, payload, qos_num(qos));
+            self.route_retained_commit(topic, payload, qos_num(qos), app);
         }
     }
 
@@ -2282,11 +2304,14 @@ impl Hub {
         if retained.is_empty() && self.retained_tokens.is_empty() {
             return;
         }
-        let (count, hash, value_hash) = retained_digest(
-            retained
-                .iter()
-                .map(|m| (m.topic.as_str(), m.payload.as_ref(), m.qos as u8)),
-        );
+        let (count, hash, value_hash) = retained_digest(retained.iter().map(|m| {
+            (
+                m.topic.as_str(),
+                m.payload.as_ref(),
+                m.qos as u8,
+                AppProps::from(&m.app).encode(),
+            )
+        }));
         let _ = peer.tx.send(PeerMessage::RetainedDigest {
             count,
             hash,
@@ -2306,11 +2331,14 @@ impl Hub {
         let Ok(retained) = self.retained.all().await else {
             return;
         };
-        let ours = retained_digest(
-            retained
-                .iter()
-                .map(|m| (m.topic.as_str(), m.payload.as_ref(), m.qos as u8)),
-        );
+        let ours = retained_digest(retained.iter().map(|m| {
+            (
+                m.topic.as_str(),
+                m.payload.as_ref(),
+                m.qos as u8,
+                AppProps::from(&m.app).encode(),
+            )
+        }));
         if ours == (count, hash, value_hash) {
             debug!(node = %node.0, topics = count, "retained sets already match; skipping back-fill");
             return;
@@ -2343,18 +2371,30 @@ impl Hub {
                     .get(&m.topic)
                     .copied()
                     .unwrap_or((0, 0));
-                (m.topic, m.payload.to_vec(), m.qos as u8, epoch, offset)
+                RetainedWireEntry {
+                    props: AppProps::from(&m.app),
+                    topic: m.topic,
+                    payload: m.payload.to_vec(),
+                    qos: m.qos as u8,
+                    epoch,
+                    offset,
+                }
             })
             .collect();
         // Committed clears back-fill too: a token held for a topic no longer cached
         // is a tombstone, sent as an empty-payload entry so a peer that missed the
         // clear drops the topic instead of keeping it forever (ADR 0037 P5).
-        let cached: HashSet<&str> = entries.iter().map(|(t, ..)| t.as_str()).collect();
+        let cached: HashSet<&str> = entries.iter().map(|e| e.topic.as_str()).collect();
         let tombstones: Vec<RetainedWireEntry> = self
             .retained_tokens
             .iter()
             .filter(|(topic, _)| !cached.contains(topic.as_str()))
-            .map(|(topic, (epoch, offset))| (topic.clone(), Vec::new(), 0, *epoch, *offset))
+            .map(|(topic, (epoch, offset))| RetainedWireEntry {
+                topic: topic.clone(),
+                epoch: *epoch,
+                offset: *offset,
+                ..Default::default()
+            })
             .collect();
         entries.extend(tombstones);
         if entries.is_empty() {
@@ -2381,16 +2421,17 @@ impl Hub {
     /// Divergence detection (ADR 0037 P1) runs in both modes: a topic both sides hold
     /// differently is counted (`retained_divergence_total`) and surfaced with one
     /// `warn!` per snapshot chunk — under durable the same pass now also *resolves* it.
-    async fn apply_retained_snapshot(
-        &mut self,
-        node: &NodeId,
-        messages: Vec<(String, Bytes, QoS, u64, u64)>,
-    ) {
+    async fn apply_retained_snapshot(&mut self, node: &NodeId, messages: Vec<RetainedWireEntry>) {
         let have: HashMap<String, u64> = match self.retained.all().await {
             Ok(all) => all
                 .into_iter()
                 .map(|m| {
-                    let id = retained_value_id(&m.topic, m.payload.as_ref(), m.qos as u8);
+                    let id = retained_value_id(
+                        &m.topic,
+                        m.payload.as_ref(),
+                        m.qos as u8,
+                        &AppProps::from(&m.app).encode(),
+                    );
                     (m.topic, id)
                 })
                 .collect(),
@@ -2399,13 +2440,23 @@ impl Hub {
         let durable = self.durable_retained.is_some();
         let mut filled = 0;
         let mut diverged = 0u64;
-        for (topic, payload, qos, epoch, offset) in messages {
+        for entry in messages {
+            let RetainedWireEntry {
+                topic,
+                payload,
+                qos,
+                epoch,
+                offset,
+                props,
+            } = entry;
+            let payload = Bytes::from(payload);
             let held_value = have.get(&topic);
             // Detection (P1): both sides hold the topic, with different values (an
-            // incoming committed clear against our value counts too).
-            if held_value
-                .is_some_and(|ours| *ours != retained_value_id(&topic, payload.as_ref(), qos as u8))
-            {
+            // incoming committed clear against our value counts too; differing
+            // application properties on an equal payload count as well — ADR 0038 T3).
+            if held_value.is_some_and(|ours| {
+                *ours != retained_value_id(&topic, payload.as_ref(), qos, &props.encode())
+            }) {
                 diverged += 1;
                 debug!(node = %node.0, %topic, "retained value diverges from peer");
                 if let Some(m) = &self.metrics {
@@ -2429,15 +2480,15 @@ impl Hub {
                 // Gap-fill only (ADR 0014 §3); a tombstone entry has nothing to fill.
                 continue;
             }
-            // The retained-snapshot wire does not carry application properties (a narrow
-            // gap, like the persistent-retained codec); a back-filled retained message
-            // has none. An empty payload clears the topic [MQTT-3.3.1-10].
+            // An empty payload clears the topic [MQTT-3.3.1-10]. Application
+            // properties back-fill with the value (ADR 0038 T3), so a replay from a
+            // back-filled cache matches one from the origin node.
             let message = Message {
                 topic,
                 payload,
-                qos,
+                qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
                 retain: true,
-                app: AppProperties::default(),
+                app: props.into(),
             };
             if self.retained.set(&message).await.is_ok() {
                 filled += 1;
@@ -2608,7 +2659,13 @@ impl Hub {
     /// commits (per-node order holds even for rapid same-topic publishes) and lets a
     /// mutation that cannot reach its owner wait for a heal instead of being dropped.
     /// At the bound the **oldest** is dropped, loudly.
-    fn route_retained_commit(&mut self, topic: &str, payload: &Bytes, qos: u8) {
+    fn route_retained_commit(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: u8,
+        app: &AppProperties,
+    ) {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
         }
@@ -2616,6 +2673,7 @@ impl Hub {
             topic: topic.to_string(),
             payload: payload.clone(),
             qos,
+            app: app.clone(),
             reply: None,
         });
         self.kick_retained_queue();
@@ -2656,6 +2714,7 @@ impl Hub {
         topic: String,
         payload: Bytes,
         qos: u8,
+        app: AppProperties,
         seq: u64,
     ) {
         if self.durable_retained.is_none() {
@@ -2678,6 +2737,7 @@ impl Hub {
             topic,
             payload,
             qos,
+            app,
             reply: Some((node, seq)),
         });
         self.kick_retained_queue();
@@ -2762,6 +2822,7 @@ impl Hub {
                 topic: mutation.topic.clone(),
                 payload: mutation.payload.to_vec(),
                 qos: mutation.qos,
+                props: app_to_wire(&mutation.app),
                 seq,
             });
         }
@@ -2797,13 +2858,16 @@ impl Hub {
             topic,
             payload,
             qos,
+            app,
             reply,
         } = mutation;
         tokio::spawn(async move {
             let result = if payload.is_empty() {
                 durable.clear(&topic).await
             } else {
-                durable.set(&topic, &payload, qos).await
+                durable
+                    .set(&topic, &payload, qos, &AppProps::from(&app))
+                    .await
             };
             let token = match result {
                 Ok((epoch, offset)) => {
@@ -2826,6 +2890,7 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                app,
                 token,
                 reply,
             });
@@ -2841,6 +2906,7 @@ impl Hub {
         topic: &str,
         payload: &Bytes,
         qos: u8,
+        app: &AppProperties,
         token: (u64, u64),
     ) {
         if self
@@ -2857,7 +2923,7 @@ impl Hub {
             payload: payload.clone(),
             qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
             retain: true,
-            app: AppProperties::default(),
+            app: app.clone(),
         };
         if let Err(e) = self.retained.set(&message).await {
             warn!(topic = %topic, error = %e, "failed to apply committed retained update");
@@ -3039,17 +3105,35 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
+    /// A committed retained snapshot entry with no application properties — the
+    /// common test shape (props-bearing cases build the struct directly).
+    fn snap(topic: &str, payload: &[u8], epoch: u64, offset: u64) -> RetainedWireEntry {
+        RetainedWireEntry {
+            topic: topic.into(),
+            payload: payload.to_vec(),
+            qos: 0,
+            epoch,
+            offset,
+            props: mqtt_cluster::peer::WireAppProps::default(),
+        }
+    }
+    /// The canonical empty-props bytes folded into digest entries (ADR 0038 T3).
+    fn no_props() -> Vec<u8> {
+        AppProps::default().encode()
+    }
+
     use super::{
         AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound,
         RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, REPLAY_LIMIT,
     };
     use bytes::Bytes;
-    use mqtt_cluster::peer::PeerMessage;
+    use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
     use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
     use mqtt_cluster::swim::MemberState;
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
     use mqtt_core::{AppProperties, ClientId};
+    use mqtt_storage::app_props::AppProps;
     use mqtt_storage::repl::InMemoryReplicatedLog;
     use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
     use std::sync::{Arc, RwLock};
@@ -3795,8 +3879,8 @@ mod tests {
         match recv_peer(&mut peer).await {
             Some(PeerMessage::RetainedSnapshot { messages }) => {
                 assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0].0, "t");
-                assert_eq!(&messages[0].1[..], b"r");
+                assert_eq!(messages[0].topic, "t");
+                assert_eq!(&messages[0].payload[..], b"r");
             }
             other => panic!("expected RetainedSnapshot, got {other:?}"),
         }
@@ -3820,7 +3904,7 @@ mod tests {
 
         // The peer claims the same single (topic, value, qos) we hold: same digest, no pull.
         let (count, hash, value_hash) =
-            super::retained_digest(std::iter::once(("t", b"r".as_ref(), 0u8)));
+            super::retained_digest(std::iter::once(("t", b"r".as_ref(), 0u8, no_props())));
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
             count,
@@ -3851,7 +3935,11 @@ mod tests {
 
         // The peer holds a different set: we answer its digest with a pull.
         let (count, hash, value_hash) = super::retained_digest(
-            [("t", b"r".as_ref(), 0u8), ("other", b"x".as_ref(), 0u8)].into_iter(),
+            [
+                ("t", b"r".as_ref(), 0u8, no_props()),
+                ("other", b"x".as_ref(), 0u8, no_props()),
+            ]
+            .into_iter(),
         );
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
@@ -3885,7 +3973,7 @@ mod tests {
 
         // Same single topic, different value: set hash matches, value hash differs.
         let (count, hash, value_hash) =
-            super::retained_digest(std::iter::once(("t", b"THEIRS".as_ref(), 0u8)));
+            super::retained_digest(std::iter::once(("t", b"THEIRS".as_ref(), 0u8, no_props())));
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
             count,
@@ -3907,11 +3995,18 @@ mod tests {
     fn a_large_retained_set_is_chunked_under_the_frame_budget() {
         // 9 entries of ~1 MiB against a 4 MiB budget → at least 3 chunks.
         let payload = vec![0u8; 1024 * 1024];
-        let entries = (0..9).map(|i| (format!("t/{i}"), payload.clone(), 0u8, 0u64, 0u64));
+        let entries = (0..9).map(|i| RetainedWireEntry {
+            topic: format!("t/{i}"),
+            payload: payload.clone(),
+            ..Default::default()
+        });
         let chunks = super::chunk_retained(entries);
         assert!(chunks.len() >= 3, "9 MiB must not fit 2 chunks of 4 MiB");
         for chunk in &chunks {
-            let bytes: usize = chunk.iter().map(|(t, p, ..)| t.len() + p.len() + 48).sum();
+            let bytes: usize = chunk
+                .iter()
+                .map(|e| e.topic.len() + e.payload.len() + 48)
+                .sum();
             assert!(bytes <= super::RETAINED_CHUNK_BYTES, "chunk over budget");
         }
         let total: usize = chunks.iter().map(Vec::len).sum();
@@ -3925,11 +4020,19 @@ mod tests {
     fn an_oversized_single_retained_message_is_skipped_not_sent() {
         let huge = vec![0u8; super::RETAINED_CHUNK_BYTES + 1];
         let entries = vec![
-            ("ok".to_string(), vec![1u8; 8], 0u8, 0u64, 0u64),
-            ("huge".to_string(), huge, 0u8, 0u64, 0u64),
+            RetainedWireEntry {
+                topic: "ok".into(),
+                payload: vec![1u8; 8],
+                ..Default::default()
+            },
+            RetainedWireEntry {
+                topic: "huge".into(),
+                payload: huge,
+                ..Default::default()
+            },
         ];
         let chunks = super::chunk_retained(entries.into_iter());
-        let all: Vec<&str> = chunks.iter().flatten().map(|(t, ..)| t.as_str()).collect();
+        let all: Vec<&str> = chunks.iter().flatten().map(|e| e.topic.as_str()).collect();
         assert_eq!(
             all,
             vec!["ok"],
@@ -3941,17 +4044,19 @@ mod tests {
     /// hash sees payload changes the topic-set hash ignores (ADR 0037 P1).
     #[test]
     fn the_retained_digest_is_order_independent_and_set_sensitive() {
-        let one = ("x", b"1".as_ref(), 0u8);
-        let two = ("y", b"2".as_ref(), 1u8);
-        let three = ("z", b"3".as_ref(), 0u8);
-        let full = super::retained_digest([one, two, three].into_iter());
-        let shuffled = super::retained_digest([three, one, two].into_iter());
+        let one = ("x", b"1".as_ref(), 0u8, no_props());
+        let two = ("y", b"2".as_ref(), 1u8, no_props());
+        let three = ("z", b"3".as_ref(), 0u8, no_props());
+        let full = super::retained_digest([one.clone(), two.clone(), three.clone()].into_iter());
+        let shuffled =
+            super::retained_digest([three.clone(), one.clone(), two.clone()].into_iter());
         assert_eq!(full, shuffled, "order must not matter");
-        let subset = super::retained_digest([one, two].into_iter());
+        let subset = super::retained_digest([one.clone(), two.clone()].into_iter());
         assert_ne!(full, subset, "a different set must differ");
         // Same topics, different value: topic hash equal, value hash different.
-        let two_changed = ("y", b"CHANGED".as_ref(), 1u8);
-        let diverged = super::retained_digest([one, two_changed, three].into_iter());
+        let two_changed = ("y", b"CHANGED".as_ref(), 1u8, no_props());
+        let diverged =
+            super::retained_digest([one.clone(), two_changed, three.clone()].into_iter());
         assert_eq!(full.1, diverged.1, "topic-set hash ignores values");
         assert_ne!(
             full.2, diverged.2,
@@ -3967,13 +4072,7 @@ mod tests {
         let tx = start_hub();
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "room/t".into(),
-                Bytes::from_static(b"v"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("room/t", b"v", 0, 0)],
         })
         .unwrap();
 
@@ -4003,27 +4102,9 @@ mod tests {
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
             messages: vec![
-                (
-                    "dev/1".into(),
-                    Bytes::from_static(b"theirs"),
-                    QoS::AtMostOnce,
-                    0,
-                    0,
-                ),
-                (
-                    "dev/same".into(),
-                    Bytes::from_static(b"agreed"),
-                    QoS::AtMostOnce,
-                    0,
-                    0,
-                ),
-                (
-                    "dev/new".into(),
-                    Bytes::from_static(b"x"),
-                    QoS::AtMostOnce,
-                    0,
-                    0,
-                ),
+                snap("dev/1", b"theirs", 0, 0),
+                snap("dev/same", b"agreed", 0, 0),
+                snap("dev/new", b"x", 0, 0),
             ],
         })
         .unwrap();
@@ -4053,13 +4134,7 @@ mod tests {
         publish_retained(&tx, "t", b"local");
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"peer-stale"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("t", b"peer-stale", 0, 0)],
         })
         .unwrap();
 
@@ -4581,6 +4656,7 @@ mod tests {
             payload: Bytes::from_static(b"shut"),
             qos: 1,
             seq: 1,
+            app: AppProperties::default(),
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |_| true).await;
@@ -4594,6 +4670,7 @@ mod tests {
             payload: Bytes::new(),
             qos: 0,
             seq: 2,
+            app: AppProperties::default(),
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |e| e.tombstone).await;
@@ -4621,6 +4698,7 @@ mod tests {
                 qos: 0,
                 epoch,
                 offset,
+                app: AppProperties::default(),
             })
             .unwrap();
         };
@@ -4656,6 +4734,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 4,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
@@ -4667,6 +4746,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 5,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert!(retained_replay(&tx, "c2", "t").await.is_none());
@@ -4678,6 +4758,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 4,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert!(retained_replay(&tx, "c3", "t").await.is_none());
@@ -4707,6 +4788,7 @@ mod tests {
                 qos,
                 epoch,
                 offset,
+                ..
             }) => {
                 assert_eq!(topic, "t");
                 assert_eq!(payload, b"v");
@@ -4759,6 +4841,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 2,
+            app: AppProperties::default(),
         })
         .unwrap();
 
@@ -4766,13 +4849,7 @@ mod tests {
         // resolved, not just detected).
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"newer"),
-                QoS::AtMostOnce,
-                1,
-                5,
-            )],
+            messages: vec![snap("t", b"newer", 1, 5)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"newer");
@@ -4780,13 +4857,7 @@ mod tests {
         // A STALER snapshot entry is rejected — back-fill can never regress a topic.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"old"),
-                QoS::AtMostOnce,
-                1,
-                3,
-            )],
+            messages: vec![snap("t", b"old", 1, 3)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"newer");
@@ -4804,6 +4875,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 3,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
@@ -4811,7 +4883,7 @@ mod tests {
         // The peer committed a clear at (1, 6): our value drops.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![("t".into(), Bytes::new(), QoS::AtMostOnce, 1, 6)],
+            messages: vec![snap("t", b"", 1, 6)],
         })
         .unwrap();
         assert!(retained_replay(&tx, "c2", "t").await.is_none());
@@ -4819,13 +4891,7 @@ mod tests {
         // A staler value (from a peer that missed the clear) cannot resurrect it.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"zombie"),
-                QoS::AtMostOnce,
-                1,
-                5,
-            )],
+            messages: vec![snap("t", b"zombie", 1, 5)],
         })
         .unwrap();
         assert!(retained_replay(&tx, "c3", "t").await.is_none());
@@ -4861,19 +4927,19 @@ mod tests {
         .unwrap();
         match recv_peer(&mut peer).await {
             Some(PeerMessage::RetainedSnapshot { mut messages }) => {
-                messages.sort_by(|a, b| a.0.cmp(&b.0));
+                messages.sort_by(|a, b| a.topic.cmp(&b.topic));
                 assert_eq!(
                     messages.len(),
                     2,
                     "the value AND the tombstone: {messages:?}"
                 );
-                let (t, payload, _, epoch, offset) = &messages[0];
-                assert_eq!((t.as_str(), &payload[..]), ("alive", b"v".as_ref()));
-                assert_eq!((*epoch, *offset), (0, 1), "the value carries its token");
-                let (t, payload, _, epoch, offset) = &messages[1];
-                assert_eq!(t, "dead");
-                assert!(payload.is_empty(), "the clear rides as a tombstone entry");
-                assert_eq!((*epoch, *offset), (0, 2), "with the clear's token");
+                let e = &messages[0];
+                assert_eq!((e.topic.as_str(), &e.payload[..]), ("alive", b"v".as_ref()));
+                assert_eq!((e.epoch, e.offset), (0, 1), "the value carries its token");
+                let e = &messages[1];
+                assert_eq!(e.topic, "dead");
+                assert!(e.payload.is_empty(), "the clear rides as a tombstone entry");
+                assert_eq!((e.epoch, e.offset), (0, 2), "with the clear's token");
             }
             other => panic!("expected the retained snapshot, got {other:?}"),
         }
@@ -4888,13 +4954,7 @@ mod tests {
         // Absent topic: the untokened entry gap-fills.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"first"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("t", b"first", 0, 0)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"first");
@@ -4902,13 +4962,7 @@ mod tests {
         // Present topic: another untokened entry cannot overwrite it.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"second"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("t", b"second", 0, 0)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"first");
@@ -4916,13 +4970,7 @@ mod tests {
         // A committed token, however, beats the uncommitted value.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"committed"),
-                QoS::AtMostOnce,
-                2,
-                1,
-            )],
+            messages: vec![snap("t", b"committed", 2, 1)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c3", "t").await.unwrap(), b"committed");
@@ -4993,6 +5041,7 @@ mod tests {
             topic: &str,
             payload: &[u8],
             _qos: u8,
+            _props: &AppProps,
         ) -> Result<(u64, u64), mqtt_storage::StorageError> {
             self.commit(topic, payload, false)
         }
@@ -5313,6 +5362,7 @@ mod tests {
                 topic: "t".into(),
                 payload: Bytes::from_static(b"v"),
                 qos: 0,
+                app: AppProperties::default(),
                 seq,
             })
             .unwrap();
@@ -5374,6 +5424,7 @@ mod tests {
             payload: Bytes::from_static(b"v"),
             qos: 0,
             seq: 3,
+            app: AppProperties::default(),
         })
         .unwrap();
         match recv_peer(&mut peer).await {

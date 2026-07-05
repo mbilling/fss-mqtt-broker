@@ -9,10 +9,15 @@
 //!
 //! ## On-disk layout
 //!
-//! One table, `retained`, keyed by topic; the value is `qos(1) ++ retain(1) ++ payload`
-//! (the topic is the key, so it is not repeated in the value). An empty-payload `set`
-//! deletes the topic's row (MQTT zero-length retained-PUBLISH semantics).
+//! One table, `retained`, keyed by topic; the value is
+//! `qos(1) ++ retain(1) ++ props_len(4) ++ props ++ payload` (the topic is the key, so
+//! it is not repeated in the value; the properties block is
+//! [`AppProps::encode`](crate::app_props::AppProps::encode)'s output, length-prefixed —
+//! ADR 0038 T3, so a retained replay after restart carries the publisher's application
+//! properties). An empty-payload `set` deletes the topic's row (MQTT zero-length
+//! retained-PUBLISH semantics).
 
+use crate::app_props::AppProps;
 use crate::{RetainedStore, StorageError};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,8 +28,10 @@ use std::fmt::Display;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// The retained store's on-disk layout version (ADR 0038 T2).
-const SCHEMA_VERSION: u32 = 1;
+/// The retained store's on-disk layout version (ADR 0038 T2). v2: application
+/// properties in the value (ADR 0038 T3) — pre-1.0, a v1 file fails closed at the
+/// gate (wipe-and-rejoin) rather than silently decoding payload bytes as properties.
+const SCHEMA_VERSION: u32 = 2;
 
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 
@@ -32,25 +39,33 @@ fn backend<E: Display>(e: E) -> StorageError {
     StorageError::Backend(e.to_string())
 }
 
-/// Encode a retained message's value: `qos ++ retain ++ payload` (the topic is the key).
+/// Encode a retained message's value: `qos ++ retain ++ props_len ++ props ++ payload`
+/// (the topic is the key).
 fn encode(m: &Message) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + m.payload.len());
+    let props = AppProps::from(&m.app).encode();
+    let mut out = Vec::with_capacity(6 + props.len() + m.payload.len());
     out.push(m.qos as u8);
     out.push(u8::from(m.retain));
+    out.extend_from_slice(&u32::try_from(props.len()).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(&props);
     out.extend_from_slice(&m.payload);
     out
 }
 
-/// Decode a value back into a [`Message`] for `topic`.
+/// Decode a value back into a [`Message`] for `topic`; `None` (row treated as absent,
+/// fail-closed) on a malformed value.
 fn decode(topic: &str, bytes: &[u8]) -> Option<Message> {
     let qos = QoS::from_u8(*bytes.first()?)?;
     let retain = *bytes.get(1)? != 0;
-    Some(Message::new(
-        topic.to_string(),
-        Bytes::copy_from_slice(&bytes[2..]),
+    let props_len = u32::from_be_bytes(bytes.get(2..6)?.try_into().ok()?) as usize;
+    let props = AppProps::decode(bytes.get(6..6 + props_len)?)?;
+    Some(Message {
+        topic: topic.to_string(),
+        payload: Bytes::copy_from_slice(bytes.get(6 + props_len..)?),
         qos,
         retain,
-    ))
+        app: props.into(),
+    })
 }
 
 /// A durable [`RetainedStore`] persisting to a `redb` file (ADR 0018 phase 4).
@@ -170,7 +185,7 @@ mod tests {
     fn a_foreign_schema_version_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retained.redb");
-        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped v1
+        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped v2
         {
             let db = redb::Database::create(&path).unwrap();
             crate::schema::force_version(&db, 999).unwrap();
@@ -178,7 +193,7 @@ mod tests {
         let err = super::PersistentRetainedStore::open(&path)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+        assert!(err.contains("v999") && err.contains("expects v2"), "{err}");
     }
 
     use super::PersistentRetainedStore;
@@ -203,7 +218,15 @@ mod tests {
         let path = dir.path().join("retained.redb");
         {
             let store = PersistentRetainedStore::open(&path).unwrap();
-            store.set(&msg("home/a", b"1")).await.unwrap();
+            let mut with_props = msg("home/a", b"1");
+            with_props.app = mqtt_core::AppProperties {
+                payload_format: Some(1),
+                content_type: Some("application/json".into()),
+                response_topic: Some("replies/a".into()),
+                correlation_data: Some(Bytes::from_static(&[9, 9])),
+                user_properties: vec![("origin".into(), "sensor-7".into())],
+            };
+            store.set(&with_props).await.unwrap();
             store.set(&msg("home/b", b"2")).await.unwrap();
             store.set(&msg("away/c", b"3")).await.unwrap();
             // Clear home/b with an empty payload.
@@ -229,5 +252,16 @@ mod tests {
         assert_eq!(&matched[0].payload[..], b"1");
         assert_eq!(matched[0].qos, QoS::AtLeastOnce);
         assert!(matched[0].retain);
+        // Application properties replay exactly as published across the restart
+        // (ADR 0038 T3).
+        let app = &matched[0].app;
+        assert_eq!(app.payload_format, Some(1));
+        assert_eq!(app.content_type.as_deref(), Some("application/json"));
+        assert_eq!(app.response_topic.as_deref(), Some("replies/a"));
+        assert_eq!(app.correlation_data.as_deref(), Some(&[9u8, 9][..]));
+        assert_eq!(
+            app.user_properties,
+            vec![("origin".to_string(), "sensor-7".to_string())]
+        );
     }
 }

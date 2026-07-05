@@ -53,18 +53,31 @@ pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8, bool)>)>;
 /// publisher's User Properties plus the other message-level properties, so a peer re-emits
 /// them to its subscribers exactly as the origin node would (MQTT-3.3.2-17). Mirrors
 /// `mqtt_core::AppProperties` in a wire-friendly form (`Vec<u8>` correlation data).
+///
+/// One struct serves the peer frames and the durable/persistent retained record
+/// codecs alike (ADR 0038 T3): it lives in `mqtt_storage` and is re-exported here
+/// under the wire name, so the stored and transmitted shapes cannot drift apart.
+pub use mqtt_storage::app_props::AppProps as WireAppProps;
+
+/// One retained-snapshot entry (ADR 0037 P5 wire shape, named per ADR 0038 T4): a
+/// retained value — or, with an empty payload, a committed clear (tombstone) — with
+/// its `(epoch, offset)` convergence token and the publisher's application
+/// properties (ADR 0038 T3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireAppProps {
-    /// `0x01` Payload Format Indicator.
-    pub payload_format: Option<u8>,
-    /// `0x03` Content Type.
-    pub content_type: Option<String>,
-    /// `0x08` Response Topic.
-    pub response_topic: Option<String>,
-    /// `0x09` Correlation Data.
-    pub correlation_data: Option<Vec<u8>>,
-    /// `0x26` User Properties, in wire order.
-    pub user_properties: Vec<(String, String)>,
+pub struct RetainedWireEntry {
+    /// The retained topic.
+    pub topic: String,
+    /// The retained payload; empty = committed clear (tombstone).
+    pub payload: Vec<u8>,
+    /// The publish `QoS` as its 2-bit wire value.
+    pub qos: u8,
+    /// The lease epoch the value committed under (token high half); `0` with
+    /// `offset 0` marks an uncommitted (durable-off) value.
+    pub epoch: u64,
+    /// The committed log offset (token low half).
+    pub offset: u64,
+    /// The publisher's forwardable MQTT 5 application properties.
+    pub props: WireAppProps,
 }
 
 /// A message exchanged between broker nodes.
@@ -136,9 +149,8 @@ pub enum PeerMessage {
     /// value: it gap-fills an absent topic but never overwrites, and a durable-off
     /// receiver keeps exactly the ADR 0014 gap-fill behaviour.
     RetainedSnapshot {
-        /// Each entry: `(topic, payload, QoS u8, epoch, offset)`; an empty payload
-        /// is a committed clear (tombstone).
-        messages: Vec<(String, Vec<u8>, u8, u64, u64)>,
+        /// The entries; an empty payload is a committed clear (tombstone).
+        messages: Vec<RetainedWireEntry>,
     },
     /// An order-independent digest of the sender's retained **topic set**, sent on link
     /// establishment instead of the full snapshot (0014-T6). If the receiver's own
@@ -284,6 +296,9 @@ pub enum PeerMessage {
         payload: Vec<u8>,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0038 T3),
+        /// committed into the durable record so any node's replay carries them.
+        props: WireAppProps,
         /// Per-sender monotonic handoff sequence (dedup key for retransmissions).
         seq: u64,
     },
@@ -306,6 +321,9 @@ pub enum PeerMessage {
         epoch: u64,
         /// The committed log offset (token low half).
         offset: u64,
+        /// The committed application properties (ADR 0038 T3), applied to the cache
+        /// with the value so a replay from any node carries them.
+        props: WireAppProps,
     },
     /// The owner's **commit-gated** answer to a
     /// [`RetainedCommit`](PeerMessage::RetainedCommit) (ADR 0037 T8). Sent only once
@@ -378,8 +396,8 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, WireAppProps, MAX_FRAME,
-        PROTO_MAX, PROTO_MIN,
+        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, RetainedWireEntry,
+        WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN,
     };
     use bytes::BytesMut;
 
@@ -437,9 +455,29 @@ mod tests {
         });
         roundtrip(&PeerMessage::RetainedSnapshot {
             messages: vec![
-                ("t/a".into(), b"v".to_vec(), 1, 7, 42),
-                ("$SYS/x".into(), b"w".to_vec(), 0, 0, 0),
-                ("t/cleared".into(), Vec::new(), 0, 7, 43), // a committed clear
+                RetainedWireEntry {
+                    topic: "t/a".into(),
+                    payload: b"v".to_vec(),
+                    qos: 1,
+                    epoch: 7,
+                    offset: 42,
+                    props: WireAppProps {
+                        content_type: Some("application/cbor".into()),
+                        user_properties: vec![("origin".into(), "n1".into())],
+                        ..Default::default()
+                    },
+                },
+                RetainedWireEntry {
+                    topic: "$SYS/x".into(),
+                    payload: b"w".to_vec(),
+                    ..Default::default()
+                },
+                RetainedWireEntry {
+                    topic: "t/cleared".into(), // a committed clear
+                    epoch: 7,
+                    offset: 43,
+                    ..Default::default()
+                },
             ],
         });
         roundtrip(&PeerMessage::RetainedDigest {
@@ -490,12 +528,18 @@ mod tests {
             topic: "dev/1/state".into(),
             payload: b"open".to_vec(),
             qos: 1,
+            props: WireAppProps {
+                payload_format: Some(1),
+                content_type: Some("application/json".into()),
+                ..Default::default()
+            },
             seq: 9,
         });
         roundtrip(&PeerMessage::RetainedCommit {
             topic: "dev/1/state".into(),
             payload: Vec::new(), // a clear (versioned tombstone)
             qos: 0,
+            props: WireAppProps::default(),
             seq: 10,
         });
         roundtrip(&PeerMessage::RetainedCommitAck {
@@ -512,6 +556,11 @@ mod tests {
             qos: 1,
             epoch: 7,
             offset: 42,
+            props: WireAppProps {
+                response_topic: Some("replies/dev1".into()),
+                correlation_data: Some(vec![1, 2]),
+                ..Default::default()
+            },
         });
         roundtrip(&PeerMessage::RetainedUpdate {
             topic: "dev/1/state".into(),
@@ -519,6 +568,7 @@ mod tests {
             qos: 0,
             epoch: 7,
             offset: 43,
+            props: WireAppProps::default(),
         });
     }
 
@@ -549,7 +599,11 @@ mod tests {
     #[test]
     fn an_oversized_frame_is_rejected_at_encode() {
         let msg = PeerMessage::RetainedSnapshot {
-            messages: vec![("t".into(), vec![0u8; MAX_FRAME + 1], 0, 0, 0)],
+            messages: vec![RetainedWireEntry {
+                topic: "t".into(),
+                payload: vec![0u8; MAX_FRAME + 1],
+                ..Default::default()
+            }],
         };
         let mut out = Vec::new();
         assert!(matches!(
