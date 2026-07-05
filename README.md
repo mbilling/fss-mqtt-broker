@@ -364,9 +364,12 @@ applies — formats may change freely, wipe-and-rejoin on schema bumps):
 - **Adjacent version skew only**: a cluster may mix release N and N+1 — the rolling
   upgrade state — and nothing wider. Enforced mechanically: the peer handshake
   negotiates a protocol range and fails closed (loudly) on disjoint ranges.
-- **Sequential major upgrades** (1 → 2 → 3, no skipping): each major migrates store
-  layouts from exactly one major back, dispatched on the per-store schema stamp; the
-  gate's error names the version to route through.
+- **Sequential major upgrades, rolled through a gateway minor** (1 → 2 → 3, no
+  skipping): each new major names the minor it upgrades from — by default the
+  previous major's last minor, where known upgrade issues are fixed first — and the
+  handshake refuses older nodes, so the path is "roll to the gateway minor, then roll
+  to the new major". Store layouts migrate exactly one major back, dispatched on the
+  per-store schema stamp; the gate's error names the version to route through.
 - **Three supported lines**: patches and security fixes land on the latest three minor
   lines; older lines are EOL.
 - **MQTT clients are exempt**: client compatibility is governed by the MQTT
