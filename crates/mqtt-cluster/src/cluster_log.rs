@@ -69,6 +69,10 @@ pub enum ReplOp {
     },
 }
 
+/// The replica store's on-disk layout version (ADR 0038 T2). v1 includes the
+/// per-group fence rows (ADR 0037 P4).
+const R_SCHEMA_VERSION: u32 = 1;
+
 const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
 const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
 /// Per logical key, the highest truncation low-water this replica has applied (ADR 0018
@@ -186,6 +190,8 @@ impl ReplicaState {
     /// [`ReplError::Backend`] if the database cannot be opened or its contents decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
         let db = Database::create(path).map_err(rdb)?;
+        // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
+        mqtt_storage::schema::gate(&db, "replicas.redb", R_SCHEMA_VERSION).map_err(rdb)?;
         let txn = db.begin_write().map_err(rdb)?;
         {
             let _ = txn.open_table(R_ENTRIES).map_err(rdb)?;
@@ -836,6 +842,21 @@ mod tests {
 
     fn n(s: &str) -> NodeId {
         NodeId(s.to_string())
+    }
+
+    /// ADR 0038 T2: a replica store stamped by a foreign layout version refuses to
+    /// open, naming both versions.
+    #[test]
+    fn a_foreign_replica_schema_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replicas.redb");
+        drop(ReplicaState::open(&path).unwrap()); // stamped v1
+        {
+            let db = redb::Database::create(&path).unwrap();
+            mqtt_storage::schema::force_version(&db, 999).unwrap();
+        }
+        let err = ReplicaState::open(&path).unwrap_err().to_string();
+        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
     }
 
     /// ADR 0018 phase 3: a persistent replica's stored entries and fence epoch survive

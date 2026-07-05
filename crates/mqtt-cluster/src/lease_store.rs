@@ -40,6 +40,9 @@ use std::sync::{Arc, Mutex};
 
 type NodeId = u64;
 
+/// The lease store's on-disk layout version (ADR 0038 T2).
+const LEASE_SCHEMA_VERSION: u32 = 1;
+
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 
@@ -140,6 +143,9 @@ impl LeaseStore {
     /// Returns a `StorageError` if the database cannot be opened or its contents decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
         let db = Database::create(path).map_err(|e| io(pe(e)))?;
+        // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
+        mqtt_storage::schema::gate(&db, "lease.redb", LEASE_SCHEMA_VERSION)
+            .map_err(|e| io(pe(e)))?;
         // Create both tables so reads never race a missing table.
         let txn = db.begin_write().map_err(|e| io(pe(e)))?;
         {
@@ -512,6 +518,21 @@ mod tests {
     use crate::lease_raft::{GroupId, LeaseRequest, RaftNodeId};
     use openraft::StorageError;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// ADR 0038 T2: a lease store stamped by a foreign layout version refuses to
+    /// open, naming both versions.
+    #[test]
+    fn a_foreign_lease_schema_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease.redb");
+        drop(LeaseStore::open(&path).unwrap()); // stamped v1
+        {
+            let db = redb::Database::create(&path).unwrap();
+            mqtt_storage::schema::force_version(&db, 999).unwrap();
+        }
+        let err = format!("{:?}", LeaseStore::open(&path).unwrap_err());
+        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+    }
 
     /// openraft's conformance suite against the **in-memory** store.
     #[test]

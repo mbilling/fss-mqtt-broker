@@ -23,6 +23,9 @@ use std::fmt::Display;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// The retained store's on-disk layout version (ADR 0038 T2).
+const SCHEMA_VERSION: u32 = 1;
+
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 
 fn backend<E: Display>(e: E) -> StorageError {
@@ -65,6 +68,8 @@ impl PersistentRetainedStore {
     /// [`StorageError::Backend`] if the database cannot be opened or decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let db = Database::create(path).map_err(backend)?;
+        // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
+        crate::schema::gate(&db, "retained.redb", SCHEMA_VERSION).map_err(backend)?;
         let txn = db.begin_write().map_err(backend)?;
         {
             let _ = txn.open_table(RETAINED).map_err(backend)?;
@@ -159,6 +164,23 @@ impl RetainedStore for PersistentRetainedStore {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 0038 T2: a retained store stamped by a foreign layout version refuses to
+    /// open, naming both versions.
+    #[test]
+    fn a_foreign_schema_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retained.redb");
+        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped v1
+        {
+            let db = redb::Database::create(&path).unwrap();
+            crate::schema::force_version(&db, 999).unwrap();
+        }
+        let err = super::PersistentRetainedStore::open(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+    }
+
     use super::PersistentRetainedStore;
     use crate::RetainedStore;
     use bytes::Bytes;
