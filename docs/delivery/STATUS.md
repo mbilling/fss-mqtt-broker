@@ -45,7 +45,7 @@
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [8/8 done](0037-durable-retained-messages.md) | — |
-| [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Proposed | [3/4 done](0038-prerelease-compatibility-freeze.md) | 1 open |
+| [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 
 ## Open and deferred work
@@ -105,10 +105,6 @@
 **0036 — MQTT-over-QUIC transport (multi-stream)**
 
 - `0036-T11` 💤 deferred: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection) — 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.
-
-**0038 — Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs)**
-
-- `0038-T4` ⬜ planned: Wire-shape finalization — named serde structs for multi-field entries; frozen-vs-versioned frame inventory recorded
 
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 

@@ -1,6 +1,6 @@
 # ADR 0038 — Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-04
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0038-prerelease-compatibility-freeze.md](../delivery/0038-prerelease-compatibility-freeze.md) — plan, progress, and changelog

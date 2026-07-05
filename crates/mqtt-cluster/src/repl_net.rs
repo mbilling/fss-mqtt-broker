@@ -31,7 +31,7 @@
 
 use crate::cluster_log::{ReplOp, ReplicaTransport};
 use crate::lease::Epoch;
-use crate::peer::PeerMessage;
+use crate::peer::{PeerMessage, ReplicaEntryWire};
 use crate::NodeId;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -85,7 +85,7 @@ struct Pending {
 }
 
 /// A recovery-read reply: the replica's truncation `(watermark, entries)` (ADR 0018 §3b).
-type ReadReply = (u64, Vec<(u64, Vec<u8>)>);
+type ReadReply = (u64, Vec<ReplicaEntryWire>);
 
 #[derive(Debug)]
 struct PendingRead {
@@ -166,7 +166,7 @@ impl PeerReplicaTransport {
     /// Resolve a pending recovery-read with the replica's watermark and entries.
     ///
     /// Called by the link handler when a [`PeerMessage::ReplicaReadReply`] arrives.
-    pub fn complete_read(&self, req_id: u64, watermark: u64, entries: Vec<(u64, Vec<u8>)>) {
+    pub fn complete_read(&self, req_id: u64, watermark: u64, entries: Vec<ReplicaEntryWire>) {
         if let Some(p) = self.lock().pending_reads.remove(&req_id) {
             let _ = p.reply.send((watermark, entries));
         }
@@ -261,7 +261,10 @@ impl ReplicaTransport for PeerReplicaTransport {
             watermark,
             entries: entries
                 .into_iter()
-                .map(|(offset, record)| mqtt_storage::repl::LogEntry { offset, record })
+                .map(|e| mqtt_storage::repl::LogEntry {
+                    offset: e.offset,
+                    record: e.record,
+                })
                 .collect(),
         })
     }

@@ -43,11 +43,29 @@ pub fn negotiate_proto(local: (u32, u32), remote: (u32, u32)) -> Option<u32> {
     (candidate >= local.0 && candidate >= remote.0).then_some(candidate)
 }
 
-/// Wire form of a shared-subscription membership snapshot (ADR 0015 §2): each entry
-/// is `(ShareName, filter, [(client id, granted QoS u8, online-on-this-node)])`. The
-/// per-member liveness lets a peer's selector skip a member offline on its home node
-/// (ADR 0015 T8).
-pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8, bool)>)>;
+/// One shared-subscription group in a membership snapshot (ADR 0015 §2 wire shape,
+/// named per ADR 0038 T4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedGroupWire {
+    /// The share name (the `<name>` in `$share/<name>/<filter>`).
+    pub group: String,
+    /// The underlying topic filter.
+    pub filter: String,
+    /// The group's members on the sending node.
+    pub members: Vec<SharedMemberWire>,
+}
+
+/// One member of a [`SharedGroupWire`]. The per-member liveness lets a peer's
+/// selector skip a member that is offline on its home node (ADR 0015 T8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemberWire {
+    /// The member's client id.
+    pub client: String,
+    /// The granted subscription `QoS` as its 2-bit wire value.
+    pub qos: u8,
+    /// Whether the member is currently online on the sending node.
+    pub online: bool,
+}
 
 /// The forwardable MQTT 5 application properties carried cross-node (ADR 0030): the
 /// publisher's User Properties plus the other message-level properties, so a peer re-emits
@@ -78,6 +96,17 @@ pub struct RetainedWireEntry {
     pub offset: u64,
     /// The publisher's forwardable MQTT 5 application properties.
     pub props: WireAppProps,
+}
+
+/// One stored log entry in a [`ReplicaReadReply`](PeerMessage::ReplicaReadReply)
+/// (named per ADR 0038 T4). The wire keeps its own shape rather than reusing the
+/// storage crate's `LogEntry`, so that type need not be serde-wire-encodable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaEntryWire {
+    /// The entry's offset in the key's log.
+    pub offset: u64,
+    /// The stored record bytes, opaque to the wire.
+    pub record: Vec<u8>,
 }
 
 /// A message exchanged between broker nodes.
@@ -128,8 +157,8 @@ pub enum PeerMessage {
     /// so the receiver can select one member per group across the whole cluster.
     /// Sent on the same triggers as [`Interest`](PeerMessage::Interest).
     SharedInterest {
-        /// Each shared group: `(ShareName, filter, [(client id, granted QoS u8)])`.
-        groups: SharedGroupsWire,
+        /// Every shared group with at least one member on the sender.
+        groups: Vec<SharedGroupWire>,
     },
     /// A **chunk** of the sender's retained-message set (ADR 0014 §3). Sent on link
     /// establishment when the digest exchange (see
@@ -265,9 +294,8 @@ pub enum PeerMessage {
         key: String,
     },
     /// The reply to a [`ReplicaRead`](PeerMessage::ReplicaRead): the replica's stored
-    /// entries for the key, as `(offset, record)` pairs (kept as tuples so the
-    /// storage crate's `LogEntry` need not be serde-wire-encodable), plus its truncation
-    /// low-water so a recovery cannot resurrect an already-acked prefix (ADR 0018 §3b).
+    /// entries for the key, plus its truncation low-water so a recovery cannot
+    /// resurrect an already-acked prefix (ADR 0018 §3b).
     ReplicaReadReply {
         /// The `req_id` of the [`ReplicaRead`](PeerMessage::ReplicaRead) answered.
         req_id: u64,
@@ -275,7 +303,7 @@ pub enum PeerMessage {
         #[serde(default)]
         watermark: u64,
         /// The stored entries, in offset order.
-        entries: Vec<(u64, Vec<u8>)>,
+        entries: Vec<ReplicaEntryWire>,
     },
     /// A retained mutation routed to the topic's placement-group lease-owner
     /// (ADR 0037 §1): the sender is the node the publish landed on, the receiver owns
@@ -396,8 +424,9 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, RetainedWireEntry,
-        WireAppProps, MAX_FRAME, PROTO_MAX, PROTO_MIN,
+        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, ReplicaEntryWire,
+        RetainedWireEntry, SharedGroupWire, SharedMemberWire, WireAppProps, MAX_FRAME, PROTO_MAX,
+        PROTO_MIN,
     };
     use bytes::BytesMut;
 
@@ -436,11 +465,22 @@ mod tests {
             },
         });
         roundtrip(&PeerMessage::SharedInterest {
-            groups: vec![(
-                "grp".into(),
-                "t/+".into(),
-                vec![("c1".into(), 1, true), ("c2".into(), 0, false)],
-            )],
+            groups: vec![SharedGroupWire {
+                group: "grp".into(),
+                filter: "t/+".into(),
+                members: vec![
+                    SharedMemberWire {
+                        client: "c1".into(),
+                        qos: 1,
+                        online: true,
+                    },
+                    SharedMemberWire {
+                        client: "c2".into(),
+                        qos: 0,
+                        online: false,
+                    },
+                ],
+            }],
         });
         roundtrip(&PeerMessage::SharedDeliver {
             client: "c1".into(),
@@ -522,7 +562,16 @@ mod tests {
         roundtrip(&PeerMessage::ReplicaReadReply {
             req_id: 3,
             watermark: 4,
-            entries: vec![(1, vec![1, 2]), (2, vec![3, 4])],
+            entries: vec![
+                ReplicaEntryWire {
+                    offset: 1,
+                    record: vec![1, 2],
+                },
+                ReplicaEntryWire {
+                    offset: 2,
+                    record: vec![3, 4],
+                },
+            ],
         });
         roundtrip(&PeerMessage::RetainedCommit {
             topic: "dev/1/state".into(),
@@ -570,6 +619,58 @@ mod tests {
             offset: 43,
             props: WireAppProps::default(),
         });
+    }
+
+    /// ADR 0038 T4: the two **frozen** frames' encodings, pinned byte for byte.
+    /// `Hello` and `ProxyHello` are the bootstrap frames any two builds, of any
+    /// versions, must exchange before a protocol is negotiated — if this test
+    /// fails, the change is a cross-version wire break that no proto bump can
+    /// carry, not something to fix by updating the expected bytes. (bincode
+    /// encodes the enum variant *index*, so this also pins the rule that new
+    /// frames are APPENDED to [`PeerMessage`], never inserted or reordered.)
+    #[test]
+    fn the_frozen_frames_encode_byte_for_byte_stably() {
+        let mut hello = Vec::new();
+        encode(
+            &PeerMessage::Hello {
+                node_id: "n1".into(),
+                proto_min: 1,
+                proto_max: 1,
+            },
+            &mut hello,
+        )
+        .unwrap();
+        #[rustfmt::skip]
+        let expected_hello = [
+            0, 0, 0, 22,                          // frame length (u32 BE)
+            0, 0, 0, 0,                           // variant index: Hello = 0
+            2, 0, 0, 0, 0, 0, 0, 0, b'n', b'1',   // node_id (u64 LE len + bytes)
+            1, 0, 0, 0,                           // proto_min (u32 LE)
+            1, 0, 0, 0,                           // proto_max (u32 LE)
+        ];
+        assert_eq!(hello, expected_hello);
+
+        let mut proxy = Vec::new();
+        encode(
+            &PeerMessage::ProxyHello {
+                identity: Some("client-a".into()),
+                via: Some("node-b".into()),
+            },
+            &mut proxy,
+        )
+        .unwrap();
+        #[rustfmt::skip]
+        let expected_proxy = [
+            0, 0, 0, 36,                          // frame length (u32 BE)
+            8, 0, 0, 0,                           // variant index: ProxyHello = 8
+            1,                                    // identity: Some
+            8, 0, 0, 0, 0, 0, 0, 0,               // identity length (u64 LE)
+            b'c', b'l', b'i', b'e', b'n', b't', b'-', b'a',
+            1,                                    // via: Some
+            6, 0, 0, 0, 0, 0, 0, 0,               // via length (u64 LE)
+            b'n', b'o', b'd', b'e', b'-', b'b',
+        ];
+        assert_eq!(proxy, expected_proxy);
     }
 
     /// ADR 0038: version negotiation picks the newest version both sides speak,

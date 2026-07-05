@@ -394,7 +394,10 @@ mod tests {
                                 s.watermark(&key),
                                 s.entries(&key)
                                     .into_iter()
-                                    .map(|e| (e.offset, e.record))
+                                    .map(|e| crate::peer::ReplicaEntryWire {
+                                        offset: e.offset,
+                                        record: e.record,
+                                    })
                                     .collect(),
                             )
                         };

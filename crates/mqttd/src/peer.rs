@@ -443,16 +443,18 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
         PeerMessage::SharedInterest { groups } => {
             let groups = groups
                 .into_iter()
-                .map(|(group, filter, members)| crate::hub::RemoteSharedGroup {
-                    group,
-                    filter,
-                    members: members
+                .map(|g| crate::hub::RemoteSharedGroup {
+                    group: g.group,
+                    filter: g.filter,
+                    members: g
+                        .members
                         .into_iter()
-                        .map(|(c, q, online)| {
+                        .map(|m| {
                             (
-                                mqtt_core::ClientId(c),
-                                mqtt_codec::QoS::from_u8(q).unwrap_or(mqtt_codec::QoS::AtMostOnce),
-                                online,
+                                mqtt_core::ClientId(m.client),
+                                mqtt_codec::QoS::from_u8(m.qos)
+                                    .unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                                m.online,
                             )
                         })
                         .collect(),

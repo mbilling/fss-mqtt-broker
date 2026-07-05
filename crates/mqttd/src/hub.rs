@@ -2625,7 +2625,8 @@ impl Hub {
     }
 
     /// This node's shared-subscription membership snapshot, in the peer wire form.
-    fn shared_snapshot(&self) -> mqtt_cluster::peer::SharedGroupsWire {
+    fn shared_snapshot(&self) -> Vec<mqtt_cluster::peer::SharedGroupWire> {
+        use mqtt_cluster::peer::{SharedGroupWire, SharedMemberWire};
         self.shared
             .snapshot()
             .into_iter()
@@ -2635,12 +2636,17 @@ impl Hub {
                 let members = g
                     .members
                     .into_iter()
-                    .map(|(c, q)| {
-                        let online = self.online.contains_key(&c);
-                        (c.0, q as u8, online)
+                    .map(|(c, q)| SharedMemberWire {
+                        online: self.online.contains_key(&c),
+                        client: c.0,
+                        qos: q as u8,
                     })
                     .collect();
-                (g.group, g.filter, members)
+                SharedGroupWire {
+                    group: g.group,
+                    filter: g.filter,
+                    members,
+                }
             })
             .collect()
     }

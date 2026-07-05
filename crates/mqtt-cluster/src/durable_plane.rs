@@ -205,7 +205,10 @@ impl DurablePlane {
                         r.watermark(&key),
                         r.entries(&key)
                             .into_iter()
-                            .map(|e| (e.offset, e.record))
+                            .map(|e| crate::peer::ReplicaEntryWire {
+                                offset: e.offset,
+                                record: e.record,
+                            })
                             .collect(),
                     )
                 };
