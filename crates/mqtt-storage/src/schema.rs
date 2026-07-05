@@ -7,6 +7,11 @@
 //! rebuilds a node's replicated state from its peers) — but the stamp is what makes
 //! post-1.0 migrations writable at all: a future build gets a version to dispatch
 //! on instead of guessing at bytes.
+//!
+//! **Release rule (ADR 0039)**: store versions bump only in MAJOR releases, and each
+//! major ships migrations from exactly **one** major back — sequential upgrades
+//! (1 → 2 → 3, no skipping). A gate mismatch more than one version old means the
+//! operator must upgrade through the intermediate major first.
 
 use redb::{Database, ReadableTable, TableDefinition};
 

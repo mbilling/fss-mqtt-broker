@@ -17,10 +17,15 @@ use serde::{Deserialize, Serialize};
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// The oldest peer-bus protocol version this build can speak (ADR 0038).
+///
+/// **Release rule (ADR 0039)**: from 1.0, every release sets this to the *previous*
+/// release's proto — that window IS the adjacent-only version-skew policy. Raising it
+/// further drops rolling-upgrade support from the version before; never do that in a
+/// minor.
 pub const PROTO_MIN: u32 = 1;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
 /// negotiated version is `min(proto_max_a, proto_max_b)`; every frame shape change
-/// after the first release bumps this.
+/// after the first release bumps this (a MAJOR release, per ADR 0039).
 pub const PROTO_MAX: u32 = 1;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
