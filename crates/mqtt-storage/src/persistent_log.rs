@@ -31,6 +31,9 @@ use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
 
+/// The session store's on-disk layout version (ADR 0038 T2).
+const SCHEMA_VERSION: u32 = 1;
+
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const NEXT_OFFSET: TableDefinition<&str, u64> = TableDefinition::new("next_offset");
 
@@ -53,6 +56,8 @@ impl PersistentLog {
     /// Returns [`ReplError::Backend`] if the database cannot be opened or initialised.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
         let db = Database::create(path).map_err(backend)?;
+        // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
+        crate::schema::gate(&db, "sessions.redb", SCHEMA_VERSION).map_err(backend)?;
         // Create both tables once so read transactions always find them.
         let txn = db.begin_write().map_err(backend)?;
         {
@@ -257,6 +262,21 @@ mod tests {
 
     fn rec(b: &[u8]) -> Vec<u8> {
         b.to_vec()
+    }
+
+    /// ADR 0038 T2: a session store stamped by a foreign layout version refuses to
+    /// open, naming both versions — never silently misreading bytes.
+    #[test]
+    fn a_foreign_schema_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+        drop(PersistentLog::open(&path).unwrap()); // stamped v1
+        {
+            let db = redb::Database::create(&path).unwrap();
+            crate::schema::force_version(&db, 999).unwrap();
+        }
+        let err = PersistentLog::open(&path).unwrap_err().to_string();
+        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
     }
 
     fn temp_log() -> (tempfile::TempDir, PersistentLog) {
