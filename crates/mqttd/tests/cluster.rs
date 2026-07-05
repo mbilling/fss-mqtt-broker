@@ -193,6 +193,27 @@ impl Client {
         c
     }
 
+    /// Publish a retained message (`QoS` 0) carrying the given MQTT 5 properties.
+    async fn publish_retained_v5(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        properties: mqtt_codec::Properties,
+    ) {
+        self.writer
+            .send(&Packet::Publish(Publish {
+                properties,
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: true,
+                topic: topic.to_string(),
+                pkid: None,
+                payload: bytes::Bytes::copy_from_slice(payload),
+            }))
+            .await
+            .unwrap();
+    }
+
     /// Publish (`QoS` 0) with MQTT 5 User Properties.
     async fn publish_with_props(
         &mut self,
@@ -305,6 +326,53 @@ async fn non_matching_topic_is_not_forwarded_across_nodes() {
     );
 }
 
+/// One of two durable-retained nodes (`name` + `other`) sharing the same
+/// two-member ring view.
+async fn build_durable_retained_node(
+    name: &str,
+    other: &str,
+) -> (
+    NodeId,
+    SocketAddr, // client addr
+    SocketAddr, // peer addr
+    tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+    std::sync::Arc<std::sync::RwLock<mqtt_cluster::placement::Placement>>,
+) {
+    use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
+    use mqtt_cluster::swim::MemberState;
+    use mqtt_storage::repl::InMemoryReplicatedLog;
+    use mqtt_storage::retained_log::ReplicatedRetained;
+    use std::sync::{Arc, RwLock};
+
+    let id = NodeId(name.to_string());
+    let mut p = Placement::new(id.clone(), DEFAULT_REPLICAS);
+    p.observe(&NodeId(other.to_string()), MemberState::Alive, "x:1", None);
+    let placement = Arc::new(RwLock::new(p));
+    let (mut hub, tx) = Hub::with_config_and_placement(
+        id.clone(),
+        Arc::new(MemorySessionStore::new()),
+        Some(placement.clone()),
+    );
+    hub.attach_durable_retained(Arc::new(ReplicatedRetained::new(
+        InMemoryReplicatedLog::new(),
+    )));
+    tokio::spawn(hub.run());
+
+    let cli = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = cli.local_addr().unwrap();
+    spawn_client_loop(cli, tx.clone());
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    tokio::spawn(mqttd::peer::serve_listener(
+        peer,
+        id.clone(),
+        tx.clone(),
+        None,
+        None,
+    ));
+    (id, client_addr, peer_addr, tx, placement)
+}
+
 /// The retained value a fresh subscriber replays for `topic` on the node at `addr`,
 /// or `None` if that node's cache holds nothing. `id` must be unique per call.
 async fn retained_on(addr: SocketAddr, id: &str, topic: &str) -> Option<Vec<u8>> {
@@ -313,6 +381,148 @@ async fn retained_on(addr: SocketAddr, id: &str, topic: &str) -> Option<Vec<u8>>
     match c.recv().await {
         Some(Packet::Publish(p)) => Some(p.payload.to_vec()),
         _ => None,
+    }
+}
+
+/// The retained (payload, properties) a fresh **MQTT 5** subscriber replays for
+/// `topic` on the node at `addr`, or `None` if that node's cache holds nothing.
+/// `id` must be unique per call.
+async fn retained_v5_on(
+    addr: SocketAddr,
+    id: &str,
+    topic: &str,
+) -> Option<(Vec<u8>, Vec<Property>)> {
+    let mut c = Client::connect_v5(addr, id).await;
+    c.subscribe(topic).await;
+    match c.recv().await {
+        Some(Packet::Publish(p)) => Some((p.payload.to_vec(), p.properties.0)),
+        _ => None,
+    }
+}
+
+/// ADR 0038 T3 acceptance: **a retained publish with MQTT 5 properties replays with
+/// those properties from any node's cache** (MQTT-3.3.2-17 across the cluster).
+///
+/// One scenario pins all three property-carrying paths end to end over real peer
+/// links:
+///  1. a v5 publish with the full forwardable set (payload-format indicator,
+///     Content Type, Response Topic, Correlation Data, User Properties) lands on
+///     the NON-owner node — so the properties ride the owner-routed submit, the
+///     committed record, and the commit fan-out before any subscriber sees them;
+///  2. fresh subscribers on BOTH nodes replay payload AND properties;
+///  3. the mesh is severed, the owner commits an update with different properties,
+///     and on heal the non-owner converges via queue-heal + token back-fill — a
+///     fresh subscriber there replays the NEW properties.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_mqtt5_properties_replay_from_any_nodes_cache() {
+    let (id_a, cli_a, peer_a, tx_a, placement_a) =
+        build_durable_retained_node("prop-a", "prop-b").await;
+    let (id_b, cli_b, peer_b, tx_b, _) = build_durable_retained_node("prop-b", "prop-a").await;
+
+    let link = || {
+        vec![
+            tokio::spawn(mqttd::peer::dial_forever(
+                peer_b.to_string(),
+                id_a.clone(),
+                tx_a.clone(),
+                None,
+            )),
+            tokio::spawn(mqttd::peer::dial_forever(
+                peer_a.to_string(),
+                id_b.clone(),
+                tx_b.clone(),
+                None,
+            )),
+        ]
+    };
+
+    // A topic whose group node A owns (HRW — identical from both views), so a
+    // publish on B must route to A, commit there, and fan back out.
+    let topic = (0..100_000)
+        .map(|i| format!("dev/{i}/state"))
+        .find(|t| placement_a.read().unwrap().owner(t) == id_a)
+        .expect("some topic is owned by A");
+
+    // The full forwardable property set, in the order the broker replays them.
+    let props_v1 = || {
+        mqtt_codec::Properties(vec![
+            Property::PayloadFormatIndicator(1),
+            Property::ContentType("application/json".into()),
+            Property::ResponseTopic("replies/dev".into()),
+            Property::CorrelationData(bytes::Bytes::from_static(b"corr-1")),
+            Property::UserProperty("trace".into(), "abc".into()),
+            Property::UserProperty("origin".into(), "sensor-7".into()),
+        ])
+    };
+
+    // 1+2: publish on the non-owner; a fresh v5 subscriber on EACH node must
+    // replay the payload with every property intact.
+    let dials = link();
+    let mut publisher = Client::connect_v5(cli_b, "prop-pub").await;
+    let expect_v1 = Some((b"v1".to_vec(), props_v1().0));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        publisher
+            .publish_retained_v5(&topic, b"v1", props_v1())
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if retained_v5_on(cli_a, &format!("pv-a{tick}"), &topic).await == expect_v1
+            && retained_v5_on(cli_b, &format!("pv-b{tick}"), &topic).await == expect_v1
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "properties never replayed from both caches"
+        );
+    }
+
+    // 3: sever, commit an update with DIFFERENT properties on the owner, heal —
+    // the non-owner must converge to the new payload AND the new properties.
+    for d in dials {
+        d.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let props_v2 = mqtt_codec::Properties(vec![
+        Property::ContentType("text/plain".into()),
+        Property::UserProperty("trace".into(), "xyz".into()),
+    ]);
+    let mut owner_pub = Client::connect_v5(cli_a, "prop-pub-a").await;
+    owner_pub
+        .publish_retained_v5(&topic, b"v2", props_v2.clone())
+        .await;
+    let expect_v2 = Some((b"v2".to_vec(), props_v2.0));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        if retained_v5_on(cli_a, &format!("ov-a{tick}"), &topic).await == expect_v2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner never committed the updated properties"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _dials = link();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut tick = 0;
+    loop {
+        tick += 1;
+        let on_b = retained_v5_on(cli_b, &format!("bf-b{tick}"), &topic).await;
+        if on_b == expect_v2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "back-fill never delivered the updated properties to the non-owner: {on_b:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -335,54 +545,9 @@ async fn retained_on(addr: SocketAddr, id: &str, topic: &str) -> Option<Vec<u8>>
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn divergent_retained_writes_across_a_partition_converge_after_heal() {
-    use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
-    use mqtt_cluster::swim::MemberState;
-    use mqtt_storage::repl::InMemoryReplicatedLog;
-    use mqtt_storage::retained_log::ReplicatedRetained;
-    use std::sync::{Arc, RwLock};
-
-    // Two durable-retained nodes sharing the same two-member ring view.
-    async fn build(
-        name: &str,
-        other: &str,
-    ) -> (
-        NodeId,
-        SocketAddr, // client addr
-        SocketAddr, // peer addr
-        tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-        Arc<RwLock<Placement>>,
-    ) {
-        let id = NodeId(name.to_string());
-        let mut p = Placement::new(id.clone(), DEFAULT_REPLICAS);
-        p.observe(&NodeId(other.to_string()), MemberState::Alive, "x:1", None);
-        let placement = Arc::new(RwLock::new(p));
-        let (mut hub, tx) = Hub::with_config_and_placement(
-            id.clone(),
-            Arc::new(MemorySessionStore::new()),
-            Some(placement.clone()),
-        );
-        hub.attach_durable_retained(Arc::new(ReplicatedRetained::new(
-            InMemoryReplicatedLog::new(),
-        )));
-        tokio::spawn(hub.run());
-
-        let cli = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_addr = cli.local_addr().unwrap();
-        spawn_client_loop(cli, tx.clone());
-        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer.local_addr().unwrap();
-        tokio::spawn(mqttd::peer::serve_listener(
-            peer,
-            id.clone(),
-            tx.clone(),
-            None,
-            None,
-        ));
-        (id, client_addr, peer_addr, tx, placement)
-    }
-
-    let (id_a, cli_a, peer_a, tx_a, placement_a) = build("part-a", "part-b").await;
-    let (id_b, cli_b, peer_b, tx_b, _) = build("part-b", "part-a").await;
+    let (id_a, cli_a, peer_a, tx_a, placement_a) =
+        build_durable_retained_node("part-a", "part-b").await;
+    let (id_b, cli_b, peer_b, tx_b, _) = build_durable_retained_node("part-b", "part-a").await;
 
     // A severable full-mesh link (mirrors common::link/sever).
     let link = |tx_a: &tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,

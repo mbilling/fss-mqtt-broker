@@ -45,7 +45,7 @@
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [8/8 done](0037-durable-retained-messages.md) | — |
-| [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Proposed | [2/4 done](0038-prerelease-compatibility-freeze.md) | 2 open |
+| [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Proposed | [3/4 done](0038-prerelease-compatibility-freeze.md) | 1 open |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 
 ## Open and deferred work
@@ -108,7 +108,6 @@
 
 **0038 — Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs)**
 
-- `0038-T3` ⬜ planned: Retained MQTT 5 fidelity — app properties through the durable record codec, RetainedCommit/Update/Snapshot frames, and the persistent retained store
 - `0038-T4` ⬜ planned: Wire-shape finalization — named serde structs for multi-field entries; frozen-vs-versioned frame inventory recorded
 
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
