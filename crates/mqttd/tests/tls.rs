@@ -500,7 +500,7 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
             let hub = hub_tx.clone();
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
-                    let identity = mqttd::conn::tls_identity(&tls);
+                    let identity = mqttd::conn::tls_admission(&tls);
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
@@ -589,7 +589,7 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
             let hub = hub_tx.clone();
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
-                    let identity = mqttd::conn::tls_identity(&tls);
+                    let identity = mqttd::conn::tls_admission(&tls);
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });

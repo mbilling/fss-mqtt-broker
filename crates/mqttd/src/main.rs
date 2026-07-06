@@ -1376,9 +1376,9 @@ async fn serve_tls_clients(
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    // mTLS identity (ADR 0004): the verified leaf cert's CN.
-                    let identity = conn::tls_identity(&tls_stream);
-                    conn::handle_stream(tls_stream, Some(peer), identity, policy, hub).await;
+                    // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
+                    let cert = conn::tls_admission(&tls_stream);
+                    conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await;
                 }
                 Err(e) => {
                     debug!(%peer, error = %e, "TLS handshake failed");
@@ -1507,11 +1507,11 @@ async fn serve_wss_clients(
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls) => {
-                    // mTLS identity (ADR 0004): the verified leaf cert's CN — read before the
-                    // TLS stream is consumed by the WebSocket adapter.
-                    let identity = conn::tls_identity(&tls);
+                    // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
+                    // read before the TLS stream is consumed by the WebSocket adapter.
+                    let cert = conn::tls_admission(&tls);
                     match mqtt_net::ws::accept(tls).await {
-                        Ok(ws) => conn::handle_stream(ws, Some(peer), identity, policy, hub).await,
+                        Ok(ws) => conn::handle_stream(ws, Some(peer), cert, policy, hub).await,
                         Err(e) => {
                             debug!(%peer, error = %e, "websocket handshake failed");
                             if let Some(m) = &policy.metrics {
@@ -1571,9 +1571,10 @@ async fn serve_quic_clients(
             if let Some(m) = &policy.metrics {
                 m.connection_accepted("quic");
             }
-            // mTLS identity (ADR 0004): the verified leaf cert's CN, from the QUIC handshake.
-            let identity = mqtt_net::quic::peer_leaf_cert(&conn)
-                .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
+            // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial, from
+            // the QUIC handshake.
+            let cert = mqtt_net::quic::peer_leaf_cert(&conn).and_then(|c| conn::cert_admission(&c));
+            let identity = cert.as_ref().map(|c| c.identity.clone());
             // Connection-migration observation (ADR 0036 §3b): QUIC keeps a connection alive
             // across a client path change (Wi-Fi↔cellular, NAT rebind). Watch the remote address
             // on the *same* connection — a change is a migration, not a reconnect — and log +
@@ -1582,7 +1583,7 @@ async fn serve_quic_clients(
             // Multi-stream mux (ADR 0036): the control stream carries the session; any data
             // streams the client opens feed PUBLISH into the same session, no HoL blocking.
             match mqtt_net::quic::accept_mux(conn).await {
-                Ok(mux) => conn::handle_stream(mux, Some(peer), identity, policy, hub).await,
+                Ok(mux) => conn::handle_stream(mux, Some(peer), cert, policy, hub).await,
                 Err(e) => {
                     debug!(%peer, error = %e, "QUIC connection opened no control stream");
                 }

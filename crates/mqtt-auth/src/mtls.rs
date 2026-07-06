@@ -36,6 +36,21 @@ pub fn identity_from_cert(der: &[u8]) -> Result<Identity, AuthError> {
     })
 }
 
+/// Extract the serial number (big-endian bytes as encoded in the certificate) from
+/// a DER-encoded, already chain-verified X.509 leaf — the fact a CRL names, kept
+/// with the connection so a revocation sweep can re-check it (ADR 0040 T1).
+///
+/// `None` if the certificate cannot be parsed (the identity extraction will have
+/// rejected such a leaf already).
+#[must_use]
+pub fn serial_from_cert(der: &[u8]) -> Option<Vec<u8>> {
+    let (rest, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(cert.raw_serial().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

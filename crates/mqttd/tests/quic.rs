@@ -66,7 +66,7 @@ fn start_quic_node(cert: &Path, key: &Path, ca: &Path) -> SocketAddr {
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_address();
                 let identity = mqtt_net::quic::peer_leaf_cert(&conn)
-                    .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
+                    .and_then(|c| mqttd::conn::cert_admission(&c));
                 // The multi-stream mux: control stream + any data streams feed one session.
                 if let Ok(mux) = mqtt_net::quic::accept_mux(conn).await {
                     mqttd::conn::handle_stream(mux, Some(peer), identity, permissive_policy(), hub)

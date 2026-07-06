@@ -34,7 +34,10 @@ use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
-use mqtt_codec::{packet::Publish, Packet, QoS};
+use mqtt_codec::{
+    packet::{Disconnect, Publish},
+    Packet, ProtocolVersion, QoS,
+};
 use mqtt_core::{
     parse_shared, topic_matches, AppProperties, ClientId, Message, SharedSubscriptionTable,
     Subscription, SubscriptionTable,
@@ -136,6 +139,45 @@ pub type Outbound = mpsc::UnboundedSender<Packet>;
 /// Sender for messages destined to a peer node's link.
 pub type PeerOutbound = mpsc::UnboundedSender<PeerMessage>;
 
+/// How a connection authenticated (ADR 0040 T1): the credential class whose
+/// server-side facts a policy-reload sweep can re-check. `Token`/`Enhanced`
+/// credentials carry their own lifetime (a JWT's `exp`; a mechanism exchange) and
+/// have no server-side store row to probe, so a sweep bounds them via the ACL only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// No credentials (only admitted when the policy opts in).
+    Anonymous,
+    /// Username/password against the credential store.
+    Password,
+    /// A bearer token (JWT/OIDC).
+    Token,
+    /// A TLS-verified client certificate (mTLS subject).
+    Certificate,
+    /// An MQTT 5 enhanced-auth exchange (ADR 0013).
+    Enhanced,
+}
+
+/// The server-side revocable facts a connection was admitted under (ADR 0040 T1):
+/// what a policy-reload sweep re-evaluates against the new policy. Recorded at
+/// CONNECT and kept with the online entry — the broker retains *facts about* the
+/// admission (subject, method, certificate serial), never replayable credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    /// The authenticated principal's stable subject (== the session owner, ADR 0031).
+    pub subject: String,
+    /// How the connection authenticated.
+    pub method: AuthMethod,
+    /// The mTLS leaf certificate's serial number (big-endian bytes as encoded in the
+    /// certificate) when one was presented at *this* hop; `None` on plaintext, on
+    /// no-cert listeners, and for proxied sessions (ADR 0005 — the landing node holds
+    /// the actual TLS session and its serial).
+    pub cert_serial: Option<Vec<u8>>,
+    /// The connection's negotiated MQTT protocol version: an evicted v5 client is
+    /// told why (DISCONNECT `0x87`); v3.1.1 has no server DISCONNECT, so it just
+    /// gets the close.
+    pub protocol: ProtocolVersion,
+}
+
 /// A currently-online client connection.
 #[derive(Debug)]
 struct Online {
@@ -145,6 +187,8 @@ struct Online {
     tx: Outbound,
     /// Will message published if this connection ends ungracefully.
     will: Option<Message>,
+    /// The revocable facts this connection was admitted under (ADR 0040 T1).
+    admission: Admission,
 }
 
 /// Downstream acknowledgement state of an unacked `QoS` > 0 message.
@@ -277,8 +321,9 @@ pub enum SessionRecovery {
 pub struct PendingAttach {
     /// The client identifier.
     client: ClientId,
-    /// The authenticated principal's stable subject — the owner to bind/verify (ADR 0031).
-    owner: String,
+    /// The revocable facts the connection was admitted under (ADR 0040 T1); its
+    /// `subject` is the owner to bind/verify (ADR 0031).
+    admission: Admission,
     /// Unique id for this physical connection (guards last-writer-wins on overlap).
     conn_id: u64,
     /// MQTT 5.0 Session Expiry Interval (seconds).
@@ -301,9 +346,10 @@ pub enum HubCommand {
     Attach {
         /// The client identifier.
         client: ClientId,
-        /// The authenticated principal's stable subject (mTLS CN / username / token subject,
-        /// or the shared `"anonymous"` principal). Binds the session to its owner (ADR 0031).
-        owner: String,
+        /// The revocable facts the connection was admitted under (ADR 0040 T1). Its
+        /// `subject` (mTLS CN / username / token subject, or the shared `"anonymous"`
+        /// principal) binds the session to its owner (ADR 0031).
+        admission: Admission,
         /// Unique id for this physical connection.
         conn_id: u64,
         /// MQTT 5.0 Clean Start: discard any existing session before attaching
@@ -396,6 +442,18 @@ pub enum HubCommand {
         /// `true` for a clean DISCONNECT (the will is discarded); `false` for
         /// any other end (the will is published) [MQTT-3.14.4-3].
         graceful: bool,
+    },
+    /// Terminate a client's live session server-side (ADR 0040 T1): the eviction
+    /// primitive the policy-reload sweeps drive. A v5 client is told why
+    /// (DISCONNECT `0x87` Not authorized) before the close; v3.1.1 has no server
+    /// DISCONNECT, so its connection just closes. Ends like any ungraceful
+    /// disconnect: the will is published and session retention (ADR 0009)
+    /// proceeds normally. Evicting an offline client is a no-op.
+    Evict {
+        /// The client whose session to terminate.
+        client: ClientId,
+        /// Why (for the log/audit trail), e.g. `cert-revoked`, `user-removed`.
+        reason: String,
     },
 
     /// A peer node's link came up; register it and send our interest snapshot.
@@ -964,7 +1022,7 @@ impl Hub {
         match cmd {
             HubCommand::Attach {
                 client,
-                owner,
+                admission,
                 conn_id,
                 clean_start,
                 session_expiry,
@@ -976,7 +1034,7 @@ impl Hub {
                 self.attach(
                     PendingAttach {
                         client,
-                        owner,
+                        admission,
                         conn_id,
                         session_expiry,
                         receive_maximum,
@@ -1031,6 +1089,9 @@ impl Hub {
                 graceful,
             } => {
                 self.detach(&client, conn_id, graceful).await;
+            }
+            HubCommand::Evict { client, reason } => {
+                self.evict(&client, &reason).await;
             }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
@@ -1396,7 +1457,7 @@ impl Hub {
             SessionRecovery::Denied { owner } => {
                 warn!(
                     client = %pending.client.0,
-                    claimant = %pending.owner,
+                    claimant = %pending.admission.subject,
                     owner = %owner,
                     "session-identity mismatch: a different principal may not resume/take over \
                      this persistent session; rejecting CONNECT (ADR 0031)"
@@ -1419,8 +1480,10 @@ impl Hub {
     ) {
         let PendingAttach {
             client,
-            // The owner was bound/verified during recovery (claim_session); not needed here.
-            owner: _,
+            // The owner (admission.subject) was bound/verified during recovery
+            // (claim_session); the facts are kept with the online entry for the
+            // reload sweep (ADR 0040).
+            admission,
             conn_id,
             session_expiry,
             receive_maximum,
@@ -1481,6 +1544,7 @@ impl Hub {
                 conn_id,
                 tx: outbound.clone(),
                 will,
+                admission,
             },
         );
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
@@ -2044,6 +2108,26 @@ impl Hub {
         if completed {
             self.drain_backlog(client).await;
         }
+    }
+
+    /// Terminate a client's live session server-side (ADR 0040 T1). See
+    /// [`HubCommand::Evict`]. Routes through [`detach`](Self::detach) so session
+    /// retention, the will, and backlog spill behave exactly as for any other
+    /// ungraceful end — the DISCONNECT (v5 only) is queued first and drains to the
+    /// wire before the dropped outbound closes the writer.
+    async fn evict(&mut self, client: &ClientId, reason: &str) {
+        let Some(online) = self.online.get(client) else {
+            return;
+        };
+        warn!(client = %client.0, reason, "evicting live session");
+        if online.admission.protocol == ProtocolVersion::V5 {
+            let _ = online.tx.send(Packet::Disconnect(Disconnect {
+                reason: mqtt_codec::reason::NOT_AUTHORIZED,
+                properties: mqtt_codec::Properties::new(),
+            }));
+        }
+        let conn_id = online.conn_id;
+        self.detach(client, conn_id, false).await;
     }
 
     async fn detach(&mut self, client: &ClientId, conn_id: u64, graceful: bool) {
@@ -3047,7 +3131,7 @@ async fn recover_session(
     self_tx: mpsc::UnboundedSender<HubCommand>,
     pending: PendingAttach,
 ) {
-    let recovery = recover_until_ready(&store, &pending.client, &pending.owner).await;
+    let recovery = recover_until_ready(&store, &pending.client, &pending.admission.subject).await;
     let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
 }
 
@@ -3140,8 +3224,9 @@ mod tests {
     }
 
     use super::{
-        AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound,
-        RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, REPLAY_LIMIT,
+        Admission, AttachOutcome, AuthMethod, Backlog, Hub, HubCommand, Inflight, Outbound,
+        PeerOutbound, ProtocolVersion, RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG,
+        REPLAY_LIMIT,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
@@ -3211,6 +3296,16 @@ mod tests {
         tx
     }
 
+    /// A password-admitted v3.1.1 [`Admission`] for `subject` — the common test shape.
+    fn admission(subject: &str) -> Admission {
+        Admission {
+            subject: subject.to_string(),
+            method: AuthMethod::Password,
+            cert_serial: None,
+            protocol: ProtocolVersion::V311,
+        }
+    }
+
     /// Send a persistent (resume) `Attach` and return the raw [`AttachOutcome`] so a
     /// test can assert a reject (`Unavailable`) as well as a present/absent session.
     async fn attach_outcome(tx: &HubTx, client: &str, conn_id: u64) -> AttachOutcome {
@@ -3218,7 +3313,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            owner: client.to_string(),
+            admission: admission(client),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -3244,7 +3339,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            owner: owner.to_string(),
+            admission: admission(owner),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -3498,7 +3593,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            owner: client.to_string(),
+            admission: admission(client),
             conn_id,
             clean_start,
             session_expiry,
@@ -3796,6 +3891,105 @@ mod tests {
             payload_of(&recv_packet(&mut rx2).await.unwrap()),
             b"still-live",
             "a stale detach must not deregister the new connection"
+        );
+    }
+
+    /// ADR 0040 T1: the eviction primitive. Evicting a live v5 client sends
+    /// DISCONNECT 0x87 (Not authorized) and closes its connection; its will is
+    /// published (an eviction is an ungraceful end, MQTT-3.14.4-3); an untouched
+    /// client keeps flowing; and evicting an offline client is a no-op.
+    #[tokio::test]
+    async fn eviction_disconnects_the_target_and_leaves_others_undisturbed() {
+        let tx = start_hub();
+
+        // A bystander subscribed to the victim's will topic.
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "wills/victim");
+
+        // The victim: a v5 client with a will, admitted by certificate.
+        let (out_tx, mut victim): (Outbound, _) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId("victim".into()),
+            admission: Admission {
+                subject: "victim".into(),
+                method: AuthMethod::Certificate,
+                cert_serial: Some(vec![0x0a, 0x0b]),
+                protocol: ProtocolVersion::V5,
+            },
+            conn_id: 2,
+            clean_start: true,
+            session_expiry: 0,
+            receive_maximum: u16::MAX,
+            will: Some(mqtt_core::Message {
+                topic: "wills/victim".into(),
+                payload: Bytes::from_static(b"gone"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+            }),
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        tx.send(HubCommand::Evict {
+            client: ClientId("victim".into()),
+            reason: "cert-revoked".into(),
+        })
+        .unwrap();
+
+        // The victim is told why (v5), then its connection closes.
+        match recv_packet(&mut victim).await {
+            Some(Packet::Disconnect(d)) => assert_eq!(
+                d.reason, 0x87,
+                "an evicted v5 client gets DISCONNECT Not authorized"
+            ),
+            other => panic!("expected DISCONNECT 0x87, got {other:?}"),
+        }
+        assert!(
+            recv_packet(&mut victim).await.is_none(),
+            "the evicted connection must be closed"
+        );
+
+        // The will reached the bystander, whose own connection is untouched.
+        match recv_packet(&mut watcher).await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(p.topic, "wills/victim");
+                assert_eq!(&p.payload[..], b"gone");
+            }
+            other => panic!("expected the victim's will, got {other:?}"),
+        }
+
+        // Evicting an offline/unknown client is a no-op — the hub keeps serving.
+        tx.send(HubCommand::Evict {
+            client: ClientId("missing".into()),
+            reason: "user-removed".into(),
+        })
+        .unwrap();
+        publish(&tx, "wills/victim", b"still-serving");
+        assert_eq!(
+            payload_of(&recv_packet(&mut watcher).await.unwrap()),
+            b"still-serving"
+        );
+    }
+
+    /// ADR 0040 T1: v3.1.1 has no server DISCONNECT — an evicted v3.1.1 client's
+    /// connection just closes, with no packet first.
+    #[tokio::test]
+    async fn evicting_a_v311_client_closes_without_a_disconnect_packet() {
+        let tx = start_hub();
+        // The test helpers admit at v3.1.1 (see `admission`).
+        let (mut rx, _) = attach(&tx, "v3", 1, true).await;
+        tx.send(HubCommand::Evict {
+            client: ClientId("v3".into()),
+            reason: "user-removed".into(),
+        })
+        .unwrap();
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a v3.1.1 eviction is a bare close — no DISCONNECT exists to send"
         );
     }
 
@@ -6050,7 +6244,7 @@ mod tests {
         let (reply_tx, mut a_reply) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("a".into()),
-            owner: "a".to_string(),
+            admission: admission("a"),
             conn_id: 1,
             clean_start: false,
             session_expiry: u32::MAX,

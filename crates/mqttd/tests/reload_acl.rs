@@ -125,7 +125,17 @@ async fn start_reloadable_node(
             });
             let hub = hub_tx.clone();
             tokio::spawn(async move {
-                mqttd::conn::handle_stream(stream, Some(peer), identity, conn_policy, hub).await;
+                mqttd::conn::handle_stream(
+                    stream,
+                    Some(peer),
+                    identity.map(|identity| mqttd::conn::CertAdmission {
+                        identity,
+                        serial: None,
+                    }),
+                    conn_policy,
+                    hub,
+                )
+                .await;
             });
         }
     });

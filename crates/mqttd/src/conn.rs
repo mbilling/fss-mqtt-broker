@@ -9,7 +9,7 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{AttachOutcome, HubCommand, Outbound};
+use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, AllowAll, AuthSession, AuthStep, Authenticator, Authorizer,
@@ -127,16 +127,38 @@ static CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Counter for server-assigned client ids (empty-id clients).
 static AUTO_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Extract the mTLS identity (ADR 0004) from an accepted server-side TLS
-/// stream: the chain-verified leaf certificate's Subject Common Name.
+/// A TLS-verified client-certificate admission (ADR 0004): the extracted identity
+/// plus the leaf's serial number — the server-side fact a CRL revocation sweep
+/// re-checks against a reloaded policy (ADR 0040 T1).
+#[derive(Debug, Clone)]
+pub struct CertAdmission {
+    /// The broker identity (Subject CN) of the verified leaf.
+    pub identity: Identity,
+    /// The leaf's serial number (big-endian bytes as encoded in the certificate);
+    /// `None` when no live TLS leaf exists at this hop (a vouched proxied session,
+    /// ADR 0005 — the landing node holds the actual TLS session).
+    pub serial: Option<Vec<u8>>,
+}
+
+/// Extract the mTLS admission (ADR 0004/0040) from an accepted server-side TLS
+/// stream: the chain-verified leaf certificate's Subject Common Name and serial.
 ///
 /// Returns `None` when no client certificate was presented, or when a verified
 /// certificate carries no usable CN (logged — such a client can only proceed
 /// as anonymous, which the default policy denies).
-pub fn tls_identity<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Identity> {
+pub fn tls_admission<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<CertAdmission> {
     let leaf = tls.get_ref().1.peer_certificates()?.first()?;
+    cert_admission(leaf)
+}
+
+/// Build a [`CertAdmission`] from a chain-verified DER leaf certificate (shared by
+/// the TLS/WSS listeners and the QUIC handshake).
+pub fn cert_admission(leaf: &[u8]) -> Option<CertAdmission> {
     match mqtt_auth::mtls::identity_from_cert(leaf) {
-        Ok(identity) => Some(identity),
+        Ok(identity) => Some(CertAdmission {
+            identity,
+            serial: mqtt_auth::mtls::serial_from_cert(leaf),
+        }),
         Err(e) => {
             warn!(error = %e, "client certificate verified but has no usable Common Name");
             None
@@ -273,26 +295,26 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
 
 /// Drive one accepted connection over any transport (TCP, TLS) to completion,
 /// logging any error. `peer` is the remote address, for diagnostics only.
-/// `identity` is the TLS-verified mTLS identity, `None` on plaintext or
-/// no-client-cert connections; `policy` decides authentication, authorization,
-/// and auditing.
+/// `cert` is the TLS-verified mTLS admission (identity + leaf serial), `None` on
+/// plaintext or no-client-cert connections; `policy` decides authentication,
+/// authorization, and auditing.
 pub async fn handle_stream<S>(
     stream: S,
     peer: Option<SocketAddr>,
-    identity: Option<Identity>,
+    cert: Option<CertAdmission>,
     policy: Arc<ConnPolicy>,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = run(stream, identity, &policy, hub).await {
+    if let Err(e) = run(stream, cert, &policy, hub).await {
         warn!(?peer, error = %e, "connection ended with error");
     }
 }
 
 async fn run<S>(
     stream: S,
-    identity: Option<Identity>,
+    cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
 ) -> Result<(), NetError>
@@ -304,7 +326,7 @@ where
     let writer = FrameWriter::new(wh, ProtocolVersion::V311);
     // A directly-accepted client may be relocated to its placement owner; it has no
     // relaying node (`via = None`).
-    run_framed(reader, writer, identity, policy, hub, true, None).await
+    run_framed(reader, writer, cert, policy, hub, true, None).await
 }
 
 /// Serve an MQTT connection over already-framed halves. `allow_proxy` is `true`
@@ -416,7 +438,7 @@ async fn read_connect<R: AsyncRead + Unpin>(
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
-    identity: Option<Identity>,
+    cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
     allow_proxy: bool,
@@ -445,12 +467,12 @@ where
 
     // Authentication gate: verify credentials BEFORE attaching to the hub, so a
     // rejected client never touches session state (enhanced exchange or single-shot).
-    let Some(principal) = authenticate(
+    let Some((principal, auth_method)) = authenticate(
         &mut reader,
         &mut writer,
         &client,
         &connect,
-        identity.as_ref(),
+        cert.as_ref().map(|c| &c.identity),
         policy,
         via,
     )
@@ -507,7 +529,12 @@ where
     if hub
         .send(HubCommand::Attach {
             client: client.clone(),
-            owner: principal.subject.clone(),
+            admission: Admission {
+                subject: principal.subject.clone(),
+                method: auth_method,
+                cert_serial: cert.and_then(|c| c.serial),
+                protocol: connect.protocol,
+            },
             conn_id,
             clean_start,
             session_expiry,
@@ -698,8 +725,13 @@ pub async fn serve_proxied<R, W>(
     let reader = FrameReader::with_buffer(client_rh, ProtocolVersion::V311, prefix);
     let writer = FrameWriter::new(client_wh, ProtocolVersion::V311);
     // A proxied session is never re-proxied (`allow_proxy = false`); `via` is the
-    // relaying node, recorded in the auth audit.
-    if let Err(e) = run_framed(reader, writer, identity, &policy, hub, false, via).await {
+    // relaying node, recorded in the auth audit. The vouched identity carries no
+    // leaf serial — the landing node holds the actual TLS session (ADR 0040 T1).
+    let cert = identity.map(|identity| CertAdmission {
+        identity,
+        serial: None,
+    });
+    if let Err(e) = run_framed(reader, writer, cert, &policy, hub, false, via).await {
         warn!(?peer, error = %e, "proxied session ended with error");
     }
 }
@@ -794,13 +826,17 @@ async fn authenticate<R, W>(
     identity: Option<&Identity>,
     policy: &ConnPolicy,
     via: Option<String>,
-) -> Result<Option<Identity>, NetError>
+) -> Result<Option<(Identity, AuthMethod)>, NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     if let Some(method) = connect.properties.authentication_method() {
-        enhanced_auth(reader, writer, client, connect, method, policy).await
+        Ok(
+            enhanced_auth(reader, writer, client, connect, method, policy)
+                .await?
+                .map(|id| (id, AuthMethod::Enhanced)),
+        )
     } else {
         authenticate_connect(writer, client, connect, identity, policy, via).await
     }
@@ -819,7 +855,7 @@ async fn authenticate_connect<W>(
     identity: Option<&Identity>,
     policy: &ConnPolicy,
     via: Option<String>,
-) -> Result<Option<Identity>, NetError>
+) -> Result<Option<(Identity, AuthMethod)>, NetError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -832,6 +868,12 @@ where
             password: connect.password.as_deref().unwrap_or(&[]),
         },
         (None, None) => Credentials::Anonymous,
+    };
+    let auth_method = match creds {
+        Credentials::ClientCert { .. } => AuthMethod::Certificate,
+        Credentials::Password { .. } => AuthMethod::Password,
+        Credentials::Token(_) => AuthMethod::Token,
+        Credentials::Anonymous => AuthMethod::Anonymous,
     };
     let method = match creds {
         Credentials::ClientCert { .. } => "certificate",
@@ -849,7 +891,7 @@ where
                 Some(&id.subject),
                 &format!("client {} via {method}{relayed}", client.0),
             );
-            Ok(Some(id))
+            Ok(Some((id, auth_method)))
         }
         Err(e) => {
             let code = if matches!(creds, Credentials::Password { .. }) {

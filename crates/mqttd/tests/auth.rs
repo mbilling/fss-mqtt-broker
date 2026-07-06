@@ -49,7 +49,10 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
             tokio::spawn(mqttd::conn::handle_stream(
                 stream,
                 None,
-                identity.clone(),
+                identity.clone().map(|identity| mqttd::conn::CertAdmission {
+                    identity,
+                    serial: None,
+                }),
                 policy,
                 hub_tx.clone(),
             ));
