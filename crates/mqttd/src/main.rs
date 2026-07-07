@@ -299,6 +299,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
     });
     reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
+    // The hub consults the live authorizer when a persistent session resumes
+    // (ADR 0040 T3): grants a tightening reload revoked while the session slept are
+    // removed at resume, before any replay. Sent before any listener accepts.
+    let _ = hub_tx.send(mqttd::hub::HubCommand::AttachAuthorizer(
+        mqttd::hub::AuthzWatch(policy.authz.clone()),
+    ));
 
     start_client_listeners(hub_tx, policy, &mut reloader, &shutdown, &connections).await?;
 

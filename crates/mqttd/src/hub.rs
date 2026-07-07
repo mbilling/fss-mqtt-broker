@@ -206,6 +206,18 @@ impl std::fmt::Debug for SweepPolicy {
     }
 }
 
+/// The live authorizer handle the hub consults for resume-time grant re-checks
+/// (ADR 0040 T3) — the same `watch` channel the connections read, so the hub and
+/// the admission path always see the same policy. A newtype so [`HubCommand`]
+/// stays `Debug`.
+pub struct AuthzWatch(pub tokio::sync::watch::Receiver<Arc<dyn mqtt_auth::Authorizer>>);
+
+impl std::fmt::Debug for AuthzWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthzWatch").finish_non_exhaustive()
+    }
+}
+
 /// A currently-online client connection.
 #[derive(Debug)]
 struct Online {
@@ -484,9 +496,16 @@ pub enum HubCommand {
         reason: String,
     },
     /// A successful security reload published a new policy — sweep the online table
-    /// against it (ADR 0040 T2): identity-level revocation terminates sessions.
-    /// Sent by the [`Reloader`](crate::reload::Reloader) after the swap.
+    /// against it (ADR 0040 T2/T3): identity-level revocation terminates sessions;
+    /// permission-level tightening removes subscription grants. Sent by the
+    /// [`Reloader`](crate::reload::Reloader) after the swap.
     SweepIdentities(SweepPolicy),
+    /// Hand the hub the live authorizer handle (ADR 0040 T3), consulted when a
+    /// persistent session resumes: restored subscriptions are re-authorized under
+    /// the resuming principal's full identity, so an offline session's tightened
+    /// grants are revoked at the moment delivery could resume. Sent once at
+    /// startup, before any listener accepts.
+    AttachAuthorizer(AuthzWatch),
 
     /// A peer node's link came up; register it and send our interest snapshot.
     PeerConnected {
@@ -744,6 +763,10 @@ pub struct Hub {
     /// addition to the local cache above. `None` (durable off) keeps ADR 0014
     /// best-effort behaviour unchanged.
     durable_retained: Option<Arc<dyn DurableRetained>>,
+    /// The live authorizer for resume-time grant re-checks (ADR 0040 T3); `None`
+    /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
+    /// without a reloadable policy keep today's restore-as-persisted behavior.
+    authz: Option<AuthzWatch>,
     /// The `(epoch, offset)` convergence token each cached retained topic was applied
     /// at (ADR 0037 §3): a fan-out/back-fill value is applied only when its token
     /// exceeds the held one — monotonic per topic, idempotent, order-insensitive. A
@@ -972,6 +995,7 @@ impl Hub {
                 durable_plane: None,
                 retained: Box::new(MemoryRetainedStore::new()),
                 durable_retained: None,
+                authz: None,
                 retained_tokens: HashMap::new(),
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
@@ -1127,6 +1151,10 @@ impl Hub {
             }
             HubCommand::SweepIdentities(policy) => {
                 self.sweep_identities(&policy).await;
+                self.sweep_grants(&policy).await;
+            }
+            HubCommand::AttachAuthorizer(watch) => {
+                self.authz = Some(watch);
             }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
@@ -1527,6 +1555,25 @@ impl Hub {
             reply,
         } = pending;
 
+        // Revocation reaches resumed grants (ADR 0040 T3): re-authorize each restored
+        // subscription against the CURRENT policy, under the resuming principal's
+        // full identity (fresh from authentication — groups included). A persistent
+        // session that slept through a tightening reload has its revoked grants
+        // removed at the moment delivery could resume; queued messages that only a
+        // revoked grant admits are dropped below. No authorizer attached = no
+        // re-check (harnesses without a reloadable policy).
+        let (subscriptions, revoked_grants): (Vec<Subscription>, Vec<Subscription>) =
+            match &self.authz {
+                Some(rx) => {
+                    let authorizer = rx.0.borrow().clone();
+                    subscriptions.into_iter().partition(|s| {
+                        authorizer.authorize_subscribe(&admission.identity, &s.filter)
+                    })
+                }
+                None => (subscriptions, Vec::new()),
+            };
+        let revoked_grants: Vec<String> = revoked_grants.into_iter().map(|s| s.filter).collect();
+
         // Reconcile the routing table with persisted subscriptions (idempotent; empty
         // for a clean start).
         for s in subscriptions {
@@ -1540,6 +1587,19 @@ impl Hub {
                 .entry(client.clone())
                 .or_default()
                 .insert(s.filter, s.max_qos);
+        }
+        if !revoked_grants.is_empty() {
+            warn!(
+                client = %client.0,
+                filters = ?revoked_grants,
+                "resume: tightened ACL revokes persisted subscriptions (ADR 0040 T3)"
+            );
+            // A live routing table may still carry the offline session's revoked
+            // grants (that is how offline queueing works) — remove them there too,
+            // and persist the pruned set so the revocation is durable. AFTER the
+            // reconcile above, so the persisted result is exactly the surviving set
+            // (a fresh hub's empty maps would otherwise persist an empty set).
+            self.unsubscribe(&client, &revoked_grants).await;
         }
 
         // Record this session's retention: it survives disconnect iff the expiry
@@ -1618,6 +1678,25 @@ impl Hub {
                 let mut last = 0;
                 for qm in pending {
                     last = qm.offset;
+                    // A queued message that only a revoked grant admits is dropped
+                    // (ADR 0040 T3): delivering it would leak data the new policy
+                    // denies. A topic a surviving grant also matches still replays.
+                    if !revoked_grants.is_empty() {
+                        let topic = &qm.message.topic;
+                        let admits = |f: &String| {
+                            let f = parse_shared(f).map_or(f.as_str(), |(_, inner)| inner);
+                            topic_matches(f, topic)
+                        };
+                        let survives = self
+                            .subs_by_client
+                            .get(&client)
+                            .is_some_and(|m| m.keys().any(admits));
+                        if revoked_grants.iter().any(admits) && !survives {
+                            debug!(client = %client.0, offset = qm.offset, %topic,
+                                   "dropping queued message for a revoked grant (ADR 0040 T3)");
+                            continue;
+                        }
+                    }
                     match qm.expiry_at {
                         Some(deadline) if deadline <= now => {
                             debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
@@ -2192,6 +2271,49 @@ impl Hub {
                 &format!("{reason} (trigger={})", policy.trigger),
             );
             self.evict(&client, reason).await;
+        }
+    }
+
+    /// The grant sweep (ADR 0040 T3): re-authorize every surviving online session's
+    /// subscription grants against the freshly-reloaded ACL — under the identity the
+    /// session was admitted with — and remove the grants the new policy denies, from
+    /// live routing and the durable subscription set alike. The client is NOT
+    /// disconnected: who it is remains valid, only what it may read shrank. Its next
+    /// SUBSCRIBE re-attempt is denied at the admission-path check like any new
+    /// operation. Offline sessions are re-checked at resume (see
+    /// [`finish_attach`](Self::finish_attach)), where the resuming principal's full
+    /// identity is available.
+    async fn sweep_grants(&mut self, policy: &SweepPolicy) {
+        // The same raw filter string the SUBSCRIBE-time check authorized (including
+        // any `$share/` prefix), so sweep-time and admission-time verdicts align.
+        let revocations: Vec<(ClientId, Vec<String>)> = self
+            .online
+            .iter()
+            .filter_map(|(client, online)| {
+                let identity = &online.admission.identity;
+                let revoked: Vec<String> = self
+                    .subs_by_client
+                    .get(client)?
+                    .keys()
+                    .filter(|f| !policy.authorizer.authorize_subscribe(identity, f))
+                    .cloned()
+                    .collect();
+                (!revoked.is_empty()).then(|| (client.clone(), revoked))
+            })
+            .collect();
+        for (client, filters) in revocations {
+            warn!(
+                client = %client.0,
+                filters = ?filters,
+                trigger = %policy.trigger,
+                "grant sweep: tightened ACL revokes live subscriptions (ADR 0040)"
+            );
+            policy.audit.record(
+                "security.evict",
+                Some(&client.0),
+                &format!("grant-revoked {filters:?} (trigger={})", policy.trigger),
+            );
+            self.unsubscribe(&client, &filters).await;
         }
     }
 
@@ -4179,6 +4301,130 @@ mod tests {
                 "missing security.evict audit for {reason}: {events:?}"
             );
         }
+    }
+
+    /// ADR 0040 T3: the grant sweep. A reload that tightens a subscriber's read
+    /// access removes the revoked grant from live routing — delivery stops, durably —
+    /// while the client stays CONNECTED and its untouched grants keep flowing. The
+    /// grant removal is audited.
+    #[tokio::test]
+    async fn the_grant_sweep_removes_revoked_subscriptions_without_disconnecting() {
+        use mqtt_auth::signed_gossip::RevocationList;
+        use mqtt_auth::Identity;
+
+        /// Denies subscriptions to `secret/#`; permits everything else.
+        struct DenySecret;
+        impl mqtt_auth::Authorizer for DenySecret {
+            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_subscribe(&self, _: &Identity, filter: &String) -> bool {
+                !filter.starts_with("secret/")
+            }
+        }
+
+        let tx = start_hub();
+        let (mut reader, _) = attach(&tx, "reader", 1, true).await;
+        subscribe(&tx, "reader", "secret/#");
+        subscribe(&tx, "reader", "ok/#");
+        publish(&tx, "secret/1", b"s1");
+        assert_eq!(payload_of(&recv_packet(&mut reader).await.unwrap()), b"s1");
+
+        let audit = Arc::new(mqtt_observability::RecordingAuditSink::default());
+        tx.send(HubCommand::SweepIdentities(super::SweepPolicy {
+            authorizer: Arc::new(DenySecret),
+            authenticator: Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            revoked: RevocationList::default(),
+            trigger: "signal".into(),
+            audit: audit.clone(),
+        }))
+        .unwrap();
+
+        // The revoked grant stops delivering; the untouched grant and the
+        // connection itself keep working.
+        publish(&tx, "secret/2", b"s2");
+        publish(&tx, "ok/1", b"fine");
+        assert_eq!(
+            payload_of(&recv_packet(&mut reader).await.unwrap()),
+            b"fine",
+            "only the surviving grant may deliver after the sweep"
+        );
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|e| e.kind == "security.evict" && e.detail.contains("grant-revoked")),
+            "the grant removal must be audited"
+        );
+    }
+
+    /// ADR 0040 T3: resume-time grant revocation. A persistent session that slept
+    /// through a tightening reload has its revoked grants removed when it resumes —
+    /// re-checked under the resuming principal's identity against the CURRENT
+    /// policy — and queued messages that only a revoked grant admits are dropped
+    /// from the replay, durably.
+    #[tokio::test]
+    async fn a_resumed_session_loses_grants_the_current_policy_denies() {
+        use mqtt_auth::{AllowAll, Identity};
+
+        struct DenySecret;
+        impl mqtt_auth::Authorizer for DenySecret {
+            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_subscribe(&self, _: &Identity, filter: &String) -> bool {
+                !filter.starts_with("secret/")
+            }
+        }
+
+        let tx = start_hub();
+        // The hub consults this live handle at resume, exactly like the connections do.
+        let (authz_tx, authz_rx) =
+            tokio::sync::watch::channel(Arc::new(AllowAll) as Arc<dyn mqtt_auth::Authorizer>);
+        tx.send(HubCommand::AttachAuthorizer(super::AuthzWatch(authz_rx)))
+            .unwrap();
+
+        // A persistent subscriber sleeps with two granted filters...
+        let (_rx, _) = attach(&tx, "sleeper", 1, false).await;
+        subscribe(&tx, "sleeper", "secret/#");
+        subscribe(&tx, "sleeper", "ok/#");
+        tx.send(HubCommand::Detach {
+            client: ClientId("sleeper".into()),
+            conn_id: 1,
+            graceful: true,
+        })
+        .unwrap();
+
+        // ...misses two QoS 1 messages (both queued)...
+        publish_qos1(&tx, "secret/1", b"leaked?");
+        publish_qos1(&tx, "ok/1", b"kept");
+
+        // ...and the policy tightens while it sleeps.
+        authz_tx
+            .send(Arc::new(DenySecret) as Arc<dyn mqtt_auth::Authorizer>)
+            .unwrap();
+
+        // On resume: the revoked grant is gone, its queued message is NOT replayed,
+        // the surviving grant's message is.
+        let (mut rx, present) = attach(&tx, "sleeper", 2, false).await;
+        assert!(present, "the persistent session must still be present");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"kept",
+            "only the surviving grant's queued message may replay"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the revoked grant's queued message must not replay"
+        );
+        // New traffic on the revoked filter no longer routes to the session...
+        publish(&tx, "secret/2", b"s2");
+        assert!(recv_packet(&mut rx).await.is_none());
+        // ...while the surviving grant keeps flowing.
+        publish(&tx, "ok/2", b"still");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"still");
     }
 
     /// ADR 0040 T1: v3.1.1 has no server DISCONNECT — an evicted v3.1.1 client's
