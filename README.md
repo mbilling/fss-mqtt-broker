@@ -73,6 +73,12 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   a missing or unparseable file is rejected and the running policy is kept intact
   (never fail open, never brick); every reload is audited and metered
   ([ADR 0032](docs/adr/0032-hot-reloadable-security-policy.md)).
+- **Revocation reaches live state**: a successful reload **sweeps** live sessions,
+  subscription grants, and peer links against the new policy — a CRL'd certificate, a
+  removed user, or a connect-ACL deny evicts the live session; a tightened subscribe-ACL
+  stops existing flows; a cluster-CRL'd node's established links are torn down. Identity
+  revoked → session ends; permission revoked → flow ends
+  ([ADR 0040](docs/adr/0040-revocation-reaches-live-state.md)).
 - **Tamper-evident audit log**: a hash-chained record of auth and authorization
   decisions (no credential ever reaches it).
 - **Secure by default**: plaintext listeners, anonymous access, an unkeyed
@@ -231,7 +237,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
 | `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
 | `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN |
-| `MQTTD_TLS_CRL` | Certificate revocation list (PEM; needs `…_CLIENT_CA`). A client whose cert is listed is refused at the TLS handshake; re-read on `SIGHUP`, so a published CRL applies with no restart (ADR 0002) |
+| `MQTTD_TLS_CRL` | Certificate revocation list (PEM; needs `…_CLIENT_CA`). A client whose cert is listed is refused at the TLS handshake **and its live session is evicted on reload** (ADR 0002/0040); re-read on `SIGHUP`, so a published CRL applies with no restart |
 | `MQTTD_WSS_BIND` | MQTT-over-WebSocket **over TLS** (`wss://`), e.g. `0.0.0.0:8884` (ADR 0035; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA` — same TLS 1.3 + mTLS + hot reload as the TLS listener) |
 | `MQTTD_WS_BIND` | **Insecure** plaintext MQTT-over-WebSocket (`ws://`) — for browsers in local/dev only (ADR 0035) |
 | `MQTTD_QUIC_BIND` | MQTT-over-QUIC (UDP), e.g. `0.0.0.0:8885` (ADR 0036; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA`). QUIC mandates TLS 1.3 (no plaintext mode); **multi-stream** (one session across many streams, no head-of-line blocking); **non-standard** (EMQX-style), identity = leaf CN, no 0-RTT for CONNECT |
@@ -252,7 +258,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 |---|---|
 | `MQTTD_PEER_BIND` | Inter-node peer listener, e.g. `0.0.0.0:7001` |
 | `MQTTD_PEER_TLS_CA` / `…_CERT` / `…_KEY` | Cluster-bus mTLS material (set all three). A leaf whose SANs include `URI:urn:fss:failure-domain:<label>` has its failure domain **CA-attested** (ADR 0016 T6): the label is authoritative on the gossip plane (a contradicting self-claim is rejected) and can replace `MQTTD_FAILURE_DOMAIN` entirely — relabel by reissuing the cert |
-| `MQTTD_PEER_TLS_CRL` | Cluster-bus CRL (PEM, **signed by the cluster CA**; needs the three above). Signed gossip from a revoked cert is dropped (ADR 0022 T7); expired/not-yet-valid certs are rejected regardless. Hot-reloads via `SIGHUP`/`MQTTD_CONFIG_WATCH`, so publishing a CRL evicts a compromised node with no restart |
+| `MQTTD_PEER_TLS_CRL` | Cluster-bus CRL (PEM, **signed by the cluster CA**; needs the three above). Signed gossip from a revoked cert is dropped (ADR 0022 T7), fresh peer handshakes are refused in both directions, and **established peer links are torn down on reload** (ADR 0040); expired/not-yet-valid certs are rejected regardless. Hot-reloads via `SIGHUP`/`MQTTD_CONFIG_WATCH`, so publishing a CRL evicts a compromised node with no restart |
 | `MQTTD_PEERS` | Comma-separated static peer addresses (alternative to gossip) |
 | `MQTTD_SWIM_BIND` | SWIM gossip UDP bind (needs `MQTTD_PEER_BIND`) |
 | `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
@@ -293,9 +299,34 @@ The broker re-reads the configured files in place and swaps them on **live** con
   publish/subscribe; a loosened rule takes effect immediately.
 - **Authenticators** (`MQTTD_PASSWORD_FILE`, `MQTTD_JWT_*`) — a rotated password file or JWT
   key authenticates the new credential and rejects the old on the next CONNECT.
-- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA` / `…_CRL`) — a renewed
-  certificate, or an updated **CRL**, is served on the next handshake; **in-flight TLS
-  sessions are undisturbed**. A newly-revoked client cert is refused from the next handshake.
+- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA` / `…_CRL`, and the peer-bus
+  `MQTTD_PEER_TLS_*` trio) — a renewed certificate is served on the next handshake;
+  in-flight TLS sessions of *non-revoked* certs are undisturbed (rotation never drops a
+  valid session).
+
+**Revocation reaches live state (ADR 0040).** A successful reload also **sweeps** what is
+already connected, with a two-tier rule — *who you are* revoked ends the session; *what you
+may read* revoked ends the flow:
+
+- a client whose certificate the new **CRL** names, whose **password user was removed**, or
+  whose principal the new **connect-ACL** denies is **disconnected immediately** (MQTT 5
+  clients get `DISCONNECT 0x87 Not authorized`; MQTT 3.1.1 has no server DISCONNECT, so the
+  connection just closes; the will is published and session retention proceeds normally);
+- an existing **subscription** whose filter the tightened ACL denies stops delivering — it
+  is removed from routing *and* the durable session set (offline sessions are re-checked at
+  resume, and queued messages only the revoked grant admits are not replayed). The client
+  stays connected; its next SUBSCRIBE is denied;
+- an established **peer link** whose remote certificate the new cluster CRL
+  (`MQTTD_PEER_TLS_CRL`) revokes is torn down, and the revoked node cannot re-handshake in
+  either direction. The mesh reacts as to any link loss.
+
+An unchanged policy evicts no one (the sweep re-derives each admission verdict, so only
+differences act). Each action emits a `security.evict` audit event with its reason
+(`cert-revoked`, `user-removed`, `connect-denied`, `grant-revoked`, `peer-revoked`) and
+increments `mqttd_revocation_evictions_total{reason}`; every sweep leaves one
+`security.sweep` summary record with the counts. Durable session *state* of a removed user
+is not destroyed — it is unreachable (resume fails at authentication; a different subject is
+refused by the ADR 0031 owner binding) and expires on schedule.
 
 The reload is **validate-before-swap and all-or-nothing**: every file is parsed first, and
 the swap is applied only if *all* succeed. A missing or unparseable file is **rejected** —

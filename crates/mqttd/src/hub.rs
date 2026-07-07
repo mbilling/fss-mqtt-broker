@@ -1160,9 +1160,19 @@ impl Hub {
                 self.evict(&client, &reason).await;
             }
             HubCommand::SweepIdentities(policy) => {
-                self.sweep_identities(&policy).await;
-                self.sweep_grants(&policy).await;
-                self.sweep_peers(&policy);
+                let identities = self.sweep_identities(&policy).await;
+                let grants = self.sweep_grants(&policy).await;
+                let peers = self.sweep_peers(&policy);
+                // One summary record per sweep (ADR 0040 T5), zeros included — the
+                // proof the sweep ran is as valuable as what it did.
+                policy.audit.record(
+                    "security.sweep",
+                    None,
+                    &format!(
+                        "identities={identities} grants={grants} peers={peers}                          (trigger={})",
+                        policy.trigger
+                    ),
+                );
             }
             HubCommand::AttachAuthorizer(watch) => {
                 self.authz = Some(watch);
@@ -2248,7 +2258,7 @@ impl Hub {
     /// sweep, T3, handles subscriptions; publish checks are already per-operation).
     /// An unchanged policy evicts no one — every check re-derives the admission
     /// verdict, so only differences act.
-    async fn sweep_identities(&mut self, policy: &SweepPolicy) {
+    async fn sweep_identities(&mut self, policy: &SweepPolicy) -> usize {
         let victims: Vec<(ClientId, &'static str)> = self
             .online
             .iter()
@@ -2273,21 +2283,26 @@ impl Hub {
             })
             .collect();
         if victims.is_empty() {
-            return;
+            return 0;
         }
         info!(
             evictions = victims.len(),
             trigger = %policy.trigger,
             "identity sweep: policy reload revoked live sessions (ADR 0040)"
         );
+        let evicted = victims.len();
         for (client, reason) in victims {
             policy.audit.record(
                 "security.evict",
                 Some(&client.0),
                 &format!("{reason} (trigger={})", policy.trigger),
             );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction(reason);
+            }
             self.evict(&client, reason).await;
         }
+        evicted
     }
 
     /// The grant sweep (ADR 0040 T3): re-authorize every surviving online session's
@@ -2299,7 +2314,7 @@ impl Hub {
     /// operation. Offline sessions are re-checked at resume (see
     /// [`finish_attach`](Self::finish_attach)), where the resuming principal's full
     /// identity is available.
-    async fn sweep_grants(&mut self, policy: &SweepPolicy) {
+    async fn sweep_grants(&mut self, policy: &SweepPolicy) -> usize {
         // The same raw filter string the SUBSCRIBE-time check authorized (including
         // any `$share/` prefix), so sweep-time and admission-time verdicts align.
         let revocations: Vec<(ClientId, Vec<String>)> = self
@@ -2317,6 +2332,7 @@ impl Hub {
                 (!revoked.is_empty()).then(|| (client.clone(), revoked))
             })
             .collect();
+        let mut revoked_grants = 0;
         for (client, filters) in revocations {
             warn!(
                 client = %client.0,
@@ -2329,8 +2345,13 @@ impl Hub {
                 Some(&client.0),
                 &format!("grant-revoked {filters:?} (trigger={})", policy.trigger),
             );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction("grant-revoked");
+            }
+            revoked_grants += filters.len();
             self.unsubscribe(&client, &filters).await;
         }
+        revoked_grants
     }
 
     /// The peer sweep (ADR 0040 T4): tear down established peer links whose remote
@@ -2340,7 +2361,7 @@ impl Hub {
     /// node's datagrams per ADR 0022 T7 — marks it dead; placement and leases
     /// move), and the revoked node cannot re-handshake (both handshake sides gate
     /// on the same live CRL slot).
-    fn sweep_peers(&mut self, policy: &SweepPolicy) {
+    fn sweep_peers(&mut self, policy: &SweepPolicy) -> usize {
         let victims: Vec<NodeId> = self
             .peers
             .iter()
@@ -2351,6 +2372,7 @@ impl Hub {
             })
             .map(|(node, _)| node.clone())
             .collect();
+        let torn_down = victims.len();
         for node in victims {
             warn!(
                 peer = %node.0,
@@ -2362,9 +2384,13 @@ impl Hub {
                 Some(&node.0),
                 &format!("peer-revoked (trigger={})", policy.trigger),
             );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction("peer-revoked");
+            }
             let conn_id = self.peers[&node].conn_id;
             self.peer_disconnected(&node, conn_id);
         }
+        torn_down
     }
 
     /// Terminate a client's live session server-side (ADR 0040 T1). See
@@ -4257,6 +4283,8 @@ mod tests {
     /// pass, the session whose certificate serial is CRL'd, the session whose
     /// password user was removed, and the session the new connect-ACL denies — while
     /// an untouched session keeps flowing. Each eviction is audited with its reason.
+    // One scenario deliberately covers all three eviction classes plus the summary.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn the_identity_sweep_evicts_revoked_sessions_and_spares_the_rest() {
         use mqtt_auth::signed_gossip::RevocationList;
@@ -4366,6 +4394,14 @@ mod tests {
                 "missing security.evict audit for {reason}: {events:?}"
             );
         }
+        // ...and the sweep leaves one summary record with the counts (ADR 0040 T5).
+        assert!(
+            events.iter().any(|e| e.kind == "security.sweep"
+                && e.detail.contains("identities=3")
+                && e.detail.contains("grants=0")
+                && e.detail.contains("peers=0")),
+            "missing the security.sweep summary: {events:?}"
+        );
     }
 
     /// ADR 0040 T3: the grant sweep. A reload that tightens a subscriber's read

@@ -89,6 +89,7 @@ struct OtelInstruments {
     durable_append_failures: OtelCounter<u64>,
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
+    revocation_evictions: OtelCounter<u64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
@@ -122,6 +123,7 @@ impl OtelInstruments {
             durable_append_failures: meter.u64_counter("durable_append_failures").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
+            revocation_evictions: meter.u64_counter("revocation_evictions").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
@@ -166,6 +168,7 @@ pub struct Metrics {
     durable_append_failures_total: Family<ReasonLabel, Counter>,
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
+    revocation_evictions_total: Family<ReasonLabel, Counter>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
     retained_queue_dropped_total: Counter,
@@ -325,6 +328,12 @@ impl Metrics {
             "security_reloads",
             "Hot reloads of the security policy, by outcome (ok, rejected) and trigger (signal, watch)",
         );
+        let revocation_evictions_total = register_family(
+            &mut registry,
+            "revocation_evictions",
+            "Live state revoked by a policy-reload sweep (ADR 0040), by kind \
+             (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked)",
+        );
         let quic_path_migrations_total = register_counter(
             &mut registry,
             "quic_path_migrations",
@@ -378,6 +387,7 @@ impl Metrics {
             durable_append_failures_total,
             gossip_rejected_total,
             security_reloads_total,
+            revocation_evictions_total,
             quic_path_migrations_total,
             retained_divergence_total,
             retained_queue_dropped_total,
@@ -591,6 +601,21 @@ impl Metrics {
                 KeyValue::new("trigger", trigger.to_string()),
             ],
         );
+    }
+
+    /// A policy-reload sweep revoked live state (ADR 0040): a session evicted
+    /// (`cert-revoked` / `user-removed` / `connect-denied`), a subscription grant
+    /// removed (`grant-revoked`), or an established peer link torn down
+    /// (`peer-revoked`). Bounded kinds only — never a per-client value.
+    pub fn revocation_eviction(&self, kind: &str) {
+        self.revocation_evictions_total
+            .get_or_create(&ReasonLabel {
+                reason: kind.to_string(),
+            })
+            .inc();
+        self.otel
+            .revocation_evictions
+            .add(1, &[KeyValue::new("kind", kind.to_string())]);
     }
 
     /// A QUIC connection migrated to a new client path (ADR 0036 §3b): the peer's remote address

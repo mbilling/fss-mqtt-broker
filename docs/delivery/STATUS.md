@@ -47,7 +47,7 @@
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [8/8 done](0037-durable-retained-messages.md) | — |
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
-| [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Proposed | [4/5 done](0040-revocation-reaches-live-state.md) | 1 open |
+| [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 
 ## Open and deferred work
 
@@ -110,7 +110,3 @@
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
-
-**0040 — Revocation reaches live state (eviction on reload)**
-
-- `0040-T5` ⬜ planned: Audit/metrics + closure — security.evict audit events and revocation_evictions_total{kind}; reload audit gains the sweep summary; admission-side durable-resume block pinned by test; README ops note

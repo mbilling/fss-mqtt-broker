@@ -262,3 +262,74 @@ async fn connected_session(addr: SocketAddr, username: &str, password: &str) -> 
         other => panic!("expected CONNACK 0x00, got {other:?}"),
     }
 }
+
+/// ADR 0040 T5 (pinning the ADR §5 decision): a **removed** user cannot resume
+/// their durable session — the block is at admission (authentication fails with
+/// the reloaded store), and the inert session state is unreachable rather than
+/// destroyed. A different, valid principal is refused separately by the ADR 0031
+/// owner binding (covered in the durable-session suites).
+#[tokio::test]
+async fn a_removed_user_cannot_resume_their_durable_session() {
+    let pw = PwFile::new(&format!(
+        "alice:{}\nbob:{}",
+        hash("alice-pw"),
+        hash("bob-pw")
+    ));
+    let (addr, reloader) = start_reloadable_node(pw.path.clone()).await;
+
+    // Bob holds a durable session (v3.1.1 clean_session=0), then disconnects.
+    {
+        let mut bob = connected_session_with(addr, "bob", "bob-pw", false).await;
+        bob.writer.send(&Packet::PingReq).await.unwrap(); // session is live
+        assert!(matches!(
+            timeout(RECV_TIMEOUT, bob.reader.next_packet()).await,
+            Ok(Ok(Some(Packet::PingResp)))
+        ));
+    } // dropped: bob is offline, his durable session retained
+
+    // Bob's user is removed and the policy reloads.
+    pw.write(&format!("alice:{}", hash("alice-pw")));
+    assert!(reloader.reload("signal"), "the rotated file should reload");
+
+    // Resume is blocked at ADMISSION: the same credentials are now rejected, so
+    // the durable session is unreachable (and reaped by expiry, never resumed).
+    assert_eq!(
+        connect_code(addr, "bob", "bob-pw").await,
+        BAD_CREDENTIALS,
+        "a removed user must not authenticate, so their durable session cannot resume"
+    );
+    // The surviving user still connects fine.
+    assert_eq!(connect_code(addr, "alice", "alice-pw").await, 0);
+}
+
+/// Like [`connected_session`], with an explicit `clean_session` flag (a durable
+/// session needs `false`).
+async fn connected_session_with(
+    addr: SocketAddr,
+    username: &str,
+    password: &str,
+    clean_session: bool,
+) -> Session {
+    let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut s = Session {
+        reader: mqtt_net::FrameReader::new(rh, V4),
+        writer: mqtt_net::FrameWriter::new(wh, V4),
+    };
+    s.writer
+        .send(&Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
+            protocol: V4,
+            clean_session,
+            keep_alive: 30,
+            client_id: format!("c-{username}"),
+            last_will: None,
+            username: Some(username.to_string()),
+            password: Some(password.as_bytes().to_vec().into()),
+        }))
+        .await
+        .unwrap();
+    match timeout(RECV_TIMEOUT, s.reader.next_packet()).await {
+        Ok(Ok(Some(Packet::ConnAck(ack)))) if ack.code == 0 => s,
+        other => panic!("expected CONNACK 0x00, got {other:?}"),
+    }
+}

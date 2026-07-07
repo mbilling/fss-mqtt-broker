@@ -1,6 +1,6 @@
 # ADR 0040 — Revocation reaches live state (eviction on reload)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-05
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0040-revocation-reaches-live-state.md](../delivery/0040-revocation-reaches-live-state.md) — plan, progress, and changelog
