@@ -286,6 +286,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
     // local-testing escape hatch. The serve loops stop themselves on `shutdown`. The TLS
     // branch registers its acceptor with the reloader so SIGHUP also rotates cert/key/CA.
+    // Revocation reaches live state (ADR 0040 T2): after every successful reload the
+    // hub sweeps online sessions against the new policy — a CRL'd certificate, a
+    // removed password user, or a connect-ACL deny evicts the live session. The
+    // client-CRL serials mirror the same MQTTD_TLS_CRL file the TLS verifier enforces
+    // per handshake; parsing it is part of the same validate-before-swap reload.
+    let client_crl_build = non_empty_env("MQTTD_TLS_CRL").map(|path| {
+        Box::new(move || {
+            let bytes = std::fs::read(&path).map_err(|e| format!("read client crl {path}: {e}"))?;
+            mqtt_auth::signed_gossip::RevocationList::from_bytes_unverified(&bytes)
+                .map_err(|e| format!("parse client crl {path}: {e}"))
+        }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
+    });
+    reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
+
     start_client_listeners(hub_tx, policy, &mut reloader, &shutdown, &connections).await?;
 
     // Share the (now fully-configured) reloader between the SIGHUP handler and the optional

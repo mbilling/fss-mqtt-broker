@@ -46,6 +46,20 @@ actions = ["subscribe"]
 topics = ["room/#"]
 "#;
 
+/// Like [`PERMISSIVE`], plus a connect rule (ADR 0031, opt-in) reserving connects
+/// for the `keeper` identity — once any connect rule exists, a connect (and, per
+/// ADR 0040 T2, a live session) needs a matching allow.
+const CONNECT_LOCKED: &str = r#"
+[[rules]]
+actions = ["publish", "subscribe"]
+topics = ["room/#"]
+
+[[rules]]
+identities = ["keeper"]
+actions = ["connect"]
+clients = ["*"]
+"#;
+
 /// A self-removing temp file holding the ACL the broker reloads from.
 struct AclFile {
     path: PathBuf,
@@ -96,13 +110,16 @@ async fn start_reloadable_node(
     };
     let initial = build().expect("the initial ACL builds");
     let audit = Arc::new(mqtt_observability::AuditLog::new());
-    let (reloader, handles) = reload::Reloader::new(initial, audit, build);
+    let (mut reloader, handles) = reload::Reloader::new(initial, audit, build);
 
     let (hub, hub_tx) = Hub::with_config(
         NodeId("reload-node".into()),
         std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
+    // Revocation reaches live state (ADR 0040 T2): a successful reload sweeps the
+    // online table against the new policy.
+    reloader.attach_identity_sweep(hub_tx.clone(), None);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -299,5 +316,43 @@ async fn malformed_acl_reload_is_rejected_and_keeps_the_running_policy() {
             "the kept policy must still forward the publish"
         ),
         other => panic!("expected delivery after the rejected reload, got {other:?}"),
+    }
+}
+
+/// ADR 0040 T2 — the identity sweep: a reload that denies a principal's *connect*
+/// evicts its **live** session with no client action, while an untouched session
+/// keeps flowing. (Contrast with the T4 test above, which pins next-operation
+/// semantics for permission changes.)
+#[tokio::test]
+async fn a_connect_acl_tightening_evicts_the_live_session() {
+    let acl = AclFile::new(PERMISSIVE);
+    let (addr, ids, reloader) = start_reloadable_node(acl.path.clone()).await;
+
+    ids.send(identity("victim")).unwrap();
+    let mut victim = Client::connect(addr, "c-victim").await;
+    assert_eq!(victim.subscribe("room/1", QoS::AtMostOnce).await, vec![0]);
+
+    ids.send(identity("keeper")).unwrap();
+    let mut keeper = Client::connect(addr, "c-keeper").await;
+    assert_eq!(keeper.subscribe("room/1", QoS::AtMostOnce).await, vec![0]);
+
+    // Tighten: connects become keeper-only; the reload sweeps live sessions.
+    acl.write(CONNECT_LOCKED);
+    assert!(
+        reloader.reload("signal"),
+        "the tightened ACL should reload cleanly"
+    );
+
+    // The victim is evicted without sending anything.
+    assert!(
+        victim.recv().await.is_none(),
+        "the connect-denied session must be closed by the sweep"
+    );
+
+    // The keeper's live session is untouched: it still publishes and receives.
+    keeper.publish_qos1("room/1", 7, b"still-here").await;
+    match keeper.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"still-here"),
+        other => panic!("the keeper must keep flowing, got {other:?}"),
     }
 }

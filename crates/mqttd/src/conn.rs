@@ -530,7 +530,7 @@ where
         .send(HubCommand::Attach {
             client: client.clone(),
             admission: Admission {
-                subject: principal.subject.clone(),
+                identity: principal.clone(),
                 method: auth_method,
                 cert_serial: cert.and_then(|c| c.serial),
                 protocol: connect.protocol,

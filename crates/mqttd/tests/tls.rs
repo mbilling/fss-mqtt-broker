@@ -837,10 +837,13 @@ async fn start_reloadable_mtls_node(
         pki.ca.clone(),
         pki.crl.clone(),
     );
-    let build = move || {
-        let crl_opt = crl_active.load(Ordering::SeqCst).then_some(crl.as_path());
-        mqtt_net::tls::server_acceptor_with_crl(&cert, &key, Some(&ca), crl_opt)
-            .map_err(|e| e.to_string())
+    let build = {
+        let crl_active = crl_active.clone();
+        move || {
+            let crl_opt = crl_active.load(Ordering::SeqCst).then_some(crl.as_path());
+            mqtt_net::tls::server_acceptor_with_crl(&cert, &key, Some(&ca), crl_opt)
+                .map_err(|e| e.to_string())
+        }
     };
     let acceptor = build().expect("initial acceptor");
     let acceptor_rx = reloader.attach_tls(acceptor, build);
@@ -850,6 +853,24 @@ async fn start_reloadable_mtls_node(
         std::sync::Arc::new(MemorySessionStore::new()),
     );
     tokio::spawn(hub.run());
+    // Revocation reaches live state (ADR 0040 T2): a successful reload sweeps live
+    // sessions against the same CRL file the verifier enforces per handshake.
+    {
+        let crl = pki.crl.clone();
+        let crl_active = crl_active.clone();
+        reloader.attach_identity_sweep(
+            hub_tx.clone(),
+            Some(Box::new(move || {
+                use std::sync::atomic::Ordering;
+                if !crl_active.load(Ordering::SeqCst) {
+                    return Ok(mqtt_auth::signed_gossip::RevocationList::default());
+                }
+                let bytes = std::fs::read(&crl).map_err(|e| format!("read crl: {e}"))?;
+                mqtt_auth::signed_gossip::RevocationList::from_bytes_unverified(&bytes)
+                    .map_err(|e| format!("parse crl: {e}"))
+            })),
+        );
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -872,7 +893,8 @@ async fn start_reloadable_mtls_node(
                         metrics: None,
                         enhanced: None,
                     });
-                    mqttd::conn::handle_stream(tls, Some(peer), None, policy, hub).await;
+                    let cert = mqttd::conn::tls_admission(&tls);
+                    mqttd::conn::handle_stream(tls, Some(peer), cert, policy, hub).await;
                 }
             });
         }
@@ -905,4 +927,40 @@ async fn reloading_a_crl_revokes_a_client_in_place() {
     let valid = test_connector(&pki.ca, Some((&pki.valid_cert, &pki.valid_key)));
     let mut ok = Client::connect(tls_connect(addr, &valid).await.unwrap(), "post").await;
     ok.subscribe("ok/#").await;
+}
+
+/// ADR 0040 T2 — the identity sweep closes the gap the test above leaves open: a
+/// **live, already-connected** session whose certificate the freshly-published CRL
+/// revokes is evicted by the reload itself — no client action, no reconnect — while
+/// a live session with a non-revoked cert from the same CA keeps flowing.
+#[tokio::test]
+async fn a_crl_reload_evicts_the_live_session_of_a_revoked_cert() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pki = mint_crl_pki("evict");
+    let crl_active = Arc::new(AtomicBool::new(false));
+    let (addr, reloader) = start_reloadable_mtls_node(&pki, crl_active.clone()).await;
+
+    // Both certs connect BEFORE the CRL exists, and both sessions stay open.
+    let revoked = test_connector(&pki.ca, Some((&pki.revoked_cert, &pki.revoked_key)));
+    let mut victim = Client::connect(tls_connect(addr, &revoked).await.unwrap(), "victim").await;
+    victim.subscribe("ok/#").await;
+    let valid = test_connector(&pki.ca, Some((&pki.valid_cert, &pki.valid_key)));
+    let mut keeper = Client::connect(tls_connect(addr, &valid).await.unwrap(), "keeper").await;
+    keeper.subscribe("ok/#").await;
+
+    // Publish the CRL and reload: the sweep must reach the LIVE session.
+    crl_active.store(true, Ordering::SeqCst);
+    assert!(reloader.reload("signal"), "the CRL reload should apply");
+
+    assert!(
+        victim.recv().await.is_none(),
+        "the revoked cert's live session must be closed by the sweep"
+    );
+
+    // The non-revoked session is untouched.
+    keeper.writer.send(&Packet::PingReq).await.unwrap();
+    assert!(
+        matches!(keeper.recv().await, Some(Packet::PingResp)),
+        "the non-revoked session must keep flowing"
+    );
 }

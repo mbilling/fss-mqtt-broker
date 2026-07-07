@@ -38,6 +38,11 @@ pub type SwimCrlSlot = Arc<RwLock<Option<RevocationList>>>;
 /// list, or an error string (a missing/unparseable/unsigned CRL) that aborts the swap.
 pub type SwimCrlBuildResult = Result<RevocationList, String>;
 
+/// What a client-CRL `build` closure returns for the identity sweep (ADR 0040 T2): the
+/// freshly-parsed revoked-serial list from `MQTTD_TLS_CRL` (whose signature the TLS
+/// verifier enforces per handshake), or an error string that aborts the swap.
+pub type ClientCrlBuildResult = Result<RevocationList, String>;
+
 /// The `watch` receivers to wire into [`crate::conn::ConnPolicy`].
 pub struct Handles {
     /// Current authorizer; re-read per publish/subscribe.
@@ -70,6 +75,13 @@ pub struct Reloader {
     /// configured (ADR 0022 T7); rebuilt and swapped in the same atomic reload.
     swim_crl: Option<SwimCrlSlot>,
     swim_crl_build: Option<Box<dyn Fn() -> SwimCrlBuildResult + Send + Sync>>,
+    /// Set by [`attach_identity_sweep`](Self::attach_identity_sweep): after a
+    /// successful swap, the hub sweeps live sessions against the new policy
+    /// (ADR 0040 T2).
+    sweep_hub: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::HubCommand>>,
+    /// Re-reads the client-listener CRL's revoked serials for the sweep; `None` when
+    /// no `MQTTD_TLS_CRL` is configured (the sweep then checks users + connect-ACL only).
+    client_crl_build: Option<Box<dyn Fn() -> ClientCrlBuildResult + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -111,6 +123,8 @@ impl Reloader {
                 tls_build: None,
                 swim_crl: None,
                 swim_crl_build: None,
+                sweep_hub: None,
+                client_crl_build: None,
             },
             Handles {
                 authz,
@@ -153,6 +167,21 @@ impl Reloader {
         self.swim_crl_build = Some(Box::new(build));
     }
 
+    /// Register the identity sweep (ADR 0040 T2): after every **successful** reload the
+    /// hub receives the new policy and re-evaluates live sessions against it, evicting
+    /// identity-revoked ones (CRL'd certificate, removed password user, connect-ACL
+    /// deny). `client_crl_build` re-reads the client-listener CRL's serials — `None`
+    /// when no client CRL is configured. A failed reload sweeps nothing (the running
+    /// policy did not change).
+    pub fn attach_identity_sweep(
+        &mut self,
+        hub: tokio::sync::mpsc::UnboundedSender<crate::hub::HubCommand>,
+        client_crl_build: Option<Box<dyn Fn() -> ClientCrlBuildResult + Send + Sync>>,
+    ) {
+        self.sweep_hub = Some(hub);
+        self.client_crl_build = client_crl_build;
+    }
+
     /// Re-read the sources and swap the policy in place — **validate-before-swap**: build the
     /// new authorizer, authenticator, *and* (if a TLS listener is attached) the TLS acceptor
     /// first; publish them only if **every** build succeeded. On any failure nothing is
@@ -167,12 +196,16 @@ impl Reloader {
         let policy = (self.build)();
         let tls = self.tls_build.as_ref().map(|b| b());
         let crl = self.swim_crl_build.as_ref().map(|b| b());
-        // A configured TLS or gossip-CRL build failed: reject the whole reload, swap nothing.
+        let client_crl = self.client_crl_build.as_ref().map(|b| b());
+        // A configured TLS or CRL build failed: reject the whole reload, swap nothing.
         if let Some(Err(e)) = &tls {
             return self.reject(trigger, &format!("tls: {e}"));
         }
         if let Some(Err(e)) = &crl {
             return self.reject(trigger, &format!("gossip crl: {e}"));
+        }
+        if let Some(Err(e)) = &client_crl {
+            return self.reject(trigger, &format!("client crl: {e}"));
         }
         match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
@@ -180,8 +213,8 @@ impl Reloader {
             // Everything built cleanly: publish atomically. The connection/accept loop reads
             // whichever it reaches first on its next check; all are mutually consistent.
             Ok((authz, auth)) => {
-                let _ = self.authz_tx.send(authz);
-                let _ = self.auth_tx.send(auth);
+                let _ = self.authz_tx.send(authz.clone());
+                let _ = self.auth_tx.send(auth.clone());
                 if let (Some(tx), Some(Ok(acceptor))) = (&self.tls_tx, tls) {
                     let _ = tx.send(acceptor);
                 }
@@ -189,6 +222,22 @@ impl Reloader {
                     *slot
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(list);
+                }
+                // Revocation reaches live state (ADR 0040 T2): the hub re-evaluates
+                // every online session against exactly the policy just published.
+                if let Some(hub) = &self.sweep_hub {
+                    let _ = hub.send(crate::hub::HubCommand::SweepIdentities(
+                        crate::hub::SweepPolicy {
+                            authorizer: authz,
+                            authenticator: auth,
+                            revoked: match client_crl {
+                                Some(Ok(list)) => list,
+                                _ => RevocationList::default(),
+                            },
+                            trigger: trigger.to_string(),
+                            audit: self.audit.clone(),
+                        },
+                    ));
                 }
                 info!(
                     trigger,
@@ -228,6 +277,60 @@ mod tests {
 
     fn audit() -> Arc<dyn AuditSink> {
         Arc::new(AuditLog::new())
+    }
+
+    /// ADR 0040 T2: a successful reload hands the hub the freshly-published policy
+    /// for the identity sweep; a rejected reload sweeps nothing; a bad client CRL
+    /// rejects the whole reload (validate-before-swap).
+    #[tokio::test]
+    async fn a_reload_dispatches_the_identity_sweep_only_on_success() {
+        let ok_build = || -> BuildResult {
+            Ok((
+                Arc::new(AllowAll) as Arc<dyn Authorizer>,
+                Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                    allow_anonymous: true,
+                }) as Arc<dyn Authenticator>,
+            ))
+        };
+        let initial = ok_build().unwrap();
+        let (mut reloader, _handles) = Reloader::new(initial, audit(), ok_build);
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        reloader.attach_identity_sweep(
+            hub_tx,
+            Some(Box::new(|| Ok(RevocationList::from_serials([vec![0x42]])))),
+        );
+
+        assert!(reloader.reload("signal"));
+        match hub_rx.try_recv() {
+            Ok(crate::hub::HubCommand::SweepIdentities(policy)) => {
+                assert!(policy.revoked.contains(&[0x42]));
+                assert_eq!(policy.trigger, "signal");
+            }
+            other => panic!("expected a SweepIdentities command, got {other:?}"),
+        }
+
+        // A rejected reload (bad ACL build) must not sweep.
+        let (mut reloader, _handles) = Reloader::new(ok_build().unwrap(), audit(), || {
+            Err("acl: parse error".into())
+        });
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        reloader.attach_identity_sweep(hub_tx, None);
+        assert!(!reloader.reload("signal"));
+        assert!(
+            hub_rx.try_recv().is_err(),
+            "a rejected reload must not dispatch a sweep"
+        );
+
+        // A bad client CRL rejects the whole reload — and no sweep fires.
+        let (mut reloader, handles) = Reloader::new(ok_build().unwrap(), audit(), ok_build);
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        reloader.attach_identity_sweep(
+            hub_tx,
+            Some(Box::new(|| Err("client crl: parse error".into()))),
+        );
+        assert!(!reloader.reload("signal"));
+        assert!(hub_rx.try_recv().is_err());
+        drop(handles);
     }
 
     /// A successful reload swaps the value the receivers observe.

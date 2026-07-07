@@ -163,8 +163,10 @@ pub enum AuthMethod {
 /// admission (subject, method, certificate serial), never replayable credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
-    /// The authenticated principal's stable subject (== the session owner, ADR 0031).
-    pub subject: String,
+    /// The authenticated principal (subject + groups); its `subject` is the session
+    /// owner (ADR 0031). The full identity is kept so sweep-time authorization checks
+    /// see exactly what admission-time checks saw.
+    pub identity: mqtt_auth::Identity,
     /// How the connection authenticated.
     pub method: AuthMethod,
     /// The mTLS leaf certificate's serial number (big-endian bytes as encoded in the
@@ -176,6 +178,32 @@ pub struct Admission {
     /// told why (DISCONNECT `0x87`); v3.1.1 has no server DISCONNECT, so it just
     /// gets the close.
     pub protocol: ProtocolVersion,
+}
+
+/// The new policy a successful security reload published, handed to the hub for
+/// the identity sweep (ADR 0040 T2). Carries `Arc`s to exactly the values the
+/// reload swapped into the live `watch` channels, so the sweep and the next
+/// admission see the same policy.
+pub struct SweepPolicy {
+    /// The new authorizer (connect-ACL re-check).
+    pub authorizer: Arc<dyn mqtt_auth::Authorizer>,
+    /// The new authenticator (password-user existence probe).
+    pub authenticator: Arc<dyn mqtt_auth::Authenticator>,
+    /// The client-listener CRL's revoked serials (empty when none is configured).
+    pub revoked: mqtt_auth::signed_gossip::RevocationList,
+    /// What fired the reload (`signal` / `watch`), for the audit trail.
+    pub trigger: String,
+    /// Audit sink for the per-eviction `security.evict` records.
+    pub audit: Arc<dyn mqtt_observability::AuditSink>,
+}
+
+impl std::fmt::Debug for SweepPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SweepPolicy")
+            .field("revoked", &self.revoked.len())
+            .field("trigger", &self.trigger)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A currently-online client connection.
@@ -455,6 +483,10 @@ pub enum HubCommand {
         /// Why (for the log/audit trail), e.g. `cert-revoked`, `user-removed`.
         reason: String,
     },
+    /// A successful security reload published a new policy — sweep the online table
+    /// against it (ADR 0040 T2): identity-level revocation terminates sessions.
+    /// Sent by the [`Reloader`](crate::reload::Reloader) after the swap.
+    SweepIdentities(SweepPolicy),
 
     /// A peer node's link came up; register it and send our interest snapshot.
     PeerConnected {
@@ -1093,6 +1125,9 @@ impl Hub {
             HubCommand::Evict { client, reason } => {
                 self.evict(&client, &reason).await;
             }
+            HubCommand::SweepIdentities(policy) => {
+                self.sweep_identities(&policy).await;
+            }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
@@ -1457,7 +1492,7 @@ impl Hub {
             SessionRecovery::Denied { owner } => {
                 warn!(
                     client = %pending.client.0,
-                    claimant = %pending.admission.subject,
+                    claimant = %pending.admission.identity.subject,
                     owner = %owner,
                     "session-identity mismatch: a different principal may not resume/take over \
                      this persistent session; rejecting CONNECT (ADR 0031)"
@@ -2107,6 +2142,56 @@ impl Hub {
         });
         if completed {
             self.drain_backlog(client).await;
+        }
+    }
+
+    /// The identity sweep (ADR 0040 T2): re-evaluate every online connection's
+    /// admission facts against a freshly-reloaded policy and evict the sessions
+    /// whose *identity* was revoked — presented certificate now on the CRL,
+    /// password user gone from the credential store, or principal denied by the
+    /// new connect-ACL. Permission-level changes are NOT swept here (the grant
+    /// sweep, T3, handles subscriptions; publish checks are already per-operation).
+    /// An unchanged policy evicts no one — every check re-derives the admission
+    /// verdict, so only differences act.
+    async fn sweep_identities(&mut self, policy: &SweepPolicy) {
+        let victims: Vec<(ClientId, &'static str)> = self
+            .online
+            .iter()
+            .filter_map(|(client, online)| {
+                let a = &online.admission;
+                if let Some(serial) = &a.cert_serial {
+                    if policy.revoked.contains(serial) {
+                        return Some((client.clone(), "cert-revoked"));
+                    }
+                }
+                if a.method == AuthMethod::Password
+                    && !policy
+                        .authenticator
+                        .password_subject_exists(&a.identity.subject)
+                {
+                    return Some((client.clone(), "user-removed"));
+                }
+                if !policy.authorizer.authorize_connect(&a.identity, client) {
+                    return Some((client.clone(), "connect-denied"));
+                }
+                None
+            })
+            .collect();
+        if victims.is_empty() {
+            return;
+        }
+        info!(
+            evictions = victims.len(),
+            trigger = %policy.trigger,
+            "identity sweep: policy reload revoked live sessions (ADR 0040)"
+        );
+        for (client, reason) in victims {
+            policy.audit.record(
+                "security.evict",
+                Some(&client.0),
+                &format!("{reason} (trigger={})", policy.trigger),
+            );
+            self.evict(&client, reason).await;
         }
     }
 
@@ -3131,7 +3216,8 @@ async fn recover_session(
     self_tx: mpsc::UnboundedSender<HubCommand>,
     pending: PendingAttach,
 ) {
-    let recovery = recover_until_ready(&store, &pending.client, &pending.admission.subject).await;
+    let recovery =
+        recover_until_ready(&store, &pending.client, &pending.admission.identity.subject).await;
     let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
 }
 
@@ -3299,7 +3385,10 @@ mod tests {
     /// A password-admitted v3.1.1 [`Admission`] for `subject` — the common test shape.
     fn admission(subject: &str) -> Admission {
         Admission {
-            subject: subject.to_string(),
+            identity: mqtt_auth::Identity {
+                subject: subject.to_string(),
+                groups: vec![],
+            },
             method: AuthMethod::Password,
             cert_serial: None,
             protocol: ProtocolVersion::V311,
@@ -3912,7 +4001,10 @@ mod tests {
         tx.send(HubCommand::Attach {
             client: ClientId("victim".into()),
             admission: Admission {
-                subject: "victim".into(),
+                identity: mqtt_auth::Identity {
+                    subject: "victim".into(),
+                    groups: vec![],
+                },
                 method: AuthMethod::Certificate,
                 cert_serial: Some(vec![0x0a, 0x0b]),
                 protocol: ProtocolVersion::V5,
@@ -3973,6 +4065,120 @@ mod tests {
             payload_of(&recv_packet(&mut watcher).await.unwrap()),
             b"still-serving"
         );
+    }
+
+    /// ADR 0040 T2: the identity sweep. One reload-published policy evicts, in one
+    /// pass, the session whose certificate serial is CRL'd, the session whose
+    /// password user was removed, and the session the new connect-ACL denies — while
+    /// an untouched session keeps flowing. Each eviction is audited with its reason.
+    #[tokio::test]
+    async fn the_identity_sweep_evicts_revoked_sessions_and_spares_the_rest() {
+        use mqtt_auth::signed_gossip::RevocationList;
+        use mqtt_auth::{AuthError, Authenticator, Authorizer, Credentials, Identity};
+
+        /// Denies connect for one subject; permits everything else.
+        struct DenyConnectFor(&'static str);
+        impl Authorizer for DenyConnectFor {
+            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_subscribe(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_connect(&self, identity: &Identity, _: &ClientId) -> bool {
+                identity.subject != self.0
+            }
+        }
+        /// A credential store that no longer knows one subject.
+        struct UserGone(&'static str);
+        impl Authenticator for UserGone {
+            fn authenticate(
+                &self,
+                _: &ClientId,
+                _: &Credentials<'_>,
+            ) -> Result<Identity, AuthError> {
+                Err(AuthError::Rejected)
+            }
+            fn password_subject_exists(&self, subject: &str) -> bool {
+                subject != self.0
+            }
+        }
+
+        let tx = start_hub();
+        // Four live sessions, admitted under distinct facts.
+        let attach_as = |client: &str, adm: Admission, conn_id: u64| {
+            let tx = tx.clone();
+            let client = client.to_string();
+            async move {
+                let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
+                let (reply_tx, reply_rx) = oneshot::channel();
+                tx.send(HubCommand::Attach {
+                    client: ClientId(client),
+                    admission: adm,
+                    conn_id,
+                    clean_start: true,
+                    session_expiry: 0,
+                    receive_maximum: u16::MAX,
+                    will: None,
+                    outbound: out_tx,
+                    reply: reply_tx,
+                })
+                .unwrap();
+                reply_rx.await.unwrap();
+                out_rx
+            }
+        };
+        let cert_admission = Admission {
+            identity: mqtt_auth::Identity {
+                subject: "cert-user".into(),
+                groups: vec![],
+            },
+            method: AuthMethod::Certificate,
+            cert_serial: Some(vec![0x42]),
+            protocol: ProtocolVersion::V311,
+        };
+        let mut revoked_cert = attach_as("by-cert", cert_admission, 1).await;
+        let mut removed_user = attach_as("by-user", admission("bob"), 2).await;
+        let mut denied_connect = attach_as("by-acl", admission("evil"), 3).await;
+        let (mut survivor, _) = attach(&tx, "keeper", 4, true).await;
+        subscribe(&tx, "keeper", "t");
+
+        let audit = Arc::new(mqtt_observability::RecordingAuditSink::default());
+        tx.send(HubCommand::SweepIdentities(super::SweepPolicy {
+            authorizer: Arc::new(DenyConnectFor("evil")),
+            authenticator: Arc::new(UserGone("bob")),
+            revoked: RevocationList::from_serials([vec![0x42]]),
+            trigger: "signal".into(),
+            audit: audit.clone(),
+        }))
+        .unwrap();
+
+        for (rx, who) in [
+            (&mut revoked_cert, "CRL'd certificate"),
+            (&mut removed_user, "removed password user"),
+            (&mut denied_connect, "connect-ACL denied principal"),
+        ] {
+            assert!(
+                recv_packet(rx).await.is_none(),
+                "the {who} session must be evicted by the sweep"
+            );
+        }
+        // The untouched session still receives traffic.
+        publish(&tx, "t", b"alive");
+        assert_eq!(
+            payload_of(&recv_packet(&mut survivor).await.unwrap()),
+            b"alive"
+        );
+        // Each eviction was audited with its reason.
+        let events = audit.events();
+        for reason in ["cert-revoked", "user-removed", "connect-denied"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.kind == "security.evict" && e.detail.contains(reason)),
+                "missing security.evict audit for {reason}: {events:?}"
+            );
+        }
     }
 
     /// ADR 0040 T1: v3.1.1 has no server DISCONNECT — an evicted v3.1.1 client's

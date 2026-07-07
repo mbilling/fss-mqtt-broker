@@ -52,6 +52,15 @@ impl Authenticator for ChainAuthenticator {
         }
         Err(AuthError::NotPermitted)
     }
+
+    fn password_subject_exists(&self, subject: &str) -> bool {
+        // Chain semantics for password credentials are first-authoritative-wins, and
+        // members without a password store answer `true` (no opinion) — so `all`
+        // reduces to the password member's verdict.
+        self.members
+            .iter()
+            .all(|m| m.password_subject_exists(subject))
+    }
 }
 
 #[cfg(test)]
