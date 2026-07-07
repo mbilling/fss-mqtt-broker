@@ -191,6 +191,9 @@ pub struct SweepPolicy {
     pub authenticator: Arc<dyn mqtt_auth::Authenticator>,
     /// The client-listener CRL's revoked serials (empty when none is configured).
     pub revoked: mqtt_auth::signed_gossip::RevocationList,
+    /// The cluster CRL's revoked serials (ADR 0040 T4; empty when none is
+    /// configured) — the peer sweep tears down established links these name.
+    pub peer_revoked: mqtt_auth::signed_gossip::RevocationList,
     /// What fired the reload (`signal` / `watch`), for the audit trail.
     pub trigger: String,
     /// Audit sink for the per-eviction `security.evict` records.
@@ -515,6 +518,9 @@ pub enum HubCommand {
         conn_id: u64,
         /// Channel to send messages to that peer.
         tx: PeerOutbound,
+        /// The remote leaf certificate's serial from the mTLS handshake
+        /// (ADR 0040 T4); `None` on a plaintext mesh.
+        cert_serial: Option<Vec<u8>>,
     },
     /// A peer node's link went down.
     PeerDisconnected {
@@ -705,6 +711,10 @@ pub enum HubCommand {
 struct Peer {
     conn_id: u64,
     tx: PeerOutbound,
+    /// The remote leaf certificate's serial (big-endian bytes) from the link's
+    /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
+    /// (ADR 0040 T4). `None` on a plaintext mesh.
+    cert_serial: Option<Vec<u8>>,
 }
 
 /// The smaller of two `QoS` levels (delivery downgrade rule [MQTT-3.8.4-6]).
@@ -1152,6 +1162,7 @@ impl Hub {
             HubCommand::SweepIdentities(policy) => {
                 self.sweep_identities(&policy).await;
                 self.sweep_grants(&policy).await;
+                self.sweep_peers(&policy);
             }
             HubCommand::AttachAuthorizer(watch) => {
                 self.authz = Some(watch);
@@ -1184,8 +1195,13 @@ impl Hub {
                 self.deliver(&topic, &payload, qos, retain, message_expiry, &app)
                     .await;
             }
-            HubCommand::PeerConnected { node, conn_id, tx } => {
-                self.peer_connected(node.clone(), conn_id, tx);
+            HubCommand::PeerConnected {
+                node,
+                conn_id,
+                tx,
+                cert_serial,
+            } => {
+                self.peer_connected(node.clone(), conn_id, tx, cert_serial);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -2317,6 +2333,40 @@ impl Hub {
         }
     }
 
+    /// The peer sweep (ADR 0040 T4): tear down established peer links whose remote
+    /// certificate the freshly-reloaded cluster CRL revokes. Removing the entry
+    /// drops the link's outbound sender, which ends its pump task and closes the
+    /// socket; the mesh reacts as to any link loss (SWIM — already refusing the
+    /// node's datagrams per ADR 0022 T7 — marks it dead; placement and leases
+    /// move), and the revoked node cannot re-handshake (both handshake sides gate
+    /// on the same live CRL slot).
+    fn sweep_peers(&mut self, policy: &SweepPolicy) {
+        let victims: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.cert_serial
+                    .as_ref()
+                    .is_some_and(|serial| policy.peer_revoked.contains(serial))
+            })
+            .map(|(node, _)| node.clone())
+            .collect();
+        for node in victims {
+            warn!(
+                peer = %node.0,
+                trigger = %policy.trigger,
+                "peer sweep: cluster CRL revokes an established link (ADR 0040)"
+            );
+            policy.audit.record(
+                "security.evict",
+                Some(&node.0),
+                &format!("peer-revoked (trigger={})", policy.trigger),
+            );
+            let conn_id = self.peers[&node].conn_id;
+            self.peer_disconnected(&node, conn_id);
+        }
+    }
+
     /// Terminate a client's live session server-side (ADR 0040 T1). See
     /// [`HubCommand::Evict`]. Routes through [`detach`](Self::detach) so session
     /// retention, the will, and backlog spill behave exactly as for any other
@@ -2820,7 +2870,13 @@ impl Hub {
         }
     }
 
-    fn peer_connected(&mut self, node: NodeId, conn_id: u64, tx: PeerOutbound) {
+    fn peer_connected(
+        &mut self,
+        node: NodeId,
+        conn_id: u64,
+        tx: PeerOutbound,
+        cert_serial: Option<Vec<u8>>,
+    ) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest + shared membership so the peer can route to us
         // immediately (ordinary fan-out and cluster-wide shared selection, ADR 0015).
@@ -2835,7 +2891,14 @@ impl Hub {
         if let Some(plane) = &self.durable_plane {
             plane.register(&node, tx.clone());
         }
-        self.peers.insert(node, Peer { conn_id, tx });
+        self.peers.insert(
+            node,
+            Peer {
+                conn_id,
+                tx,
+                cert_serial,
+            },
+        );
     }
 
     fn peer_disconnected(&mut self, node: &NodeId, conn_id: u64) {
@@ -3980,6 +4043,7 @@ mod tests {
             node: NodeId(node.into()),
             conn_id,
             tx: peer_tx,
+            cert_serial: None,
         })
         .unwrap();
         peer_rx
@@ -4270,6 +4334,7 @@ mod tests {
             authorizer: Arc::new(DenyConnectFor("evil")),
             authenticator: Arc::new(UserGone("bob")),
             revoked: RevocationList::from_serials([vec![0x42]]),
+            peer_revoked: RevocationList::default(),
             trigger: "signal".into(),
             audit: audit.clone(),
         }))
@@ -4337,6 +4402,7 @@ mod tests {
                 allow_anonymous: true,
             }),
             revoked: RevocationList::default(),
+            peer_revoked: RevocationList::default(),
             trigger: "signal".into(),
             audit: audit.clone(),
         }))

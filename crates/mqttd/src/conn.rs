@@ -178,7 +178,9 @@ pub struct ProxyContext {
     /// The live session-placement ring.
     pub placement: Arc<RwLock<Placement>>,
     /// mTLS connector for dialing the owner's peer listener; `None` = plaintext.
-    pub connector: Option<TlsConnector>,
+    /// Behind a `watch` (ADR 0040 T4): read per relocation dial, so a reload's
+    /// rebuilt connector (rotated cluster cert) is used on the next proxy.
+    pub connector: Option<tokio::sync::watch::Receiver<TlsConnector>>,
 }
 
 impl std::fmt::Debug for ProxyContext {
@@ -660,7 +662,7 @@ where
     Packet::Connect(connect.clone()).encode(&mut prelude, connect.protocol)?;
     prelude.extend_from_slice(&leftover);
 
-    if let Some(connector) = &proxy.connector {
+    if let Some(connector) = proxy.connector.as_ref().map(|w| w.borrow().clone()) {
         let name = mqtt_net::tls::server_name(addr)?;
         let tcp = TcpStream::connect(addr).await?;
         let _ = tcp.set_nodelay(true);

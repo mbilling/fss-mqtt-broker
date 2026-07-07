@@ -43,6 +43,11 @@ pub type SwimCrlBuildResult = Result<RevocationList, String>;
 /// verifier enforces per handshake), or an error string that aborts the swap.
 pub type ClientCrlBuildResult = Result<RevocationList, String>;
 
+/// What a peer-bus TLS `build` closure returns (ADR 0040 T4): a freshly-built
+/// acceptor + connector from the re-read cluster CA / node cert / key, or an error
+/// string that aborts the swap.
+pub type PeerTlsBuildResult = Result<(TlsAcceptor, tokio_rustls::TlsConnector), String>;
+
 /// The `watch` receivers to wire into [`crate::conn::ConnPolicy`].
 pub struct Handles {
     /// Current authorizer; re-read per publish/subscribe.
@@ -82,6 +87,13 @@ pub struct Reloader {
     /// Re-reads the client-listener CRL's revoked serials for the sweep; `None` when
     /// no `MQTTD_TLS_CRL` is configured (the sweep then checks users + connect-ACL only).
     client_crl_build: Option<Box<dyn Fn() -> ClientCrlBuildResult + Send + Sync>>,
+    /// Set by [`attach_peer_tls`](Self::attach_peer_tls) (ADR 0040 T4): the peer-bus
+    /// acceptor/connector senders + rebuild closure, swapped in the same atomic reload.
+    peer_tls: Option<(
+        watch::Sender<TlsAcceptor>,
+        watch::Sender<tokio_rustls::TlsConnector>,
+    )>,
+    peer_tls_build: Option<Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -125,6 +137,8 @@ impl Reloader {
                 swim_crl_build: None,
                 sweep_hub: None,
                 client_crl_build: None,
+                peer_tls: None,
+                peer_tls_build: None,
             },
             Handles {
                 authz,
@@ -182,6 +196,21 @@ impl Reloader {
         self.client_crl_build = client_crl_build;
     }
 
+    /// Register the peer-bus TLS material for reload (ADR 0040 T4, paying the
+    /// ADR 0032 deferred item): `build` re-reads the cluster CA / node cert / key,
+    /// and both sides of the bus read the current value per handshake — a rotated
+    /// cluster cert is served on the next peer handshake, folded into the same
+    /// atomic validate-before-swap reload as everything else.
+    pub fn attach_peer_tls(
+        &mut self,
+        acceptor_tx: watch::Sender<TlsAcceptor>,
+        connector_tx: watch::Sender<tokio_rustls::TlsConnector>,
+        build: Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>,
+    ) {
+        self.peer_tls = Some((acceptor_tx, connector_tx));
+        self.peer_tls_build = Some(build);
+    }
+
     /// Re-read the sources and swap the policy in place — **validate-before-swap**: build the
     /// new authorizer, authenticator, *and* (if a TLS listener is attached) the TLS acceptor
     /// first; publish them only if **every** build succeeded. On any failure nothing is
@@ -197,6 +226,7 @@ impl Reloader {
         let tls = self.tls_build.as_ref().map(|b| b());
         let crl = self.swim_crl_build.as_ref().map(|b| b());
         let client_crl = self.client_crl_build.as_ref().map(|b| b());
+        let peer_tls = self.peer_tls_build.as_ref().map(|b| b());
         // A configured TLS or CRL build failed: reject the whole reload, swap nothing.
         if let Some(Err(e)) = &tls {
             return self.reject(trigger, &format!("tls: {e}"));
@@ -206,6 +236,9 @@ impl Reloader {
         }
         if let Some(Err(e)) = &client_crl {
             return self.reject(trigger, &format!("client crl: {e}"));
+        }
+        if let Some(Err(e)) = &peer_tls {
+            return self.reject(trigger, &format!("peer tls: {e}"));
         }
         match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
@@ -223,9 +256,25 @@ impl Reloader {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(list);
                 }
-                // Revocation reaches live state (ADR 0040 T2): the hub re-evaluates
-                // every online session against exactly the policy just published.
+                if let (Some((acc_tx, conn_tx)), Some(Ok((acceptor, connector)))) =
+                    (&self.peer_tls, peer_tls)
+                {
+                    let _ = acc_tx.send(acceptor);
+                    let _ = conn_tx.send(connector);
+                }
+                // Revocation reaches live state (ADR 0040 T2/T3/T4): the hub
+                // re-evaluates every online session, subscription grant, and peer
+                // link against exactly the policy just published.
                 if let Some(hub) = &self.sweep_hub {
+                    let peer_revoked = self
+                        .swim_crl
+                        .as_ref()
+                        .and_then(|slot| {
+                            slot.read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                        })
+                        .unwrap_or_default();
                     let _ = hub.send(crate::hub::HubCommand::SweepIdentities(
                         crate::hub::SweepPolicy {
                             authorizer: authz,
@@ -234,6 +283,7 @@ impl Reloader {
                                 Some(Ok(list)) => list,
                                 _ => RevocationList::default(),
                             },
+                            peer_revoked,
                             trigger: trigger.to_string(),
                             audit: self.audit.clone(),
                         },
@@ -277,6 +327,81 @@ mod tests {
 
     fn audit() -> Arc<dyn AuditSink> {
         Arc::new(AuditLog::new())
+    }
+
+    /// ADR 0040 T4: a successful reload rebuilds and swaps the peer-bus
+    /// acceptor/connector (rotated cluster material is served on the next peer
+    /// handshake), and a failing peer-TLS build rejects the whole reload —
+    /// validate-before-swap covers the peer bus too.
+    #[test]
+    fn a_reload_swaps_the_peer_bus_tls_material() {
+        // Throwaway self-signed material to build real acceptors/connectors from.
+        let dir = std::env::temp_dir().join(format!("mqttd-peer-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+        let build_tls = {
+            let (cert_path, key_path) = (cert_path.clone(), key_path.clone());
+            move || -> PeerTlsBuildResult {
+                Ok((
+                    mqtt_net::tls::server_acceptor(&cert_path, &key_path, Some(&cert_path))
+                        .map_err(|e| e.to_string())?,
+                    mqtt_net::tls::client_connector(&cert_path, &cert_path, &key_path)
+                        .map_err(|e| e.to_string())?,
+                ))
+            }
+        };
+        let ok_policy = || -> BuildResult {
+            Ok((
+                Arc::new(AllowAll) as Arc<dyn Authorizer>,
+                Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                    allow_anonymous: true,
+                }) as Arc<dyn Authenticator>,
+            ))
+        };
+
+        // Success: both watch values are replaced.
+        let (initial_acc, initial_conn) = build_tls().unwrap();
+        let (acc_tx, mut acc_rx) = watch::channel(initial_acc);
+        let (conn_tx, mut conn_rx) = watch::channel(initial_conn);
+        acc_rx.mark_unchanged();
+        conn_rx.mark_unchanged();
+        let (mut reloader, _handles) = Reloader::new(ok_policy().unwrap(), audit(), ok_policy);
+        reloader.attach_peer_tls(acc_tx, conn_tx, Box::new(build_tls.clone()));
+        assert!(reloader.reload("signal"));
+        assert!(
+            acc_rx.has_changed().unwrap(),
+            "the peer acceptor must be rebuilt and swapped"
+        );
+        assert!(
+            conn_rx.has_changed().unwrap(),
+            "the peer connector must be rebuilt and swapped"
+        );
+
+        // Failure: a bad peer-TLS build rejects the WHOLE reload — nothing swaps.
+        let (initial_acc, initial_conn) = build_tls().unwrap();
+        let (acc_tx, mut acc_rx) = watch::channel(initial_acc);
+        let (conn_tx, _conn_rx) = watch::channel(initial_conn);
+        acc_rx.mark_unchanged();
+        let (mut reloader, handles) = Reloader::new(ok_policy().unwrap(), audit(), ok_policy);
+        reloader.attach_peer_tls(
+            acc_tx,
+            conn_tx,
+            Box::new(|| Err("peer cert: unreadable".into())),
+        );
+        assert!(!reloader.reload("signal"), "the reload must be rejected");
+        assert!(
+            !acc_rx.has_changed().unwrap(),
+            "a rejected reload must swap nothing"
+        );
+        drop(handles);
     }
 
     /// ADR 0040 T2: a successful reload hands the hub the freshly-published policy

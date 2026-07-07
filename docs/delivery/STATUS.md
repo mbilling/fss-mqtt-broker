@@ -47,7 +47,7 @@
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [8/8 done](0037-durable-retained-messages.md) | — |
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
-| [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Proposed | [3/5 done](0040-revocation-reaches-live-state.md) | 2 open |
+| [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Proposed | [4/5 done](0040-revocation-reaches-live-state.md) | 1 open |
 
 ## Open and deferred work
 
@@ -113,5 +113,4 @@
 
 **0040 — Revocation reaches live state (eviction on reload)**
 
-- `0040-T4` ⬜ planned: Peer-bus revocation — peer acceptor/connector become reloadable (the ADR 0032 deferred item); links record the remote leaf serial and a cluster-CRL reload tears down revoked links; mesh reacts as to link loss
 - `0040-T5` ⬜ planned: Audit/metrics + closure — security.evict audit events and revocation_evictions_total{kind}; reload audit gains the sweep summary; admission-side durable-resume block pinned by test; README ops note

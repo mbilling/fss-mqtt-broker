@@ -217,7 +217,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
-    let peer_tls = peer_tls_from_env()?;
+    let peer_tls_parts = peer_tls_from_env()?;
+    let (peer_tls, peer_tls_reload) = match peer_tls_parts {
+        Some((tls, reload_parts)) => (Some(tls), Some(reload_parts)),
+        None => (None, None),
+    };
 
     // Client policy (ADR 0004 auth/authz/audit + ADR 0005 session relocation),
     // built before the peer listener so the latter can serve sessions relocated
@@ -240,6 +244,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 load_gossip_crl(&path, &ca_der)
             });
         }
+    }
+    // Peer-bus TLS reload (ADR 0040 T4, paying the ADR 0032 deferred item): the
+    // acceptor/connector are rebuilt in the same validate-before-swap reload, so a
+    // rotated cluster cert/key/CA is served on the next peer handshake.
+    if let Some(parts) = peer_tls_reload {
+        reloader.attach_peer_tls(parts.acceptor_tx, parts.connector_tx, parts.build);
     }
 
     // Cluster peer mesh (opt-in).
@@ -946,11 +956,22 @@ fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
     Ok(limits)
 }
 
+/// The reload half of the peer-bus TLS context (ADR 0040 T4): the `watch` senders
+/// behind [`peer::PeerTls`]'s acceptor/connector plus the closure that re-reads the
+/// PEM files — handed to [`reload::Reloader::attach_peer_tls`] once the reloader
+/// exists, so a rotated cluster cert/key/CA is served on the next peer handshake.
+struct PeerTlsReload {
+    acceptor_tx: tokio::sync::watch::Sender<tokio_rustls::TlsAcceptor>,
+    connector_tx: tokio::sync::watch::Sender<tokio_rustls::TlsConnector>,
+    build: Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>,
+}
+
 /// Build the cluster-bus mTLS context from `MQTTD_PEER_TLS_{CA,CERT,KEY}`.
 /// All three must be set together; none means a (loudly logged) plaintext mesh.
 /// `MQTTD_PEER_TLS_CRL` (optional, requires the other three) loads a cluster-CA-signed
 /// CRL checked on every inbound signed-gossip datagram (ADR 0022 T7).
-fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Error>> {
+fn peer_tls_from_env() -> Result<Option<(peer::PeerTls, PeerTlsReload)>, Box<dyn std::error::Error>>
+{
     let crl_path = non_empty_env("MQTTD_PEER_TLS_CRL");
     match (
         non_empty_env("MQTTD_PEER_TLS_CA"),
@@ -972,17 +993,41 @@ fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Erro
                 }
                 None => None,
             };
-            Ok(Some(peer::PeerTls {
-                acceptor: tls::server_acceptor(cert, key, Some(ca))?,
-                connector: tls::client_connector(ca, cert, key)?,
-                // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound certs,
-                // and our leaf + key sign outbound datagrams.
-                cert_der: tls::first_cert_der(cert)?,
-                key_der: tls::private_key_der(key)?,
-                ca_der,
-                gossip_crl: Arc::new(std::sync::RwLock::new(gossip_crl)),
-                crl_path,
-            }))
+            // The acceptor/connector live behind `watch` channels (ADR 0040 T4): the
+            // senders + rebuild closure go to the reloader once it exists, so a
+            // rotated cluster cert is served on the next peer handshake.
+            let (acceptor_tx, acceptor) =
+                tokio::sync::watch::channel(tls::server_acceptor(cert, key, Some(ca))?);
+            let (connector_tx, connector) =
+                tokio::sync::watch::channel(tls::client_connector(ca, cert, key)?);
+            let build = {
+                let (ca, cert, key) = (ca.to_path_buf(), cert.to_path_buf(), key.to_path_buf());
+                Box::new(move || {
+                    let acceptor =
+                        tls::server_acceptor(&cert, &key, Some(&ca)).map_err(|e| e.to_string())?;
+                    let connector =
+                        tls::client_connector(&ca, &cert, &key).map_err(|e| e.to_string())?;
+                    Ok((acceptor, connector))
+                }) as Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>
+            };
+            Ok(Some((
+                peer::PeerTls {
+                    acceptor,
+                    connector,
+                    // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound
+                    // certs, and our leaf + key sign outbound datagrams.
+                    cert_der: tls::first_cert_der(cert)?,
+                    key_der: tls::private_key_der(key)?,
+                    ca_der,
+                    gossip_crl: Arc::new(std::sync::RwLock::new(gossip_crl)),
+                    crl_path,
+                },
+                PeerTlsReload {
+                    acceptor_tx,
+                    connector_tx,
+                    build,
+                },
+            )))
         }
         (None, None, None) if crl_path.is_none() => Ok(None),
         (None, None, None) => Err(

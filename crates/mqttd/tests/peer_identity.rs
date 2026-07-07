@@ -53,6 +53,12 @@ impl ClusterPki {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        // CrlSign so the CA can also issue the revocation list (ADR 0040 T4 test);
+        // rcgen refuses to sign a CRL without it.
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let ca_path = dir.join("ca.pem");
@@ -90,12 +96,78 @@ impl ClusterPki {
         (cert_path, key_path)
     }
 
+    /// Like [`mint_leaf`](Self::mint_leaf), with an explicit certificate serial —
+    /// the fact a CRL names (ADR 0040 T4).
+    fn mint_leaf_with_serial(&self, cn: &str, serial: u64) -> (PathBuf, PathBuf) {
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let leaf = params
+            .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
+            .unwrap();
+        let cert_path = self.dir.join(format!("{cn}-cert.pem"));
+        let key_path = self.dir.join(format!("{cn}-key.pem"));
+        std::fs::write(&cert_path, leaf.pem()).unwrap();
+        std::fs::write(&key_path, leaf_key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
+
+    /// A CA-signed CRL revoking `serial`, written as PEM (ADR 0040 T4).
+    fn mint_crl(&self, serial: u64) -> PathBuf {
+        let crl_params = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2020, 1, 1),
+            next_update: rcgen::date_time_ymd(2099, 1, 1),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![rcgen::RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from(serial),
+                revocation_time: rcgen::date_time_ymd(2020, 1, 2),
+                reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = crl_params.signed_by(&self.ca_cert, &self.ca_key).unwrap();
+        let crl_path = self.dir.join("crl.pem");
+        std::fs::write(&crl_path, crl.pem().unwrap()).unwrap();
+        crl_path
+    }
+
+    /// A `PeerTls` whose presented cert has Common Name `cn` and serial `serial`.
+    fn peer_tls_with_serial(&self, cn: &str, serial: u64) -> PeerTls {
+        let (cert, key) = self.mint_leaf_with_serial(cn, serial);
+        PeerTls {
+            acceptor: mqttd::peer::fixed_acceptor(
+                mqtt_net::tls::server_acceptor(&cert, &key, Some(&self.ca_path)).unwrap(),
+            ),
+            connector: mqttd::peer::fixed_connector(
+                mqtt_net::tls::client_connector(&self.ca_path, &cert, &key).unwrap(),
+            ),
+            ca_der: mqtt_net::tls::first_cert_der(&self.ca_path).unwrap(),
+            cert_der: mqtt_net::tls::first_cert_der(&cert).unwrap(),
+            key_der: mqtt_net::tls::private_key_der(&key).unwrap(),
+            gossip_crl: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            crl_path: None,
+        }
+    }
+
     /// A `PeerTls` whose presented cert has Common Name `cn`.
     fn peer_tls(&self, cn: &str) -> PeerTls {
         let (cert, key) = self.mint_leaf(cn);
         PeerTls {
-            acceptor: mqtt_net::tls::server_acceptor(&cert, &key, Some(&self.ca_path)).unwrap(),
-            connector: mqtt_net::tls::client_connector(&self.ca_path, &cert, &key).unwrap(),
+            acceptor: mqttd::peer::fixed_acceptor(
+                mqtt_net::tls::server_acceptor(&cert, &key, Some(&self.ca_path)).unwrap(),
+            ),
+            connector: mqttd::peer::fixed_connector(
+                mqtt_net::tls::client_connector(&self.ca_path, &cert, &key).unwrap(),
+            ),
             ca_der: mqtt_net::tls::first_cert_der(&self.ca_path).unwrap(),
             cert_der: mqtt_net::tls::first_cert_der(&cert).unwrap(),
             key_der: mqtt_net::tls::private_key_der(&key).unwrap(),
@@ -355,4 +427,86 @@ async fn plaintext_mesh_without_binding_still_routes() {
         crosses(&mut sub, &mut pubr, "plain/zone/data", b"cleartext").await,
         "plaintext mesh must still link and route with no CN binding"
     );
+}
+
+/// ADR 0040 T4 — peer-bus revocation reaches the **established** link: with a
+/// healthy two-node mTLS mesh routing traffic, publishing a cluster CRL that
+/// revokes node-b's certificate and reloading on node-a tears the live link down
+/// (no waiting for it to drop on its own), node-b cannot re-handshake in either
+/// direction (both sides gate on the same live CRL slot), and node-a's local
+/// clients keep working undisturbed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cluster_crl_reload_tears_down_the_revoked_nodes_link() {
+    use mqtt_auth::signed_gossip::RevocationList;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let pki = ClusterPki::new("crl-evict");
+    let revoked_serial = 0xB0B;
+    let mut a = bind_node(NodeId("node-a".into())).await;
+    let mut b = bind_node(NodeId("node-b".into())).await;
+
+    // Node A's TLS context shares its CRL slot with a reloader, exactly as the
+    // binary wires MQTTD_PEER_TLS_CRL (initially: no CRL).
+    let tls_a = pki.peer_tls_with_serial("node-a", 0xA11CE);
+    let tls_b = pki.peer_tls_with_serial("node-b", revoked_serial);
+    let crl_path = pki.mint_crl(revoked_serial);
+    let crl_active = Arc::new(AtomicBool::new(false));
+
+    let audit = Arc::new(mqtt_observability::AuditLog::new());
+    let ok_build = || -> mqttd::reload::BuildResult {
+        Ok((
+            Arc::new(mqtt_auth::AllowAll) as Arc<dyn mqtt_auth::Authorizer>,
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }) as Arc<dyn mqtt_auth::Authenticator>,
+        ))
+    };
+    let (mut reloader, _handles) =
+        mqttd::reload::Reloader::new(ok_build().unwrap(), audit, ok_build);
+    {
+        let crl_active = crl_active.clone();
+        reloader.attach_swim_crl(tls_a.gossip_crl.clone(), move || {
+            if !crl_active.load(Ordering::SeqCst) {
+                return Ok(RevocationList::default());
+            }
+            let bytes = std::fs::read(&crl_path).map_err(|e| format!("read crl: {e}"))?;
+            RevocationList::from_bytes_unverified(&bytes).map_err(|e| format!("parse crl: {e}"))
+        });
+    }
+    reloader.attach_identity_sweep(a.hub_tx.clone(), None);
+
+    a.serve(Some(tls_a.clone()));
+    b.serve(Some(tls_b.clone()));
+    a.dial(b.peer_addr, Some(tls_a.clone()));
+    b.dial(a.peer_addr, Some(tls_b));
+
+    // The mesh is up: traffic crosses from B to a subscriber on A.
+    let mut sub_a = Client::connect(a.client_addr, "sub-a").await;
+    sub_a.subscribe("evict/+").await;
+    let mut pub_b = Client::connect(b.client_addr, "pub-b").await;
+    assert!(
+        crosses(&mut sub_a, &mut pub_b, "evict/x", b"pre-revocation").await,
+        "the mTLS mesh must route before the revocation"
+    );
+
+    // Publish the CRL and reload on node A: the sweep must tear the LIVE link down.
+    crl_active.store(true, Ordering::SeqCst);
+    assert!(reloader.reload("signal"), "the CRL reload should apply");
+
+    // Cross-node traffic stops, and B cannot re-handshake (both directions are
+    // gated on the live CRL) — give the dialers ample time to try.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        never_crosses(&mut sub_a, &mut pub_b, "evict/y").await,
+        "a revoked node's link must stay torn down"
+    );
+
+    // Node A's local clients are undisturbed.
+    let mut local_pub = Client::connect(a.client_addr, "pub-a").await;
+    local_pub.publish("evict/z", b"local").await;
+    match sub_a.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"local"),
+        other => panic!("node A's local delivery must keep working, got {other:?}"),
+    }
 }

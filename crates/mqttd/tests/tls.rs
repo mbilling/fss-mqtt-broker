@@ -353,8 +353,12 @@ fn node_peer_tls(
     std::fs::write(&cert_path, cert.pem()).unwrap();
     std::fs::write(&key_path, key.serialize_pem()).unwrap();
     PeerTls {
-        acceptor: mqtt_net::tls::server_acceptor(&cert_path, &key_path, Some(ca_pem)).unwrap(),
-        connector: mqtt_net::tls::client_connector(ca_pem, &cert_path, &key_path).unwrap(),
+        acceptor: mqttd::peer::fixed_acceptor(
+            mqtt_net::tls::server_acceptor(&cert_path, &key_path, Some(ca_pem)).unwrap(),
+        ),
+        connector: mqttd::peer::fixed_connector(
+            mqtt_net::tls::client_connector(ca_pem, &cert_path, &key_path).unwrap(),
+        ),
         ca_der: mqtt_net::tls::first_cert_der(ca_pem).unwrap(),
         cert_der: mqtt_net::tls::first_cert_der(&cert_path).unwrap(),
         key_der: mqtt_net::tls::private_key_der(&key_path).unwrap(),

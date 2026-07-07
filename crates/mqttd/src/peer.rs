@@ -49,14 +49,53 @@ fn peer_cert_cn(state: &tokio_rustls::rustls::CommonState) -> Option<String> {
     }
 }
 
+/// The remote leaf certificate's serial from an established peer TLS session —
+/// the fact a cluster CRL names, recorded with the link so a revocation sweep can
+/// re-check it (ADR 0040 T4).
+fn peer_cert_serial(state: &tokio_rustls::rustls::CommonState) -> Option<Vec<u8>> {
+    let leaf = state.peer_certificates()?.first()?;
+    mqtt_auth::mtls::serial_from_cert(leaf)
+}
+
+/// Gate a freshly-handshaken peer link on the **live** cluster CRL (ADR 0040 T4):
+/// the same slot the gossip verifier reads per datagram, so a republished CRL
+/// refuses new links immediately — on the ACCEPT side (a revoked node dialing us)
+/// and on the DIAL side (us dialing a node whose cert was revoked; the TLS
+/// verifier alone would still admit it, since the connector checks chain + name,
+/// not revocation). Returns the remote serial for the link's registration, or
+/// `Err(())` when the link must be dropped.
+fn admit_peer_link(
+    state: &tokio_rustls::rustls::CommonState,
+    crl: &crate::reload::SwimCrlSlot,
+) -> Result<Option<Vec<u8>>, ()> {
+    let serial = peer_cert_serial(state);
+    if let (Some(serial), Some(list)) = (
+        &serial,
+        crl.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+    ) {
+        if list.contains(serial) {
+            warn!("peer certificate is revoked by the cluster CRL; dropping link (ADR 0040)");
+            return Err(());
+        }
+    }
+    Ok(serial)
+}
+
 /// The cluster bus mTLS context, built once from the cluster CA + node cert and
 /// shared by every peer link (both accepting and dialing sides).
 #[derive(Clone)]
 pub struct PeerTls {
     /// Accepts inbound links, requiring a cluster-CA-issued client certificate.
-    pub acceptor: TlsAcceptor,
+    /// Behind a `watch` (ADR 0040 T4): read per accept, so a reload's rebuilt
+    /// acceptor (rotated cluster cert/key/CA) is served on the next handshake.
+    /// Use [`fixed_acceptor`] where no reloader exists.
+    pub acceptor: tokio::sync::watch::Receiver<TlsAcceptor>,
     /// Dials outbound links, presenting our certificate and verifying the peer's.
-    pub connector: TlsConnector,
+    /// Behind a `watch` (ADR 0040 T4): read per dial. Use [`fixed_connector`]
+    /// where no reloader exists.
+    pub connector: tokio::sync::watch::Receiver<TlsConnector>,
     /// Cluster CA certificate (DER) — verifies inbound signed-gossip certs (ADR 0022).
     pub ca_der: Vec<u8>,
     /// This node's leaf certificate (DER) — embedded inline in signed gossip.
@@ -69,6 +108,20 @@ pub struct PeerTls {
     pub gossip_crl: crate::reload::SwimCrlSlot,
     /// The configured CRL path, kept so the reload closure and the file watcher re-read it.
     pub crl_path: Option<std::path::PathBuf>,
+}
+
+/// A fixed (never-reloading) acceptor handle — for tests and setups without a
+/// [`Reloader`](crate::reload::Reloader).
+#[must_use]
+pub fn fixed_acceptor(acceptor: TlsAcceptor) -> tokio::sync::watch::Receiver<TlsAcceptor> {
+    tokio::sync::watch::channel(acceptor).1
+}
+
+/// A fixed (never-reloading) connector handle — for tests and setups without a
+/// [`Reloader`](crate::reload::Reloader).
+#[must_use]
+pub fn fixed_connector(connector: TlsConnector) -> tokio::sync::watch::Receiver<TlsConnector> {
+    tokio::sync::watch::channel(connector).1
 }
 
 impl std::fmt::Debug for PeerTls {
@@ -107,18 +160,26 @@ pub async fn serve_listener(
                 let policy = client_policy.clone();
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    let result = match &tls {
-                        Some(t) => match t.acceptor.accept(stream).await {
+                    // Read the CURRENT acceptor per accept (ADR 0040 T4): a reload's
+                    // rebuilt material is served on the next handshake. (Bound first:
+                    // the watch guard must not live across an await.)
+                    let acceptor = tls.as_ref().map(|t| t.acceptor.borrow().clone());
+                    let result = match (&tls, acceptor) {
+                        (Some(t), Some(acceptor)) => match acceptor.accept(stream).await {
                             Ok(s) => {
+                                let Ok(serial) = admit_peer_link(s.get_ref().1, &t.gossip_crl)
+                                else {
+                                    return; // revoked: fail closed (ADR 0040 T4)
+                                };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local, hub, false, expected_cn, policy).await
+                                handle(s, local, hub, false, expected_cn, serial, policy).await
                             }
                             Err(e) => {
                                 debug!(error = %e, "peer mTLS handshake failed; link rejected");
                                 return;
                             }
                         },
-                        None => handle(stream, local, hub, false, None, policy).await,
+                        _ => handle(stream, local, hub, false, None, None, policy).await,
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "inbound peer link ended");
@@ -163,10 +224,28 @@ pub async fn dial_forever(
                 let _ = stream.set_nodelay(true);
                 let outcome = match (&tls, &server_name) {
                     (Some(t), Some(name)) => {
-                        match t.connector.connect(name.clone(), stream).await {
+                        // Read the CURRENT connector per dial (ADR 0040 T4).
+                        let connector = t.connector.borrow().clone();
+                        match connector.connect(name.clone(), stream).await {
                             Ok(s) => {
+                                let Ok(serial) = admit_peer_link(s.get_ref().1, &t.gossip_crl)
+                                else {
+                                    // Revoked (ADR 0040 T4): fail closed, but keep
+                                    // redialing — an un-revocation (new CRL) heals.
+                                    tokio::time::sleep(REDIAL_DELAY).await;
+                                    continue;
+                                };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local.clone(), hub.clone(), true, expected_cn, None).await
+                                handle(
+                                    s,
+                                    local.clone(),
+                                    hub.clone(),
+                                    true,
+                                    expected_cn,
+                                    serial,
+                                    None,
+                                )
+                                .await
                             }
                             Err(e) => {
                                 debug!(%addr, error = %e, "peer mTLS handshake failed; will retry");
@@ -175,7 +254,7 @@ pub async fn dial_forever(
                             }
                         }
                     }
-                    _ => handle(stream, local.clone(), hub.clone(), true, None, None).await,
+                    _ => handle(stream, local.clone(), hub.clone(), true, None, None, None).await,
                 };
                 match outcome {
                     Ok(LinkOutcome::Redundant) => {
@@ -239,6 +318,7 @@ async fn handle<S>(
     hub: mpsc::UnboundedSender<HubCommand>,
     initiated: bool,
     expected_cn: Option<String>,
+    cert_serial: Option<Vec<u8>>,
     client_policy: Option<Arc<ConnPolicy>>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
@@ -358,6 +438,7 @@ where
             node: remote.clone(),
             conn_id,
             tx: out_tx,
+            cert_serial,
         })
         .is_err()
     {
