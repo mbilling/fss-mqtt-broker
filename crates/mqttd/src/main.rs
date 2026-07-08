@@ -128,7 +128,7 @@ use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::persistent_log::PersistentLog;
 use mqtt_storage::persistent_retained::PersistentRetainedStore;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
-use mqttd::{cluster, config_watch, conn, hub, peer, reload};
+use mqttd::{admission, cluster, config_watch, conn, hub, peer, reload};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -352,6 +352,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // A flat sequence of per-listener setup blocks: long by count (one per transport), not by
 // branching complexity — like `Metrics::build`'s registration list.
 #[allow(clippy::too_many_lines)]
+/// Build the connection-admission gate (ADR 0041 T1) from
+/// `MQTTD_MAX_CONNECTIONS` / `MQTTD_MAX_CONNECTIONS_PER_IP`. Unset = uncapped
+/// (today's behavior); a value that does not parse as a positive integer is a
+/// startup error, not a silent misconfiguration.
+fn admission_gate_from_env(
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+) -> Result<admission::AdmissionGate, Box<dyn std::error::Error>> {
+    let cap = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        match non_empty_env(var) {
+            None => Ok(None),
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(Some(n)),
+                _ => Err(format!("{var} must be a positive integer, got {v:?}").into()),
+            },
+        }
+    };
+    let max_connections = cap("MQTTD_MAX_CONNECTIONS")?;
+    let max_per_ip = cap("MQTTD_MAX_CONNECTIONS_PER_IP")?;
+    if max_connections.is_some() || max_per_ip.is_some() {
+        info!(
+            ?max_connections,
+            ?max_per_ip,
+            "connection admission caps active (ADR 0041): over-cap connections are \
+             closed at accept, before any TLS work"
+        );
+    }
+    Ok(admission::AdmissionGate::new(
+        max_connections,
+        max_per_ip,
+        metrics,
+    ))
+}
+
+// One linear listener-wiring flow; splitting it would scatter the env-var reads.
+#[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -360,6 +395,8 @@ async fn start_client_listeners(
     connections: &tokio_util::task::TaskTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut any = false;
+    // Connection admission caps (ADR 0041 T1), shared by every client listener.
+    let gate = admission_gate_from_env(policy.metrics.clone())?;
     let tls_bind = non_empty_env("MQTTD_TLS_BIND");
     let wss_bind = non_empty_env("MQTTD_WSS_BIND");
 
@@ -405,6 +442,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&bind).await?;
         info!(%bind, "accepting MQTT 3.1.1 clients over TLS 1.3");
         tokio::spawn(serve_tls_clients(
+            gate.clone(),
             listener,
             acceptor_rx
                 .clone()
@@ -420,6 +458,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&bind).await?;
         info!(%bind, "accepting MQTT clients over WebSocket + TLS 1.3 (wss, ADR 0035)");
         tokio::spawn(serve_wss_clients(
+            gate.clone(),
             listener,
             acceptor_rx
                 .clone()
@@ -436,6 +475,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT 3.1.1 clients");
         tokio::spawn(serve_plaintext_clients(
+            gate.clone(),
             listener,
             hub_tx.clone(),
             policy.clone(),
@@ -449,6 +489,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT clients over WebSocket (ws, ADR 0035)");
         tokio::spawn(serve_ws_clients(
+            gate.clone(),
             listener,
             hub_tx.clone(),
             policy.clone(),
@@ -478,6 +519,7 @@ async fn start_client_listeners(
         )?;
         info!(%bind, "accepting MQTT clients over QUIC + TLS 1.3 (ADR 0036)");
         tokio::spawn(serve_quic_clients(
+            gate.clone(),
             endpoint,
             hub_tx.clone(),
             policy.clone(),
@@ -1406,6 +1448,7 @@ async fn start_swim_from_env(
 /// Accept TLS clients forever: per-connection handshake (off the accept loop so
 /// a slow handshake cannot stall other clients), then normal MQTT handling.
 async fn serve_tls_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
@@ -1428,6 +1471,11 @@ async fn serve_tls_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse BEFORE any TLS handshake work;
+        // dropping the stream closes it. Counted + logged by the gate.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted TLS connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("tls");
@@ -1438,6 +1486,7 @@ async fn serve_tls_clients(
         let hub = hub_tx.clone();
         let policy = policy.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
@@ -1458,6 +1507,7 @@ async fn serve_tls_clients(
 
 /// Accept plaintext clients forever (insecure; explicitly opted into).
 async fn serve_plaintext_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -1478,18 +1528,20 @@ async fn serve_plaintext_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse before spawning any per-connection work.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("plaintext");
         }
         let _ = stream.set_nodelay(true);
-        connections.spawn(conn::handle_stream(
-            stream,
-            Some(peer),
-            None,
-            policy.clone(),
-            hub_tx.clone(),
-        ));
+        let (policy, hub) = (policy.clone(), hub_tx.clone());
+        connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
+            conn::handle_stream(stream, Some(peer), None, policy, hub).await;
+        });
     }
 }
 
@@ -1497,6 +1549,7 @@ async fn serve_plaintext_clients(
 /// The WebSocket handshake (per connection, off the accept loop) yields a byte stream that
 /// the MQTT engine reads exactly like a TCP socket (ADR 0035).
 async fn serve_ws_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -1515,6 +1568,10 @@ async fn serve_ws_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse before the WebSocket handshake.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted ws connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("ws");
@@ -1522,6 +1579,7 @@ async fn serve_ws_clients(
         let hub = hub_tx.clone();
         let policy = policy.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match mqtt_net::ws::accept(stream).await {
                 Ok(ws) => conn::handle_stream(ws, Some(peer), None, policy, hub).await,
@@ -1541,6 +1599,7 @@ async fn serve_ws_clients(
 /// the TLS stream exactly as for a TCP TLS client (ADR 0004) — then the WebSocket handshake
 /// runs over the TLS stream.
 async fn serve_wss_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
@@ -1560,6 +1619,10 @@ async fn serve_wss_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse BEFORE any TLS handshake work.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted wss connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("wss");
@@ -1569,6 +1632,7 @@ async fn serve_wss_clients(
         let hub = hub_tx.clone();
         let policy = policy.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls) => {
@@ -1601,6 +1665,7 @@ async fn serve_wss_clients(
 /// client. The MQTT session runs over the connection's first **bidirectional** stream (the
 /// control stream) — multi-stream data streams layer on this foundation.
 async fn serve_quic_clients(
+    gate: admission::AdmissionGate,
     endpoint: quinn::Endpoint,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -1618,9 +1683,16 @@ async fn serve_quic_clients(
                 None => return, // endpoint closed
             },
         };
+        // Admission caps (ADR 0041 T1): refuse BEFORE the QUIC/TLS handshake —
+        // the remote address is known from the initial datagram.
+        let Some(permit) = gate.try_admit(Some(incoming.remote_address().ip())) else {
+            incoming.refuse();
+            continue;
+        };
         let hub = hub_tx.clone();
         let policy = policy.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let conn = match incoming.await {
                 Ok(conn) => conn,
                 Err(e) => {

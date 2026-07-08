@@ -5,7 +5,9 @@ adr_status: Proposed
 tasks:
   - id: 0041-T1
     title: Admission caps — global + per-IP connection limits enforced at accept (pre-TLS close), bounded per-IP accounting, metrics; env-tunable with generous defaults
-    status: planned
+    status: done
+    date: 2026-07-06
+    evidence: "New mqttd::admission module: AdmissionGate hands out RAII AdmissionPermits — the accept loop asks try_admit(ip) BEFORE spawning any per-connection work (in particular before the TLS handshake; QUIC refuses via Incoming::refuse before the handshake future), moves the permit into the connection task, and the slot frees itself however the task ends. All five listeners gated (TCP-TLS, plaintext, WS, WSS, QUIC). One mutex over both counts (accept-rate, not per-message); the per-IP table removes entries at zero, so it is bounded by live connections — each entry is backed by a real socket, so the accounting can never outgrow the resource it guards. MQTTD_MAX_CONNECTIONS / MQTTD_MAX_CONNECTIONS_PER_IP (admission_gate_from_env): unset = uncapped (today's behavior), a non-positive or unparseable value is a startup error. Rejections counted (admission_rejected_total{reason=max-connections|per-ip}, Prometheus + OTel — bounded reasons, never per-address) and debug-logged. README config table documents both vars. Tests: admission unit (global cap refuses at bound and a freed slot readmits; per-IP independent across addresses and the table shrinks to empty; unconfigured admits 1000 with an empty table) and two process-level acceptance tests through the real binary (binary_smoke): max_connections_cap_refuses_at_accept_and_recovers (third concurrent connection closed with no CONNACK, admitted clients keep a pub/sub round-trip working, a dropped client's slot recycles) and per_ip_cap_refuses_a_second_connection_from_the_same_address. Workspace green (785 tests), clippy zero warnings. Noted: one unrelated pre-existing load-dependent flake observed once (mqtt-cluster a_takeover_recovers_the_retained_value_and_its_token; 5/5 green isolated, 3/3 green per-crate, full-workspace rerun green) — a candidate exhibit for pre-release area 4's stress harness.
   - id: 0041-T2
     title: Auth-failure pushback — per-source-IP decaying penalty box; penalized addresses closed at accept before any Argon2 work; audited + counted; bounded table
     status: planned
@@ -46,7 +48,7 @@ defaults, and a metric per cap.
 <!-- status-table:0041 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0041-T1 | ⬜ planned | — |  |
+| 0041-T1 | ✅ done | 2026-07-06 | "New mqttd::admission module: AdmissionGate hands out RAII AdmissionPermits — the accept loop asks try_admit(ip) BEFORE spawning any per-connection work (in particular before the TLS handshake; QUIC refuses via Incoming::refuse before the handshake future), moves the permit into the connection task, and the slot frees itself however the task ends. All five listeners gated (TCP-TLS, plaintext, WS, WSS, QUIC). One mutex over both counts (accept-rate, not per-message); the per-IP table removes entries at zero, so it is bounded by live connections — each entry is backed by a real socket, so the accounting can never outgrow the resource it guards. MQTTD_MAX_CONNECTIONS / MQTTD_MAX_CONNECTIONS_PER_IP (admission_gate_from_env): unset = uncapped (today's behavior), a non-positive or unparseable value is a startup error. Rejections counted (admission_rejected_total{reason=max-connections|per-ip}, Prometheus + OTel — bounded reasons, never per-address) and debug-logged. README config table documents both vars. Tests: admission unit (global cap refuses at bound and a freed slot readmits; per-IP independent across addresses and the table shrinks to empty; unconfigured admits 1000 with an empty table) and two process-level acceptance tests through the real binary (binary_smoke): max_connections_cap_refuses_at_accept_and_recovers (third concurrent connection closed with no CONNACK, admitted clients keep a pub/sub round-trip working, a dropped client's slot recycles) and per_ip_cap_refuses_a_second_connection_from_the_same_address. Workspace green (785 tests), clippy zero warnings. Noted: one unrelated pre-existing load-dependent flake observed once (mqtt-cluster a_takeover_recovers_the_retained_value_and_its_token; 5/5 green isolated, 3/3 green per-crate, full-workspace rerun green) — a candidate exhibit for pre-release area 4's stress harness. |
 | 0041-T2 | ⬜ planned | — |  |
 | 0041-T3 | ⬜ planned | — |  |
 | 0041-T4 | ⬜ planned | — |  |
@@ -55,6 +57,10 @@ defaults, and a metric per cap.
 
 ## Changelog
 
+- **2026-07-06** — T1 (admission caps) landed: every client listener now gates accepts
+  through an RAII admission permit — over-cap connections (global or per-source-IP) are
+  closed before any TLS work, counted, and freed slots recycle. The per-IP table is
+  structurally bounded by live connections. Proven through the real binary.
 - **2026-07-05** — ADR proposed and delivery opened. Scope fixed by a bounds survey:
   per-frame/per-session costs are bounded and tested (read buffer 1 MiB, peer frame
   16 MiB, backlog 10 000 drop-oldest, offline queue 100 000 drop-oldest, alias table,

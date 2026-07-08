@@ -90,6 +90,7 @@ struct OtelInstruments {
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
     revocation_evictions: OtelCounter<u64>,
+    admission_rejected: OtelCounter<u64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
@@ -124,6 +125,7 @@ impl OtelInstruments {
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
+            admission_rejected: meter.u64_counter("admission_rejected").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
@@ -169,6 +171,7 @@ pub struct Metrics {
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
     revocation_evictions_total: Family<ReasonLabel, Counter>,
+    admission_rejected_total: Family<ReasonLabel, Counter>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
     retained_queue_dropped_total: Counter,
@@ -334,6 +337,12 @@ impl Metrics {
             "Live state revoked by a policy-reload sweep (ADR 0040), by kind \
              (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked)",
         );
+        let admission_rejected_total = register_family(
+            &mut registry,
+            "admission_rejected",
+            "Connections refused at accept by an admission cap (ADR 0041), by reason \
+             (max-connections, per-ip)",
+        );
         let quic_path_migrations_total = register_counter(
             &mut registry,
             "quic_path_migrations",
@@ -388,6 +397,7 @@ impl Metrics {
             gossip_rejected_total,
             security_reloads_total,
             revocation_evictions_total,
+            admission_rejected_total,
             quic_path_migrations_total,
             retained_divergence_total,
             retained_queue_dropped_total,
@@ -601,6 +611,20 @@ impl Metrics {
                 KeyValue::new("trigger", trigger.to_string()),
             ],
         );
+    }
+
+    /// A connection was refused at accept by an admission cap (ADR 0041 T1),
+    /// before any TLS handshake work. Bounded reasons only (`max-connections`,
+    /// `per-ip`) — never a per-client or per-address value.
+    pub fn admission_rejected(&self, reason: &str) {
+        self.admission_rejected_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .admission_rejected
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
     /// A policy-reload sweep revoked live state (ADR 0040): a session evicted

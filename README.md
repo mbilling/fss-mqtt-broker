@@ -228,6 +228,8 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
 | `MQTTD_TOPIC_ALIAS_MAX` | Topic Alias Maximum advertised to v5 clients (ADR 0011; default `16`, `0` disables) |
 | `MQTTD_RECEIVE_MAXIMUM` | Receive Maximum advertised to v5 clients (ADR 0012; default `256`). Exceeding it → DISCONNECT `0x93` |
+| `MQTTD_MAX_CONNECTIONS` | Global concurrent-connection cap (ADR 0041). An over-cap connection is closed **at accept, before any TLS work**; a freed slot is immediately reusable. Unset = uncapped |
+| `MQTTD_MAX_CONNECTIONS_PER_IP` | Concurrent-connection cap per source IP (ADR 0041), enforced the same way. The accounting table is bounded by live connections. Unset = uncapped |
 | `MQTTD_AUTH_TIMEOUT` | Per-round enhanced-auth reply timeout, seconds (ADR 0013; default `10`) |
 | `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
 | `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); unset → in-memory |
