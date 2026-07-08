@@ -295,22 +295,37 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     handle_stream(stream, peer, None, policy, hub).await;
 }
 
+/// How a connection ended, for the accept-loop wrapper: today just whether the
+/// CONNECT failed **authentication** (never authorization) — the fact the
+/// auth-failure penalty box records per source address (ADR 0041 T2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnOutcome {
+    /// The connection's CONNECT was rejected by the authenticator.
+    pub auth_failed: bool,
+}
+
 /// Drive one accepted connection over any transport (TCP, TLS) to completion,
 /// logging any error. `peer` is the remote address, for diagnostics only.
 /// `cert` is the TLS-verified mTLS admission (identity + leaf serial), `None` on
 /// plaintext or no-client-cert connections; `policy` decides authentication,
-/// authorization, and auditing.
+/// authorization, and auditing. Returns the [`ConnOutcome`] the admission gate
+/// consumes (ADR 0041 T2).
 pub async fn handle_stream<S>(
     stream: S,
     peer: Option<SocketAddr>,
     cert: Option<CertAdmission>,
     policy: Arc<ConnPolicy>,
     hub: mpsc::UnboundedSender<HubCommand>,
-) where
+) -> ConnOutcome
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = run(stream, cert, &policy, hub).await {
+    let auth_failed = std::sync::atomic::AtomicBool::new(false);
+    if let Err(e) = run(stream, cert, &policy, hub, &auth_failed).await {
         warn!(?peer, error = %e, "connection ended with error");
+    }
+    ConnOutcome {
+        auth_failed: auth_failed.load(Ordering::Relaxed),
     }
 }
 
@@ -319,6 +334,7 @@ async fn run<S>(
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
+    auth_failed: &std::sync::atomic::AtomicBool,
 ) -> Result<(), NetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -328,7 +344,7 @@ where
     let writer = FrameWriter::new(wh, ProtocolVersion::V311);
     // A directly-accepted client may be relocated to its placement owner; it has no
     // relaying node (`via = None`).
-    run_framed(reader, writer, cert, policy, hub, true, None).await
+    run_framed(reader, writer, cert, policy, hub, true, None, auth_failed).await
 }
 
 /// Serve an MQTT connection over already-framed halves. `allow_proxy` is `true`
@@ -437,6 +453,7 @@ async fn read_connect<R: AsyncRead + Unpin>(
 // A flat CONNECT→serve sequence: long by the number of handshake/attach outcomes it maps,
 // not by branching complexity.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
@@ -445,6 +462,7 @@ async fn run_framed<R, W>(
     hub: mpsc::UnboundedSender<HubCommand>,
     allow_proxy: bool,
     via: Option<String>,
+    auth_failed: &std::sync::atomic::AtomicBool,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -480,6 +498,9 @@ where
     )
     .await?
     else {
+        // The penalty box (ADR 0041 T2) keys on this: authentication failed —
+        // authorization denials below never set it.
+        auth_failed.store(true, Ordering::Relaxed);
         return Ok(()); // rejected; CONNACK/close already handled
     };
 
@@ -733,7 +754,11 @@ pub async fn serve_proxied<R, W>(
         identity,
         serial: None,
     });
-    if let Err(e) = run_framed(reader, writer, cert, &policy, hub, false, via).await {
+    // The auth-failure flag is deliberately dropped here: a proxied stream's peer
+    // address is the RELAYING NODE (ADR 0005), which must never be penalized for
+    // a client's bad credentials (ADR 0041 T2).
+    let auth_failed = std::sync::atomic::AtomicBool::new(false);
+    if let Err(e) = run_framed(reader, writer, cert, &policy, hub, false, via, &auth_failed).await {
         warn!(?peer, error = %e, "proxied session ended with error");
     }
 }

@@ -358,6 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// startup error, not a silent misconfiguration.
 fn admission_gate_from_env(
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    audit: Option<Arc<dyn mqtt_observability::AuditSink>>,
 ) -> Result<admission::AdmissionGate, Box<dyn std::error::Error>> {
     let cap = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
         match non_empty_env(var) {
@@ -370,18 +371,34 @@ fn admission_gate_from_env(
     };
     let max_connections = cap("MQTTD_MAX_CONNECTIONS")?;
     let max_per_ip = cap("MQTTD_MAX_CONNECTIONS_PER_IP")?;
-    if max_connections.is_some() || max_per_ip.is_some() {
+    // Auth-failure penalty box (ADR 0041 T2): threshold enables it; the decay is
+    // how long one strike takes to age away (default 60s).
+    let penalty = match cap("MQTTD_AUTH_PENALTY_THRESHOLD")? {
+        None => None,
+        Some(threshold) => {
+            let decay_secs = cap("MQTTD_AUTH_PENALTY_DECAY_SECS")?.unwrap_or(60);
+            Some(admission::PenaltyConfig {
+                threshold: u32::try_from(threshold)
+                    .map_err(|_| "MQTTD_AUTH_PENALTY_THRESHOLD is too large")?,
+                decay: std::time::Duration::from_secs(decay_secs as u64),
+            })
+        }
+    };
+    if max_connections.is_some() || max_per_ip.is_some() || penalty.is_some() {
         info!(
             ?max_connections,
             ?max_per_ip,
-            "connection admission caps active (ADR 0041): over-cap connections are \
-             closed at accept, before any TLS work"
+            ?penalty,
+            "connection admission caps active (ADR 0041): over-cap or penalized \
+             connections are closed at accept, before any TLS work"
         );
     }
-    Ok(admission::AdmissionGate::new(
+    Ok(admission::AdmissionGate::with_penalty(
         max_connections,
         max_per_ip,
+        penalty,
         metrics,
+        audit,
     ))
 }
 
@@ -396,7 +413,7 @@ async fn start_client_listeners(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut any = false;
     // Connection admission caps (ADR 0041 T1), shared by every client listener.
-    let gate = admission_gate_from_env(policy.metrics.clone())?;
+    let gate = admission_gate_from_env(policy.metrics.clone(), Some(policy.audit.clone()))?;
     let tls_bind = non_empty_env("MQTTD_TLS_BIND");
     let wss_bind = non_empty_env("MQTTD_WSS_BIND");
 
@@ -1485,6 +1502,7 @@ async fn serve_tls_clients(
         let acceptor = acceptor_rx.borrow().clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
             let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
@@ -1492,7 +1510,11 @@ async fn serve_tls_clients(
                 Ok(tls_stream) => {
                     // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
                     let cert = conn::tls_admission(&tls_stream);
-                    conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await;
+                    let outcome =
+                        conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await;
+                    if outcome.auth_failed {
+                        gate.record_auth_failure(Some(peer.ip()));
+                    }
                 }
                 Err(e) => {
                     debug!(%peer, error = %e, "TLS handshake failed");
@@ -1537,10 +1559,13 @@ async fn serve_plaintext_clients(
             m.connection_accepted("plaintext");
         }
         let _ = stream.set_nodelay(true);
-        let (policy, hub) = (policy.clone(), hub_tx.clone());
+        let (policy, hub, gate) = (policy.clone(), hub_tx.clone(), gate.clone());
         connections.spawn(async move {
             let _permit = permit; // slot freed when the connection task ends
-            conn::handle_stream(stream, Some(peer), None, policy, hub).await;
+            let outcome = conn::handle_stream(stream, Some(peer), None, policy, hub).await;
+            if outcome.auth_failed {
+                gate.record_auth_failure(Some(peer.ip()));
+            }
         });
     }
 }
@@ -1578,11 +1603,17 @@ async fn serve_ws_clients(
         }
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
             let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match mqtt_net::ws::accept(stream).await {
-                Ok(ws) => conn::handle_stream(ws, Some(peer), None, policy, hub).await,
+                Ok(ws) => {
+                    let outcome = conn::handle_stream(ws, Some(peer), None, policy, hub).await;
+                    if outcome.auth_failed {
+                        gate.record_auth_failure(Some(peer.ip()));
+                    }
+                }
                 Err(e) => {
                     debug!(%peer, error = %e, "websocket handshake failed");
                     if let Some(m) = &policy.metrics {
@@ -1631,6 +1662,7 @@ async fn serve_wss_clients(
         let acceptor = acceptor_rx.borrow().clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
             let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
@@ -1640,7 +1672,13 @@ async fn serve_wss_clients(
                     // read before the TLS stream is consumed by the WebSocket adapter.
                     let cert = conn::tls_admission(&tls);
                     match mqtt_net::ws::accept(tls).await {
-                        Ok(ws) => conn::handle_stream(ws, Some(peer), cert, policy, hub).await,
+                        Ok(ws) => {
+                            let outcome =
+                                conn::handle_stream(ws, Some(peer), cert, policy, hub).await;
+                            if outcome.auth_failed {
+                                gate.record_auth_failure(Some(peer.ip()));
+                            }
+                        }
                         Err(e) => {
                             debug!(%peer, error = %e, "websocket handshake failed");
                             if let Some(m) = &policy.metrics {
@@ -1691,6 +1729,7 @@ async fn serve_quic_clients(
         };
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
             let _permit = permit; // slot freed when the connection task ends
             let conn = match incoming.await {
@@ -1720,7 +1759,12 @@ async fn serve_quic_clients(
             // Multi-stream mux (ADR 0036): the control stream carries the session; any data
             // streams the client opens feed PUBLISH into the same session, no HoL blocking.
             match mqtt_net::quic::accept_mux(conn).await {
-                Ok(mux) => conn::handle_stream(mux, Some(peer), cert, policy, hub).await,
+                Ok(mux) => {
+                    let outcome = conn::handle_stream(mux, Some(peer), cert, policy, hub).await;
+                    if outcome.auth_failed {
+                        gate.record_auth_failure(Some(peer.ip()));
+                    }
+                }
                 Err(e) => {
                     debug!(%peer, error = %e, "QUIC connection opened no control stream");
                 }
