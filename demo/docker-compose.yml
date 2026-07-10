@@ -1,15 +1,16 @@
 name: mqttd-demo
 
-# A 3-node durable mqttd cluster plus a Grafana / Prometheus / Alloy observability
-# stack. Each broker BOTH exposes Prometheus /metrics (scraped by Alloy) and pushes
-# OTLP/HTTP to Alloy — so both metric paths are exercised. A small load generator
-# drives cross-node traffic so the dashboard is populated.
+# A 7-node durable mqttd cluster plus a Grafana / Prometheus / Alloy observability
+# stack (EXPERIMENT: scaled up from the baseline 3-node demo). Each broker BOTH exposes
+# Prometheus /metrics (scraped by Alloy) and pushes OTLP/HTTP to Alloy — so both metric
+# paths are exercised. A small load generator drives cross-node traffic so the dashboard
+# is populated.
 #
 #   cd demo && docker compose up --build
 #   Grafana:    http://localhost:3000  (anonymous admin) -> "mqttd — broker overview"
 #   Prometheus: http://localhost:9090
 #   Alloy UI:   http://localhost:12345
-#   MQTT:       localhost:1883 / 1884 / 1885
+#   MQTT:       localhost:1883 / 1884 / 1885 / 1887 / 1888 / 1889 / 1891  (mqttd-1..7)
 
 x-broker-env: &broker-env
   MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext, loudly logged insecure
@@ -33,7 +34,8 @@ x-broker-env: &broker-env
   MQTTD_DATA_DIR: /data
   MQTTD_OTLP_ENDPOINT: http://alloy:4318
   MQTTD_OTLP_INTERVAL: "5"
-  MQTTD_READY_MIN_MEMBERS: "3"
+  MQTTD_READY_MIN_MEMBERS: "4"        # a node is /readyz once it sees a majority of the
+                                       # cluster (the durable-quorum floor); set by scale-cluster.py
   RUST_LOG: info
 
 services:
@@ -57,6 +59,7 @@ services:
       quic-certs:
         condition: service_completed_successfully
 
+  # >>> generated: follower nodes mqttd-2..N — edit demo/scale-cluster.py, not here >>>
   mqttd-2:
     image: mqttd-demo
     hostname: mqttd-2
@@ -90,6 +93,75 @@ services:
         condition: service_started
       quic-certs:
         condition: service_completed_successfully
+
+  mqttd-4:
+    image: mqttd-demo
+    hostname: mqttd-4
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-4
+      MQTTD_PEER_BIND: mqttd-4:7001
+      MQTTD_SWIM_BIND: mqttd-4:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1887:1883", "8084:8080"]
+    volumes: ["d4:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-5:
+    image: mqttd-demo
+    hostname: mqttd-5
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-5
+      MQTTD_PEER_BIND: mqttd-5:7001
+      MQTTD_SWIM_BIND: mqttd-5:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1888:1883", "8085:8080"]
+    volumes: ["d5:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-6:
+    image: mqttd-demo
+    hostname: mqttd-6
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-6
+      MQTTD_PEER_BIND: mqttd-6:7001
+      MQTTD_SWIM_BIND: mqttd-6:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1889:1883", "8086:8080"]
+    volumes: ["d6:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-7:
+    image: mqttd-demo
+    hostname: mqttd-7
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-7
+      MQTTD_PEER_BIND: mqttd-7:7001
+      MQTTD_SWIM_BIND: mqttd-7:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1891:1883", "8087:8080"]
+    volumes: ["d7:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+  # <<< generated: follower nodes <<<
 
   alloy:
     image: grafana/alloy:latest
@@ -131,7 +203,11 @@ services:
     entrypoint: ["/bin/sh", "/loadgen.sh"]
     volumes:
       - ./loadgen/loadgen.sh:/loadgen.sh:ro
-    depends_on: [mqttd-1, mqttd-2, mqttd-3]
+    # >>> generated: loadgen node list — edit demo/scale-cluster.py, not here >>>
+    environment:
+      LOADGEN_NODES: "mqttd-1 mqttd-2 mqttd-3 mqttd-4 mqttd-5 mqttd-6 mqttd-7"
+    depends_on: [mqttd-1, mqttd-2, mqttd-3, mqttd-4, mqttd-5, mqttd-6, mqttd-7]
+    # <<< generated: loadgen node list <<<
 
   # --- browser MQTT playground -------------------------------------------------------
   # The page connects directly to mqttd's NATIVE MQTT-over-WebSocket listener (ADR 0035) on
@@ -221,8 +297,14 @@ services:
 
 # Per-node durable state (lease group + replicated session log); each broker gets its own.
 volumes:
+  # >>> generated: per-node data volumes d1..dN — edit demo/scale-cluster.py, not here >>>
   d1:
   d2:
   d3:
+  d4:
+  d5:
+  d6:
+  d7:
+  # <<< generated: per-node data volumes <<<
   bridge-spool:
   quic-certs:   # throwaway demo PKI for the MQTT-over-QUIC listener (ADR 0036)

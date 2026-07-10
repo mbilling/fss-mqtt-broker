@@ -9,9 +9,15 @@
 // --- 1. Scrape the three brokers' /metrics --------------------------------------
 prometheus.scrape "brokers" {
 	targets = [
+		// >>> generated: broker scrape targets — edit demo/scale-cluster.py, not here >>>
 		{ __address__ = "mqttd-1:8080", instance = "mqttd-1" },
 		{ __address__ = "mqttd-2:8080", instance = "mqttd-2" },
 		{ __address__ = "mqttd-3:8080", instance = "mqttd-3" },
+		{ __address__ = "mqttd-4:8080", instance = "mqttd-4" },
+		{ __address__ = "mqttd-5:8080", instance = "mqttd-5" },
+		{ __address__ = "mqttd-6:8080", instance = "mqttd-6" },
+		{ __address__ = "mqttd-7:8080", instance = "mqttd-7" },
+		// <<< generated: broker scrape targets <<<
 	]
 	metrics_path    = "/metrics"
 	scrape_interval = "5s"
