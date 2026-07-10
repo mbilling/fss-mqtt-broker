@@ -49,7 +49,7 @@
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
-| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [2/7 done](0042-durable-plane-stress-harness.md) | 5 open |
+| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [3/8 done](0042-durable-plane-stress-harness.md) | 5 open |
 
 ## Open and deferred work
 
@@ -118,5 +118,5 @@
 - `0042-T3` ⬜ planned: Seeded whole-cluster stress harness — in-process multi-node cluster under seed-composed fault schedules (kill/restart, partition/heal, frame delay/drop, client churn, takeover storms) with a seeded workload; post-quiesce invariant + convergence oracle; failure prints seed + schedule trace
 - `0042-T4` ⬜ planned: Crash/restart/disk faults — process kill with surviving data dir, full-cluster stop/start recovery, disk-full and write-error injection (FlakyStore promoted to a shared fixture), brownout entry/exit mid-workload
 - `0042-T5` ⬜ planned: Profiles + exhibits + closure — bounded CI profile on every push, env-tunable soak profile, exhibit ledger opened with the takeover flake (reproduced-and-fixed or explained), TEST-PLAN/docs updated, ADR acceptance
-- `0042-T6` ⬜ planned: "Fix exhibit ②: takeover re-commit — a new owner re-replicates the recovered log to a quorum (at its epoch) before serving or appending, so adopted single-replica orphans cannot gap out the acked tail at the next takeover"
 - `0042-T7` ⬜ planned: "Fix exhibit ③: epoch-tagged replica entries (schema v3, peer-proto bump) — merge resolves same-offset conflicts by higher epoch and truncates non-monotonic-epoch tails (log matching), ending offset-reuse divergence and stale retained-token adoption; un-ignores the strict no-waiver sim test with T6"
+- `0042-T8` ⬜ planned: "Fix exhibit ④: durable leader self-ack — the owner's append (and re-commit) persists to its own durable replica copy before counting its self-ack toward quorum, so an acked entry exists on a full durable quorum and a restarted owner's recovery read cannot lose it"

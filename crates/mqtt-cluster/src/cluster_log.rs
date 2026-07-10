@@ -621,11 +621,19 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     }
 
     /// Seed `key`'s committed state from `entries` recovered from a quorum of
-    /// replicas on takeover (workstream F). Idempotent and non-clobbering: only a
-    /// key with no state yet is seeded, so a re-recovery or a concurrent builder is
-    /// a no-op. Appends then continue from the recovered watermark.
-    pub async fn seed_key(&self, key: &str, entries: Vec<LogEntry>) {
-        if entries.is_empty() {
+    /// replicas on takeover (workstream F), with `floor` the highest **truncation
+    /// low-water** seen across the recovery reads. Idempotent and non-clobbering:
+    /// only a key with no state yet is seeded, so a re-recovery or a concurrent
+    /// builder is a no-op.
+    ///
+    /// Appends continue from the recovered watermark **or `floor`, whichever is
+    /// higher** (ADR 0042 T6, exhibit ②): a fully-truncated queue legitimately
+    /// merges *empty*, but restarting its offset space at 1 would put every new
+    /// acked write at or below some replica's durable truncation watermark — and
+    /// any later recovery reading that replica silently drops those offsets. The
+    /// key's offset space is monotonic across owners, truncation included.
+    pub async fn seed_key(&self, key: &str, entries: Vec<LogEntry>, floor: Offset) {
+        if entries.is_empty() && floor == 0 {
             return;
         }
         let mut state = self.state.lock().await;
@@ -639,7 +647,72 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             ks.committed = ks.committed.max(entry.offset);
             ks.entries.insert(entry.offset, entry.record);
         }
-        ks.truncated = lowest.map_or(0, |l| l.saturating_sub(1));
+        // Recovered entries all sit above `floor` (the merge dropped anything at
+        // or below it), so both watermarks are at least `floor`.
+        ks.committed = ks.committed.max(floor);
+        ks.truncated = lowest.map_or(floor, |l| l.saturating_sub(1)).max(floor);
+    }
+}
+
+impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
+    /// Re-commit a recovered log to a **write quorum** at this owner's epoch
+    /// ([ADR 0042](../../../docs/adr/0042-durable-plane-stress-harness.md) T6,
+    /// exhibit ②).
+    ///
+    /// A takeover merge can *adopt* an entry that lives on a single replica — an
+    /// orphan a crashed owner's partial fan-out left behind, contiguous with the
+    /// committed run and therefore indistinguishable from it. Building on an
+    /// adopted base without restoring its quorum spread lets the **next** takeover
+    /// gap out at that offset when its read quorum misses the orphan-holder, and
+    /// the merge's contiguity rule then discards the acked tail above the gap.
+    ///
+    /// So before a recovered key is served or appended to, every recovered entry
+    /// is re-delivered to the followers (idempotent: same offset, same bytes) at
+    /// this owner's **new epoch** — which also advances the followers' group
+    /// fences — and each entry must reach the write quorum (the owner's own copy
+    /// counts as one ack, as on [`append`](Self::append)). An owner that cannot
+    /// re-commit its base must not serve it: the caller propagates
+    /// [`ReplError::NoQuorum`] and recovery is retried on the next touch, the
+    /// ADR 0017 posture.
+    ///
+    /// # Errors
+    /// [`ReplError::NoQuorum`] if any recovered entry cannot reach the quorum.
+    pub async fn recommit_key(&self, key: &str, entries: &[LogEntry]) -> Result<(), ReplError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Fan every (entry, follower) delivery out concurrently — recovery-time,
+        // one wave — and count per-entry acks, the owner's copy included.
+        let mut acks = vec![1usize; entries.len()];
+        let mut inflight = tokio::task::JoinSet::new();
+        for follower in &self.followers {
+            for (i, entry) in entries.iter().enumerate() {
+                let transport = self.transport.clone();
+                let follower = follower.clone();
+                let epoch = self.lease.epoch;
+                let op = ReplOp::Append {
+                    key: key.to_string(),
+                    offset: entry.offset,
+                    record: entry.record.clone(),
+                };
+                inflight.spawn(async move { (i, transport.deliver(&follower, epoch, &op).await) });
+            }
+        }
+        while let Some(res) = inflight.join_next().await {
+            if let Ok((i, true)) = res {
+                acks[i] += 1;
+            }
+        }
+        if acks.iter().all(|a| *a >= self.quorum) {
+            Ok(())
+        } else {
+            tracing::warn!(
+                key,
+                epoch = self.lease.epoch,
+                "takeover re-commit could not reach quorum; refusing to serve the recovered log (ADR 0042 T6)"
+            );
+            Err(ReplError::NoQuorum)
+        }
     }
 }
 
@@ -1092,6 +1165,11 @@ mod tests {
             self.reachable.lock().unwrap().remove(node);
         }
 
+        /// Bring `node` back online (a heal).
+        fn up(&self, node: &NodeId) {
+            self.reachable.lock().unwrap().insert(node.clone());
+        }
+
         /// Stored entries on a replica (for assertions).
         fn entries(&self, node: &NodeId, key: &str) -> Vec<u64> {
             self.replicas
@@ -1265,6 +1343,43 @@ mod tests {
         ));
         // The catalog states the same thing once, over every decision the
         // transport carried: no replica accepted a stale epoch (ADR 0042 T1).
+        sim.assert_fencing_held();
+    }
+
+    /// Takeover re-commit (ADR 0042 T6, exhibit ②): an owner that cannot restore
+    /// its recovered base to a write quorum refuses to serve it (`NoQuorum`), and
+    /// once the followers heal the same re-commit succeeds — landing the adopted
+    /// base on every reachable replica at the owner's epoch (advancing fences).
+    #[tokio::test]
+    async fn recommit_requires_a_write_quorum_for_the_recovered_base() {
+        let (log, sim, followers) = group(5);
+        let k = "x".to_string();
+        let base = vec![
+            LogEntry {
+                offset: 1,
+                record: b"adopted-orphan".to_vec(),
+            },
+            LogEntry {
+                offset: 2,
+                record: b"acked".to_vec(),
+            },
+        ];
+
+        // Both followers down: only the owner's own (volatile) ack — no quorum,
+        // no service.
+        sim.down(&followers[0]);
+        sim.down(&followers[1]);
+        assert!(matches!(
+            log.recommit_key(&k, &base).await,
+            Err(mqtt_storage::repl::ReplError::NoQuorum)
+        ));
+
+        // One follower heals: owner + one replica = quorum. The base spreads to
+        // the reachable follower and its group fence advances to the new epoch.
+        sim.up(&followers[0]);
+        log.recommit_key(&k, &base).await.unwrap();
+        assert_eq!(sim.entries(&followers[0], &k), vec![1, 2]);
+        assert!(sim.entries(&followers[1], &k).is_empty());
         sim.assert_fencing_held();
     }
 

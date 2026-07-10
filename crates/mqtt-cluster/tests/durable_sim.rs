@@ -23,11 +23,11 @@
 //! On its first sweep this harness found two **real defects** in the replication
 //! glue, recorded as exhibits ② and ③ in the delivery doc's ledger:
 //!
-//! - **② Adopted-orphan gap loss** (`acked-durability`): a takeover merge adopts
-//!   a single-replica orphan into the committed run and the new owner builds on
-//!   top of it without re-replicating it; a later takeover whose read quorum
-//!   misses the orphan-holder hits a gap at that offset, and the contiguity rule
-//!   discards the **acked tail above it**. Fix: 0042-T6 (takeover re-commit).
+//! - **② Adopted-orphan gap loss** — **FIXED by 0042-T6** (takeover re-commit:
+//!   the new owner re-replicates the recovered base to a write quorum at its
+//!   epoch before serving; `ClusterLog::recommit_key`). The sim's takeover
+//!   models the re-commit, and the `acked-durability` waiver is gone: the
+//!   invariant is enforced on every seed again.
 //! - **③ Offset-reuse divergence** (`acked-integrity`): after `NoQuorum` the next
 //!   (different) record reuses the offset; a replica that stored the failed
 //!   attempt and missed the reuse holds different bytes at an acked offset, and
@@ -39,11 +39,11 @@
 //!   merge cannot apply the log-matching rule and truncate the stale tail).
 //!   Fix: 0042-T7 (epoch-tagged entries + conflict/tail resolution).
 //!
-//! The sweeping tests waive exactly these two violation classes (loudly, by
+//! The sweeping tests waive exactly the remaining exhibit-③ class (loudly, by
 //! count) so every *other* invariant stays enforced on every push;
 //! [`replication_catalog_holds_with_no_waivers`] runs the same schedules
-//! unwaived and is `#[ignore]`d until T6/T7 remove the defects — un-ignoring it
-//! is those tasks' acceptance.
+//! unwaived and is `#[ignore]`d until T7 removes the defect — un-ignoring it
+//! is that task's acceptance.
 
 use mqtt_cluster::cluster_log::{merge_replica_logs, ReplOp, ReplicaRead, ReplicaState};
 use mqtt_cluster::invariants::{AckLedger, FenceLog, LeaseLog, TokenLog, Violation};
@@ -60,9 +60,11 @@ const REPRO_SEED: Option<u64> = None;
 /// in seconds). `REPRO_SEED` narrows it to one.
 const SEED_SWEEP: u64 = 1000;
 
-/// The violation classes covered by the recorded exhibits ② and ③ (module docs).
-/// Removed by 0042-T6/T7; nothing else is ever waived.
-const WAIVED_KNOWN_EXHIBITS: &[&str] = &["acked-durability", "acked-integrity"];
+/// The violation class covered by the remaining recorded exhibit ③ (module
+/// docs). Removed by 0042-T7; nothing else is ever waived. (Exhibit ②'s
+/// `acked-durability` waiver was removed when 0042-T6 landed the takeover
+/// re-commit.)
+const WAIVED_KNOWN_EXHIBITS: &[&str] = &["acked-integrity"];
 
 fn seeds() -> Vec<u64> {
     match REPRO_SEED {
@@ -292,6 +294,7 @@ impl ReplSim {
     fn takeover_recover(
         &mut self,
         key: &str,
+        epoch: u64,
         waive: bool,
     ) -> (Vec<mqtt_storage::repl::LogEntry>, Vec<Violation>) {
         let first = self.rng.pick(3);
@@ -301,12 +304,31 @@ impl ReplSim {
             watermark: r.watermark(key),
             entries: r.entries(key),
         };
-        let merged =
-            merge_replica_logs(&[read(&self.replicas[first]), read(&self.replicas[second])]);
+        let reads = [read(&self.replicas[first]), read(&self.replicas[second])];
+        let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
+        let merged = merge_replica_logs(&reads);
         let (waived, violations) = split_waived(self.ledger.verify_recovered(key, &merged), waive);
         self.waived += waived;
-        self.next_offset
-            .insert(key.to_string(), merged.last().map_or(1, |e| e.offset + 1));
+        // Re-commit the recovered base to a write quorum at the new owner's
+        // epoch (the 0042-T6 fix for exhibit ②), retried through the adversarial
+        // fates until quorum — as the real recovery retries on NoQuorum.
+        for entry in &merged {
+            let op = ReplOp::Append {
+                key: key.to_string(),
+                offset: entry.offset,
+                record: entry.record.clone(),
+            };
+            while self.send(epoch, &op) < QUORUM {}
+        }
+        // The offset space continues above BOTH the recovered high-water and the
+        // reads' truncation floor (exhibit ②'s second face, also fixed by T6): a
+        // fully-truncated key merges empty, but restarting at offset 1 would put
+        // new acked writes below some replica's durable watermark — silently
+        // dropped by any later merge that reads it.
+        self.next_offset.insert(
+            key.to_string(),
+            merged.last().map_or(1, |e| e.offset + 1).max(floor + 1),
+        );
         (merged, violations)
     }
 
@@ -355,7 +377,7 @@ fn run_replication_schedule(seed: u64, keys: &[&str], waive: bool) -> usize {
         let epoch = generation;
         if generation > 1 {
             for key in keys {
-                let (_, violations) = sim.takeover_recover(key, waive);
+                let (_, violations) = sim.takeover_recover(key, epoch, waive);
                 assert_seed_holds(seed, "takeover recovery", &violations);
             }
         }
@@ -392,10 +414,10 @@ fn fencing_and_acked_durability_hold_across_seeded_takeover_schedules() {
     eprintln!("durable_sim: waived {waived} known-exhibit violations (exhibits 2-3)");
 }
 
-/// The same schedules with **no waivers**: red today, by design — exhibits ② and
-/// ③ are real. 0042-T6/T7's acceptance is un-ignoring this test.
+/// The same schedules with **no waivers**: red today, by design — exhibit ③ is
+/// still real (② was fixed by T6). 0042-T7's acceptance is un-ignoring this test.
 #[test]
-#[ignore = "exhibits 2-3 (0042-T6/T7): adopted-orphan gap loss + offset-reuse divergence"]
+#[ignore = "exhibit 3 (0042-T7): offset-reuse divergence needs epoch-tagged entries"]
 fn replication_catalog_holds_with_no_waivers() {
     for seed in seeds() {
         run_replication_schedule(seed, &["q/sim-a", "q/sim-b"], false);
@@ -486,7 +508,7 @@ fn run_retained_schedule(seed: u64, waive: bool) -> usize {
         let epoch = generation;
         if generation > 1 {
             let waived_before = sim.waived;
-            let (merged, violations) = sim.takeover_recover(topic_key, waive);
+            let (merged, violations) = sim.takeover_recover(topic_key, epoch, waive);
             assert_seed_holds(seed, "retained takeover recovery", &violations);
             let lossy = sim.waived > waived_before;
             if let (Some(entry), Some(acked), false) = (merged.last(), last_acked, lossy) {
