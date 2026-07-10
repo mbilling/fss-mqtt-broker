@@ -229,6 +229,26 @@ pub struct Quotas {
     /// is denied `0x97 Quota exceeded` (v5) / `0x80` (v3.1.1) in its SUBACK slot.
     /// Re-subscribing an already-held filter never consumes quota (it replaces).
     pub max_subscriptions_per_client: Option<usize>,
+    /// The most retained topics this node stores (ADR 0041 T4). A retained
+    /// publish creating a NEW topic beyond it is refused — the cap stops growth,
+    /// never maintenance: overwriting or clearing an existing topic always works.
+    pub max_retained_messages: Option<usize>,
+    /// The most sessions (online + retained-offline) this node holds. A CONNECT
+    /// creating a NEW session beyond it is refused (`0x97` v5 / Server
+    /// unavailable v3.1.1); resuming an existing session always works.
+    pub max_sessions: Option<usize>,
+}
+
+/// How the hub disposed of a publish, reported through the ack-gate channel
+/// (ADR 0018/0041): the connection releases the publisher's acknowledgement —
+/// or answers `0x97 Quota exceeded` — accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Fanned out (and durably appended where applicable) — ack normally.
+    Accepted,
+    /// A v5 retained publish would have created a new retained topic beyond the
+    /// quota: nothing was delivered or retained — answer `0x97` (ADR 0041 T4).
+    RetainedQuotaExceeded,
 }
 
 /// A currently-online client connection.
@@ -340,6 +360,10 @@ pub enum AttachOutcome {
     /// connection may not resume or take it over (ADR 0031). The connection must reject the
     /// CONNACK as Not-authorized; the existing session is left untouched.
     OwnerMismatch,
+    /// Creating this session would exceed the node's session quota (ADR 0041 T4).
+    /// The connection rejects the CONNACK (`0x97` v5 / Server unavailable v3.1.1);
+    /// resuming an existing session is never refused for quota.
+    QuotaExceeded,
 }
 
 /// The outcome of the off-loop durable recovery for a persistent attach (ADR 0017).
@@ -471,7 +495,12 @@ pub enum HubCommand {
         /// offline-queue appends — has completed, so the connection releases a
         /// `QoS` ≥ 1 acknowledgement only for a message the broker durably owns
         /// (ADR 0018). `None` when no acknowledgement is gated on the fan-out.
-        done: Option<oneshot::Sender<()>>,
+        done: Option<oneshot::Sender<PublishOutcome>>,
+        /// Whether the publisher speaks MQTT 5 (ADR 0041 T4): an over-quota
+        /// retained publish is refused outright for v5 (the publisher gets
+        /// `0x97`); v3.1.1 has no reason codes, so it is delivered live but not
+        /// retained.
+        v5: bool,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -1105,6 +1134,8 @@ impl Hub {
     }
 
     /// Dispatch one command to its handler.
+    // One arm per command; a flat dispatch table, not a refactor smell.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(&mut self, cmd: HubCommand) {
         match cmd {
             HubCommand::Attach {
@@ -1152,13 +1183,33 @@ impl Hub {
                 topic,
                 payload,
                 qos,
-                retain,
+                mut retain,
                 message_expiry,
                 app,
                 done,
+                v5,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
+                }
+                // Retained quota (ADR 0041 T4): a retained publish that would CREATE
+                // a new topic beyond the cap. Growth is refused; overwrite and clear
+                // (empty payload) always work. v5: refuse outright (the publisher is
+                // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
+                if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
+                    if let Some(m) = &self.metrics {
+                        m.quota_rejected("retained");
+                    }
+                    if v5 {
+                        warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
+                        if let Some(done) = done {
+                            let _ = done.send(PublishOutcome::RetainedQuotaExceeded);
+                        }
+                        return;
+                    }
+                    warn!(topic = %topic,
+                          "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
+                    retain = false;
                 }
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
@@ -1171,7 +1222,7 @@ impl Hub {
                 // The fan-out (and its durable appends) is complete: release any
                 // acknowledgement gated on it (ADR 0018).
                 if let Some(done) = done {
-                    let _ = done.send(());
+                    let _ = done.send(PublishOutcome::Accepted);
                 }
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
@@ -1608,6 +1659,27 @@ impl Hub {
             outbound,
             reply,
         } = pending;
+
+        // Session quota (ADR 0041 T4): refuse only a NEW session — a resume
+        // (session_present) or an attach for a locally-known client id (takeover,
+        // clean-start replacement) is never refused for quota. A full broker keeps
+        // serving its existing fleet and refuses only strangers.
+        if !session_present
+            && !self.online.contains_key(&client)
+            && !self.session_expiry.contains_key(&client)
+        {
+            if let Some(cap) = self.quotas.max_sessions {
+                if self.session_count() >= cap {
+                    warn!(client = %client.0, cap,
+                          "session quota exceeded; CONNECT refused (ADR 0041)");
+                    if let Some(m) = &self.metrics {
+                        m.quota_rejected("sessions");
+                    }
+                    let _ = reply.send(AttachOutcome::QuotaExceeded);
+                    return;
+                }
+            }
+        }
 
         // Revocation reaches resumed grants (ADR 0040 T3): re-authorize each restored
         // subscription against the CURRENT policy, under the resuming principal's
@@ -2324,6 +2396,37 @@ impl Hub {
         if completed {
             self.drain_backlog(client).await;
         }
+    }
+
+    /// Whether storing a retained value for `topic` would GROW the retained set
+    /// beyond the quota (ADR 0041 T4). Overwrites (topic already retained) never
+    /// count. Enforced against this node's local retained view.
+    async fn retained_quota_exceeded(&self, topic: &str) -> bool {
+        let Some(cap) = self.quotas.max_retained_messages else {
+            return false;
+        };
+        let count = self.retained.count().await.unwrap_or(0);
+        if count < cap {
+            return false;
+        }
+        // At the cap: only an overwrite of an existing topic may proceed.
+        !self
+            .retained
+            .matching(topic)
+            .await
+            .map(|m| m.iter().any(|r| r.topic == topic))
+            .unwrap_or(false)
+    }
+
+    /// The node's session count for the quota (ADR 0041 T4): every online session
+    /// plus retained-offline ones (the expiry map covers persistent sessions,
+    /// online or not; the union avoids double-counting).
+    fn session_count(&self) -> usize {
+        self.online
+            .keys()
+            .filter(|c| !self.session_expiry.contains_key(*c))
+            .count()
+            + self.session_expiry.len()
     }
 
     /// The identity sweep (ADR 0040 T2): re-evaluate every online connection's
@@ -3987,6 +4090,9 @@ mod tests {
             AttachOutcome::OwnerMismatch => {
                 panic!("same-owner attach is never an ownership mismatch")
             }
+            AttachOutcome::QuotaExceeded => {
+                panic!("uncapped test hubs never refuse for quota")
+            }
         };
         (out_rx, session_present)
     }
@@ -4027,6 +4133,7 @@ mod tests {
             message_expiry,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -4122,6 +4229,7 @@ mod tests {
             message_expiry: None,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -5342,6 +5450,7 @@ mod tests {
             message_expiry: None,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -5460,6 +5569,7 @@ mod tests {
             message_expiry: None,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
 
@@ -5929,6 +6039,7 @@ mod tests {
             message_expiry: None,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
         tx.send(HubCommand::Publish {
@@ -5939,6 +6050,7 @@ mod tests {
             message_expiry: None,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
         // No local durable write for a foreign topic while queued.
@@ -6017,6 +6129,7 @@ mod tests {
                 message_expiry: None,
                 app: AppProperties::default(),
                 done: None,
+                v5: false,
             })
             .unwrap();
         }
@@ -6128,6 +6241,7 @@ mod tests {
                 message_expiry: None,
                 app: AppProperties::default(),
                 done: None,
+                v5: false,
             })
             .unwrap();
         }
@@ -6382,6 +6496,7 @@ mod tests {
             message_expiry: None,
             app: AppProperties::default(),
             done: None,
+            v5: false,
         })
         .unwrap();
     }

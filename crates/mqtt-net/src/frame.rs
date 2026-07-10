@@ -14,7 +14,23 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// A real deployment will derive this from the negotiated MQTT 5 Maximum Packet
 /// Size; for now it is a fixed safety ceiling.
-const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_PACKET_BYTES: usize = 1024 * 1024;
+
+/// The process-wide inbound packet ceiling, settable once at startup
+/// (ADR 0041 T4: `MQTTD_MAX_PACKET_SIZE`, advertised to v5 clients as the MQTT 5
+/// Maximum Packet Size). Defaults to 1 MiB.
+static MAX_PACKET_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Set the inbound packet ceiling once, at startup before any connection is served.
+pub fn set_max_packet_bytes(bytes: usize) {
+    let _ = MAX_PACKET_BYTES.set(bytes);
+}
+
+/// The configured inbound packet ceiling (ADR 0041 T4), or the 1 MiB default.
+#[must_use]
+pub fn max_packet_bytes() -> usize {
+    *MAX_PACKET_BYTES.get_or_init(|| DEFAULT_MAX_PACKET_BYTES)
+}
 
 /// Reads framed MQTT packets from an [`AsyncRead`].
 #[derive(Debug)]
@@ -66,14 +82,14 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// - [`NetError::Codec`] if the peer sends a malformed packet.
     /// - [`NetError::UnexpectedEof`] if the stream ends mid-packet.
     /// - [`NetError::PacketTooLarge`](mqtt_codec::CodecError::PacketTooLarge)
-    ///   (wrapped) if a single packet would exceed [`MAX_BUFFERED_BYTES`].
+    ///   (wrapped) if a single packet would exceed [`max_packet_bytes`].
     /// - [`NetError::Io`] on a transport error.
     pub async fn next_packet(&mut self) -> Result<Option<Packet>, NetError> {
         loop {
             if let Some(packet) = Packet::decode(&mut self.buf, self.version)? {
                 return Ok(Some(packet));
             }
-            if self.buf.len() > MAX_BUFFERED_BYTES {
+            if self.buf.len() > max_packet_bytes() {
                 return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
             }
             let n = self.inner.read_buf(&mut self.buf).await?;
@@ -102,7 +118,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             if let Some(frame) = take_raw_frame(&mut self.buf)? {
                 return Ok(Some(frame));
             }
-            if self.buf.len() > MAX_BUFFERED_BYTES {
+            if self.buf.len() > max_packet_bytes() {
                 return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
             }
             let n = self.inner.read_buf(&mut self.buf).await?;
@@ -148,7 +164,7 @@ pub(crate) fn take_raw_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, NetErr
         }
     }
     let total = header_len + remaining;
-    if total > MAX_BUFFERED_BYTES {
+    if total > max_packet_bytes() {
         return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
     }
     if buf.len() < total {
@@ -202,7 +218,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameReader, FrameWriter, MAX_BUFFERED_BYTES};
+    use super::{FrameReader, FrameWriter};
     use crate::NetError;
     use mqtt_codec::{packet::ConnAck, CodecError, Packet, ProtocolVersion};
     use tokio::io::AsyncWriteExt;
@@ -211,7 +227,6 @@ mod tests {
 
     // Sanity for the oversized-packet test: its claimed size (2 MiB) really is
     // beyond the buffer ceiling.
-    const _: () = assert!(2_097_152 > MAX_BUFFERED_BYTES);
 
     #[tokio::test]
     async fn write_then_read_roundtrip_over_duplex() {

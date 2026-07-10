@@ -164,7 +164,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Server-wide MQTT 5 wire limits (ADR 0011/0012/0013), configurable via env, set once
     // before any connection is served.
-    conn::set_wire_limits(wire_limits_from_env()?);
+    let wire_limits = wire_limits_from_env()?;
+    // The same ceiling governs the transport frame reader (ADR 0041 T4): the
+    // advertised Maximum Packet Size and the enforced cap cannot drift apart.
+    mqtt_net::set_max_packet_bytes(wire_limits.max_packet_size as usize);
+    conn::set_wire_limits(wire_limits);
 
     // Session-placement ring (ADR 0005), kept in step with SWIM membership and
     // read by the hub to identify each persistent session's owner node.
@@ -309,21 +313,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
     });
     reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
-    // Per-client quotas (ADR 0041 T3), configured once before any listener accepts.
-    if let Some(v) = non_empty_env("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT") {
-        let cap: usize = match v.parse() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                return Err(format!(
-                    "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT must be a positive integer, got {v:?}"
-                )
-                .into())
-            }
-        };
-        info!(cap, "subscription quota active (ADR 0041)");
-        let _ = hub_tx.send(mqttd::hub::HubCommand::SetQuotas(mqttd::hub::Quotas {
-            max_subscriptions_per_client: Some(cap),
-        }));
+    // Per-client and global state quotas (ADR 0041 T3/T4), configured once before
+    // any listener accepts. Unset = uncapped; a non-positive or unparseable value
+    // is a startup error.
+    let quota = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        match non_empty_env(var) {
+            None => Ok(None),
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(Some(n)),
+                _ => Err(format!("{var} must be a positive integer, got {v:?}").into()),
+            },
+        }
+    };
+    let quotas = mqttd::hub::Quotas {
+        max_subscriptions_per_client: quota("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT")?,
+        max_retained_messages: quota("MQTTD_MAX_RETAINED_MESSAGES")?,
+        max_sessions: quota("MQTTD_MAX_SESSIONS")?,
+    };
+    if quotas.max_subscriptions_per_client.is_some()
+        || quotas.max_retained_messages.is_some()
+        || quotas.max_sessions.is_some()
+    {
+        info!(?quotas, "state quotas active (ADR 0041)");
+        let _ = hub_tx.send(mqttd::hub::HubCommand::SetQuotas(quotas));
     }
 
     // The hub consults the live authorizer when a persistent session resumes
@@ -1857,6 +1869,10 @@ fn wire_limits_from_env() -> Result<conn::WireLimits, Box<dyn std::error::Error>
         auth_round_timeout: Duration::from_secs(
             parse_env("MQTTD_AUTH_TIMEOUT", d.auth_round_timeout.as_secs())?.max(1),
         ),
+        // The inbound packet ceiling (ADR 0041 T4), advertised as the MQTT 5
+        // Maximum Packet Size; installed into the transport below. Floor 1 KiB —
+        // smaller would refuse CONNECT packets themselves.
+        max_packet_size: parse_env("MQTTD_MAX_PACKET_SIZE", d.max_packet_size)?.max(1024),
         // Per-connection publish-rate throttle (ADR 0041 T3); unset = unlimited.
         publish_rate: match non_empty_env("MQTTD_MAX_PUBLISH_RATE") {
             None => None,

@@ -101,6 +101,10 @@ pub struct WireLimits {
     /// over-rate publisher is slowed by **pausing the socket read** (TCP
     /// backpressure) — no drops, no disconnect. `None` = unlimited.
     pub publish_rate: Option<u32>,
+    /// The inbound packet ceiling, advertised to v5 clients as the MQTT 5
+    /// Maximum Packet Size (ADR 0041 T4). Also installed as the transport frame
+    /// cap (`mqtt_net::set_max_packet_bytes`) by the binary.
+    pub max_packet_size: u32,
 }
 
 impl Default for WireLimits {
@@ -110,6 +114,7 @@ impl Default for WireLimits {
             receive_maximum: 256,
             auth_round_timeout: Duration::from_secs(10),
             publish_rate: None,
+            max_packet_size: 1024 * 1024,
         }
     }
 }
@@ -585,6 +590,19 @@ where
             let code = connack_code(CONNACK_SERVER_UNAVAILABLE, connect.protocol);
             return reject_connack(&mut writer, code).await;
         }
+        Ok(AttachOutcome::QuotaExceeded) => {
+            // Creating a new session would exceed the node's session quota
+            // (ADR 0041 T4); resumes are never refused for quota, so the client's
+            // best move is another node (or later). v5 gets the honest 0x97;
+            // v3.1.1 has no quota code — Server unavailable says "try elsewhere".
+            info!(client = %client.0, "rejecting CONNECT: session quota exceeded (ADR 0041)");
+            let code = if connect.protocol == ProtocolVersion::V5 {
+                reason::QUOTA_EXCEEDED
+            } else {
+                CONNACK_SERVER_UNAVAILABLE
+            };
+            return reject_connack(&mut writer, code).await;
+        }
         Ok(AttachOutcome::OwnerMismatch) => {
             // The persistent session belongs to a different authenticated identity; this
             // principal may not resume or take it over (ADR 0031). Reject Not-authorized
@@ -633,6 +651,11 @@ where
         &mut out_rx,
         connect.keep_alive,
         connect.protocol == ProtocolVersion::V5,
+        // The client's advertised MQTT 5 Maximum Packet Size (ADR 0041 T4): the
+        // server must not send it a larger packet [MQTT-3.1.2-24-style contract].
+        (connect.protocol == ProtocolVersion::V5)
+            .then(|| connect.properties.maximum_packet_size())
+            .flatten(),
         &mut inbound_aliases,
         &mut outbound_aliases,
     )
@@ -1262,6 +1285,12 @@ fn negotiate_v5_properties(
         props
             .0
             .push(mqtt_codec::Property::ReceiveMaximum(limits.receive_maximum));
+        // The transport frame cap, stated as the spec's own contract
+        // (ADR 0041 T4): a packet beyond it closes the connection, and now the
+        // client knows the number instead of discovering the constant.
+        props.0.push(mqtt_codec::Property::MaximumPacketSize(
+            limits.max_packet_size,
+        ));
     }
     if server_alias_max > 0 {
         props
@@ -1287,6 +1316,7 @@ async fn serve<R, W>(
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
     is_v5: bool,
+    client_max_packet: Option<u32>,
     inbound_aliases: &mut InboundAliases,
     outbound_aliases: &mut OutboundAliases,
 ) -> Result<bool, NetError>
@@ -1351,6 +1381,28 @@ where
                         if let Packet::Publish(p) = &mut pkt {
                             outbound_aliases.apply(p);
                         }
+                        // The client's Maximum Packet Size (ADR 0041 T4): a message
+                        // too large for THIS subscriber is dropped for it alone,
+                        // per spec — measured after the alias rewrite (which only
+                        // shrinks), counted, never a connection error.
+                        if let (Some(max), Packet::Publish(_)) = (client_max_packet, &pkt) {
+                            let mut encoded = Vec::new();
+                            let version = if is_v5 {
+                                ProtocolVersion::V5
+                            } else {
+                                ProtocolVersion::V311
+                            };
+                            if pkt.encode(&mut encoded, version).is_ok()
+                                && encoded.len() > max as usize
+                            {
+                                debug!(client = %client.0, size = encoded.len(), max,
+                                       "outbound publish exceeds the client's Maximum Packet Size; dropped for this subscriber");
+                                if let Some(m) = &policy.metrics {
+                                    m.publish_dropped("too-large");
+                                }
+                                continue;
+                            }
+                        }
                         writer.send(&pkt).await?;
                     }
                     // The hub dropped our sender: we were taken over by a new
@@ -1393,6 +1445,8 @@ async fn drain_signal(policy: &ConnPolicy) {
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
 /// handshakes, and the exactly-once dedup window. Returns `Ok(true)` if the
 /// connection must close (a protocol violation).
+// One arm per (QoS, ack) shape; a flat dispatch, not a refactor smell.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // a connection's full publish-handling context
 async fn handle_publish<W: AsyncWrite + Unpin>(
     publish: Publish,
@@ -1453,7 +1507,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // including any durable (fsync'd) offline-queue appends — has completed, so a
     // QoS ≥ 1 acknowledgement can be released only for a message the broker durably
     // owns (ADR 0018). `None` when the publish was dropped by the ACL.
-    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| -> Option<oneshot::Receiver<()>> {
+    let forward = |hub: &mpsc::UnboundedSender<HubCommand>|
+     -> Option<oneshot::Receiver<crate::hub::PublishOutcome>> {
         if authorized {
             let (done_tx, done_rx) = oneshot::channel();
             let _ = hub.send(HubCommand::Publish {
@@ -1464,6 +1519,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 message_expiry,
                 app,
                 done: Some(done_tx),
+                v5: is_v5,
             });
             Some(done_rx)
         } else {
@@ -1486,15 +1542,22 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
                 return Ok(true);
             }
+            let mut ack = mqtt_codec::packet::Ack::from(id);
             if let Some(done) = forward(hub) {
                 // The hub disappearing mid-shutdown means the message may never be
                 // stored: close without a PUBACK (the publisher retries) rather than
                 // acknowledge a message that could be lost.
-                if done.await.is_err() {
-                    return Ok(true);
+                match done.await {
+                    Err(_) => return Ok(true),
+                    // The retained quota refused the publish (v5, ADR 0041 T4):
+                    // nothing was delivered or retained — say so.
+                    Ok(crate::hub::PublishOutcome::RetainedQuotaExceeded) => {
+                        ack.reason = reason::QUOTA_EXCEEDED;
+                    }
+                    Ok(crate::hub::PublishOutcome::Accepted) => {}
                 }
             }
-            writer.send(&Packet::PubAck(id.into())).await?;
+            writer.send(&Packet::PubAck(ack)).await?;
         }
         (QoS::ExactlyOnce, Some(id)) => {
             // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
@@ -1518,14 +1581,37 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
                     return Ok(true);
                 }
-                *qos2_inflight += 1;
+                let mut rec = mqtt_codec::packet::Ack::from(id);
                 if let Some(done) = forward(hub) {
                     // As for QoS 1: PUBREC promises the broker owns the message, so
                     // it is released only after the durable fan-out completes.
-                    if done.await.is_err() {
-                        return Ok(true);
+                    match done.await {
+                        Err(_) => return Ok(true),
+                        // Refused by the retained quota (v5, ADR 0041 T4): a
+                        // PUBREC >= 0x80 ends the flow — no slot is consumed and
+                        // the id stays reusable.
+                        Ok(crate::hub::PublishOutcome::RetainedQuotaExceeded) => {
+                            rec.reason = reason::QUOTA_EXCEEDED;
+                        }
+                        Ok(crate::hub::PublishOutcome::Accepted) => {}
                     }
                 }
+                if rec.reason == 0 {
+                    *qos2_inflight += 1;
+                } else {
+                    // The flow ended at PUBREC: release the dedup record so a
+                    // fresh publish under this id is treated as new.
+                    match &policy.store {
+                        Some(store) => {
+                            let _ = store.clear_received(client, id).await;
+                        }
+                        None => {
+                            qos2_inbound.remove(&id);
+                        }
+                    }
+                }
+                writer.send(&Packet::PubRec(rec)).await?;
+                return Ok(false);
             }
             writer.send(&Packet::PubRec(id.into())).await?;
         }
@@ -2004,7 +2090,7 @@ mod tests {
                     HubCommand::Publish {
                         done: Some(done), ..
                     } => {
-                        let _ = done.send(());
+                        let _ = done.send(crate::hub::PublishOutcome::Accepted);
                     }
                     // Grant every quota verdict, as an uncapped hub would (ADR 0041 T3).
                     HubCommand::Subscribe {
@@ -2146,7 +2232,7 @@ mod tests {
                         let _ = tx.send(topic);
                         // Release any gated acknowledgement, as the real hub would.
                         if let Some(done) = done {
-                            let _ = done.send(());
+                            let _ = done.send(crate::hub::PublishOutcome::Accepted);
                         }
                     }
                     _ => {}
