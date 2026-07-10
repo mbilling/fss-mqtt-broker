@@ -221,6 +221,16 @@ impl std::fmt::Debug for AuthzWatch {
     }
 }
 
+/// Per-client quota configuration (ADR 0041 T3), set once at startup via
+/// [`HubCommand::SetQuotas`]. Unset caps admit everything — today's behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Quotas {
+    /// The most subscriptions one client may hold; a SUBSCRIBE filter beyond it
+    /// is denied `0x97 Quota exceeded` (v5) / `0x80` (v3.1.1) in its SUBACK slot.
+    /// Re-subscribing an already-held filter never consumes quota (it replaces).
+    pub max_subscriptions_per_client: Option<usize>,
+}
+
 /// A currently-online client connection.
 #[derive(Debug)]
 struct Online {
@@ -426,7 +436,15 @@ pub enum HubCommand {
         client: ClientId,
         /// Topic filters being subscribed to, with their granted `QoS`.
         filters: Vec<(String, QoS)>,
+        /// When present, the hub answers with one flag per filter — `false` for a
+        /// filter the subscription quota denied (ADR 0041 T3) — BEFORE any
+        /// retained replay, so the connection's SUBACK precedes the replayed
+        /// publishes. `None` skips the quota round-trip (internal callers).
+        reply: Option<oneshot::Sender<Vec<bool>>>,
     },
+    /// Set the per-client quotas (ADR 0041 T3). Sent once at startup, before any
+    /// listener accepts.
+    SetQuotas(Quotas),
     /// Remove subscriptions for a client.
     Unsubscribe {
         /// The unsubscribing client.
@@ -777,6 +795,8 @@ pub struct Hub {
     /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
     /// without a reloadable policy keep today's restore-as-persisted behavior.
     authz: Option<AuthzWatch>,
+    /// Per-client quotas (ADR 0041 T3); default = uncapped.
+    quotas: Quotas,
     /// The `(epoch, offset)` convergence token each cached retained topic was applied
     /// at (ADR 0037 §3): a fan-out/back-fill value is applied only when its token
     /// exceeds the held one — monotonic per topic, idempotent, order-insensitive. A
@@ -1006,6 +1026,7 @@ impl Hub {
                 retained: Box::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
+                quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
@@ -1114,8 +1135,15 @@ impl Hub {
             HubCommand::SessionRecovered { pending, recovery } => {
                 self.session_recovered(pending, recovery).await;
             }
-            HubCommand::Subscribe { client, filters } => {
-                self.subscribe(&client, filters).await;
+            HubCommand::Subscribe {
+                client,
+                filters,
+                reply,
+            } => {
+                self.subscribe(&client, filters, reply).await;
+            }
+            HubCommand::SetQuotas(quotas) => {
+                self.quotas = quotas;
             }
             HubCommand::Unsubscribe { client, filters } => {
                 self.unsubscribe(&client, &filters).await;
@@ -1752,10 +1780,58 @@ impl Hub {
         }
     }
 
-    async fn subscribe(&mut self, client: &ClientId, filters: Vec<(String, QoS)>) {
+    async fn subscribe(
+        &mut self,
+        client: &ClientId,
+        filters: Vec<(String, QoS)>,
+        reply: Option<oneshot::Sender<Vec<bool>>>,
+    ) {
+        // Subscription quota (ADR 0041 T3): count how many NEW filters the cap
+        // admits — an already-held filter replaces (never consumes quota) — and
+        // answer the connection BEFORE any retained replay, so its SUBACK
+        // precedes the replayed publishes on the wire.
+        let filters: Vec<(String, QoS)> = {
+            let held = self.subs_by_client.get(client);
+            let mut admitted_new = 0;
+            let verdicts: Vec<bool> = filters
+                .iter()
+                .map(|(f, _)| {
+                    let replaces = held.is_some_and(|m| m.contains_key(f));
+                    let admit = replaces
+                        || match self.quotas.max_subscriptions_per_client {
+                            None => true,
+                            Some(cap) => held.map_or(0, HashMap::len) + admitted_new < cap,
+                        };
+                    if admit && !replaces {
+                        admitted_new += 1;
+                    }
+                    admit
+                })
+                .collect();
+            let denied = verdicts.iter().filter(|v| !**v).count();
+            if denied > 0 {
+                warn!(client = %client.0, denied,
+                      "subscription quota exceeded; denied in SUBACK (ADR 0041)");
+                if let Some(m) = &self.metrics {
+                    for _ in 0..denied {
+                        m.quota_rejected("subscriptions");
+                    }
+                }
+            }
+            let admitted = filters
+                .into_iter()
+                .zip(verdicts.iter())
+                .filter_map(|(fq, ok)| ok.then_some(fq))
+                .collect();
+            if let Some(tx) = reply {
+                let _ = tx.send(verdicts);
+            }
+            admitted
+        };
+
         // Retained messages are replayed only for ordinary subscriptions; a new
         // shared subscription does not receive them (ADR 0010 §3, [MQTT-3.8.4]).
-        let mut replay: Vec<Message> = Vec::new();
+        let mut retained_replay: Vec<Message> = Vec::new();
         for (f, q) in &filters {
             // Keep the full filter string (including any `$share/` prefix) so it is
             // persisted; `$share/...` never matches a concrete topic in `granted_qos`.
@@ -1772,7 +1848,7 @@ impl Hub {
             self.table.subscribe(client.clone(), f.clone());
             if let Ok(matching) = self.retained.matching(f).await {
                 for m in matching {
-                    replay.push(Message {
+                    retained_replay.push(Message {
                         qos: min_qos(m.qos, *q),
                         retain: true,
                         ..m
@@ -1784,7 +1860,7 @@ impl Hub {
         self.gossip_interest();
 
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
-            for m in replay {
+            for m in retained_replay {
                 self.send_to_client(client, &tx, &m, true, None).await;
             }
         }
@@ -3928,6 +4004,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), QoS::AtMostOnce)],
+            reply: None,
         })
         .unwrap();
     }
@@ -3958,6 +4035,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), qos)],
+            reply: None,
         })
         .unwrap();
     }

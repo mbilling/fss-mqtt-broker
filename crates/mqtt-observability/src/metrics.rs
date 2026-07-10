@@ -91,6 +91,7 @@ struct OtelInstruments {
     security_reloads: OtelCounter<u64>,
     revocation_evictions: OtelCounter<u64>,
     admission_rejected: OtelCounter<u64>,
+    quota_rejections: OtelCounter<u64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
@@ -126,6 +127,7 @@ impl OtelInstruments {
             security_reloads: meter.u64_counter("security_reloads").build(),
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
             admission_rejected: meter.u64_counter("admission_rejected").build(),
+            quota_rejections: meter.u64_counter("quota_rejections").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
@@ -172,6 +174,7 @@ pub struct Metrics {
     security_reloads_total: Family<OutcomeLabel, Counter>,
     revocation_evictions_total: Family<ReasonLabel, Counter>,
     admission_rejected_total: Family<ReasonLabel, Counter>,
+    quota_rejections_total: Family<ReasonLabel, Counter>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
     retained_queue_dropped_total: Counter,
@@ -343,6 +346,12 @@ impl Metrics {
             "Connections refused at accept by an admission cap (ADR 0041), by reason \
              (max-connections, per-ip)",
         );
+        let quota_rejections_total = register_family(
+            &mut registry,
+            "quota_rejections",
+            "Operations refused by a per-client or global quota (ADR 0041), by kind \
+             (subscriptions, ...)",
+        );
         let quic_path_migrations_total = register_counter(
             &mut registry,
             "quic_path_migrations",
@@ -398,6 +407,7 @@ impl Metrics {
             security_reloads_total,
             revocation_evictions_total,
             admission_rejected_total,
+            quota_rejections_total,
             quic_path_migrations_total,
             retained_divergence_total,
             retained_queue_dropped_total,
@@ -625,6 +635,19 @@ impl Metrics {
         self.otel
             .admission_rejected
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only
+    /// (`subscriptions`, later `retained`, `sessions`) — never a per-client value.
+    pub fn quota_rejected(&self, kind: &str) {
+        self.quota_rejections_total
+            .get_or_create(&ReasonLabel {
+                reason: kind.to_string(),
+            })
+            .inc();
+        self.otel
+            .quota_rejections
+            .add(1, &[KeyValue::new("kind", kind.to_string())]);
     }
 
     /// A policy-reload sweep revoked live state (ADR 0040): a session evicted

@@ -48,7 +48,7 @@
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
-| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Proposed | [2/5 done](0041-resource-governance.md) | 3 open |
+| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Proposed | [3/5 done](0041-resource-governance.md) | 2 open |
 
 ## Open and deferred work
 
@@ -114,6 +114,5 @@
 
 **0041 — Resource governance (admission caps, per-client quotas, bounded state)**
 
-- `0041-T3` ⬜ planned: Per-client quotas — max subscriptions per client (per-filter 0x97/0x80 SUBACK), publish-rate token bucket with read-pause throttling, inbound QoS 1 Receive Maximum enforcement (closes the ADR 0012 §3 deferral)
 - `0041-T4` ⬜ planned: Global state caps — retained-topic cap (growth refused, maintenance always allowed), max-sessions cap (resume always allowed), MQTT 5 Maximum Packet Size negotiated from the transport cap, QueueLimits env wiring
 - `0041-T5` ⬜ planned: Disk watermark + closure — per-store size gauges, soft high-water brownout (growth writes refused, maintenance continues), uniform fail-closed disk-full paths, README config table, ADR acceptance

@@ -309,6 +309,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
     });
     reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
+    // Per-client quotas (ADR 0041 T3), configured once before any listener accepts.
+    if let Some(v) = non_empty_env("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT") {
+        let cap: usize = match v.parse() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                return Err(format!(
+                    "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT must be a positive integer, got {v:?}"
+                )
+                .into())
+            }
+        };
+        info!(cap, "subscription quota active (ADR 0041)");
+        let _ = hub_tx.send(mqttd::hub::HubCommand::SetQuotas(mqttd::hub::Quotas {
+            max_subscriptions_per_client: Some(cap),
+        }));
+    }
+
     // The hub consults the live authorizer when a persistent session resumes
     // (ADR 0040 T3): grants a tightening reload revoked while the session slept are
     // removed at resume, before any replay. Sent before any listener accepts.
@@ -1840,6 +1857,19 @@ fn wire_limits_from_env() -> Result<conn::WireLimits, Box<dyn std::error::Error>
         auth_round_timeout: Duration::from_secs(
             parse_env("MQTTD_AUTH_TIMEOUT", d.auth_round_timeout.as_secs())?.max(1),
         ),
+        // Per-connection publish-rate throttle (ADR 0041 T3); unset = unlimited.
+        publish_rate: match non_empty_env("MQTTD_MAX_PUBLISH_RATE") {
+            None => None,
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    return Err(format!(
+                        "MQTTD_MAX_PUBLISH_RATE must be a positive integer, got {v:?}"
+                    )
+                    .into())
+                }
+            },
+        },
     })
 }
 

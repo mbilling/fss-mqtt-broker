@@ -97,6 +97,10 @@ pub struct WireLimits {
     /// How long the server waits for the client's reply in each round of the enhanced-auth
     /// exchange before aborting it (ADR 0013 §3) — bounds a stalled half-open auth.
     pub auth_round_timeout: Duration,
+    /// Per-connection inbound publish rate (messages/second, ADR 0041 T3); an
+    /// over-rate publisher is slowed by **pausing the socket read** (TCP
+    /// backpressure) — no drops, no disconnect. `None` = unlimited.
+    pub publish_rate: Option<u32>,
 }
 
 impl Default for WireLimits {
@@ -105,6 +109,7 @@ impl Default for WireLimits {
             topic_alias_max: 16,
             receive_maximum: 256,
             auth_round_timeout: Duration::from_secs(10),
+            publish_rate: None,
         }
     }
 }
@@ -1301,6 +1306,8 @@ where
     // window against the server's Receive Maximum (ADR 0012). QoS 1 is acked inline so
     // never accumulates; QoS 2 holds a slot from PUBLISH until PUBREL. Overrun → 0x93.
     let mut qos2_inflight: usize = 0;
+    // Per-connection publish-rate limiter (ADR 0041 T3); `None` = unlimited.
+    let mut publish_rate = wire_limits().publish_rate.map(PublishRateLimiter::new);
 
     loop {
         let idle = async {
@@ -1323,6 +1330,13 @@ where
                         }
                     }
                     Some(packet) => {
+                        // Publish-rate throttle (ADR 0041 T3): an empty bucket pauses
+                        // HERE — before processing, with the socket unread — so an
+                        // over-rate publisher backs up its own TCP window. Only
+                        // publishes take tokens; acks/pings/subscribes flow freely.
+                        if let (Some(limiter), Packet::Publish(_)) = (&mut publish_rate, &packet) {
+                            limiter.acquire().await;
+                        }
                         if handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
@@ -1461,6 +1475,17 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             let _ = forward(hub); // nothing to acknowledge, nothing to gate
         }
         (QoS::AtLeastOnce, Some(id)) => {
+            // Receive Maximum counts QoS 1 and QoS 2 publications TOGETHER
+            // [MQTT-3.3.4]: with `qos2_inflight` windows already open, this QoS 1
+            // publication would be one more concurrent unacknowledged message —
+            // beyond the advertised quota it is a flow-control breach (ADR 0041 T3,
+            // finishing the ADR 0012 §3 deferral). v5 only, as for QoS 2.
+            if is_v5 && *qos2_inflight >= wire_limits().receive_maximum as usize {
+                warn!(client = %client.0, limit = wire_limits().receive_maximum,
+                      "QoS 1 publish beyond Receive Maximum; DISCONNECT 0x93");
+                disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
+                return Ok(true);
+            }
             if let Some(done) = forward(hub) {
                 // The hub disappearing mid-shutdown means the message may never be
                 // stored: close without a PUBACK (the publisher retries) rather than
@@ -1509,7 +1534,46 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     Ok(false)
 }
 
+/// Per-connection inbound publish-rate limiter (ADR 0041 T3): a token bucket
+/// with a one-second burst. An empty bucket **pauses the read** — TCP
+/// backpressure, the transport's native flow control — so a bursty-but-compliant
+/// client just slows down and an abusive one saturates its own connection, not
+/// the broker. Nothing is dropped and nothing is disconnected.
+struct PublishRateLimiter {
+    tokens: f64,
+    last: std::time::Instant,
+    rate: f64,
+}
+
+impl PublishRateLimiter {
+    fn new(rate: u32) -> Self {
+        PublishRateLimiter {
+            tokens: f64::from(rate),
+            last: std::time::Instant::now(),
+            rate: f64::from(rate),
+        }
+    }
+
+    /// Take one token, sleeping (pausing this connection's reads) until one is due.
+    async fn acquire(&mut self) {
+        let now = std::time::Instant::now();
+        self.tokens =
+            (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate).min(self.rate);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return;
+        }
+        let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
+        tokio::time::sleep(wait).await;
+        self.last = std::time::Instant::now();
+        self.tokens = 0.0;
+    }
+}
+
 /// Handle one inbound packet. Returns `Ok(true)` if the connection should close.
+// One arm per packet type; a flat dispatch table, not a refactor smell.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // a connection's full inbound-handling context
 async fn handle_inbound<W: AsyncWrite + Unpin>(
     packet: Packet,
@@ -1603,10 +1667,32 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 }
             }
             if !granted.is_empty() {
+                // Subscription quota (ADR 0041 T3): the hub answers one verdict per
+                // ACL-granted filter BEFORE any retained replay, so the SUBACK below
+                // still precedes replayed publishes on the wire. A quota-denied
+                // filter answers 0x97 Quota exceeded (v5) / 0x80 (v3.1.1) in its slot.
+                let (reply_tx, reply_rx) = oneshot::channel();
                 let _ = hub.send(HubCommand::Subscribe {
                     client: client.clone(),
                     filters: granted,
+                    reply: Some(reply_tx),
                 });
+                let Ok(verdicts) = reply_rx.await else {
+                    return Ok(true); // hub shut down mid-subscribe: close
+                };
+                let denied_code = if is_v5 {
+                    reason::QUOTA_EXCEEDED
+                } else {
+                    SUBACK_FAILURE
+                };
+                // Walk the granted slots (the codes currently carrying a QoS) and
+                // overwrite the ones the quota denied, in order.
+                let mut v = verdicts.iter();
+                for code in &mut return_codes {
+                    if *code != SUBACK_FAILURE && !v.next().copied().unwrap_or(true) {
+                        *code = denied_code;
+                    }
+                }
             }
             writer
                 .send(&Packet::SubAck(SubAck {
@@ -1919,6 +2005,14 @@ mod tests {
                         done: Some(done), ..
                     } => {
                         let _ = done.send(());
+                    }
+                    // Grant every quota verdict, as an uncapped hub would (ADR 0041 T3).
+                    HubCommand::Subscribe {
+                        filters,
+                        reply: Some(reply),
+                        ..
+                    } => {
+                        let _ = reply.send(vec![true; filters.len()]);
                     }
                     _ => {}
                 }
