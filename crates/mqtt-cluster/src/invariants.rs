@@ -10,10 +10,11 @@
 //!
 //! The catalog:
 //!
-//! - **Acked durability** ([`AckLedger`], ADR 0006/0018): everything acknowledged
-//!   to a caller — a quorum-acked append, an acked truncation — is present, byte
-//!   identical, in any later recovery of that log; nothing at or below an acked
-//!   truncation ever resurrects.
+//! - **Acked durability** ([`AckLedger`], ADR 0006/0018): every quorum-acked
+//!   append is present, byte identical, in any later recovery of that log until a
+//!   truncation covering it is **issued** (a truncation is only issued for
+//!   client-acked data, so issuing discharges the promise even under-replicated);
+//!   nothing at or below a **quorum-acked** truncation ever resurrects.
 //! - **Epoch fencing** ([`FenceLog`], ADR 0006 §1): once a replica acknowledges an
 //!   op at epoch E for a group, it never accepts an op at an epoch `< E` for that
 //!   group. Refusals are always allowed (a persist failure refuses a current
@@ -89,10 +90,13 @@ fn violation(invariant: &'static str, detail: String) -> Violation {
 /// Per-key ledger state: what has been acknowledged for one log.
 #[derive(Debug, Default, Clone)]
 struct KeyAcks {
-    /// Acked appends: offset → record bytes, as acknowledged to the caller.
+    /// Acked appends still under promise: offset → record bytes. A truncation
+    /// *issue* prunes entries it covers (the promise is discharged).
     appends: BTreeMap<Offset, Vec<u8>>,
-    /// The highest acked truncation (`up_to`, inclusive); 0 = none.
-    truncated: Offset,
+    /// The no-resurrection floor: the highest **quorum-acked** truncation
+    /// (`up_to`, inclusive); 0 = none. Only a quorum-acked truncation is
+    /// guaranteed visible to any later read quorum.
+    floor: Offset,
 }
 
 /// The acked-durability ledger (ADR 0006/0018): record what the durable plane
@@ -125,10 +129,27 @@ impl AckLedger {
             .insert(offset, record.to_vec());
     }
 
-    /// Record that `key`'s truncation up to `up_to` (inclusive) was acknowledged.
-    pub fn ack_truncate(&mut self, key: &str, up_to: Offset) {
+    /// Record that `key`'s truncation up to `up_to` (inclusive) was **issued**.
+    /// A truncation is only ever issued for data the caller has finished with
+    /// (client-acked messages), so the durability promise for those offsets is
+    /// discharged the moment it is issued — even if the truncation never reaches
+    /// quorum. It does NOT set the no-resurrection floor: an under-replicated
+    /// truncation can legally resurface its offsets on recovery (a duplicate
+    /// replay, not data loss).
+    pub fn note_truncate_issued(&mut self, key: &str, up_to: Offset) {
         let k = self.keys.entry(key.to_string()).or_default();
-        k.truncated = k.truncated.max(up_to);
+        let keep = k.appends.split_off(&(up_to + 1));
+        k.appends = keep;
+    }
+
+    /// Record that `key`'s truncation up to `up_to` (inclusive) reached a
+    /// **quorum**: promises discharged, and — because any later read quorum
+    /// intersects the truncation's acceptors — offsets at or below it must never
+    /// resurface (the no-resurrection floor).
+    pub fn ack_truncate(&mut self, key: &str, up_to: Offset) {
+        self.note_truncate_issued(key, up_to);
+        let k = self.keys.entry(key.to_string()).or_default();
+        k.floor = k.floor.max(up_to);
     }
 
     /// Record that `key`'s log removal was acknowledged: every promise made so far
@@ -162,12 +183,12 @@ impl AckLedger {
             }
             prev = Some(e.offset);
 
-            if e.offset <= acks.truncated {
+            if e.offset <= acks.floor {
                 out.push(violation(
                     "no-resurrection",
                     format!(
                         "{key}: offset {} resurfaced at or below the acked truncation {}",
-                        e.offset, acks.truncated
+                        e.offset, acks.floor
                     ),
                 ));
             }
@@ -184,7 +205,7 @@ impl AckLedger {
             }
         }
 
-        for (offset, _) in acks.appends.range((acks.truncated + 1)..) {
+        for offset in acks.appends.keys() {
             if !recovered.iter().any(|e| e.offset == *offset) {
                 out.push(violation(
                     "acked-durability",
@@ -541,6 +562,18 @@ mod tests {
         // Offset 3 was committed but never acked: allowed to appear.
         let recovered = [entry(2, b"b"), entry(3, b"unacked")];
         assert_holds(&ledger.verify_recovered("k", &recovered));
+
+        // An ISSUED (under-replicated) truncation discharges durability for 2 —
+        // its absence is fine — but sets no floor: its reappearance is also fine
+        // (a duplicate replay, not data loss).
+        ledger.note_truncate_issued("k", 2);
+        assert_holds(&ledger.verify_recovered("k", &[]));
+        assert_holds(&ledger.verify_recovered("k", &[entry(2, b"b")]));
+        // The quorum-acked truncation at 1 still floors resurrection there.
+        assert!(ledger
+            .verify_recovered("k", &[entry(1, b"a")])
+            .iter()
+            .any(|v| v.invariant == "no-resurrection"));
 
         ledger.ack_remove("k");
         assert_holds(&ledger.verify_recovered("k", &[]));
