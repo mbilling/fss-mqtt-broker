@@ -49,7 +49,7 @@
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
-| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [0/5 done](0042-durable-plane-stress-harness.md) | 5 open |
+| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [1/5 done](0042-durable-plane-stress-harness.md) | 4 open |
 
 ## Open and deferred work
 
@@ -115,7 +115,6 @@
 
 **0042 — Durable-plane stress and simulation harness**
 
-- `0042-T1` ⬜ planned: Invariant catalog — the durable plane's guarantees as executable checkers (acked durability, epoch fencing, session singularity, recovery honesty, retained convergence, bounded structures), shared with existing scenario tests
 - `0042-T2` ⬜ planned: Deterministic simulation of the pure core — seeded many-seed schedules (reorder/duplicate/drop/interleave) over LeaseMap, cluster_log fencing/replay, retained token application, HRW placement; failing seed reruns identically
 - `0042-T3` ⬜ planned: Seeded whole-cluster stress harness — in-process multi-node cluster under seed-composed fault schedules (kill/restart, partition/heal, frame delay/drop, client churn, takeover storms) with a seeded workload; post-quiesce invariant + convergence oracle; failure prints seed + schedule trace
 - `0042-T4` ⬜ planned: Crash/restart/disk faults — process kill with surviving data dir, full-cluster stop/start recovery, disk-full and write-error injection (FlakyStore promoted to a shared fixture), brownout entry/exit mid-workload

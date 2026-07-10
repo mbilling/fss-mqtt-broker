@@ -972,7 +972,11 @@ mod tests {
         ));
         let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
 
-        retained
+        // Every token this owner's cache generation applies goes through the
+        // ADR 0042 T1 catalog: strictly increasing per topic, or it's a violation.
+        let mut tokens = crate::invariants::TokenLog::new();
+
+        let t1 = retained
             .set(
                 &topic,
                 b"v1",
@@ -981,18 +985,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            retained
-                .set(
-                    &topic,
-                    b"v2",
-                    1,
-                    &mqtt_storage::app_props::AppProps::default()
-                )
-                .await
-                .unwrap(),
-            (2, 2)
-        );
+        tokens.observe_applied(&topic, t1);
+        let t2 = retained
+            .set(
+                &topic,
+                b"v2",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(t2, (2, 2));
+        tokens.observe_applied(&topic, t2);
 
         // Ownership lost and regained at a higher epoch: the cached group log is
         // rebuilt and the key re-recovered from the followers' committed copies
@@ -1023,5 +1027,12 @@ mod tests {
             .unwrap();
         assert_eq!(tok, (5, 3));
         assert!(tok > e.token());
+
+        // The recovered token continues the pre-takeover cache's history: feeding
+        // the post-takeover applications into the SAME log proves no token was
+        // reissued or regressed across the takeover (ADR 0042 T1). The recovered
+        // (2, 2) is a re-read of the held high-water, not a new application.
+        tokens.observe_applied(&topic, tok);
+        crate::invariants::assert_holds(&tokens.verify());
     }
 }

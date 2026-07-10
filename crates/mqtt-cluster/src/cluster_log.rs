@@ -1057,11 +1057,14 @@ mod tests {
     }
 
     /// Deterministic in-process transport holding the follower replicas, with an
-    /// injectable reachable-set (partition / kill a replica).
+    /// injectable reachable-set (partition / kill a replica). Every reachable
+    /// delivery's accept/refuse decision is recorded into a [`FenceLog`], so any
+    /// test over this transport can close with the ADR 0042 fencing check.
     #[derive(Debug)]
     struct SimCluster {
         replicas: Mutex<BTreeMap<NodeId, ReplicaState>>,
         reachable: Mutex<BTreeSet<NodeId>>,
+        fences: Mutex<crate::invariants::FenceLog>,
     }
 
     impl SimCluster {
@@ -1074,7 +1077,14 @@ mod tests {
             Arc::new(Self {
                 replicas: Mutex::new(replicas),
                 reachable: Mutex::new(reachable),
+                fences: Mutex::new(crate::invariants::FenceLog::new()),
             })
+        }
+
+        /// Assert the epoch-fencing invariant over every replica decision this
+        /// transport has carried (ADR 0042 T1 catalog).
+        fn assert_fencing_held(&self) {
+            crate::invariants::assert_holds(&self.fences.lock().unwrap().verify());
         }
 
         /// Take `node` offline (its deliveries now fail) — a crash or partition.
@@ -1097,12 +1107,18 @@ mod tests {
     impl ReplicaTransport for SimCluster {
         async fn deliver(&self, replica: &NodeId, epoch: Epoch, op: &ReplOp) -> bool {
             if !self.reachable.lock().unwrap().contains(replica) {
-                return false; // unreachable
+                return false; // unreachable, not a fencing decision
             }
             let mut replicas = self.replicas.lock().unwrap();
-            replicas
+            let accepted = replicas
                 .get_mut(replica)
-                .is_some_and(|r| r.apply(epoch, op))
+                .is_some_and(|r| r.apply(epoch, op));
+            self.fences.lock().unwrap().observe(
+                crate::placement::group_of_key(super::op_key(op)),
+                epoch,
+                accepted,
+            );
+            accepted
         }
     }
 
@@ -1247,6 +1263,9 @@ mod tests {
             stale.append(&k, b"stale".to_vec()).await,
             Err(mqtt_storage::repl::ReplError::NoQuorum)
         ));
+        // The catalog states the same thing once, over every decision the
+        // transport carried: no replica accepted a stale epoch (ADR 0042 T1).
+        sim.assert_fencing_held();
     }
 
     /// `live_range` reflects the committed watermarks: an uncommitted (below-quorum)
@@ -1464,6 +1483,10 @@ mod tests {
             record: rec.to_vec(),
         };
 
+        // Everything acknowledged goes in the ledger; the recovery is verified
+        // against it below (ADR 0042 T1: acked durability, no resurrection).
+        let mut ledger = crate::invariants::AckLedger::new();
+
         // The owner replicated two committed entries (epoch 7) to a quorum of persistent
         // followers; their on-disk replica copies fsync'd before the ack.
         {
@@ -1472,6 +1495,7 @@ mod tests {
             for (off, rec) in [(1u64, b"m1".as_slice()), (2, b"m2")] {
                 assert!(b.apply(7, &ap(off, rec)));
                 assert!(c.apply(7, &ap(off, rec)));
+                ledger.ack_append(&k, off, rec);
             }
             // drop → close the databases (every node is now "down")
         }
@@ -1497,6 +1521,7 @@ mod tests {
             vec![1, 2],
             "the committed log is recovered from the persisted replicas"
         );
+        crate::invariants::assert_holds(&ledger.verify_recovered(&k, &recovered));
 
         // ...and serves it through a recovered ClusterLog, continuing to append.
         let owner = n("d");
@@ -1515,5 +1540,6 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(&served[1].record, b"m2");
+        crate::invariants::assert_holds(&ledger.verify_recovered(&k, &served));
     }
 }
