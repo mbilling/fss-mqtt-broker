@@ -1,6 +1,6 @@
 # ADR 0041 — Resource governance (admission caps, per-client quotas, bounded state)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-05
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0041-resource-governance.md](../delivery/0041-resource-governance.md) — plan, progress, and changelog

@@ -313,6 +313,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
     });
     reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
+    // Disk visibility + watermark brownout (ADR 0041 T5): stat the redb stores
+    // periodically, export store_bytes{store}, and drive the hub's brownout flag
+    // when MQTTD_STORE_MAX_BYTES is configured.
+    if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
+        let max_bytes = match non_empty_env("MQTTD_STORE_MAX_BYTES") {
+            None => None,
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    return Err(format!(
+                        "MQTTD_STORE_MAX_BYTES must be a positive integer, got {v:?}"
+                    )
+                    .into())
+                }
+            },
+        };
+        if let Some(max) = max_bytes {
+            info!(max, "disk watermark active (ADR 0041): brownout above it");
+        }
+        tokio::spawn(mqttd::store_watch::watch(
+            std::path::PathBuf::from(dir),
+            max_bytes,
+            hub_tx.clone(),
+            Some(metrics.clone()),
+            None,
+        ));
+    }
+
     // Per-client and global state quotas (ADR 0041 T3/T4), configured once before
     // any listener accepts. Unset = uncapped; a non-positive or unparseable value
     // is a startup error.

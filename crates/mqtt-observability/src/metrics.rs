@@ -59,6 +59,11 @@ struct StateLabel {
 /// `{outcome, trigger}` label for hot reloads — a bounded set: outcome `ok`/`rejected`,
 /// trigger `signal` (SIGHUP) / `watch` (filesystem auto-reload, ADR 0033).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StoreLabel {
+    store: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OutcomeLabel {
     outcome: String,
     trigger: String,
@@ -92,6 +97,7 @@ struct OtelInstruments {
     revocation_evictions: OtelCounter<u64>,
     admission_rejected: OtelCounter<u64>,
     quota_rejections: OtelCounter<u64>,
+    store_bytes: OtelGauge<i64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
@@ -128,6 +134,7 @@ impl OtelInstruments {
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
             admission_rejected: meter.u64_counter("admission_rejected").build(),
             quota_rejections: meter.u64_counter("quota_rejections").build(),
+            store_bytes: meter.i64_gauge("store_bytes").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
@@ -175,6 +182,7 @@ pub struct Metrics {
     revocation_evictions_total: Family<ReasonLabel, Counter>,
     admission_rejected_total: Family<ReasonLabel, Counter>,
     quota_rejections_total: Family<ReasonLabel, Counter>,
+    store_bytes: Family<StoreLabel, Gauge>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
     retained_queue_dropped_total: Counter,
@@ -352,6 +360,12 @@ impl Metrics {
             "Operations refused by a per-client or global quota (ADR 0041), by kind \
              (subscriptions, ...)",
         );
+        let store_bytes = register_gauge_family(
+            &mut registry,
+            "store_bytes",
+            "On-disk size of each redb store in bytes (ADR 0041 T5), by store \
+             (sessions, retained, replicas, lease)",
+        );
         let quic_path_migrations_total = register_counter(
             &mut registry,
             "quic_path_migrations",
@@ -408,6 +422,7 @@ impl Metrics {
             revocation_evictions_total,
             admission_rejected_total,
             quota_rejections_total,
+            store_bytes,
             quic_path_migrations_total,
             retained_divergence_total,
             retained_queue_dropped_total,
@@ -635,6 +650,19 @@ impl Metrics {
         self.otel
             .admission_rejected
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// The on-disk size of one redb store (ADR 0041 T5). Bounded store names only.
+    pub fn set_store_bytes(&self, store: &str, bytes: u64) {
+        self.store_bytes
+            .get_or_create(&StoreLabel {
+                store: store.to_string(),
+            })
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.otel.store_bytes.record(
+            i64::try_from(bytes).unwrap_or(i64::MAX),
+            &[KeyValue::new("store", store.to_string())],
+        );
     }
 
     /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only

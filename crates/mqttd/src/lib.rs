@@ -14,5 +14,6 @@ pub mod health;
 pub mod hub;
 pub mod peer;
 pub mod reload;
+pub mod store_watch;
 
 pub use hub::{Hub, HubCommand};

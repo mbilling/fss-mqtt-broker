@@ -469,6 +469,10 @@ pub enum HubCommand {
     /// Set the per-client quotas (ADR 0041 T3). Sent once at startup, before any
     /// listener accepts.
     SetQuotas(Quotas),
+    /// Enter or leave disk **brownout** (ADR 0041 T5): sent by the store-size
+    /// watcher on watermark transitions. Under brownout, growth writes are
+    /// refused with the quota behaviors while maintenance continues.
+    SetBrownout(bool),
     /// Remove subscriptions for a client.
     Unsubscribe {
         /// The unsubscribing client.
@@ -824,6 +828,12 @@ pub struct Hub {
     /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
     /// without a reloadable policy keep today's restore-as-persisted behavior.
     authz: Option<AuthzWatch>,
+    /// Disk brownout (ADR 0041 T5): set while the stores' on-disk size exceeds
+    /// `MQTTD_STORE_MAX_BYTES`. Growth writes (new retained topics, new sessions,
+    /// offline enqueues) are refused with the quota behaviors; acks, deletes,
+    /// expiry, and resumes continue — read-mostly, not read-only, and never the
+    /// disk-full cliff.
+    brownout: bool,
     /// Per-client quotas (ADR 0041 T3); default = uncapped.
     quotas: Quotas,
     /// The `(epoch, offset)` convergence token each cached retained topic was applied
@@ -1055,6 +1065,7 @@ impl Hub {
                 retained: Box::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
+                brownout: false,
                 quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
                 retained_queue: VecDeque::new(),
@@ -1176,6 +1187,18 @@ impl Hub {
             HubCommand::SetQuotas(quotas) => {
                 self.quotas = quotas;
             }
+            HubCommand::SetBrownout(on) => {
+                if on != self.brownout {
+                    if on {
+                        warn!(
+                            "disk watermark exceeded: BROWNOUT — growth writes refused (ADR 0041)"
+                        );
+                    } else {
+                        info!("disk usage back under the watermark: brownout lifted (ADR 0041)");
+                    }
+                }
+                self.brownout = on;
+            }
             HubCommand::Unsubscribe { client, filters } => {
                 self.unsubscribe(&client, &filters).await;
             }
@@ -1214,15 +1237,21 @@ impl Hub {
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
-                self.publish(&topic, &payload, qos, retain, message_expiry, &app)
+                let durable_ok = self
+                    .publish(&topic, &payload, qos, retain, message_expiry, &app)
                     .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
                 }
                 // The fan-out (and its durable appends) is complete: release any
-                // acknowledgement gated on it (ADR 0018).
+                // acknowledgement gated on it (ADR 0018). A failed durable append
+                // WITHHOLDS the ack instead (drop the sender): the publisher's
+                // connection closes unacked and it retries — fail closed, never
+                // an ack for a message a subscriber will never see (ADR 0041 T5).
                 if let Some(done) = done {
-                    let _ = done.send(PublishOutcome::Accepted);
+                    if durable_ok {
+                        let _ = done.send(PublishOutcome::Accepted);
+                    }
                 }
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
@@ -1463,6 +1492,8 @@ impl Hub {
     /// Publish a locally-originated message: apply it on this node, then forward to
     /// peers (interested peers for live delivery; **all** peers for retained, so each
     /// node stores it for its future subscribers — ADR 0014).
+    /// Returns `false` when a durable offline enqueue failed — the dispatch then
+    /// withholds the publisher's ack (ADR 0041 T5).
     async fn publish(
         &mut self,
         topic: &str,
@@ -1471,8 +1502,9 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
-        self.deliver(topic, payload, qos, retain, message_expiry, app)
+    ) -> bool {
+        let durable_ok = self
+            .deliver(topic, payload, qos, retain, message_expiry, app)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
         // node (ADR 0015), so this runs only for locally-originated publishes.
@@ -1487,6 +1519,7 @@ impl Hub {
         if retain {
             self.route_retained_commit(topic, payload, qos_num(qos), app);
         }
+        durable_ok
     }
 
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
@@ -1501,6 +1534,7 @@ impl Hub {
     /// for local publishes (via
     /// [`publish`](Self::publish)) and for publishes received from a peer, which must
     /// never be re-forwarded.
+    /// Returns `false` when a durable offline enqueue failed (ADR 0041 T5).
     async fn deliver(
         &mut self,
         topic: &str,
@@ -1509,7 +1543,7 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
         // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
         // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
         // untokened) flag here is exactly the everyday-race divergence the ADR removes.
@@ -1529,7 +1563,7 @@ impl Hub {
         }
         // Live deliveries carry retain=0 [MQTT-3.3.1-9].
         self.deliver_local(topic, payload, qos, message_expiry, app)
-            .await;
+            .await
     }
 
     /// Log when a persistent session is served on a node that is not its
@@ -1668,16 +1702,33 @@ impl Hub {
             && !self.online.contains_key(&client)
             && !self.session_expiry.contains_key(&client)
         {
-            if let Some(cap) = self.quotas.max_sessions {
-                if self.session_count() >= cap {
-                    warn!(client = %client.0, cap,
-                          "session quota exceeded; CONNECT refused (ADR 0041)");
-                    if let Some(m) = &self.metrics {
-                        m.quota_rejected("sessions");
-                    }
-                    let _ = reply.send(AttachOutcome::QuotaExceeded);
-                    return;
+            let over_cap = self
+                .quotas
+                .max_sessions
+                .is_some_and(|cap| self.session_count() >= cap);
+            if over_cap || self.brownout {
+                warn!(client = %client.0, brownout = self.brownout,
+                      "session quota/brownout: new-session CONNECT refused (ADR 0041)");
+                if let Some(m) = &self.metrics {
+                    m.quota_rejected(if self.brownout {
+                        "brownout"
+                    } else {
+                        "sessions"
+                    });
                 }
+                // Recovery already ran claim_session, which CREATED this
+                // stranger's durable record before we could refuse it. A
+                // refused grant must not leave that growth behind (the whole
+                // point of the cap/brownout), so reap the just-created empty
+                // record off-loop; the refusal reply is gated on the reap so
+                // the client cannot observe the refusal and reconnect into a
+                // half-removed session.
+                let store = self.store.clone();
+                tokio::spawn(async move {
+                    let _ = store.remove(&client).await;
+                    let _ = reply.send(AttachOutcome::QuotaExceeded);
+                });
+                return;
             }
         }
 
@@ -1968,6 +2019,7 @@ impl Hub {
     /// Deliver a message to this node's **ordinary** local subscribers at
     /// `min(qos, granted)` each. Shared subscriptions are routed separately by
     /// [`deliver_shared`](Self::deliver_shared) (ADR 0015).
+    /// Returns `false` when any recipient's durable enqueue failed (ADR 0041 T5).
     async fn deliver_local(
         &mut self,
         topic: &str,
@@ -1975,7 +2027,7 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
         let targets: Vec<(ClientId, QoS)> = self
             .table
             .matching_clients(topic)
@@ -1986,23 +2038,28 @@ impl Hub {
             })
             .collect();
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
+        let mut all_durable = true;
         for (c, granted) in targets {
-            self.deliver_to_client(
-                &c,
-                topic,
-                payload,
-                min_qos(qos, granted),
-                message_expiry,
-                app,
-            )
-            .await;
+            all_durable &= self
+                .deliver_to_client(
+                    &c,
+                    topic,
+                    payload,
+                    min_qos(qos, granted),
+                    message_expiry,
+                    app,
+                )
+                .await;
         }
+        all_durable
     }
 
     /// Deliver one message to a single named recipient: live if online (tracking
     /// `QoS` > 0 in flight), else queued if the session is persistent, else dropped.
     /// The unit of both ordinary and shared (ADR 0015) delivery; `qos` is the
     /// already-downgraded delivery `QoS`.
+    /// Returns `false` when a durable offline enqueue failed terminally — the
+    /// caller withholds the publisher's ack so it retries (ADR 0041 T5).
     async fn deliver_to_client(
         &mut self,
         client: &ClientId,
@@ -2011,7 +2068,7 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
@@ -2025,7 +2082,19 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
             }
-        } else if self.is_persistent(client) {
+            return true;
+        }
+        if self.is_persistent(client) {
+            // Disk brownout (ADR 0041 T5): an offline enqueue GROWS the store —
+            // refused above the watermark, counted, like a queue overflow.
+            if self.brownout {
+                warn!(client = %client.0, topic = %topic,
+                      "brownout: offline enqueue refused (ADR 0041)");
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("brownout");
+                }
+                return true;
+            }
             // Offline but persistent: queue for replay on reconnect. The absolute
             // deadline (ADR 0009 §3) is receipt time plus the interval. The queue is
             // bounded (ADR 0001 §6); log when the cap drops messages.
@@ -2065,10 +2134,16 @@ impl Hub {
                     if let Some(m) = &self.metrics {
                         m.durable_append_failed(durable_failure_reason(&e));
                     }
-                    warn!(client = %client.0, error = %e, "failed to enqueue offline message");
+                    warn!(client = %client.0, error = %e,
+                          "failed to enqueue offline message; withholding the publisher's ack (ADR 0041 T5)");
+                    // Fail closed like the local ack path (ADR 0018): the caller
+                    // withholds the publisher's acknowledgement so it retries,
+                    // instead of acking a message a subscriber will never see.
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// Route a message to the shared subscriptions matching `topic`: for each group,
@@ -2402,14 +2477,17 @@ impl Hub {
     /// beyond the quota (ADR 0041 T4). Overwrites (topic already retained) never
     /// count. Enforced against this node's local retained view.
     async fn retained_quota_exceeded(&self, topic: &str) -> bool {
-        let Some(cap) = self.quotas.max_retained_messages else {
-            return false;
+        let over = if self.brownout {
+            true // brownout (ADR 0041 T5): any retained GROWTH is refused
+        } else if let Some(cap) = self.quotas.max_retained_messages {
+            self.retained.count().await.unwrap_or(0) >= cap
+        } else {
+            false
         };
-        let count = self.retained.count().await.unwrap_or(0);
-        if count < cap {
+        if !over {
             return false;
         }
-        // At the cap: only an overwrite of an existing topic may proceed.
+        // At the bound: only an overwrite of an existing topic may proceed.
         !self
             .retained
             .matching(topic)
@@ -5292,6 +5370,134 @@ mod tests {
         panic!(
             "durable-append failure was never counted:\n{}",
             metrics.render()
+        );
+    }
+
+    /// ADR 0041 T5 — a failed durable offline enqueue WITHHOLDS the publisher's
+    /// ack (the sender is dropped, the publisher retries) instead of acking a
+    /// message a subscriber will never see — fail closed, like the local path.
+    #[tokio::test]
+    async fn a_failed_offline_enqueue_withholds_the_publishers_ack() {
+        let (hub, tx) = Hub::with_config(NodeId("h".into()), FlakyStore::new_no_quorum_enqueue());
+        tokio::spawn(hub.run());
+
+        // A persistent, offline subscriber: a publish to it takes the durable
+        // enqueue path, which this store fails.
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "fc/t");
+        detach(&tx, "p", 1);
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "fc/t".into(),
+            payload: Bytes::from_static(b"x"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(done_tx),
+            v5: false,
+        })
+        .unwrap();
+        assert!(
+            done_rx.await.is_err(),
+            "the ack must be withheld when the durable enqueue fails"
+        );
+    }
+
+    /// ADR 0041 T5 — brownout: above the disk watermark, growth writes are
+    /// refused (new retained topics, new sessions, offline enqueues) while
+    /// maintenance continues (resume, retained overwrite), and recovery below
+    /// the mark restores everything.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn brownout_refuses_growth_and_recovery_restores_it() {
+        let tx = start_hub();
+
+        // Pre-existing state: a persistent session with a QoS 1 subscription
+        // (asleep through the brownout), and one retained topic.
+        let (_rx, _) = attach(&tx, "sleeper", 1, false).await;
+        subscribe(&tx, "sleeper", "b/q");
+        detach(&tx, "sleeper", 1);
+        let retained_publish = |topic: &str, payload: &'static [u8]| {
+            let (done_tx, done_rx) = oneshot::channel();
+            tx.send(HubCommand::Publish {
+                topic: topic.into(),
+                payload: Bytes::from_static(payload),
+                qos: QoS::AtMostOnce,
+                retain: true,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: Some(done_tx),
+                v5: true,
+            })
+            .unwrap();
+            done_rx
+        };
+        assert_eq!(
+            retained_publish("b/r1", b"v1").await.unwrap(),
+            super::PublishOutcome::Accepted
+        );
+
+        tx.send(HubCommand::SetBrownout(true)).unwrap();
+
+        // Growth refused: a NEW retained topic...
+        assert_eq!(
+            retained_publish("b/r2", b"nope").await.unwrap(),
+            super::PublishOutcome::RetainedQuotaExceeded,
+            "a new retained topic must be refused under brownout"
+        );
+        // ...and a NEW session...
+        assert!(
+            matches!(
+                attach_outcome(&tx, "stranger", 2).await,
+                AttachOutcome::QuotaExceeded
+            ),
+            "a new session must be refused under brownout"
+        );
+        // ...and an offline enqueue (silently dropped, counted): this message
+        // must NOT replay after recovery.
+        publish_qos1(&tx, "b/q", b"browned-out");
+
+        // Maintenance continues: an overwrite of the existing retained topic...
+        assert_eq!(
+            retained_publish("b/r1", b"v2").await.unwrap(),
+            super::PublishOutcome::Accepted,
+            "overwriting an existing retained topic is maintenance, not growth"
+        );
+        // ...and resuming the existing session.
+        assert!(
+            matches!(
+                attach_outcome(&tx, "sleeper", 3).await,
+                AttachOutcome::Present(true)
+            ),
+            "a resume is never refused under brownout"
+        );
+        detach(&tx, "sleeper", 3);
+
+        // Recovery below the mark restores growth.
+        tx.send(HubCommand::SetBrownout(false)).unwrap();
+        assert_eq!(
+            retained_publish("b/r2", b"now").await.unwrap(),
+            super::PublishOutcome::Accepted
+        );
+        assert!(matches!(
+            attach_outcome(&tx, "stranger", 4).await,
+            AttachOutcome::Present(false)
+        ));
+        publish_qos1(&tx, "b/q", b"kept");
+
+        // The sleeper replays ONLY the post-recovery message.
+        let (mut rx, present) = attach(&tx, "sleeper", 5, false).await;
+        assert!(present);
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"kept",
+            "only the post-recovery enqueue may replay"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the browned-out message must not have been queued"
         );
     }
 
