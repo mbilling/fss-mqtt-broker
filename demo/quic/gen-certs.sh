@@ -16,9 +16,11 @@ mkdir -p "$D"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$D/ca.key" -out "$D/ca.pem" \
   -subj '/CN=mqttd-demo-quic-ca' -days 3650 >/dev/null 2>&1
 
-# Server leaf — SAN covers the three cluster nodes + localhost/127.0.0.1.
+# Server leaf — SAN covers every cluster node + localhost/127.0.0.1.
 server_ext="$(mktemp)"
-printf 'subjectAltName=DNS:mqttd-1,DNS:mqttd-2,DNS:mqttd-3,DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$server_ext"
+# >>> generated: server-cert SAN — edit demo/scale-cluster.py, not here >>>
+printf 'subjectAltName=DNS:mqttd-1,DNS:mqttd-2,DNS:mqttd-3,DNS:mqttd-4,DNS:mqttd-5,DNS:mqttd-6,DNS:mqttd-7,DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$server_ext"
+# <<< generated: server-cert SAN <<<
 openssl req -newkey rsa:2048 -nodes -keyout "$D/server.key" -out "$D/server.csr" \
   -subj '/CN=mqttd-quic' >/dev/null 2>&1
 openssl x509 -req -in "$D/server.csr" -CA "$D/ca.pem" -CAkey "$D/ca.key" -CAcreateserial \

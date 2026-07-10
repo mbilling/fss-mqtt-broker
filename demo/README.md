@@ -1,6 +1,10 @@
-# mqttd demo: 3-node cluster + Grafana / Prometheus / Alloy
+# mqttd demo: 7-node cluster + Grafana / Prometheus / Alloy
 
-A one-command demo that brings up a **3-node durable `mqttd` cluster** wired to a
+> **Experiment branch (`experiment/7-node-demo`).** Scaled up from the baseline 3-node demo
+> to exercise a larger durable cluster. The node count is adjustable — see
+> [Scaling the cluster](#scaling-the-cluster) below.
+
+A one-command demo that brings up a **7-node durable `mqttd` cluster** wired to a
 **Grafana + Prometheus + Grafana Alloy** observability stack, with a small load
 generator driving cross-node traffic and a dashboard that showcases every metric the
 broker exports (ADR 0020).
@@ -18,7 +22,7 @@ First build compiles the broker (a few minutes); subsequent starts are fast. The
 | <http://localhost:3000> | **Grafana** → dashboard **"mqttd — broker overview"** (anonymous admin) |
 | <http://localhost:9090> | Prometheus |
 | <http://localhost:12345> | Alloy UI (pipeline graph, OTLP receiver, scrape targets) |
-| `localhost:1883` / `1884` / `1885` | the three brokers' MQTT ports |
+| `localhost:1883` / `1884` / `1885` / `1887` / `1888` / `1889` / `1891` | the seven brokers' MQTT ports (mqttd-1..7) |
 | <http://localhost:8080/metrics> | node-1's raw Prometheus exposition |
 
 Tear down (and wipe the durable volumes):
@@ -27,12 +31,30 @@ Tear down (and wipe the durable volumes):
 docker compose down -v
 ```
 
+## Scaling the cluster
+
+Docker Compose can't loop to create N distinct stateful brokers (each node needs its own
+node id, peer/SWIM bind, data volume, and host ports), so the per-node topology is **generated**.
+`demo/scale-cluster.py` is the single source of truth — it rewrites the marked regions of
+`docker-compose.yml`, `alloy/config.alloy`, `loadgen.sh`'s node list, and the QUIC server-cert
+SAN, and sets `MQTTD_READY_MIN_MEMBERS` to the majority quorum:
+
+```sh
+python3 demo/scale-cluster.py 5     # scale to 5 nodes (default is 7)
+cd demo && docker compose down -v && docker compose up --build
+```
+
+`mqttd-1` (the founder / playground / QUIC entry point) is hand-written; only the homogeneous
+followers `mqttd-2..N` are generated. Host ports are assigned deterministically and skip ports
+already taken by other services, so there are no collisions as N changes. Valid range: 1–20 nodes.
+
 ## What's running
 
 ```
  mqttd-1 (founder) ─┐
- mqttd-2 ───────────┤  SWIM gossip mesh + durable lease group (ADR 0006/0007/0018)
- mqttd-3 ───────────┘
+ mqttd-2 ───────────┤
+   …                ┤  SWIM gossip mesh + durable lease group (ADR 0006/0007/0018)
+ mqttd-7 ───────────┘  (7 nodes; adjust with demo/scale-cluster.py)
      │  │
      │  └── Prometheus /metrics ──────── scraped by ─┐
      └───── OTLP/HTTP push ── received by ───────────┤
@@ -49,14 +71,15 @@ Both metric paths are live:
   graph, or `docker compose logs alloy`. This exercises the broker's in-process OTLP
   exporter end to end.
 
-The cluster runs **ephemeral (in-memory) sessions** — SWIM-clustered but without the durable
-lease group. Expect `cluster_members = 3`, `peer_links = 2` per node, and `members{alive} = 3`.
+The cluster runs **durable, consensus-backed sessions** — the default (ADR 0029). Each broker
+persists its lease group and replicated session log to its own `/data` volume. Expect
+`cluster_members = 7`, `peer_links = 6` per node, and `members{alive} = 7` once the mesh forms.
 
-> The `lease_*` and `durable_append_*` panels are intentionally empty here: they only exist
-> in **durable** mode (`MQTTD_DURABLE_SESSIONS=1`), which is disabled because the all-voters
-> lease group currently churns at 3 nodes (re-electing ~1×/s). Bounded voters — the fix —
-> are ADR 0021, still *Proposed*. Enable durable mode (and a per-node `MQTTD_DATA_DIR`) to
-> exercise those panels once that lands.
+> The `lease_*` and `durable_append_*` panels populate once the lease group elects a leader
+> (~90 s). **Bounded lease voters** (ADR 0021/0028, both Accepted) cap the voter set, so the
+> group stays stable at 7 nodes instead of the all-voters churn earlier revisions hit — which
+> is what makes scaling this demo up viable. Set `MQTTD_DURABLE_SESSIONS=0` to fall back to the
+> bounded in-memory store (then those panels stay empty).
 
 The **loadgen** keeps a persistent QoS-1 subscriber on node-2 and publishes QoS-1 +
 retained messages on node-1, so publishes route **across nodes** — populating

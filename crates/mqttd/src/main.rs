@@ -190,7 +190,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let interval = non_empty_env("MQTTD_OTLP_INTERVAL")
                 .and_then(|v| v.parse().ok())
                 .map_or(Duration::from_secs(10), Duration::from_secs);
-            let m = mqtt_observability::metrics::Metrics::with_otlp(version, &endpoint, interval)?;
+            // node_id becomes service.instance.id so each cluster node's OTLP series are
+            // distinct at the backend (otherwise all nodes collide into one series).
+            let m = mqtt_observability::metrics::Metrics::with_otlp(
+                version, &endpoint, interval, &node_id.0,
+            )?;
             info!(%endpoint, interval_s = interval.as_secs(), "OTLP/HTTP metric export enabled");
             m
         } else {

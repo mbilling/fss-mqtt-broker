@@ -186,14 +186,20 @@ impl Metrics {
     /// `interval`. The Prometheus endpoint stays available. Must be called within a Tokio
     /// runtime (the periodic export task is spawned on it).
     ///
+    /// `instance_id` (the node id) becomes the `OTel` resource `service.instance.id` — without
+    /// it every node in a cluster pushes the *same* series identity (`service.name=mqttd`),
+    /// and their cumulative counters collide into one meaningless stream at the backend.
+    /// Collectors map it to the Prometheus `instance` label, matching the scraped path.
+    ///
     /// # Errors
     /// Returns an error if the OTLP exporter cannot be built (e.g. a malformed endpoint).
     pub fn with_otlp(
         version: &str,
         endpoint: &str,
         interval: std::time::Duration,
+        instance_id: &str,
     ) -> Result<Self, opentelemetry_otlp::ExporterBuildError> {
-        let provider = build_otlp_provider(endpoint, interval)?;
+        let provider = build_otlp_provider(endpoint, interval, instance_id)?;
         let meter = opentelemetry::metrics::MeterProvider::meter(&provider, "mqttd");
         Ok(Self::build(version, &meter, Some(provider)))
     }
@@ -623,10 +629,13 @@ impl Metrics {
 
 /// Build an OTLP/HTTP metric exporter, a periodic reader pushing every `interval`, and the
 /// SDK meter provider that drives them. `endpoint` is the OTLP base URL (the exporter
-/// appends `/v1/metrics`); `service.name=mqttd` namespaces the metrics at the backend.
+/// appends `/v1/metrics`); `service.name=mqttd` namespaces the metrics at the backend and
+/// `service.instance.id=instance_id` distinguishes this node's series from its cluster peers'
+/// (collectors map it to the Prometheus `instance` label).
 fn build_otlp_provider(
     endpoint: &str,
     interval: std::time::Duration,
+    instance_id: &str,
 ) -> Result<opentelemetry_sdk::metrics::SdkMeterProvider, opentelemetry_otlp::ExporterBuildError> {
     use opentelemetry_otlp::WithExportConfig;
     // `with_endpoint` is used verbatim (unlike the env-var path, it does not append the
@@ -641,6 +650,10 @@ fn build_otlp_provider(
         .build();
     let resource = opentelemetry_sdk::Resource::builder()
         .with_service_name("mqttd")
+        .with_attribute(KeyValue::new(
+            "service.instance.id",
+            instance_id.to_string(),
+        ))
         .build();
     Ok(opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(reader)
@@ -848,7 +861,7 @@ mod tests {
 
         let endpoint = format!("http://{addr}");
         // Long interval so the only push is the explicit flush below.
-        let m = Metrics::with_otlp("t", &endpoint, Duration::from_secs(3600)).unwrap();
+        let m = Metrics::with_otlp("t", &endpoint, Duration::from_secs(3600), "node-test").unwrap();
         m.connection_opened("5");
         m.gossip_rejected("replay");
         m.flush();
@@ -867,6 +880,12 @@ mod tests {
         assert!(
             req.contains("mqttd"),
             "OTLP payload missing service.name:\n{req}"
+        );
+        // The per-node resource identity: without service.instance.id every cluster node's
+        // series collide at the backend into one meaningless stream.
+        assert!(
+            req.contains("node-test"),
+            "OTLP payload missing service.instance.id:\n{req}"
         );
         assert!(
             req.contains("connections") || req.contains("gossip_rejected"),
