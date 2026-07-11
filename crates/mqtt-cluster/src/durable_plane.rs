@@ -203,10 +203,12 @@ impl DurablePlane {
                     let r = self.lock_replicas();
                     (
                         r.watermark(&key),
-                        r.entries(&key)
+                        r.epoch_entries(&key)
                             .into_iter()
                             .map(|e| crate::peer::ReplicaEntryWire {
                                 offset: e.offset,
+                                epoch: e.epoch,
+                                seq: e.seq,
                                 record: e.record,
                             })
                             .collect(),
@@ -424,6 +426,7 @@ mod tests {
         let op = ReplOp::Append {
             key: "client-x".to_string(),
             offset: 1,
+            seq: 1,
             record: b"hello".to_vec(),
         };
         // A 1-of-1 "quorum" to node-2 is enough to prove the wire path: deliver
@@ -467,6 +470,7 @@ mod tests {
         let op = ReplOp::Append {
             key: "k".to_string(),
             offset: 1,
+            seq: 1,
             record: vec![1],
         };
         assert!(!p.transport().deliver(&n("ghost"), 1, &op).await);
@@ -494,6 +498,7 @@ mod tests {
             let op = ReplOp::Append {
                 key: "q/c".to_string(),
                 offset,
+                seq: offset,
                 record: rec.to_vec(),
             };
             assert!(p1.transport().deliver(&n("node-2"), 1, &op).await);
@@ -542,6 +547,7 @@ mod tests {
                     op: ReplOp::Append {
                         key: format!("q/{i}"),
                         offset: 1,
+                        seq: 1,
                         record: vec![i],
                     },
                 };

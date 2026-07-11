@@ -261,7 +261,9 @@ impl ReplicaTransport for PeerReplicaTransport {
             watermark,
             entries: entries
                 .into_iter()
-                .map(|e| mqtt_storage::repl::LogEntry {
+                .map(|e| crate::cluster_log::EpochEntry {
+                    epoch: e.epoch,
+                    seq: e.seq,
                     offset: e.offset,
                     record: e.record,
                 })
@@ -290,6 +292,7 @@ mod tests {
         ReplOp::Append {
             key: key.to_string(),
             offset,
+            seq: offset,
             record: b"payload".to_vec(),
         }
     }

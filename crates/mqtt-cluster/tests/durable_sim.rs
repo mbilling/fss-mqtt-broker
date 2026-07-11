@@ -18,32 +18,27 @@
 //! seeds; a violation panics with the offending seed, which reruns the identical
 //! schedule (set [`REPRO_SEED`] to focus it).
 //!
-//! ## Known exhibits (waived, tracked, red under `--ignored`)
+//! ## Exhibits found and fixed (the full catalog is enforced, no waivers)
 //!
 //! On its first sweep this harness found two **real defects** in the replication
-//! glue, recorded as exhibits ② and ③ in the delivery doc's ledger:
+//! glue, recorded as exhibits ② and ③ in the delivery doc's ledger — both fixed:
 //!
-//! - **② Adopted-orphan gap loss** — **FIXED by 0042-T6** (takeover re-commit:
-//!   the new owner re-replicates the recovered base to a write quorum at its
-//!   epoch before serving; `ClusterLog::recommit_key`). The sim's takeover
-//!   models the re-commit, and the `acked-durability` waiver is gone: the
-//!   invariant is enforced on every seed again.
-//! - **③ Offset-reuse divergence** (`acked-integrity`): after `NoQuorum` the next
-//!   (different) record reuses the offset; a replica that stored the failed
-//!   attempt and missed the reuse holds different bytes at an acked offset, and
-//!   [`merge_replica_logs`] resolves the conflict by read order — the stale
-//!   record can win. The same unfenced adoption has a **retained face** the
-//!   ledger cannot see: a deposed owner's never-acked writes at *higher* offsets
-//!   can be adopted above a newer owner's acked write, regressing the recovered
-//!   retained value/token behind an acked one (entries carry no epoch, so the
-//!   merge cannot apply the log-matching rule and truncate the stale tail).
-//!   Fix: 0042-T7 (epoch-tagged entries + conflict/tail resolution).
+//! - **② Adopted-orphan gap loss** — fixed by 0042-T6 (takeover re-commit: the
+//!   new owner re-replicates the recovered base to a write quorum at its epoch
+//!   before serving, `ClusterLog::recommit_key`; plus truncation-floor offset
+//!   continuation). The sim's takeover models both.
+//! - **③ Offset-reuse divergence** — fixed by 0042-T7 (epoch-tagged entries):
+//!   every entry carries its writing `(epoch, seq)`; a replica keeps the higher
+//!   version of an offset, and the recovery merge resolves same-offset conflicts
+//!   by tag and truncates a tail whose tag regresses (log matching) — so a
+//!   failed attempt whose offset was reused can never shadow the acked record,
+//!   and a deposed owner's orphans can never regress a recovered retained value
+//!   behind an acked one. The sim allocates seqs exactly as `ClusterLog` does
+//!   (every attempt bumps; re-commit re-tags 1..=n at the new epoch).
 //!
-//! The sweeping tests waive exactly the remaining exhibit-③ class (loudly, by
-//! count) so every *other* invariant stays enforced on every push;
-//! [`replication_catalog_holds_with_no_waivers`] runs the same schedules
-//! unwaived and is `#[ignore]`d until T7 removes the defect — un-ignoring it
-//! is that task's acceptance.
+//! These sweeps enforce the **entire** T1 catalog on every seed, unwaived — the
+//! state the ADR calls done. A future violation here is a new defect, not a
+//! known exhibit.
 
 use mqtt_cluster::cluster_log::{merge_replica_logs, ReplOp, ReplicaRead, ReplicaState};
 use mqtt_cluster::invariants::{AckLedger, FenceLog, LeaseLog, TokenLog, Violation};
@@ -59,12 +54,6 @@ const REPRO_SEED: Option<u64> = None;
 /// How many seeds each scenario sweeps (the pure core is cheap; a full sweep runs
 /// in seconds). `REPRO_SEED` narrows it to one.
 const SEED_SWEEP: u64 = 1000;
-
-/// The violation class covered by the remaining recorded exhibit ③ (module
-/// docs). Removed by 0042-T7; nothing else is ever waived. (Exhibit ②'s
-/// `acked-durability` waiver was removed when 0042-T6 landed the takeover
-/// re-commit.)
-const WAIVED_KNOWN_EXHIBITS: &[&str] = &["acked-integrity"];
 
 fn seeds() -> Vec<u64> {
     match REPRO_SEED {
@@ -103,18 +92,6 @@ impl Rng {
     fn pick(&mut self, len: usize) -> usize {
         usize::try_from(self.range(0, len as u64)).unwrap()
     }
-}
-
-/// Split off the violations covered by the recorded exhibits (when waiving);
-/// everything else must hold. Returns `(waived_count, remaining)`.
-fn split_waived(violations: Vec<Violation>, waive: bool) -> (usize, Vec<Violation>) {
-    if !waive {
-        return (0, violations);
-    }
-    let (waived, remaining): (Vec<_>, Vec<_>) = violations
-        .into_iter()
-        .partition(|v| WAIVED_KNOWN_EXHIBITS.contains(&v.invariant));
-    (waived.len(), remaining)
 }
 
 /// Panic with the catalog's violations, tagged with the reproducing seed.
@@ -166,8 +143,10 @@ struct ReplSim {
     /// Distinguishes the bytes of successive attempts (a reused offset must carry
     /// *different* bytes to make silent replacement detectable).
     attempt: u64,
-    /// Exhibit-waived violations seen so far (counted loudly at scenario end).
-    waived: usize,
+    /// Per key: the owner's write-attempt seq counter, allocated exactly as
+    /// `ClusterLog` does — bumped on EVERY attempt (failed ones included), reset
+    /// to the re-committed entry count at takeover (ADR 0042 T7).
+    seq: BTreeMap<String, u64>,
 }
 
 impl ReplSim {
@@ -181,8 +160,15 @@ impl ReplSim {
             next_offset: BTreeMap::new(),
             acked_high: BTreeMap::new(),
             attempt: 0,
-            waived: 0,
+            seq: BTreeMap::new(),
         }
+    }
+
+    /// Allocate the next write-attempt seq for `key` (every attempt bumps).
+    fn next_seq(&mut self, key: &str) -> u64 {
+        let c = self.seq.entry(key.to_string()).or_insert(0);
+        *c += 1;
+        *c
     }
 
     /// Deliver `op` at `epoch` to one replica right now, recording the decision
@@ -244,15 +230,18 @@ impl ReplSim {
 
     /// One owner append to `key` at `epoch`: acked (and the offset advanced) only
     /// on a counted write quorum; otherwise the next append **reuses the offset
-    /// with different bytes** — the `ClusterLog` behavior under a failed quorum.
+    /// with different bytes** — the `ClusterLog` behavior under a failed quorum
+    /// (the next attempt's higher seq supersedes the failed one, ADR 0042 T7).
     /// Returns the acked offset, if acked.
     fn owner_append(&mut self, epoch: u64, key: &str) -> Option<u64> {
         let offset = *self.next_offset.entry(key.to_string()).or_insert(1);
         self.attempt += 1;
+        let seq = self.next_seq(key);
         let record = format!("e{epoch}-{key}-o{offset}-a{}", self.attempt).into_bytes();
         let op = ReplOp::Append {
             key: key.to_string(),
             offset,
+            seq,
             record: record.clone(),
         };
         if self.send(epoch, &op) >= QUORUM {
@@ -289,37 +278,40 @@ impl ReplSim {
 
     /// A takeover's recovery read: merge a seeded 2-replica quorum in a seeded
     /// *order* (the merge must not depend on which replica is read first), verify
-    /// the ledger against it, and hand the recovered log to the next owner (which
-    /// continues after the recovered high-water, as `ClusterLog::recovered` does).
+    /// the ledger against it, **re-commit the recovered base to a write quorum at
+    /// the new owner's `epoch`** (the 0042-T6 fix for exhibit ② — retried through
+    /// the adversarial fates until quorum, as the real recovery retries on
+    /// `NoQuorum`; entries re-tagged with seqs 1..=n, as `recommit_key` does),
+    /// and hand the recovered log to the next owner (which continues after the
+    /// recovered high-water, as `ClusterLog::recovered` does).
     fn takeover_recover(
         &mut self,
         key: &str,
         epoch: u64,
-        waive: bool,
     ) -> (Vec<mqtt_storage::repl::LogEntry>, Vec<Violation>) {
         let first = self.rng.pick(3);
         let second = self.rng.pick(2);
         let second = if second >= first { second + 1 } else { second };
         let read = |r: &ReplicaState| ReplicaRead {
             watermark: r.watermark(key),
-            entries: r.entries(key),
+            entries: r.epoch_entries(key),
         };
         let reads = [read(&self.replicas[first]), read(&self.replicas[second])];
         let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
         let merged = merge_replica_logs(&reads);
-        let (waived, violations) = split_waived(self.ledger.verify_recovered(key, &merged), waive);
-        self.waived += waived;
-        // Re-commit the recovered base to a write quorum at the new owner's
-        // epoch (the 0042-T6 fix for exhibit ②), retried through the adversarial
-        // fates until quorum — as the real recovery retries on NoQuorum.
-        for entry in &merged {
+        let violations = self.ledger.verify_recovered(key, &merged);
+        // Re-commit at the new epoch, re-tagged with seqs 1..=n; the owner's seq
+        // counter continues above n (the recommit_key/seed_key convention).
+        for (i, entry) in merged.iter().enumerate() {
             let op = ReplOp::Append {
                 key: key.to_string(),
                 offset: entry.offset,
+                seq: (i as u64) + 1,
                 record: entry.record.clone(),
             };
             while self.send(epoch, &op) < QUORUM {}
         }
+        self.seq.insert(key.to_string(), merged.len() as u64);
         // The offset space continues above BOTH the recovered high-water and the
         // reads' truncation floor (exhibit ②'s second face, also fixed by T6): a
         // fully-truncated key merges empty, but restarting at offset 1 would put
@@ -335,7 +327,7 @@ impl ReplSim {
     /// Verify the whole catalog: per-replica fencing over every decision the
     /// plane carried, and the ledger against every ordered read-quorum choice
     /// (all six), so a divergence visible only under one read order cannot hide.
-    fn verify_all(&mut self, key: &str, waive: bool) -> Vec<Violation> {
+    fn verify_all(&self, key: &str) -> Vec<Violation> {
         let mut all: Vec<Violation> = self.fences.iter().flat_map(FenceLog::verify).collect();
         for first in 0..3 {
             for second in 0..3 {
@@ -344,7 +336,7 @@ impl ReplSim {
                 }
                 let read = |r: &ReplicaState| ReplicaRead {
                     watermark: r.watermark(key),
-                    entries: r.entries(key),
+                    entries: r.epoch_entries(key),
                 };
                 let merged = merge_replica_logs(&[
                     read(&self.replicas[first]),
@@ -353,9 +345,7 @@ impl ReplSim {
                 all.extend(self.ledger.verify_recovered(key, &merged));
             }
         }
-        let (waived, remaining) = split_waived(all, waive);
-        self.waived += waived;
-        remaining
+        all
     }
 }
 
@@ -369,15 +359,15 @@ fn op_key(op: &ReplOp) -> &str {
 /// One full seeded replication schedule over `keys`: four owner generations at
 /// increasing epochs append, truncate, and lose deliveries; deferred (stale) ops
 /// land throughout and drain at the end; each takeover recovers from a seeded
-/// read quorum in a seeded order. The catalog is checked at every takeover and,
-/// over every read order, at the end. Returns the waived-exhibit count.
-fn run_replication_schedule(seed: u64, keys: &[&str], waive: bool) -> usize {
+/// read quorum in a seeded order, re-committing its base. The full catalog is
+/// checked at every takeover and, over every read order, at the end.
+fn run_replication_schedule(seed: u64, keys: &[&str]) {
     let mut sim = ReplSim::new(seed);
     for generation in 1..=4u64 {
         let epoch = generation;
         if generation > 1 {
             for key in keys {
-                let (_, violations) = sim.takeover_recover(key, epoch, waive);
+                let (_, violations) = sim.takeover_recover(key, epoch);
                 assert_seed_holds(seed, "takeover recovery", &violations);
             }
         }
@@ -394,34 +384,16 @@ fn run_replication_schedule(seed: u64, keys: &[&str], waive: bool) -> usize {
     }
     sim.drain_deferred();
     for key in keys {
-        let violations = sim.verify_all(key, waive);
-        assert_seed_holds(seed, "end-of-schedule catalog", &violations);
+        assert_seed_holds(seed, "end-of-schedule catalog", &sim.verify_all(key));
     }
-    sim.waived
 }
 
-/// Fencing + acked durability across seeded takeover schedules, with the two
-/// recorded exhibits waived (module docs) — every other invariant enforced on
-/// every seed.
+/// Fencing + acked durability + integrity across seeded takeover schedules —
+/// the full T1 catalog, no waivers (exhibits ② and ③ are fixed; module docs).
 #[test]
 fn fencing_and_acked_durability_hold_across_seeded_takeover_schedules() {
-    let mut waived = 0;
     for seed in seeds() {
-        waived += run_replication_schedule(seed, &["q/sim-a", "q/sim-b"], true);
-    }
-    // Loud, not silent: the waiver's footprint is visible under --nocapture and
-    // shrinks to zero when 0042-T6/T7 land.
-    eprintln!("durable_sim: waived {waived} known-exhibit violations (exhibits 2-3)");
-}
-
-/// The same schedules with **no waivers**: red today, by design — exhibit ③ is
-/// still real (② was fixed by T6). 0042-T7's acceptance is un-ignoring this test.
-#[test]
-#[ignore = "exhibit 3 (0042-T7): offset-reuse divergence needs epoch-tagged entries"]
-fn replication_catalog_holds_with_no_waivers() {
-    for seed in seeds() {
-        run_replication_schedule(seed, &["q/sim-a", "q/sim-b"], false);
-        run_retained_schedule(seed, false);
+        run_replication_schedule(seed, &["q/sim-a", "q/sim-b"]);
     }
 }
 
@@ -482,76 +454,59 @@ fn lease_minting_is_monotonic_and_replay_is_deterministic() {
 /// are appends on an `r/` key whose records carry their `(epoch, offset)` token;
 /// every acked set's token feeds one [`TokenLog`] across all four owner
 /// generations — strictly increasing per topic or it panics — and each takeover's
-/// recovered token must not be behind the last acked one (the exhibit test's
-/// claim, generalized over schedules; skipped for a recovery the waived exhibits
-/// already flagged as lossy, since a lost tail legally lowers the recovered
-/// high-water).
+/// recovered token must never be behind the last acked one (the exhibit-①
+/// scenario test's claim, generalized over schedules; guaranteed by T7's
+/// log-matching merge, which truncates a deposed owner's stale orphan tail).
 #[test]
 fn retained_tokens_never_regress_across_seeded_takeover_schedules() {
-    let mut waived_total = 0;
-    for seed in seeds() {
-        waived_total += run_retained_schedule(seed, true);
-    }
-    eprintln!("durable_sim(retained): waived {waived_total} known-exhibit violations");
-}
-
-/// One full seeded retained schedule (see the test above). Returns the count of
-/// waived known-exhibit events (ledger shapes plus recovered-token regressions —
-/// exhibit ③'s retained face).
-fn run_retained_schedule(seed: u64, waive: bool) -> usize {
     let topic_key = "r/sim-topic";
-    let mut sim = ReplSim::new(seed);
-    let mut tokens = TokenLog::new();
-    let mut last_acked: Option<(u64, u64)> = None;
+    for seed in seeds() {
+        let mut sim = ReplSim::new(seed);
+        let mut tokens = TokenLog::new();
+        let mut last_acked: Option<(u64, u64)> = None;
 
-    for generation in 1..=4u64 {
-        let epoch = generation;
-        if generation > 1 {
-            let waived_before = sim.waived;
-            let (merged, violations) = sim.takeover_recover(topic_key, epoch, waive);
-            assert_seed_holds(seed, "retained takeover recovery", &violations);
-            let lossy = sim.waived > waived_before;
-            if let (Some(entry), Some(acked), false) = (merged.last(), last_acked, lossy) {
-                let recovered = decode_token(&entry.record);
-                if recovered < acked {
-                    // Exhibit ③, retained face: a stale-epoch orphan adopted
-                    // above the acked write regressed the recovered value.
+        for generation in 1..=4u64 {
+            let epoch = generation;
+            if generation > 1 {
+                let (merged, violations) = sim.takeover_recover(topic_key, epoch);
+                assert_seed_holds(seed, "retained takeover recovery", &violations);
+                if let (Some(entry), Some(acked)) = (merged.last(), last_acked) {
+                    let recovered = decode_token(&entry.record);
                     assert!(
-                        waive,
+                        recovered >= acked,
                         "seed {seed}: takeover recovered token {recovered:?} behind the \
                          acked {acked:?} (re-run with REPRO_SEED = Some({seed}))"
                     );
-                    sim.waived += 1;
                 }
             }
-        }
-        let sets = sim.rng.range(1, 5);
-        for _ in 0..sets {
-            let offset = *sim.next_offset.entry(topic_key.to_string()).or_insert(1);
-            let record = encode_token(epoch, offset);
-            let op = ReplOp::Append {
-                key: topic_key.to_string(),
-                offset,
-                record: record.clone(),
-            };
-            if sim.send(epoch, &op) >= QUORUM {
-                sim.ledger.ack_append(topic_key, offset, &record);
-                sim.acked_high
-                    .entry(topic_key.to_string())
-                    .and_modify(|h| *h = (*h).max(offset))
-                    .or_insert(offset);
-                sim.next_offset.insert(topic_key.to_string(), offset + 1);
-                tokens.observe_applied(topic_key, (epoch, offset));
-                last_acked = Some((epoch, offset));
+            let sets = sim.rng.range(1, 5);
+            for _ in 0..sets {
+                let offset = *sim.next_offset.entry(topic_key.to_string()).or_insert(1);
+                let seq = sim.next_seq(topic_key);
+                let record = encode_token(epoch, offset);
+                let op = ReplOp::Append {
+                    key: topic_key.to_string(),
+                    offset,
+                    seq,
+                    record: record.clone(),
+                };
+                if sim.send(epoch, &op) >= QUORUM {
+                    sim.ledger.ack_append(topic_key, offset, &record);
+                    sim.acked_high
+                        .entry(topic_key.to_string())
+                        .and_modify(|h| *h = (*h).max(offset))
+                        .or_insert(offset);
+                    sim.next_offset.insert(topic_key.to_string(), offset + 1);
+                    tokens.observe_applied(topic_key, (epoch, offset));
+                    last_acked = Some((epoch, offset));
+                }
+                sim.release_some_deferred();
             }
-            sim.release_some_deferred();
         }
+        sim.drain_deferred();
+        assert_seed_holds(seed, "retained token monotonicity", &tokens.verify());
+        assert_seed_holds(seed, "end-of-schedule catalog", &sim.verify_all(topic_key));
     }
-    sim.drain_deferred();
-    assert_seed_holds(seed, "retained token monotonicity", &tokens.verify());
-    let violations = sim.verify_all(topic_key, waive);
-    assert_seed_holds(seed, "end-of-schedule catalog", &violations);
-    sim.waived
 }
 
 /// Encode a retained record carrying its convergence token (the real retained

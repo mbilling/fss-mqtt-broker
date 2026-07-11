@@ -52,6 +52,13 @@ pub enum ReplOp {
         key: String,
         /// The leader-assigned offset.
         offset: Offset,
+        /// The leader's per-key **write attempt** counter (ADR 0042 T7). Strictly
+        /// increasing per append call within an owner generation, so two attempts
+        /// that reused one offset (a failed quorum, then the next append) are
+        /// ordered: a replica keeps the higher `(epoch, seq)` version of an
+        /// offset, and the recovery merge resolves cross-replica conflicts the
+        /// same way — divergence at an acked offset cannot survive.
+        seq: u64,
         /// The opaque record bytes.
         record: Vec<u8>,
     },
@@ -73,7 +80,10 @@ pub enum ReplOp {
 /// per-group fence rows (ADR 0037 P4).
 /// v2: retained rows (`r/` keys) carry application properties (ADR 0038 T3) —
 /// the row bytes' meaning changed, so a v1 file fails closed at the gate.
-const R_SCHEMA_VERSION: u32 = 2;
+/// v3: every entry row is prefixed with its writing `(epoch, seq)` (ADR 0042 T7)
+/// — the tags the recovery merge resolves offset conflicts and stale tails with;
+/// a v2 file fails closed at the gate.
+const R_SCHEMA_VERSION: u32 = 3;
 
 const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
 const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
@@ -88,8 +98,29 @@ const R_TRUNC: TableDefinition<&str, u64> = TableDefinition::new("replica_trunc"
 /// other group's (perfectly current) lease-holder on this replica.
 const R_FENCE_PREFIX: &str = "fence/";
 
-/// A replica's stored entries: per logical key, an offset → record map.
-type ReplicaLogs = BTreeMap<String, BTreeMap<Offset, Vec<u8>>>;
+/// A replica's stored entries: per logical key, offset → the entry's writing
+/// `(epoch, seq)` tags (ADR 0042 T7) and record bytes.
+type ReplicaLogs = BTreeMap<String, BTreeMap<Offset, ((Epoch, u64), Vec<u8>)>>;
+
+/// Encode an entry row's value: `epoch_be ++ seq_be ++ record` (schema v3).
+fn r_entry_value(epoch: Epoch, seq: u64, record: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + record.len());
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(record);
+    out
+}
+
+/// Decode an entry row's value into `((epoch, seq), record)`. A short row (a
+/// corrupt write) decodes as tag zero with the raw bytes, never a panic.
+fn r_decode_value(v: &[u8]) -> ((Epoch, u64), Vec<u8>) {
+    if v.len() < 16 {
+        return ((0, 0), v.to_vec());
+    }
+    let epoch = Epoch::from_be_bytes(v[..8].try_into().expect("checked length"));
+    let seq = u64::from_be_bytes(v[8..16].try_into().expect("checked length"));
+    ((epoch, seq), v[16..].to_vec())
+}
 
 /// Per placement group, the highest leadership epoch this replica has acknowledged.
 type Fences = BTreeMap<GroupId, Epoch>;
@@ -238,7 +269,7 @@ impl ReplicaState {
             let (key, offset) = r_decode_key(k.value());
             logs.entry(key)
                 .or_default()
-                .insert(offset, v.value().to_vec());
+                .insert(offset, r_decode_value(v.value()));
         }
         let mut truncated = BTreeMap::new();
         let trunc = txn.open_table(R_TRUNC).map_err(rdb)?;
@@ -257,7 +288,7 @@ impl ReplicaState {
     /// **one** fsync'd transaction — the on-disk mirror of the in-memory mutations,
     /// coalesced so a burst of replicated messages costs a single fsync rather than one
     /// each (ADR 0027). Ops apply in slice order. No-op (`Ok`) when in-memory.
-    fn persist_batch(&self, fences: &Fences, ops: &[&ReplOp]) -> Result<(), ReplError> {
+    fn persist_batch(&self, fences: &Fences, ops: &[(Epoch, &ReplOp)]) -> Result<(), ReplError> {
         let Some(db) = &self.db else {
             return Ok(());
         };
@@ -274,15 +305,19 @@ impl ReplicaState {
             // Running per-key truncation low-water across this batch, overlaying the
             // committed `self.truncated`, so successive truncates in one batch compound.
             let mut wm: BTreeMap<&str, Offset> = BTreeMap::new();
-            for op in ops {
+            for (epoch, op) in ops {
                 match op {
                     ReplOp::Append {
                         key,
                         offset,
+                        seq,
                         record,
                     } => {
                         entries
-                            .insert(r_entry_key(key, *offset).as_slice(), record.as_slice())
+                            .insert(
+                                r_entry_key(key, *offset).as_slice(),
+                                r_entry_value(*epoch, *seq, record).as_slice(),
+                            )
                             .map_err(rdb)?;
                     }
                     ReplOp::Truncate { key, up_to } => {
@@ -309,17 +344,18 @@ impl ReplicaState {
     }
 
     /// Apply one op's mutation to the in-memory copy (after it is durable on disk).
-    fn apply_in_memory(&mut self, op: &ReplOp) {
+    fn apply_in_memory(&mut self, epoch: Epoch, op: &ReplOp) {
         match op {
             ReplOp::Append {
                 key,
                 offset,
+                seq,
                 record,
             } => {
                 self.logs
                     .entry(key.clone())
                     .or_default()
-                    .insert(*offset, record.clone());
+                    .insert(*offset, ((epoch, *seq), record.clone()));
             }
             ReplOp::Truncate { key, up_to } => {
                 if let Some(log) = self.logs.get_mut(key) {
@@ -357,15 +393,40 @@ impl ReplicaState {
         if epoch < self.fences.get(&group).copied().unwrap_or(0) {
             return false;
         }
+        // Stale-attempt guard (ADR 0042 T7): an Append for an offset this replica
+        // already holds at a HIGHER `(epoch, seq)` is a late duplicate of an older
+        // attempt — discharged idempotently (accepted, nothing overwritten): the
+        // newer version stands, on disk and in memory alike.
+        if self.is_stale_attempt(epoch, op) {
+            self.fences.insert(
+                group,
+                epoch.max(self.fences.get(&group).copied().unwrap_or(0)),
+            );
+            return true;
+        }
         // Persist-before-mutate: a `true` ack means the op is on disk (ADR 0018 phase 3).
         let advanced = Fences::from([(group, epoch)]);
-        if let Err(e) = self.persist_batch(&advanced, &[op]) {
+        if let Err(e) = self.persist_batch(&advanced, &[(epoch, op)]) {
             tracing::warn!(error = %e, "replica persist failed; not acking the replication op");
             return false;
         }
         self.fences.insert(group, epoch);
-        self.apply_in_memory(op);
+        self.apply_in_memory(epoch, op);
         true
+    }
+
+    /// Whether `op` is an Append for an offset already held at a higher
+    /// `(epoch, seq)` — a late duplicate of a superseded attempt (ADR 0042 T7).
+    fn is_stale_attempt(&self, epoch: Epoch, op: &ReplOp) -> bool {
+        if let ReplOp::Append {
+            key, offset, seq, ..
+        } = op
+        {
+            if let Some((held, _)) = self.logs.get(key).and_then(|log| log.get(offset)) {
+                return *held > (epoch, *seq);
+            }
+        }
+        false
     }
 
     /// Durably apply a **batch** of `(epoch, op)` in one fsync'd transaction (ADR 0027).
@@ -381,9 +442,10 @@ impl ReplicaState {
     /// nothing was durably stored.
     pub fn apply_batch(&mut self, batch: &[(Epoch, ReplOp)]) -> Vec<bool> {
         let mut accepted = Vec::with_capacity(batch.len());
+        let mut stale = vec![false; batch.len()];
         let mut advanced = Fences::new();
-        let mut to_persist: Vec<&ReplOp> = Vec::new();
-        for (epoch, op) in batch {
+        let mut to_persist: Vec<(Epoch, &ReplOp)> = Vec::new();
+        for (i, (epoch, op)) in batch.iter().enumerate() {
             let group = group_of_key(op_key(op));
             let running = advanced
                 .get(&group)
@@ -392,13 +454,20 @@ impl ReplicaState {
                 .unwrap_or(0);
             if *epoch < running {
                 accepted.push(false);
+            } else if self.is_stale_attempt(*epoch, op) {
+                // A late duplicate of a superseded attempt: accepted (idempotent
+                // discharge) but neither persisted nor applied (ADR 0042 T7).
+                advanced.insert(group, *epoch);
+                stale[i] = true;
+                accepted.push(true);
             } else {
                 advanced.insert(group, *epoch);
-                to_persist.push(op);
+                to_persist.push((*epoch, op));
                 accepted.push(true);
             }
         }
         if to_persist.is_empty() {
+            self.fences.extend(advanced);
             return accepted;
         }
         // One fsync for every accepted op in the batch (persist-before-mutate).
@@ -407,9 +476,9 @@ impl ReplicaState {
             return vec![false; batch.len()];
         }
         self.fences.extend(advanced);
-        for ((_, op), ok) in batch.iter().zip(&accepted) {
-            if *ok {
-                self.apply_in_memory(op);
+        for (i, ((epoch, op), ok)) in batch.iter().zip(&accepted).enumerate() {
+            if *ok && !stale[i] {
+                self.apply_in_memory(*epoch, op);
             }
         }
         accepted
@@ -442,7 +511,27 @@ impl ReplicaState {
             .get(key)
             .map(|log| {
                 log.iter()
-                    .map(|(offset, record)| LogEntry {
+                    .map(|(offset, (_, record))| LogEntry {
+                        offset: *offset,
+                        record: record.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// This replica's stored entries for `key` **with their writing tags**, in
+    /// offset order — what a recovery read carries so the merge can resolve
+    /// same-offset conflicts and stale tails (ADR 0042 T7).
+    #[must_use]
+    pub fn epoch_entries(&self, key: &str) -> Vec<EpochEntry> {
+        self.logs
+            .get(key)
+            .map(|log| {
+                log.iter()
+                    .map(|(offset, ((epoch, seq), record))| EpochEntry {
+                        epoch: *epoch,
+                        seq: *seq,
                         offset: *offset,
                         record: record.clone(),
                     })
@@ -494,6 +583,10 @@ struct KeyState {
     committed: Offset,
     /// Entries with offset `<= truncated` have been dropped.
     truncated: Offset,
+    /// The per-key write-attempt counter (ADR 0042 T7): bumped on every append
+    /// call — including failed ones, so a reused offset's next attempt carries a
+    /// higher `seq` and supersedes any replica still holding the failed one.
+    seq: u64,
 }
 
 /// The lease-holder's quorum-replicated [`ReplicatedLog`].
@@ -594,6 +687,9 @@ impl<T: ReplicaTransport> ClusterLog<T> {
                 lowest = Some(lowest.map_or(entry.offset, |l| l.min(entry.offset)));
                 ks.committed = ks.committed.max(entry.offset);
                 ks.entries.insert(entry.offset, entry.record);
+                // The re-commit convention (ADR 0042 T7): recovered entries were
+                // re-delivered with seqs 1..=n, so appends continue above them.
+                ks.seq += 1;
             }
             ks.truncated = lowest.map_or(0, |l| l.saturating_sub(1));
             state.insert(key, ks);
@@ -646,6 +742,9 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             lowest = Some(lowest.map_or(entry.offset, |l| l.min(entry.offset)));
             ks.committed = ks.committed.max(entry.offset);
             ks.entries.insert(entry.offset, entry.record);
+            // The re-commit convention (ADR 0042 T7): recovered entries were
+            // re-delivered with seqs 1..=n, so appends continue above them.
+            ks.seq += 1;
         }
         // Recovered entries all sit above `floor` (the merge dropped anything at
         // or below it), so both watermarks are at least `floor`.
@@ -682,7 +781,10 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
             return Ok(());
         }
         // Fan every (entry, follower) delivery out concurrently — recovery-time,
-        // one wave — and count per-entry acks, the owner's copy included.
+        // one wave — and count per-entry acks, the owner's copy included. Each
+        // entry is re-tagged at THIS owner's epoch with seqs 1..=n in offset
+        // order (ADR 0042 T7): the re-committed base supersedes every older copy
+        // of those offsets, and `seed_key` continues the seq counter above n.
         let mut acks = vec![1usize; entries.len()];
         let mut inflight = tokio::task::JoinSet::new();
         for follower in &self.followers {
@@ -693,6 +795,7 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
                 let op = ReplOp::Append {
                     key: key.to_string(),
                     offset: entry.offset,
+                    seq: u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1),
                     record: entry.record.clone(),
                 };
                 inflight.spawn(async move { (i, transport.deliver(&follower, epoch, &op).await) });
@@ -716,19 +819,38 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
     }
 }
 
-/// One replica's read for recovery: its truncation low-water and its stored entries.
+/// One stored entry together with its writing tags (ADR 0042 T7): the leadership
+/// `epoch` it was delivered under and the leader's per-key attempt `seq`. The
+/// tags order every version of an offset — across owners (epoch) and across
+/// attempts that reused an offset within one owner (seq) — which is what lets a
+/// recovery merge pick the surviving version instead of trusting read order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpochEntry {
+    /// The leadership epoch the entry was delivered under.
+    pub epoch: Epoch,
+    /// The leader's per-key write-attempt counter at delivery.
+    pub seq: u64,
+    /// The entry's offset in the key's log.
+    pub offset: Offset,
+    /// The record bytes.
+    pub record: Vec<u8>,
+}
+
+/// One replica's read for recovery: its truncation low-water and its stored
+/// entries, tagged (ADR 0042 T7).
 #[derive(Debug, Clone, Default)]
 pub struct ReplicaRead {
     /// The replica's truncation low-water for the key (ADR 0018 phase 3b).
     pub watermark: Offset,
-    /// The replica's stored entries for the key, in offset order.
-    pub entries: Vec<LogEntry>,
+    /// The replica's stored entries for the key, in offset order, with tags.
+    pub entries: Vec<EpochEntry>,
 }
 
 /// Merge per-replica reads of one key's log into its recovered committed log: drop any
-/// entry at or below the **highest truncation low-water** seen, then take the union of
-/// the rest by offset and the contiguous run from the lowest present, stopping at the
-/// first gap.
+/// entry at or below the **highest truncation low-water** seen, take the union of the
+/// rest by offset — resolving a same-offset conflict to the **highest `(epoch, seq)`**
+/// version (ADR 0042 T7) — and keep the contiguous run from the lowest present,
+/// stopping at the first gap **or the first `(epoch, seq)` regression**.
 ///
 /// A gap marks an uncommitted tail: the owner commits offsets in order, so it cannot
 /// have committed past a missing offset; reading from a **quorum** guarantees every
@@ -737,28 +859,49 @@ pub struct ReplicaRead {
 /// was down and missed a truncation — from resurrecting an already-acked prefix: the
 /// recovering owner's own (current) watermark is among the reads, so a truncated offset
 /// is excluded even if the stale replica still holds it (ADR 0018 phase 3b).
+///
+/// The tag rules are the log-matching property (ADR 0042 T7, exhibit ③): a committed
+/// log's tags are non-decreasing along offsets, so (a) when two replicas hold
+/// **different versions of one offset** — a failed attempt whose reuse one replica
+/// missed, or a deposed owner's write superseded at a higher epoch — the higher tag is
+/// the surviving version, never whichever replica happened to be read first; and (b) an
+/// entry whose tag **regresses** below its predecessor's is a deposed owner's orphan
+/// adopted above a newer owner's write — a stale tail, truncated rather than served
+/// (the retained face: a recovered retained value can never regress behind an acked
+/// one).
 #[must_use]
 pub fn merge_replica_logs(reads: &[ReplicaRead]) -> Vec<LogEntry> {
     let low_water = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
-    let mut by_offset: BTreeMap<Offset, Vec<u8>> = BTreeMap::new();
+    let mut by_offset: BTreeMap<Offset, (Epoch, u64, Vec<u8>)> = BTreeMap::new();
     for r in reads {
         for entry in &r.entries {
             if entry.offset > low_water {
-                by_offset
-                    .entry(entry.offset)
-                    .or_insert_with(|| entry.record.clone());
+                let newer = match by_offset.get(&entry.offset) {
+                    Some((epoch, seq, _)) => (entry.epoch, entry.seq) > (*epoch, *seq),
+                    None => true,
+                };
+                if newer {
+                    by_offset.insert(entry.offset, (entry.epoch, entry.seq, entry.record.clone()));
+                }
             }
         }
     }
     let mut out = Vec::new();
     let mut expected: Option<Offset> = None;
-    for (offset, record) in by_offset {
+    let mut high: Option<(Epoch, u64)> = None;
+    for (offset, (epoch, seq, record)) in by_offset {
         if let Some(e) = expected {
             if offset != e {
                 break; // a gap — the rest is an uncommitted tail
             }
         }
+        if let Some(h) = high {
+            if (epoch, seq) < h {
+                break; // a tag regression — a deposed owner's stale orphan tail
+            }
+        }
         expected = Some(offset + 1);
+        high = Some((epoch, seq));
         out.push(LogEntry { offset, record });
     }
     out
@@ -775,10 +918,14 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         // retry reuses the same offset (idempotent on any follower that stored it).
         let offset = ks.committed + 1;
         ks.entries.insert(offset, record.clone());
+        // Every attempt gets a fresh seq (ADR 0042 T7) — a retry that reuses this
+        // offset after a failed quorum supersedes the failed attempt everywhere.
+        ks.seq += 1;
 
         let op = ReplOp::Append {
             key: key.clone(),
             offset,
+            seq: ks.seq,
             record,
         };
 
@@ -945,6 +1092,7 @@ mod tests {
         let ap = |key: &str, offset, rec: &[u8]| ReplOp::Append {
             key: key.to_string(),
             offset,
+            seq: offset,
             record: rec.to_vec(),
         };
         {
@@ -982,6 +1130,7 @@ mod tests {
         ReplOp::Append {
             key: key.to_string(),
             offset,
+            seq: offset,
             record: rec.to_vec(),
         }
     }
@@ -1469,15 +1618,19 @@ mod tests {
         assert_eq!(&pending[0].message.payload[..], b"payload");
     }
 
-    fn entry(offset: u64, record: &[u8]) -> LogEntry {
-        LogEntry {
+    /// A tagged input entry for merge tests: epoch 1, seq = offset (one attempt
+    /// per offset — tags non-decreasing along offsets, a legal committed log).
+    fn entry(offset: u64, record: &[u8]) -> super::EpochEntry {
+        super::EpochEntry {
+            epoch: 1,
+            seq: offset,
             offset,
             record: record.to_vec(),
         }
     }
 
     /// A replica read with no truncation (`watermark = 0`).
-    fn rd(entries: Vec<super::LogEntry>) -> ReplicaRead {
+    fn rd(entries: Vec<super::EpochEntry>) -> ReplicaRead {
         ReplicaRead {
             watermark: 0,
             entries,
@@ -1522,6 +1675,101 @@ mod tests {
         );
         assert!(merge_replica_logs(&[]).is_empty());
         assert!(merge_replica_logs(&[rd(vec![])]).is_empty());
+    }
+
+    /// Exhibit ③ regression (ADR 0042 T7): when two replicas hold **different
+    /// versions of one offset** — a failed attempt whose reuse one replica missed
+    /// — the merge picks the higher `(epoch, seq)` version, whichever replica is
+    /// read first. Before the tags, read order decided, and a never-acked record
+    /// could shadow the acked one.
+    #[test]
+    fn merge_resolves_a_same_offset_conflict_by_tag_not_read_order() {
+        let tagged = |epoch, seq, offset, rec: &[u8]| super::EpochEntry {
+            epoch,
+            seq,
+            offset,
+            record: rec.to_vec(),
+        };
+        // Replica A holds the failed attempt (seq 1); replica B holds the acked
+        // reuse (seq 2, different bytes) plus the next acked entry.
+        let a = rd(vec![tagged(1, 1, 1, b"failed-attempt")]);
+        let b = rd(vec![
+            tagged(1, 2, 1, b"acked-reuse"),
+            tagged(1, 3, 2, b"next"),
+        ]);
+        for reads in [[a.clone(), b.clone()], [b, a]] {
+            let merged = merge_replica_logs(&reads);
+            assert_eq!(offsets(&merged), vec![1, 2]);
+            assert_eq!(
+                &merged[0].record, b"acked-reuse",
+                "the higher (epoch, seq) version wins under either read order"
+            );
+        }
+    }
+
+    /// Exhibit ③'s retained face (ADR 0042 T7): a deposed owner's never-acked
+    /// orphans sitting at offsets **above** a newer owner's write are a stale
+    /// tail — the tags regress along offsets, so the merge truncates them
+    /// (log matching) instead of adopting them over the acked value.
+    #[test]
+    fn merge_truncates_a_tail_whose_tag_regresses() {
+        let tagged = |epoch, seq, offset, rec: &[u8]| super::EpochEntry {
+            epoch,
+            seq,
+            offset,
+            record: rec.to_vec(),
+        };
+        // Replica A: the new owner's re-committed base (epoch 3). Replica B: a
+        // deposed owner's unacked orphans at offsets 2..3 (epoch 2).
+        let a = rd(vec![tagged(3, 1, 1, b"acked-e3")]);
+        let b = rd(vec![
+            tagged(2, 5, 2, b"stale-orphan"),
+            tagged(2, 6, 3, b"stale-orphan-2"),
+        ]);
+        for reads in [[a.clone(), b.clone()], [b, a]] {
+            let merged = merge_replica_logs(&reads);
+            assert_eq!(
+                offsets(&merged),
+                vec![1],
+                "the epoch-regressing tail is truncated, not adopted"
+            );
+            assert_eq!(&merged[0].record, b"acked-e3");
+        }
+    }
+
+    /// The replica-side stale-attempt guard (ADR 0042 T7): a late duplicate of a
+    /// superseded attempt — same offset, lower `(epoch, seq)` — is discharged
+    /// idempotently: accepted, but the newer version stands, across a reopen too.
+    #[test]
+    fn a_replica_keeps_the_newer_version_of_an_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.redb");
+        let ap = |seq, rec: &[u8]| ReplOp::Append {
+            key: "q/c".to_string(),
+            offset: 1,
+            seq,
+            record: rec.to_vec(),
+        };
+        {
+            let mut r = ReplicaState::open(&path).unwrap();
+            assert!(
+                r.apply(2, &ap(4, b"acked-reuse")),
+                "the current attempt lands"
+            );
+            assert!(
+                r.apply(2, &ap(3, b"late-duplicate")),
+                "a stale attempt is accepted (idempotent discharge)..."
+            );
+            assert_eq!(
+                &r.entries("q/c")[0].record,
+                b"acked-reuse",
+                "...but never overwrites the newer version"
+            );
+        }
+        // The guard held on disk too: the reopened replica serves the newer bytes.
+        let r = ReplicaState::open(&path).unwrap();
+        assert_eq!(&r.entries("q/c")[0].record, b"acked-reuse");
+        assert_eq!(r.epoch_entries("q/c")[0].seq, 4);
     }
 
     /// ADR 0018 phase 3b: a stale replica that missed a truncation must not resurrect
@@ -1569,7 +1817,11 @@ mod tests {
             epoch: 5,
         };
         let mut logs = BTreeMap::new();
-        logs.insert("q/c".to_string(), vec![entry(1, b"m1"), entry(2, b"m2")]);
+        let le = |offset, rec: &[u8]| LogEntry {
+            offset,
+            record: rec.to_vec(),
+        };
+        logs.insert("q/c".to_string(), vec![le(1, b"m1"), le(2, b"m2")]);
         let log = ClusterLog::recovered(local, lease, &set, sim, logs);
 
         let k = "q/c".to_string();
@@ -1595,6 +1847,7 @@ mod tests {
         let ap = |offset, rec: &[u8]| ReplOp::Append {
             key: k.clone(),
             offset,
+            seq: offset,
             record: rec.to_vec(),
         };
 
@@ -1624,11 +1877,11 @@ mod tests {
         let recovered = merge_replica_logs(&[
             ReplicaRead {
                 watermark: b.watermark(&k),
-                entries: b.entries(&k),
+                entries: b.epoch_entries(&k),
             },
             ReplicaRead {
                 watermark: c.watermark(&k),
-                entries: c.entries(&k),
+                entries: c.epoch_entries(&k),
             },
         ]);
         assert_eq!(

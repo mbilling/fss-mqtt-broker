@@ -24,7 +24,12 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// minor of the previous major, where known upgrade issues are fixed first); that is
 /// what makes "upgrade to the gateway before rolling to the next major" fail closed
 /// at `Hello` instead of being release-notes prose.
-pub const PROTO_MIN: u32 = 1;
+/// Pre-release history: proto 2 (ADR 0042 T7) tagged `ReplicaEntryWire` and
+/// `ReplOp::Append` with the writing `(epoch, seq)` — an incompatible reshape of
+/// the replication frames, so the floor rose with the ceiling. Legal exactly
+/// because no release exists yet; after the first release this kind of raise is
+/// the MAJOR-release act described above.
+pub const PROTO_MIN: u32 = 2;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
 /// negotiated version is `min(proto_max_a, proto_max_b)`.
 ///
@@ -32,7 +37,7 @@ pub const PROTO_MIN: u32 = 1;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 1;
+pub const PROTO_MAX: u32 = 2;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -105,6 +110,12 @@ pub struct RetainedWireEntry {
 pub struct ReplicaEntryWire {
     /// The entry's offset in the key's log.
     pub offset: u64,
+    /// The leadership epoch the entry was delivered under (ADR 0042 T7; proto 2).
+    pub epoch: u64,
+    /// The leader's per-key write-attempt counter at delivery (ADR 0042 T7;
+    /// proto 2). Together with `epoch` this orders every version of an offset,
+    /// so the recovery merge resolves conflicts instead of trusting read order.
+    pub seq: u64,
     /// The stored record bytes, opaque to the wire.
     pub record: Vec<u8>,
 }
@@ -540,6 +551,7 @@ mod tests {
             op: crate::cluster_log::ReplOp::Append {
                 key: "client-x".into(),
                 offset: 3,
+                seq: 3,
                 record: b"payload".to_vec(),
             },
         });
@@ -565,10 +577,14 @@ mod tests {
             entries: vec![
                 ReplicaEntryWire {
                     offset: 1,
+                    epoch: 7,
+                    seq: 1,
                     record: vec![1, 2],
                 },
                 ReplicaEntryWire {
                     offset: 2,
+                    epoch: 7,
+                    seq: 2,
                     record: vec![3, 4],
                 },
             ],

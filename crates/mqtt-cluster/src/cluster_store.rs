@@ -255,7 +255,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::cluster_log::ReplicaRead {
                 watermark: r.watermark(key),
-                entries: r.entries(key),
+                entries: r.epoch_entries(key),
             }
         }];
         // Read peers **concurrently** (like the append fan-out) and stop as soon as a
@@ -405,10 +405,12 @@ mod tests {
                             let s = state.lock().unwrap();
                             (
                                 s.watermark(&key),
-                                s.entries(&key)
+                                s.epoch_entries(&key)
                                     .into_iter()
                                     .map(|e| crate::peer::ReplicaEntryWire {
                                         offset: e.offset,
+                                        epoch: e.epoch,
+                                        seq: e.seq,
                                         record: e.record,
                                     })
                                     .collect(),
@@ -620,6 +622,7 @@ mod tests {
                     &ReplOp::Append {
                         key: qkey.clone(),
                         offset,
+                        seq: offset,
                         record,
                     },
                 );
@@ -681,6 +684,7 @@ mod tests {
             &ReplOp::Append {
                 key: qkey.clone(),
                 offset: 1,
+                seq: 1,
                 record: b"orphan".to_vec(),
             }
         ));
@@ -737,6 +741,7 @@ mod tests {
                     &ReplOp::Append {
                         key: qkey.clone(),
                         offset,
+                        seq: offset,
                         record,
                     },
                 );
@@ -795,6 +800,7 @@ mod tests {
             &ReplOp::Append {
                 key: qkey.clone(),
                 offset: 1,
+                seq: 1,
                 record: b"m1".to_vec(),
             },
         );
@@ -843,6 +849,7 @@ mod tests {
                     &ReplOp::Append {
                         key: qkey.clone(),
                         offset,
+                        seq: offset,
                         record,
                     },
                 );
@@ -871,6 +878,7 @@ mod tests {
             &ReplOp::Append {
                 key: qkey.clone(),
                 offset: 3,
+                seq: 3,
                 record: b"m3".to_vec(),
             },
         );
@@ -1046,6 +1054,7 @@ mod tests {
                 &ReplOp::Append {
                     key: format!("q/{topic}"),
                     offset: 1,
+                    seq: 1,
                     record: b"newer-owner".to_vec(),
                 },
             );
