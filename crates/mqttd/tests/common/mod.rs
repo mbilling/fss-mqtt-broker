@@ -387,6 +387,16 @@ pub async fn start_broker_with_policy(policy: Arc<ConnPolicy>) -> SocketAddr {
 }
 
 /// A minimal MQTT client over the project framing + codec.
+/// Outcome of a bounded, non-panicking receive ([`Client::recv_bounded`]).
+pub enum Recv {
+    /// A packet arrived.
+    Packet(Packet),
+    /// Nothing arrived in the window; the connection is still open.
+    Quiet,
+    /// The connection is over (clean close or transport error).
+    Closed,
+}
+
 pub struct Client {
     reader: mqtt_net::FrameReader<OwnedReadHalf>,
     writer: mqtt_net::FrameWriter<OwnedWriteHalf>,
@@ -509,6 +519,40 @@ impl Client {
             .expect("timed out waiting for a packet")
             .expect("transport error")
             .expect("connection closed unexpectedly")
+    }
+
+    /// The next event within `window`, distinguishing quiet from a dead
+    /// connection **without panicking** — for harnesses whose nodes crash on
+    /// purpose (ADR 0042 T3): a killed node resets its sockets, and both a clean
+    /// close and a transport error mean the same thing to a stress client.
+    pub async fn recv_bounded(&mut self, window: Duration) -> Recv {
+        match timeout(window, self.reader.next_packet()).await {
+            Err(_) => Recv::Quiet,
+            Ok(Ok(Some(p))) => Recv::Packet(p),
+            Ok(Ok(None) | Err(_)) => Recv::Closed,
+        }
+    }
+
+    /// Publish with every knob exposed (retain included) — the stress harness
+    /// needs retained `QoS` 1 publishes whose ack it awaits tolerantly itself.
+    pub async fn publish_full(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+        pkid: Option<u16>,
+    ) {
+        self.send(&Packet::Publish(Publish {
+            properties: Properties::new(),
+            dup: false,
+            qos,
+            retain,
+            topic: topic.into(),
+            pkid,
+            payload: bytes::Bytes::copy_from_slice(payload),
+        }))
+        .await;
     }
 
     /// The next packet within the window, or `None` if none arrived (still open).
