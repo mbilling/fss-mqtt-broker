@@ -601,6 +601,13 @@ pub struct ClusterLog<T: ReplicaTransport> {
     quorum: usize,
     transport: T,
     state: tokio::sync::Mutex<BTreeMap<String, KeyState>>,
+    /// The node's own **durable** replica copy (ADR 0042 T8, exhibit ④). When
+    /// attached, the owner's self-ack counts toward a write quorum only after
+    /// the op is durably applied here — so an acked entry exists on a full
+    /// quorum of durable copies, and a restarted owner's recovery read (which
+    /// includes its own copy) cannot lose it. `None` keeps the volatile
+    /// self-ack (single-node/in-memory harnesses).
+    local_store: Option<Arc<std::sync::Mutex<ReplicaState>>>,
 }
 
 // Manual Debug so the transport `T` need not be `Debug` (the trait requires
@@ -646,6 +653,28 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             quorum,
             transport,
             state: tokio::sync::Mutex::new(BTreeMap::new()),
+            local_store: None,
+        }
+    }
+
+    /// Attach the node's own durable replica copy (ADR 0042 T8): see the field
+    /// docs — self-acks become durable-or-not-counted.
+    #[must_use]
+    pub fn with_local_store(mut self, store: Arc<std::sync::Mutex<ReplicaState>>) -> Self {
+        self.local_store = Some(store);
+        self
+    }
+
+    /// Apply `op` to the node's own durable replica copy and report whether the
+    /// owner's self-ack may count toward quorum (ADR 0042 T8). Without an
+    /// attached copy the (volatile) self-ack stands, as before.
+    fn local_ack(&self, epoch: Epoch, op: &ReplOp) -> bool {
+        match &self.local_store {
+            Some(store) => store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .apply(epoch, op),
+            None => true,
         }
     }
 
@@ -701,6 +730,7 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             quorum,
             transport,
             state: tokio::sync::Mutex::new(state),
+            local_store: None,
         }
     }
 
@@ -781,23 +811,30 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
             return Ok(());
         }
         // Fan every (entry, follower) delivery out concurrently — recovery-time,
-        // one wave — and count per-entry acks, the owner's copy included. Each
-        // entry is re-tagged at THIS owner's epoch with seqs 1..=n in offset
-        // order (ADR 0042 T7): the re-committed base supersedes every older copy
-        // of those offsets, and `seed_key` continues the seq counter above n.
-        let mut acks = vec![1usize; entries.len()];
+        // one wave — and count per-entry acks, the owner's copy included (durable,
+        // ADR 0042 T8: each self-ack counts only once the entry is applied to the
+        // node's own replica copy). Each entry is re-tagged at THIS owner's epoch
+        // with seqs 1..=n in offset order (ADR 0042 T7): the re-committed base
+        // supersedes every older copy of those offsets, and `seed_key` continues
+        // the seq counter above n.
+        let recommit_op = |i: usize, entry: &LogEntry| ReplOp::Append {
+            key: key.to_string(),
+            offset: entry.offset,
+            seq: u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1),
+            record: entry.record.clone(),
+        };
+        let mut acks: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| usize::from(self.local_ack(self.lease.epoch, &recommit_op(i, entry))))
+            .collect();
         let mut inflight = tokio::task::JoinSet::new();
         for follower in &self.followers {
             for (i, entry) in entries.iter().enumerate() {
                 let transport = self.transport.clone();
                 let follower = follower.clone();
                 let epoch = self.lease.epoch;
-                let op = ReplOp::Append {
-                    key: key.to_string(),
-                    offset: entry.offset,
-                    seq: u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1),
-                    record: entry.record.clone(),
-                };
+                let op = recommit_op(i, entry);
                 inflight.spawn(async move { (i, transport.deliver(&follower, epoch, &op).await) });
             }
         }
@@ -930,13 +967,15 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
         };
 
         // Fan out to every follower **concurrently** and commit as soon as a quorum
-        // has accepted — the leader's own copy is one ack. A slow or wedged replica
-        // no longer serializes the append: once quorum is met the remaining
-        // deliveries are abandoned (their frames were already sent, so a reachable
-        // replica still applies them for best-effort spread; the transport reaps the
-        // in-flight entry on timeout). Any committed entry is therefore on ≥ quorum
-        // replicas, which a quorum recovery-read is guaranteed to intersect.
-        let mut acks = 1usize;
+        // has accepted — the leader's own copy is one ack, counted only once it is
+        // DURABLY applied to the node's own replica copy (ADR 0042 T8): an acked
+        // entry is then on ≥ quorum durable copies, which a quorum recovery-read —
+        // including a restarted owner reading its own copy — is guaranteed to
+        // intersect. A slow or wedged replica no longer serializes the append:
+        // once quorum is met the remaining deliveries are abandoned (their frames
+        // were already sent, so a reachable replica still applies them for
+        // best-effort spread; the transport reaps the in-flight entry on timeout).
+        let mut acks = usize::from(self.local_ack(self.lease.epoch, &op));
         if acks < self.quorum {
             let mut inflight = tokio::task::JoinSet::new();
             for follower in &self.followers {
@@ -1014,8 +1053,11 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             });
         }
         drop(state);
-        // Local-first and lazy: propagate best-effort, do not gate on acks.
+        // Local-first and lazy: propagate best-effort, do not gate on acks. The
+        // node's own durable copy truncates too (ADR 0042 T8) — best-effort, since
+        // a failure only leaves a lower watermark (the safe direction).
         if let Some(op) = op {
+            let _ = self.local_ack(self.lease.epoch, &op);
             for follower in &self.followers {
                 let _ = self
                     .transport
@@ -1032,6 +1074,7 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             state.remove(key);
         }
         let op = ReplOp::Remove { key: key.clone() };
+        let _ = self.local_ack(self.lease.epoch, &op);
         for follower in &self.followers {
             let _ = self
                 .transport

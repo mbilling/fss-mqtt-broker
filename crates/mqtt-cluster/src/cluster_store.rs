@@ -191,12 +191,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                         epoch,
                     };
                     let entry = Arc::new(GroupEntry {
-                        log: Arc::new(ClusterLog::new(
-                            self.local.clone(),
-                            lease,
-                            &replica_set,
-                            self.transport.clone(),
-                        )),
+                        log: Arc::new(
+                            ClusterLog::new(
+                                self.local.clone(),
+                                lease,
+                                &replica_set,
+                                self.transport.clone(),
+                            )
+                            // The owner's self-ack is durable (ADR 0042 T8): it
+                            // counts toward quorum only once the op is applied to
+                            // this node's own replica copy — the same copy its
+                            // recovery reads consult after a restart.
+                            .with_local_store(self.local_replicas.clone()),
+                        ),
                         recovered: Mutex::new(BTreeSet::new()),
                     });
                     cache.insert(group, entry.clone());
@@ -713,6 +720,73 @@ mod tests {
                 "the re-commit advances follower {i}'s group fence to the new epoch"
             );
         }
+    }
+
+    /// Exhibit ④ regression (ADR 0042 T8): the owner's quorum self-ack is
+    /// **durable** — an append acked via {owner, one follower} survives the
+    /// owner's crash-and-restart even when that follower is down at recovery,
+    /// because the owner's own durable replica copy (which its recovery read
+    /// consults) received the entry before the self-ack counted. Before the fix
+    /// the self-ack was the volatile `ClusterLog` cache: the same recovery read
+    /// {restarted-owner(empty), other-follower(empty)} merged empty and the
+    /// acked entry was gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_acked_append_survives_owner_restart_via_its_durable_self_copy() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + f1 (up) + f2 (down for now).
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let (f1_tx, f1_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), f1_tx);
+        spawn_follower(transport.clone(), f1_state.clone(), f1_rx);
+
+        // The node's own durable replica copy — it survives the "restart" below.
+        let local = Arc::new(Mutex::new(ReplicaState::new()));
+
+        let epoch = Arc::new(AtomicU64::new(2));
+        let log = GroupRoutedLog::new(
+            owner,
+            placement,
+            transport.clone(),
+            BumpableLease(epoch.clone()),
+            local.clone(),
+        );
+
+        // Acked with f2 down: quorum = the owner's DURABLE self-ack + f1.
+        assert_eq!(log.append(&qkey, b"precious".to_vec()).await.unwrap(), 1);
+        assert_eq!(
+            local.lock().unwrap().entries(&qkey).len(),
+            1,
+            "the self-ack was durable: the entry is in the owner's own copy"
+        );
+
+        // Owner crashes and restarts; f1 is now down and f2 up — the recovery
+        // read is {own durable copy, f2}, which before the fix held nothing.
+        transport.fail_node(&nid("f1"));
+        let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let (f2_tx, f2_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f2"), f2_tx);
+        spawn_follower(transport.clone(), f2_state.clone(), f2_rx);
+        epoch.store(3, Ordering::Relaxed); // the restart won a fresh lease epoch
+
+        let served = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(
+            served.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1],
+            "the acked entry survived the restart via the owner's durable copy"
+        );
+        assert_eq!(&served[0].record, b"precious");
+        // And the takeover re-commit (T6) spread it back to a quorum: f2 has it.
+        assert_eq!(f2_state.lock().unwrap().entries(&qkey).len(), 1);
     }
 
     /// Exhibit ②'s second face (ADR 0042 T6, found when the T2 sim's waiver
