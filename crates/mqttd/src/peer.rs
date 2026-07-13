@@ -736,6 +736,7 @@ fn forward_inbound(
         | PeerMessage::ReplicaRead2 { .. }
         | PeerMessage::ReplicaReadReply2 { .. }
         | PeerMessage::ReplicaCatchUp { .. }
+        | PeerMessage::ReplicaCatchUpTo { .. }
         | PeerMessage::ReplicaKeys { .. }
         | PeerMessage::ReplicaKeysReply { .. }) => {
             // Durable-plane frames (ADR 0006/0007): consensus RPCs and session-log

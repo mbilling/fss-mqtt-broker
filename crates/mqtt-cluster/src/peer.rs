@@ -37,7 +37,7 @@ pub const PROTO_MIN: u32 = 2;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 4;
+pub const PROTO_MAX: u32 = 5;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -467,6 +467,20 @@ pub enum PeerMessage {
     ReplicaCatchUp {
         /// The log key to re-commit.
         key: String,
+    },
+    /// A decommissioning node's request that `key`'s group **owner** re-commit
+    /// the key's committed log to one **specific** node (ADR 0043 P3; proto 5):
+    /// the drain hands its groups' data to the post-departure replica set, whose
+    /// newcomers are not yet in the owner's fan-out. The owner re-delivers every
+    /// committed entry (re-tagged at its epoch, like a catch-up re-commit) plus
+    /// its truncation floor to `target` only — additive and idempotent; the
+    /// drain verifies by reading the target back and re-asks until content-
+    /// complete. A non-owner receiver ignores it.
+    ReplicaCatchUpTo {
+        /// The log key to re-commit.
+        key: String,
+        /// The node (its id) to re-commit the key to.
+        target: String,
     },
 }
 

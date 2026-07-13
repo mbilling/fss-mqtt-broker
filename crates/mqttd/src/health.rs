@@ -21,9 +21,10 @@
 //! liveness/readiness booleans, the member count, and the lease-group-ready flag.
 
 use crate::hub::HubCommand;
+use mqtt_cluster::decommission::DrainStatus;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::placement::Placement;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +51,10 @@ pub struct HealthState {
     /// so orchestrators stop routing new traffic, but `/livez` stays up so we are not
     /// killed mid-drain.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when a decommission drain starts (ADR 0043 P3): `/readyz` then reports
+    /// the drain's progress — pending hand-offs, rounds, completion — so an
+    /// operator can watch the departure instead of guessing.
+    decommission: Arc<OnceLock<Arc<DrainStatus>>>,
     /// When set, `GET /metrics` serves Prometheus exposition (ADR 0020); otherwise it 404s.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
 }
@@ -69,6 +74,9 @@ struct Report {
     ready: bool,
     members: Option<usize>,
     lease_group_ready: Option<bool>,
+    /// `(pending hand-offs, rounds, complete)` when a decommission drain is
+    /// active (ADR 0043 P3).
+    decommission: Option<(usize, u64, bool)>,
 }
 
 impl Report {
@@ -84,6 +92,12 @@ impl Report {
         }
         if let Some(l) = self.lease_group_ready {
             let _ = write!(s, ",\"lease_group_ready\":{l}");
+        }
+        if let Some((pending, rounds, complete)) = self.decommission {
+            let _ = write!(
+                s,
+                ",\"decommission\":{{\"pending\":{pending},\"rounds\":{rounds},\"complete\":{complete}}}"
+            );
         }
         s.push('}');
         s
@@ -108,6 +122,7 @@ impl HealthState {
             durable,
             min_members,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            decommission: Arc::new(OnceLock::new()),
             metrics: None,
         }
     }
@@ -124,6 +139,13 @@ impl HealthState {
     #[must_use]
     pub fn draining_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.draining.clone()
+    }
+
+    /// The slot a starting decommission drain (ADR 0043 P3) publishes its
+    /// [`DrainStatus`] into, making the drain's progress visible on `/readyz`.
+    #[must_use]
+    pub fn decommission_slot(&self) -> Arc<OnceLock<Arc<DrainStatus>>> {
+        self.decommission.clone()
     }
 
     /// Whether the hub actor loop is draining: it answers a ping within
@@ -156,11 +178,20 @@ impl HealthState {
             && live
             && members.is_none_or(|n| n >= self.min_members)
             && lease_group_ready.unwrap_or(true);
+        let decommission = self.decommission.get().map(|d| {
+            use std::sync::atomic::Ordering::Acquire;
+            (
+                d.pending.load(Acquire),
+                d.rounds.load(Acquire),
+                d.complete.load(Acquire),
+            )
+        });
         Report {
             live,
             ready,
             members,
             lease_group_ready,
+            decommission,
         }
     }
 }

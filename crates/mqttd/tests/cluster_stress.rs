@@ -1790,16 +1790,227 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
     }
 }
 
-/// Bring-up gate shared by the stop/start test: full membership + full voters.
+/// ADR 0043 P3 — decommission, end to end on a FOUR-node cluster: acked facts
+/// (an offline durable session owed three acked payloads, plus an acked
+/// retained value) live on replica sets that include the node being removed;
+/// the decommission drain hands every key it holds to each group's
+/// post-departure replica set — whose third member is a NEWCOMER the group's
+/// fan-out never reached (4 members, R=3: removing one adds exactly one new
+/// member to every set it was in) — verifies the hand-off, and reports
+/// complete. THEN the node dies. Every acked fact must survive: the session
+/// resumes present on its (possibly new) owner, every acked payload replays,
+/// the retained value serves.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_decommissioned_nodes_departure_loses_nothing() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node("dc-a", vec![], &dir("a")).await;
+    let b = start_stress_node("dc-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("dc-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    let mut leaver = start_stress_node("dc-d", vec![a.swim_addr.clone()], &dir("d")).await;
+    wait_cluster_ready(&[&a, &b, &c, &leaver]).await;
+
+    // A durable subscriber owned by the node we will remove — the sharpest
+    // case: its session's data AND its attach point both walk out the door.
+    let sub_id = {
+        let p = leaver.placement.read().unwrap();
+        (0..100_000)
+            .map(|i| format!("dc-sub-{i}"))
+            .find(|c| p.owner(c) == leaver.node_id)
+            .expect("some session is owned by the leaver")
+    };
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut sub, _present) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                leaver.client_addr,
+                &sub_id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "subscriber never connected");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ack = sub.subscribe(1, "dc/t", QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|c| *c != 0x80) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        sub.disconnect().await;
+    }
+
+    // Acked facts: three QoS 1 payloads (published across the cluster) and one
+    // acked retained value.
+    let nodes = [&a, &b, &c, &leaver];
+    for (i, payload) in [b"dc-m1".as_slice(), b"dc-m2", b"dc-m3"].iter().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                nodes[i % 4].client_addr,
+                &format!("dc-pub-{i}"),
+                true,
+                Duration::from_secs(20),
+            )
+            .await
+            {
+                publisher
+                    .publish("dc/t", payload, QoS::AtLeastOnce, Some(7), vec![])
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(12);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "publish {i} never acked");
+        }
+    }
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                b.client_addr,
+                "dc-rpub",
+                true,
+                Duration::from_secs(20),
+            )
+            .await
+            {
+                publisher
+                    .publish_full("dc/r", b"dc-retained", QoS::AtLeastOnce, true, Some(9))
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(12);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 9 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "retained set never acked");
+        }
+    }
+
+    // --- the decommission: drain the leaver, exactly as SIGUSR1 drives it ---
+    let drain = leaver
+        .plane
+        .as_ref()
+        .expect("plane alive")
+        .decommission_drain(leaver.node_id.clone());
+    let status = drain.status();
+    tokio::time::timeout(Duration::from_secs(120), drain.run())
+        .await
+        .expect("the drain must converge on a healthy cluster");
+    assert!(
+        status.complete.load(std::sync::atomic::Ordering::Acquire),
+        "the drain reports complete"
+    );
+    assert_eq!(status.pending.load(std::sync::atomic::Ordering::Acquire), 0);
+
+    // The node leaves. (The harness kill stands in for the graceful leave —
+    // HARSHER than production, which announces departure; if even a post-drain
+    // crash loses nothing, the graceful path cannot.)
+    leaver.kill().await;
+
+    // Every acked fact survives on the remaining three.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let (mut sub, present) = loop {
+        let owner = a.placement.read().unwrap().owner(&sub_id);
+        let addr = [&a, &b, &c]
+            .iter()
+            .find(|n| n.node_id == owner)
+            .map(|n| n.client_addr);
+        if let Some(addr) = addr {
+            if let Some(ok) =
+                common::Client::connect_v311_within(addr, &sub_id, false, Duration::from_secs(10))
+                    .await
+            {
+                break ok;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscriber could not resume after the decommission"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        present,
+        "recovery honesty: the durable session must survive its owner's decommission"
+    );
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain_deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < 3 && Instant::now() < drain_deadline {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    for payload in [b"dc-m1".as_slice(), b"dc-m2", b"dc-m3"] {
+        assert!(
+            got.contains(payload),
+            "acked payload {:?} lost across the decommission (ADR 0043 P3)",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    let probe_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let seen = retained_seen(a.client_addr, "dc-probe", "dc/r").await;
+        if seen.as_deref() == Some(b"dc-retained".as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < probe_deadline,
+            "acked retained value not served after the decommission (got {seen:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Bring-up gate shared by the resize/restart tests: full membership + full
+/// voters across every given node.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
+    let expected = nodes.len();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let members = nodes
             .iter()
-            .all(|n| n.placement.read().unwrap().member_count() == 3);
-        let voters = nodes
-            .iter()
-            .all(|n| n.plane.as_ref().is_some_and(|p| p.voter_count() == 3));
+            .all(|n| n.placement.read().unwrap().member_count() == expected);
+        let voters = nodes.iter().all(|n| {
+            n.plane
+                .as_ref()
+                .is_some_and(|p| p.voter_count() == expected)
+        });
         if members && voters {
             return;
         }

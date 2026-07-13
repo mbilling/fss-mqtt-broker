@@ -177,6 +177,23 @@ impl Placement {
         self.group_owner(group) == self.local
     }
 
+    /// The replica set `group` will have once `leaving` departs (ADR 0043 P3):
+    /// the HRW selection over the current members minus that node. What the
+    /// decommission drain hands each group's data to — computed BEFORE the leave,
+    /// so the hand-off completes while the leaver still serves reads. HRW
+    /// monotonicity means every current member of the set (other than the
+    /// leaver) stays in it.
+    #[must_use]
+    pub fn group_replica_set_without(&self, group: GroupId, leaving: &NodeId) -> Vec<NodeId> {
+        let nodes: Vec<NodeId> = self
+            .eligible
+            .iter()
+            .filter(|n| *n != leaving)
+            .cloned()
+            .collect();
+        hrw::replica_set(group_key(group).as_bytes(), &nodes, self.replicas)
+    }
+
     /// The owner node for `client` — the owner of its placement group.
     #[must_use]
     pub fn owner(&self, client: &str) -> NodeId {
