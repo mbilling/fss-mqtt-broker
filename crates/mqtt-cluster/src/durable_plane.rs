@@ -25,15 +25,31 @@ use crate::lease::Epoch;
 use crate::lease_group::LeaseRaft;
 use crate::node_registry::raft_id;
 use crate::peer::PeerMessage;
+use crate::placement::{group_of_key, Placement};
 use crate::raft_mesh::{dispatch, MeshRaftNetwork};
 use crate::repl_net::PeerReplicaTransport;
 use crate::NodeId;
-use std::sync::{Arc, Mutex};
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 /// One queued replica write: the holder's `op` at `epoch`, plus a one-shot to return
 /// whether it was accepted (durably applied / not fenced) to the waiting frame.
 type ReplicaWrite = (Epoch, ReplOp, oneshot::Sender<bool>);
+
+/// Serves a [`PeerMessage::ReplicaCatchUp`] request on the **owner** side
+/// ([ADR 0043](../../../docs/adr/0043-elastic-cluster-resize.md) P1): re-commit
+/// `key`'s committed log to the current replica set so a hollow replica (a node
+/// that entered the set mid-history) back-fills. Implemented by the group-routed
+/// store; a seam so the plane — which is built before the store — can route the
+/// frame without owning the store.
+#[async_trait]
+pub trait CatchUpSource: Send + Sync {
+    /// Re-spread `key`'s committed log to its group's current replica set.
+    /// Best-effort: a failure (not owner / no quorum) is left for the
+    /// requester's sweep to retry.
+    async fn catch_up_key(&self, key: &str);
+}
 
 /// A node's endpoint on the durable plane: its lease-group consensus handle, its
 /// replication-follower state, and its replication-leader transport, plus the routing
@@ -49,6 +65,15 @@ pub struct DurablePlane {
     /// group-commit a burst into one transaction. The recovery-read path still locks
     /// `replicas` directly (between batches).
     replica_tx: mpsc::UnboundedSender<ReplicaWrite>,
+    /// The owner-side server for catch-up requests (ADR 0043 P1). Set after
+    /// construction ([`set_catch_up_source`](Self::set_catch_up_source)) because
+    /// the group-routed store is built on top of the plane's shared handles; a
+    /// `ReplicaCatchUp` arriving before it is set is dropped (the sweep retries).
+    catch_up: Arc<Mutex<Option<Arc<dyn CatchUpSource>>>>,
+    /// The live placement ring — a proto-4 recovery read's completeness verdict
+    /// (ADR 0043 P1) compares this node's durable caught-up stamp against the
+    /// group's **current** replica set.
+    placement: Arc<RwLock<Placement>>,
     /// Aborts the replica-writer when the **last** plane clone drops. The writer holds a
     /// clone of `replicas` (hence of the persistent `replicas.redb` handle); without this,
     /// the writer outlives the plane and the file lock is never released, so a restart
@@ -81,6 +106,7 @@ impl DurablePlane {
         network: MeshRaftNetwork,
         transport: Arc<PeerReplicaTransport>,
         replicas: Arc<Mutex<ReplicaState>>,
+        placement: Arc<RwLock<Placement>>,
     ) -> Self {
         let (replica_tx, writer) = spawn_replica_writer(replicas.clone());
         Self {
@@ -89,8 +115,19 @@ impl DurablePlane {
             transport,
             replicas,
             replica_tx,
+            catch_up: Arc::new(Mutex::new(None)),
+            placement,
             _writer: Arc::new(AbortOnDrop(writer)),
         }
+    }
+
+    /// Wire the owner-side catch-up server (ADR 0043 P1) — the group-routed
+    /// store, built after the plane over its shared handles.
+    pub fn set_catch_up_source(&self, source: Arc<dyn CatchUpSource>) {
+        *self
+            .catch_up
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
     }
 
     /// The lease-group consensus handle (to initialize, propose lease assignments,
@@ -146,12 +183,28 @@ impl DurablePlane {
                 .any(|id| id == metrics.id)
     }
 
+    /// Whether this node's replica copy of `key` is **caught up** (ADR 0043 P1):
+    /// non-empty, gap-free, and stamped current for the key's group replica set —
+    /// exactly the verdict its recovery reads answer with. Observability for the
+    /// resize harness and, later, the decommission progress gate (0043-P3).
+    #[must_use]
+    pub fn replica_caught_up(&self, key: &str) -> bool {
+        let group = group_of_key(key);
+        let set = self
+            .placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .group_replica_set(group);
+        let r = self.lock_replicas();
+        !r.entries(key).is_empty() && r.complete(key) && r.group_current(group, &set)
+    }
+
     /// Register a peer's outbound link channel for *both* planes — consensus
     /// (keyed by the peer's [`raft_id`]) and replication (keyed by its [`NodeId`]).
     /// Called when a peer link is established.
-    pub fn register(&self, node: &NodeId, tx: mpsc::UnboundedSender<PeerMessage>) {
+    pub fn register(&self, node: &NodeId, tx: mpsc::UnboundedSender<PeerMessage>, proto: u32) {
         self.network.register(raft_id(node), tx.clone());
-        self.transport.register(node.clone(), tx);
+        self.transport.register(node.clone(), tx, proto);
     }
 
     /// Fail a peer on both planes when its link drops, so in-flight consensus RPCs
@@ -164,6 +217,8 @@ impl DurablePlane {
     /// Route an inbound durable-plane frame, returning the reply to send back over
     /// the same link (or `None` for replies, which terminate here, and for frames
     /// that are not part of this plane).
+    // One arm per wire variant — a flat dispatch table, not a refactor smell.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle(&self, frame: PeerMessage) -> Option<PeerMessage> {
         match frame {
             // Consensus request → run it against our lease raft, reply with the result.
@@ -235,6 +290,71 @@ impl DurablePlane {
                 entries,
             } => {
                 self.transport.complete_read(req_id, watermark, entries);
+                None
+            }
+            // Proto-4 recovery-read (ADR 0043 P1): same as ReplicaRead plus this
+            // replica's completeness verdict, so the recovering owner can refuse a
+            // merge whose every read might be a hollow joiner's.
+            PeerMessage::ReplicaRead2 { req_id, key } => {
+                // Complete = gap-free AND stamped current for the group's replica
+                // set (the durable caught-up watermark): a hollow joiner — even an
+                // EMPTY one — must not anchor a recovery merge as authority that
+                // the key has no history it never received.
+                let group = group_of_key(&key);
+                let set = self
+                    .placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .group_replica_set(group);
+                let (watermark, complete, entries) = {
+                    let r = self.lock_replicas();
+                    (
+                        r.watermark(&key),
+                        r.complete(&key) && r.group_current(group, &set),
+                        r.epoch_entries(&key)
+                            .into_iter()
+                            .map(|e| crate::peer::ReplicaEntryWire {
+                                offset: e.offset,
+                                epoch: e.epoch,
+                                seq: e.seq,
+                                record: e.record,
+                            })
+                            .collect(),
+                    )
+                };
+                Some(PeerMessage::ReplicaReadReply2 {
+                    req_id,
+                    watermark,
+                    complete,
+                    entries,
+                })
+            }
+            PeerMessage::ReplicaReadReply2 {
+                req_id,
+                watermark,
+                complete,
+                entries,
+            } => {
+                self.transport
+                    .complete_read2(req_id, watermark, complete, entries);
+                None
+            }
+            // Catch-up request (ADR 0043 P1): a replica that entered `key`'s
+            // group mid-history asks us — the owner — to re-commit the key's
+            // committed log to the current replica set, back-filling its copy.
+            // Best-effort: no source wired yet (boot ordering) or a failed
+            // re-commit just leaves the requester's sweep to retry.
+            PeerMessage::ReplicaCatchUp { key } => {
+                let source = self
+                    .catch_up
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(source) = source {
+                    source.catch_up_key(&key).await;
+                } else {
+                    tracing::debug!(key, "catch-up request before store wired; dropped");
+                }
                 None
             }
             // Key discovery (ADR 0042 T9, exhibit ⑥): answer with every key our
@@ -352,6 +472,10 @@ mod tests {
             net,
             Arc::new(PeerReplicaTransport::new()),
             Arc::new(Mutex::new(ReplicaState::new())),
+            Arc::new(std::sync::RwLock::new(crate::placement::Placement::new(
+                n(id),
+                crate::placement::DEFAULT_REPLICAS,
+            ))),
         )
     }
 
@@ -417,8 +541,8 @@ mod tests {
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
         // Each plane reaches the other peer via the other's outbound channel.
-        p1.register(&n("node-2"), out1_tx.clone());
-        p2.register(&n("node-1"), out2_tx.clone());
+        p1.register(&n("node-2"), out1_tx.clone(), peer::PROTO_MAX);
+        p2.register(&n("node-1"), out2_tx.clone(), peer::PROTO_MAX);
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -508,8 +632,8 @@ mod tests {
         let (io1, io2) = tokio::io::duplex(256 * 1024);
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
-        p1.register(&n("node-2"), out1_tx.clone());
-        p2.register(&n("node-1"), out2_tx.clone());
+        p1.register(&n("node-2"), out1_tx.clone(), peer::PROTO_MAX);
+        p2.register(&n("node-1"), out2_tx.clone(), peer::PROTO_MAX);
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -542,6 +666,85 @@ mod tests {
             .read_replica(&n("ghost"), "q/c")
             .await
             .is_none());
+
+        p1.raft().shutdown().await.unwrap();
+        p2.raft().shutdown().await.unwrap();
+    }
+
+    /// ADR 0043 P1 over the wire: a proto-4 recovery-read round-trips the replica's
+    /// **completeness** verdict (hollow → false, back-filled → true), and a
+    /// `ReplicaCatchUp` request routes to the owner plane's [`CatchUpSource`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn proto4_reads_carry_completeness_and_catch_up_reaches_the_source() {
+        /// Records every key the owner plane is asked to catch up.
+        struct Recorder(mpsc::UnboundedSender<String>);
+        #[async_trait::async_trait]
+        impl super::CatchUpSource for Recorder {
+            async fn catch_up_key(&self, key: &str) {
+                let _ = self.0.send(key.to_string());
+            }
+        }
+
+        let p1 = node("node-1").await;
+        let p2 = node("node-2").await;
+
+        let (io1, io2) = tokio::io::duplex(256 * 1024);
+        let (out1_tx, out1_rx) = mpsc::unbounded_channel();
+        let (out2_tx, out2_rx) = mpsc::unbounded_channel();
+        p1.register(&n("node-2"), out1_tx.clone(), peer::PROTO_MAX);
+        p2.register(&n("node-1"), out2_tx.clone(), peer::PROTO_MAX);
+        spawn_link(p1.clone(), io1, out1_tx, out1_rx);
+        spawn_link(p2.clone(), io2, out2_tx, out2_rx);
+
+        // node-2's caught-up watermark says it is current for the group (its
+        // sweep completed) — so the verdicts below are pure gap-freedom, the
+        // per-key half of the completeness rule.
+        {
+            let group = crate::placement::group_of_key("q/c");
+            let set = vec![n("node-2")]; // node-2's own (solo) placement view
+            p2.replicas
+                .lock()
+                .unwrap()
+                .mark_groups_current(&[(group, set)]);
+        }
+
+        // node-2 joined mid-history: it received only offset 2 — a hollow copy.
+        let ap = |offset: u64| crate::cluster_log::ReplOp::Append {
+            key: "q/c".to_string(),
+            offset,
+            seq: offset,
+            record: vec![u8::try_from(offset).unwrap()],
+        };
+        assert!(p1.transport().deliver(&n("node-2"), 1, &ap(2)).await);
+        let read = p1
+            .transport()
+            .read_replica(&n("node-2"), "q/c")
+            .await
+            .expect("reachable replica");
+        assert!(
+            !read.complete,
+            "a copy with entries above a never-received prefix reads incomplete"
+        );
+
+        // Back-fill the hole (what a catch-up re-commit does): now complete.
+        assert!(p1.transport().deliver(&n("node-2"), 1, &ap(1)).await);
+        let read = p1
+            .transport()
+            .read_replica(&n("node-2"), "q/c")
+            .await
+            .expect("reachable replica");
+        assert!(read.complete, "the back-filled copy reads complete");
+
+        // node-2 asks node-1 (the owner) to catch a key up: the request crosses
+        // the wire and lands on the owner plane's CatchUpSource.
+        let (rec_tx, mut rec_rx) = mpsc::unbounded_channel();
+        p1.set_catch_up_source(Arc::new(Recorder(rec_tx)));
+        p2.transport().request_catch_up(&n("node-1"), "q/c");
+        let asked = tokio::time::timeout(Duration::from_secs(5), rec_rx.recv())
+            .await
+            .expect("catch-up request reaches the owner")
+            .unwrap();
+        assert_eq!(asked, "q/c");
 
         p1.raft().shutdown().await.unwrap();
         p2.raft().shutdown().await.unwrap();

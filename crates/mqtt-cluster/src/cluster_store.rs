@@ -94,6 +94,11 @@ impl LeaseSource for LocalLeaseSource {
 struct GroupEntry<T: ReplicaTransport> {
     log: Arc<ClusterLog<T>>,
     recovered: Mutex<BTreeSet<String>>,
+    /// The replica set the log was built over. A membership change that moves the
+    /// group's replicas (ADR 0043 P1) rebuilds the entry so appends and re-commits
+    /// fan out to the **current** set — a cached log pinned to the old set would
+    /// never deliver to a joiner, leaving it hollow forever.
+    replica_set: Vec<NodeId>,
 }
 
 /// A [`ReplicatedLog`] that routes each key to its placement group's
@@ -179,12 +184,16 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // (and the group's keys re-recovered) against the new lease.
         let epoch = self.leases.epoch_for(group).await?;
 
-        // Get-or-(re)build the group entry at the current epoch. Resolve to an owned
+        // Get-or-(re)build the group entry at the current epoch **and replica set**.
+        // A replica-set change rebuilds (and re-recovers, which re-commits to the
+        // new set — ADR 0043 P1) even under an unchanged lease. Resolve to an owned
         // `Arc` and drop the guard before any await (the guard is not `Send`).
         let entry = {
             let mut cache = self.cache();
             match cache.get(&group) {
-                Some(entry) if entry.log.epoch() == epoch => entry.clone(),
+                Some(entry) if entry.log.epoch() == epoch && entry.replica_set == replica_set => {
+                    entry.clone()
+                }
                 _ => {
                     let lease = OwnershipLease {
                         holder: self.local.clone(),
@@ -205,6 +214,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                             .with_local_store(self.local_replicas.clone()),
                         ),
                         recovered: Mutex::new(BTreeSet::new()),
+                        replica_set: replica_set.clone(),
                     });
                     cache.insert(group, entry.clone());
                     entry
@@ -245,13 +255,21 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     /// Recover `key`'s committed log by reading a quorum of the replica set: this
     /// node's own follower copy plus the reachable peers'. Errors with
     /// [`ReplError::NoQuorum`] if fewer than a quorum can be read (recovery is unsafe
-    /// — a committed entry might live only on an unread replica).
+    /// — a committed entry might live only on an unread replica), or if no read in
+    /// the merge is **complete** (ADR 0043 P1): a quorum assembled entirely from
+    /// hollow joiners — replicas that entered the set mid-history and hold entries
+    /// above a hole — could silently truncate the history none of them received.
+    /// At least one gap-free copy must anchor the merge.
     async fn recover_key(
         &self,
         key: &str,
         replica_set: &[NodeId],
     ) -> Result<(Vec<LogEntry>, Offset), ReplError> {
         let quorum = replica_set.len() / 2 + 1;
+        let enough = |reads: &[crate::cluster_log::ReplicaRead]| {
+            reads.len() >= quorum && reads.iter().any(|r| r.complete)
+        };
+        let group = group_of_key(key);
         // Local copy first (sync; the guard is dropped before any await). Each read
         // carries the replica's truncation low-water so the merge cannot resurrect an
         // already-acked prefix from a stale replica (ADR 0018 §3b).
@@ -262,13 +280,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::cluster_log::ReplicaRead {
                 watermark: r.watermark(key),
+                // Our own copy anchors the merge only if it is gap-free AND we are
+                // stamped current for the group's replica set (ADR 0043 P1): an
+                // owner that is itself a fresh joiner must not treat its empty
+                // copy as authority that the key has no history.
+                complete: r.complete(key) && r.group_current(group, replica_set),
                 entries: r.epoch_entries(key),
             }
         }];
-        // Read peers **concurrently** (like the append fan-out) and stop as soon as a
-        // quorum has responded, so a slow or just-died replica's RPC timeout does not
-        // serialize recovery when quorum is reachable from faster replicas.
-        if reads.len() < quorum {
+        // Read peers **concurrently** (like the append fan-out) and stop as soon as
+        // enough have responded — a quorum, at least one of it complete — so a slow
+        // or just-died replica's RPC timeout does not serialize recovery when quorum
+        // is reachable from faster replicas.
+        if !enough(&reads) {
             let mut inflight = tokio::task::JoinSet::new();
             for replica in replica_set.iter().filter(|n| **n != self.local) {
                 let transport = self.transport.clone();
@@ -276,16 +300,16 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 let key = key.to_string();
                 inflight.spawn(async move { transport.read_replica(&replica, &key).await });
             }
-            while reads.len() < quorum {
+            while !enough(&reads) {
                 match inflight.join_next().await {
                     Some(Ok(Some(read))) => reads.push(read),
                     // A replica that did not respond (or a join error): keep waiting.
                     Some(Ok(None) | Err(_)) => {}
-                    None => break, // every replica reported; quorum not reached
+                    None => break, // every replica reported; not enough
                 }
             }
         }
-        if reads.len() < quorum {
+        if !enough(&reads) {
             return Err(ReplError::NoQuorum);
         }
         // The floor: the highest truncation low-water across the reads. The merge
@@ -293,6 +317,39 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // offset space above it (ADR 0042 T6).
         let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
         Ok((merge_replica_logs(&reads), floor))
+    }
+}
+
+#[async_trait]
+impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> crate::durable_plane::CatchUpSource
+    for GroupRoutedLog<S, T>
+{
+    async fn catch_up_key(&self, key: &str) {
+        // Route to the key's group log — which recovers the key (quorum read +
+        // re-commit) on first touch per epoch/replica-set as usual — then re-spread
+        // its committed log to the CURRENT replica set (ADR 0043 P1). Idempotent:
+        // same offsets, same bytes, fenced at this owner's epoch; a follower that
+        // already holds an entry just re-applies it. Best-effort — the requesting
+        // replica's sweep retries while its copy stays hollow.
+        let log = match self.log_for_key(key).await {
+            Ok(log) => log,
+            Err(e) => {
+                tracing::debug!(key, error = ?e, "catch-up: cannot route/recover key; requester will retry");
+                return;
+            }
+        };
+        let entries = log.committed_entries(key).await;
+        if let Err(e) = log.recommit_key(key, &entries).await {
+            tracing::debug!(key, error = ?e, "catch-up: re-commit fell short of quorum; requester will retry");
+            return;
+        }
+        // Fan the truncation low-water too (best-effort, like every truncate): a
+        // back-filled copy whose entries start above offset 1 is gap-free only
+        // once its own watermark records the acked-away prefix.
+        let floor = log.committed_floor(key).await;
+        if floor > 0 {
+            let _ = log.truncate(&key.to_string(), floor).await;
+        }
     }
 }
 
@@ -430,10 +487,42 @@ mod tests {
                         };
                         transport.complete_read(req_id, watermark, entries);
                     }
+                    // The proto-4 read (ADR 0043 P1): same, plus the completeness
+                    // verdict — what the plane serves on a real link.
+                    PeerMessage::ReplicaRead2 { req_id, key } => {
+                        let (watermark, complete, entries) = {
+                            let s = state.lock().unwrap();
+                            (
+                                s.watermark(&key),
+                                s.complete(&key),
+                                s.epoch_entries(&key)
+                                    .into_iter()
+                                    .map(|e| crate::peer::ReplicaEntryWire {
+                                        offset: e.offset,
+                                        epoch: e.epoch,
+                                        seq: e.seq,
+                                        record: e.record,
+                                    })
+                                    .collect(),
+                            )
+                        };
+                        transport.complete_read2(req_id, watermark, complete, entries);
+                    }
                     _ => {}
                 }
             }
         });
+    }
+
+    /// Stamp `replicas` caught-up for every group at its **current** replica set —
+    /// the state a completed catch-up sweep leaves behind (ADR 0043 P1). Tests
+    /// that model an established (non-joiner) node start from here, exactly as a
+    /// real node does after its boot sweep.
+    fn stamp_current(replicas: &Arc<Mutex<ReplicaState>>, placement: &Placement) {
+        let stamps: Vec<_> = (0..NUM_GROUPS)
+            .map(|g| (g, placement.group_replica_set(g)))
+            .collect();
+        replicas.lock().unwrap().mark_groups_current(&stamps);
     }
 
     /// Find a placement group `owner` owns, and a client id that hashes to it.
@@ -479,7 +568,7 @@ mod tests {
         let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
         for (node, state) in [(nid("f1"), &f1_state), (nid("f2"), &f2_state)] {
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx);
+            transport.register(node, tx, crate::peer::PROTO_MAX);
             spawn_follower(transport.clone(), state.clone(), rx);
         }
 
@@ -641,6 +730,8 @@ mod tests {
             }
         }
 
+        // This node completed its catch-up sweep long ago (it held the copy).
+        stamp_current(&replicas, &placement.read().unwrap());
         let log = GroupRoutedLog::new(
             owner.clone(),
             placement.clone(),
@@ -682,7 +773,7 @@ mod tests {
         for node in [nid("f1"), nid("f2")] {
             let state = Arc::new(Mutex::new(ReplicaState::new()));
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx);
+            transport.register(node, tx, crate::peer::PROTO_MAX);
             spawn_follower(transport.clone(), state.clone(), rx);
             follower_states.push(state);
         }
@@ -751,7 +842,7 @@ mod tests {
         let transport = Arc::new(PeerReplicaTransport::new());
         let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
         let (f1_tx, f1_rx) = mpsc::unbounded_channel();
-        transport.register(nid("f1"), f1_tx);
+        transport.register(nid("f1"), f1_tx, crate::peer::PROTO_MAX);
         spawn_follower(transport.clone(), f1_state.clone(), f1_rx);
 
         // The node's own durable replica copy — it survives the "restart" below.
@@ -779,7 +870,7 @@ mod tests {
         transport.fail_node(&nid("f1"));
         let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
         let (f2_tx, f2_rx) = mpsc::unbounded_channel();
-        transport.register(nid("f2"), f2_tx);
+        transport.register(nid("f2"), f2_tx, crate::peer::PROTO_MAX);
         spawn_follower(transport.clone(), f2_state.clone(), f2_rx);
         epoch.store(3, Ordering::Relaxed); // the restart won a fresh lease epoch
 
@@ -836,6 +927,8 @@ mod tests {
             assert!(r.entries(&qkey).is_empty());
         }
 
+        // An established node (its sweep completed while it held the copy).
+        stamp_current(&replicas, &placement.read().unwrap());
         let log = GroupRoutedLog::new(
             owner,
             placement,
@@ -903,6 +996,204 @@ mod tests {
         );
     }
 
+    /// ADR 0043 P1, the empty-joiner face of the hazard: an owner that has not
+    /// completed its catch-up sweep (no durable caught-up stamp for the group)
+    /// must not treat its own EMPTY copy as proof a key has no history — the
+    /// history may live entirely on nodes it has not caught up from. Recovery
+    /// fails closed until the boot sweep stamps the group; then the same read
+    /// serves the (actually) fresh key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unstamped_owner_cannot_fabricate_an_empty_log() {
+        let owner = nid("owner");
+        let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            Arc::new(PeerReplicaTransport::new()),
+            FixedLease(1),
+            replicas.clone(),
+        );
+
+        // Before the sweep stamps: the empty copy is not an anchor. Fail closed.
+        let err = log.read(&qkey, 0, 100).await.unwrap_err();
+        assert!(
+            matches!(err, mqtt_storage::repl::ReplError::NoQuorum),
+            "an unstamped empty copy must not fabricate a clean log, got {err:?}"
+        );
+
+        // The boot sweep stamps the (self-only) sets; the fresh key now serves.
+        stamp_current(&replicas, &placement.read().unwrap());
+        assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 0);
+        assert_eq!(log.append(&qkey, b"m1".to_vec()).await.unwrap(), 1);
+    }
+
+    /// ADR 0043 P1: recovery refuses a quorum assembled entirely from HOLLOW copies.
+    /// Every read reaching quorum here has a gap (entries above a hole none of them
+    /// received); merging them would silently truncate the missing history, so the
+    /// gate fails closed with `NoQuorum` — until a complete copy joins the reads,
+    /// at which point the same recovery serves the full log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_refuses_a_quorum_of_hollow_replicas() {
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two followers.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        let hollow = |key: &str| {
+            // Offset 2 above a hole at 1: a joiner that caught only the newest append.
+            let mut s = ReplicaState::new();
+            assert!(s.apply(
+                3,
+                &ReplOp::Append {
+                    key: key.to_string(),
+                    offset: 2,
+                    seq: 2,
+                    record: b"m2".to_vec(),
+                }
+            ));
+            assert!(!s.complete(key));
+            s
+        };
+
+        // This node's own copy is hollow, and so is the one reachable follower.
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let f1_state = Arc::new(Mutex::new(hollow(&qkey)));
+        let (f1_tx, f1_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), f1_tx, crate::peer::PROTO_MAX);
+        spawn_follower(transport.clone(), f1_state.clone(), f1_rx);
+
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(7),
+            Arc::new(Mutex::new(hollow(&qkey))),
+        );
+
+        // Quorum (2 of 3) is readable — but every read is hollow. Fail closed.
+        let err = log.read(&qkey, 0, 100).await.unwrap_err();
+        assert!(
+            matches!(err, mqtt_storage::repl::ReplError::NoQuorum),
+            "a merge with no complete read must refuse (ADR 0043 P1), got {err:?}"
+        );
+
+        // A complete copy (f2, holding 1..=2) joins the reads: recovery now serves
+        // the FULL history, including the offset every hollow copy lacked.
+        let mut full = ReplicaState::new();
+        for off in 1..=2u64 {
+            assert!(full.apply(
+                3,
+                &ReplOp::Append {
+                    key: qkey.clone(),
+                    offset: off,
+                    seq: off,
+                    record: format!("m{off}").into_bytes(),
+                }
+            ));
+        }
+        let (f2_tx, f2_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f2"), f2_tx, crate::peer::PROTO_MAX);
+        spawn_follower(transport.clone(), Arc::new(Mutex::new(full)), f2_rx);
+
+        let served = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(
+            served.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1, 2],
+            "with a complete anchor the merge serves the whole history"
+        );
+    }
+
+    /// ADR 0043 P1, the laptop→server sell at the store seam: a group written when
+    /// the cluster was ONE node (replica set = the owner, quorum 1) re-replicates
+    /// its history when the ring grows to three — the replica-set change rebuilds
+    /// the cached group log, recovery re-commits to the NEW set, and the joiners'
+    /// copies end up complete. This is the same path a `ReplicaCatchUp` request
+    /// drives through [`CatchUpSource::catch_up_key`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn growing_a_one_node_group_back_fills_the_joiners() {
+        use crate::durable_plane::CatchUpSource;
+
+        let owner = nid("owner");
+        // Pick a client whose group the founder still OWNS in the grown 3-node
+        // ring (growth moves ~2/3 of the groups to the joiners — those move under
+        // P2's eager migration; P1 is about the groups whose owner stays put but
+        // whose replica set gains members).
+        let (_group, client) = {
+            let mut grown = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+            grown.observe(&nid("f1"), MemberState::Alive, "x:7000", None);
+            grown.observe(&nid("f2"), MemberState::Alive, "x:7000", None);
+            owned_group_and_client(&grown)
+        };
+        let qkey = format!("q/{}", client.0);
+        // Lifetime as a laptop: single member, so every group's set is {owner}.
+        let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let local = Arc::new(Mutex::new(ReplicaState::new()));
+        // The laptop's boot sweep stamped its (self-only) sets long ago.
+        stamp_current(&local, &placement.read().unwrap());
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(1),
+            local.clone(),
+        );
+
+        // Two entries committed at quorum 1 — history only the laptop holds.
+        assert_eq!(log.append(&qkey, b"m1".to_vec()).await.unwrap(), 1);
+        assert_eq!(log.append(&qkey, b"m2".to_vec()).await.unwrap(), 2);
+
+        // The cluster grows 1→3; the two joiners connect.
+        let mut follower_states = Vec::new();
+        for node in [nid("f1"), nid("f2")] {
+            placement
+                .write()
+                .unwrap()
+                .observe(&node, MemberState::Alive, "x:7000", None);
+            let state = Arc::new(Mutex::new(ReplicaState::new()));
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx, crate::peer::PROTO_MAX);
+            spawn_follower(transport.clone(), state.clone(), rx);
+            follower_states.push(state);
+        }
+        // The founder's sweep re-stamps against the grown set: its copies are
+        // gap-free and the joiners answered discovery, so it stays the anchor
+        // recovery needs while the joiners are still hollow.
+        stamp_current(&local, &placement.read().unwrap());
+
+        // A joiner's sweep asks the owner to catch the key up (the plane routes
+        // `ReplicaCatchUp` here): the ring change rebuilds the cached log over the
+        // new set and the committed history re-commits to it.
+        log.catch_up_key(&qkey).await;
+
+        for (i, state) in follower_states.iter().enumerate() {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.entries(&qkey)
+                    .iter()
+                    .map(|e| e.offset)
+                    .collect::<Vec<_>>(),
+                vec![1, 2],
+                "joiner f{} must hold the laptop-era history",
+                i + 1
+            );
+            assert!(s.complete(&qkey), "the back-filled copy is complete");
+        }
+
+        // And the grown group still serves + appends (now at quorum 2).
+        assert_eq!(log.append(&qkey, b"m3".to_vec()).await.unwrap(), 3);
+        assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 3);
+    }
+
     /// When a group's lease epoch advances (ownership lost then regained), the cached
     /// `ClusterLog` — which writes at the stale epoch and would be fenced by followers
     /// forever — is rebuilt at the new epoch and the group's keys are re-recovered
@@ -935,6 +1226,8 @@ mod tests {
             }
         }
 
+        // An established node (its sweep completed while it held the copy).
+        stamp_current(&replicas, &placement.read().unwrap());
         let epoch = Arc::new(AtomicU64::new(3));
         let log = GroupRoutedLog::new(
             owner.clone(),
@@ -996,7 +1289,7 @@ mod tests {
         let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
         for (node, state) in [(nid("f1"), &f1_state), (nid("f2"), &f2_state)] {
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx);
+            transport.register(node, tx, crate::peer::PROTO_MAX);
             spawn_follower(transport.clone(), state.clone(), rx);
         }
 
@@ -1138,7 +1431,7 @@ mod tests {
                 },
             );
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx);
+            transport.register(node, tx, crate::peer::PROTO_MAX);
             spawn_follower(transport.clone(), state, rx);
         }
 
@@ -1184,7 +1477,7 @@ mod tests {
         for node in [nid("f1"), nid("f2")] {
             let state = Arc::new(Mutex::new(ReplicaState::new()));
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx);
+            transport.register(node, tx, crate::peer::PROTO_MAX);
             spawn_follower(transport.clone(), state, rx);
         }
 

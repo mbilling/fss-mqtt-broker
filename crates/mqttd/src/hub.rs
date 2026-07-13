@@ -3955,7 +3955,7 @@ impl Hub {
         // Register the link with the durable plane (consensus + replication) so its
         // RPCs to this peer route over the same channel.
         if let Some(plane) = &self.durable_plane {
-            plane.register(&node, tx.clone());
+            plane.register(&node, tx.clone(), proto);
         }
         self.peers.insert(
             node,

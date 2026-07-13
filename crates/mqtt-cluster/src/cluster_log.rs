@@ -97,6 +97,27 @@ const R_TRUNC: TableDefinition<&str, u64> = TableDefinition::new("replica_trunc"
 /// would let whichever group carries the highest epoch permanently fence out every
 /// other group's (perfectly current) lease-holder on this replica.
 const R_FENCE_PREFIX: &str = "fence/";
+/// Per placement group, the replica set this node was last **caught up** against —
+/// the durable caught-up watermark of [ADR 0043](../../../docs/adr/0043-elastic-cluster-resize.md)
+/// P1. Key: the group id (decimal string); value: the set's node ids, `\n`-joined.
+/// A node whose stored set differs from the current one answers recovery reads as
+/// **incomplete** (its copy may predate history written under another set), so a
+/// hollow joiner can never anchor a recovery merge — and a restart mid-catch-up
+/// reopens exactly the stamps it had, resuming (never faking) the back-fill.
+/// Additive table: a pre-P1 binary opening this file simply never reads it.
+const R_CAUGHT: TableDefinition<&str, &[u8]> = TableDefinition::new("replica_caught_up");
+
+/// Per placement group, the replica set this node last completed catch-up against.
+type CaughtUp = BTreeMap<GroupId, std::collections::BTreeSet<NodeId>>;
+
+/// Serialize a caught-up set row: sorted node ids, `\n`-joined.
+fn r_caught_value(set: &std::collections::BTreeSet<NodeId>) -> Vec<u8> {
+    set.iter()
+        .map(|n| n.0.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
+}
 
 /// A replica's stored entries: per logical key, offset → the entry's writing
 /// `(epoch, seq)` tags (ADR 0042 T7) and record bytes.
@@ -130,6 +151,7 @@ struct Loaded {
     fences: Fences,
     logs: ReplicaLogs,
     truncated: BTreeMap<String, Offset>,
+    caught_up: CaughtUp,
 }
 
 /// The logical key an op addresses (every op carries exactly one).
@@ -205,6 +227,9 @@ pub struct ReplicaState {
     /// replica knows was dropped. Propagated on recovery so a stale replica cannot
     /// resurrect a truncated prefix.
     truncated: BTreeMap<String, Offset>,
+    /// Per group, the replica set this node last completed catch-up against —
+    /// the durable caught-up watermark (ADR 0043 P1). See [`R_CAUGHT`].
+    caught_up: CaughtUp,
     /// `Some` when persisting to disk; `None` for the in-memory default.
     db: Option<Arc<Database>>,
 }
@@ -230,17 +255,20 @@ impl ReplicaState {
             let _ = txn.open_table(R_ENTRIES).map_err(rdb)?;
             let _ = txn.open_table(R_META).map_err(rdb)?;
             let _ = txn.open_table(R_TRUNC).map_err(rdb)?;
+            let _ = txn.open_table(R_CAUGHT).map_err(rdb)?;
         }
         txn.commit().map_err(rdb)?;
         let Loaded {
             fences,
             logs,
             truncated,
+            caught_up,
         } = Self::load(&db)?;
         Ok(Self {
             fences,
             logs,
             truncated,
+            caught_up,
             db: Some(Arc::new(db)),
         })
     }
@@ -277,10 +305,23 @@ impl ReplicaState {
             let (k, v) = item.map_err(rdb)?;
             truncated.insert(k.value().to_string(), v.value());
         }
+        let mut caught_up = CaughtUp::new();
+        let caught = txn.open_table(R_CAUGHT).map_err(rdb)?;
+        for item in caught.range::<&str>(..).map_err(rdb)? {
+            let (k, v) = item.map_err(rdb)?;
+            if let Ok(group) = k.value().parse::<GroupId>() {
+                let set = String::from_utf8_lossy(v.value())
+                    .lines()
+                    .map(|id| NodeId(id.to_string()))
+                    .collect();
+                caught_up.insert(group, set);
+            }
+        }
         Ok(Loaded {
             fences,
             logs,
             truncated,
+            caught_up,
         })
     }
 
@@ -489,6 +530,90 @@ impl ReplicaState {
     #[must_use]
     pub fn watermark(&self, key: &str) -> Offset {
         self.truncated.get(key).copied().unwrap_or(0)
+    }
+
+    /// Whether this replica's copy of `key` is **complete**: its stored offsets
+    /// run contiguously from just above its truncation low-water to its highest
+    /// entry, with no gap ([ADR 0043](../../../docs/adr/0043-elastic-cluster-resize.md) P1).
+    /// A replica that entered the key's replica set mid-history accepts new
+    /// appends above a hole it never received — its copy is real but HOLLOW, and
+    /// a recovery merge counting it as authoritative could silently truncate the
+    /// history it lacks. An empty copy is complete (a fresh key looks the same
+    /// everywhere). Derived from the stored entries themselves, so it survives
+    /// restart by construction and can never drift from the data.
+    #[must_use]
+    pub fn complete(&self, key: &str) -> bool {
+        let Some(log) = self.logs.get(key) else {
+            return true; // nothing stored: indistinguishable from a fresh key
+        };
+        let floor = self.watermark(key);
+        let mut expected = floor + 1;
+        for offset in log.keys() {
+            if *offset < expected {
+                continue; // below the low-water: stale leftover, not a gap
+            }
+            if *offset != expected {
+                return false;
+            }
+            expected += 1;
+        }
+        true
+    }
+
+    /// Whether this node's copy of `group` is **current** for `set` — the durable
+    /// caught-up watermark (ADR 0043 P1). True only when the stored stamp equals
+    /// the group's current replica set: a joiner (no stamp, or a stamp from an
+    /// older cohort) answers recovery reads as incomplete until its catch-up sweep
+    /// completes and re-stamps, so a merge can never anchor on a copy that may
+    /// predate history written under another set.
+    #[must_use]
+    pub fn group_current(&self, group: GroupId, set: &[NodeId]) -> bool {
+        self.caught_up.get(&group).is_some_and(|stored| {
+            stored.len() == set.len() && set.iter().all(|n| stored.contains(n))
+        })
+    }
+
+    /// The replica set this node last completed catch-up against for `group`
+    /// (`None` if never stamped) — what the sweep compares to decide between
+    /// "pure shrink of a cohort I was current with" (re-stamp immediately) and
+    /// "new cohort members" (full catch-up first).
+    #[must_use]
+    pub fn caught_up_set(&self, group: GroupId) -> Option<&std::collections::BTreeSet<NodeId>> {
+        self.caught_up.get(&group)
+    }
+
+    /// Durably stamp each `(group, set)` as caught up, in **one** fsync'd
+    /// transaction (a boot sweep stamps every owned group at once). On a persist
+    /// failure nothing is stamped in memory either — the watermark never claims
+    /// more than the disk holds (a restart must resume, not fake, the catch-up).
+    pub fn mark_groups_current(&mut self, stamps: &[(GroupId, Vec<NodeId>)]) {
+        if stamps.is_empty() {
+            return;
+        }
+        if let Some(db) = &self.db {
+            let persist = || -> Result<(), ReplError> {
+                let mut txn = db.begin_write().map_err(rdb)?;
+                txn.set_durability(Durability::Immediate);
+                {
+                    let mut caught = txn.open_table(R_CAUGHT).map_err(rdb)?;
+                    for (group, set) in stamps {
+                        let value = r_caught_value(&set.iter().cloned().collect());
+                        caught
+                            .insert(group.to_string().as_str(), value.as_slice())
+                            .map_err(rdb)?;
+                    }
+                }
+                txn.commit().map_err(rdb)?;
+                Ok(())
+            };
+            if let Err(e) = persist() {
+                tracing::warn!(error = %e, "caught-up stamp persist failed; groups stay pending");
+                return;
+            }
+        }
+        for (group, set) in stamps {
+            self.caught_up.insert(*group, set.iter().cloned().collect());
+        }
     }
 
     /// Every logical key this replica currently holds entries for (ADR 0009 §3): a new
@@ -796,6 +921,37 @@ impl<T: ReplicaTransport> ClusterLog<T> {
     }
 }
 
+impl<T: ReplicaTransport> ClusterLog<T> {
+    /// The owner's committed entries for `key`, in offset order — the source a
+    /// catch-up re-commit re-delivers (ADR 0043 P1). Never exposes the
+    /// uncommitted tail.
+    pub async fn committed_entries(&self, key: &str) -> Vec<LogEntry> {
+        let state = self.state.lock().await;
+        let Some(ks) = state.get(key) else {
+            return Vec::new();
+        };
+        ks.entries
+            .range(..=ks.committed)
+            .map(|(offset, record)| LogEntry {
+                offset: *offset,
+                record: record.clone(),
+            })
+            .collect()
+    }
+
+    /// The owner's truncation low-water for `key` (`0` if untracked) — a catch-up
+    /// re-commit fans this to the replicas too (ADR 0043 P1): a back-filled copy
+    /// whose history starts above 1 is only gap-free once its watermark says the
+    /// missing prefix was acked away, not lost.
+    pub async fn committed_floor(&self, key: &str) -> Offset {
+        self.state
+            .lock()
+            .await
+            .get(key)
+            .map_or(0, |ks| ks.truncated)
+    }
+}
+
 impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
     /// Re-commit a recovered log to a **write quorum** at this owner's epoch
     /// ([ADR 0042](../../../docs/adr/0042-durable-plane-stress-harness.md) T6,
@@ -892,6 +1048,11 @@ pub struct EpochEntry {
 pub struct ReplicaRead {
     /// The replica's truncation low-water for the key (ADR 0018 phase 3b).
     pub watermark: Offset,
+    /// Whether the replica's copy is gap-free (ADR 0043 P1,
+    /// [`ReplicaState::complete`]): a recovery merge requires at least one
+    /// complete read — a hollow joiner's copy contributes entries but never
+    /// authority. Reads from pre-P1 peers arrive as `false` (conservative).
+    pub complete: bool,
     /// The replica's stored entries for the key, in offset order, with tags.
     pub entries: Vec<EpochEntry>,
 }
@@ -1136,6 +1297,97 @@ mod tests {
         let err = ReplicaState::open(&path).unwrap_err().to_string();
         let expected = format!("expects v{}", super::R_SCHEMA_VERSION);
         assert!(err.contains("v999") && err.contains(&expected), "{err}");
+    }
+
+    /// ADR 0043 P1: `complete` tells a real copy of a key's log from a HOLLOW one —
+    /// a replica that entered the set mid-history and accepted new appends above a
+    /// hole it never received. Complete = the stored offsets run contiguously from
+    /// just above the truncation low-water; empty is complete (indistinguishable
+    /// from a fresh key); stale leftovers below the low-water are not gaps.
+    #[test]
+    fn completeness_is_gap_freedom_above_the_truncation_watermark() {
+        let ap = |offset| ReplOp::Append {
+            key: "q/c".to_string(),
+            offset,
+            seq: offset,
+            record: b"m".to_vec(),
+        };
+        // Nothing stored: complete.
+        let mut r = ReplicaState::new();
+        assert!(r.complete("q/c"));
+
+        // Contiguous from 1: complete.
+        assert!(r.apply(1, &ap(1)));
+        assert!(r.apply(1, &ap(2)));
+        assert!(r.complete("q/c"));
+
+        // A joiner's copy: new appends landed above history it never received.
+        let mut joiner = ReplicaState::new();
+        assert!(joiner.apply(1, &ap(3)));
+        assert!(
+            !joiner.complete("q/c"),
+            "entries above a never-received prefix are a hollow copy"
+        );
+        // Back-fill (the catch-up re-commit) heals it.
+        assert!(joiner.apply(1, &ap(1)));
+        assert!(joiner.apply(1, &ap(2)));
+        assert!(joiner.complete("q/c"));
+
+        // A mid-log gap is hollow even with a matching prefix.
+        let mut gappy = ReplicaState::new();
+        assert!(gappy.apply(1, &ap(1)));
+        assert!(gappy.apply(1, &ap(3)));
+        assert!(!gappy.complete("q/c"));
+
+        // Truncation moves the floor: [3] alone is complete once 1..=2 are acked
+        // away (watermark 2) — a drained prefix is not a gap.
+        let mut truncated = ReplicaState::new();
+        for off in 1..=3 {
+            assert!(truncated.apply(1, &ap(off)));
+        }
+        assert!(truncated.apply(
+            1,
+            &ReplOp::Truncate {
+                key: "q/c".into(),
+                up_to: 2
+            }
+        ));
+        assert!(truncated.complete("q/c"));
+    }
+
+    /// ADR 0043 P1: the caught-up watermark gates currency per (group, replica
+    /// set) and is durable — a restart mid-catch-up reopens exactly the stamps
+    /// it had (resuming, never faking, the back-fill), and a set change makes
+    /// the old stamp non-current.
+    #[test]
+    fn caught_up_stamps_gate_currency_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.redb");
+        let solo = vec![n("a")];
+        let grown = vec![n("a"), n("b"), n("c")];
+        {
+            let mut r = ReplicaState::open(&path).unwrap();
+            assert!(!r.group_current(7, &solo), "never stamped: not current");
+            r.mark_groups_current(&[(7, solo.clone()), (9, grown.clone())]);
+            assert!(r.group_current(7, &solo));
+            assert!(
+                !r.group_current(7, &grown),
+                "a stamp is per replica set: a grown set is a new cohort"
+            );
+            assert_eq!(
+                r.caught_up_set(9).map(std::collections::BTreeSet::len),
+                Some(3),
+                "the stored cohort is readable for the sweep's shrink rule"
+            );
+            // drop → close (a crash mid-catch-up: group 8 was never stamped)
+        }
+        let r = ReplicaState::open(&path).unwrap();
+        assert!(r.group_current(7, &solo), "stamps survive the restart");
+        assert!(r.group_current(9, &grown));
+        assert!(
+            !r.group_current(8, &solo),
+            "a group whose catch-up never completed stays pending after restart"
+        );
     }
 
     /// ADR 0018 phase 3: a persistent replica's stored entries and fence epoch survive
@@ -1689,6 +1941,7 @@ mod tests {
     fn rd(entries: Vec<super::EpochEntry>) -> ReplicaRead {
         ReplicaRead {
             watermark: 0,
+            complete: true,
             entries,
         }
     }
@@ -1837,10 +2090,12 @@ mod tests {
         // (down through the truncation, watermark 0) still holds [1..7].
         let live = ReplicaRead {
             watermark: 5,
+            complete: true,
             entries: vec![entry(6, b"f"), entry(7, b"g")],
         };
         let stale = ReplicaRead {
             watermark: 0,
+            complete: true,
             entries: vec![
                 entry(1, b"a"),
                 entry(2, b"b"),
@@ -1933,10 +2188,12 @@ mod tests {
         let recovered = merge_replica_logs(&[
             ReplicaRead {
                 watermark: b.watermark(&k),
+                complete: b.complete(&k),
                 entries: b.epoch_entries(&k),
             },
             ReplicaRead {
                 watermark: c.watermark(&k),
+                complete: c.complete(&k),
                 entries: c.epoch_entries(&k),
             },
         ]);

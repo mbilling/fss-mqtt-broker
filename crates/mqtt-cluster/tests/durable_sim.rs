@@ -299,6 +299,7 @@ impl ReplSim {
         let second = if second >= first { second + 1 } else { second };
         let read = |r: &ReplicaState| ReplicaRead {
             watermark: r.watermark(key),
+            complete: r.complete(key),
             entries: r.epoch_entries(key),
         };
         let reads = [read(&self.replicas[first]), read(&self.replicas[second])];
@@ -341,6 +342,7 @@ impl ReplSim {
                 }
                 let read = |r: &ReplicaState| ReplicaRead {
                     watermark: r.watermark(key),
+                    complete: r.complete(key),
                     entries: r.epoch_entries(key),
                 };
                 let merged = merge_replica_logs(&[

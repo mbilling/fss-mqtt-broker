@@ -86,8 +86,10 @@ question ([ADR 0042](adr/0042-durable-plane-stress-harness.md)):
   schedules — owner kills, restarts over surviving data dirs, asymmetric link flaps,
   disk write-fault injection, brownout entry/exit, client churn — against an
   obligations ledger of **acked facts only**, judged post-quiesce by the catalog. A
-  separate test power-cycles the whole cluster. The seed reproduces the *scenario*
-  (tokio/I-O timing is real); every failure prints the seed and full schedule trace.
+  separate test power-cycles the whole cluster, and another grows 1→3 under acked
+  facts then kills the founder (the ADR 0043 P1 catch-up path). The seed reproduces
+  the *scenario* (tokio/I-O timing is real); every failure prints the seed and full
+  schedule trace.
 
 **Profiles:** every push runs the CI profile (1000 sim seeds; 1 stress seed, ~60–90 s;
 the stop/start test, ~10 s) inside `cargo test --all`. Soak runs opt in via env:
