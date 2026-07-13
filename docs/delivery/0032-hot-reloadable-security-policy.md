@@ -46,7 +46,7 @@ tasks:
   - id: 0032-T9
     title: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload
     status: deferred
-    notes: "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum."
+    notes: "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum. Now tracked as ADR 0040 T4 (revocation reaches live state)."
 ---
 
 # Delivery — ADR 0032: Hot-reloadable security policy
@@ -86,10 +86,15 @@ adversarial test.
 | 0032-T6 | ✅ done | 2026-06-26 | "Reloader::attach_tls + serve_tls_clients per-accept read. Test: reload_tls::renewed_cert_is_served_on_the_next_handshake — a renewed leaf (distinct CA) is served on the next handshake while the in-flight session (handshaked under the old cert) keeps carrying traffic." |
 | 0032-T7 | ✅ done | 2026-06-26 | "Reloader::reload records security.reload (ok / rejected: <reason>) and increments mqttd_security_reloads_total{outcome}. Test: reload::reload_increments_the_metric_by_outcome asserts both outcome labels." |
 | 0032-T8 | ✅ done | 2026-06-26 | "README Security bullet + 'Hot reload (SIGHUP)' Configuration subsection: kill -HUP, what reloads (ACL/auth/TLS), validate-before-swap fail-safe, audit + metric, non-unix caveat, path-rotation restart note." |
-| 0032-T9 | 💤 deferred | — | "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum." |
+| 0032-T9 | 💤 deferred | — | "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum. Now tracked as ADR 0040 T4 (revocation reaches live state)." |
 <!-- /status-table:0032 -->
 
 ## Changelog
+
+- **2026-07-05** — The remaining deferred item (peer-bus TLS reload) is now scoped into
+  [ADR 0040](../adr/0040-revocation-reaches-live-state.md) (T4), together with the
+  live-state gap this ADR's "next operation" semantics left open: reload-triggered
+  eviction of revoked certs/users and removal of grandfathered subscription grants.
 
 - **2026-06-26** — ADR accepted and delivery opened. Chosen from the security-hardening
   backlog (the most security-central, unblocking the ADR 0002/0004 reload items). Mechanism:

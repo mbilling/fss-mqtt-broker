@@ -42,9 +42,23 @@ pub async fn maintain_peer_links(
     tls: Option<peer::PeerTls>,
     placement: Option<Arc<RwLock<Placement>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 ) {
-    // Active dialer per peer we own the link to.
-    let mut dialers: HashMap<NodeId, JoinHandle<()>> = HashMap::new();
+    // Active dialer per peer we own the link to. The book aborts every dialer
+    // when it drops — the dial tasks are children of THIS task, and must not
+    // outlive it: a dialer that survives its node's shutdown (or a test
+    // harness's in-process "crash") keeps redialing forever and pins every
+    // resource its links capture (observed: a killed stress node's lease store
+    // held open by a zombie dialer's durable-plane handle, ADR 0042 T4).
+    struct DialerBook(HashMap<NodeId, JoinHandle<()>>);
+    impl Drop for DialerBook {
+        fn drop(&mut self) {
+            for (_, h) in self.0.drain() {
+                h.abort();
+            }
+        }
+    }
+    let mut dialers = DialerBook(HashMap::new());
     // Last-seen SWIM state per peer, for the members-by-state gauge (ADR 0020-T6). A
     // node reuses its stable id across restarts, so a rejoin overwrites its `Dead` entry.
     let mut member_states: HashMap<NodeId, MemberState> = HashMap::new();
@@ -71,7 +85,7 @@ pub async fn maintain_peer_links(
                     warn!(peer = %ev.id.0, "peer is alive but gossiped no routing address; cannot dial");
                     continue;
                 }
-                if let Some(h) = dialers.get(&ev.id) {
+                if let Some(h) = dialers.0.get(&ev.id) {
                     if !h.is_finished() {
                         continue; // already dialing / linked
                     }
@@ -82,12 +96,13 @@ pub async fn maintain_peer_links(
                     local.clone(),
                     hub.clone(),
                     tls.clone(),
+                    plane.clone(),
                 ));
-                dialers.insert(ev.id.clone(), handle);
+                dialers.0.insert(ev.id.clone(), handle);
             }
             MemberState::Suspect => {}
             MemberState::Dead => {
-                if let Some(h) = dialers.remove(&ev.id) {
+                if let Some(h) = dialers.0.remove(&ev.id) {
                     h.abort();
                 }
                 info!(peer = %ev.id.0, "membership: peer dead; dropping link");
@@ -159,6 +174,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         (ev_tx, hub_rx)
     }
@@ -178,6 +194,7 @@ mod tests {
             None,
             None,
             Some(metrics.clone()),
+            None,
         ));
 
         // Two alive peers + self = 3 alive; then one goes suspect, then dead.

@@ -46,6 +46,9 @@ rustls-pki-types.workspace = true
 # `test-util` enables tokio's paused-clock test helpers (start_paused) for the
 # time-based session-expiry tests (ADR 0009).
 tokio = { workspace = true, features = ["test-util"] }
+# Per-node surviving data dirs for the crash/restart stress vocabulary (ADR 0042 T4).
+# Already in the tree via mqtt-cluster's dev-dependencies.
+tempfile = "3"
 
 [lints]
 workspace = true

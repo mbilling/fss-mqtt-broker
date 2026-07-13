@@ -10,7 +10,7 @@ mod frame;
 pub mod quic;
 pub mod tls;
 pub mod ws;
-pub use frame::{FrameReader, FrameWriter};
+pub use frame::{max_packet_bytes, set_max_packet_bytes, FrameReader, FrameWriter};
 
 /// The transport a client connection arrived over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

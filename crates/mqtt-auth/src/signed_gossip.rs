@@ -104,6 +104,39 @@ impl RevocationList {
         Ok(Self { serials })
     }
 
+    /// Parse a CRL **without verifying its signature** — for mirroring the
+    /// client-listener CRL (`MQTTD_TLS_CRL`) into the identity sweep (ADR 0040 T2),
+    /// where the same file's signature is already enforced by the TLS verifier at
+    /// every handshake. Accepts PEM (`X509 CRL` block) or raw DER. For the gossip
+    /// plane use [`from_der`](Self::from_der), which requires the cluster-CA
+    /// signature (there the CRL arrives on a trust boundary this constructor must
+    /// not weaken).
+    ///
+    /// # Errors
+    /// [`CrlError::Parse`] if the bytes are neither a PEM CRL nor a DER CRL.
+    pub fn from_bytes_unverified(bytes: &[u8]) -> Result<Self, CrlError> {
+        let der: Vec<u8> = match x509_parser::pem::parse_x509_pem(bytes) {
+            Ok((_, pem)) => pem.contents,
+            Err(_) => bytes.to_vec(), // not PEM: try raw DER
+        };
+        let (_, crl) = CertificateRevocationList::from_der(&der).map_err(|_| CrlError::Parse)?;
+        let serials = crl
+            .iter_revoked_certificates()
+            .map(|r| r.user_certificate.to_bytes_be())
+            .collect();
+        Ok(Self { serials })
+    }
+
+    /// Build a list from raw big-endian serials — for tests and tools that already
+    /// hold the revoked set (production loads go through
+    /// [`from_der`](Self::from_der) / [`from_bytes_unverified`](Self::from_bytes_unverified)).
+    #[must_use]
+    pub fn from_serials(serials: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            serials: serials.into_iter().collect(),
+        }
+    }
+
     /// Whether the given big-endian serial bytes are revoked.
     #[must_use]
     pub fn contains(&self, serial_be: &[u8]) -> bool {

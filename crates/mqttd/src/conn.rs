@@ -9,7 +9,7 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{AttachOutcome, HubCommand, Outbound};
+use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, AllowAll, AuthSession, AuthStep, Authenticator, Authorizer,
@@ -97,6 +97,14 @@ pub struct WireLimits {
     /// How long the server waits for the client's reply in each round of the enhanced-auth
     /// exchange before aborting it (ADR 0013 §3) — bounds a stalled half-open auth.
     pub auth_round_timeout: Duration,
+    /// Per-connection inbound publish rate (messages/second, ADR 0041 T3); an
+    /// over-rate publisher is slowed by **pausing the socket read** (TCP
+    /// backpressure) — no drops, no disconnect. `None` = unlimited.
+    pub publish_rate: Option<u32>,
+    /// The inbound packet ceiling, advertised to v5 clients as the MQTT 5
+    /// Maximum Packet Size (ADR 0041 T4). Also installed as the transport frame
+    /// cap (`mqtt_net::set_max_packet_bytes`) by the binary.
+    pub max_packet_size: u32,
 }
 
 impl Default for WireLimits {
@@ -105,6 +113,8 @@ impl Default for WireLimits {
             topic_alias_max: 16,
             receive_maximum: 256,
             auth_round_timeout: Duration::from_secs(10),
+            publish_rate: None,
+            max_packet_size: 1024 * 1024,
         }
     }
 }
@@ -127,16 +137,38 @@ static CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Counter for server-assigned client ids (empty-id clients).
 static AUTO_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Extract the mTLS identity (ADR 0004) from an accepted server-side TLS
-/// stream: the chain-verified leaf certificate's Subject Common Name.
+/// A TLS-verified client-certificate admission (ADR 0004): the extracted identity
+/// plus the leaf's serial number — the server-side fact a CRL revocation sweep
+/// re-checks against a reloaded policy (ADR 0040 T1).
+#[derive(Debug, Clone)]
+pub struct CertAdmission {
+    /// The broker identity (Subject CN) of the verified leaf.
+    pub identity: Identity,
+    /// The leaf's serial number (big-endian bytes as encoded in the certificate);
+    /// `None` when no live TLS leaf exists at this hop (a vouched proxied session,
+    /// ADR 0005 — the landing node holds the actual TLS session).
+    pub serial: Option<Vec<u8>>,
+}
+
+/// Extract the mTLS admission (ADR 0004/0040) from an accepted server-side TLS
+/// stream: the chain-verified leaf certificate's Subject Common Name and serial.
 ///
 /// Returns `None` when no client certificate was presented, or when a verified
 /// certificate carries no usable CN (logged — such a client can only proceed
 /// as anonymous, which the default policy denies).
-pub fn tls_identity<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Identity> {
+pub fn tls_admission<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<CertAdmission> {
     let leaf = tls.get_ref().1.peer_certificates()?.first()?;
+    cert_admission(leaf)
+}
+
+/// Build a [`CertAdmission`] from a chain-verified DER leaf certificate (shared by
+/// the TLS/WSS listeners and the QUIC handshake).
+pub fn cert_admission(leaf: &[u8]) -> Option<CertAdmission> {
     match mqtt_auth::mtls::identity_from_cert(leaf) {
-        Ok(identity) => Some(identity),
+        Ok(identity) => Some(CertAdmission {
+            identity,
+            serial: mqtt_auth::mtls::serial_from_cert(leaf),
+        }),
         Err(e) => {
             warn!(error = %e, "client certificate verified but has no usable Common Name");
             None
@@ -156,7 +188,9 @@ pub struct ProxyContext {
     /// The live session-placement ring.
     pub placement: Arc<RwLock<Placement>>,
     /// mTLS connector for dialing the owner's peer listener; `None` = plaintext.
-    pub connector: Option<TlsConnector>,
+    /// Behind a `watch` (ADR 0040 T4): read per relocation dial, so a reload's
+    /// rebuilt connector (rotated cluster cert) is used on the next proxy.
+    pub connector: Option<tokio::sync::watch::Receiver<TlsConnector>>,
 }
 
 impl std::fmt::Debug for ProxyContext {
@@ -271,30 +305,46 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
     handle_stream(stream, peer, None, policy, hub).await;
 }
 
+/// How a connection ended, for the accept-loop wrapper: today just whether the
+/// CONNECT failed **authentication** (never authorization) — the fact the
+/// auth-failure penalty box records per source address (ADR 0041 T2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnOutcome {
+    /// The connection's CONNECT was rejected by the authenticator.
+    pub auth_failed: bool,
+}
+
 /// Drive one accepted connection over any transport (TCP, TLS) to completion,
 /// logging any error. `peer` is the remote address, for diagnostics only.
-/// `identity` is the TLS-verified mTLS identity, `None` on plaintext or
-/// no-client-cert connections; `policy` decides authentication, authorization,
-/// and auditing.
+/// `cert` is the TLS-verified mTLS admission (identity + leaf serial), `None` on
+/// plaintext or no-client-cert connections; `policy` decides authentication,
+/// authorization, and auditing. Returns the [`ConnOutcome`] the admission gate
+/// consumes (ADR 0041 T2).
 pub async fn handle_stream<S>(
     stream: S,
     peer: Option<SocketAddr>,
-    identity: Option<Identity>,
+    cert: Option<CertAdmission>,
     policy: Arc<ConnPolicy>,
     hub: mpsc::UnboundedSender<HubCommand>,
-) where
+) -> ConnOutcome
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = run(stream, identity, &policy, hub).await {
+    let auth_failed = std::sync::atomic::AtomicBool::new(false);
+    if let Err(e) = run(stream, cert, &policy, hub, &auth_failed).await {
         warn!(?peer, error = %e, "connection ended with error");
+    }
+    ConnOutcome {
+        auth_failed: auth_failed.load(Ordering::Relaxed),
     }
 }
 
 async fn run<S>(
     stream: S,
-    identity: Option<Identity>,
+    cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
+    auth_failed: &std::sync::atomic::AtomicBool,
 ) -> Result<(), NetError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -304,7 +354,7 @@ where
     let writer = FrameWriter::new(wh, ProtocolVersion::V311);
     // A directly-accepted client may be relocated to its placement owner; it has no
     // relaying node (`via = None`).
-    run_framed(reader, writer, identity, policy, hub, true, None).await
+    run_framed(reader, writer, cert, policy, hub, true, None, auth_failed).await
 }
 
 /// Serve an MQTT connection over already-framed halves. `allow_proxy` is `true`
@@ -413,14 +463,16 @@ async fn read_connect<R: AsyncRead + Unpin>(
 // A flat CONNECT→serve sequence: long by the number of handshake/attach outcomes it maps,
 // not by branching complexity.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_framed<R, W>(
     mut reader: FrameReader<R>,
     mut writer: FrameWriter<W>,
-    identity: Option<Identity>,
+    cert: Option<CertAdmission>,
     policy: &ConnPolicy,
     hub: mpsc::UnboundedSender<HubCommand>,
     allow_proxy: bool,
     via: Option<String>,
+    auth_failed: &std::sync::atomic::AtomicBool,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -445,17 +497,20 @@ where
 
     // Authentication gate: verify credentials BEFORE attaching to the hub, so a
     // rejected client never touches session state (enhanced exchange or single-shot).
-    let Some(principal) = authenticate(
+    let Some((principal, auth_method)) = authenticate(
         &mut reader,
         &mut writer,
         &client,
         &connect,
-        identity.as_ref(),
+        cert.as_ref().map(|c| &c.identity),
         policy,
         via,
     )
     .await?
     else {
+        // The penalty box (ADR 0041 T2) keys on this: authentication failed —
+        // authorization denials below never set it.
+        auth_failed.store(true, Ordering::Relaxed);
         return Ok(()); // rejected; CONNACK/close already handled
     };
 
@@ -507,7 +562,12 @@ where
     if hub
         .send(HubCommand::Attach {
             client: client.clone(),
-            owner: principal.subject.clone(),
+            admission: Admission {
+                identity: principal.clone(),
+                method: auth_method,
+                cert_serial: cert.and_then(|c| c.serial),
+                protocol: connect.protocol,
+            },
             conn_id,
             clean_start,
             session_expiry,
@@ -528,6 +588,19 @@ where
             // clean session over a recoverable one (ADR 0017).
             info!(client = %client.0, "rejecting CONNECT: durable session unavailable, retry");
             let code = connack_code(CONNACK_SERVER_UNAVAILABLE, connect.protocol);
+            return reject_connack(&mut writer, code).await;
+        }
+        Ok(AttachOutcome::QuotaExceeded) => {
+            // Creating a new session would exceed the node's session quota
+            // (ADR 0041 T4); resumes are never refused for quota, so the client's
+            // best move is another node (or later). v5 gets the honest 0x97;
+            // v3.1.1 has no quota code — Server unavailable says "try elsewhere".
+            info!(client = %client.0, "rejecting CONNECT: session quota exceeded (ADR 0041)");
+            let code = if connect.protocol == ProtocolVersion::V5 {
+                reason::QUOTA_EXCEEDED
+            } else {
+                CONNACK_SERVER_UNAVAILABLE
+            };
             return reject_connack(&mut writer, code).await;
         }
         Ok(AttachOutcome::OwnerMismatch) => {
@@ -578,6 +651,11 @@ where
         &mut out_rx,
         connect.keep_alive,
         connect.protocol == ProtocolVersion::V5,
+        // The client's advertised MQTT 5 Maximum Packet Size (ADR 0041 T4): the
+        // server must not send it a larger packet [MQTT-3.1.2-24-style contract].
+        (connect.protocol == ProtocolVersion::V5)
+            .then(|| connect.properties.maximum_packet_size())
+            .flatten(),
         &mut inbound_aliases,
         &mut outbound_aliases,
     )
@@ -633,7 +711,7 @@ where
     Packet::Connect(connect.clone()).encode(&mut prelude, connect.protocol)?;
     prelude.extend_from_slice(&leftover);
 
-    if let Some(connector) = &proxy.connector {
+    if let Some(connector) = proxy.connector.as_ref().map(|w| w.borrow().clone()) {
         let name = mqtt_net::tls::server_name(addr)?;
         let tcp = TcpStream::connect(addr).await?;
         let _ = tcp.set_nodelay(true);
@@ -698,8 +776,17 @@ pub async fn serve_proxied<R, W>(
     let reader = FrameReader::with_buffer(client_rh, ProtocolVersion::V311, prefix);
     let writer = FrameWriter::new(client_wh, ProtocolVersion::V311);
     // A proxied session is never re-proxied (`allow_proxy = false`); `via` is the
-    // relaying node, recorded in the auth audit.
-    if let Err(e) = run_framed(reader, writer, identity, &policy, hub, false, via).await {
+    // relaying node, recorded in the auth audit. The vouched identity carries no
+    // leaf serial — the landing node holds the actual TLS session (ADR 0040 T1).
+    let cert = identity.map(|identity| CertAdmission {
+        identity,
+        serial: None,
+    });
+    // The auth-failure flag is deliberately dropped here: a proxied stream's peer
+    // address is the RELAYING NODE (ADR 0005), which must never be penalized for
+    // a client's bad credentials (ADR 0041 T2).
+    let auth_failed = std::sync::atomic::AtomicBool::new(false);
+    if let Err(e) = run_framed(reader, writer, cert, &policy, hub, false, via, &auth_failed).await {
         warn!(?peer, error = %e, "proxied session ended with error");
     }
 }
@@ -794,13 +881,17 @@ async fn authenticate<R, W>(
     identity: Option<&Identity>,
     policy: &ConnPolicy,
     via: Option<String>,
-) -> Result<Option<Identity>, NetError>
+) -> Result<Option<(Identity, AuthMethod)>, NetError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     if let Some(method) = connect.properties.authentication_method() {
-        enhanced_auth(reader, writer, client, connect, method, policy).await
+        Ok(
+            enhanced_auth(reader, writer, client, connect, method, policy)
+                .await?
+                .map(|id| (id, AuthMethod::Enhanced)),
+        )
     } else {
         authenticate_connect(writer, client, connect, identity, policy, via).await
     }
@@ -819,7 +910,7 @@ async fn authenticate_connect<W>(
     identity: Option<&Identity>,
     policy: &ConnPolicy,
     via: Option<String>,
-) -> Result<Option<Identity>, NetError>
+) -> Result<Option<(Identity, AuthMethod)>, NetError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -832,6 +923,12 @@ where
             password: connect.password.as_deref().unwrap_or(&[]),
         },
         (None, None) => Credentials::Anonymous,
+    };
+    let auth_method = match creds {
+        Credentials::ClientCert { .. } => AuthMethod::Certificate,
+        Credentials::Password { .. } => AuthMethod::Password,
+        Credentials::Token(_) => AuthMethod::Token,
+        Credentials::Anonymous => AuthMethod::Anonymous,
     };
     let method = match creds {
         Credentials::ClientCert { .. } => "certificate",
@@ -849,7 +946,7 @@ where
                 Some(&id.subject),
                 &format!("client {} via {method}{relayed}", client.0),
             );
-            Ok(Some(id))
+            Ok(Some((id, auth_method)))
         }
         Err(e) => {
             let code = if matches!(creds, Credentials::Password { .. }) {
@@ -1188,6 +1285,12 @@ fn negotiate_v5_properties(
         props
             .0
             .push(mqtt_codec::Property::ReceiveMaximum(limits.receive_maximum));
+        // The transport frame cap, stated as the spec's own contract
+        // (ADR 0041 T4): a packet beyond it closes the connection, and now the
+        // client knows the number instead of discovering the constant.
+        props.0.push(mqtt_codec::Property::MaximumPacketSize(
+            limits.max_packet_size,
+        ));
     }
     if server_alias_max > 0 {
         props
@@ -1213,6 +1316,7 @@ async fn serve<R, W>(
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
     keep_alive: u16,
     is_v5: bool,
+    client_max_packet: Option<u32>,
     inbound_aliases: &mut InboundAliases,
     outbound_aliases: &mut OutboundAliases,
 ) -> Result<bool, NetError>
@@ -1232,6 +1336,8 @@ where
     // window against the server's Receive Maximum (ADR 0012). QoS 1 is acked inline so
     // never accumulates; QoS 2 holds a slot from PUBLISH until PUBREL. Overrun → 0x93.
     let mut qos2_inflight: usize = 0;
+    // Per-connection publish-rate limiter (ADR 0041 T3); `None` = unlimited.
+    let mut publish_rate = wire_limits().publish_rate.map(PublishRateLimiter::new);
 
     loop {
         let idle = async {
@@ -1254,6 +1360,13 @@ where
                         }
                     }
                     Some(packet) => {
+                        // Publish-rate throttle (ADR 0041 T3): an empty bucket pauses
+                        // HERE — before processing, with the socket unread — so an
+                        // over-rate publisher backs up its own TCP window. Only
+                        // publishes take tokens; acks/pings/subscribes flow freely.
+                        if let (Some(limiter), Packet::Publish(_)) = (&mut publish_rate, &packet) {
+                            limiter.acquire().await;
+                        }
                         if handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
                             return Ok(true); // client sent DISCONNECT
                         }
@@ -1267,6 +1380,28 @@ where
                     Some(mut pkt) => {
                         if let Packet::Publish(p) = &mut pkt {
                             outbound_aliases.apply(p);
+                        }
+                        // The client's Maximum Packet Size (ADR 0041 T4): a message
+                        // too large for THIS subscriber is dropped for it alone,
+                        // per spec — measured after the alias rewrite (which only
+                        // shrinks), counted, never a connection error.
+                        if let (Some(max), Packet::Publish(_)) = (client_max_packet, &pkt) {
+                            let mut encoded = Vec::new();
+                            let version = if is_v5 {
+                                ProtocolVersion::V5
+                            } else {
+                                ProtocolVersion::V311
+                            };
+                            if pkt.encode(&mut encoded, version).is_ok()
+                                && encoded.len() > max as usize
+                            {
+                                debug!(client = %client.0, size = encoded.len(), max,
+                                       "outbound publish exceeds the client's Maximum Packet Size; dropped for this subscriber");
+                                if let Some(m) = &policy.metrics {
+                                    m.publish_dropped("too-large");
+                                }
+                                continue;
+                            }
                         }
                         writer.send(&pkt).await?;
                     }
@@ -1310,6 +1445,8 @@ async fn drain_signal(policy: &ConnPolicy) {
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
 /// handshakes, and the exactly-once dedup window. Returns `Ok(true)` if the
 /// connection must close (a protocol violation).
+// One arm per (QoS, ack) shape; a flat dispatch, not a refactor smell.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // a connection's full publish-handling context
 async fn handle_publish<W: AsyncWrite + Unpin>(
     publish: Publish,
@@ -1366,8 +1503,14 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             .audit
             .record("acl.deny.publish", Some(&principal.subject), &topic);
     }
-    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| {
+    // Forward to the hub; the returned receiver resolves once the hub's fan-out —
+    // including any durable (fsync'd) offline-queue appends — has completed, so a
+    // QoS ≥ 1 acknowledgement can be released only for a message the broker durably
+    // owns (ADR 0018). `None` when the publish was dropped by the ACL.
+    let forward = |hub: &mpsc::UnboundedSender<HubCommand>|
+     -> Option<oneshot::Receiver<crate::hub::PublishOutcome>> {
         if authorized {
+            let (done_tx, done_rx) = oneshot::channel();
             let _ = hub.send(HubCommand::Publish {
                 topic,
                 payload,
@@ -1375,14 +1518,46 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 retain,
                 message_expiry,
                 app,
+                done: Some(done_tx),
+                v5: is_v5,
             });
+            Some(done_rx)
+        } else {
+            None
         }
     };
     match (qos, pkid) {
-        (QoS::AtMostOnce, _) => forward(hub),
+        (QoS::AtMostOnce, _) => {
+            let _ = forward(hub); // nothing to acknowledge, nothing to gate
+        }
         (QoS::AtLeastOnce, Some(id)) => {
-            forward(hub);
-            writer.send(&Packet::PubAck(id.into())).await?;
+            // Receive Maximum counts QoS 1 and QoS 2 publications TOGETHER
+            // [MQTT-3.3.4]: with `qos2_inflight` windows already open, this QoS 1
+            // publication would be one more concurrent unacknowledged message —
+            // beyond the advertised quota it is a flow-control breach (ADR 0041 T3,
+            // finishing the ADR 0012 §3 deferral). v5 only, as for QoS 2.
+            if is_v5 && *qos2_inflight >= wire_limits().receive_maximum as usize {
+                warn!(client = %client.0, limit = wire_limits().receive_maximum,
+                      "QoS 1 publish beyond Receive Maximum; DISCONNECT 0x93");
+                disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
+                return Ok(true);
+            }
+            let mut ack = mqtt_codec::packet::Ack::from(id);
+            if let Some(done) = forward(hub) {
+                // The hub disappearing mid-shutdown means the message may never be
+                // stored: close without a PUBACK (the publisher retries) rather than
+                // acknowledge a message that could be lost.
+                match done.await {
+                    Err(_) => return Ok(true),
+                    // The retained quota refused the publish (v5, ADR 0041 T4):
+                    // nothing was delivered or retained — say so.
+                    Ok(crate::hub::PublishOutcome::RetainedQuotaExceeded) => {
+                        ack.reason = reason::QUOTA_EXCEEDED;
+                    }
+                    Ok(crate::hub::PublishOutcome::Accepted) => {}
+                }
+            }
+            writer.send(&Packet::PubAck(ack)).await?;
         }
         (QoS::ExactlyOnce, Some(id)) => {
             // Exactly-once inbound [MQTT-4.3.3-2]: forward only the first
@@ -1406,8 +1581,37 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
                     return Ok(true);
                 }
-                *qos2_inflight += 1;
-                forward(hub);
+                let mut rec = mqtt_codec::packet::Ack::from(id);
+                if let Some(done) = forward(hub) {
+                    // As for QoS 1: PUBREC promises the broker owns the message, so
+                    // it is released only after the durable fan-out completes.
+                    match done.await {
+                        Err(_) => return Ok(true),
+                        // Refused by the retained quota (v5, ADR 0041 T4): a
+                        // PUBREC >= 0x80 ends the flow — no slot is consumed and
+                        // the id stays reusable.
+                        Ok(crate::hub::PublishOutcome::RetainedQuotaExceeded) => {
+                            rec.reason = reason::QUOTA_EXCEEDED;
+                        }
+                        Ok(crate::hub::PublishOutcome::Accepted) => {}
+                    }
+                }
+                if rec.reason == 0 {
+                    *qos2_inflight += 1;
+                } else {
+                    // The flow ended at PUBREC: release the dedup record so a
+                    // fresh publish under this id is treated as new.
+                    match &policy.store {
+                        Some(store) => {
+                            let _ = store.clear_received(client, id).await;
+                        }
+                        None => {
+                            qos2_inbound.remove(&id);
+                        }
+                    }
+                }
+                writer.send(&Packet::PubRec(rec)).await?;
+                return Ok(false);
             }
             writer.send(&Packet::PubRec(id.into())).await?;
         }
@@ -1416,7 +1620,46 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     Ok(false)
 }
 
+/// Per-connection inbound publish-rate limiter (ADR 0041 T3): a token bucket
+/// with a one-second burst. An empty bucket **pauses the read** — TCP
+/// backpressure, the transport's native flow control — so a bursty-but-compliant
+/// client just slows down and an abusive one saturates its own connection, not
+/// the broker. Nothing is dropped and nothing is disconnected.
+struct PublishRateLimiter {
+    tokens: f64,
+    last: std::time::Instant,
+    rate: f64,
+}
+
+impl PublishRateLimiter {
+    fn new(rate: u32) -> Self {
+        PublishRateLimiter {
+            tokens: f64::from(rate),
+            last: std::time::Instant::now(),
+            rate: f64::from(rate),
+        }
+    }
+
+    /// Take one token, sleeping (pausing this connection's reads) until one is due.
+    async fn acquire(&mut self) {
+        let now = std::time::Instant::now();
+        self.tokens =
+            (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate).min(self.rate);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return;
+        }
+        let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
+        tokio::time::sleep(wait).await;
+        self.last = std::time::Instant::now();
+        self.tokens = 0.0;
+    }
+}
+
 /// Handle one inbound packet. Returns `Ok(true)` if the connection should close.
+// One arm per packet type; a flat dispatch table, not a refactor smell.
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // a connection's full inbound-handling context
 async fn handle_inbound<W: AsyncWrite + Unpin>(
     packet: Packet,
@@ -1510,10 +1753,32 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 }
             }
             if !granted.is_empty() {
+                // Subscription quota (ADR 0041 T3): the hub answers one verdict per
+                // ACL-granted filter BEFORE any retained replay, so the SUBACK below
+                // still precedes replayed publishes on the wire. A quota-denied
+                // filter answers 0x97 Quota exceeded (v5) / 0x80 (v3.1.1) in its slot.
+                let (reply_tx, reply_rx) = oneshot::channel();
                 let _ = hub.send(HubCommand::Subscribe {
                     client: client.clone(),
                     filters: granted,
+                    reply: Some(reply_tx),
                 });
+                let Ok(verdicts) = reply_rx.await else {
+                    return Ok(true); // hub shut down mid-subscribe: close
+                };
+                let denied_code = if is_v5 {
+                    reason::QUOTA_EXCEEDED
+                } else {
+                    SUBACK_FAILURE
+                };
+                // Walk the granted slots (the codes currently carrying a QoS) and
+                // overwrite the ones the quota denied, in order.
+                let mut v = verdicts.iter();
+                for code in &mut return_codes {
+                    if *code != SUBACK_FAILURE && !v.next().copied().unwrap_or(true) {
+                        *code = denied_code;
+                    }
+                }
             }
             writer
                 .send(&Packet::SubAck(SubAck {
@@ -1810,16 +2075,32 @@ mod tests {
         tokio::spawn(async move {
             let mut keep_alive = Vec::new();
             while let Some(cmd) = hub_rx.recv().await {
-                if let HubCommand::Attach {
-                    client,
-                    outbound,
-                    reply,
-                    ..
-                } = cmd
-                {
-                    record.lock().unwrap().push(client.0.clone());
-                    keep_alive.push(outbound);
-                    let _ = reply.send(AttachOutcome::Present(false));
+                match cmd {
+                    HubCommand::Attach {
+                        client,
+                        outbound,
+                        reply,
+                        ..
+                    } => {
+                        record.lock().unwrap().push(client.0.clone());
+                        keep_alive.push(outbound);
+                        let _ = reply.send(AttachOutcome::Present(false));
+                    }
+                    // Release any gated acknowledgement, as the real hub would.
+                    HubCommand::Publish {
+                        done: Some(done), ..
+                    } => {
+                        let _ = done.send(crate::hub::PublishOutcome::Accepted);
+                    }
+                    // Grant every quota verdict, as an uncapped hub would (ADR 0041 T3).
+                    HubCommand::Subscribe {
+                        filters,
+                        reply: Some(reply),
+                        ..
+                    } => {
+                        let _ = reply.send(vec![true; filters.len()]);
+                    }
+                    _ => {}
                 }
             }
         });
@@ -1947,8 +2228,12 @@ mod tests {
                         keep_alive.push(outbound);
                         let _ = reply.send(AttachOutcome::Present(false));
                     }
-                    HubCommand::Publish { topic, .. } => {
+                    HubCommand::Publish { topic, done, .. } => {
                         let _ = tx.send(topic);
+                        // Release any gated acknowledgement, as the real hub would.
+                        if let Some(done) = done {
+                            let _ = done.send(crate::hub::PublishOutcome::Accepted);
+                        }
                     }
                     _ => {}
                 }

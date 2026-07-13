@@ -72,6 +72,13 @@ futures-util = "0.3"
 # matching the rest of the broker; already in-tree transitively on our rustls 0.23.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 
+# Test/dev builds keep file:line panic locations but drop full debuginfo:
+# the workspace's ~30 integration-test binaries at debug=2 exceed 20 GiB of
+# target/ churn per rebuild, which exhausts CI/dev disk for no diagnostic
+# gain (failures are diagnosed from logs + file:line backtraces).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

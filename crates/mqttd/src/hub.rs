@@ -31,14 +31,18 @@
 
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
-use mqtt_cluster::peer::PeerMessage;
+use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
-use mqtt_codec::{packet::Publish, Packet, QoS};
+use mqtt_codec::{
+    packet::{Disconnect, Publish},
+    Packet, ProtocolVersion, QoS,
+};
 use mqtt_core::{
     parse_shared, topic_matches, AppProperties, ClientId, Message, SharedSubscriptionTable,
     Subscription, SubscriptionTable,
 };
+use mqtt_storage::app_props::AppProps;
 use mqtt_storage::retained_log::DurableRetained;
 use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionClaim, SessionStore,
@@ -135,6 +139,118 @@ pub type Outbound = mpsc::UnboundedSender<Packet>;
 /// Sender for messages destined to a peer node's link.
 pub type PeerOutbound = mpsc::UnboundedSender<PeerMessage>;
 
+/// How a connection authenticated (ADR 0040 T1): the credential class whose
+/// server-side facts a policy-reload sweep can re-check. `Token`/`Enhanced`
+/// credentials carry their own lifetime (a JWT's `exp`; a mechanism exchange) and
+/// have no server-side store row to probe, so a sweep bounds them via the ACL only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// No credentials (only admitted when the policy opts in).
+    Anonymous,
+    /// Username/password against the credential store.
+    Password,
+    /// A bearer token (JWT/OIDC).
+    Token,
+    /// A TLS-verified client certificate (mTLS subject).
+    Certificate,
+    /// An MQTT 5 enhanced-auth exchange (ADR 0013).
+    Enhanced,
+}
+
+/// The server-side revocable facts a connection was admitted under (ADR 0040 T1):
+/// what a policy-reload sweep re-evaluates against the new policy. Recorded at
+/// CONNECT and kept with the online entry — the broker retains *facts about* the
+/// admission (subject, method, certificate serial), never replayable credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    /// The authenticated principal (subject + groups); its `subject` is the session
+    /// owner (ADR 0031). The full identity is kept so sweep-time authorization checks
+    /// see exactly what admission-time checks saw.
+    pub identity: mqtt_auth::Identity,
+    /// How the connection authenticated.
+    pub method: AuthMethod,
+    /// The mTLS leaf certificate's serial number (big-endian bytes as encoded in the
+    /// certificate) when one was presented at *this* hop; `None` on plaintext, on
+    /// no-cert listeners, and for proxied sessions (ADR 0005 — the landing node holds
+    /// the actual TLS session and its serial).
+    pub cert_serial: Option<Vec<u8>>,
+    /// The connection's negotiated MQTT protocol version: an evicted v5 client is
+    /// told why (DISCONNECT `0x87`); v3.1.1 has no server DISCONNECT, so it just
+    /// gets the close.
+    pub protocol: ProtocolVersion,
+}
+
+/// The new policy a successful security reload published, handed to the hub for
+/// the identity sweep (ADR 0040 T2). Carries `Arc`s to exactly the values the
+/// reload swapped into the live `watch` channels, so the sweep and the next
+/// admission see the same policy.
+pub struct SweepPolicy {
+    /// The new authorizer (connect-ACL re-check).
+    pub authorizer: Arc<dyn mqtt_auth::Authorizer>,
+    /// The new authenticator (password-user existence probe).
+    pub authenticator: Arc<dyn mqtt_auth::Authenticator>,
+    /// The client-listener CRL's revoked serials (empty when none is configured).
+    pub revoked: mqtt_auth::signed_gossip::RevocationList,
+    /// The cluster CRL's revoked serials (ADR 0040 T4; empty when none is
+    /// configured) — the peer sweep tears down established links these name.
+    pub peer_revoked: mqtt_auth::signed_gossip::RevocationList,
+    /// What fired the reload (`signal` / `watch`), for the audit trail.
+    pub trigger: String,
+    /// Audit sink for the per-eviction `security.evict` records.
+    pub audit: Arc<dyn mqtt_observability::AuditSink>,
+}
+
+impl std::fmt::Debug for SweepPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SweepPolicy")
+            .field("revoked", &self.revoked.len())
+            .field("trigger", &self.trigger)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The live authorizer handle the hub consults for resume-time grant re-checks
+/// (ADR 0040 T3) — the same `watch` channel the connections read, so the hub and
+/// the admission path always see the same policy. A newtype so [`HubCommand`]
+/// stays `Debug`.
+pub struct AuthzWatch(pub tokio::sync::watch::Receiver<Arc<dyn mqtt_auth::Authorizer>>);
+
+impl std::fmt::Debug for AuthzWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthzWatch").finish_non_exhaustive()
+    }
+}
+
+/// Per-client quota configuration (ADR 0041 T3), set once at startup via
+/// [`HubCommand::SetQuotas`]. Unset caps admit everything — today's behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Quotas {
+    /// The most subscriptions one client may hold; a SUBSCRIBE filter beyond it
+    /// is denied `0x97 Quota exceeded` (v5) / `0x80` (v3.1.1) in its SUBACK slot.
+    /// Re-subscribing an already-held filter never consumes quota (it replaces).
+    pub max_subscriptions_per_client: Option<usize>,
+    /// The most retained topics this node stores (ADR 0041 T4). A retained
+    /// publish creating a NEW topic beyond it is refused — the cap stops growth,
+    /// never maintenance: overwriting or clearing an existing topic always works.
+    pub max_retained_messages: Option<usize>,
+    /// The most sessions (online + retained-offline) this node holds. A CONNECT
+    /// creating a NEW session beyond it is refused (`0x97` v5 / Server
+    /// unavailable v3.1.1); resuming an existing session always works.
+    pub max_sessions: Option<usize>,
+}
+
+/// How the hub disposed of a publish, reported through the ack-gate channel
+/// (ADR 0018/0041): the connection releases the publisher's acknowledgement —
+/// or answers `0x97 Quota exceeded` — accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Fanned out (and durably appended where applicable) — ack normally.
+    Accepted,
+    /// A v5 retained publish would have created a new retained topic beyond the
+    /// quota: nothing was delivered or retained — answer `0x97` (ADR 0041 T4).
+    RetainedQuotaExceeded,
+}
+
 /// A currently-online client connection.
 #[derive(Debug)]
 struct Online {
@@ -144,6 +260,12 @@ struct Online {
     tx: Outbound,
     /// Will message published if this connection ends ungracefully.
     will: Option<Message>,
+    /// The revocable facts this connection was admitted under (ADR 0040 T1).
+    admission: Admission,
+    /// When this connection attached: a takeover-window re-delivery
+    /// (ADR 0042 T9) skips clients attached BEFORE the publish first fanned
+    /// out — they already received it live; re-sending would duplicate.
+    attached_at: Instant,
 }
 
 /// Downstream acknowledgement state of an unacked `QoS` > 0 message.
@@ -242,6 +364,10 @@ pub enum AttachOutcome {
     /// connection may not resume or take it over (ADR 0031). The connection must reject the
     /// CONNACK as Not-authorized; the existing session is left untouched.
     OwnerMismatch,
+    /// Creating this session would exceed the node's session quota (ADR 0041 T4).
+    /// The connection rejects the CONNACK (`0x97` v5 / Server unavailable v3.1.1);
+    /// resuming an existing session is never refused for quota.
+    QuotaExceeded,
 }
 
 /// The outcome of the off-loop durable recovery for a persistent attach (ADR 0017).
@@ -276,8 +402,9 @@ pub enum SessionRecovery {
 pub struct PendingAttach {
     /// The client identifier.
     client: ClientId,
-    /// The authenticated principal's stable subject — the owner to bind/verify (ADR 0031).
-    owner: String,
+    /// The revocable facts the connection was admitted under (ADR 0040 T1); its
+    /// `subject` is the owner to bind/verify (ADR 0031).
+    admission: Admission,
     /// Unique id for this physical connection (guards last-writer-wins on overlap).
     conn_id: u64,
     /// MQTT 5.0 Session Expiry Interval (seconds).
@@ -300,9 +427,10 @@ pub enum HubCommand {
     Attach {
         /// The client identifier.
         client: ClientId,
-        /// The authenticated principal's stable subject (mTLS CN / username / token subject,
-        /// or the shared `"anonymous"` principal). Binds the session to its owner (ADR 0031).
-        owner: String,
+        /// The revocable facts the connection was admitted under (ADR 0040 T1). Its
+        /// `subject` (mTLS CN / username / token subject, or the shared `"anonymous"`
+        /// principal) binds the session to its owner (ADR 0031).
+        admission: Admission,
         /// Unique id for this physical connection.
         conn_id: u64,
         /// MQTT 5.0 Clean Start: discard any existing session before attaching
@@ -336,7 +464,19 @@ pub enum HubCommand {
         client: ClientId,
         /// Topic filters being subscribed to, with their granted `QoS`.
         filters: Vec<(String, QoS)>,
+        /// When present, the hub answers with one flag per filter — `false` for a
+        /// filter the subscription quota denied (ADR 0041 T3) — BEFORE any
+        /// retained replay, so the connection's SUBACK precedes the replayed
+        /// publishes. `None` skips the quota round-trip (internal callers).
+        reply: Option<oneshot::Sender<Vec<bool>>>,
     },
+    /// Set the per-client quotas (ADR 0041 T3). Sent once at startup, before any
+    /// listener accepts.
+    SetQuotas(Quotas),
+    /// Enter or leave disk **brownout** (ADR 0041 T5): sent by the store-size
+    /// watcher on watermark transitions. Under brownout, growth writes are
+    /// refused with the quota behaviors while maintenance continues.
+    SetBrownout(bool),
     /// Remove subscriptions for a client.
     Unsubscribe {
         /// The unsubscribing client.
@@ -359,6 +499,16 @@ pub enum HubCommand {
         message_expiry: Option<u32>,
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
+        /// Signalled once the on-loop fan-out — including any durable (fsync'd)
+        /// offline-queue appends — has completed, so the connection releases a
+        /// `QoS` ≥ 1 acknowledgement only for a message the broker durably owns
+        /// (ADR 0018). `None` when no acknowledgement is gated on the fan-out.
+        done: Option<oneshot::Sender<PublishOutcome>>,
+        /// Whether the publisher speaks MQTT 5 (ADR 0041 T4): an over-quota
+        /// retained publish is refused outright for v5 (the publisher gets
+        /// `0x97`); v3.1.1 has no reason codes, so it is delivered live but not
+        /// retained.
+        v5: bool,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -391,6 +541,29 @@ pub enum HubCommand {
         /// any other end (the will is published) [MQTT-3.14.4-3].
         graceful: bool,
     },
+    /// Terminate a client's live session server-side (ADR 0040 T1): the eviction
+    /// primitive the policy-reload sweeps drive. A v5 client is told why
+    /// (DISCONNECT `0x87` Not authorized) before the close; v3.1.1 has no server
+    /// DISCONNECT, so its connection just closes. Ends like any ungraceful
+    /// disconnect: the will is published and session retention (ADR 0009)
+    /// proceeds normally. Evicting an offline client is a no-op.
+    Evict {
+        /// The client whose session to terminate.
+        client: ClientId,
+        /// Why (for the log/audit trail), e.g. `cert-revoked`, `user-removed`.
+        reason: String,
+    },
+    /// A successful security reload published a new policy — sweep the online table
+    /// against it (ADR 0040 T2/T3): identity-level revocation terminates sessions;
+    /// permission-level tightening removes subscription grants. Sent by the
+    /// [`Reloader`](crate::reload::Reloader) after the swap.
+    SweepIdentities(SweepPolicy),
+    /// Hand the hub the live authorizer handle (ADR 0040 T3), consulted when a
+    /// persistent session resumes: restored subscriptions are re-authorized under
+    /// the resuming principal's full identity, so an offline session's tightened
+    /// grants are revoked at the moment delivery could resume. Sent once at
+    /// startup, before any listener accepts.
+    AttachAuthorizer(AuthzWatch),
 
     /// A peer node's link came up; register it and send our interest snapshot.
     PeerConnected {
@@ -400,6 +573,12 @@ pub enum HubCommand {
         conn_id: u64,
         /// Channel to send messages to that peer.
         tx: PeerOutbound,
+        /// The remote leaf certificate's serial from the mTLS handshake
+        /// (ADR 0040 T4); `None` on a plaintext mesh.
+        cert_serial: Option<Vec<u8>>,
+        /// The peer-bus protocol version negotiated on the link (ADR 0038): the
+        /// hub sends a frame introduced in proto N only when `proto >= N`.
+        proto: u32,
     },
     /// A peer node's link went down.
     PeerDisconnected {
@@ -438,9 +617,9 @@ pub enum HubCommand {
     RemoteRetainedSnapshot {
         /// The peer the snapshot came from (divergence attribution, ADR 0037 P1).
         node: NodeId,
-        /// Each entry as `(topic, payload, QoS, epoch, offset)`; token `(0, 0)` =
-        /// uncommitted (gap-fill only).
-        messages: Vec<(String, Bytes, QoS, u64, u64)>,
+        /// The wire entries as received; token `(0, 0)` = uncommitted (gap-fill
+        /// only). Application properties ride each entry (ADR 0038 T3).
+        messages: Vec<RetainedWireEntry>,
     },
     /// A peer's retained digest, sent on link-up instead of the full snapshot
     /// (0014-T6). If both the topic-set hash and the value hash match our own there is
@@ -476,6 +655,9 @@ pub enum HubCommand {
         payload: Bytes,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The publisher's forwardable application properties (ADR 0038 T3),
+        /// committed with the value.
+        app: AppProperties,
         /// The sender's handoff sequence (echoed in the ack; dedup key).
         seq: u64,
     },
@@ -503,12 +685,18 @@ pub enum HubCommand {
         payload: Bytes,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The application properties the commit carried (ADR 0038 T3) — fanned out
+        /// with the value on success, kept with the re-queued mutation on failure.
+        app: AppProperties,
         /// `Some((epoch, offset))` on success; `None` = the commit failed and the
         /// mutation is re-queued.
         token: Option<(u64, u64)>,
         /// Set when a peer routed this mutation here (T8): the `(node, seq)` to send
         /// the commit-gated ack back to on success.
         reply: Option<(NodeId, u64)>,
+        /// The pending publish gated on this commit (ADR 0042 T9, exhibit ⑦), if
+        /// the mutation originated from a gated local publish.
+        publish: Option<u64>,
     },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
@@ -524,6 +712,8 @@ pub enum HubCommand {
         epoch: u64,
         /// The committed log offset (token low half).
         offset: u64,
+        /// The committed application properties (ADR 0038 T3).
+        app: AppProperties,
     },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
@@ -541,6 +731,42 @@ pub enum HubCommand {
         message_expiry: Option<u32>,
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
+    },
+    /// An **acknowledged** publish forward from a peer (ADR 0042 T9, exhibit ⑤;
+    /// proto 3): local delivery only (never re-forwarded), answered with a
+    /// durability-gated [`PeerMessage::PublishAck`] once the local fan-out —
+    /// including any durable offline enqueue — has completed. Duplicates
+    /// (retransmissions) are delivered again: legal at `QoS` 1.
+    RemotePublishAcked {
+        /// The peer the forward arrived from (where the ack is sent).
+        node: NodeId,
+        /// The sender's forward sequence (correlates the ack).
+        seq: u64,
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Bytes,
+        /// The original publish `QoS` (local downgrade still applies).
+        qos: QoS,
+        /// Whether the publish carried the retain flag (same rules as
+        /// [`RemotePublish`](Self::RemotePublish)).
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds). `None` = no expiry.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
+    },
+    /// A peer's durability-gated answer to a forwarded publish (ADR 0042 T9,
+    /// exhibit ⑤): resolves the matching obligation on the pending publish that
+    /// forwarded it, releasing the publisher's acknowledgement when it was the
+    /// last one outstanding.
+    RemotePublishAck {
+        /// The peer that answered.
+        node: NodeId,
+        /// The forward sequence being answered.
+        seq: u64,
+        /// Whether the peer's local fan-out (durable appends included) succeeded.
+        ok: bool,
     },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
@@ -569,6 +795,15 @@ pub enum HubCommand {
         /// The durable-plane frame to route.
         frame: PeerMessage,
     },
+    /// **Internal**: the off-loop inherited-session scan finished (ADR 0042 T9,
+    /// exhibit ⑥) — every session the durable store holds, with subscriptions and
+    /// expiry deadline. The loop materializes the OWNED, not-yet-known ones into
+    /// the routing table so a publish arriving before the client's first re-attach
+    /// enqueues instead of routing to nothing.
+    InheritedSessions {
+        /// `(client, subscriptions, expiry deadline)` per stored session.
+        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    },
     /// Liveness probe (the health endpoint): the hub replies as soon as the actor
     /// loop dequeues this command, proving the loop is draining and not wedged.
     Ping {
@@ -582,6 +817,12 @@ pub enum HubCommand {
 struct Peer {
     conn_id: u64,
     tx: PeerOutbound,
+    /// The remote leaf certificate's serial (big-endian bytes) from the link's
+    /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
+    /// (ADR 0040 T4). `None` on a plaintext mesh.
+    cert_serial: Option<Vec<u8>>,
+    /// The peer-bus protocol version negotiated on the link (ADR 0038).
+    proto: u32,
 }
 
 /// The smaller of two `QoS` levels (delivery downgrade rule [MQTT-3.8.4-6]).
@@ -640,6 +881,18 @@ pub struct Hub {
     /// addition to the local cache above. `None` (durable off) keeps ADR 0014
     /// best-effort behaviour unchanged.
     durable_retained: Option<Arc<dyn DurableRetained>>,
+    /// The live authorizer for resume-time grant re-checks (ADR 0040 T3); `None`
+    /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
+    /// without a reloadable policy keep today's restore-as-persisted behavior.
+    authz: Option<AuthzWatch>,
+    /// Disk brownout (ADR 0041 T5): set while the stores' on-disk size exceeds
+    /// `MQTTD_STORE_MAX_BYTES`. Growth writes (new retained topics, new sessions,
+    /// offline enqueues) are refused with the quota behaviors; acks, deletes,
+    /// expiry, and resumes continue — read-mostly, not read-only, and never the
+    /// disk-full cliff.
+    brownout: bool,
+    /// Per-client quotas (ADR 0041 T3); default = uncapped.
+    quotas: Quotas,
     /// The `(epoch, offset)` convergence token each cached retained topic was applied
     /// at (ADR 0037 §3): a fan-out/back-fill value is applied only when its token
     /// exceeds the held one — monotonic per topic, idempotent, order-insensitive. A
@@ -675,6 +928,24 @@ pub struct Hub {
     /// Owner side (T8): the handoff currently queued/committing per routing peer, so
     /// a retransmission that overtakes the commit is not enqueued twice.
     retained_handoff_pending: HashMap<NodeId, u64>,
+    /// Publishes whose `QoS` 1 acknowledgement awaits cluster-wide durability
+    /// (ADR 0042 T9): keyed by a monotonic id, ordered so the cap drops the
+    /// oldest. Entries resolve via forward acks, the retained commit, and the
+    /// local fan-out; the sweep tick retransmits and re-routes.
+    pending_publishes: BTreeMap<u64, PendingPublish>,
+    /// Monotonic pending-publish id source.
+    publish_ids: u64,
+    /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤).
+    forward_seq: u64,
+    /// Forward seq → pending publish id, for ack resolution.
+    forward_index: HashMap<u64, u64>,
+    /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
+    /// exhibit ⑥) — one at a time.
+    inherited_scan_inflight: bool,
+    /// Sweep ticks remaining of eager takeover reconciliation: set on `PeerDead`
+    /// so inherited sessions materialize within seconds, not on the slow
+    /// [`EXPIRY_RECONCILE_EVERY`] cadence.
+    takeover_reconcile_ticks: u8,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -738,9 +1009,73 @@ struct RetainedMutation {
     payload: Bytes,
     /// The publish `QoS` as its 2-bit wire value.
     qos: u8,
+    /// The publisher's forwardable application properties (ADR 0038 T3), committed
+    /// into the durable record with the value.
+    app: AppProperties,
     /// Set when a peer routed this mutation here (T8): the `(node, seq)` its
     /// commit-gated ack goes back to.
     reply: Option<(NodeId, u64)>,
+    /// The pending publish whose acknowledgement is gated on this mutation's
+    /// authority commit (ADR 0042 T9, exhibit ⑦). Survives re-queues and rides
+    /// the handoff hold, so the gate holds however long the commit takes.
+    publish: Option<u64>,
+}
+
+/// The bound on publishes whose acknowledgement awaits cluster-wide durability
+/// (ADR 0042 T9). Publisher inflight windows (`receive_maximum`) bound this
+/// naturally; the cap is a backstop against a partition outlasting every window.
+/// At the cap the **oldest** pending publish is dropped loudly — its ack is
+/// withheld, so the publisher retries (never an ack for an unowned message).
+const PENDING_PUBLISH_CAP: usize = 4096;
+
+/// Sweep ticks a pending publish waits after its forward target **died** with no
+/// current remote interest in the topic, before concluding the interest genuinely
+/// ended (session gone) rather than being mid-takeover: the dead owner's successor
+/// materializes inherited sessions and re-advertises their filters (exhibit ⑥ fix)
+/// within this window in any live cluster. Sized to outlast SWIM confirmation plus
+/// the successor's inherited-session scan; the cost of the margin is only a slower
+/// (withheld) ack for a publish whose subscriber genuinely no longer exists.
+const REROUTE_GRACE_TICKS: u8 = 8;
+
+// The bools are independent obligations, not an encodable state machine.
+#[allow(clippy::struct_excessive_bools)]
+/// A `QoS` 1 publish whose acknowledgement is gated on **cluster-wide** durability
+/// (ADR 0042 T9): the local fan-out's durable appends (synchronous), the retained
+/// authority commit (exhibit ⑦), and one durability-gated ack per acked peer
+/// forward (exhibit ⑤). The ack releases only when every obligation resolves;
+/// a terminal failure drops the entry, withholding the ack (the publisher retries).
+#[derive(Debug)]
+struct PendingPublish {
+    /// Releases the publisher's acknowledgement (dropped = withheld).
+    done: oneshot::Sender<PublishOutcome>,
+    /// The forwarded frame, kept for retransmission and takeover re-routing.
+    topic: String,
+    payload: Bytes,
+    qos: QoS,
+    retain: bool,
+    message_expiry: Option<u32>,
+    app: AppProperties,
+    /// Outstanding forward acks: forward seq → target node.
+    awaiting: HashMap<u64, NodeId>,
+    /// Peers whose durability ack already arrived — a takeover re-route never
+    /// re-obligates them.
+    acked_nodes: HashSet<NodeId>,
+    /// Whether the retained authority commit is still outstanding (exhibit ⑦).
+    awaiting_retained: bool,
+    /// Set once the on-loop local fan-out (durable appends included) completed OK.
+    local_done: bool,
+    /// When the publish first fanned out — the cutoff for re-delivery (only
+    /// clients attached or materialized AFTER this can have missed it).
+    created_at: Instant,
+    /// Engaged when a forward target died: counts down sweep ticks with no
+    /// re-routable remote interest before the obligation is considered moot
+    /// (see [`REROUTE_GRACE_TICKS`]).
+    reroute_grace: Option<u8>,
+    /// Set when the publish arrived during a takeover window (an inherited-session
+    /// scan pending or running): the ack waits until the scan lands, then the
+    /// publish re-delivers locally against the just-materialized subscriptions
+    /// (exhibit ⑥'s ack-into-the-void window; duplicates are legal at `QoS` 1).
+    awaiting_settle: bool,
 }
 
 /// The order-independent digest of a retained set (0014-T6 + ADR 0037 P1): the topic
@@ -748,26 +1083,32 @@ struct RetainedMutation {
 /// `(topic, payload, qos)` **value** hash. Independent of iteration order and cheap to
 /// compare (a collision merely skips a best-effort back-fill / detection). Equal topic
 /// hashes with **differing value hashes** mean divergence: same topics, different values.
-fn retained_digest<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8], u8)>) -> (u64, u64, u64) {
+fn retained_digest<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a [u8], u8, Vec<u8>)>,
+) -> (u64, u64, u64) {
     let mut count = 0u64;
     let mut hash = 0u64;
     let mut value_hash = 0u64;
-    for (topic, payload, qos) in entries {
+    for (topic, payload, qos, props) in entries {
         count += 1;
         hash ^= mqtt_cluster::hrw::stable_id(topic.as_bytes());
-        value_hash ^= retained_value_id(topic, payload, qos);
+        value_hash ^= retained_value_id(topic, payload, qos, &props);
     }
     (count, hash, value_hash)
 }
 
-/// A stable 64-bit hash of one retained `(topic, payload, qos)` value (ADR 0037 P1).
-/// The topic is length-prefixed so `("a", "bc")` and `("ab", "c")` cannot collide.
-fn retained_value_id(topic: &str, payload: &[u8], qos: u8) -> u64 {
-    let mut bytes = Vec::with_capacity(8 + topic.len() + payload.len() + 1);
+/// A stable 64-bit hash of one retained `(topic, payload, qos, props)` value
+/// (ADR 0037 P1). The topic is length-prefixed so `("a", "bc")` and `("ab", "c")`
+/// cannot collide; the canonical props encoding (ADR 0038 T3) is folded in so two
+/// caches holding the same payload with different application properties still read
+/// as divergent and reconcile by token.
+fn retained_value_id(topic: &str, payload: &[u8], qos: u8, props: &[u8]) -> u64 {
+    let mut bytes = Vec::with_capacity(8 + topic.len() + payload.len() + 1 + props.len());
     bytes.extend_from_slice(&(topic.len() as u64).to_be_bytes());
     bytes.extend_from_slice(topic.as_bytes());
     bytes.extend_from_slice(payload);
     bytes.push(qos);
+    bytes.extend_from_slice(props);
     mqtt_cluster::hrw::stable_id(&bytes)
 }
 
@@ -775,22 +1116,20 @@ fn retained_value_id(topic: &str, payload: &[u8], qos: u8) -> u64 {
 /// [`RETAINED_CHUNK_BYTES`] (0014-T8). A single entry larger than the whole budget is
 /// skipped with a warning — it could never fit a frame, and sending it would sever the
 /// link instead of just missing one back-fill.
-/// One retained snapshot wire entry: `(topic, payload, qos, epoch, offset)` — the
-/// token halves per ADR 0037 P5; an empty payload is a committed clear.
-type RetainedWireEntry = (String, Vec<u8>, u8, u64, u64);
-
 fn chunk_retained(entries: impl Iterator<Item = RetainedWireEntry>) -> Vec<Vec<RetainedWireEntry>> {
     // Fixed per-entry overhead estimate for bincode length prefixes, the QoS byte,
-    // and the two u64 token halves (ADR 0037 P5).
+    // and the two u64 token halves (ADR 0037 P5); the variable-length application
+    // properties (ADR 0038 T3) are sized per entry.
     const ENTRY_OVERHEAD: usize = 48;
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut current_bytes = 0usize;
-    for (topic, payload, qos, epoch, offset) in entries {
-        let size = topic.len() + payload.len() + ENTRY_OVERHEAD;
+    for entry in entries {
+        let size =
+            entry.topic.len() + entry.payload.len() + entry.props.size_hint() + ENTRY_OVERHEAD;
         if size > RETAINED_CHUNK_BYTES {
             warn!(
-                topic = %topic,
+                topic = %entry.topic,
                 bytes = size,
                 "retained message exceeds the snapshot chunk budget; skipping back-fill for it"
             );
@@ -801,7 +1140,7 @@ fn chunk_retained(entries: impl Iterator<Item = RetainedWireEntry>) -> Vec<Vec<R
             current_bytes = 0;
         }
         current_bytes += size;
-        current.push((topic, payload, qos, epoch, offset));
+        current.push(entry);
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -861,6 +1200,9 @@ impl Hub {
                 durable_plane: None,
                 retained: Box::new(MemoryRetainedStore::new()),
                 durable_retained: None,
+                authz: None,
+                brownout: false,
+                quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
@@ -868,6 +1210,17 @@ impl Hub {
                 retained_handoff_seq: 0,
                 retained_handoff_seen: HashMap::new(),
                 retained_handoff_pending: HashMap::new(),
+                pending_publishes: BTreeMap::new(),
+                publish_ids: 0,
+                forward_seq: 0,
+                forward_index: HashMap::new(),
+                inherited_scan_inflight: false,
+                // A boot window (like the post-PeerDead takeover window): a
+                // restarted or newly-joined node may already own groups with
+                // orphaned sessions, and eagerly recovering them BEFORE workload
+                // arrives keeps the first-touch epoch bumps (which transiently
+                // break quorum for concurrent appends) out of the hot path.
+                takeover_reconcile_ticks: 8,
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -918,6 +1271,10 @@ impl Hub {
     pub async fn run(mut self) {
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The boot window's FIRST inherited-session scan runs immediately, not a
+        // sweep tick later: on a fresh or restarted node it completes in
+        // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
+        self.spawn_inherited_session_scan();
         loop {
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
@@ -933,17 +1290,22 @@ impl Hub {
                     // or quorum returning on links that never dropped. No-ops when idle.
                     self.retry_retained_handoff();
                     self.kick_retained_queue();
+                    // Retransmit / re-route acked publish forwards (ADR 0042 T9,
+                    // exhibit ⑤); no-op when none are pending.
+                    self.sweep_pending_forwards().await;
                 }
             }
         }
     }
 
     /// Dispatch one command to its handler.
+    // One arm per command; a flat dispatch table, not a refactor smell.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(&mut self, cmd: HubCommand) {
         match cmd {
             HubCommand::Attach {
                 client,
-                owner,
+                admission,
                 conn_id,
                 clean_start,
                 session_expiry,
@@ -955,7 +1317,7 @@ impl Hub {
                 self.attach(
                     PendingAttach {
                         client,
-                        owner,
+                        admission,
                         conn_id,
                         session_expiry,
                         receive_maximum,
@@ -969,8 +1331,27 @@ impl Hub {
             HubCommand::SessionRecovered { pending, recovery } => {
                 self.session_recovered(pending, recovery).await;
             }
-            HubCommand::Subscribe { client, filters } => {
-                self.subscribe(&client, filters).await;
+            HubCommand::Subscribe {
+                client,
+                filters,
+                reply,
+            } => {
+                self.subscribe(&client, filters, reply).await;
+            }
+            HubCommand::SetQuotas(quotas) => {
+                self.quotas = quotas;
+            }
+            HubCommand::SetBrownout(on) => {
+                if on != self.brownout {
+                    if on {
+                        warn!(
+                            "disk watermark exceeded: BROWNOUT — growth writes refused (ADR 0041)"
+                        );
+                    } else {
+                        info!("disk usage back under the watermark: brownout lifted (ADR 0041)");
+                    }
+                }
+                self.brownout = on;
             }
             HubCommand::Unsubscribe { client, filters } => {
                 self.unsubscribe(&client, &filters).await;
@@ -979,20 +1360,62 @@ impl Hub {
                 topic,
                 payload,
                 qos,
-                retain,
+                mut retain,
                 message_expiry,
                 app,
+                done,
+                v5,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
                 }
+                // Retained quota (ADR 0041 T4): a retained publish that would CREATE
+                // a new topic beyond the cap. Growth is refused; overwrite and clear
+                // (empty payload) always work. v5: refuse outright (the publisher is
+                // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
+                if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
+                    if let Some(m) = &self.metrics {
+                        m.quota_rejected("retained");
+                    }
+                    if v5 {
+                        warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
+                        if let Some(done) = done {
+                            let _ = done.send(PublishOutcome::RetainedQuotaExceeded);
+                        }
+                        return;
+                    }
+                    warn!(topic = %topic,
+                          "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
+                    retain = false;
+                }
+                // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
+                // the fan-out can attach its cluster-wide obligations: acked peer
+                // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
+                let gate = done.map(|done| {
+                    self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
+                });
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
-                self.publish(&topic, &payload, qos, retain, message_expiry, &app)
+                let durable_ok = self
+                    .publish(&topic, &payload, qos, retain, message_expiry, &app, gate)
                     .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
+                }
+                // The LOCAL fan-out (and its durable appends) is complete: resolve
+                // that obligation — the ack releases once every cluster-wide
+                // obligation has (ADR 0018 + ADR 0042 T9; the local-only publish
+                // completes right here). A failed durable append WITHHOLDS the ack
+                // instead (drop the entry): the publisher's connection closes
+                // unacked and it retries — fail closed, never an ack for a message
+                // a subscriber will never see (ADR 0041 T5).
+                if let Some(id) = gate {
+                    if durable_ok {
+                        self.pending_local_done(id);
+                    } else {
+                        self.drop_pending(id);
+                    }
                 }
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
@@ -1004,6 +1427,27 @@ impl Hub {
                 graceful,
             } => {
                 self.detach(&client, conn_id, graceful).await;
+            }
+            HubCommand::Evict { client, reason } => {
+                self.evict(&client, &reason).await;
+            }
+            HubCommand::SweepIdentities(policy) => {
+                let identities = self.sweep_identities(&policy).await;
+                let grants = self.sweep_grants(&policy).await;
+                let peers = self.sweep_peers(&policy);
+                // One summary record per sweep (ADR 0040 T5), zeros included — the
+                // proof the sweep ran is as valuable as what it did.
+                policy.audit.record(
+                    "security.sweep",
+                    None,
+                    &format!(
+                        "identities={identities} grants={grants} peers={peers}                          (trigger={})",
+                        policy.trigger
+                    ),
+                );
+            }
+            HubCommand::AttachAuthorizer(watch) => {
+                self.authz = Some(watch);
             }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
@@ -1017,6 +1461,31 @@ impl Hub {
     #[allow(clippy::too_many_lines)]
     async fn dispatch_cluster(&mut self, cmd: HubCommand) {
         match cmd {
+            HubCommand::RemotePublishAcked {
+                node,
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => {
+                // An acked forward (ADR 0042 T9, exhibit ⑤): apply locally like
+                // RemotePublish, then answer with a durability-gated ack — sent only
+                // after the local fan-out, durable offline enqueues included. A
+                // retransmission is delivered again (duplicates are legal at QoS 1),
+                // so no receiver dedup state is needed.
+                let ok = self
+                    .deliver(&topic, &payload, qos, retain, message_expiry, &app)
+                    .await;
+                if let Some(peer) = self.peers.get(&node) {
+                    let _ = peer.tx.send(PeerMessage::PublishAck { seq, ok });
+                }
+            }
+            HubCommand::RemotePublishAck { node, seq, ok } => {
+                self.forward_acked(&node, seq, ok);
+            }
             HubCommand::RemotePublish {
                 topic,
                 payload,
@@ -1033,8 +1502,14 @@ impl Hub {
                 self.deliver(&topic, &payload, qos, retain, message_expiry, &app)
                     .await;
             }
-            HubCommand::PeerConnected { node, conn_id, tx } => {
-                self.peer_connected(node.clone(), conn_id, tx);
+            HubCommand::PeerConnected {
+                node,
+                conn_id,
+                tx,
+                cert_serial,
+                proto,
+            } => {
+                self.peer_connected(node.clone(), conn_id, tx, cert_serial, proto);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -1049,9 +1524,16 @@ impl Hub {
             }
             HubCommand::PeerDead { node } => {
                 self.peer_dead(&node);
+                // The takeover window (ADR 0042 T9, exhibit ⑥): reconcile inherited
+                // sessions eagerly for the next several sweep ticks so their
+                // subscriptions materialize within seconds of the owner's death.
+                self.takeover_reconcile_ticks = 8;
             }
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
+            }
+            HubCommand::InheritedSessions { sessions } => {
+                self.inherit_sessions(sessions).await;
             }
             HubCommand::Ping { reply } => {
                 // Reached the loop → it is live. The receiver may be gone if the
@@ -1087,13 +1569,14 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                app,
                 seq,
             } => {
                 // A peer routed a retained mutation here because this node owns the
                 // topic's group (ADR 0037 §1): dedup retransmissions, then run it
                 // through the same queue as local mutations — serialized commit
                 // order, retry-until-heal, and a NACK back if the lease moved (T8).
-                self.accept_routed_retained(node, topic, payload, qos, seq);
+                self.accept_routed_retained(node, topic, payload, qos, app, seq);
             }
             HubCommand::RemoteRetainedCommitAck { node, seq, token } => {
                 // The commit-gated answer to our in-flight handoff (T8). A stale or
@@ -1108,7 +1591,11 @@ impl Hub {
                 }
                 if token.is_some() {
                     // Committed by the owner (its fan-out warms the caches): the
-                    // mutation is finally done — drive the next one.
+                    // mutation is finally done — resolve the gated publish riding
+                    // it (ADR 0042 T9, exhibit ⑦) and drive the next one.
+                    if let Some(id) = mutation.publish {
+                        self.pending_retained_done(id);
+                    }
                     self.kick_retained_queue();
                 } else {
                     // NACK: the owner's lease moved. Re-queue at the front and wait
@@ -1122,16 +1609,24 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                app,
                 token,
                 reply,
+                publish,
             } => {
                 self.retained_commit_inflight = false;
                 if let Some((epoch, offset)) = token {
+                    // The authority commit landed: resolve the gated publish riding
+                    // this mutation (ADR 0042 T9, exhibit ⑦).
+                    if let Some(id) = publish {
+                        self.pending_retained_done(id);
+                    }
                     // Committed: warm the local cache, fan the tokened value out to
                     // every peer (ADR 0037 §3 — best-effort; a peer that misses it
                     // converges via the P5 back-fill on the next link-up), and drive
-                    // the next queued mutation.
-                    self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                    // the next queued mutation. Application properties travel with
+                    // the value everywhere (ADR 0038 T3).
+                    self.apply_retained_update(&topic, &payload, qos, &app, (epoch, offset))
                         .await;
                     for peer in self.peers.values() {
                         let _ = peer.tx.send(PeerMessage::RetainedUpdate {
@@ -1140,6 +1635,7 @@ impl Hub {
                             qos,
                             epoch,
                             offset,
+                            props: app_to_wire(&app),
                         });
                     }
                     // A peer-routed mutation gets its commit-gated ack (T8); the
@@ -1164,7 +1660,9 @@ impl Hub {
                         topic,
                         payload,
                         qos,
+                        app,
                         reply,
+                        publish,
                     });
                 }
             }
@@ -1174,8 +1672,9 @@ impl Hub {
                 qos,
                 epoch,
                 offset,
+                app,
             } => {
-                self.apply_retained_update(&topic, &payload, qos, (epoch, offset))
+                self.apply_retained_update(&topic, &payload, qos, &app, (epoch, offset))
                     .await;
             }
             HubCommand::RemoteSharedDeliver {
@@ -1201,6 +1700,9 @@ impl Hub {
     /// Publish a locally-originated message: apply it on this node, then forward to
     /// peers (interested peers for live delivery; **all** peers for retained, so each
     /// node stores it for its future subscribers — ADR 0014).
+    /// Returns `false` when a durable offline enqueue failed — the dispatch then
+    /// withholds the publisher's ack (ADR 0041 T5).
+    #[allow(clippy::too_many_arguments)]
     async fn publish(
         &mut self,
         topic: &str,
@@ -1209,28 +1711,33 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
-        self.deliver(topic, payload, qos, retain, message_expiry, app)
+        gate: Option<u64>,
+    ) -> bool {
+        let durable_ok = self
+            .deliver(topic, payload, qos, retain, message_expiry, app)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
         // node (ADR 0015), so this runs only for locally-originated publishes.
         self.deliver_shared(topic, payload, qos, message_expiry, app)
             .await;
-        self.forward_to_peers(topic, payload, qos, retain, message_expiry, app);
+        self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
         // route the retained mutation to its topic's group lease-owner for the
         // quorum-committed authority write. Only the **landing** node routes (a
         // forwarded publish enters via `RemotePublish` → `deliver`, never here), so one
-        // publish is exactly one authority commit.
+        // publish is exactly one authority commit. The gated publish's ack now waits
+        // for this commit too (ADR 0042 T9, exhibit ⑦).
         if retain {
-            self.route_retained_commit(topic, payload, qos_num(qos));
+            self.route_retained_commit(topic, payload, qos_num(qos), app, gate);
         }
+        durable_ok
     }
 
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
     /// will's own application properties (ADR 0030); a will never sets a message-expiry.
     async fn publish_will(&mut self, w: &Message) {
-        self.publish(&w.topic, &w.payload, w.qos, w.retain, None, &w.app)
+        // No publisher waits on a will, so nothing gates on its durability.
+        self.publish(&w.topic, &w.payload, w.qos, w.retain, None, &w.app, None)
             .await;
     }
 
@@ -1239,6 +1746,7 @@ impl Hub {
     /// for local publishes (via
     /// [`publish`](Self::publish)) and for publishes received from a peer, which must
     /// never be re-forwarded.
+    /// Returns `false` when a durable offline enqueue failed (ADR 0041 T5).
     async fn deliver(
         &mut self,
         topic: &str,
@@ -1247,7 +1755,7 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
         // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
         // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
         // untokened) flag here is exactly the everyday-race divergence the ADR removes.
@@ -1267,7 +1775,7 @@ impl Hub {
         }
         // Live deliveries carry retain=0 [MQTT-3.3.1-9].
         self.deliver_local(topic, payload, qos, message_expiry, app)
-            .await;
+            .await
     }
 
     /// Log when a persistent session is served on a node that is not its
@@ -1363,7 +1871,7 @@ impl Hub {
             SessionRecovery::Denied { owner } => {
                 warn!(
                     client = %pending.client.0,
-                    claimant = %pending.owner,
+                    claimant = %pending.admission.identity.subject,
                     owner = %owner,
                     "session-identity mismatch: a different principal may not resume/take over \
                      this persistent session; rejecting CONNECT (ADR 0031)"
@@ -1386,8 +1894,10 @@ impl Hub {
     ) {
         let PendingAttach {
             client,
-            // The owner was bound/verified during recovery (claim_session); not needed here.
-            owner: _,
+            // The owner (admission.subject) was bound/verified during recovery
+            // (claim_session); the facts are kept with the online entry for the
+            // reload sweep (ADR 0040).
+            admission,
             conn_id,
             session_expiry,
             receive_maximum,
@@ -1396,8 +1906,66 @@ impl Hub {
             reply,
         } = pending;
 
+        // Session quota (ADR 0041 T4): refuse only a NEW session — a resume
+        // (session_present) or an attach for a locally-known client id (takeover,
+        // clean-start replacement) is never refused for quota. A full broker keeps
+        // serving its existing fleet and refuses only strangers.
+        if !session_present
+            && !self.online.contains_key(&client)
+            && !self.session_expiry.contains_key(&client)
+        {
+            let over_cap = self
+                .quotas
+                .max_sessions
+                .is_some_and(|cap| self.session_count() >= cap);
+            if over_cap || self.brownout {
+                warn!(client = %client.0, brownout = self.brownout,
+                      "session quota/brownout: new-session CONNECT refused (ADR 0041)");
+                if let Some(m) = &self.metrics {
+                    m.quota_rejected(if self.brownout {
+                        "brownout"
+                    } else {
+                        "sessions"
+                    });
+                }
+                // Recovery already ran claim_session, which CREATED this
+                // stranger's durable record before we could refuse it. A
+                // refused grant must not leave that growth behind (the whole
+                // point of the cap/brownout), so reap the just-created empty
+                // record off-loop; the refusal reply is gated on the reap so
+                // the client cannot observe the refusal and reconnect into a
+                // half-removed session.
+                let store = self.store.clone();
+                tokio::spawn(async move {
+                    let _ = store.remove(&client).await;
+                    let _ = reply.send(AttachOutcome::QuotaExceeded);
+                });
+                return;
+            }
+        }
+
+        // Revocation reaches resumed grants (ADR 0040 T3): re-authorize each restored
+        // subscription against the CURRENT policy, under the resuming principal's
+        // full identity (fresh from authentication — groups included). A persistent
+        // session that slept through a tightening reload has its revoked grants
+        // removed at the moment delivery could resume; queued messages that only a
+        // revoked grant admits are dropped below. No authorizer attached = no
+        // re-check (harnesses without a reloadable policy).
+        let (subscriptions, revoked_grants): (Vec<Subscription>, Vec<Subscription>) =
+            match &self.authz {
+                Some(rx) => {
+                    let authorizer = rx.0.borrow().clone();
+                    subscriptions.into_iter().partition(|s| {
+                        authorizer.authorize_subscribe(&admission.identity, &s.filter)
+                    })
+                }
+                None => (subscriptions, Vec::new()),
+            };
+        let revoked_grants: Vec<String> = revoked_grants.into_iter().map(|s| s.filter).collect();
+
         // Reconcile the routing table with persisted subscriptions (idempotent; empty
         // for a clean start).
+        let recovered_any = !subscriptions.is_empty();
         for s in subscriptions {
             if let Some((group, filter)) = parse_shared(&s.filter) {
                 self.shared
@@ -1409,6 +1977,27 @@ impl Hub {
                 .entry(client.clone())
                 .or_default()
                 .insert(s.filter, s.max_qos);
+        }
+        // A resumed session registers filters WITHOUT a SUBSCRIBE, so peers must
+        // learn them here (ADR 0042 T9): after a takeover, this advertisement is
+        // what re-targets a peer's held acked forward to this node — the client
+        // re-attaching is one of the two ways an inherited session materializes
+        // (the other, the takeover scan, skips clients that are already attaching).
+        if recovered_any {
+            self.gossip_interest();
+        }
+        if !revoked_grants.is_empty() {
+            warn!(
+                client = %client.0,
+                filters = ?revoked_grants,
+                "resume: tightened ACL revokes persisted subscriptions (ADR 0040 T3)"
+            );
+            // A live routing table may still carry the offline session's revoked
+            // grants (that is how offline queueing works) — remove them there too,
+            // and persist the pruned set so the revocation is durable. AFTER the
+            // reconcile above, so the persisted result is exactly the surviving set
+            // (a fresh hub's empty maps would otherwise persist an empty set).
+            self.unsubscribe(&client, &revoked_grants).await;
         }
 
         // Record this session's retention: it survives disconnect iff the expiry
@@ -1448,6 +2037,8 @@ impl Hub {
                 conn_id,
                 tx: outbound.clone(),
                 will,
+                admission,
+                attached_at: Instant::now(),
             },
         );
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
@@ -1486,6 +2077,25 @@ impl Hub {
                 let mut last = 0;
                 for qm in pending {
                     last = qm.offset;
+                    // A queued message that only a revoked grant admits is dropped
+                    // (ADR 0040 T3): delivering it would leak data the new policy
+                    // denies. A topic a surviving grant also matches still replays.
+                    if !revoked_grants.is_empty() {
+                        let topic = &qm.message.topic;
+                        let admits = |f: &String| {
+                            let f = parse_shared(f).map_or(f.as_str(), |(_, inner)| inner);
+                            topic_matches(f, topic)
+                        };
+                        let survives = self
+                            .subs_by_client
+                            .get(&client)
+                            .is_some_and(|m| m.keys().any(admits));
+                        if revoked_grants.iter().any(admits) && !survives {
+                            debug!(client = %client.0, offset = qm.offset, %topic,
+                                   "dropping queued message for a revoked grant (ADR 0040 T3)");
+                            continue;
+                        }
+                    }
                     match qm.expiry_at {
                         Some(deadline) if deadline <= now => {
                             debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
@@ -1515,10 +2125,59 @@ impl Hub {
         }
     }
 
-    async fn subscribe(&mut self, client: &ClientId, filters: Vec<(String, QoS)>) {
+    async fn subscribe(
+        &mut self,
+        client: &ClientId,
+        filters: Vec<(String, QoS)>,
+        reply: Option<oneshot::Sender<Vec<bool>>>,
+    ) {
+        // Subscription quota (ADR 0041 T3): count how many NEW filters the cap
+        // admits — an already-held filter replaces (never consumes quota). The
+        // SUBACK itself is answered only after the durable persist below
+        // (ADR 0042 T9): granted must mean durably granted.
+        let filters: (Vec<(String, QoS)>, Vec<bool>) = {
+            let held = self.subs_by_client.get(client);
+            let mut admitted_new = 0;
+            let verdicts: Vec<bool> = filters
+                .iter()
+                .map(|(f, _)| {
+                    let replaces = held.is_some_and(|m| m.contains_key(f));
+                    let admit = replaces
+                        || match self.quotas.max_subscriptions_per_client {
+                            None => true,
+                            Some(cap) => held.map_or(0, HashMap::len) + admitted_new < cap,
+                        };
+                    if admit && !replaces {
+                        admitted_new += 1;
+                    }
+                    admit
+                })
+                .collect();
+            let denied = verdicts.iter().filter(|v| !**v).count();
+            if denied > 0 {
+                warn!(client = %client.0, denied,
+                      "subscription quota exceeded; denied in SUBACK (ADR 0041)");
+                if let Some(m) = &self.metrics {
+                    for _ in 0..denied {
+                        m.quota_rejected("subscriptions");
+                    }
+                }
+            }
+            let admitted = filters
+                .into_iter()
+                .zip(verdicts.iter())
+                .filter_map(|(fq, ok)| ok.then_some(fq))
+                .collect();
+            (admitted, verdicts)
+        };
+        let (filters, verdicts) = filters;
+        // Snapshot for rollback: a failed durable persist must leave the routing
+        // state exactly as before, so the failure SUBACK tells the truth.
+        let prior = self.subs_by_client.get(client).cloned();
+
         // Retained messages are replayed only for ordinary subscriptions; a new
         // shared subscription does not receive them (ADR 0010 §3, [MQTT-3.8.4]).
-        let mut replay: Vec<Message> = Vec::new();
+        let mut retained_replay: Vec<Message> = Vec::new();
         for (f, q) in &filters {
             // Keep the full filter string (including any `$share/` prefix) so it is
             // persisted; `$share/...` never matches a concrete topic in `granted_qos`.
@@ -1535,7 +2194,7 @@ impl Hub {
             self.table.subscribe(client.clone(), f.clone());
             if let Ok(matching) = self.retained.matching(f).await {
                 for m in matching {
-                    replay.push(Message {
+                    retained_replay.push(Message {
                         qos: min_qos(m.qos, *q),
                         retain: true,
                         ..m
@@ -1543,11 +2202,41 @@ impl Hub {
                 }
             }
         }
-        self.persist_subscriptions(client).await;
+        // The SUBACK is DURABILITY-GATED (ADR 0042 T9, exhibit ⑨): a persistent
+        // session's subscription is a promise about future messages, so granting
+        // it while the durable write failed builds every downstream durability
+        // guarantee on sand — the owner's enqueue, the takeover materialization,
+        // and the resume replay would all consult a durable record that says
+        // "no subscriptions". Fail closed: roll the routing state back and
+        // report failure codes; the client retries its SUBSCRIBE.
+        if !self.persist_subscriptions(client).await {
+            warn!(
+                client = %client.0,
+                "durable subscription write failed; SUBACK reports failure (fail closed, ADR 0042 T9)"
+            );
+            self.drop_subscriptions(client);
+            if let Some(prior) = prior {
+                for (f, q) in &prior {
+                    if let Some((group, filter)) = parse_shared(f) {
+                        self.shared.subscribe(client.clone(), group, filter, *q);
+                    } else {
+                        self.table.subscribe(client.clone(), f.clone());
+                    }
+                }
+                self.subs_by_client.insert(client.clone(), prior);
+            }
+            if let Some(tx) = reply {
+                let _ = tx.send(vec![false; verdicts.len()]);
+            }
+            return;
+        }
+        if let Some(tx) = reply {
+            let _ = tx.send(verdicts);
+        }
         self.gossip_interest();
 
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
-            for m in replay {
+            for m in retained_replay {
                 self.send_to_client(client, &tx, &m, true, None).await;
             }
         }
@@ -1564,7 +2253,10 @@ impl Hub {
                 self.table.unsubscribe(client, f);
             }
         }
-        self.persist_subscriptions(client).await;
+        // An UNSUBACK has no failure codes (v3.1.1); a failed durable removal
+        // leaves the subscription durably present — the safe side (no loss,
+        // possible extra deliveries until a later persist succeeds).
+        let _ = self.persist_subscriptions(client).await;
         self.gossip_interest();
     }
 
@@ -1583,6 +2275,7 @@ impl Hub {
     /// Deliver a message to this node's **ordinary** local subscribers at
     /// `min(qos, granted)` each. Shared subscriptions are routed separately by
     /// [`deliver_shared`](Self::deliver_shared) (ADR 0015).
+    /// Returns `false` when any recipient's durable enqueue failed (ADR 0041 T5).
     async fn deliver_local(
         &mut self,
         topic: &str,
@@ -1590,7 +2283,7 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
         let targets: Vec<(ClientId, QoS)> = self
             .table
             .matching_clients(topic)
@@ -1601,23 +2294,28 @@ impl Hub {
             })
             .collect();
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
+        let mut all_durable = true;
         for (c, granted) in targets {
-            self.deliver_to_client(
-                &c,
-                topic,
-                payload,
-                min_qos(qos, granted),
-                message_expiry,
-                app,
-            )
-            .await;
+            all_durable &= self
+                .deliver_to_client(
+                    &c,
+                    topic,
+                    payload,
+                    min_qos(qos, granted),
+                    message_expiry,
+                    app,
+                )
+                .await;
         }
+        all_durable
     }
 
     /// Deliver one message to a single named recipient: live if online (tracking
     /// `QoS` > 0 in flight), else queued if the session is persistent, else dropped.
     /// The unit of both ordinary and shared (ADR 0015) delivery; `qos` is the
     /// already-downgraded delivery `QoS`.
+    /// Returns `false` when a durable offline enqueue failed terminally — the
+    /// caller withholds the publisher's ack so it retries (ADR 0041 T5).
     async fn deliver_to_client(
         &mut self,
         client: &ClientId,
@@ -1626,7 +2324,7 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
@@ -1640,7 +2338,19 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
             }
-        } else if self.is_persistent(client) {
+            return true;
+        }
+        if self.is_persistent(client) {
+            // Disk brownout (ADR 0041 T5): an offline enqueue GROWS the store —
+            // refused above the watermark, counted, like a queue overflow.
+            if self.brownout {
+                warn!(client = %client.0, topic = %topic,
+                      "brownout: offline enqueue refused (ADR 0041)");
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("brownout");
+                }
+                return true;
+            }
             // Offline but persistent: queue for replay on reconnect. The absolute
             // deadline (ADR 0009 §3) is receipt time plus the interval. The queue is
             // bounded (ADR 0001 §6); log when the cap drops messages.
@@ -1680,10 +2390,16 @@ impl Hub {
                     if let Some(m) = &self.metrics {
                         m.durable_append_failed(durable_failure_reason(&e));
                     }
-                    warn!(client = %client.0, error = %e, "failed to enqueue offline message");
+                    warn!(client = %client.0, error = %e,
+                          "failed to enqueue offline message; withholding the publisher's ack (ADR 0041 T5)");
+                    // Fail closed like the local ack path (ADR 0018): the caller
+                    // withholds the publisher's acknowledgement so it retries,
+                    // instead of acking a message a subscriber will never see.
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// Route a message to the shared subscriptions matching `topic`: for each group,
@@ -2013,6 +2729,202 @@ impl Hub {
         }
     }
 
+    /// Whether storing a retained value for `topic` would GROW the retained set
+    /// beyond the quota (ADR 0041 T4). Overwrites (topic already retained) never
+    /// count. Enforced against this node's local retained view.
+    async fn retained_quota_exceeded(&self, topic: &str) -> bool {
+        let over = if self.brownout {
+            true // brownout (ADR 0041 T5): any retained GROWTH is refused
+        } else if let Some(cap) = self.quotas.max_retained_messages {
+            self.retained.count().await.unwrap_or(0) >= cap
+        } else {
+            false
+        };
+        if !over {
+            return false;
+        }
+        // At the bound: only an overwrite of an existing topic may proceed.
+        !self
+            .retained
+            .matching(topic)
+            .await
+            .is_ok_and(|m| m.iter().any(|r| r.topic == topic))
+    }
+
+    /// The node's session count for the quota (ADR 0041 T4): every online session
+    /// plus retained-offline ones (the expiry map covers persistent sessions,
+    /// online or not; the union avoids double-counting).
+    fn session_count(&self) -> usize {
+        self.online
+            .keys()
+            .filter(|c| !self.session_expiry.contains_key(*c))
+            .count()
+            + self.session_expiry.len()
+    }
+
+    /// The identity sweep (ADR 0040 T2): re-evaluate every online connection's
+    /// admission facts against a freshly-reloaded policy and evict the sessions
+    /// whose *identity* was revoked — presented certificate now on the CRL,
+    /// password user gone from the credential store, or principal denied by the
+    /// new connect-ACL. Permission-level changes are NOT swept here (the grant
+    /// sweep, T3, handles subscriptions; publish checks are already per-operation).
+    /// An unchanged policy evicts no one — every check re-derives the admission
+    /// verdict, so only differences act.
+    async fn sweep_identities(&mut self, policy: &SweepPolicy) -> usize {
+        let victims: Vec<(ClientId, &'static str)> = self
+            .online
+            .iter()
+            .filter_map(|(client, online)| {
+                let a = &online.admission;
+                if let Some(serial) = &a.cert_serial {
+                    if policy.revoked.contains(serial) {
+                        return Some((client.clone(), "cert-revoked"));
+                    }
+                }
+                if a.method == AuthMethod::Password
+                    && !policy
+                        .authenticator
+                        .password_subject_exists(&a.identity.subject)
+                {
+                    return Some((client.clone(), "user-removed"));
+                }
+                if !policy.authorizer.authorize_connect(&a.identity, client) {
+                    return Some((client.clone(), "connect-denied"));
+                }
+                None
+            })
+            .collect();
+        if victims.is_empty() {
+            return 0;
+        }
+        info!(
+            evictions = victims.len(),
+            trigger = %policy.trigger,
+            "identity sweep: policy reload revoked live sessions (ADR 0040)"
+        );
+        let evicted = victims.len();
+        for (client, reason) in victims {
+            policy.audit.record(
+                "security.evict",
+                Some(&client.0),
+                &format!("{reason} (trigger={})", policy.trigger),
+            );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction(reason);
+            }
+            self.evict(&client, reason).await;
+        }
+        evicted
+    }
+
+    /// The grant sweep (ADR 0040 T3): re-authorize every surviving online session's
+    /// subscription grants against the freshly-reloaded ACL — under the identity the
+    /// session was admitted with — and remove the grants the new policy denies, from
+    /// live routing and the durable subscription set alike. The client is NOT
+    /// disconnected: who it is remains valid, only what it may read shrank. Its next
+    /// SUBSCRIBE re-attempt is denied at the admission-path check like any new
+    /// operation. Offline sessions are re-checked at resume (see
+    /// [`finish_attach`](Self::finish_attach)), where the resuming principal's full
+    /// identity is available.
+    async fn sweep_grants(&mut self, policy: &SweepPolicy) -> usize {
+        // The same raw filter string the SUBSCRIBE-time check authorized (including
+        // any `$share/` prefix), so sweep-time and admission-time verdicts align.
+        let revocations: Vec<(ClientId, Vec<String>)> = self
+            .online
+            .iter()
+            .filter_map(|(client, online)| {
+                let identity = &online.admission.identity;
+                let revoked: Vec<String> = self
+                    .subs_by_client
+                    .get(client)?
+                    .keys()
+                    .filter(|f| !policy.authorizer.authorize_subscribe(identity, f))
+                    .cloned()
+                    .collect();
+                (!revoked.is_empty()).then(|| (client.clone(), revoked))
+            })
+            .collect();
+        let mut revoked_grants = 0;
+        for (client, filters) in revocations {
+            warn!(
+                client = %client.0,
+                filters = ?filters,
+                trigger = %policy.trigger,
+                "grant sweep: tightened ACL revokes live subscriptions (ADR 0040)"
+            );
+            policy.audit.record(
+                "security.evict",
+                Some(&client.0),
+                &format!("grant-revoked {filters:?} (trigger={})", policy.trigger),
+            );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction("grant-revoked");
+            }
+            revoked_grants += filters.len();
+            self.unsubscribe(&client, &filters).await;
+        }
+        revoked_grants
+    }
+
+    /// The peer sweep (ADR 0040 T4): tear down established peer links whose remote
+    /// certificate the freshly-reloaded cluster CRL revokes. Removing the entry
+    /// drops the link's outbound sender, which ends its pump task and closes the
+    /// socket; the mesh reacts as to any link loss (SWIM — already refusing the
+    /// node's datagrams per ADR 0022 T7 — marks it dead; placement and leases
+    /// move), and the revoked node cannot re-handshake (both handshake sides gate
+    /// on the same live CRL slot).
+    fn sweep_peers(&mut self, policy: &SweepPolicy) -> usize {
+        let victims: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.cert_serial
+                    .as_ref()
+                    .is_some_and(|serial| policy.peer_revoked.contains(serial))
+            })
+            .map(|(node, _)| node.clone())
+            .collect();
+        let torn_down = victims.len();
+        for node in victims {
+            warn!(
+                peer = %node.0,
+                trigger = %policy.trigger,
+                "peer sweep: cluster CRL revokes an established link (ADR 0040)"
+            );
+            policy.audit.record(
+                "security.evict",
+                Some(&node.0),
+                &format!("peer-revoked (trigger={})", policy.trigger),
+            );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction("peer-revoked");
+            }
+            let conn_id = self.peers[&node].conn_id;
+            self.peer_disconnected(&node, conn_id);
+        }
+        torn_down
+    }
+
+    /// Terminate a client's live session server-side (ADR 0040 T1). See
+    /// [`HubCommand::Evict`]. Routes through [`detach`](Self::detach) so session
+    /// retention, the will, and backlog spill behave exactly as for any other
+    /// ungraceful end — the DISCONNECT (v5 only) is queued first and drains to the
+    /// wire before the dropped outbound closes the writer.
+    async fn evict(&mut self, client: &ClientId, reason: &str) {
+        let Some(online) = self.online.get(client) else {
+            return;
+        };
+        warn!(client = %client.0, reason, "evicting live session");
+        if online.admission.protocol == ProtocolVersion::V5 {
+            let _ = online.tx.send(Packet::Disconnect(Disconnect {
+                reason: mqtt_codec::reason::NOT_AUTHORIZED,
+                properties: mqtt_codec::Properties::new(),
+            }));
+        }
+        let conn_id = online.conn_id;
+        self.detach(client, conn_id, false).await;
+    }
+
     async fn detach(&mut self, client: &ClientId, conn_id: u64, graceful: bool) {
         // Only act if this is still the current connection; a stale detach from a
         // connection that was already taken over must not disturb the new one.
@@ -2103,11 +3015,16 @@ impl Hub {
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
     /// (ADR 0009). Runs on the hub's periodic sweep tick.
     async fn sweep_expired_sessions(&mut self) {
-        // Periodically inherit persisted deadlines for owned sessions this node did not see
-        // disconnect — those handed to it by a takeover (ADR 0009 §3).
+        // Periodically inherit sessions this node did not see disconnect — those handed
+        // to it by a takeover: their persisted expiry deadlines (ADR 0009 §3) AND their
+        // routing subscriptions (ADR 0042 T9, exhibit ⑥). Eagerly for a few ticks after
+        // a peer death (the takeover window), else on the slow reconcile cadence.
         self.expiry_reconcile_tick = self.expiry_reconcile_tick.wrapping_add(1);
-        if self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0 {
-            self.reconcile_inherited_expiries().await;
+        if self.takeover_reconcile_ticks > 0 {
+            self.takeover_reconcile_ticks -= 1;
+            self.spawn_inherited_session_scan();
+        } else if self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0 {
+            self.spawn_inherited_session_scan();
         }
 
         let now = self.clock.now_epoch_secs();
@@ -2128,32 +3045,212 @@ impl Hub {
         self.gossip_interest();
     }
 
-    /// Pull persisted expiry deadlines from the durable store for sessions this node now
-    /// **owns** but is not already tracking — the orphaned, never-reconnected sessions a
-    /// takeover handed it. Without this, such a session would never expire on the new owner
-    /// (the clock effectively restarts); with it, the new owner expires it at the original
-    /// absolute deadline (ADR 0009 §3).
-    async fn reconcile_inherited_expiries(&mut self) {
-        let persisted = match self.store.expiring_sessions().await {
-            Ok(v) => v,
-            Err(e) => {
-                debug!(error = %e, "could not read persisted session expiries");
-                return;
-            }
-        };
-        for (client, deadline) in persisted {
-            // Skip ones we already handle (online here, or already scheduled), and ones we
-            // do not own (a replica we hold for another node — its owner expires it).
+    /// Start the off-loop inherited-session scan (ADR 0042 T9, exhibit ⑥): enumerate
+    /// every stored session with its subscriptions and expiry deadline, and post the
+    /// result back to the loop as [`HubCommand::InheritedSessions`]. Off-loop because
+    /// the enumeration reads through the durable store and may trigger first-touch
+    /// group recovery (quorum reads) — exactly the eager recovery a takeover wants,
+    /// but never on the actor loop. One scan at a time.
+    fn spawn_inherited_session_scan(&mut self) {
+        if self.inherited_scan_inflight {
+            return;
+        }
+        self.inherited_scan_inflight = true;
+        let store = self.store.clone();
+        let tx = self.self_tx.clone();
+        debug!("inherited-session scan started");
+        tokio::spawn(async move {
+            let sessions = match store.all_sessions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(error = %e, "inherited-session scan failed; retried next tick");
+                    Vec::new()
+                }
+            };
+            debug!(sessions = sessions.len(), "inherited-session scan finished");
+            let _ = tx.send(HubCommand::InheritedSessions { sessions });
+        });
+    }
+
+    /// Materialize sessions a takeover handed this node, before their clients
+    /// re-attach (ADR 0042 T9, exhibit ⑥): register each OWNED, not-yet-known
+    /// session's subscriptions into the routing table (so a publish arriving now
+    /// enqueues durably instead of routing to nothing), mark it persistent, and
+    /// schedule its inherited absolute expiry deadline (ADR 0009 §3 — without
+    /// which an orphaned session would never expire on the new owner). A later
+    /// real attach takes over cleanly: registration is idempotent and
+    /// `finish_attach` overwrites the placeholder expiry interval.
+    async fn inherit_sessions(
+        &mut self,
+        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    ) {
+        self.inherited_scan_inflight = false;
+        let mut registered = false;
+        for (client, subs, deadline) in sessions {
+            // Skip ones already handled (online or attaching here) and ones this
+            // node does not own (a replica held for another node — its owner
+            // materializes it).
             if self.online.contains_key(&client)
-                || self.expiring.contains_key(&client)
+                || self.connecting.contains_key(&client)
                 || !self.owns_session(&client)
             {
+                debug!(client = %client.0, "inherited-session scan: skipped (online/attaching/unowned)");
                 continue;
             }
-            // Schedule its expiry at the inherited absolute deadline; the sweep discards it
-            // when due (discard_session removes the durable session and any local state).
-            self.expiring.insert(client, deadline);
+            if let Some(d) = deadline {
+                self.expiring.entry(client.clone()).or_insert(d);
+            }
+            debug!(
+                client = %client.0,
+                subs = subs.len(),
+                known = self.subs_by_client.contains_key(&client),
+                "inherited-session scan: owned offline session"
+            );
+            if subs.is_empty() || self.subs_by_client.contains_key(&client) {
+                continue; // nothing to route, or already materialized
+            }
+            for sub in subs {
+                if let Some((group, filter)) = parse_shared(&sub.filter) {
+                    self.shared
+                        .subscribe(client.clone(), group, filter, sub.max_qos);
+                } else {
+                    self.table.subscribe(client.clone(), sub.filter.clone());
+                }
+                self.subs_by_client
+                    .entry(client.clone())
+                    .or_default()
+                    .insert(sub.filter, sub.max_qos);
+            }
+            // Persistent from the routing path's point of view (offline enqueue).
+            // The placeholder interval is corrected by the next real attach; the
+            // inherited absolute deadline above still bounds the session's life.
+            self.session_expiry
+                .entry(client.clone())
+                .or_insert(u32::MAX);
+            debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
+            registered = true;
         }
+        if registered {
+            // Peers must know this node now routes the inherited filters — this is
+            // what re-targets acked forwards after a takeover (exhibit ⑤ re-route).
+            self.gossip_interest();
+        }
+        self.settle_pending_publishes().await;
+    }
+
+    /// A takeover-window re-delivery of pending publish `id` (ADR 0042 T9):
+    /// deliver the frame ONLY to routing state that could have missed the
+    /// original fan-out — offline persistent sessions (materialized since) and
+    /// clients attached after the publish. Clients online since BEFORE the
+    /// publish already received it live; re-sending would duplicate (dups are
+    /// legal at `QoS` 1, but a boot-window re-send to a steady subscriber is a
+    /// gratuitous one — observed as duplicate bridge forwards). Returns `false`
+    /// on a terminal durable-append failure (the caller withholds).
+    async fn redeliver_pending(&mut self, id: u64) -> bool {
+        let Some(p) = self.pending_publishes.get(&id) else {
+            return true;
+        };
+        let (topic, payload, qos, expiry, app, since) = (
+            p.topic.clone(),
+            p.payload.clone(),
+            p.qos,
+            p.message_expiry,
+            p.app.clone(),
+            p.created_at,
+        );
+        let targets: Vec<(ClientId, QoS)> = self
+            .table
+            .matching_clients(&topic)
+            .into_iter()
+            .filter(|c| self.online.get(c).is_none_or(|o| o.attached_at > since))
+            .map(|c| {
+                let granted = self.granted_qos(&c, &topic);
+                (c, granted)
+            })
+            .collect();
+        let mut all_durable = true;
+        for (c, granted) in targets {
+            all_durable &= self
+                .deliver_to_client(&c, &topic, &payload, min_qos(qos, granted), expiry, &app)
+                .await;
+        }
+        all_durable
+    }
+
+    /// The takeover window closed for this node (an inherited-session scan just
+    /// landed): every held pending publish re-delivers **locally** against the
+    /// just-materialized subscriptions (duplicates are legal at `QoS` 1 — the
+    /// alternative was an ack into the void, exhibit ⑥), then re-checks remote
+    /// interest via the sweep's re-route path before its ack can release.
+    async fn settle_pending_publishes(&mut self) {
+        let held: Vec<u64> = self
+            .pending_publishes
+            .iter()
+            .filter(|(_, p)| p.awaiting_settle || p.reroute_grace.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        // The hold clears only when the whole takeover WINDOW is over: one scan
+        // is not enough — the group leases reassign for seconds after the death,
+        // and a scan that ran before a lease landed saw nothing. Every scan in
+        // the window re-delivers (duplicates are legal); the last one releases.
+        // And never on a broken mesh: an unreachable-but-alive peer may hold
+        // interest this node cannot see (seed 4).
+        let window_over = self.takeover_reconcile_ticks == 0 && self.mesh_whole();
+        for id in held {
+            if !self.redeliver_pending(id).await {
+                // The re-delivery's durable append failed terminally: withhold.
+                self.drop_pending(id);
+                continue;
+            }
+            // The successor may have materialized the subscriber on ANOTHER node
+            // and advertised its interest since this publish's original fan-out
+            // (which found nothing): forward to it now — a publish that arrived
+            // after the death dropped the dead node's interest has no obligation
+            // to re-route, so this is where it re-targets.
+            for node in self.reroute_candidates(id) {
+                self.send_acked_forward(id, &node);
+            }
+            if window_over {
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.awaiting_settle = false;
+                }
+            }
+            self.try_complete_pending(id);
+        }
+    }
+
+    /// Whether every membership-alive peer has a live link (the mesh is
+    /// WHOLE). While it is not — a peer is alive per membership but its link is
+    /// down — this node cannot see that peer's interest, so a gated publish
+    /// must not conclude "nobody is owed this" (ADR 0042 T4, seed 4: the
+    /// takeover successor materialized the subscriber behind an active
+    /// partition, and the grace expired into an ack for a message the
+    /// partitioned owner never received). Withholding under partition is the
+    /// same CP posture the durable attach path already takes.
+    fn mesh_whole(&self) -> bool {
+        let Some(placement) = &self.placement else {
+            return true;
+        };
+        let members: Vec<NodeId> = {
+            let p = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.members()
+        };
+        members
+            .iter()
+            .filter(|m| **m != self.node_id)
+            .all(|m| self.peers.contains_key(m))
+    }
+
+    /// Whether this node runs in a multi-node cluster (placement with >1 member).
+    fn clustered(&self) -> bool {
+        self.placement.as_ref().is_some_and(|p| {
+            p.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .member_count()
+                > 1
+        })
     }
 
     /// Whether this node is the placement owner of `client`'s session. Outside a cluster
@@ -2199,9 +3296,9 @@ impl Hub {
     }
 
     /// Persist the current subscription set for a client if its session is durable.
-    async fn persist_subscriptions(&mut self, client: &ClientId) {
+    async fn persist_subscriptions(&mut self, client: &ClientId) -> bool {
         if !self.is_persistent(client) {
-            return;
+            return true; // nothing durable is promised for a clean session
         }
         let subs: Vec<mqtt_core::Subscription> = self
             .subs_by_client
@@ -2214,7 +3311,13 @@ impl Hub {
                 no_local: false,
             })
             .collect();
-        let _ = self.store.set_subscriptions(client, &subs).await;
+        match self.store.set_subscriptions(client, &subs).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(client = %client.0, error = %e, "durable subscription write failed");
+                false
+            }
+        }
     }
 
     /// Remove all of a client's subscriptions from the routing table.
@@ -2236,31 +3339,367 @@ impl Hub {
     /// broadcast: caches are warmed by the owner's post-commit fan-out instead, so a
     /// retained publish forwards like any other — to interested peers, for live
     /// delivery only.
+    #[allow(clippy::too_many_arguments)]
     fn forward_to_peers(
-        &self,
+        &mut self,
         topic: &str,
         payload: &Bytes,
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
+        gate: Option<u64>,
     ) {
         let retain_broadcasts = retain && self.durable_retained.is_none();
+        // A gated QoS ≥ 1 forward is ACKED (ADR 0042 T9, exhibit ⑤): the
+        // publisher's ack waits for each target's durability-gated answer, and
+        // the sweep retransmits while unanswered. Targets come from the INTEREST
+        // map, not the connected-peer map: a link-down (but not dead) peer's
+        // subscribers are still owed the publish — the obligation is recorded
+        // now, the frame flows when the link returns (sweep), or re-routes to
+        // the successor when membership confirms death (`peer_dead`). A proto-2
+        // peer (mixed-version window) keeps the fire-and-forget frame — the old
+        // semantics, honestly.
+        let gated = gate.is_some() && qos_num(qos) >= 1;
+        if gated {
+            let targets: Vec<NodeId> = self
+                .remote_interest
+                .iter()
+                .filter(|(_, filters)| filters.iter().any(|f| topic_matches(f, topic)))
+                .map(|(node, _)| node.clone())
+                .collect();
+            let id = gate.unwrap_or_default();
+            for node in targets {
+                if self.peers.get(&node).is_some_and(|p| p.proto < 3) {
+                    // Connected but old: fire-and-forget, as before proto 3.
+                    if let Some(peer) = self.peers.get(&node) {
+                        let _ = peer.tx.send(PeerMessage::Publish {
+                            topic: topic.to_string(),
+                            payload: payload.to_vec(),
+                            qos: qos as u8,
+                            retain,
+                            message_expiry,
+                            app: app_to_wire(app),
+                        });
+                    }
+                    continue;
+                }
+                self.send_acked_forward(id, &node);
+            }
+            if !retain_broadcasts {
+                return;
+            }
+        }
         for (node, peer) in &self.peers {
             let interested = self
                 .remote_interest
                 .get(node)
                 .is_some_and(|filters| filters.iter().any(|f| topic_matches(f, topic)));
-            if retain_broadcasts || interested {
-                let _ = peer.tx.send(PeerMessage::Publish {
-                    topic: topic.to_string(),
-                    payload: payload.to_vec(),
-                    qos: qos as u8,
-                    retain,
-                    message_expiry,
-                    app: app_to_wire(app),
+            if gated && interested {
+                continue; // already handled (acked or legacy) above
+            }
+            if !(retain_broadcasts || interested) {
+                continue;
+            }
+            let _ = peer.tx.send(PeerMessage::Publish {
+                topic: topic.to_string(),
+                payload: payload.to_vec(),
+                qos: qos as u8,
+                retain,
+                message_expiry,
+                app: app_to_wire(app),
+            });
+        }
+    }
+
+    /// Peers that now advertise matching interest for pending publish `id` but
+    /// have neither acked a forward nor have one outstanding — the re-route
+    /// targets after a takeover (the dead owner's successor materializes the
+    /// inherited sessions and re-advertises their filters).
+    fn reroute_candidates(&self, id: u64) -> Vec<NodeId> {
+        let Some(p) = self.pending_publishes.get(&id) else {
+            return Vec::new();
+        };
+        self.peers
+            .iter()
+            .filter(|(n, peer)| {
+                peer.proto >= 3
+                    && !p.acked_nodes.contains(*n)
+                    && !p.awaiting.values().any(|v| v == *n)
+                    && self
+                        .remote_interest
+                        .get(*n)
+                        .is_some_and(|fs| fs.iter().any(|f| topic_matches(f, &p.topic)))
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Send (or re-send, on re-route) one acked forward of pending publish `id` to
+    /// `node`, recording the obligation (ADR 0042 T9, exhibit ⑤).
+    fn send_acked_forward(&mut self, id: u64, node: &NodeId) {
+        self.forward_seq += 1;
+        let seq = self.forward_seq;
+        let Some(p) = self.pending_publishes.get_mut(&id) else {
+            return;
+        };
+        p.awaiting.insert(seq, node.clone());
+        self.forward_index.insert(seq, id);
+        debug!(publish = id, seq, target = %node.0, topic = %p.topic, "acked forward recorded");
+        let frame = PeerMessage::PublishAcked {
+            seq,
+            topic: p.topic.clone(),
+            payload: p.payload.to_vec(),
+            qos: p.qos as u8,
+            retain: p.retain,
+            message_expiry: p.message_expiry,
+            app: app_to_wire(&p.app),
+        };
+        if let Some(peer) = self.peers.get(node) {
+            let _ = peer.tx.send(frame);
+        }
+    }
+
+    /// Register a `QoS` 1 publish whose acknowledgement is gated on cluster-wide
+    /// durability (ADR 0042 T9). At the cap the oldest entry is dropped loudly —
+    /// its ack withheld, so its publisher retries.
+    #[allow(clippy::too_many_arguments)]
+    fn register_pending(
+        &mut self,
+        done: oneshot::Sender<PublishOutcome>,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        retain: bool,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+    ) -> u64 {
+        if self.pending_publishes.len() >= PENDING_PUBLISH_CAP {
+            if let Some((old_id, old)) = self.pending_publishes.pop_first() {
+                warn!(
+                    topic = %old.topic,
+                    cap = PENDING_PUBLISH_CAP,
+                    "pending-publish cap: dropped the OLDEST unacknowledged publish \
+                     (ack withheld; its publisher retries — ADR 0042 T9)"
+                );
+                self.forward_index.retain(|_, pid| *pid != old_id);
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("pending-cap");
+                }
+            }
+        }
+        self.publish_ids += 1;
+        let id = self.publish_ids;
+        self.pending_publishes.insert(
+            id,
+            PendingPublish {
+                done,
+                topic: topic.to_string(),
+                payload: payload.clone(),
+                qos,
+                retain,
+                message_expiry,
+                app: app.clone(),
+                awaiting: HashMap::new(),
+                acked_nodes: HashSet::new(),
+                awaiting_retained: false,
+                local_done: false,
+                created_at: Instant::now(),
+                reroute_grace: None,
+                // During a takeover window the routing table may not yet hold the
+                // sessions this node (or a successor) inherited — hold the ack
+                // until the scan lands and the publish re-delivers (exhibit ⑥).
+                // Only meaningful on a multi-node cluster: a standalone node has
+                // no takeovers, and holding its boot-time acks would just delay
+                // every early publish for nothing.
+                awaiting_settle: self.clustered()
+                    && (self.takeover_reconcile_ticks > 0
+                        || self.inherited_scan_inflight
+                        || !self.mesh_whole()),
+            },
+        );
+        id
+    }
+
+    /// The local fan-out obligation resolved OK (durable appends included).
+    fn pending_local_done(&mut self, id: u64) {
+        if let Some(p) = self.pending_publishes.get_mut(&id) {
+            p.local_done = true;
+        }
+        self.try_complete_pending(id);
+    }
+
+    /// The retained authority commit obligation resolved (ADR 0042 T9, exhibit ⑦).
+    fn pending_retained_done(&mut self, id: u64) {
+        if let Some(p) = self.pending_publishes.get_mut(&id) {
+            p.awaiting_retained = false;
+        }
+        self.try_complete_pending(id);
+    }
+
+    /// Drop a pending publish, WITHHOLDING its acknowledgement (the sender side
+    /// of fail-closed: the publisher's connection sees no ack and retries).
+    fn drop_pending(&mut self, id: u64) {
+        if self.pending_publishes.remove(&id).is_some() {
+            self.forward_index.retain(|_, pid| *pid != id);
+        }
+    }
+
+    /// Release the publisher's acknowledgement iff every cluster-wide durability
+    /// obligation has resolved (ADR 0042 T9).
+    fn try_complete_pending(&mut self, id: u64) {
+        let complete = self.pending_publishes.get(&id).is_some_and(|p| {
+            p.local_done
+                && !p.awaiting_retained
+                && !p.awaiting_settle
+                && p.awaiting.is_empty()
+                && p.reroute_grace.unwrap_or(0) == 0
+        });
+        if complete {
+            if let Some(p) = self.pending_publishes.remove(&id) {
+                debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
+                let _ = p.done.send(PublishOutcome::Accepted);
+            }
+        }
+    }
+
+    /// A peer's durability-gated answer to one acked forward (ADR 0042 T9,
+    /// exhibit ⑤). `ok = false` is a terminal durable failure on the peer: the
+    /// whole pending publish is dropped — ack withheld, publisher retries.
+    fn forward_acked(&mut self, node: &NodeId, seq: u64, ok: bool) {
+        let Some(id) = self.forward_index.remove(&seq) else {
+            return; // stale ack (entry dropped or already resolved)
+        };
+        let Some(p) = self.pending_publishes.get_mut(&id) else {
+            return;
+        };
+        if p.awaiting.get(&seq) != Some(node) {
+            return; // not the node this seq was sent to — ignore
+        }
+        p.awaiting.remove(&seq);
+        if ok {
+            debug!(publish = id, seq, from = %node.0, "forward ack");
+            p.acked_nodes.insert(node.clone());
+            self.try_complete_pending(id);
+        } else {
+            warn!(
+                peer = %node.0,
+                "peer reported a terminal durable failure for a forwarded publish; \
+                 ack withheld (the publisher retries — ADR 0042 T9)"
+            );
+            self.drop_pending(id);
+        }
+    }
+
+    /// The sweep-tick half of acked forwards (ADR 0042 T9, exhibit ⑤): retransmit
+    /// unanswered forwards whose target link is up (same seq — duplicates are
+    /// legal at `QoS` 1), and drive takeover re-routes: a forward whose target
+    /// DIED re-forwards to whichever peers now advertise matching interest (the
+    /// dead owner's successor, once it materializes inherited sessions —
+    /// exhibit ⑥); with no such interest for [`REROUTE_GRACE_TICKS`] ticks the
+    /// obligation is moot (the interest genuinely ended) and the ack releases.
+    // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
+    // splitting it would scatter the obligation lifecycle.
+    #[allow(clippy::too_many_lines)]
+    async fn sweep_pending_forwards(&mut self) {
+        let ids: Vec<u64> = self.pending_publishes.keys().copied().collect();
+        for id in ids {
+            // Retransmit outstanding forwards over live links.
+            let outstanding: Vec<(u64, NodeId)> = self
+                .pending_publishes
+                .get(&id)
+                .map(|p| p.awaiting.iter().map(|(s, n)| (*s, n.clone())).collect())
+                .unwrap_or_default();
+            for (seq, node) in &outstanding {
+                let Some(peer) = self.peers.get(node) else {
+                    continue; // link down (not dead): wait for it to return
+                };
+                let Some(p) = self.pending_publishes.get(&id) else {
+                    continue;
+                };
+                if peer.proto < 3 {
+                    // The target reconnected speaking an older proto (mixed-version
+                    // downgrade): fall back to fire-and-forget — the old semantics,
+                    // honestly — and release the unfulfillable obligation.
+                    let _ = peer.tx.send(PeerMessage::Publish {
+                        topic: p.topic.clone(),
+                        payload: p.payload.to_vec(),
+                        qos: p.qos as u8,
+                        retain: p.retain,
+                        message_expiry: p.message_expiry,
+                        app: app_to_wire(&p.app),
+                    });
+                    self.forward_index.remove(seq);
+                    if let Some(p) = self.pending_publishes.get_mut(&id) {
+                        p.awaiting.remove(seq);
+                    }
+                    self.try_complete_pending(id);
+                    continue;
+                }
+                let _ = peer.tx.send(PeerMessage::PublishAcked {
+                    seq: *seq,
+                    topic: p.topic.clone(),
+                    payload: p.payload.to_vec(),
+                    qos: p.qos as u8,
+                    retain: p.retain,
+                    message_expiry: p.message_expiry,
+                    app: app_to_wire(&p.app),
                 });
             }
+            // Re-route after a target death (grace engaged by peer_dead).
+            let Some(p) = self.pending_publishes.get(&id) else {
+                continue;
+            };
+            let Some(grace) = p.reroute_grace else {
+                continue;
+            };
+            let candidates = self.reroute_candidates(id);
+            if !candidates.is_empty() {
+                debug!(
+                    publish = id,
+                    targets = candidates.len(),
+                    "re-routing acked forward"
+                );
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.reroute_grace = None;
+                }
+                for node in candidates {
+                    self.send_acked_forward(id, &node);
+                }
+                continue;
+            }
+            let awaiting_empty = p.awaiting.is_empty();
+            if awaiting_empty && grace <= 1 && !self.mesh_whole() {
+                // An alive peer is unreachable: its interest is invisible, so
+                // "no candidates" proves nothing. Hold at the last grace tick
+                // until the mesh heals (seed 4) — the publisher waits, exactly
+                // like a durable attach under partition.
+                continue;
+            }
+            if awaiting_empty && grace <= 1 {
+                // The grace ends with a FINAL local re-delivery: the subscriber
+                // may have materialized HERE in the meantime — via this node's
+                // takeover scan or its own re-attach — after this publish's
+                // original local fan-out ran against a not-yet-materialized
+                // table (exhibit ⑥'s race, both faces). Targeted: only routing
+                // state that could have missed the original fan-out.
+                debug!(
+                    publish = id,
+                    "re-route grace expired; final local re-delivery"
+                );
+                if !self.redeliver_pending(id).await {
+                    self.drop_pending(id);
+                    continue;
+                }
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.reroute_grace = None;
+                }
+            } else if awaiting_empty {
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.reroute_grace = Some(grace - 1);
+                }
+            }
+            self.try_complete_pending(id);
         }
     }
 
@@ -2282,11 +3721,14 @@ impl Hub {
         if retained.is_empty() && self.retained_tokens.is_empty() {
             return;
         }
-        let (count, hash, value_hash) = retained_digest(
-            retained
-                .iter()
-                .map(|m| (m.topic.as_str(), m.payload.as_ref(), m.qos as u8)),
-        );
+        let (count, hash, value_hash) = retained_digest(retained.iter().map(|m| {
+            (
+                m.topic.as_str(),
+                m.payload.as_ref(),
+                m.qos as u8,
+                AppProps::from(&m.app).encode(),
+            )
+        }));
         let _ = peer.tx.send(PeerMessage::RetainedDigest {
             count,
             hash,
@@ -2306,11 +3748,14 @@ impl Hub {
         let Ok(retained) = self.retained.all().await else {
             return;
         };
-        let ours = retained_digest(
-            retained
-                .iter()
-                .map(|m| (m.topic.as_str(), m.payload.as_ref(), m.qos as u8)),
-        );
+        let ours = retained_digest(retained.iter().map(|m| {
+            (
+                m.topic.as_str(),
+                m.payload.as_ref(),
+                m.qos as u8,
+                AppProps::from(&m.app).encode(),
+            )
+        }));
         if ours == (count, hash, value_hash) {
             debug!(node = %node.0, topics = count, "retained sets already match; skipping back-fill");
             return;
@@ -2343,18 +3788,30 @@ impl Hub {
                     .get(&m.topic)
                     .copied()
                     .unwrap_or((0, 0));
-                (m.topic, m.payload.to_vec(), m.qos as u8, epoch, offset)
+                RetainedWireEntry {
+                    props: AppProps::from(&m.app),
+                    topic: m.topic,
+                    payload: m.payload.to_vec(),
+                    qos: m.qos as u8,
+                    epoch,
+                    offset,
+                }
             })
             .collect();
         // Committed clears back-fill too: a token held for a topic no longer cached
         // is a tombstone, sent as an empty-payload entry so a peer that missed the
         // clear drops the topic instead of keeping it forever (ADR 0037 P5).
-        let cached: HashSet<&str> = entries.iter().map(|(t, ..)| t.as_str()).collect();
+        let cached: HashSet<&str> = entries.iter().map(|e| e.topic.as_str()).collect();
         let tombstones: Vec<RetainedWireEntry> = self
             .retained_tokens
             .iter()
             .filter(|(topic, _)| !cached.contains(topic.as_str()))
-            .map(|(topic, (epoch, offset))| (topic.clone(), Vec::new(), 0, *epoch, *offset))
+            .map(|(topic, (epoch, offset))| RetainedWireEntry {
+                topic: topic.clone(),
+                epoch: *epoch,
+                offset: *offset,
+                ..Default::default()
+            })
             .collect();
         entries.extend(tombstones);
         if entries.is_empty() {
@@ -2381,16 +3838,17 @@ impl Hub {
     /// Divergence detection (ADR 0037 P1) runs in both modes: a topic both sides hold
     /// differently is counted (`retained_divergence_total`) and surfaced with one
     /// `warn!` per snapshot chunk — under durable the same pass now also *resolves* it.
-    async fn apply_retained_snapshot(
-        &mut self,
-        node: &NodeId,
-        messages: Vec<(String, Bytes, QoS, u64, u64)>,
-    ) {
+    async fn apply_retained_snapshot(&mut self, node: &NodeId, messages: Vec<RetainedWireEntry>) {
         let have: HashMap<String, u64> = match self.retained.all().await {
             Ok(all) => all
                 .into_iter()
                 .map(|m| {
-                    let id = retained_value_id(&m.topic, m.payload.as_ref(), m.qos as u8);
+                    let id = retained_value_id(
+                        &m.topic,
+                        m.payload.as_ref(),
+                        m.qos as u8,
+                        &AppProps::from(&m.app).encode(),
+                    );
                     (m.topic, id)
                 })
                 .collect(),
@@ -2399,13 +3857,23 @@ impl Hub {
         let durable = self.durable_retained.is_some();
         let mut filled = 0;
         let mut diverged = 0u64;
-        for (topic, payload, qos, epoch, offset) in messages {
+        for entry in messages {
+            let RetainedWireEntry {
+                topic,
+                payload,
+                qos,
+                epoch,
+                offset,
+                props,
+            } = entry;
+            let payload = Bytes::from(payload);
             let held_value = have.get(&topic);
             // Detection (P1): both sides hold the topic, with different values (an
-            // incoming committed clear against our value counts too).
-            if held_value
-                .is_some_and(|ours| *ours != retained_value_id(&topic, payload.as_ref(), qos as u8))
-            {
+            // incoming committed clear against our value counts too; differing
+            // application properties on an equal payload count as well — ADR 0038 T3).
+            if held_value.is_some_and(|ours| {
+                *ours != retained_value_id(&topic, payload.as_ref(), qos, &props.encode())
+            }) {
                 diverged += 1;
                 debug!(node = %node.0, %topic, "retained value diverges from peer");
                 if let Some(m) = &self.metrics {
@@ -2429,15 +3897,15 @@ impl Hub {
                 // Gap-fill only (ADR 0014 §3); a tombstone entry has nothing to fill.
                 continue;
             }
-            // The retained-snapshot wire does not carry application properties (a narrow
-            // gap, like the persistent-retained codec); a back-filled retained message
-            // has none. An empty payload clears the topic [MQTT-3.3.1-10].
+            // An empty payload clears the topic [MQTT-3.3.1-10]. Application
+            // properties back-fill with the value (ADR 0038 T3), so a replay from a
+            // back-filled cache matches one from the origin node.
             let message = Message {
                 topic,
                 payload,
-                qos,
+                qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
                 retain: true,
-                app: AppProperties::default(),
+                app: props.into(),
             };
             if self.retained.set(&message).await.is_ok() {
                 filled += 1;
@@ -2467,7 +3935,14 @@ impl Hub {
         }
     }
 
-    fn peer_connected(&mut self, node: NodeId, conn_id: u64, tx: PeerOutbound) {
+    fn peer_connected(
+        &mut self,
+        node: NodeId,
+        conn_id: u64,
+        tx: PeerOutbound,
+        cert_serial: Option<Vec<u8>>,
+        proto: u32,
+    ) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest + shared membership so the peer can route to us
         // immediately (ordinary fan-out and cluster-wide shared selection, ADR 0015).
@@ -2482,7 +3957,21 @@ impl Hub {
         if let Some(plane) = &self.durable_plane {
             plane.register(&node, tx.clone());
         }
-        self.peers.insert(node, Peer { conn_id, tx });
+        self.peers.insert(
+            node,
+            Peer {
+                conn_id,
+                tx,
+                cert_serial,
+                proto,
+            },
+        );
+        // A link (re)forming while gated publishes are held: schedule a scan so
+        // the settle pass re-runs against the now-visible peer state (its
+        // Interest snapshot arrives with the link) and releases what it can.
+        if !self.pending_publishes.is_empty() {
+            self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
+        }
     }
 
     fn peer_disconnected(&mut self, node: &NodeId, conn_id: u64) {
@@ -2492,7 +3981,13 @@ impl Hub {
         }
         info!(peer = %node.0, "peer link lost");
         self.peers.remove(node);
-        self.remote_interest.remove(node);
+        // The peer's INTEREST is kept (ADR 0042 T9): a link-down peer is not a
+        // dead peer, and its subscribers are still owed matching publishes — a
+        // gated forward to it becomes a held obligation that retransmits when the
+        // link returns, or re-routes when membership confirms death (`peer_dead`,
+        // which does drop the interest). Dropping interest here was exhibit ⑤'s
+        // second face: a publish in the disconnect-to-confirmation window found
+        // no interest anywhere and acked a trivially-empty fan-out.
         self.remote_shared.remove(node);
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
@@ -2508,6 +4003,30 @@ impl Hub {
         let had_link = self.peers.remove(node).is_some();
         let had_interest = self.remote_interest.remove(node).is_some();
         self.remote_shared.remove(node);
+        // Acked forwards to the dead node re-route to its successor once it
+        // advertises the inherited interest (ADR 0042 T9, exhibit ⑤ + ⑥): drop
+        // the dead obligations and engage the sweep's re-route grace.
+        let mut dead_seqs: Vec<u64> = Vec::new();
+        for p in self.pending_publishes.values_mut() {
+            let seqs: Vec<u64> = p
+                .awaiting
+                .iter()
+                .filter(|(_, n)| *n == node)
+                .map(|(s, _)| *s)
+                .collect();
+            if seqs.is_empty() {
+                continue;
+            }
+            for seq in seqs {
+                p.awaiting.remove(&seq);
+                dead_seqs.push(seq);
+            }
+            debug!(peer = %node.0, topic = %p.topic, "forward target died; re-route grace engaged");
+            p.reroute_grace = Some(REROUTE_GRACE_TICKS);
+        }
+        for seq in dead_seqs {
+            self.forward_index.remove(&seq);
+        }
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
         }
@@ -2563,7 +4082,8 @@ impl Hub {
     }
 
     /// This node's shared-subscription membership snapshot, in the peer wire form.
-    fn shared_snapshot(&self) -> mqtt_cluster::peer::SharedGroupsWire {
+    fn shared_snapshot(&self) -> Vec<mqtt_cluster::peer::SharedGroupWire> {
+        use mqtt_cluster::peer::{SharedGroupWire, SharedMemberWire};
         self.shared
             .snapshot()
             .into_iter()
@@ -2573,12 +4093,17 @@ impl Hub {
                 let members = g
                     .members
                     .into_iter()
-                    .map(|(c, q)| {
-                        let online = self.online.contains_key(&c);
-                        (c.0, q as u8, online)
+                    .map(|(c, q)| SharedMemberWire {
+                        online: self.online.contains_key(&c),
+                        client: c.0,
+                        qos: q as u8,
                     })
                     .collect();
-                (g.group, g.filter, members)
+                SharedGroupWire {
+                    group: g.group,
+                    filter: g.filter,
+                    members,
+                }
             })
             .collect()
     }
@@ -2608,15 +4133,32 @@ impl Hub {
     /// commits (per-node order holds even for rapid same-topic publishes) and lets a
     /// mutation that cannot reach its owner wait for a heal instead of being dropped.
     /// At the bound the **oldest** is dropped, loudly.
-    fn route_retained_commit(&mut self, topic: &str, payload: &Bytes, qos: u8) {
+    fn route_retained_commit(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: u8,
+        app: &AppProperties,
+        gate: Option<u64>,
+    ) {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
+        }
+        // The gated publish's ack now waits for this authority commit (ADR 0042 T9,
+        // exhibit ⑦) — the obligation rides the mutation through re-queues and the
+        // handoff hold, however long the commit takes.
+        if let Some(id) = gate {
+            if let Some(p) = self.pending_publishes.get_mut(&id) {
+                p.awaiting_retained = true;
+            }
         }
         self.enqueue_retained_mutation(RetainedMutation {
             topic: topic.to_string(),
             payload: payload.clone(),
             qos,
+            app: app.clone(),
             reply: None,
+            publish: gate,
         });
         self.kick_retained_queue();
     }
@@ -2638,6 +4180,11 @@ impl Hub {
                         self.retained_handoff_pending.remove(&node);
                     }
                 }
+                // A gated publish whose authority commit was dropped never acks
+                // (ADR 0042 T9, exhibit ⑦): the publisher retries.
+                if let Some(id) = dropped.publish {
+                    self.drop_pending(id);
+                }
             }
             if let Some(m) = &self.metrics {
                 m.retained_queue_dropped();
@@ -2656,6 +4203,7 @@ impl Hub {
         topic: String,
         payload: Bytes,
         qos: u8,
+        app: AppProperties,
         seq: u64,
     ) {
         if self.durable_retained.is_none() {
@@ -2678,7 +4226,9 @@ impl Hub {
             topic,
             payload,
             qos,
+            app,
             reply: Some((node, seq)),
+            publish: None,
         });
         self.kick_retained_queue();
     }
@@ -2762,6 +4312,7 @@ impl Hub {
                 topic: mutation.topic.clone(),
                 payload: mutation.payload.to_vec(),
                 qos: mutation.qos,
+                props: app_to_wire(&mutation.app),
                 seq,
             });
         }
@@ -2797,13 +4348,17 @@ impl Hub {
             topic,
             payload,
             qos,
+            app,
             reply,
+            publish,
         } = mutation;
         tokio::spawn(async move {
             let result = if payload.is_empty() {
                 durable.clear(&topic).await
             } else {
-                durable.set(&topic, &payload, qos).await
+                durable
+                    .set(&topic, &payload, qos, &AppProps::from(&app))
+                    .await
             };
             let token = match result {
                 Ok((epoch, offset)) => {
@@ -2826,8 +4381,10 @@ impl Hub {
                 topic,
                 payload,
                 qos,
+                app,
                 token,
                 reply,
+                publish,
             });
         });
     }
@@ -2841,6 +4398,7 @@ impl Hub {
         topic: &str,
         payload: &Bytes,
         qos: u8,
+        app: &AppProperties,
         token: (u64, u64),
     ) {
         if self
@@ -2857,7 +4415,7 @@ impl Hub {
             payload: payload.clone(),
             qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
             retain: true,
-            app: AppProperties::default(),
+            app: app.clone(),
         };
         if let Err(e) = self.retained.set(&message).await {
             warn!(topic = %topic, error = %e, "failed to apply committed retained update");
@@ -2964,7 +4522,8 @@ async fn recover_session(
     self_tx: mpsc::UnboundedSender<HubCommand>,
     pending: PendingAttach,
 ) {
-    let recovery = recover_until_ready(&store, &pending.client, &pending.owner).await;
+    let recovery =
+        recover_until_ready(&store, &pending.client, &pending.admission.identity.subject).await;
     let _ = self_tx.send(HubCommand::SessionRecovered { pending, recovery });
 }
 
@@ -3039,17 +4598,36 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
+    /// A committed retained snapshot entry with no application properties — the
+    /// common test shape (props-bearing cases build the struct directly).
+    fn snap(topic: &str, payload: &[u8], epoch: u64, offset: u64) -> RetainedWireEntry {
+        RetainedWireEntry {
+            topic: topic.into(),
+            payload: payload.to_vec(),
+            qos: 0,
+            epoch,
+            offset,
+            props: mqtt_cluster::peer::WireAppProps::default(),
+        }
+    }
+    /// The canonical empty-props bytes folded into digest entries (ADR 0038 T3).
+    fn no_props() -> Vec<u8> {
+        AppProps::default().encode()
+    }
+
     use super::{
-        AttachOutcome, Backlog, Hub, HubCommand, Inflight, Outbound, PeerOutbound,
-        RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, REPLAY_LIMIT,
+        Admission, AttachOutcome, AuthMethod, Backlog, Hub, HubCommand, Inflight, Outbound,
+        PeerOutbound, ProtocolVersion, RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG,
+        REPLAY_LIMIT,
     };
     use bytes::Bytes;
-    use mqtt_cluster::peer::PeerMessage;
+    use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
     use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
     use mqtt_cluster::swim::MemberState;
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
     use mqtt_core::{AppProperties, ClientId};
+    use mqtt_storage::app_props::AppProps;
     use mqtt_storage::repl::InMemoryReplicatedLog;
     use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
     use std::sync::{Arc, RwLock};
@@ -3110,6 +4688,19 @@ mod tests {
         tx
     }
 
+    /// A password-admitted v3.1.1 [`Admission`] for `subject` — the common test shape.
+    fn admission(subject: &str) -> Admission {
+        Admission {
+            identity: mqtt_auth::Identity {
+                subject: subject.to_string(),
+                groups: vec![],
+            },
+            method: AuthMethod::Password,
+            cert_serial: None,
+            protocol: ProtocolVersion::V311,
+        }
+    }
+
     /// Send a persistent (resume) `Attach` and return the raw [`AttachOutcome`] so a
     /// test can assert a reject (`Unavailable`) as well as a present/absent session.
     async fn attach_outcome(tx: &HubTx, client: &str, conn_id: u64) -> AttachOutcome {
@@ -3117,7 +4708,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            owner: client.to_string(),
+            admission: admission(client),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -3143,7 +4734,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            owner: owner.to_string(),
+            admission: admission(owner),
             conn_id,
             clean_start: false,
             session_expiry: u32::MAX,
@@ -3397,7 +4988,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
-            owner: client.to_string(),
+            admission: admission(client),
             conn_id,
             clean_start,
             session_expiry,
@@ -3414,6 +5005,9 @@ mod tests {
             }
             AttachOutcome::OwnerMismatch => {
                 panic!("same-owner attach is never an ownership mismatch")
+            }
+            AttachOutcome::QuotaExceeded => {
+                panic!("uncapped test hubs never refuse for quota")
             }
         };
         (out_rx, session_present)
@@ -3432,6 +5026,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), QoS::AtMostOnce)],
+            reply: None,
         })
         .unwrap();
     }
@@ -3453,6 +5048,8 @@ mod tests {
             retain: false,
             message_expiry,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -3461,6 +5058,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), qos)],
+            reply: None,
         })
         .unwrap();
     }
@@ -3546,6 +5144,8 @@ mod tests {
             retain: false,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -3571,6 +5171,8 @@ mod tests {
             node: NodeId(node.into()),
             conn_id,
             tx: peer_tx,
+            cert_serial: None,
+            proto: mqtt_cluster::peer::PROTO_MAX,
         })
         .unwrap();
         peer_rx
@@ -3696,6 +5298,358 @@ mod tests {
         );
     }
 
+    /// ADR 0040 T1: the eviction primitive. Evicting a live v5 client sends
+    /// DISCONNECT 0x87 (Not authorized) and closes its connection; its will is
+    /// published (an eviction is an ungraceful end, MQTT-3.14.4-3); an untouched
+    /// client keeps flowing; and evicting an offline client is a no-op.
+    #[tokio::test]
+    async fn eviction_disconnects_the_target_and_leaves_others_undisturbed() {
+        let tx = start_hub();
+
+        // A bystander subscribed to the victim's will topic.
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "wills/victim");
+
+        // The victim: a v5 client with a will, admitted by certificate.
+        let (out_tx, mut victim): (Outbound, _) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId("victim".into()),
+            admission: Admission {
+                identity: mqtt_auth::Identity {
+                    subject: "victim".into(),
+                    groups: vec![],
+                },
+                method: AuthMethod::Certificate,
+                cert_serial: Some(vec![0x0a, 0x0b]),
+                protocol: ProtocolVersion::V5,
+            },
+            conn_id: 2,
+            clean_start: true,
+            session_expiry: 0,
+            receive_maximum: u16::MAX,
+            will: Some(mqtt_core::Message {
+                topic: "wills/victim".into(),
+                payload: Bytes::from_static(b"gone"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+            }),
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        tx.send(HubCommand::Evict {
+            client: ClientId("victim".into()),
+            reason: "cert-revoked".into(),
+        })
+        .unwrap();
+
+        // The victim is told why (v5), then its connection closes.
+        match recv_packet(&mut victim).await {
+            Some(Packet::Disconnect(d)) => assert_eq!(
+                d.reason, 0x87,
+                "an evicted v5 client gets DISCONNECT Not authorized"
+            ),
+            other => panic!("expected DISCONNECT 0x87, got {other:?}"),
+        }
+        assert!(
+            recv_packet(&mut victim).await.is_none(),
+            "the evicted connection must be closed"
+        );
+
+        // The will reached the bystander, whose own connection is untouched.
+        match recv_packet(&mut watcher).await {
+            Some(Packet::Publish(p)) => {
+                assert_eq!(p.topic, "wills/victim");
+                assert_eq!(&p.payload[..], b"gone");
+            }
+            other => panic!("expected the victim's will, got {other:?}"),
+        }
+
+        // Evicting an offline/unknown client is a no-op — the hub keeps serving.
+        tx.send(HubCommand::Evict {
+            client: ClientId("missing".into()),
+            reason: "user-removed".into(),
+        })
+        .unwrap();
+        publish(&tx, "wills/victim", b"still-serving");
+        assert_eq!(
+            payload_of(&recv_packet(&mut watcher).await.unwrap()),
+            b"still-serving"
+        );
+    }
+
+    /// ADR 0040 T2: the identity sweep. One reload-published policy evicts, in one
+    /// pass, the session whose certificate serial is CRL'd, the session whose
+    /// password user was removed, and the session the new connect-ACL denies — while
+    /// an untouched session keeps flowing. Each eviction is audited with its reason.
+    // One scenario deliberately covers all three eviction classes plus the summary.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn the_identity_sweep_evicts_revoked_sessions_and_spares_the_rest() {
+        use mqtt_auth::signed_gossip::RevocationList;
+        use mqtt_auth::{AuthError, Authenticator, Authorizer, Credentials, Identity};
+
+        /// Denies connect for one subject; permits everything else.
+        struct DenyConnectFor(&'static str);
+        impl Authorizer for DenyConnectFor {
+            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_subscribe(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_connect(&self, identity: &Identity, _: &ClientId) -> bool {
+                identity.subject != self.0
+            }
+        }
+        /// A credential store that no longer knows one subject.
+        struct UserGone(&'static str);
+        impl Authenticator for UserGone {
+            fn authenticate(
+                &self,
+                _: &ClientId,
+                _: &Credentials<'_>,
+            ) -> Result<Identity, AuthError> {
+                Err(AuthError::Rejected)
+            }
+            fn password_subject_exists(&self, subject: &str) -> bool {
+                subject != self.0
+            }
+        }
+
+        let tx = start_hub();
+        // Four live sessions, admitted under distinct facts.
+        let attach_as = |client: &str, adm: Admission, conn_id: u64| {
+            let tx = tx.clone();
+            let client = client.to_string();
+            async move {
+                let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
+                let (reply_tx, reply_rx) = oneshot::channel();
+                tx.send(HubCommand::Attach {
+                    client: ClientId(client),
+                    admission: adm,
+                    conn_id,
+                    clean_start: true,
+                    session_expiry: 0,
+                    receive_maximum: u16::MAX,
+                    will: None,
+                    outbound: out_tx,
+                    reply: reply_tx,
+                })
+                .unwrap();
+                reply_rx.await.unwrap();
+                out_rx
+            }
+        };
+        let cert_admission = Admission {
+            identity: mqtt_auth::Identity {
+                subject: "cert-user".into(),
+                groups: vec![],
+            },
+            method: AuthMethod::Certificate,
+            cert_serial: Some(vec![0x42]),
+            protocol: ProtocolVersion::V311,
+        };
+        let mut revoked_cert = attach_as("by-cert", cert_admission, 1).await;
+        let mut removed_user = attach_as("by-user", admission("bob"), 2).await;
+        let mut denied_connect = attach_as("by-acl", admission("evil"), 3).await;
+        let (mut survivor, _) = attach(&tx, "keeper", 4, true).await;
+        subscribe(&tx, "keeper", "t");
+
+        let audit = Arc::new(mqtt_observability::RecordingAuditSink::default());
+        tx.send(HubCommand::SweepIdentities(super::SweepPolicy {
+            authorizer: Arc::new(DenyConnectFor("evil")),
+            authenticator: Arc::new(UserGone("bob")),
+            revoked: RevocationList::from_serials([vec![0x42]]),
+            peer_revoked: RevocationList::default(),
+            trigger: "signal".into(),
+            audit: audit.clone(),
+        }))
+        .unwrap();
+
+        for (rx, who) in [
+            (&mut revoked_cert, "CRL'd certificate"),
+            (&mut removed_user, "removed password user"),
+            (&mut denied_connect, "connect-ACL denied principal"),
+        ] {
+            assert!(
+                recv_packet(rx).await.is_none(),
+                "the {who} session must be evicted by the sweep"
+            );
+        }
+        // The untouched session still receives traffic.
+        publish(&tx, "t", b"alive");
+        assert_eq!(
+            payload_of(&recv_packet(&mut survivor).await.unwrap()),
+            b"alive"
+        );
+        // Each eviction was audited with its reason.
+        let events = audit.events();
+        for reason in ["cert-revoked", "user-removed", "connect-denied"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.kind == "security.evict" && e.detail.contains(reason)),
+                "missing security.evict audit for {reason}: {events:?}"
+            );
+        }
+        // ...and the sweep leaves one summary record with the counts (ADR 0040 T5).
+        assert!(
+            events.iter().any(|e| e.kind == "security.sweep"
+                && e.detail.contains("identities=3")
+                && e.detail.contains("grants=0")
+                && e.detail.contains("peers=0")),
+            "missing the security.sweep summary: {events:?}"
+        );
+    }
+
+    /// ADR 0040 T3: the grant sweep. A reload that tightens a subscriber's read
+    /// access removes the revoked grant from live routing — delivery stops, durably —
+    /// while the client stays CONNECTED and its untouched grants keep flowing. The
+    /// grant removal is audited.
+    #[tokio::test]
+    async fn the_grant_sweep_removes_revoked_subscriptions_without_disconnecting() {
+        use mqtt_auth::signed_gossip::RevocationList;
+        use mqtt_auth::Identity;
+
+        /// Denies subscriptions to `secret/#`; permits everything else.
+        struct DenySecret;
+        impl mqtt_auth::Authorizer for DenySecret {
+            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_subscribe(&self, _: &Identity, filter: &String) -> bool {
+                !filter.starts_with("secret/")
+            }
+        }
+
+        let tx = start_hub();
+        let (mut reader, _) = attach(&tx, "reader", 1, true).await;
+        subscribe(&tx, "reader", "secret/#");
+        subscribe(&tx, "reader", "ok/#");
+        publish(&tx, "secret/1", b"s1");
+        assert_eq!(payload_of(&recv_packet(&mut reader).await.unwrap()), b"s1");
+
+        let audit = Arc::new(mqtt_observability::RecordingAuditSink::default());
+        tx.send(HubCommand::SweepIdentities(super::SweepPolicy {
+            authorizer: Arc::new(DenySecret),
+            authenticator: Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+            revoked: RevocationList::default(),
+            peer_revoked: RevocationList::default(),
+            trigger: "signal".into(),
+            audit: audit.clone(),
+        }))
+        .unwrap();
+
+        // The revoked grant stops delivering; the untouched grant and the
+        // connection itself keep working.
+        publish(&tx, "secret/2", b"s2");
+        publish(&tx, "ok/1", b"fine");
+        assert_eq!(
+            payload_of(&recv_packet(&mut reader).await.unwrap()),
+            b"fine",
+            "only the surviving grant may deliver after the sweep"
+        );
+        assert!(
+            audit
+                .events()
+                .iter()
+                .any(|e| e.kind == "security.evict" && e.detail.contains("grant-revoked")),
+            "the grant removal must be audited"
+        );
+    }
+
+    /// ADR 0040 T3: resume-time grant revocation. A persistent session that slept
+    /// through a tightening reload has its revoked grants removed when it resumes —
+    /// re-checked under the resuming principal's identity against the CURRENT
+    /// policy — and queued messages that only a revoked grant admits are dropped
+    /// from the replay, durably.
+    #[tokio::test]
+    async fn a_resumed_session_loses_grants_the_current_policy_denies() {
+        use mqtt_auth::{AllowAll, Identity};
+
+        struct DenySecret;
+        impl mqtt_auth::Authorizer for DenySecret {
+            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+                true
+            }
+            fn authorize_subscribe(&self, _: &Identity, filter: &String) -> bool {
+                !filter.starts_with("secret/")
+            }
+        }
+
+        let tx = start_hub();
+        // The hub consults this live handle at resume, exactly like the connections do.
+        let (authz_tx, authz_rx) =
+            tokio::sync::watch::channel(Arc::new(AllowAll) as Arc<dyn mqtt_auth::Authorizer>);
+        tx.send(HubCommand::AttachAuthorizer(super::AuthzWatch(authz_rx)))
+            .unwrap();
+
+        // A persistent subscriber sleeps with two granted filters...
+        let (_rx, _) = attach(&tx, "sleeper", 1, false).await;
+        subscribe(&tx, "sleeper", "secret/#");
+        subscribe(&tx, "sleeper", "ok/#");
+        tx.send(HubCommand::Detach {
+            client: ClientId("sleeper".into()),
+            conn_id: 1,
+            graceful: true,
+        })
+        .unwrap();
+
+        // ...misses two QoS 1 messages (both queued)...
+        publish_qos1(&tx, "secret/1", b"leaked?");
+        publish_qos1(&tx, "ok/1", b"kept");
+
+        // ...and the policy tightens while it sleeps.
+        authz_tx
+            .send(Arc::new(DenySecret) as Arc<dyn mqtt_auth::Authorizer>)
+            .unwrap();
+
+        // On resume: the revoked grant is gone, its queued message is NOT replayed,
+        // the surviving grant's message is.
+        let (mut rx, present) = attach(&tx, "sleeper", 2, false).await;
+        assert!(present, "the persistent session must still be present");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"kept",
+            "only the surviving grant's queued message may replay"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the revoked grant's queued message must not replay"
+        );
+        // New traffic on the revoked filter no longer routes to the session...
+        publish(&tx, "secret/2", b"s2");
+        assert!(recv_packet(&mut rx).await.is_none());
+        // ...while the surviving grant keeps flowing.
+        publish(&tx, "ok/2", b"still");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"still");
+    }
+
+    /// ADR 0040 T1: v3.1.1 has no server DISCONNECT — an evicted v3.1.1 client's
+    /// connection just closes, with no packet first.
+    #[tokio::test]
+    async fn evicting_a_v311_client_closes_without_a_disconnect_packet() {
+        let tx = start_hub();
+        // The test helpers admit at v3.1.1 (see `admission`).
+        let (mut rx, _) = attach(&tx, "v3", 1, true).await;
+        tx.send(HubCommand::Evict {
+            client: ClientId("v3".into()),
+            reason: "user-removed".into(),
+        })
+        .unwrap();
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a v3.1.1 eviction is a bare close — no DISCONNECT exists to send"
+        );
+    }
+
     /// Cluster-wide shared selection (ADR 0015): with a local member and a peer
     /// member in the same group, the round-robin alternates — the local member is
     /// delivered to directly, and the remote pick goes out as a targeted
@@ -3795,8 +5749,8 @@ mod tests {
         match recv_peer(&mut peer).await {
             Some(PeerMessage::RetainedSnapshot { messages }) => {
                 assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0].0, "t");
-                assert_eq!(&messages[0].1[..], b"r");
+                assert_eq!(messages[0].topic, "t");
+                assert_eq!(&messages[0].payload[..], b"r");
             }
             other => panic!("expected RetainedSnapshot, got {other:?}"),
         }
@@ -3820,7 +5774,7 @@ mod tests {
 
         // The peer claims the same single (topic, value, qos) we hold: same digest, no pull.
         let (count, hash, value_hash) =
-            super::retained_digest(std::iter::once(("t", b"r".as_ref(), 0u8)));
+            super::retained_digest(std::iter::once(("t", b"r".as_ref(), 0u8, no_props())));
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
             count,
@@ -3851,7 +5805,11 @@ mod tests {
 
         // The peer holds a different set: we answer its digest with a pull.
         let (count, hash, value_hash) = super::retained_digest(
-            [("t", b"r".as_ref(), 0u8), ("other", b"x".as_ref(), 0u8)].into_iter(),
+            [
+                ("t", b"r".as_ref(), 0u8, no_props()),
+                ("other", b"x".as_ref(), 0u8, no_props()),
+            ]
+            .into_iter(),
         );
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
@@ -3885,7 +5843,7 @@ mod tests {
 
         // Same single topic, different value: set hash matches, value hash differs.
         let (count, hash, value_hash) =
-            super::retained_digest(std::iter::once(("t", b"THEIRS".as_ref(), 0u8)));
+            super::retained_digest(std::iter::once(("t", b"THEIRS".as_ref(), 0u8, no_props())));
         tx.send(HubCommand::RemoteRetainedDigest {
             node: NodeId("n".into()),
             count,
@@ -3907,11 +5865,18 @@ mod tests {
     fn a_large_retained_set_is_chunked_under_the_frame_budget() {
         // 9 entries of ~1 MiB against a 4 MiB budget → at least 3 chunks.
         let payload = vec![0u8; 1024 * 1024];
-        let entries = (0..9).map(|i| (format!("t/{i}"), payload.clone(), 0u8, 0u64, 0u64));
+        let entries = (0..9).map(|i| RetainedWireEntry {
+            topic: format!("t/{i}"),
+            payload: payload.clone(),
+            ..Default::default()
+        });
         let chunks = super::chunk_retained(entries);
         assert!(chunks.len() >= 3, "9 MiB must not fit 2 chunks of 4 MiB");
         for chunk in &chunks {
-            let bytes: usize = chunk.iter().map(|(t, p, ..)| t.len() + p.len() + 48).sum();
+            let bytes: usize = chunk
+                .iter()
+                .map(|e| e.topic.len() + e.payload.len() + 48)
+                .sum();
             assert!(bytes <= super::RETAINED_CHUNK_BYTES, "chunk over budget");
         }
         let total: usize = chunks.iter().map(Vec::len).sum();
@@ -3925,11 +5890,19 @@ mod tests {
     fn an_oversized_single_retained_message_is_skipped_not_sent() {
         let huge = vec![0u8; super::RETAINED_CHUNK_BYTES + 1];
         let entries = vec![
-            ("ok".to_string(), vec![1u8; 8], 0u8, 0u64, 0u64),
-            ("huge".to_string(), huge, 0u8, 0u64, 0u64),
+            RetainedWireEntry {
+                topic: "ok".into(),
+                payload: vec![1u8; 8],
+                ..Default::default()
+            },
+            RetainedWireEntry {
+                topic: "huge".into(),
+                payload: huge,
+                ..Default::default()
+            },
         ];
         let chunks = super::chunk_retained(entries.into_iter());
-        let all: Vec<&str> = chunks.iter().flatten().map(|(t, ..)| t.as_str()).collect();
+        let all: Vec<&str> = chunks.iter().flatten().map(|e| e.topic.as_str()).collect();
         assert_eq!(
             all,
             vec!["ok"],
@@ -3941,17 +5914,19 @@ mod tests {
     /// hash sees payload changes the topic-set hash ignores (ADR 0037 P1).
     #[test]
     fn the_retained_digest_is_order_independent_and_set_sensitive() {
-        let one = ("x", b"1".as_ref(), 0u8);
-        let two = ("y", b"2".as_ref(), 1u8);
-        let three = ("z", b"3".as_ref(), 0u8);
-        let full = super::retained_digest([one, two, three].into_iter());
-        let shuffled = super::retained_digest([three, one, two].into_iter());
+        let one = ("x", b"1".as_ref(), 0u8, no_props());
+        let two = ("y", b"2".as_ref(), 1u8, no_props());
+        let three = ("z", b"3".as_ref(), 0u8, no_props());
+        let full = super::retained_digest([one.clone(), two.clone(), three.clone()].into_iter());
+        let shuffled =
+            super::retained_digest([three.clone(), one.clone(), two.clone()].into_iter());
         assert_eq!(full, shuffled, "order must not matter");
-        let subset = super::retained_digest([one, two].into_iter());
+        let subset = super::retained_digest([one.clone(), two.clone()].into_iter());
         assert_ne!(full, subset, "a different set must differ");
         // Same topics, different value: topic hash equal, value hash different.
-        let two_changed = ("y", b"CHANGED".as_ref(), 1u8);
-        let diverged = super::retained_digest([one, two_changed, three].into_iter());
+        let two_changed = ("y", b"CHANGED".as_ref(), 1u8, no_props());
+        let diverged =
+            super::retained_digest([one.clone(), two_changed, three.clone()].into_iter());
         assert_eq!(full.1, diverged.1, "topic-set hash ignores values");
         assert_ne!(
             full.2, diverged.2,
@@ -3967,13 +5942,7 @@ mod tests {
         let tx = start_hub();
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "room/t".into(),
-                Bytes::from_static(b"v"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("room/t", b"v", 0, 0)],
         })
         .unwrap();
 
@@ -4003,27 +5972,9 @@ mod tests {
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
             messages: vec![
-                (
-                    "dev/1".into(),
-                    Bytes::from_static(b"theirs"),
-                    QoS::AtMostOnce,
-                    0,
-                    0,
-                ),
-                (
-                    "dev/same".into(),
-                    Bytes::from_static(b"agreed"),
-                    QoS::AtMostOnce,
-                    0,
-                    0,
-                ),
-                (
-                    "dev/new".into(),
-                    Bytes::from_static(b"x"),
-                    QoS::AtMostOnce,
-                    0,
-                    0,
-                ),
+                snap("dev/1", b"theirs", 0, 0),
+                snap("dev/same", b"agreed", 0, 0),
+                snap("dev/new", b"x", 0, 0),
             ],
         })
         .unwrap();
@@ -4053,13 +6004,7 @@ mod tests {
         publish_retained(&tx, "t", b"local");
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"peer-stale"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("t", b"peer-stale", 0, 0)],
         })
         .unwrap();
 
@@ -4267,6 +6212,134 @@ mod tests {
         );
     }
 
+    /// ADR 0041 T5 — a failed durable offline enqueue WITHHOLDS the publisher's
+    /// ack (the sender is dropped, the publisher retries) instead of acking a
+    /// message a subscriber will never see — fail closed, like the local path.
+    #[tokio::test]
+    async fn a_failed_offline_enqueue_withholds_the_publishers_ack() {
+        let (hub, tx) = Hub::with_config(NodeId("h".into()), FlakyStore::new_no_quorum_enqueue());
+        tokio::spawn(hub.run());
+
+        // A persistent, offline subscriber: a publish to it takes the durable
+        // enqueue path, which this store fails.
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "fc/t");
+        detach(&tx, "p", 1);
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "fc/t".into(),
+            payload: Bytes::from_static(b"x"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(done_tx),
+            v5: false,
+        })
+        .unwrap();
+        assert!(
+            done_rx.await.is_err(),
+            "the ack must be withheld when the durable enqueue fails"
+        );
+    }
+
+    /// ADR 0041 T5 — brownout: above the disk watermark, growth writes are
+    /// refused (new retained topics, new sessions, offline enqueues) while
+    /// maintenance continues (resume, retained overwrite), and recovery below
+    /// the mark restores everything.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn brownout_refuses_growth_and_recovery_restores_it() {
+        let tx = start_hub();
+
+        // Pre-existing state: a persistent session with a QoS 1 subscription
+        // (asleep through the brownout), and one retained topic.
+        let (_rx, _) = attach(&tx, "sleeper", 1, false).await;
+        subscribe(&tx, "sleeper", "b/q");
+        detach(&tx, "sleeper", 1);
+        let retained_publish = |topic: &str, payload: &'static [u8]| {
+            let (done_tx, done_rx) = oneshot::channel();
+            tx.send(HubCommand::Publish {
+                topic: topic.into(),
+                payload: Bytes::from_static(payload),
+                qos: QoS::AtMostOnce,
+                retain: true,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: Some(done_tx),
+                v5: true,
+            })
+            .unwrap();
+            done_rx
+        };
+        assert_eq!(
+            retained_publish("b/r1", b"v1").await.unwrap(),
+            super::PublishOutcome::Accepted
+        );
+
+        tx.send(HubCommand::SetBrownout(true)).unwrap();
+
+        // Growth refused: a NEW retained topic...
+        assert_eq!(
+            retained_publish("b/r2", b"nope").await.unwrap(),
+            super::PublishOutcome::RetainedQuotaExceeded,
+            "a new retained topic must be refused under brownout"
+        );
+        // ...and a NEW session...
+        assert!(
+            matches!(
+                attach_outcome(&tx, "stranger", 2).await,
+                AttachOutcome::QuotaExceeded
+            ),
+            "a new session must be refused under brownout"
+        );
+        // ...and an offline enqueue (silently dropped, counted): this message
+        // must NOT replay after recovery.
+        publish_qos1(&tx, "b/q", b"browned-out");
+
+        // Maintenance continues: an overwrite of the existing retained topic...
+        assert_eq!(
+            retained_publish("b/r1", b"v2").await.unwrap(),
+            super::PublishOutcome::Accepted,
+            "overwriting an existing retained topic is maintenance, not growth"
+        );
+        // ...and resuming the existing session.
+        assert!(
+            matches!(
+                attach_outcome(&tx, "sleeper", 3).await,
+                AttachOutcome::Present(true)
+            ),
+            "a resume is never refused under brownout"
+        );
+        detach(&tx, "sleeper", 3);
+
+        // Recovery below the mark restores growth.
+        tx.send(HubCommand::SetBrownout(false)).unwrap();
+        assert_eq!(
+            retained_publish("b/r2", b"now").await.unwrap(),
+            super::PublishOutcome::Accepted
+        );
+        assert!(matches!(
+            attach_outcome(&tx, "stranger", 4).await,
+            AttachOutcome::Present(false)
+        ));
+        publish_qos1(&tx, "b/q", b"kept");
+
+        // The sleeper replays ONLY the post-recovery message.
+        let (mut rx, present) = attach(&tx, "sleeper", 5, false).await;
+        assert!(present);
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.unwrap()),
+            b"kept",
+            "only the post-recovery enqueue may replay"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the browned-out message must not have been queued"
+        );
+    }
+
     /// The append-failure reason classes are bounded and map each `StorageError`.
     #[test]
     fn durable_failure_reasons_are_bounded() {
@@ -4421,6 +6494,8 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -4538,6 +6613,8 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
 
@@ -4581,6 +6658,7 @@ mod tests {
             payload: Bytes::from_static(b"shut"),
             qos: 1,
             seq: 1,
+            app: AppProperties::default(),
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |_| true).await;
@@ -4594,6 +6672,7 @@ mod tests {
             payload: Bytes::new(),
             qos: 0,
             seq: 2,
+            app: AppProperties::default(),
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |e| e.tombstone).await;
@@ -4621,6 +6700,7 @@ mod tests {
                 qos: 0,
                 epoch,
                 offset,
+                app: AppProperties::default(),
             })
             .unwrap();
         };
@@ -4656,6 +6736,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 4,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
@@ -4667,6 +6748,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 5,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert!(retained_replay(&tx, "c2", "t").await.is_none());
@@ -4678,6 +6760,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 4,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert!(retained_replay(&tx, "c3", "t").await.is_none());
@@ -4707,6 +6790,7 @@ mod tests {
                 qos,
                 epoch,
                 offset,
+                ..
             }) => {
                 assert_eq!(topic, "t");
                 assert_eq!(payload, b"v");
@@ -4759,6 +6843,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 2,
+            app: AppProperties::default(),
         })
         .unwrap();
 
@@ -4766,13 +6851,7 @@ mod tests {
         // resolved, not just detected).
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"newer"),
-                QoS::AtMostOnce,
-                1,
-                5,
-            )],
+            messages: vec![snap("t", b"newer", 1, 5)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"newer");
@@ -4780,13 +6859,7 @@ mod tests {
         // A STALER snapshot entry is rejected — back-fill can never regress a topic.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"old"),
-                QoS::AtMostOnce,
-                1,
-                3,
-            )],
+            messages: vec![snap("t", b"old", 1, 3)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"newer");
@@ -4804,6 +6877,7 @@ mod tests {
             qos: 0,
             epoch: 1,
             offset: 3,
+            app: AppProperties::default(),
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
@@ -4811,7 +6885,7 @@ mod tests {
         // The peer committed a clear at (1, 6): our value drops.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![("t".into(), Bytes::new(), QoS::AtMostOnce, 1, 6)],
+            messages: vec![snap("t", b"", 1, 6)],
         })
         .unwrap();
         assert!(retained_replay(&tx, "c2", "t").await.is_none());
@@ -4819,13 +6893,7 @@ mod tests {
         // A staler value (from a peer that missed the clear) cannot resurrect it.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"zombie"),
-                QoS::AtMostOnce,
-                1,
-                5,
-            )],
+            messages: vec![snap("t", b"zombie", 1, 5)],
         })
         .unwrap();
         assert!(retained_replay(&tx, "c3", "t").await.is_none());
@@ -4861,19 +6929,19 @@ mod tests {
         .unwrap();
         match recv_peer(&mut peer).await {
             Some(PeerMessage::RetainedSnapshot { mut messages }) => {
-                messages.sort_by(|a, b| a.0.cmp(&b.0));
+                messages.sort_by(|a, b| a.topic.cmp(&b.topic));
                 assert_eq!(
                     messages.len(),
                     2,
                     "the value AND the tombstone: {messages:?}"
                 );
-                let (t, payload, _, epoch, offset) = &messages[0];
-                assert_eq!((t.as_str(), &payload[..]), ("alive", b"v".as_ref()));
-                assert_eq!((*epoch, *offset), (0, 1), "the value carries its token");
-                let (t, payload, _, epoch, offset) = &messages[1];
-                assert_eq!(t, "dead");
-                assert!(payload.is_empty(), "the clear rides as a tombstone entry");
-                assert_eq!((*epoch, *offset), (0, 2), "with the clear's token");
+                let e = &messages[0];
+                assert_eq!((e.topic.as_str(), &e.payload[..]), ("alive", b"v".as_ref()));
+                assert_eq!((e.epoch, e.offset), (0, 1), "the value carries its token");
+                let e = &messages[1];
+                assert_eq!(e.topic, "dead");
+                assert!(e.payload.is_empty(), "the clear rides as a tombstone entry");
+                assert_eq!((e.epoch, e.offset), (0, 2), "with the clear's token");
             }
             other => panic!("expected the retained snapshot, got {other:?}"),
         }
@@ -4888,13 +6956,7 @@ mod tests {
         // Absent topic: the untokened entry gap-fills.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"first"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("t", b"first", 0, 0)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"first");
@@ -4902,13 +6964,7 @@ mod tests {
         // Present topic: another untokened entry cannot overwrite it.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"second"),
-                QoS::AtMostOnce,
-                0,
-                0,
-            )],
+            messages: vec![snap("t", b"second", 0, 0)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c2", "t").await.unwrap(), b"first");
@@ -4916,13 +6972,7 @@ mod tests {
         // A committed token, however, beats the uncommitted value.
         tx.send(HubCommand::RemoteRetainedSnapshot {
             node: NodeId("n".into()),
-            messages: vec![(
-                "t".into(),
-                Bytes::from_static(b"committed"),
-                QoS::AtMostOnce,
-                2,
-                1,
-            )],
+            messages: vec![snap("t", b"committed", 2, 1)],
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c3", "t").await.unwrap(), b"committed");
@@ -4993,6 +7043,7 @@ mod tests {
             topic: &str,
             payload: &[u8],
             _qos: u8,
+            _props: &AppProps,
         ) -> Result<(u64, u64), mqtt_storage::StorageError> {
             self.commit(topic, payload, false)
         }
@@ -5032,6 +7083,8 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
         tx.send(HubCommand::Publish {
@@ -5041,6 +7094,8 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
         // No local durable write for a foreign topic while queued.
@@ -5118,6 +7173,8 @@ mod tests {
                 retain: true,
                 message_expiry: None,
                 app: AppProperties::default(),
+                done: None,
+                v5: false,
             })
             .unwrap();
         }
@@ -5228,6 +7285,8 @@ mod tests {
                 retain: true,
                 message_expiry: None,
                 app: AppProperties::default(),
+                done: None,
+                v5: false,
             })
             .unwrap();
         }
@@ -5313,6 +7372,7 @@ mod tests {
                 topic: "t".into(),
                 payload: Bytes::from_static(b"v"),
                 qos: 0,
+                app: AppProperties::default(),
                 seq,
             })
             .unwrap();
@@ -5374,6 +7434,7 @@ mod tests {
             payload: Bytes::from_static(b"v"),
             qos: 0,
             seq: 3,
+            app: AppProperties::default(),
         })
         .unwrap();
         match recv_peer(&mut peer).await {
@@ -5479,6 +7540,8 @@ mod tests {
             retain: true,
             message_expiry: None,
             app: AppProperties::default(),
+            done: None,
+            v5: false,
         })
         .unwrap();
     }
@@ -5973,7 +8036,7 @@ mod tests {
         let (reply_tx, mut a_reply) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("a".into()),
-            owner: "a".to_string(),
+            admission: admission("a"),
             conn_id: 1,
             clean_start: false,
             session_expiry: u32::MAX,

@@ -24,7 +24,12 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// minor of the previous major, where known upgrade issues are fixed first); that is
 /// what makes "upgrade to the gateway before rolling to the next major" fail closed
 /// at `Hello` instead of being release-notes prose.
-pub const PROTO_MIN: u32 = 1;
+/// Pre-release history: proto 2 (ADR 0042 T7) tagged `ReplicaEntryWire` and
+/// `ReplOp::Append` with the writing `(epoch, seq)` — an incompatible reshape of
+/// the replication frames, so the floor rose with the ceiling. Legal exactly
+/// because no release exists yet; after the first release this kind of raise is
+/// the MAJOR-release act described above.
+pub const PROTO_MIN: u32 = 2;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
 /// negotiated version is `min(proto_max_a, proto_max_b)`.
 ///
@@ -32,7 +37,7 @@ pub const PROTO_MIN: u32 = 1;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 1;
+pub const PROTO_MAX: u32 = 3;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -43,28 +48,76 @@ pub fn negotiate_proto(local: (u32, u32), remote: (u32, u32)) -> Option<u32> {
     (candidate >= local.0 && candidate >= remote.0).then_some(candidate)
 }
 
-/// Wire form of a shared-subscription membership snapshot (ADR 0015 §2): each entry
-/// is `(ShareName, filter, [(client id, granted QoS u8, online-on-this-node)])`. The
-/// per-member liveness lets a peer's selector skip a member offline on its home node
-/// (ADR 0015 T8).
-pub type SharedGroupsWire = Vec<(String, String, Vec<(String, u8, bool)>)>;
+/// One shared-subscription group in a membership snapshot (ADR 0015 §2 wire shape,
+/// named per ADR 0038 T4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedGroupWire {
+    /// The share name (the `<name>` in `$share/<name>/<filter>`).
+    pub group: String,
+    /// The underlying topic filter.
+    pub filter: String,
+    /// The group's members on the sending node.
+    pub members: Vec<SharedMemberWire>,
+}
+
+/// One member of a [`SharedGroupWire`]. The per-member liveness lets a peer's
+/// selector skip a member that is offline on its home node (ADR 0015 T8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemberWire {
+    /// The member's client id.
+    pub client: String,
+    /// The granted subscription `QoS` as its 2-bit wire value.
+    pub qos: u8,
+    /// Whether the member is currently online on the sending node.
+    pub online: bool,
+}
 
 /// The forwardable MQTT 5 application properties carried cross-node (ADR 0030): the
 /// publisher's User Properties plus the other message-level properties, so a peer re-emits
 /// them to its subscribers exactly as the origin node would (MQTT-3.3.2-17). Mirrors
 /// `mqtt_core::AppProperties` in a wire-friendly form (`Vec<u8>` correlation data).
+///
+/// One struct serves the peer frames and the durable/persistent retained record
+/// codecs alike (ADR 0038 T3): it lives in `mqtt_storage` and is re-exported here
+/// under the wire name, so the stored and transmitted shapes cannot drift apart.
+pub use mqtt_storage::app_props::AppProps as WireAppProps;
+
+/// One retained-snapshot entry (ADR 0037 P5 wire shape, named per ADR 0038 T4): a
+/// retained value — or, with an empty payload, a committed clear (tombstone) — with
+/// its `(epoch, offset)` convergence token and the publisher's application
+/// properties (ADR 0038 T3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireAppProps {
-    /// `0x01` Payload Format Indicator.
-    pub payload_format: Option<u8>,
-    /// `0x03` Content Type.
-    pub content_type: Option<String>,
-    /// `0x08` Response Topic.
-    pub response_topic: Option<String>,
-    /// `0x09` Correlation Data.
-    pub correlation_data: Option<Vec<u8>>,
-    /// `0x26` User Properties, in wire order.
-    pub user_properties: Vec<(String, String)>,
+pub struct RetainedWireEntry {
+    /// The retained topic.
+    pub topic: String,
+    /// The retained payload; empty = committed clear (tombstone).
+    pub payload: Vec<u8>,
+    /// The publish `QoS` as its 2-bit wire value.
+    pub qos: u8,
+    /// The lease epoch the value committed under (token high half); `0` with
+    /// `offset 0` marks an uncommitted (durable-off) value.
+    pub epoch: u64,
+    /// The committed log offset (token low half).
+    pub offset: u64,
+    /// The publisher's forwardable MQTT 5 application properties.
+    pub props: WireAppProps,
+}
+
+/// One stored log entry in a [`ReplicaReadReply`](PeerMessage::ReplicaReadReply)
+/// (named per ADR 0038 T4). The wire keeps its own shape rather than reusing the
+/// storage crate's `LogEntry`, so that type need not be serde-wire-encodable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaEntryWire {
+    /// The entry's offset in the key's log.
+    pub offset: u64,
+    /// The leadership epoch the entry was delivered under (ADR 0042 T7; proto 2).
+    pub epoch: u64,
+    /// The leader's per-key write-attempt counter at delivery (ADR 0042 T7;
+    /// proto 2). Together with `epoch` this orders every version of an offset,
+    /// so the recovery merge resolves conflicts instead of trusting read order.
+    pub seq: u64,
+    /// The stored record bytes, opaque to the wire.
+    pub record: Vec<u8>,
 }
 
 /// A message exchanged between broker nodes.
@@ -115,8 +168,8 @@ pub enum PeerMessage {
     /// so the receiver can select one member per group across the whole cluster.
     /// Sent on the same triggers as [`Interest`](PeerMessage::Interest).
     SharedInterest {
-        /// Each shared group: `(ShareName, filter, [(client id, granted QoS u8)])`.
-        groups: SharedGroupsWire,
+        /// Every shared group with at least one member on the sender.
+        groups: Vec<SharedGroupWire>,
     },
     /// A **chunk** of the sender's retained-message set (ADR 0014 §3). Sent on link
     /// establishment when the digest exchange (see
@@ -136,9 +189,8 @@ pub enum PeerMessage {
     /// value: it gap-fills an absent topic but never overwrites, and a durable-off
     /// receiver keeps exactly the ADR 0014 gap-fill behaviour.
     RetainedSnapshot {
-        /// Each entry: `(topic, payload, QoS u8, epoch, offset)`; an empty payload
-        /// is a committed clear (tombstone).
-        messages: Vec<(String, Vec<u8>, u8, u64, u64)>,
+        /// The entries; an empty payload is a committed clear (tombstone).
+        messages: Vec<RetainedWireEntry>,
     },
     /// An order-independent digest of the sender's retained **topic set**, sent on link
     /// establishment instead of the full snapshot (0014-T6). If the receiver's own
@@ -253,9 +305,8 @@ pub enum PeerMessage {
         key: String,
     },
     /// The reply to a [`ReplicaRead`](PeerMessage::ReplicaRead): the replica's stored
-    /// entries for the key, as `(offset, record)` pairs (kept as tuples so the
-    /// storage crate's `LogEntry` need not be serde-wire-encodable), plus its truncation
-    /// low-water so a recovery cannot resurrect an already-acked prefix (ADR 0018 §3b).
+    /// entries for the key, plus its truncation low-water so a recovery cannot
+    /// resurrect an already-acked prefix (ADR 0018 §3b).
     ReplicaReadReply {
         /// The `req_id` of the [`ReplicaRead`](PeerMessage::ReplicaRead) answered.
         req_id: u64,
@@ -263,7 +314,7 @@ pub enum PeerMessage {
         #[serde(default)]
         watermark: u64,
         /// The stored entries, in offset order.
-        entries: Vec<(u64, Vec<u8>)>,
+        entries: Vec<ReplicaEntryWire>,
     },
     /// A retained mutation routed to the topic's placement-group lease-owner
     /// (ADR 0037 §1): the sender is the node the publish landed on, the receiver owns
@@ -284,6 +335,9 @@ pub enum PeerMessage {
         payload: Vec<u8>,
         /// The publish `QoS` as its 2-bit wire value.
         qos: u8,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0038 T3),
+        /// committed into the durable record so any node's replay carries them.
+        props: WireAppProps,
         /// Per-sender monotonic handoff sequence (dedup key for retransmissions).
         seq: u64,
     },
@@ -306,6 +360,9 @@ pub enum PeerMessage {
         epoch: u64,
         /// The committed log offset (token low half).
         offset: u64,
+        /// The committed application properties (ADR 0038 T3), applied to the cache
+        /// with the value so a replay from any node carries them.
+        props: WireAppProps,
     },
     /// The owner's **commit-gated** answer to a
     /// [`RetainedCommit`](PeerMessage::RetainedCommit) (ADR 0037 T8). Sent only once
@@ -319,6 +376,62 @@ pub enum PeerMessage {
         /// `Some((epoch, offset))` = committed with this token; `None` = not the
         /// owner (re-route).
         token: Option<(u64, u64)>,
+    },
+    /// An **acknowledged** cross-node publish forward (ADR 0042 T9, exhibit ⑤;
+    /// proto 3). Semantically a [`Publish`](PeerMessage::Publish), but the sender
+    /// holds the publisher's `QoS` 1 acknowledgement until the receiver answers
+    /// with [`PublishAck`](PeerMessage::PublishAck) — sent only once the
+    /// receiver's local fan-out, **including any durable offline enqueue**, has
+    /// completed. Unanswered forwards are retransmitted (same `seq`); the
+    /// receiver does not dedup — a duplicate delivery is legal at `QoS` 1
+    /// (at-least-once), so retransmission needs no receiver state.
+    PublishAcked {
+        /// Per-sender monotonic forward sequence (correlates the ack).
+        seq: u64,
+        /// Destination topic (no wildcards).
+        topic: String,
+        /// Application payload.
+        payload: Vec<u8>,
+        /// Publish `QoS` as its 2-bit wire value (the receiver re-applies its
+        /// own per-subscriber downgrade).
+        qos: u8,
+        /// Whether the message was published with the retain flag (the receiver
+        /// applies its ADR 0014/0037 retained rules exactly as for `Publish`).
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds), if any.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties.
+        app: WireAppProps,
+    },
+    /// The durability-gated answer to a
+    /// [`PublishAcked`](PeerMessage::PublishAcked) (ADR 0042 T9; proto 3). `ok`
+    /// is `true` once the receiver's local fan-out and durable enqueues
+    /// completed; `false` reports a terminal durable-append failure — the sender
+    /// withholds the publisher's acknowledgement (the publisher retries).
+    PublishAck {
+        /// The `seq` of the [`PublishAcked`](PeerMessage::PublishAcked) answered.
+        seq: u64,
+        /// Whether the receiver durably owns the forwarded copy.
+        ok: bool,
+    },
+    /// A request for every replicated log key the receiver holds locally
+    /// (ADR 0042 T9, exhibit ⑥; proto 3). A new owner enumerating a group's
+    /// sessions cannot rely on its own replica copies alone — quorum appends
+    /// mean any single node may lack a key — so the takeover scan unions the
+    /// key sets of the whole replica mesh before quorum-recovering each key.
+    /// Key NAMES only; values still travel via
+    /// [`ReplicaRead`](PeerMessage::ReplicaRead) quorum recovery.
+    ReplicaKeys {
+        /// Correlates this request with its reply on the same link.
+        req_id: u64,
+    },
+    /// The reply to a [`ReplicaKeys`](PeerMessage::ReplicaKeys): the keys the
+    /// replica holds locally.
+    ReplicaKeysReply {
+        /// The `req_id` of the [`ReplicaKeys`](PeerMessage::ReplicaKeys) answered.
+        req_id: u64,
+        /// Every replicated log key in the sender's local replica store.
+        keys: Vec<String>,
     },
 }
 
@@ -378,8 +491,9 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, WireAppProps, MAX_FRAME,
-        PROTO_MAX, PROTO_MIN,
+        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, ReplicaEntryWire,
+        RetainedWireEntry, SharedGroupWire, SharedMemberWire, WireAppProps, MAX_FRAME, PROTO_MAX,
+        PROTO_MIN,
     };
     use bytes::BytesMut;
 
@@ -418,11 +532,22 @@ mod tests {
             },
         });
         roundtrip(&PeerMessage::SharedInterest {
-            groups: vec![(
-                "grp".into(),
-                "t/+".into(),
-                vec![("c1".into(), 1, true), ("c2".into(), 0, false)],
-            )],
+            groups: vec![SharedGroupWire {
+                group: "grp".into(),
+                filter: "t/+".into(),
+                members: vec![
+                    SharedMemberWire {
+                        client: "c1".into(),
+                        qos: 1,
+                        online: true,
+                    },
+                    SharedMemberWire {
+                        client: "c2".into(),
+                        qos: 0,
+                        online: false,
+                    },
+                ],
+            }],
         });
         roundtrip(&PeerMessage::SharedDeliver {
             client: "c1".into(),
@@ -437,9 +562,29 @@ mod tests {
         });
         roundtrip(&PeerMessage::RetainedSnapshot {
             messages: vec![
-                ("t/a".into(), b"v".to_vec(), 1, 7, 42),
-                ("$SYS/x".into(), b"w".to_vec(), 0, 0, 0),
-                ("t/cleared".into(), Vec::new(), 0, 7, 43), // a committed clear
+                RetainedWireEntry {
+                    topic: "t/a".into(),
+                    payload: b"v".to_vec(),
+                    qos: 1,
+                    epoch: 7,
+                    offset: 42,
+                    props: WireAppProps {
+                        content_type: Some("application/cbor".into()),
+                        user_properties: vec![("origin".into(), "n1".into())],
+                        ..Default::default()
+                    },
+                },
+                RetainedWireEntry {
+                    topic: "$SYS/x".into(),
+                    payload: b"w".to_vec(),
+                    ..Default::default()
+                },
+                RetainedWireEntry {
+                    topic: "t/cleared".into(), // a committed clear
+                    epoch: 7,
+                    offset: 43,
+                    ..Default::default()
+                },
             ],
         });
         roundtrip(&PeerMessage::RetainedDigest {
@@ -462,6 +607,7 @@ mod tests {
             op: crate::cluster_log::ReplOp::Append {
                 key: "client-x".into(),
                 offset: 3,
+                seq: 3,
                 record: b"payload".to_vec(),
             },
         });
@@ -484,18 +630,37 @@ mod tests {
         roundtrip(&PeerMessage::ReplicaReadReply {
             req_id: 3,
             watermark: 4,
-            entries: vec![(1, vec![1, 2]), (2, vec![3, 4])],
+            entries: vec![
+                ReplicaEntryWire {
+                    offset: 1,
+                    epoch: 7,
+                    seq: 1,
+                    record: vec![1, 2],
+                },
+                ReplicaEntryWire {
+                    offset: 2,
+                    epoch: 7,
+                    seq: 2,
+                    record: vec![3, 4],
+                },
+            ],
         });
         roundtrip(&PeerMessage::RetainedCommit {
             topic: "dev/1/state".into(),
             payload: b"open".to_vec(),
             qos: 1,
+            props: WireAppProps {
+                payload_format: Some(1),
+                content_type: Some("application/json".into()),
+                ..Default::default()
+            },
             seq: 9,
         });
         roundtrip(&PeerMessage::RetainedCommit {
             topic: "dev/1/state".into(),
             payload: Vec::new(), // a clear (versioned tombstone)
             qos: 0,
+            props: WireAppProps::default(),
             seq: 10,
         });
         roundtrip(&PeerMessage::RetainedCommitAck {
@@ -512,6 +677,11 @@ mod tests {
             qos: 1,
             epoch: 7,
             offset: 42,
+            props: WireAppProps {
+                response_topic: Some("replies/dev1".into()),
+                correlation_data: Some(vec![1, 2]),
+                ..Default::default()
+            },
         });
         roundtrip(&PeerMessage::RetainedUpdate {
             topic: "dev/1/state".into(),
@@ -519,7 +689,60 @@ mod tests {
             qos: 0,
             epoch: 7,
             offset: 43,
+            props: WireAppProps::default(),
         });
+    }
+
+    /// ADR 0038 T4: the two **frozen** frames' encodings, pinned byte for byte.
+    /// `Hello` and `ProxyHello` are the bootstrap frames any two builds, of any
+    /// versions, must exchange before a protocol is negotiated — if this test
+    /// fails, the change is a cross-version wire break that no proto bump can
+    /// carry, not something to fix by updating the expected bytes. (bincode
+    /// encodes the enum variant *index*, so this also pins the rule that new
+    /// frames are APPENDED to [`PeerMessage`], never inserted or reordered.)
+    #[test]
+    fn the_frozen_frames_encode_byte_for_byte_stably() {
+        let mut hello = Vec::new();
+        encode(
+            &PeerMessage::Hello {
+                node_id: "n1".into(),
+                proto_min: 1,
+                proto_max: 1,
+            },
+            &mut hello,
+        )
+        .unwrap();
+        #[rustfmt::skip]
+        let expected_hello = [
+            0, 0, 0, 22,                          // frame length (u32 BE)
+            0, 0, 0, 0,                           // variant index: Hello = 0
+            2, 0, 0, 0, 0, 0, 0, 0, b'n', b'1',   // node_id (u64 LE len + bytes)
+            1, 0, 0, 0,                           // proto_min (u32 LE)
+            1, 0, 0, 0,                           // proto_max (u32 LE)
+        ];
+        assert_eq!(hello, expected_hello);
+
+        let mut proxy = Vec::new();
+        encode(
+            &PeerMessage::ProxyHello {
+                identity: Some("client-a".into()),
+                via: Some("node-b".into()),
+            },
+            &mut proxy,
+        )
+        .unwrap();
+        #[rustfmt::skip]
+        let expected_proxy = [
+            0, 0, 0, 36,                          // frame length (u32 BE)
+            8, 0, 0, 0,                           // variant index: ProxyHello = 8
+            1,                                    // identity: Some
+            8, 0, 0, 0, 0, 0, 0, 0,               // identity length (u64 LE)
+            b'c', b'l', b'i', b'e', b'n', b't', b'-', b'a',
+            1,                                    // via: Some
+            6, 0, 0, 0, 0, 0, 0, 0,               // via length (u64 LE)
+            b'n', b'o', b'd', b'e', b'-', b'b',
+        ];
+        assert_eq!(proxy, expected_proxy);
     }
 
     /// ADR 0038: version negotiation picks the newest version both sides speak,
@@ -549,7 +772,11 @@ mod tests {
     #[test]
     fn an_oversized_frame_is_rejected_at_encode() {
         let msg = PeerMessage::RetainedSnapshot {
-            messages: vec![("t".into(), vec![0u8; MAX_FRAME + 1], 0, 0, 0)],
+            messages: vec![RetainedWireEntry {
+                topic: "t".into(),
+                payload: vec![0u8; MAX_FRAME + 1],
+                ..Default::default()
+            }],
         };
         let mut out = Vec::new();
         assert!(matches!(

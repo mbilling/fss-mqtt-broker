@@ -14,6 +14,7 @@
 use crate::conn::ConnPolicy;
 use crate::hub::{HubCommand, PeerOutbound};
 use bytes::BytesMut;
+use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{self, PeerMessage};
 use mqtt_cluster::NodeId;
 use mqtt_net::tls;
@@ -49,14 +50,53 @@ fn peer_cert_cn(state: &tokio_rustls::rustls::CommonState) -> Option<String> {
     }
 }
 
+/// The remote leaf certificate's serial from an established peer TLS session —
+/// the fact a cluster CRL names, recorded with the link so a revocation sweep can
+/// re-check it (ADR 0040 T4).
+fn peer_cert_serial(state: &tokio_rustls::rustls::CommonState) -> Option<Vec<u8>> {
+    let leaf = state.peer_certificates()?.first()?;
+    mqtt_auth::mtls::serial_from_cert(leaf)
+}
+
+/// Gate a freshly-handshaken peer link on the **live** cluster CRL (ADR 0040 T4):
+/// the same slot the gossip verifier reads per datagram, so a republished CRL
+/// refuses new links immediately — on the ACCEPT side (a revoked node dialing us)
+/// and on the DIAL side (us dialing a node whose cert was revoked; the TLS
+/// verifier alone would still admit it, since the connector checks chain + name,
+/// not revocation). Returns the remote serial for the link's registration, or
+/// `Err(())` when the link must be dropped.
+fn admit_peer_link(
+    state: &tokio_rustls::rustls::CommonState,
+    crl: &crate::reload::SwimCrlSlot,
+) -> Result<Option<Vec<u8>>, ()> {
+    let serial = peer_cert_serial(state);
+    if let (Some(serial), Some(list)) = (
+        &serial,
+        crl.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+    ) {
+        if list.contains(serial) {
+            warn!("peer certificate is revoked by the cluster CRL; dropping link (ADR 0040)");
+            return Err(());
+        }
+    }
+    Ok(serial)
+}
+
 /// The cluster bus mTLS context, built once from the cluster CA + node cert and
 /// shared by every peer link (both accepting and dialing sides).
 #[derive(Clone)]
 pub struct PeerTls {
     /// Accepts inbound links, requiring a cluster-CA-issued client certificate.
-    pub acceptor: TlsAcceptor,
+    /// Behind a `watch` (ADR 0040 T4): read per accept, so a reload's rebuilt
+    /// acceptor (rotated cluster cert/key/CA) is served on the next handshake.
+    /// Use [`fixed_acceptor`] where no reloader exists.
+    pub acceptor: tokio::sync::watch::Receiver<TlsAcceptor>,
     /// Dials outbound links, presenting our certificate and verifying the peer's.
-    pub connector: TlsConnector,
+    /// Behind a `watch` (ADR 0040 T4): read per dial. Use [`fixed_connector`]
+    /// where no reloader exists.
+    pub connector: tokio::sync::watch::Receiver<TlsConnector>,
     /// Cluster CA certificate (DER) — verifies inbound signed-gossip certs (ADR 0022).
     pub ca_der: Vec<u8>,
     /// This node's leaf certificate (DER) — embedded inline in signed gossip.
@@ -69,6 +109,20 @@ pub struct PeerTls {
     pub gossip_crl: crate::reload::SwimCrlSlot,
     /// The configured CRL path, kept so the reload closure and the file watcher re-read it.
     pub crl_path: Option<std::path::PathBuf>,
+}
+
+/// A fixed (never-reloading) acceptor handle — for tests and setups without a
+/// [`Reloader`](crate::reload::Reloader).
+#[must_use]
+pub fn fixed_acceptor(acceptor: TlsAcceptor) -> tokio::sync::watch::Receiver<TlsAcceptor> {
+    tokio::sync::watch::channel(acceptor).1
+}
+
+/// A fixed (never-reloading) connector handle — for tests and setups without a
+/// [`Reloader`](crate::reload::Reloader).
+#[must_use]
+pub fn fixed_connector(connector: TlsConnector) -> tokio::sync::watch::Receiver<TlsConnector> {
+    tokio::sync::watch::channel(connector).1
 }
 
 impl std::fmt::Debug for PeerTls {
@@ -97,6 +151,7 @@ pub async fn serve_listener(
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<PeerTls>,
     client_policy: Option<Arc<ConnPolicy>>,
+    plane: Option<DurablePlane>,
 ) {
     loop {
         match listener.accept().await {
@@ -105,20 +160,30 @@ pub async fn serve_listener(
                 let hub = hub.clone();
                 let tls = tls.clone();
                 let policy = client_policy.clone();
+                let plane = plane.clone();
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    let result = match &tls {
-                        Some(t) => match t.acceptor.accept(stream).await {
+                    // Read the CURRENT acceptor per accept (ADR 0040 T4): a reload's
+                    // rebuilt material is served on the next handshake. (Bound first:
+                    // the watch guard must not live across an await.)
+                    let acceptor = tls.as_ref().map(|t| t.acceptor.borrow().clone());
+                    let result = match (&tls, acceptor) {
+                        (Some(t), Some(acceptor)) => match acceptor.accept(stream).await {
                             Ok(s) => {
+                                let Ok(serial) = admit_peer_link(s.get_ref().1, &t.gossip_crl)
+                                else {
+                                    return; // revoked: fail closed (ADR 0040 T4)
+                                };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local, hub, false, expected_cn, policy).await
+                                handle(s, local, hub, false, expected_cn, serial, policy, plane)
+                                    .await
                             }
                             Err(e) => {
                                 debug!(error = %e, "peer mTLS handshake failed; link rejected");
                                 return;
                             }
                         },
-                        None => handle(stream, local, hub, false, None, policy).await,
+                        _ => handle(stream, local, hub, false, None, None, policy, plane).await,
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "inbound peer link ended");
@@ -147,6 +212,7 @@ pub async fn dial_forever(
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<PeerTls>,
+    plane: Option<DurablePlane>,
 ) {
     // An undialable name is permanent; retrying would only spin.
     let server_name = match tls.as_ref().map(|_| tls::server_name(&addr)).transpose() {
@@ -163,10 +229,29 @@ pub async fn dial_forever(
                 let _ = stream.set_nodelay(true);
                 let outcome = match (&tls, &server_name) {
                     (Some(t), Some(name)) => {
-                        match t.connector.connect(name.clone(), stream).await {
+                        // Read the CURRENT connector per dial (ADR 0040 T4).
+                        let connector = t.connector.borrow().clone();
+                        match connector.connect(name.clone(), stream).await {
                             Ok(s) => {
+                                let Ok(serial) = admit_peer_link(s.get_ref().1, &t.gossip_crl)
+                                else {
+                                    // Revoked (ADR 0040 T4): fail closed, but keep
+                                    // redialing — an un-revocation (new CRL) heals.
+                                    tokio::time::sleep(REDIAL_DELAY).await;
+                                    continue;
+                                };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local.clone(), hub.clone(), true, expected_cn, None).await
+                                handle(
+                                    s,
+                                    local.clone(),
+                                    hub.clone(),
+                                    true,
+                                    expected_cn,
+                                    serial,
+                                    None,
+                                    plane.clone(),
+                                )
+                                .await
                             }
                             Err(e) => {
                                 debug!(%addr, error = %e, "peer mTLS handshake failed; will retry");
@@ -175,7 +260,19 @@ pub async fn dial_forever(
                             }
                         }
                     }
-                    _ => handle(stream, local.clone(), hub.clone(), true, None, None).await,
+                    _ => {
+                        handle(
+                            stream,
+                            local.clone(),
+                            hub.clone(),
+                            true,
+                            None,
+                            None,
+                            None,
+                            plane.clone(),
+                        )
+                        .await
+                    }
                 };
                 match outcome {
                     Ok(LinkOutcome::Redundant) => {
@@ -233,13 +330,16 @@ fn proto_compatible(node_id: &str, proto_min: u32, proto_max: u32) -> bool {
 // The handshake/dedup ladder is one linear flow; splitting it would scatter the
 // link-rejection cases.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn handle<S>(
     stream: S,
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
     initiated: bool,
     expected_cn: Option<String>,
+    cert_serial: Option<Vec<u8>>,
     client_policy: Option<Arc<ConnPolicy>>,
+    plane: Option<DurablePlane>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -250,7 +350,7 @@ where
     // The dialer announces itself first; the accept side reads first so it can
     // detect a session-proxy connection (ADR 0005) before announcing itself —
     // a proxied client expects raw MQTT back, not our peer Hello.
-    let remote = if initiated {
+    let (remote, proto) = if initiated {
         write_frame(
             &mut wh,
             &PeerMessage::Hello {
@@ -269,7 +369,12 @@ where
                 if !proto_compatible(&node_id, proto_min, proto_max) {
                     return Ok(LinkOutcome::Closed);
                 }
-                NodeId(node_id)
+                let proto = peer::negotiate_proto(
+                    (peer::PROTO_MIN, peer::PROTO_MAX),
+                    (proto_min, proto_max),
+                )
+                .unwrap_or(peer::PROTO_MIN);
+                (NodeId(node_id), proto)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -314,7 +419,12 @@ where
                     },
                 )
                 .await?;
-                NodeId(node_id)
+                let proto = peer::negotiate_proto(
+                    (peer::PROTO_MIN, peer::PROTO_MAX),
+                    (proto_min, proto_max),
+                )
+                .unwrap_or(peer::PROTO_MIN);
+                (NodeId(node_id), proto)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -358,13 +468,24 @@ where
             node: remote.clone(),
             conn_id,
             tx: out_tx,
+            cert_serial,
+            proto,
         })
         .is_err()
     {
         return Ok(LinkOutcome::Closed);
     }
 
-    let result = pump(&mut rh, &mut wh, &mut buf, &hub, &remote, &mut out_rx).await;
+    let result = pump(
+        &mut rh,
+        &mut wh,
+        &mut buf,
+        &hub,
+        &remote,
+        &mut out_rx,
+        plane.as_ref(),
+    )
+    .await;
     let _ = hub.send(HubCommand::PeerDisconnected {
         node: remote,
         conn_id,
@@ -379,6 +500,7 @@ async fn pump<R, W>(
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
     out_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
+    plane: Option<&DurablePlane>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -389,7 +511,7 @@ where
             inbound = read_frame(rh, buf) => {
                 match inbound? {
                     None => return Ok(()), // peer closed
-                    Some(msg) => forward_inbound(msg, hub, remote),
+                    Some(msg) => forward_inbound(msg, hub, remote, plane),
                 }
             }
             maybe_out = out_rx.recv() => {
@@ -415,8 +537,32 @@ where
 /// Translate an inbound peer message into a hub command.
 // One arm per wire variant — a flat dispatch table, not a refactor smell.
 #[allow(clippy::too_many_lines)]
-fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, remote: &NodeId) {
+fn forward_inbound(
+    msg: PeerMessage,
+    hub: &mpsc::UnboundedSender<HubCommand>,
+    remote: &NodeId,
+    plane: Option<&DurablePlane>,
+) {
     match msg {
+        // Durable-plane REPLIES resolve a pending wait inside the plane and never
+        // touch hub state — route them DIRECTLY, bypassing the hub command queue
+        // (ADR 0042 T9, exhibit ⑩). Through the queue they deadlock-by-queue: an
+        // on-loop durable append awaits exactly these acks, which would sit queued
+        // behind the very dispatch that is waiting — every such append then fails
+        // at the RPC timeout ("no replication quorum" on a healthy cluster).
+        frame @ (PeerMessage::ReplicateAck { .. }
+        | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaKeysReply { .. }
+        | PeerMessage::RaftRpcReply { .. })
+            if plane.is_some() =>
+        {
+            if let Some(plane) = plane {
+                let plane = plane.clone();
+                tokio::spawn(async move {
+                    let _ = plane.handle(frame).await;
+                });
+            }
+        }
         PeerMessage::Interest { filters } => {
             let _ = hub.send(HubCommand::RemoteInterest {
                 node: remote.clone(),
@@ -440,19 +586,48 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 app: crate::hub::app_from_wire(app),
             });
         }
+        PeerMessage::PublishAcked {
+            seq,
+            topic,
+            payload,
+            qos,
+            retain,
+            message_expiry,
+            app,
+        } => {
+            let _ = hub.send(HubCommand::RemotePublishAcked {
+                node: remote.clone(),
+                seq,
+                topic,
+                payload: payload.into(),
+                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                retain,
+                message_expiry,
+                app: crate::hub::app_from_wire(app),
+            });
+        }
+        PeerMessage::PublishAck { seq, ok } => {
+            let _ = hub.send(HubCommand::RemotePublishAck {
+                node: remote.clone(),
+                seq,
+                ok,
+            });
+        }
         PeerMessage::SharedInterest { groups } => {
             let groups = groups
                 .into_iter()
-                .map(|(group, filter, members)| crate::hub::RemoteSharedGroup {
-                    group,
-                    filter,
-                    members: members
+                .map(|g| crate::hub::RemoteSharedGroup {
+                    group: g.group,
+                    filter: g.filter,
+                    members: g
+                        .members
                         .into_iter()
-                        .map(|(c, q, online)| {
+                        .map(|m| {
                             (
-                                mqtt_core::ClientId(c),
-                                mqtt_codec::QoS::from_u8(q).unwrap_or(mqtt_codec::QoS::AtMostOnce),
-                                online,
+                                mqtt_core::ClientId(m.client),
+                                mqtt_codec::QoS::from_u8(m.qos)
+                                    .unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                                m.online,
                             )
                         })
                         .collect(),
@@ -481,18 +656,6 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             });
         }
         PeerMessage::RetainedSnapshot { messages } => {
-            let messages = messages
-                .into_iter()
-                .map(|(topic, payload, qos, epoch, offset)| {
-                    (
-                        topic,
-                        payload.into(),
-                        mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
-                        epoch,
-                        offset,
-                    )
-                })
-                .collect();
             let _ = hub.send(HubCommand::RemoteRetainedSnapshot {
                 node: remote.clone(),
                 messages,
@@ -519,6 +682,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             topic,
             payload,
             qos,
+            props,
             seq,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedCommit {
@@ -526,6 +690,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 topic,
                 payload: payload.into(),
                 qos,
+                app: crate::hub::app_from_wire(props),
                 seq,
             });
         }
@@ -542,6 +707,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
             qos,
             epoch,
             offset,
+            props,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedUpdate {
                 topic,
@@ -549,6 +715,7 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 qos,
                 epoch,
                 offset,
+                app: crate::hub::app_from_wire(props),
             });
         }
         PeerMessage::Hello { .. } => {
@@ -564,7 +731,9 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
         | PeerMessage::RaftRpc { .. }
         | PeerMessage::RaftRpcReply { .. }
         | PeerMessage::ReplicaRead { .. }
-        | PeerMessage::ReplicaReadReply { .. }) => {
+        | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaKeys { .. }
+        | PeerMessage::ReplicaKeysReply { .. }) => {
             // Durable-plane frames (ADR 0006/0007): consensus RPCs and session-log
             // replication. Routed to the hub, which dispatches them to the
             // `DurablePlane` (a no-op until durable sessions are enabled, step 4f).

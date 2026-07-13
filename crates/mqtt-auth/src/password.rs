@@ -54,6 +54,11 @@ impl PasswordAuthenticator {
 }
 
 impl Authenticator for PasswordAuthenticator {
+    fn password_subject_exists(&self, subject: &str) -> bool {
+        // The subject of a password admission is the username (see `authenticate`).
+        self.hashes.contains_key(subject)
+    }
+
     fn authenticate(
         &self,
         _client: &ClientId,

@@ -182,6 +182,7 @@ async fn start_durable_node_capped(
             hub_tx.clone(),
             None,
             None,
+            Some(plane_observer.clone()),
         ))
         .abort_handle(),
     );
@@ -220,6 +221,7 @@ async fn start_durable_node_capped(
             None,
             Some(placement.clone()),
             None,
+            Some(plane_observer.clone()),
         ))
         .abort_handle(),
     );

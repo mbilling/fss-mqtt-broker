@@ -276,6 +276,15 @@ impl Properties {
         })
     }
 
+    /// The Maximum Packet Size (`0x27`) the sender will accept, if present (MQTT 5.0).
+    #[must_use]
+    pub fn maximum_packet_size(&self) -> Option<u32> {
+        self.0.iter().find_map(|p| match p {
+            Property::MaximumPacketSize(v) => Some(*v),
+            _ => None,
+        })
+    }
+
     /// The Topic Alias (`0x23`) for this PUBLISH, if present (MQTT 5.0).
     #[must_use]
     pub fn topic_alias(&self) -> Option<u16> {

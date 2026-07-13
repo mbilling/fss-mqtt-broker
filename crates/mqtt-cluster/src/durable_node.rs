@@ -381,7 +381,15 @@ mod tests {
         // The retained keyspace commits through the same plane: the token's epoch is
         // the group's real lease epoch (consensus-minted, ≥ 1 — never the 0 of an
         // un-leased backend), and the committed value reads back.
-        let (epoch, offset) = retained.set("dev/1/state", b"open", 1).await.unwrap();
+        let (epoch, offset) = retained
+            .set(
+                "dev/1/state",
+                b"open",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
         assert!(
             epoch >= 1,
             "the epoch is minted by the lease plane, got {epoch}"

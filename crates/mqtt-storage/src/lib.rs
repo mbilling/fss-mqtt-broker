@@ -18,6 +18,7 @@ use mqtt_core::{topic_matches, ClientId, Message, Subscription};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
+pub mod app_props;
 pub mod data_dir;
 pub mod logged;
 pub mod persistent_log;
@@ -289,6 +290,18 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// `(client, deadline epoch secs)`. A new owner reads this after a takeover to
     /// schedule the expiry sweep for sessions it inherited (ADR 0009 §3). Default: empty.
     async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Every session this store currently holds, with its persisted subscriptions and
+    /// expiry deadline. A new owner reads this after a takeover to **materialize**
+    /// inherited sessions into its routing table before their clients re-attach
+    /// (ADR 0042 T9, exhibit ⑥) — without it, a publish arriving between the takeover
+    /// and the first re-attach routes to nothing and is lost despite being acked.
+    /// Off the hot path. Default: empty (stores without durable metadata).
+    async fn all_sessions(
+        &self,
+    ) -> Result<Vec<(ClientId, Vec<Subscription>, Option<u64>)>, StorageError> {
         Ok(Vec::new())
     }
 
@@ -584,6 +597,16 @@ impl SessionStore for MemorySessionStore {
             .lock()
             .iter()
             .filter_map(|(c, e)| e.session_expiry_at.map(|d| (c.clone(), d)))
+            .collect())
+    }
+
+    async fn all_sessions(
+        &self,
+    ) -> Result<Vec<(ClientId, Vec<Subscription>, Option<u64>)>, StorageError> {
+        Ok(self
+            .lock()
+            .iter()
+            .map(|(c, e)| (c.clone(), e.subscriptions.clone(), e.session_expiry_at))
             .collect())
     }
 

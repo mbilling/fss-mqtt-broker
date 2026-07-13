@@ -59,6 +59,11 @@ struct StateLabel {
 /// `{outcome, trigger}` label for hot reloads — a bounded set: outcome `ok`/`rejected`,
 /// trigger `signal` (SIGHUP) / `watch` (filesystem auto-reload, ADR 0033).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StoreLabel {
+    store: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OutcomeLabel {
     outcome: String,
     trigger: String,
@@ -89,6 +94,10 @@ struct OtelInstruments {
     durable_append_failures: OtelCounter<u64>,
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
+    revocation_evictions: OtelCounter<u64>,
+    admission_rejected: OtelCounter<u64>,
+    quota_rejections: OtelCounter<u64>,
+    store_bytes: OtelGauge<i64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
@@ -122,6 +131,10 @@ impl OtelInstruments {
             durable_append_failures: meter.u64_counter("durable_append_failures").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
+            revocation_evictions: meter.u64_counter("revocation_evictions").build(),
+            admission_rejected: meter.u64_counter("admission_rejected").build(),
+            quota_rejections: meter.u64_counter("quota_rejections").build(),
+            store_bytes: meter.i64_gauge("store_bytes").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
@@ -166,6 +179,10 @@ pub struct Metrics {
     durable_append_failures_total: Family<ReasonLabel, Counter>,
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
+    revocation_evictions_total: Family<ReasonLabel, Counter>,
+    admission_rejected_total: Family<ReasonLabel, Counter>,
+    quota_rejections_total: Family<ReasonLabel, Counter>,
+    store_bytes: Family<StoreLabel, Gauge>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
     retained_queue_dropped_total: Counter,
@@ -325,6 +342,30 @@ impl Metrics {
             "security_reloads",
             "Hot reloads of the security policy, by outcome (ok, rejected) and trigger (signal, watch)",
         );
+        let revocation_evictions_total = register_family(
+            &mut registry,
+            "revocation_evictions",
+            "Live state revoked by a policy-reload sweep (ADR 0040), by kind \
+             (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked)",
+        );
+        let admission_rejected_total = register_family(
+            &mut registry,
+            "admission_rejected",
+            "Connections refused at accept by an admission cap (ADR 0041), by reason \
+             (max-connections, per-ip)",
+        );
+        let quota_rejections_total = register_family(
+            &mut registry,
+            "quota_rejections",
+            "Operations refused by a per-client or global quota (ADR 0041), by kind \
+             (subscriptions, ...)",
+        );
+        let store_bytes = register_gauge_family(
+            &mut registry,
+            "store_bytes",
+            "On-disk size of each redb store in bytes (ADR 0041 T5), by store \
+             (sessions, retained, replicas, lease)",
+        );
         let quic_path_migrations_total = register_counter(
             &mut registry,
             "quic_path_migrations",
@@ -378,6 +419,10 @@ impl Metrics {
             durable_append_failures_total,
             gossip_rejected_total,
             security_reloads_total,
+            revocation_evictions_total,
+            admission_rejected_total,
+            quota_rejections_total,
+            store_bytes,
             quic_path_migrations_total,
             retained_divergence_total,
             retained_queue_dropped_total,
@@ -591,6 +636,61 @@ impl Metrics {
                 KeyValue::new("trigger", trigger.to_string()),
             ],
         );
+    }
+
+    /// A connection was refused at accept by an admission cap (ADR 0041 T1),
+    /// before any TLS handshake work. Bounded reasons only (`max-connections`,
+    /// `per-ip`) — never a per-client or per-address value.
+    pub fn admission_rejected(&self, reason: &str) {
+        self.admission_rejected_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .admission_rejected
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// The on-disk size of one redb store (ADR 0041 T5). Bounded store names only.
+    pub fn set_store_bytes(&self, store: &str, bytes: u64) {
+        self.store_bytes
+            .get_or_create(&StoreLabel {
+                store: store.to_string(),
+            })
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.otel.store_bytes.record(
+            i64::try_from(bytes).unwrap_or(i64::MAX),
+            &[KeyValue::new("store", store.to_string())],
+        );
+    }
+
+    /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only
+    /// (`subscriptions`, later `retained`, `sessions`) — never a per-client value.
+    pub fn quota_rejected(&self, kind: &str) {
+        self.quota_rejections_total
+            .get_or_create(&ReasonLabel {
+                reason: kind.to_string(),
+            })
+            .inc();
+        self.otel
+            .quota_rejections
+            .add(1, &[KeyValue::new("kind", kind.to_string())]);
+    }
+
+    /// A policy-reload sweep revoked live state (ADR 0040): a session evicted
+    /// (`cert-revoked` / `user-removed` / `connect-denied`), a subscription grant
+    /// removed (`grant-revoked`), or an established peer link torn down
+    /// (`peer-revoked`). Bounded kinds only — never a per-client value.
+    pub fn revocation_eviction(&self, kind: &str) {
+        self.revocation_evictions_total
+            .get_or_create(&ReasonLabel {
+                reason: kind.to_string(),
+            })
+            .inc();
+        self.otel
+            .revocation_evictions
+            .add(1, &[KeyValue::new("kind", kind.to_string())]);
     }
 
     /// A QUIC connection migrated to a new client path (ADR 0036 §3b): the peer's remote address

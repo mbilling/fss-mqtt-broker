@@ -128,7 +128,7 @@ use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::persistent_log::PersistentLog;
 use mqtt_storage::persistent_retained::PersistentRetainedStore;
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, RetainedStore, SessionStore};
-use mqttd::{cluster, config_watch, conn, hub, peer, reload};
+use mqttd::{admission, cluster, config_watch, conn, hub, peer, reload};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -164,7 +164,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Server-wide MQTT 5 wire limits (ADR 0011/0012/0013), configurable via env, set once
     // before any connection is served.
-    conn::set_wire_limits(wire_limits_from_env()?);
+    let wire_limits = wire_limits_from_env()?;
+    // The same ceiling governs the transport frame reader (ADR 0041 T4): the
+    // advertised Maximum Packet Size and the enforced cap cannot drift apart.
+    mqtt_net::set_max_packet_bytes(wire_limits.max_packet_size as usize);
+    conn::set_wire_limits(wire_limits);
 
     // Session-placement ring (ADR 0005), kept in step with SWIM membership and
     // read by the hub to identify each persistent session's owner node.
@@ -213,11 +217,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
     let draining =
-        start_health_from_env(&hub_tx, &placement, durable_plane, metrics.clone()).await?;
+        start_health_from_env(&hub_tx, &placement, durable_plane.clone(), metrics.clone()).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
-    let peer_tls = peer_tls_from_env()?;
+    let peer_tls_parts = peer_tls_from_env()?;
+    let (peer_tls, peer_tls_reload) = match peer_tls_parts {
+        Some((tls, reload_parts)) => (Some(tls), Some(reload_parts)),
+        None => (None, None),
+    };
 
     // Client policy (ADR 0004 auth/authz/audit + ADR 0005 session relocation),
     // built before the peer listener so the latter can serve sessions relocated
@@ -241,6 +249,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     }
+    // Peer-bus TLS reload (ADR 0040 T4, paying the ADR 0032 deferred item): the
+    // acceptor/connector are rebuilt in the same validate-before-swap reload, so a
+    // rotated cluster cert/key/CA is served on the next peer handshake.
+    if let Some(parts) = peer_tls_reload {
+        reloader.attach_peer_tls(parts.acceptor_tx, parts.connector_tx, parts.build);
+    }
 
     // Cluster peer mesh (opt-in).
     let peer_bind = non_empty_env("MQTTD_PEER_BIND");
@@ -256,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hub_tx.clone(),
             peer_tls.clone(),
             Some(policy.clone()),
+            durable_plane.clone(),
         ));
     }
     if let Some(peers) = non_empty_env("MQTTD_PEERS") {
@@ -266,6 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 node_id.clone(),
                 hub_tx.clone(),
                 peer_tls.clone(),
+                durable_plane.clone(),
             ));
         }
     }
@@ -280,12 +296,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement,
         &shutdown,
         metrics.clone(),
+        durable_plane.clone(),
     )
     .await?;
 
     // Client listeners. TLS is the intended path; plaintext is a loudly-logged
     // local-testing escape hatch. The serve loops stop themselves on `shutdown`. The TLS
     // branch registers its acceptor with the reloader so SIGHUP also rotates cert/key/CA.
+    // Revocation reaches live state (ADR 0040 T2): after every successful reload the
+    // hub sweeps online sessions against the new policy — a CRL'd certificate, a
+    // removed password user, or a connect-ACL deny evicts the live session. The
+    // client-CRL serials mirror the same MQTTD_TLS_CRL file the TLS verifier enforces
+    // per handshake; parsing it is part of the same validate-before-swap reload.
+    let client_crl_build = non_empty_env("MQTTD_TLS_CRL").map(|path| {
+        Box::new(move || {
+            let bytes = std::fs::read(&path).map_err(|e| format!("read client crl {path}: {e}"))?;
+            mqtt_auth::signed_gossip::RevocationList::from_bytes_unverified(&bytes)
+                .map_err(|e| format!("parse client crl {path}: {e}"))
+        }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
+    });
+    reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
+    // Disk visibility + watermark brownout (ADR 0041 T5): stat the redb stores
+    // periodically, export store_bytes{store}, and drive the hub's brownout flag
+    // when MQTTD_STORE_MAX_BYTES is configured.
+    if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
+        let max_bytes = match non_empty_env("MQTTD_STORE_MAX_BYTES") {
+            None => None,
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    return Err(format!(
+                        "MQTTD_STORE_MAX_BYTES must be a positive integer, got {v:?}"
+                    )
+                    .into())
+                }
+            },
+        };
+        if let Some(max) = max_bytes {
+            info!(max, "disk watermark active (ADR 0041): brownout above it");
+        }
+        tokio::spawn(mqttd::store_watch::watch(
+            std::path::PathBuf::from(dir),
+            max_bytes,
+            hub_tx.clone(),
+            Some(metrics.clone()),
+            None,
+        ));
+    }
+
+    // Per-client and global state quotas (ADR 0041 T3/T4), configured once before
+    // any listener accepts. Unset = uncapped; a non-positive or unparseable value
+    // is a startup error.
+    let quota = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        match non_empty_env(var) {
+            None => Ok(None),
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(Some(n)),
+                _ => Err(format!("{var} must be a positive integer, got {v:?}").into()),
+            },
+        }
+    };
+    let quotas = mqttd::hub::Quotas {
+        max_subscriptions_per_client: quota("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT")?,
+        max_retained_messages: quota("MQTTD_MAX_RETAINED_MESSAGES")?,
+        max_sessions: quota("MQTTD_MAX_SESSIONS")?,
+    };
+    if quotas.max_subscriptions_per_client.is_some()
+        || quotas.max_retained_messages.is_some()
+        || quotas.max_sessions.is_some()
+    {
+        info!(?quotas, "state quotas active (ADR 0041)");
+        let _ = hub_tx.send(mqttd::hub::HubCommand::SetQuotas(quotas));
+    }
+
+    // The hub consults the live authorizer when a persistent session resumes
+    // (ADR 0040 T3): grants a tightening reload revoked while the session slept are
+    // removed at resume, before any replay. Sent before any listener accepts.
+    let _ = hub_tx.send(mqttd::hub::HubCommand::AttachAuthorizer(
+        mqttd::hub::AuthzWatch(policy.authz.clone()),
+    ));
+
     start_client_listeners(hub_tx, policy, &mut reloader, &shutdown, &connections).await?;
 
     // Share the (now fully-configured) reloader between the SIGHUP handler and the optional
@@ -322,6 +412,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // A flat sequence of per-listener setup blocks: long by count (one per transport), not by
 // branching complexity — like `Metrics::build`'s registration list.
 #[allow(clippy::too_many_lines)]
+/// Build the connection-admission gate (ADR 0041 T1) from
+/// `MQTTD_MAX_CONNECTIONS` / `MQTTD_MAX_CONNECTIONS_PER_IP`. Unset = uncapped
+/// (today's behavior); a value that does not parse as a positive integer is a
+/// startup error, not a silent misconfiguration.
+fn admission_gate_from_env(
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    audit: Option<Arc<dyn mqtt_observability::AuditSink>>,
+) -> Result<admission::AdmissionGate, Box<dyn std::error::Error>> {
+    let cap = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        match non_empty_env(var) {
+            None => Ok(None),
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(Some(n)),
+                _ => Err(format!("{var} must be a positive integer, got {v:?}").into()),
+            },
+        }
+    };
+    let max_connections = cap("MQTTD_MAX_CONNECTIONS")?;
+    let max_per_ip = cap("MQTTD_MAX_CONNECTIONS_PER_IP")?;
+    // Auth-failure penalty box (ADR 0041 T2): threshold enables it; the decay is
+    // how long one strike takes to age away (default 60s).
+    let penalty = match cap("MQTTD_AUTH_PENALTY_THRESHOLD")? {
+        None => None,
+        Some(threshold) => {
+            let decay_secs = cap("MQTTD_AUTH_PENALTY_DECAY_SECS")?.unwrap_or(60);
+            Some(admission::PenaltyConfig {
+                threshold: u32::try_from(threshold)
+                    .map_err(|_| "MQTTD_AUTH_PENALTY_THRESHOLD is too large")?,
+                decay: std::time::Duration::from_secs(decay_secs as u64),
+            })
+        }
+    };
+    if max_connections.is_some() || max_per_ip.is_some() || penalty.is_some() {
+        info!(
+            ?max_connections,
+            ?max_per_ip,
+            ?penalty,
+            "connection admission caps active (ADR 0041): over-cap or penalized \
+             connections are closed at accept, before any TLS work"
+        );
+    }
+    Ok(admission::AdmissionGate::with_penalty(
+        max_connections,
+        max_per_ip,
+        penalty,
+        metrics,
+        audit,
+    ))
+}
+
+// One linear listener-wiring flow; splitting it would scatter the env-var reads.
+#[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -330,6 +472,8 @@ async fn start_client_listeners(
     connections: &tokio_util::task::TaskTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut any = false;
+    // Connection admission caps (ADR 0041 T1), shared by every client listener.
+    let gate = admission_gate_from_env(policy.metrics.clone(), Some(policy.audit.clone()))?;
     let tls_bind = non_empty_env("MQTTD_TLS_BIND");
     let wss_bind = non_empty_env("MQTTD_WSS_BIND");
 
@@ -375,6 +519,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&bind).await?;
         info!(%bind, "accepting MQTT 3.1.1 clients over TLS 1.3");
         tokio::spawn(serve_tls_clients(
+            gate.clone(),
             listener,
             acceptor_rx
                 .clone()
@@ -390,6 +535,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&bind).await?;
         info!(%bind, "accepting MQTT clients over WebSocket + TLS 1.3 (wss, ADR 0035)");
         tokio::spawn(serve_wss_clients(
+            gate.clone(),
             listener,
             acceptor_rx
                 .clone()
@@ -406,6 +552,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT 3.1.1 clients");
         tokio::spawn(serve_plaintext_clients(
+            gate.clone(),
             listener,
             hub_tx.clone(),
             policy.clone(),
@@ -419,6 +566,7 @@ async fn start_client_listeners(
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT clients over WebSocket (ws, ADR 0035)");
         tokio::spawn(serve_ws_clients(
+            gate.clone(),
             listener,
             hub_tx.clone(),
             policy.clone(),
@@ -448,6 +596,7 @@ async fn start_client_listeners(
         )?;
         info!(%bind, "accepting MQTT clients over QUIC + TLS 1.3 (ADR 0036)");
         tokio::spawn(serve_quic_clients(
+            gate.clone(),
             endpoint,
             hub_tx.clone(),
             policy.clone(),
@@ -926,11 +1075,22 @@ fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
     Ok(limits)
 }
 
+/// The reload half of the peer-bus TLS context (ADR 0040 T4): the `watch` senders
+/// behind [`peer::PeerTls`]'s acceptor/connector plus the closure that re-reads the
+/// PEM files — handed to [`reload::Reloader::attach_peer_tls`] once the reloader
+/// exists, so a rotated cluster cert/key/CA is served on the next peer handshake.
+struct PeerTlsReload {
+    acceptor_tx: tokio::sync::watch::Sender<tokio_rustls::TlsAcceptor>,
+    connector_tx: tokio::sync::watch::Sender<tokio_rustls::TlsConnector>,
+    build: Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>,
+}
+
 /// Build the cluster-bus mTLS context from `MQTTD_PEER_TLS_{CA,CERT,KEY}`.
 /// All three must be set together; none means a (loudly logged) plaintext mesh.
 /// `MQTTD_PEER_TLS_CRL` (optional, requires the other three) loads a cluster-CA-signed
 /// CRL checked on every inbound signed-gossip datagram (ADR 0022 T7).
-fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Error>> {
+fn peer_tls_from_env() -> Result<Option<(peer::PeerTls, PeerTlsReload)>, Box<dyn std::error::Error>>
+{
     let crl_path = non_empty_env("MQTTD_PEER_TLS_CRL");
     match (
         non_empty_env("MQTTD_PEER_TLS_CA"),
@@ -952,17 +1112,41 @@ fn peer_tls_from_env() -> Result<Option<peer::PeerTls>, Box<dyn std::error::Erro
                 }
                 None => None,
             };
-            Ok(Some(peer::PeerTls {
-                acceptor: tls::server_acceptor(cert, key, Some(ca))?,
-                connector: tls::client_connector(ca, cert, key)?,
-                // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound certs,
-                // and our leaf + key sign outbound datagrams.
-                cert_der: tls::first_cert_der(cert)?,
-                key_der: tls::private_key_der(key)?,
-                ca_der,
-                gossip_crl: Arc::new(std::sync::RwLock::new(gossip_crl)),
-                crl_path,
-            }))
+            // The acceptor/connector live behind `watch` channels (ADR 0040 T4): the
+            // senders + rebuild closure go to the reloader once it exists, so a
+            // rotated cluster cert is served on the next peer handshake.
+            let (acceptor_tx, acceptor) =
+                tokio::sync::watch::channel(tls::server_acceptor(cert, key, Some(ca))?);
+            let (connector_tx, connector) =
+                tokio::sync::watch::channel(tls::client_connector(ca, cert, key)?);
+            let build = {
+                let (ca, cert, key) = (ca.to_path_buf(), cert.to_path_buf(), key.to_path_buf());
+                Box::new(move || {
+                    let acceptor =
+                        tls::server_acceptor(&cert, &key, Some(&ca)).map_err(|e| e.to_string())?;
+                    let connector =
+                        tls::client_connector(&ca, &cert, &key).map_err(|e| e.to_string())?;
+                    Ok((acceptor, connector))
+                }) as Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>
+            };
+            Ok(Some((
+                peer::PeerTls {
+                    acceptor,
+                    connector,
+                    // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound
+                    // certs, and our leaf + key sign outbound datagrams.
+                    cert_der: tls::first_cert_der(cert)?,
+                    key_der: tls::private_key_der(key)?,
+                    ca_der,
+                    gossip_crl: Arc::new(std::sync::RwLock::new(gossip_crl)),
+                    crl_path,
+                },
+                PeerTlsReload {
+                    acceptor_tx,
+                    connector_tx,
+                    build,
+                },
+            )))
         }
         (None, None, None) if crl_path.is_none() => Ok(None),
         (None, None, None) => Err(
@@ -1224,6 +1408,7 @@ fn apply_anti_replay(
 
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and
 /// hand its events to the peer-link manager.
+#[allow(clippy::too_many_arguments)]
 async fn start_swim_from_env(
     node_id: &NodeId,
     peer_bind: Option<String>,
@@ -1232,6 +1417,7 @@ async fn start_swim_from_env(
     placement: Arc<RwLock<Placement>>,
     shutdown: &tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = non_empty_env("MQTTD_SWIM_BIND") else {
         return Ok(());
@@ -1334,6 +1520,7 @@ async fn start_swim_from_env(
         peer_tls.cloned(),
         Some(placement),
         Some(metrics),
+        plane,
     ));
     Ok(())
 }
@@ -1341,6 +1528,7 @@ async fn start_swim_from_env(
 /// Accept TLS clients forever: per-connection handshake (off the accept loop so
 /// a slow handshake cannot stall other clients), then normal MQTT handling.
 async fn serve_tls_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
@@ -1363,6 +1551,11 @@ async fn serve_tls_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse BEFORE any TLS handshake work;
+        // dropping the stream closes it. Counted + logged by the gate.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted TLS connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("tls");
@@ -1372,13 +1565,19 @@ async fn serve_tls_clients(
         let acceptor = acceptor_rx.borrow().clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    // mTLS identity (ADR 0004): the verified leaf cert's CN.
-                    let identity = conn::tls_identity(&tls_stream);
-                    conn::handle_stream(tls_stream, Some(peer), identity, policy, hub).await;
+                    // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
+                    let cert = conn::tls_admission(&tls_stream);
+                    let outcome =
+                        conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await;
+                    if outcome.auth_failed {
+                        gate.record_auth_failure(Some(peer.ip()));
+                    }
                 }
                 Err(e) => {
                     debug!(%peer, error = %e, "TLS handshake failed");
@@ -1393,6 +1592,7 @@ async fn serve_tls_clients(
 
 /// Accept plaintext clients forever (insecure; explicitly opted into).
 async fn serve_plaintext_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -1413,18 +1613,23 @@ async fn serve_plaintext_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse before spawning any per-connection work.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("plaintext");
         }
         let _ = stream.set_nodelay(true);
-        connections.spawn(conn::handle_stream(
-            stream,
-            Some(peer),
-            None,
-            policy.clone(),
-            hub_tx.clone(),
-        ));
+        let (policy, hub, gate) = (policy.clone(), hub_tx.clone(), gate.clone());
+        connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
+            let outcome = conn::handle_stream(stream, Some(peer), None, policy, hub).await;
+            if outcome.auth_failed {
+                gate.record_auth_failure(Some(peer.ip()));
+            }
+        });
     }
 }
 
@@ -1432,6 +1637,7 @@ async fn serve_plaintext_clients(
 /// The WebSocket handshake (per connection, off the accept loop) yields a byte stream that
 /// the MQTT engine reads exactly like a TCP socket (ADR 0035).
 async fn serve_ws_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -1450,16 +1656,27 @@ async fn serve_ws_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse before the WebSocket handshake.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted ws connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("ws");
         }
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match mqtt_net::ws::accept(stream).await {
-                Ok(ws) => conn::handle_stream(ws, Some(peer), None, policy, hub).await,
+                Ok(ws) => {
+                    let outcome = conn::handle_stream(ws, Some(peer), None, policy, hub).await;
+                    if outcome.auth_failed {
+                        gate.record_auth_failure(Some(peer.ip()));
+                    }
+                }
                 Err(e) => {
                     debug!(%peer, error = %e, "websocket handshake failed");
                     if let Some(m) = &policy.metrics {
@@ -1476,6 +1693,7 @@ async fn serve_ws_clients(
 /// the TLS stream exactly as for a TCP TLS client (ADR 0004) — then the WebSocket handshake
 /// runs over the TLS stream.
 async fn serve_wss_clients(
+    gate: admission::AdmissionGate,
     listener: TcpListener,
     acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
@@ -1495,6 +1713,10 @@ async fn serve_wss_clients(
                 }
             },
         };
+        // Admission caps (ADR 0041 T1): refuse BEFORE any TLS handshake work.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
         debug!(%peer, "accepted wss connection");
         if let Some(m) = &policy.metrics {
             m.connection_accepted("wss");
@@ -1503,15 +1725,23 @@ async fn serve_wss_clients(
         let acceptor = acceptor_rx.borrow().clone();
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let _ = stream.set_nodelay(true);
             match acceptor.accept(stream).await {
                 Ok(tls) => {
-                    // mTLS identity (ADR 0004): the verified leaf cert's CN — read before the
-                    // TLS stream is consumed by the WebSocket adapter.
-                    let identity = conn::tls_identity(&tls);
+                    // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
+                    // read before the TLS stream is consumed by the WebSocket adapter.
+                    let cert = conn::tls_admission(&tls);
                     match mqtt_net::ws::accept(tls).await {
-                        Ok(ws) => conn::handle_stream(ws, Some(peer), identity, policy, hub).await,
+                        Ok(ws) => {
+                            let outcome =
+                                conn::handle_stream(ws, Some(peer), cert, policy, hub).await;
+                            if outcome.auth_failed {
+                                gate.record_auth_failure(Some(peer.ip()));
+                            }
+                        }
                         Err(e) => {
                             debug!(%peer, error = %e, "websocket handshake failed");
                             if let Some(m) = &policy.metrics {
@@ -1536,6 +1766,7 @@ async fn serve_wss_clients(
 /// client. The MQTT session runs over the connection's first **bidirectional** stream (the
 /// control stream) — multi-stream data streams layer on this foundation.
 async fn serve_quic_clients(
+    gate: admission::AdmissionGate,
     endpoint: quinn::Endpoint,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
@@ -1553,9 +1784,17 @@ async fn serve_quic_clients(
                 None => return, // endpoint closed
             },
         };
+        // Admission caps (ADR 0041 T1): refuse BEFORE the QUIC/TLS handshake —
+        // the remote address is known from the initial datagram.
+        let Some(permit) = gate.try_admit(Some(incoming.remote_address().ip())) else {
+            incoming.refuse();
+            continue;
+        };
         let hub = hub_tx.clone();
         let policy = policy.clone();
+        let gate = gate.clone();
         connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
             let conn = match incoming.await {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -1571,9 +1810,10 @@ async fn serve_quic_clients(
             if let Some(m) = &policy.metrics {
                 m.connection_accepted("quic");
             }
-            // mTLS identity (ADR 0004): the verified leaf cert's CN, from the QUIC handshake.
-            let identity = mqtt_net::quic::peer_leaf_cert(&conn)
-                .and_then(|c| mqtt_auth::mtls::identity_from_cert(&c).ok());
+            // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial, from
+            // the QUIC handshake.
+            let cert = mqtt_net::quic::peer_leaf_cert(&conn).and_then(|c| conn::cert_admission(&c));
+            let identity = cert.as_ref().map(|c| c.identity.clone());
             // Connection-migration observation (ADR 0036 §3b): QUIC keeps a connection alive
             // across a client path change (Wi-Fi↔cellular, NAT rebind). Watch the remote address
             // on the *same* connection — a change is a migration, not a reconnect — and log +
@@ -1582,7 +1822,12 @@ async fn serve_quic_clients(
             // Multi-stream mux (ADR 0036): the control stream carries the session; any data
             // streams the client opens feed PUBLISH into the same session, no HoL blocking.
             match mqtt_net::quic::accept_mux(conn).await {
-                Ok(mux) => conn::handle_stream(mux, Some(peer), identity, policy, hub).await,
+                Ok(mux) => {
+                    let outcome = conn::handle_stream(mux, Some(peer), cert, policy, hub).await;
+                    if outcome.auth_failed {
+                        gate.record_auth_failure(Some(peer.ip()));
+                    }
+                }
                 Err(e) => {
                     debug!(%peer, error = %e, "QUIC connection opened no control stream");
                 }
@@ -1658,6 +1903,23 @@ fn wire_limits_from_env() -> Result<conn::WireLimits, Box<dyn std::error::Error>
         auth_round_timeout: Duration::from_secs(
             parse_env("MQTTD_AUTH_TIMEOUT", d.auth_round_timeout.as_secs())?.max(1),
         ),
+        // The inbound packet ceiling (ADR 0041 T4), advertised as the MQTT 5
+        // Maximum Packet Size; installed into the transport below. Floor 1 KiB —
+        // smaller would refuse CONNECT packets themselves.
+        max_packet_size: parse_env("MQTTD_MAX_PACKET_SIZE", d.max_packet_size)?.max(1024),
+        // Per-connection publish-rate throttle (ADR 0041 T3); unset = unlimited.
+        publish_rate: match non_empty_env("MQTTD_MAX_PUBLISH_RATE") {
+            None => None,
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    return Err(format!(
+                        "MQTTD_MAX_PUBLISH_RATE must be a positive integer, got {v:?}"
+                    )
+                    .into())
+                }
+            },
+        },
     })
 }
 

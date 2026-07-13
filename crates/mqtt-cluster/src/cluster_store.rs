@@ -191,12 +191,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                         epoch,
                     };
                     let entry = Arc::new(GroupEntry {
-                        log: Arc::new(ClusterLog::new(
-                            self.local.clone(),
-                            lease,
-                            &replica_set,
-                            self.transport.clone(),
-                        )),
+                        log: Arc::new(
+                            ClusterLog::new(
+                                self.local.clone(),
+                                lease,
+                                &replica_set,
+                                self.transport.clone(),
+                            )
+                            // The owner's self-ack is durable (ADR 0042 T8): it
+                            // counts toward quorum only once the op is applied to
+                            // this node's own replica copy — the same copy its
+                            // recovery reads consult after a restart.
+                            .with_local_store(self.local_replicas.clone()),
+                        ),
                         recovered: Mutex::new(BTreeSet::new()),
                     });
                     cache.insert(group, entry.clone());
@@ -215,8 +222,17 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(key);
         if recover {
-            let recovered = self.recover_key(key, &replica_set).await?;
-            entry.log.seed_key(key, recovered).await;
+            let (recovered, floor) = self.recover_key(key, &replica_set).await?;
+            // Re-commit the recovered base to a write quorum at the new epoch
+            // BEFORE serving or appending (ADR 0042 T6, exhibit ②): a merge can
+            // adopt a single-replica orphan, and building on it un-replicated lets
+            // the next takeover gap out the acked tail above it. A NoQuorum here
+            // leaves the recovery marker unset, so the next touch retries. The
+            // floor keeps the offset space above every read replica's durable
+            // truncation watermark (the exhibit's second face: an empty merge
+            // must not restart a truncated queue's offsets at 1).
+            entry.log.recommit_key(key, &recovered).await?;
+            entry.log.seed_key(key, recovered, floor).await;
             entry
                 .recovered
                 .lock()
@@ -234,7 +250,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         &self,
         key: &str,
         replica_set: &[NodeId],
-    ) -> Result<Vec<LogEntry>, ReplError> {
+    ) -> Result<(Vec<LogEntry>, Offset), ReplError> {
         let quorum = replica_set.len() / 2 + 1;
         // Local copy first (sync; the guard is dropped before any await). Each read
         // carries the replica's truncation low-water so the merge cannot resurrect an
@@ -246,7 +262,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::cluster_log::ReplicaRead {
                 watermark: r.watermark(key),
-                entries: r.entries(key),
+                entries: r.epoch_entries(key),
             }
         }];
         // Read peers **concurrently** (like the append fan-out) and stop as soon as a
@@ -272,7 +288,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         if reads.len() < quorum {
             return Err(ReplError::NoQuorum);
         }
-        Ok(merge_replica_logs(&reads))
+        // The floor: the highest truncation low-water across the reads. The merge
+        // applies it to the entries; the caller also needs it to keep the key's
+        // offset space above it (ADR 0042 T6).
+        let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
+        Ok((merge_replica_logs(&reads), floor))
     }
 }
 
@@ -308,14 +328,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
     async fn keys(&self) -> Result<Vec<String>, ReplError> {
         // The replicated copies this node holds (ADR 0009 §3): the session metadata a new
         // owner inherited at takeover, and (on a persistent backend) what reopened from
-        // disk after a restart, live here. Sessions this node already owns and is actively
-        // managing are tracked in the hub's in-memory expiry map, so reading the replica
-        // keys is what the takeover-expiry reconcile needs.
-        Ok(self
+        // disk after a restart, live here — UNIONED with every reachable peer's key set
+        // (ADR 0042 T9, exhibit ⑥): quorum appends mean any single replica may lack a
+        // key, and a new owner that never held a copy of a group would otherwise never
+        // discover its sessions. Values are still read per key via quorum recovery.
+        let mut keys = self
             .local_replicas
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys())
+            .keys();
+        keys.append(&mut self.transport.list_remote_keys().await);
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
     }
 
     async fn epoch_for(&self, key: &String) -> Result<u64, ReplError> {
@@ -392,9 +417,14 @@ mod tests {
                             let s = state.lock().unwrap();
                             (
                                 s.watermark(&key),
-                                s.entries(&key)
+                                s.epoch_entries(&key)
                                     .into_iter()
-                                    .map(|e| (e.offset, e.record))
+                                    .map(|e| crate::peer::ReplicaEntryWire {
+                                        offset: e.offset,
+                                        epoch: e.epoch,
+                                        seq: e.seq,
+                                        record: e.record,
+                                    })
                                     .collect(),
                             )
                         };
@@ -604,6 +634,7 @@ mod tests {
                     &ReplOp::Append {
                         key: qkey.clone(),
                         offset,
+                        seq: offset,
                         record,
                     },
                 );
@@ -626,6 +657,200 @@ mod tests {
         // Appends continue after the recovered watermark (no offset reuse).
         assert_eq!(log.append(&qkey, b"m3".to_vec()).await.unwrap(), 3);
         assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 3);
+    }
+
+    /// Exhibit ② regression (ADR 0042 T6): an entry the takeover merge ADOPTS
+    /// from a single copy — here an orphan a crashed owner's partial fan-out left
+    /// on this node's own follower copy — is **re-committed to a write quorum**
+    /// before the key is served, at the new owner's epoch. Without the re-commit
+    /// the new owner builds acked entries on top of a base only it can see, and
+    /// the NEXT takeover (a read quorum missing this node) gaps out at the orphan
+    /// and discards the acked tail above it. Found by the T2 simulation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn takeover_recommits_an_adopted_orphan_to_a_write_quorum() {
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two live followers.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let mut follower_states = Vec::new();
+        for node in [nid("f1"), nid("f2")] {
+            let state = Arc::new(Mutex::new(ReplicaState::new()));
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx);
+            spawn_follower(transport.clone(), state.clone(), rx);
+            follower_states.push(state);
+        }
+
+        // The old owner (epoch 1) crashed mid-fan-out: its orphan reached only
+        // THIS node's follower copy. The recovery merge will adopt it (it is
+        // contiguous — indistinguishable from a committed entry).
+        let local = Arc::new(Mutex::new(ReplicaState::new()));
+        assert!(local.lock().unwrap().apply(
+            1,
+            &ReplOp::Append {
+                key: qkey.clone(),
+                offset: 1,
+                seq: 1,
+                record: b"orphan".to_vec(),
+            }
+        ));
+
+        let log = GroupRoutedLog::new(owner, placement, transport, FixedLease(2), local);
+
+        // First touch after the takeover: the orphan is adopted AND re-committed.
+        let served = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(served.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(&served[0].record, b"orphan");
+
+        // The adopted base now lives on BOTH followers, at the new epoch's fence:
+        // any future read quorum sees it — no gap, no discarded acked tail.
+        for (i, follower) in follower_states.iter().enumerate() {
+            let f = follower.lock().unwrap();
+            let entries = f.entries(&qkey);
+            assert_eq!(
+                entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
+                vec![1],
+                "follower {i} must hold the re-committed orphan"
+            );
+            assert_eq!(&entries[0].record, b"orphan");
+            assert_eq!(
+                f.fence_for_key(&qkey),
+                2,
+                "the re-commit advances follower {i}'s group fence to the new epoch"
+            );
+        }
+    }
+
+    /// Exhibit ④ regression (ADR 0042 T8): the owner's quorum self-ack is
+    /// **durable** — an append acked via {owner, one follower} survives the
+    /// owner's crash-and-restart even when that follower is down at recovery,
+    /// because the owner's own durable replica copy (which its recovery read
+    /// consults) received the entry before the self-ack counted. Before the fix
+    /// the self-ack was the volatile `ClusterLog` cache: the same recovery read
+    /// {restarted-owner(empty), other-follower(empty)} merged empty and the
+    /// acked entry was gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_acked_append_survives_owner_restart_via_its_durable_self_copy() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + f1 (up) + f2 (down for now).
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let (f1_tx, f1_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), f1_tx);
+        spawn_follower(transport.clone(), f1_state.clone(), f1_rx);
+
+        // The node's own durable replica copy — it survives the "restart" below.
+        let local = Arc::new(Mutex::new(ReplicaState::new()));
+
+        let epoch = Arc::new(AtomicU64::new(2));
+        let log = GroupRoutedLog::new(
+            owner,
+            placement,
+            transport.clone(),
+            BumpableLease(epoch.clone()),
+            local.clone(),
+        );
+
+        // Acked with f2 down: quorum = the owner's DURABLE self-ack + f1.
+        assert_eq!(log.append(&qkey, b"precious".to_vec()).await.unwrap(), 1);
+        assert_eq!(
+            local.lock().unwrap().entries(&qkey).len(),
+            1,
+            "the self-ack was durable: the entry is in the owner's own copy"
+        );
+
+        // Owner crashes and restarts; f1 is now down and f2 up — the recovery
+        // read is {own durable copy, f2}, which before the fix held nothing.
+        transport.fail_node(&nid("f1"));
+        let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let (f2_tx, f2_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f2"), f2_tx);
+        spawn_follower(transport.clone(), f2_state.clone(), f2_rx);
+        epoch.store(3, Ordering::Relaxed); // the restart won a fresh lease epoch
+
+        let served = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(
+            served.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![1],
+            "the acked entry survived the restart via the owner's durable copy"
+        );
+        assert_eq!(&served[0].record, b"precious");
+        // And the takeover re-commit (T6) spread it back to a quorum: f2 has it.
+        assert_eq!(f2_state.lock().unwrap().entries(&qkey).len(), 1);
+    }
+
+    /// Exhibit ②'s second face (ADR 0042 T6, found when the T2 sim's waiver
+    /// lifted): a fully-truncated queue legitimately merges **empty**, but the
+    /// new owner must NOT restart its offset space at 1 — some replica's durable
+    /// truncation watermark sits above it, and any later recovery reading that
+    /// replica silently drops every new acked write at or below the watermark.
+    /// The recovered offset space continues above the reads' truncation floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_of_a_truncated_key_continues_offsets_above_the_watermark() {
+        let owner = nid("owner");
+        // A single-node group (quorum 1): recovery reads only this node's copy.
+        let placement = Arc::new(RwLock::new(Placement::new(owner.clone(), DEFAULT_REPLICAS)));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let qkey = format!("q/{}", client.0);
+
+        // The queue was fully drained under the old owner: entries 1..=2 acked by
+        // the client and truncated away — the follower copy holds only the
+        // truncation watermark.
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        {
+            let mut r = replicas.lock().unwrap();
+            for (offset, record) in [(1u64, b"m1".to_vec()), (2u64, b"m2".to_vec())] {
+                r.apply(
+                    3,
+                    &ReplOp::Append {
+                        key: qkey.clone(),
+                        offset,
+                        seq: offset,
+                        record,
+                    },
+                );
+            }
+            r.apply(
+                3,
+                &ReplOp::Truncate {
+                    key: qkey.clone(),
+                    up_to: 2,
+                },
+            );
+            assert_eq!(r.watermark(&qkey), 2);
+            assert!(r.entries(&qkey).is_empty());
+        }
+
+        let log = GroupRoutedLog::new(
+            owner,
+            placement,
+            Arc::new(PeerReplicaTransport::new()),
+            FixedLease(7),
+            replicas,
+        );
+
+        // The recovery merge is empty — correct — but the next append must land
+        // ABOVE the watermark, not restart at 1 (which any later merge including
+        // this replica would silently drop).
+        assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 0);
+        assert_eq!(log.append(&qkey, b"m3".to_vec()).await.unwrap(), 3);
+        let served = log.read(&qkey, 0, 100).await.unwrap();
+        assert_eq!(served.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![3]);
     }
 
     /// Recovery **fails closed**: when a quorum of the replica set cannot be read, the new
@@ -654,6 +879,7 @@ mod tests {
             &ReplOp::Append {
                 key: qkey.clone(),
                 offset: 1,
+                seq: 1,
                 record: b"m1".to_vec(),
             },
         );
@@ -702,6 +928,7 @@ mod tests {
                     &ReplOp::Append {
                         key: qkey.clone(),
                         offset,
+                        seq: offset,
                         record,
                     },
                 );
@@ -730,6 +957,7 @@ mod tests {
             &ReplOp::Append {
                 key: qkey.clone(),
                 offset: 3,
+                seq: 3,
                 record: b"m3".to_vec(),
             },
         );
@@ -783,11 +1011,30 @@ mod tests {
         let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
 
         assert_eq!(
-            retained.set(&topic, b"v1", 1).await.unwrap(),
+            retained
+                .set(
+                    &topic,
+                    b"v1",
+                    1,
+                    &mqtt_storage::app_props::AppProps::default()
+                )
+                .await
+                .unwrap(),
             (1, 1),
             "the token is the committing lease epoch and the assigned offset"
         );
-        assert_eq!(retained.set(&topic, b"v2", 1).await.unwrap(), (1, 2));
+        assert_eq!(
+            retained
+                .set(
+                    &topic,
+                    b"v2",
+                    1,
+                    &mqtt_storage::app_props::AppProps::default()
+                )
+                .await
+                .unwrap(),
+            (1, 2)
+        );
 
         // The owner serves exactly the compacted last value, under its token.
         let e = retained.get(&topic).await.unwrap().unwrap();
@@ -846,7 +1093,15 @@ mod tests {
         ));
 
         let topic = foreign_client(&placement.read().unwrap()).0;
-        let err = retained.set(&topic, b"x", 0).await.unwrap_err();
+        let err = retained
+            .set(
+                &topic,
+                b"x",
+                0,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, mqtt_storage::StorageError::NotOwner),
             "a foreign topic must refuse as NotOwner, got {err:?}"
@@ -878,6 +1133,7 @@ mod tests {
                 &ReplOp::Append {
                     key: format!("q/{topic}"),
                     offset: 1,
+                    seq: 1,
                     record: b"newer-owner".to_vec(),
                 },
             );
@@ -893,7 +1149,15 @@ mod tests {
             FixedLease(1),
             Arc::new(Mutex::new(ReplicaState::new())),
         ));
-        let err = retained.set(&topic, b"stale", 0).await.unwrap_err();
+        let err = retained
+            .set(
+                &topic,
+                b"stale",
+                0,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, mqtt_storage::StorageError::NoQuorum),
             "a fenced owner must fail the retained write with NoQuorum, got {err:?}"
@@ -934,8 +1198,31 @@ mod tests {
         ));
         let topic = owned_group_and_client(&placement.read().unwrap()).1 .0;
 
-        retained.set(&topic, b"v1", 1).await.unwrap();
-        assert_eq!(retained.set(&topic, b"v2", 1).await.unwrap(), (2, 2));
+        // Every token this owner's cache generation applies goes through the
+        // ADR 0042 T1 catalog: strictly increasing per topic, or it's a violation.
+        let mut tokens = crate::invariants::TokenLog::new();
+
+        let t1 = retained
+            .set(
+                &topic,
+                b"v1",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
+        tokens.observe_applied(&topic, t1);
+        let t2 = retained
+            .set(
+                &topic,
+                b"v2",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(t2, (2, 2));
+        tokens.observe_applied(&topic, t2);
 
         // Ownership lost and regained at a higher epoch: the cached group log is
         // rebuilt and the key re-recovered from the followers' committed copies
@@ -955,8 +1242,23 @@ mod tests {
 
         // The next write commits under the new epoch, after the recovered
         // high-water: strictly increasing tokens across the takeover.
-        let tok = retained.set(&topic, b"v3", 1).await.unwrap();
+        let tok = retained
+            .set(
+                &topic,
+                b"v3",
+                1,
+                &mqtt_storage::app_props::AppProps::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(tok, (5, 3));
         assert!(tok > e.token());
+
+        // The recovered token continues the pre-takeover cache's history: feeding
+        // the post-takeover applications into the SAME log proves no token was
+        // reissued or regressed across the takeover (ADR 0042 T1). The recovered
+        // (2, 2) is a re-read of the held high-water, not a new application.
+        tokens.observe_applied(&topic, tok);
+        crate::invariants::assert_holds(&tokens.verify());
     }
 }

@@ -45,8 +45,12 @@
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [8/8 done](0037-durable-retained-messages.md) | — |
-| [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Proposed | [2/4 done](0038-prerelease-compatibility-freeze.md) | 2 open |
+| [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
+| [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
+| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
+| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
+| [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Proposed | [0/5 done](0043-elastic-cluster-resize.md) | 5 open |
 
 ## Open and deferred work
 
@@ -92,7 +96,7 @@
 
 **0032 — Hot-reloadable security policy**
 
-- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum."
+- `0032-T9` 💤 deferred: Follow-ons via the same mechanism — cert revocation (reloadable CRL → WebPkiClientVerifier) and peer-bus TLS reload — "Partly delivered. Cert revocation via a reloadable CRL → WebPkiClientVerifier is **done** (ADR 0002 T8: server_config_with_crl + MQTTD_TLS_CRL, applied through this ADR's reloadable acceptor; tests/tls.rs reloading_a_crl_revokes_a_client_in_place). Still deferred: peer-bus (cluster) TLS reload — the same pattern applied to the peer acceptor/connector, kept off the consensus bus for now to avoid coupling a client-facing change to membership/quorum. Now tracked as ADR 0040 T4 (revocation reaches live state)."
 
 **0033 — Filesystem-watch auto-reload of the security policy**
 
@@ -106,11 +110,14 @@
 
 - `0036-T11` 💤 deferred: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection) — 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.
 
-**0038 — Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs)**
-
-- `0038-T3` ⬜ planned: Retained MQTT 5 fidelity — app properties through the durable record codec, RetainedCommit/Update/Snapshot frames, and the persistent retained store
-- `0038-T4` ⬜ planned: Wire-shape finalization — named serde structs for multi-field entries; frozen-vs-versioned frame inventory recorded
-
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
+
+**0043 — Elastic cluster resize (grow, shrink, replace)**
+
+- `0043-P1` ⬜ planned: Catch-up replicas — a node entering a group's replica set back-fills the group's log (ReplicaKeys discovery + recover_key quorum reads) behind a durable caught-up watermark, and counts toward NO quorum (append or recovery) until caught up; growing 1→N back-fills laptop-mode single-replica history as the same rule
+- `0043-P2` ⬜ planned: Eager migration on ring change — membership growth triggers the takeover-scan materialization (sessions, retained, interest) for groups whose owner moved, instead of first-touch; the settle/re-route + mesh-whole ack machinery holds acks honest during the window
+- `0043-P3` ⬜ planned: Decommission — an explicit drain (stop new sessions → successors caught up + replica counts restored among remaining members → voter demotion → ADR 0019 leave), observable via the health endpoint, interruptible (crash mid-drain = crash); operator trigger chosen here (signal vs admin endpoint)
+- `0043-P4` ⬜ planned: Resize test vocabulary — join/decommission steps in the ADR 0042 stress schedules, plus dedicated upgrade-path tests (1→3 laptop-to-server, 3→5 zone-spread, 5→3 cost reduction, rolling host replacement, rolling binary upgrade across the proto window) under the unchanged acked-obligations oracle
+- `0043-P5` ⬜ planned: Operator docs — the "grow your broker" guide (one paragraph per direction), the two-node-waypoint honesty note (quorum 2-of-2; recommend 1→3), README interim warning that durable resize is unsupported until P1 lands

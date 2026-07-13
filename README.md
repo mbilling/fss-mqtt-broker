@@ -73,6 +73,12 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   a missing or unparseable file is rejected and the running policy is kept intact
   (never fail open, never brick); every reload is audited and metered
   ([ADR 0032](docs/adr/0032-hot-reloadable-security-policy.md)).
+- **Revocation reaches live state**: a successful reload **sweeps** live sessions,
+  subscription grants, and peer links against the new policy — a CRL'd certificate, a
+  removed user, or a connect-ACL deny evicts the live session; a tightened subscribe-ACL
+  stops existing flows; a cluster-CRL'd node's established links are torn down. Identity
+  revoked → session ends; permission revoked → flow ends
+  ([ADR 0040](docs/adr/0040-revocation-reaches-live-state.md)).
 - **Tamper-evident audit log**: a hash-chained record of auth and authorization
   decisions (no credential ever reaches it).
 - **Secure by default**: plaintext listeners, anonymous access, an unkeyed
@@ -109,6 +115,10 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   [0028](docs/adr/0028-link-gated-voter-admission.md)). Opt out with
   `MQTTD_DURABLE_SESSIONS=0` for the bounded in-memory store. Proven by a 3-node
   integration test (an enqueue is quorum-durable across the real peer mesh).
+  **Resizing a running durable cluster (adding/removing nodes) is not yet supported**:
+  new replicas are not back-filled with existing data, so form the cluster at its
+  intended size for now — elastic grow/shrink is planned as
+  [ADR 0043](docs/adr/0043-elastic-cluster-resize.md).
 - **Durable single-owner retained messages** ([ADR 0037](docs/adr/0037-durable-retained-messages.md),
   on whenever durable sessions are — the default). Retained conflicts are **prevented,
   not resolved**: every retained mutation commits through its topic's group lease-owner
@@ -222,6 +232,16 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
 | `MQTTD_TOPIC_ALIAS_MAX` | Topic Alias Maximum advertised to v5 clients (ADR 0011; default `16`, `0` disables) |
 | `MQTTD_RECEIVE_MAXIMUM` | Receive Maximum advertised to v5 clients (ADR 0012; default `256`). Exceeding it → DISCONNECT `0x93` |
+| `MQTTD_MAX_CONNECTIONS` | Global concurrent-connection cap (ADR 0041). An over-cap connection is closed **at accept, before any TLS work**; a freed slot is immediately reusable. Unset = uncapped |
+| `MQTTD_MAX_CONNECTIONS_PER_IP` | Concurrent-connection cap per source IP (ADR 0041), enforced the same way. The accounting table is bounded by live connections. Unset = uncapped |
+| `MQTTD_AUTH_PENALTY_THRESHOLD` | Auth-failure penalty box (ADR 0041): after this many failed authentications from one **source address**, its connections are closed at accept — before any Argon2 work — until the strikes decay. Keys on the address, never the username. Unset = disabled |
+| `MQTTD_AUTH_PENALTY_DECAY_SECS` | How long one auth-failure strike takes to decay (default `60`; needs `…_THRESHOLD`) |
+| `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` | Subscription quota (ADR 0041): a SUBSCRIBE filter beyond it is denied `0x97 Quota exceeded` (v5) / `0x80` (v3.1.1) in its SUBACK slot; in-cap filters in the same packet are granted, and re-subscribing a held filter never consumes quota. Unset = uncapped |
+| `MQTTD_MAX_PUBLISH_RATE` | Per-connection inbound publish rate (messages/second, ADR 0041). An over-rate publisher is slowed by **pausing its socket read** (TCP backpressure) — nothing is dropped, nothing is disconnected. Unset = unlimited |
+| `MQTTD_MAX_RETAINED_MESSAGES` | Retained-topic cap (ADR 0041). A retained publish creating a **new** topic beyond it is refused (`0x97` v5; v3.1.1 is delivered live but not retained, counted); overwriting or clearing an existing topic always works — the cap stops growth, never maintenance. Unset = uncapped |
+| `MQTTD_MAX_SESSIONS` | Session cap (ADR 0041). A CONNECT creating a **new** session beyond it is refused (`0x97` v5, Server-unavailable v3.1.1); resuming an existing session is never refused — a full broker keeps serving its fleet and refuses only strangers. Unset = uncapped |
+| `MQTTD_MAX_PACKET_SIZE` | Inbound packet ceiling in bytes (default 1 MiB, floor 1 KiB), advertised to v5 clients as the MQTT 5 **Maximum Packet Size** — the transport cap and the advertised contract cannot drift apart. Outbound, a message larger than the *client's* advertised maximum is dropped for that subscriber only, per spec |
+| `MQTTD_STORE_MAX_BYTES` | Disk watermark over the node's on-disk stores, total bytes (ADR 0041; needs `MQTTD_DATA_DIR`). Above it the broker **browns out**: writes that *grow* durable state (new retained topics, new sessions, offline enqueues) are refused with the quota behaviors, while acks, deletes, expiry, and resumes continue — read-mostly, never the disk-full cliff; dropping back under restores writes. Per-store sizes are always exported as the `store_bytes{store}` gauge. Unset = no watermark |
 | `MQTTD_AUTH_TIMEOUT` | Per-round enhanced-auth reply timeout, seconds (ADR 0013; default `10`) |
 | `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
 | `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); unset → in-memory |
@@ -231,7 +251,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
 | `MQTTD_TLS_CERT` / `MQTTD_TLS_KEY` | Server certificate chain + key (PEM) |
 | `MQTTD_TLS_CLIENT_CA` | Require client certs (mTLS); identity = certificate CN |
-| `MQTTD_TLS_CRL` | Certificate revocation list (PEM; needs `…_CLIENT_CA`). A client whose cert is listed is refused at the TLS handshake; re-read on `SIGHUP`, so a published CRL applies with no restart (ADR 0002) |
+| `MQTTD_TLS_CRL` | Certificate revocation list (PEM; needs `…_CLIENT_CA`). A client whose cert is listed is refused at the TLS handshake **and its live session is evicted on reload** (ADR 0002/0040); re-read on `SIGHUP`, so a published CRL applies with no restart |
 | `MQTTD_WSS_BIND` | MQTT-over-WebSocket **over TLS** (`wss://`), e.g. `0.0.0.0:8884` (ADR 0035; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA` — same TLS 1.3 + mTLS + hot reload as the TLS listener) |
 | `MQTTD_WS_BIND` | **Insecure** plaintext MQTT-over-WebSocket (`ws://`) — for browsers in local/dev only (ADR 0035) |
 | `MQTTD_QUIC_BIND` | MQTT-over-QUIC (UDP), e.g. `0.0.0.0:8885` (ADR 0036; reuses `…_CERT`/`…_KEY`/`…_CLIENT_CA`). QUIC mandates TLS 1.3 (no plaintext mode); **multi-stream** (one session across many streams, no head-of-line blocking); **non-standard** (EMQX-style), identity = leaf CN, no 0-RTT for CONNECT |
@@ -252,7 +272,7 @@ or empty means "off"; every insecure fallback is logged at startup.
 |---|---|
 | `MQTTD_PEER_BIND` | Inter-node peer listener, e.g. `0.0.0.0:7001` |
 | `MQTTD_PEER_TLS_CA` / `…_CERT` / `…_KEY` | Cluster-bus mTLS material (set all three). A leaf whose SANs include `URI:urn:fss:failure-domain:<label>` has its failure domain **CA-attested** (ADR 0016 T6): the label is authoritative on the gossip plane (a contradicting self-claim is rejected) and can replace `MQTTD_FAILURE_DOMAIN` entirely — relabel by reissuing the cert |
-| `MQTTD_PEER_TLS_CRL` | Cluster-bus CRL (PEM, **signed by the cluster CA**; needs the three above). Signed gossip from a revoked cert is dropped (ADR 0022 T7); expired/not-yet-valid certs are rejected regardless. Hot-reloads via `SIGHUP`/`MQTTD_CONFIG_WATCH`, so publishing a CRL evicts a compromised node with no restart |
+| `MQTTD_PEER_TLS_CRL` | Cluster-bus CRL (PEM, **signed by the cluster CA**; needs the three above). Signed gossip from a revoked cert is dropped (ADR 0022 T7), fresh peer handshakes are refused in both directions, and **established peer links are torn down on reload** (ADR 0040); expired/not-yet-valid certs are rejected regardless. Hot-reloads via `SIGHUP`/`MQTTD_CONFIG_WATCH`, so publishing a CRL evicts a compromised node with no restart |
 | `MQTTD_PEERS` | Comma-separated static peer addresses (alternative to gossip) |
 | `MQTTD_SWIM_BIND` | SWIM gossip UDP bind (needs `MQTTD_PEER_BIND`) |
 | `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
@@ -293,9 +313,34 @@ The broker re-reads the configured files in place and swaps them on **live** con
   publish/subscribe; a loosened rule takes effect immediately.
 - **Authenticators** (`MQTTD_PASSWORD_FILE`, `MQTTD_JWT_*`) — a rotated password file or JWT
   key authenticates the new credential and rejects the old on the next CONNECT.
-- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA` / `…_CRL`) — a renewed
-  certificate, or an updated **CRL**, is served on the next handshake; **in-flight TLS
-  sessions are undisturbed**. A newly-revoked client cert is refused from the next handshake.
+- **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA` / `…_CRL`, and the peer-bus
+  `MQTTD_PEER_TLS_*` trio) — a renewed certificate is served on the next handshake;
+  in-flight TLS sessions of *non-revoked* certs are undisturbed (rotation never drops a
+  valid session).
+
+**Revocation reaches live state (ADR 0040).** A successful reload also **sweeps** what is
+already connected, with a two-tier rule — *who you are* revoked ends the session; *what you
+may read* revoked ends the flow:
+
+- a client whose certificate the new **CRL** names, whose **password user was removed**, or
+  whose principal the new **connect-ACL** denies is **disconnected immediately** (MQTT 5
+  clients get `DISCONNECT 0x87 Not authorized`; MQTT 3.1.1 has no server DISCONNECT, so the
+  connection just closes; the will is published and session retention proceeds normally);
+- an existing **subscription** whose filter the tightened ACL denies stops delivering — it
+  is removed from routing *and* the durable session set (offline sessions are re-checked at
+  resume, and queued messages only the revoked grant admits are not replayed). The client
+  stays connected; its next SUBSCRIBE is denied;
+- an established **peer link** whose remote certificate the new cluster CRL
+  (`MQTTD_PEER_TLS_CRL`) revokes is torn down, and the revoked node cannot re-handshake in
+  either direction. The mesh reacts as to any link loss.
+
+An unchanged policy evicts no one (the sweep re-derives each admission verdict, so only
+differences act). Each action emits a `security.evict` audit event with its reason
+(`cert-revoked`, `user-removed`, `connect-denied`, `grant-revoked`, `peer-revoked`) and
+increments `mqttd_revocation_evictions_total{reason}`; every sweep leaves one
+`security.sweep` summary record with the counts. Durable session *state* of a removed user
+is not destroyed — it is unreachable (resume fails at authentication; a different subject is
+refused by the ADR 0031 owner binding) and expires on schedule.
 
 The reload is **validate-before-swap and all-or-nothing**: every file is parsed first, and
 the swap is applied only if *all* succeed. A missing or unparseable file is **rejected** —

@@ -11,6 +11,10 @@ mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
 thiserror.workspace = true
 async-trait = "0.1"
 bytes = { workspace = true }
+# The stored/wire form of MQTT 5 application properties (ADR 0038 T3) rides serde,
+# matching the peer-bus frame encoding so one struct serves both.
+serde = { workspace = true }
+bincode = "1"
 # Embedded, pure-Rust ACID engine backing the on-disk durable log (ADR 0018).
 redb = "2"
 tokio = { workspace = true }

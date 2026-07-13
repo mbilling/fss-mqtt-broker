@@ -79,6 +79,19 @@ pub trait Authenticator: Send + Sync {
         client: &ClientId,
         creds: &Credentials<'_>,
     ) -> Result<Identity, AuthError>;
+
+    /// Whether `subject`, previously admitted with **password** credentials, still
+    /// exists in this authenticator's credential store (ADR 0040 T2). The identity
+    /// sweep evicts a live password session whose user was removed by a reload.
+    ///
+    /// Default `true`: an authenticator with no server-side user store (certificates,
+    /// tokens, anonymous) cannot say a subject is gone — such sessions are bounded by
+    /// their credential's own lifetime and the ACL sweep instead. This is an
+    /// existence probe on facts the server already holds, never a re-run of
+    /// authentication (the broker retains no replayable credentials).
+    fn password_subject_exists(&self, _subject: &str) -> bool {
+        true
+    }
 }
 
 /// Decides whether an authenticated [`Identity`] may perform an [`Action`] on a topic.

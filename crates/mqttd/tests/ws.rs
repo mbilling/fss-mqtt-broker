@@ -92,7 +92,7 @@ async fn start_wss_node(acceptor: tokio_rustls::TlsAcceptor) -> SocketAddr {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
-                let identity = mqttd::conn::tls_identity(&tls);
+                let identity = mqttd::conn::tls_admission(&tls);
                 if let Ok(ws) = mqtt_net::ws::accept(tls).await {
                     mqttd::conn::handle_stream(ws, Some(peer), identity, permissive_policy(), hub)
                         .await;

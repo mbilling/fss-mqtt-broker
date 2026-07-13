@@ -63,7 +63,17 @@ async fn start_node(
             let identity = next_identity.clone();
             let hub = hub_tx.clone();
             tokio::spawn(async move {
-                mqttd::conn::handle_stream(stream, Some(peer), identity, policy, hub).await;
+                mqttd::conn::handle_stream(
+                    stream,
+                    Some(peer),
+                    identity.map(|identity| mqttd::conn::CertAdmission {
+                        identity,
+                        serial: None,
+                    }),
+                    policy,
+                    hub,
+                )
+                .await;
             });
         }
     });
