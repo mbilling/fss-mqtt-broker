@@ -338,6 +338,31 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         Ok(out)
     }
 
+    async fn all_sessions(
+        &self,
+    ) -> Result<Vec<(ClientId, Vec<Subscription>, Option<u64>)>, StorageError> {
+        // Enumerate the metadata keys this node holds (`m/{client}`) with their full
+        // snapshots. Off the hot path — used at takeover to materialize inherited
+        // sessions before their clients re-attach (ADR 0042 T9, exhibit ⑥). The keys
+        // span every group this node REPLICATES, not just those it owns; the caller
+        // filters by ownership.
+        let mut out = Vec::new();
+        for key in self.log.keys().await? {
+            let Some(id) = key.strip_prefix("m/") else {
+                continue;
+            };
+            let client = ClientId(id.to_string());
+            // A per-key error is skipped, not fatal: `NotOwner` is the common case
+            // (a replica copy held for another node — its owner materializes it),
+            // and a transient `NoQuorum`/`Unavailable` retries on the next scan.
+            // Reading an OWNED key eagerly recovers its cold group — intended.
+            if let Ok(Some(meta)) = self.load_meta(&client).await {
+                out.push((client, meta.subscriptions, meta.session_expiry_at));
+            }
+        }
+        Ok(out)
+    }
+
     async fn reserve_packet_ids(&self, client: &ClientId, count: u16) -> Result<u16, StorageError> {
         // Reserve only against an existing (persistent) session, so a clean session never
         // materialises durable metadata. One snapshot write advances the high-water by a

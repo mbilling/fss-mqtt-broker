@@ -217,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
     let draining =
-        start_health_from_env(&hub_tx, &placement, durable_plane, metrics.clone()).await?;
+        start_health_from_env(&hub_tx, &placement, durable_plane.clone(), metrics.clone()).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
@@ -270,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hub_tx.clone(),
             peer_tls.clone(),
             Some(policy.clone()),
+            durable_plane.clone(),
         ));
     }
     if let Some(peers) = non_empty_env("MQTTD_PEERS") {
@@ -280,6 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 node_id.clone(),
                 hub_tx.clone(),
                 peer_tls.clone(),
+                durable_plane.clone(),
             ));
         }
     }
@@ -294,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement,
         &shutdown,
         metrics.clone(),
+        durable_plane.clone(),
     )
     .await?;
 
@@ -1405,6 +1408,7 @@ fn apply_anti_replay(
 
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and
 /// hand its events to the peer-link manager.
+#[allow(clippy::too_many_arguments)]
 async fn start_swim_from_env(
     node_id: &NodeId,
     peer_bind: Option<String>,
@@ -1413,6 +1417,7 @@ async fn start_swim_from_env(
     placement: Arc<RwLock<Placement>>,
     shutdown: &tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = non_empty_env("MQTTD_SWIM_BIND") else {
         return Ok(());
@@ -1515,6 +1520,7 @@ async fn start_swim_from_env(
         peer_tls.cloned(),
         Some(placement),
         Some(metrics),
+        plane,
     ));
     Ok(())
 }

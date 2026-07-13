@@ -235,6 +235,7 @@ impl NodeHandles {
             self.hub_tx.clone(),
             tls,
             None,
+            None,
         ));
     }
 
@@ -245,6 +246,7 @@ impl NodeHandles {
             self.node_id.clone(),
             self.hub_tx.clone(),
             tls,
+            None,
         ));
     }
 }

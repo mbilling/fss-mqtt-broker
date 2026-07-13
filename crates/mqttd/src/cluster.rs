@@ -42,6 +42,7 @@ pub async fn maintain_peer_links(
     tls: Option<peer::PeerTls>,
     placement: Option<Arc<RwLock<Placement>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 ) {
     // Active dialer per peer we own the link to.
     let mut dialers: HashMap<NodeId, JoinHandle<()>> = HashMap::new();
@@ -82,6 +83,7 @@ pub async fn maintain_peer_links(
                     local.clone(),
                     hub.clone(),
                     tls.clone(),
+                    plane.clone(),
                 ));
                 dialers.insert(ev.id.clone(), handle);
             }
@@ -159,6 +161,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         (ev_tx, hub_rx)
     }
@@ -178,6 +181,7 @@ mod tests {
             None,
             None,
             Some(metrics.clone()),
+            None,
         ));
 
         // Two alive peers + self = 3 alive; then one goes suspect, then dead.

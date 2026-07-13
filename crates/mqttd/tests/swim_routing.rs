@@ -78,6 +78,7 @@ async fn start_node(
         hub_tx.clone(),
         None,
         None,
+        None,
     ));
 
     // SWIM membership driving the peer mesh. No static dialing anywhere.
@@ -111,6 +112,7 @@ async fn start_node(
         hub_tx,
         None,
         Some(placement.clone()),
+        None,
         None,
     ));
 
@@ -330,6 +332,7 @@ async fn start_proxy_node(
         hub_tx.clone(),
         None,
         Some(policy.clone()),
+        None,
     ));
 
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -360,6 +363,7 @@ async fn start_proxy_node(
         hub_tx,
         None,
         Some(placement.clone()),
+        None,
         None,
     ));
 

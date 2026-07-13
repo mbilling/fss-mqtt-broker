@@ -46,11 +46,13 @@ async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
         tx_a.clone(),
         None,
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::serve_listener(
         peer_b,
         id_b.clone(),
         tx_b.clone(),
+        None,
         None,
         None,
     ));
@@ -61,11 +63,13 @@ async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
         id_a,
         tx_a,
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_a.to_string(),
         id_b,
         tx_b,
+        None,
         None,
     ));
 
@@ -369,6 +373,7 @@ async fn build_durable_retained_node(
         tx.clone(),
         None,
         None,
+        None,
     ));
     (id, client_addr, peer_addr, tx, placement)
 }
@@ -426,11 +431,13 @@ async fn retained_mqtt5_properties_replay_from_any_nodes_cache() {
                 id_a.clone(),
                 tx_a.clone(),
                 None,
+                None,
             )),
             tokio::spawn(mqttd::peer::dial_forever(
                 peer_a.to_string(),
                 id_b.clone(),
                 tx_b.clone(),
+                None,
                 None,
             )),
         ]
@@ -558,11 +565,13 @@ async fn divergent_retained_writes_across_a_partition_converge_after_heal() {
                 id_a.clone(),
                 tx_a.clone(),
                 None,
+                None,
             )),
             tokio::spawn(mqttd::peer::dial_forever(
                 peer_a.to_string(),
                 id_b.clone(),
                 tx_b.clone(),
+                None,
                 None,
             )),
         ]
@@ -669,6 +678,7 @@ async fn an_incompatible_peer_protocol_range_is_rejected_at_hello() {
         peer,
         NodeId("proto-a".into()),
         tx,
+        None,
         None,
         None,
     ));

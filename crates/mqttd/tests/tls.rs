@@ -407,6 +407,7 @@ async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
         tx_a.clone(),
         Some(tls_a.clone()),
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::serve_listener(
         peer_b,
@@ -414,18 +415,21 @@ async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
         tx_b.clone(),
         Some(tls_b.clone()),
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_b.to_string(),
         id_a,
         tx_a,
         Some(tls_a),
+        None,
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_a.to_string(),
         id_b,
         tx_b,
         Some(tls_b),
+        None,
     ));
 
     (caddr_a, caddr_b, paddr_b)

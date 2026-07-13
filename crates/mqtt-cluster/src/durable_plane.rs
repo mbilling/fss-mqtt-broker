@@ -183,15 +183,23 @@ impl DurablePlane {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 // If the writer is gone (shutdown) or never answers, the op is not durable
                 // → do not ack acceptance.
+                let started = std::time::Instant::now();
                 let accepted = if self.replica_tx.send((epoch, op, reply_tx)).is_ok() {
                     reply_rx.await.unwrap_or(false)
                 } else {
                     false
                 };
+                tracing::debug!(
+                    req_id,
+                    accepted,
+                    wait_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "replicate op served"
+                );
                 Some(PeerMessage::ReplicateAck { req_id, accepted })
             }
             // Replication ack → wake the waiting append.
             PeerMessage::ReplicateAck { req_id, accepted } => {
+                tracing::debug!(req_id, accepted, "replication ack received");
                 self.transport.complete_ack(req_id, accepted);
                 None
             }
@@ -227,6 +235,18 @@ impl DurablePlane {
                 entries,
             } => {
                 self.transport.complete_read(req_id, watermark, entries);
+                None
+            }
+            // Key discovery (ADR 0042 T9, exhibit ⑥): answer with every key our
+            // local replica store holds — the takeover scan unions these across
+            // the mesh, since quorum appends mean no single node holds them all.
+            PeerMessage::ReplicaKeys { req_id } => {
+                let keys = self.lock_replicas().keys();
+                Some(PeerMessage::ReplicaKeysReply { req_id, keys })
+            }
+            // Key-discovery reply → wake the waiting scan.
+            PeerMessage::ReplicaKeysReply { req_id, keys } => {
+                self.transport.complete_keys(req_id, keys);
                 None
             }
             // Not a durable-plane frame (Hello / Interest / Publish / ProxyHello):

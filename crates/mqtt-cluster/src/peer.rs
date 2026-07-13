@@ -37,7 +37,7 @@ pub const PROTO_MIN: u32 = 2;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 2;
+pub const PROTO_MAX: u32 = 3;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -376,6 +376,62 @@ pub enum PeerMessage {
         /// `Some((epoch, offset))` = committed with this token; `None` = not the
         /// owner (re-route).
         token: Option<(u64, u64)>,
+    },
+    /// An **acknowledged** cross-node publish forward (ADR 0042 T9, exhibit ⑤;
+    /// proto 3). Semantically a [`Publish`](PeerMessage::Publish), but the sender
+    /// holds the publisher's `QoS` 1 acknowledgement until the receiver answers
+    /// with [`PublishAck`](PeerMessage::PublishAck) — sent only once the
+    /// receiver's local fan-out, **including any durable offline enqueue**, has
+    /// completed. Unanswered forwards are retransmitted (same `seq`); the
+    /// receiver does not dedup — a duplicate delivery is legal at `QoS` 1
+    /// (at-least-once), so retransmission needs no receiver state.
+    PublishAcked {
+        /// Per-sender monotonic forward sequence (correlates the ack).
+        seq: u64,
+        /// Destination topic (no wildcards).
+        topic: String,
+        /// Application payload.
+        payload: Vec<u8>,
+        /// Publish `QoS` as its 2-bit wire value (the receiver re-applies its
+        /// own per-subscriber downgrade).
+        qos: u8,
+        /// Whether the message was published with the retain flag (the receiver
+        /// applies its ADR 0014/0037 retained rules exactly as for `Publish`).
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds), if any.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties.
+        app: WireAppProps,
+    },
+    /// The durability-gated answer to a
+    /// [`PublishAcked`](PeerMessage::PublishAcked) (ADR 0042 T9; proto 3). `ok`
+    /// is `true` once the receiver's local fan-out and durable enqueues
+    /// completed; `false` reports a terminal durable-append failure — the sender
+    /// withholds the publisher's acknowledgement (the publisher retries).
+    PublishAck {
+        /// The `seq` of the [`PublishAcked`](PeerMessage::PublishAcked) answered.
+        seq: u64,
+        /// Whether the receiver durably owns the forwarded copy.
+        ok: bool,
+    },
+    /// A request for every replicated log key the receiver holds locally
+    /// (ADR 0042 T9, exhibit ⑥; proto 3). A new owner enumerating a group's
+    /// sessions cannot rely on its own replica copies alone — quorum appends
+    /// mean any single node may lack a key — so the takeover scan unions the
+    /// key sets of the whole replica mesh before quorum-recovering each key.
+    /// Key NAMES only; values still travel via
+    /// [`ReplicaRead`](PeerMessage::ReplicaRead) quorum recovery.
+    ReplicaKeys {
+        /// Correlates this request with its reply on the same link.
+        req_id: u64,
+    },
+    /// The reply to a [`ReplicaKeys`](PeerMessage::ReplicaKeys): the keys the
+    /// replica holds locally.
+    ReplicaKeysReply {
+        /// The `req_id` of the [`ReplicaKeys`](PeerMessage::ReplicaKeys) answered.
+        req_id: u64,
+        /// Every replicated log key in the sender's local replica store.
+        keys: Vec<String>,
     },
 }
 

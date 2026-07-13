@@ -49,7 +49,7 @@
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
-| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [6/9 done](0042-durable-plane-stress-harness.md) | 3 open |
+| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [7/9 done](0042-durable-plane-stress-harness.md) | 2 open |
 
 ## Open and deferred work
 
@@ -117,4 +117,3 @@
 
 - `0042-T4` ⬜ planned: Crash/restart/disk faults — process kill with surviving data dir, full-cluster stop/start recovery, disk-full and write-error injection (FlakyStore promoted to a shared fixture), brownout entry/exit mid-workload
 - `0042-T5` ⬜ planned: Profiles + exhibits + closure — bounded CI profile on every push, env-tunable soak profile, exhibit ledger opened with the takeover flake (reproduced-and-fixed or explained), TEST-PLAN/docs updated, ADR acceptance
-- `0042-T9` ⬜ planned: "Fix exhibits ⑤–⑧: acked means durable, cluster-wide — gate the cross-node QoS 1 forward on the owner's enqueue ack (⑤); materialize inherited sessions at takeover so pre-reattach publishes enqueue (⑥); gate the retained PUBACK on the authority commit via the existing done channel (⑦); give the retained queue drain and digest back-fill a periodic liveness tick beyond link-event triggers (⑧); the stress harness's exhibit counters go to zero and its waiver classifications are removed"

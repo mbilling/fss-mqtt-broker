@@ -76,6 +76,14 @@ struct Inner {
     pending: HashMap<u64, Pending>,
     /// In-flight recovery-reads (workstream F), keyed by `req_id`.
     pending_reads: HashMap<u64, PendingRead>,
+    /// In-flight key-discovery requests (ADR 0042 T9, exhibit ⑥), keyed by `req_id`.
+    pending_keys: HashMap<u64, PendingKeys>,
+}
+
+#[derive(Debug)]
+struct PendingKeys {
+    node: NodeId,
+    reply: oneshot::Sender<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -151,6 +159,15 @@ impl PeerReplicaTransport {
         for id in failed_reads {
             inner.pending_reads.remove(&id);
         }
+        let failed_keys: Vec<u64> = inner
+            .pending_keys
+            .iter()
+            .filter(|(_, p)| p.node == *node)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in failed_keys {
+            inner.pending_keys.remove(&id);
+        }
     }
 
     /// Resolve a pending request with the replica's verdict.
@@ -170,6 +187,43 @@ impl PeerReplicaTransport {
         if let Some(p) = self.lock().pending_reads.remove(&req_id) {
             let _ = p.reply.send((watermark, entries));
         }
+    }
+
+    /// Resolve a pending key-discovery request with the replica's local key set.
+    ///
+    /// Called by the link handler when a [`PeerMessage::ReplicaKeysReply`] arrives.
+    pub fn complete_keys(&self, req_id: u64, keys: Vec<String>) {
+        if let Some(p) = self.lock().pending_keys.remove(&req_id) {
+            let _ = p.reply.send(keys);
+        }
+    }
+
+    /// Ask one connected replica for its local key set (ADR 0042 T9, exhibit ⑥).
+    async fn keys_of(&self, replica: &NodeId) -> Option<Vec<String>> {
+        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut inner = self.lock();
+            let Some(tx) = inner.followers.get(replica).cloned() else {
+                return None; // replica not connected
+            };
+            inner.pending_keys.insert(
+                req_id,
+                PendingKeys {
+                    node: replica.clone(),
+                    reply: reply_tx,
+                },
+            );
+            if tx.send(PeerMessage::ReplicaKeys { req_id }).is_err() {
+                inner.pending_keys.remove(&req_id);
+                return None;
+            }
+        }
+        let Ok(res) = tokio::time::timeout(self.rpc_timeout, reply_rx).await else {
+            self.lock().pending_keys.remove(&req_id);
+            return None;
+        };
+        res.ok()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -194,6 +248,7 @@ impl ReplicaTransport for PeerReplicaTransport {
             let mut inner = self.lock();
             // Clone the sender so we hold no borrow of `inner` across the insert.
             let Some(tx) = inner.followers.get(replica).cloned() else {
+                tracing::debug!(replica = %replica.0, "replicate: follower not registered");
                 return false; // replica not connected → no ack toward quorum
             };
             // Register the pending request before sending, so a concurrent
@@ -217,6 +272,7 @@ impl ReplicaTransport for PeerReplicaTransport {
         // still-connected replica is bounded by the RPC timeout, after which the
         // pending entry is reaped and the append counts no ack toward quorum.
         let Ok(res) = tokio::time::timeout(self.rpc_timeout, ack_rx).await else {
+            tracing::debug!(replica = %replica.0, req_id, "replicate: ack timed out");
             self.lock().pending.remove(&req_id);
             return false;
         };
@@ -269,6 +325,24 @@ impl ReplicaTransport for PeerReplicaTransport {
                 })
                 .collect(),
         })
+    }
+
+    async fn list_remote_keys(&self) -> Vec<String> {
+        // Ask every connected replica for its key set and union the answers
+        // (ADR 0042 T9, exhibit ⑥). Best-effort: an unreachable replica
+        // contributes nothing. Sequential is fine — this runs on the off-loop
+        // takeover scan, the mesh is small, and each ask is bounded by the RPC
+        // timeout.
+        let replicas: Vec<NodeId> = self.lock().followers.keys().cloned().collect();
+        let mut keys: Vec<String> = Vec::new();
+        for replica in replicas {
+            if let Some(mut k) = self.keys_of(&replica).await {
+                keys.append(&mut k);
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 }
 

@@ -14,6 +14,7 @@
 use crate::conn::ConnPolicy;
 use crate::hub::{HubCommand, PeerOutbound};
 use bytes::BytesMut;
+use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{self, PeerMessage};
 use mqtt_cluster::NodeId;
 use mqtt_net::tls;
@@ -150,6 +151,7 @@ pub async fn serve_listener(
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<PeerTls>,
     client_policy: Option<Arc<ConnPolicy>>,
+    plane: Option<DurablePlane>,
 ) {
     loop {
         match listener.accept().await {
@@ -158,6 +160,7 @@ pub async fn serve_listener(
                 let hub = hub.clone();
                 let tls = tls.clone();
                 let policy = client_policy.clone();
+                let plane = plane.clone();
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
                     // Read the CURRENT acceptor per accept (ADR 0040 T4): a reload's
@@ -172,14 +175,15 @@ pub async fn serve_listener(
                                     return; // revoked: fail closed (ADR 0040 T4)
                                 };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
-                                handle(s, local, hub, false, expected_cn, serial, policy).await
+                                handle(s, local, hub, false, expected_cn, serial, policy, plane)
+                                    .await
                             }
                             Err(e) => {
                                 debug!(error = %e, "peer mTLS handshake failed; link rejected");
                                 return;
                             }
                         },
-                        _ => handle(stream, local, hub, false, None, None, policy).await,
+                        _ => handle(stream, local, hub, false, None, None, policy, plane).await,
                     };
                     if let Err(e) = result {
                         debug!(error = %e, "inbound peer link ended");
@@ -208,6 +212,7 @@ pub async fn dial_forever(
     local: NodeId,
     hub: mpsc::UnboundedSender<HubCommand>,
     tls: Option<PeerTls>,
+    plane: Option<DurablePlane>,
 ) {
     // An undialable name is permanent; retrying would only spin.
     let server_name = match tls.as_ref().map(|_| tls::server_name(&addr)).transpose() {
@@ -244,6 +249,7 @@ pub async fn dial_forever(
                                     expected_cn,
                                     serial,
                                     None,
+                                    plane.clone(),
                                 )
                                 .await
                             }
@@ -254,7 +260,19 @@ pub async fn dial_forever(
                             }
                         }
                     }
-                    _ => handle(stream, local.clone(), hub.clone(), true, None, None, None).await,
+                    _ => {
+                        handle(
+                            stream,
+                            local.clone(),
+                            hub.clone(),
+                            true,
+                            None,
+                            None,
+                            None,
+                            plane.clone(),
+                        )
+                        .await
+                    }
                 };
                 match outcome {
                     Ok(LinkOutcome::Redundant) => {
@@ -312,6 +330,7 @@ fn proto_compatible(node_id: &str, proto_min: u32, proto_max: u32) -> bool {
 // The handshake/dedup ladder is one linear flow; splitting it would scatter the
 // link-rejection cases.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn handle<S>(
     stream: S,
     local: NodeId,
@@ -320,6 +339,7 @@ async fn handle<S>(
     expected_cn: Option<String>,
     cert_serial: Option<Vec<u8>>,
     client_policy: Option<Arc<ConnPolicy>>,
+    plane: Option<DurablePlane>,
 ) -> Result<LinkOutcome, std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -330,7 +350,7 @@ where
     // The dialer announces itself first; the accept side reads first so it can
     // detect a session-proxy connection (ADR 0005) before announcing itself —
     // a proxied client expects raw MQTT back, not our peer Hello.
-    let remote = if initiated {
+    let (remote, proto) = if initiated {
         write_frame(
             &mut wh,
             &PeerMessage::Hello {
@@ -349,7 +369,12 @@ where
                 if !proto_compatible(&node_id, proto_min, proto_max) {
                     return Ok(LinkOutcome::Closed);
                 }
-                NodeId(node_id)
+                let proto = peer::negotiate_proto(
+                    (peer::PROTO_MIN, peer::PROTO_MAX),
+                    (proto_min, proto_max),
+                )
+                .unwrap_or(peer::PROTO_MIN);
+                (NodeId(node_id), proto)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -394,7 +419,12 @@ where
                     },
                 )
                 .await?;
-                NodeId(node_id)
+                let proto = peer::negotiate_proto(
+                    (peer::PROTO_MIN, peer::PROTO_MAX),
+                    (proto_min, proto_max),
+                )
+                .unwrap_or(peer::PROTO_MIN);
+                (NodeId(node_id), proto)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -439,13 +469,23 @@ where
             conn_id,
             tx: out_tx,
             cert_serial,
+            proto,
         })
         .is_err()
     {
         return Ok(LinkOutcome::Closed);
     }
 
-    let result = pump(&mut rh, &mut wh, &mut buf, &hub, &remote, &mut out_rx).await;
+    let result = pump(
+        &mut rh,
+        &mut wh,
+        &mut buf,
+        &hub,
+        &remote,
+        &mut out_rx,
+        plane.as_ref(),
+    )
+    .await;
     let _ = hub.send(HubCommand::PeerDisconnected {
         node: remote,
         conn_id,
@@ -460,6 +500,7 @@ async fn pump<R, W>(
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
     out_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
+    plane: Option<&DurablePlane>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -470,7 +511,7 @@ where
             inbound = read_frame(rh, buf) => {
                 match inbound? {
                     None => return Ok(()), // peer closed
-                    Some(msg) => forward_inbound(msg, hub, remote),
+                    Some(msg) => forward_inbound(msg, hub, remote, plane),
                 }
             }
             maybe_out = out_rx.recv() => {
@@ -496,8 +537,32 @@ where
 /// Translate an inbound peer message into a hub command.
 // One arm per wire variant — a flat dispatch table, not a refactor smell.
 #[allow(clippy::too_many_lines)]
-fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, remote: &NodeId) {
+fn forward_inbound(
+    msg: PeerMessage,
+    hub: &mpsc::UnboundedSender<HubCommand>,
+    remote: &NodeId,
+    plane: Option<&DurablePlane>,
+) {
     match msg {
+        // Durable-plane REPLIES resolve a pending wait inside the plane and never
+        // touch hub state — route them DIRECTLY, bypassing the hub command queue
+        // (ADR 0042 T9, exhibit ⑩). Through the queue they deadlock-by-queue: an
+        // on-loop durable append awaits exactly these acks, which would sit queued
+        // behind the very dispatch that is waiting — every such append then fails
+        // at the RPC timeout ("no replication quorum" on a healthy cluster).
+        frame @ (PeerMessage::ReplicateAck { .. }
+        | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaKeysReply { .. }
+        | PeerMessage::RaftRpcReply { .. })
+            if plane.is_some() =>
+        {
+            if let Some(plane) = plane {
+                let plane = plane.clone();
+                tokio::spawn(async move {
+                    let _ = plane.handle(frame).await;
+                });
+            }
+        }
         PeerMessage::Interest { filters } => {
             let _ = hub.send(HubCommand::RemoteInterest {
                 node: remote.clone(),
@@ -519,6 +584,33 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
                 retain,
                 message_expiry,
                 app: crate::hub::app_from_wire(app),
+            });
+        }
+        PeerMessage::PublishAcked {
+            seq,
+            topic,
+            payload,
+            qos,
+            retain,
+            message_expiry,
+            app,
+        } => {
+            let _ = hub.send(HubCommand::RemotePublishAcked {
+                node: remote.clone(),
+                seq,
+                topic,
+                payload: payload.into(),
+                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                retain,
+                message_expiry,
+                app: crate::hub::app_from_wire(app),
+            });
+        }
+        PeerMessage::PublishAck { seq, ok } => {
+            let _ = hub.send(HubCommand::RemotePublishAck {
+                node: remote.clone(),
+                seq,
+                ok,
             });
         }
         PeerMessage::SharedInterest { groups } => {
@@ -639,7 +731,9 @@ fn forward_inbound(msg: PeerMessage, hub: &mpsc::UnboundedSender<HubCommand>, re
         | PeerMessage::RaftRpc { .. }
         | PeerMessage::RaftRpcReply { .. }
         | PeerMessage::ReplicaRead { .. }
-        | PeerMessage::ReplicaReadReply { .. }) => {
+        | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaKeys { .. }
+        | PeerMessage::ReplicaKeysReply { .. }) => {
             // Durable-plane frames (ADR 0006/0007): consensus RPCs and session-log
             // replication. Routed to the hub, which dispatches them to the
             // `DurablePlane` (a no-op until durable sessions are enabled, step 4f).

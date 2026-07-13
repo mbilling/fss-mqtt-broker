@@ -559,6 +559,15 @@ pub trait ReplicaTransport: Send + Sync {
     async fn read_replica(&self, _replica: &NodeId, _key: &str) -> Option<ReplicaRead> {
         None
     }
+
+    /// The union of replicated log keys held by every reachable replica
+    /// (ADR 0042 T9, exhibit ⑥): a takeover scan's key discovery. Best-effort —
+    /// an unreachable replica contributes nothing (its keys are recovered later
+    /// via the per-key quorum read wherever a reachable copy exists). The
+    /// default supports no key discovery (single-node transports).
+    async fn list_remote_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Forward through an [`Arc`](std::sync::Arc) so a test can hold the transport to
@@ -571,6 +580,10 @@ impl<T: ReplicaTransport + ?Sized> ReplicaTransport for std::sync::Arc<T> {
 
     async fn read_replica(&self, replica: &NodeId, key: &str) -> Option<ReplicaRead> {
         (**self).read_replica(replica, key).await
+    }
+
+    async fn list_remote_keys(&self) -> Vec<String> {
+        (**self).list_remote_keys().await
     }
 }
 

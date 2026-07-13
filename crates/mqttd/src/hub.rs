@@ -262,6 +262,10 @@ struct Online {
     will: Option<Message>,
     /// The revocable facts this connection was admitted under (ADR 0040 T1).
     admission: Admission,
+    /// When this connection attached: a takeover-window re-delivery
+    /// (ADR 0042 T9) skips clients attached BEFORE the publish first fanned
+    /// out — they already received it live; re-sending would duplicate.
+    attached_at: Instant,
 }
 
 /// Downstream acknowledgement state of an unacked `QoS` > 0 message.
@@ -572,6 +576,9 @@ pub enum HubCommand {
         /// The remote leaf certificate's serial from the mTLS handshake
         /// (ADR 0040 T4); `None` on a plaintext mesh.
         cert_serial: Option<Vec<u8>>,
+        /// The peer-bus protocol version negotiated on the link (ADR 0038): the
+        /// hub sends a frame introduced in proto N only when `proto >= N`.
+        proto: u32,
     },
     /// A peer node's link went down.
     PeerDisconnected {
@@ -687,6 +694,9 @@ pub enum HubCommand {
         /// Set when a peer routed this mutation here (T8): the `(node, seq)` to send
         /// the commit-gated ack back to on success.
         reply: Option<(NodeId, u64)>,
+        /// The pending publish gated on this commit (ADR 0042 T9, exhibit ⑦), if
+        /// the mutation originated from a gated local publish.
+        publish: Option<u64>,
     },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
@@ -722,6 +732,42 @@ pub enum HubCommand {
         /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
         app: AppProperties,
     },
+    /// An **acknowledged** publish forward from a peer (ADR 0042 T9, exhibit ⑤;
+    /// proto 3): local delivery only (never re-forwarded), answered with a
+    /// durability-gated [`PeerMessage::PublishAck`] once the local fan-out —
+    /// including any durable offline enqueue — has completed. Duplicates
+    /// (retransmissions) are delivered again: legal at `QoS` 1.
+    RemotePublishAcked {
+        /// The peer the forward arrived from (where the ack is sent).
+        node: NodeId,
+        /// The sender's forward sequence (correlates the ack).
+        seq: u64,
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Bytes,
+        /// The original publish `QoS` (local downgrade still applies).
+        qos: QoS,
+        /// Whether the publish carried the retain flag (same rules as
+        /// [`RemotePublish`](Self::RemotePublish)).
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds). `None` = no expiry.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
+    },
+    /// A peer's durability-gated answer to a forwarded publish (ADR 0042 T9,
+    /// exhibit ⑤): resolves the matching obligation on the pending publish that
+    /// forwarded it, releasing the publisher's acknowledgement when it was the
+    /// last one outstanding.
+    RemotePublishAck {
+        /// The peer that answered.
+        node: NodeId,
+        /// The forward sequence being answered.
+        seq: u64,
+        /// Whether the peer's local fan-out (durable appends included) succeeded.
+        ok: bool,
+    },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
         /// Destination topic.
@@ -749,6 +795,15 @@ pub enum HubCommand {
         /// The durable-plane frame to route.
         frame: PeerMessage,
     },
+    /// **Internal**: the off-loop inherited-session scan finished (ADR 0042 T9,
+    /// exhibit ⑥) — every session the durable store holds, with subscriptions and
+    /// expiry deadline. The loop materializes the OWNED, not-yet-known ones into
+    /// the routing table so a publish arriving before the client's first re-attach
+    /// enqueues instead of routing to nothing.
+    InheritedSessions {
+        /// `(client, subscriptions, expiry deadline)` per stored session.
+        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    },
     /// Liveness probe (the health endpoint): the hub replies as soon as the actor
     /// loop dequeues this command, proving the loop is draining and not wedged.
     Ping {
@@ -766,6 +821,8 @@ struct Peer {
     /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
     /// (ADR 0040 T4). `None` on a plaintext mesh.
     cert_serial: Option<Vec<u8>>,
+    /// The peer-bus protocol version negotiated on the link (ADR 0038).
+    proto: u32,
 }
 
 /// The smaller of two `QoS` levels (delivery downgrade rule [MQTT-3.8.4-6]).
@@ -871,6 +928,24 @@ pub struct Hub {
     /// Owner side (T8): the handoff currently queued/committing per routing peer, so
     /// a retransmission that overtakes the commit is not enqueued twice.
     retained_handoff_pending: HashMap<NodeId, u64>,
+    /// Publishes whose `QoS` 1 acknowledgement awaits cluster-wide durability
+    /// (ADR 0042 T9): keyed by a monotonic id, ordered so the cap drops the
+    /// oldest. Entries resolve via forward acks, the retained commit, and the
+    /// local fan-out; the sweep tick retransmits and re-routes.
+    pending_publishes: BTreeMap<u64, PendingPublish>,
+    /// Monotonic pending-publish id source.
+    publish_ids: u64,
+    /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤).
+    forward_seq: u64,
+    /// Forward seq → pending publish id, for ack resolution.
+    forward_index: HashMap<u64, u64>,
+    /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
+    /// exhibit ⑥) — one at a time.
+    inherited_scan_inflight: bool,
+    /// Sweep ticks remaining of eager takeover reconciliation: set on `PeerDead`
+    /// so inherited sessions materialize within seconds, not on the slow
+    /// [`EXPIRY_RECONCILE_EVERY`] cadence.
+    takeover_reconcile_ticks: u8,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -940,6 +1015,67 @@ struct RetainedMutation {
     /// Set when a peer routed this mutation here (T8): the `(node, seq)` its
     /// commit-gated ack goes back to.
     reply: Option<(NodeId, u64)>,
+    /// The pending publish whose acknowledgement is gated on this mutation's
+    /// authority commit (ADR 0042 T9, exhibit ⑦). Survives re-queues and rides
+    /// the handoff hold, so the gate holds however long the commit takes.
+    publish: Option<u64>,
+}
+
+/// The bound on publishes whose acknowledgement awaits cluster-wide durability
+/// (ADR 0042 T9). Publisher inflight windows (`receive_maximum`) bound this
+/// naturally; the cap is a backstop against a partition outlasting every window.
+/// At the cap the **oldest** pending publish is dropped loudly — its ack is
+/// withheld, so the publisher retries (never an ack for an unowned message).
+const PENDING_PUBLISH_CAP: usize = 4096;
+
+/// Sweep ticks a pending publish waits after its forward target **died** with no
+/// current remote interest in the topic, before concluding the interest genuinely
+/// ended (session gone) rather than being mid-takeover: the dead owner's successor
+/// materializes inherited sessions and re-advertises their filters (exhibit ⑥ fix)
+/// within this window in any live cluster. Sized to outlast SWIM confirmation plus
+/// the successor's inherited-session scan; the cost of the margin is only a slower
+/// (withheld) ack for a publish whose subscriber genuinely no longer exists.
+const REROUTE_GRACE_TICKS: u8 = 8;
+
+// The bools are independent obligations, not an encodable state machine.
+#[allow(clippy::struct_excessive_bools)]
+/// A `QoS` 1 publish whose acknowledgement is gated on **cluster-wide** durability
+/// (ADR 0042 T9): the local fan-out's durable appends (synchronous), the retained
+/// authority commit (exhibit ⑦), and one durability-gated ack per acked peer
+/// forward (exhibit ⑤). The ack releases only when every obligation resolves;
+/// a terminal failure drops the entry, withholding the ack (the publisher retries).
+#[derive(Debug)]
+struct PendingPublish {
+    /// Releases the publisher's acknowledgement (dropped = withheld).
+    done: oneshot::Sender<PublishOutcome>,
+    /// The forwarded frame, kept for retransmission and takeover re-routing.
+    topic: String,
+    payload: Bytes,
+    qos: QoS,
+    retain: bool,
+    message_expiry: Option<u32>,
+    app: AppProperties,
+    /// Outstanding forward acks: forward seq → target node.
+    awaiting: HashMap<u64, NodeId>,
+    /// Peers whose durability ack already arrived — a takeover re-route never
+    /// re-obligates them.
+    acked_nodes: HashSet<NodeId>,
+    /// Whether the retained authority commit is still outstanding (exhibit ⑦).
+    awaiting_retained: bool,
+    /// Set once the on-loop local fan-out (durable appends included) completed OK.
+    local_done: bool,
+    /// When the publish first fanned out — the cutoff for re-delivery (only
+    /// clients attached or materialized AFTER this can have missed it).
+    created_at: Instant,
+    /// Engaged when a forward target died: counts down sweep ticks with no
+    /// re-routable remote interest before the obligation is considered moot
+    /// (see [`REROUTE_GRACE_TICKS`]).
+    reroute_grace: Option<u8>,
+    /// Set when the publish arrived during a takeover window (an inherited-session
+    /// scan pending or running): the ack waits until the scan lands, then the
+    /// publish re-delivers locally against the just-materialized subscriptions
+    /// (exhibit ⑥'s ack-into-the-void window; duplicates are legal at `QoS` 1).
+    awaiting_settle: bool,
 }
 
 /// The order-independent digest of a retained set (0014-T6 + ADR 0037 P1): the topic
@@ -1074,6 +1210,17 @@ impl Hub {
                 retained_handoff_seq: 0,
                 retained_handoff_seen: HashMap::new(),
                 retained_handoff_pending: HashMap::new(),
+                pending_publishes: BTreeMap::new(),
+                publish_ids: 0,
+                forward_seq: 0,
+                forward_index: HashMap::new(),
+                inherited_scan_inflight: false,
+                // A boot window (like the post-PeerDead takeover window): a
+                // restarted or newly-joined node may already own groups with
+                // orphaned sessions, and eagerly recovering them BEFORE workload
+                // arrives keeps the first-touch epoch bumps (which transiently
+                // break quorum for concurrent appends) out of the hot path.
+                takeover_reconcile_ticks: 8,
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -1124,6 +1271,10 @@ impl Hub {
     pub async fn run(mut self) {
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The boot window's FIRST inherited-session scan runs immediately, not a
+        // sweep tick later: on a fresh or restarted node it completes in
+        // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
+        self.spawn_inherited_session_scan();
         loop {
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
@@ -1139,6 +1290,9 @@ impl Hub {
                     // or quorum returning on links that never dropped. No-ops when idle.
                     self.retry_retained_handoff();
                     self.kick_retained_queue();
+                    // Retransmit / re-route acked publish forwards (ADR 0042 T9,
+                    // exhibit ⑤); no-op when none are pending.
+                    self.sweep_pending_forwards().await;
                 }
             }
         }
@@ -1234,23 +1388,33 @@ impl Hub {
                           "retained quota exceeded; delivered live, NOT retained (v3.1.1, ADR 0041)");
                     retain = false;
                 }
+                // A gated publish registers a pending entry FIRST (ADR 0042 T9), so
+                // the fan-out can attach its cluster-wide obligations: acked peer
+                // forwards (exhibit ⑤) and the retained authority commit (exhibit ⑦).
+                let gate = done.map(|done| {
+                    self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
+                });
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
                 let durable_ok = self
-                    .publish(&topic, &payload, qos, retain, message_expiry, &app)
+                    .publish(&topic, &payload, qos, retain, message_expiry, &app, gate)
                     .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
                 }
-                // The fan-out (and its durable appends) is complete: release any
-                // acknowledgement gated on it (ADR 0018). A failed durable append
-                // WITHHOLDS the ack instead (drop the sender): the publisher's
-                // connection closes unacked and it retries — fail closed, never
-                // an ack for a message a subscriber will never see (ADR 0041 T5).
-                if let Some(done) = done {
+                // The LOCAL fan-out (and its durable appends) is complete: resolve
+                // that obligation — the ack releases once every cluster-wide
+                // obligation has (ADR 0018 + ADR 0042 T9; the local-only publish
+                // completes right here). A failed durable append WITHHOLDS the ack
+                // instead (drop the entry): the publisher's connection closes
+                // unacked and it retries — fail closed, never an ack for a message
+                // a subscriber will never see (ADR 0041 T5).
+                if let Some(id) = gate {
                     if durable_ok {
-                        let _ = done.send(PublishOutcome::Accepted);
+                        self.pending_local_done(id);
+                    } else {
+                        self.drop_pending(id);
                     }
                 }
             }
@@ -1297,6 +1461,31 @@ impl Hub {
     #[allow(clippy::too_many_lines)]
     async fn dispatch_cluster(&mut self, cmd: HubCommand) {
         match cmd {
+            HubCommand::RemotePublishAcked {
+                node,
+                seq,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => {
+                // An acked forward (ADR 0042 T9, exhibit ⑤): apply locally like
+                // RemotePublish, then answer with a durability-gated ack — sent only
+                // after the local fan-out, durable offline enqueues included. A
+                // retransmission is delivered again (duplicates are legal at QoS 1),
+                // so no receiver dedup state is needed.
+                let ok = self
+                    .deliver(&topic, &payload, qos, retain, message_expiry, &app)
+                    .await;
+                if let Some(peer) = self.peers.get(&node) {
+                    let _ = peer.tx.send(PeerMessage::PublishAck { seq, ok });
+                }
+            }
+            HubCommand::RemotePublishAck { node, seq, ok } => {
+                self.forward_acked(&node, seq, ok);
+            }
             HubCommand::RemotePublish {
                 topic,
                 payload,
@@ -1318,8 +1507,9 @@ impl Hub {
                 conn_id,
                 tx,
                 cert_serial,
+                proto,
             } => {
-                self.peer_connected(node.clone(), conn_id, tx, cert_serial);
+                self.peer_connected(node.clone(), conn_id, tx, cert_serial, proto);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -1334,9 +1524,16 @@ impl Hub {
             }
             HubCommand::PeerDead { node } => {
                 self.peer_dead(&node);
+                // The takeover window (ADR 0042 T9, exhibit ⑥): reconcile inherited
+                // sessions eagerly for the next several sweep ticks so their
+                // subscriptions materialize within seconds of the owner's death.
+                self.takeover_reconcile_ticks = 8;
             }
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
+            }
+            HubCommand::InheritedSessions { sessions } => {
+                self.inherit_sessions(sessions).await;
             }
             HubCommand::Ping { reply } => {
                 // Reached the loop → it is live. The receiver may be gone if the
@@ -1394,7 +1591,11 @@ impl Hub {
                 }
                 if token.is_some() {
                     // Committed by the owner (its fan-out warms the caches): the
-                    // mutation is finally done — drive the next one.
+                    // mutation is finally done — resolve the gated publish riding
+                    // it (ADR 0042 T9, exhibit ⑦) and drive the next one.
+                    if let Some(id) = mutation.publish {
+                        self.pending_retained_done(id);
+                    }
                     self.kick_retained_queue();
                 } else {
                     // NACK: the owner's lease moved. Re-queue at the front and wait
@@ -1411,9 +1612,15 @@ impl Hub {
                 app,
                 token,
                 reply,
+                publish,
             } => {
                 self.retained_commit_inflight = false;
                 if let Some((epoch, offset)) = token {
+                    // The authority commit landed: resolve the gated publish riding
+                    // this mutation (ADR 0042 T9, exhibit ⑦).
+                    if let Some(id) = publish {
+                        self.pending_retained_done(id);
+                    }
                     // Committed: warm the local cache, fan the tokened value out to
                     // every peer (ADR 0037 §3 — best-effort; a peer that misses it
                     // converges via the P5 back-fill on the next link-up), and drive
@@ -1455,6 +1662,7 @@ impl Hub {
                         qos,
                         app,
                         reply,
+                        publish,
                     });
                 }
             }
@@ -1494,6 +1702,7 @@ impl Hub {
     /// node stores it for its future subscribers — ADR 0014).
     /// Returns `false` when a durable offline enqueue failed — the dispatch then
     /// withholds the publisher's ack (ADR 0041 T5).
+    #[allow(clippy::too_many_arguments)]
     async fn publish(
         &mut self,
         topic: &str,
@@ -1502,6 +1711,7 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
+        gate: Option<u64>,
     ) -> bool {
         let durable_ok = self
             .deliver(topic, payload, qos, retain, message_expiry, app)
@@ -1510,14 +1720,15 @@ impl Hub {
         // node (ADR 0015), so this runs only for locally-originated publishes.
         self.deliver_shared(topic, payload, qos, message_expiry, app)
             .await;
-        self.forward_to_peers(topic, payload, qos, retain, message_expiry, app);
+        self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
         // route the retained mutation to its topic's group lease-owner for the
         // quorum-committed authority write. Only the **landing** node routes (a
         // forwarded publish enters via `RemotePublish` → `deliver`, never here), so one
-        // publish is exactly one authority commit.
+        // publish is exactly one authority commit. The gated publish's ack now waits
+        // for this commit too (ADR 0042 T9, exhibit ⑦).
         if retain {
-            self.route_retained_commit(topic, payload, qos_num(qos), app);
+            self.route_retained_commit(topic, payload, qos_num(qos), app, gate);
         }
         durable_ok
     }
@@ -1525,7 +1736,8 @@ impl Hub {
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
     /// will's own application properties (ADR 0030); a will never sets a message-expiry.
     async fn publish_will(&mut self, w: &Message) {
-        self.publish(&w.topic, &w.payload, w.qos, w.retain, None, &w.app)
+        // No publisher waits on a will, so nothing gates on its durability.
+        self.publish(&w.topic, &w.payload, w.qos, w.retain, None, &w.app, None)
             .await;
     }
 
@@ -1753,6 +1965,7 @@ impl Hub {
 
         // Reconcile the routing table with persisted subscriptions (idempotent; empty
         // for a clean start).
+        let recovered_any = !subscriptions.is_empty();
         for s in subscriptions {
             if let Some((group, filter)) = parse_shared(&s.filter) {
                 self.shared
@@ -1764,6 +1977,14 @@ impl Hub {
                 .entry(client.clone())
                 .or_default()
                 .insert(s.filter, s.max_qos);
+        }
+        // A resumed session registers filters WITHOUT a SUBSCRIBE, so peers must
+        // learn them here (ADR 0042 T9): after a takeover, this advertisement is
+        // what re-targets a peer's held acked forward to this node — the client
+        // re-attaching is one of the two ways an inherited session materializes
+        // (the other, the takeover scan, skips clients that are already attaching).
+        if recovered_any {
+            self.gossip_interest();
         }
         if !revoked_grants.is_empty() {
             warn!(
@@ -1817,6 +2038,7 @@ impl Hub {
                 tx: outbound.clone(),
                 will,
                 admission,
+                attached_at: Instant::now(),
             },
         );
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
@@ -1910,10 +2132,10 @@ impl Hub {
         reply: Option<oneshot::Sender<Vec<bool>>>,
     ) {
         // Subscription quota (ADR 0041 T3): count how many NEW filters the cap
-        // admits — an already-held filter replaces (never consumes quota) — and
-        // answer the connection BEFORE any retained replay, so its SUBACK
-        // precedes the replayed publishes on the wire.
-        let filters: Vec<(String, QoS)> = {
+        // admits — an already-held filter replaces (never consumes quota). The
+        // SUBACK itself is answered only after the durable persist below
+        // (ADR 0042 T9): granted must mean durably granted.
+        let filters: (Vec<(String, QoS)>, Vec<bool>) = {
             let held = self.subs_by_client.get(client);
             let mut admitted_new = 0;
             let verdicts: Vec<bool> = filters
@@ -1946,11 +2168,12 @@ impl Hub {
                 .zip(verdicts.iter())
                 .filter_map(|(fq, ok)| ok.then_some(fq))
                 .collect();
-            if let Some(tx) = reply {
-                let _ = tx.send(verdicts);
-            }
-            admitted
+            (admitted, verdicts)
         };
+        let (filters, verdicts) = filters;
+        // Snapshot for rollback: a failed durable persist must leave the routing
+        // state exactly as before, so the failure SUBACK tells the truth.
+        let prior = self.subs_by_client.get(client).cloned();
 
         // Retained messages are replayed only for ordinary subscriptions; a new
         // shared subscription does not receive them (ADR 0010 §3, [MQTT-3.8.4]).
@@ -1979,7 +2202,37 @@ impl Hub {
                 }
             }
         }
-        self.persist_subscriptions(client).await;
+        // The SUBACK is DURABILITY-GATED (ADR 0042 T9, exhibit ⑨): a persistent
+        // session's subscription is a promise about future messages, so granting
+        // it while the durable write failed builds every downstream durability
+        // guarantee on sand — the owner's enqueue, the takeover materialization,
+        // and the resume replay would all consult a durable record that says
+        // "no subscriptions". Fail closed: roll the routing state back and
+        // report failure codes; the client retries its SUBSCRIBE.
+        if !self.persist_subscriptions(client).await {
+            warn!(
+                client = %client.0,
+                "durable subscription write failed; SUBACK reports failure (fail closed, ADR 0042 T9)"
+            );
+            self.drop_subscriptions(client);
+            if let Some(prior) = prior {
+                for (f, q) in &prior {
+                    if let Some((group, filter)) = parse_shared(f) {
+                        self.shared.subscribe(client.clone(), group, filter, *q);
+                    } else {
+                        self.table.subscribe(client.clone(), f.clone());
+                    }
+                }
+                self.subs_by_client.insert(client.clone(), prior);
+            }
+            if let Some(tx) = reply {
+                let _ = tx.send(vec![false; verdicts.len()]);
+            }
+            return;
+        }
+        if let Some(tx) = reply {
+            let _ = tx.send(verdicts);
+        }
         self.gossip_interest();
 
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
@@ -2000,7 +2253,10 @@ impl Hub {
                 self.table.unsubscribe(client, f);
             }
         }
-        self.persist_subscriptions(client).await;
+        // An UNSUBACK has no failure codes (v3.1.1); a failed durable removal
+        // leaves the subscription durably present — the safe side (no loss,
+        // possible extra deliveries until a later persist succeeds).
+        let _ = self.persist_subscriptions(client).await;
         self.gossip_interest();
     }
 
@@ -2760,11 +3016,16 @@ impl Hub {
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
     /// (ADR 0009). Runs on the hub's periodic sweep tick.
     async fn sweep_expired_sessions(&mut self) {
-        // Periodically inherit persisted deadlines for owned sessions this node did not see
-        // disconnect — those handed to it by a takeover (ADR 0009 §3).
+        // Periodically inherit sessions this node did not see disconnect — those handed
+        // to it by a takeover: their persisted expiry deadlines (ADR 0009 §3) AND their
+        // routing subscriptions (ADR 0042 T9, exhibit ⑥). Eagerly for a few ticks after
+        // a peer death (the takeover window), else on the slow reconcile cadence.
         self.expiry_reconcile_tick = self.expiry_reconcile_tick.wrapping_add(1);
-        if self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0 {
-            self.reconcile_inherited_expiries().await;
+        if self.takeover_reconcile_ticks > 0 {
+            self.takeover_reconcile_ticks -= 1;
+            self.spawn_inherited_session_scan();
+        } else if self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0 {
+            self.spawn_inherited_session_scan();
         }
 
         let now = self.clock.now_epoch_secs();
@@ -2785,32 +3046,186 @@ impl Hub {
         self.gossip_interest();
     }
 
-    /// Pull persisted expiry deadlines from the durable store for sessions this node now
-    /// **owns** but is not already tracking — the orphaned, never-reconnected sessions a
-    /// takeover handed it. Without this, such a session would never expire on the new owner
-    /// (the clock effectively restarts); with it, the new owner expires it at the original
-    /// absolute deadline (ADR 0009 §3).
-    async fn reconcile_inherited_expiries(&mut self) {
-        let persisted = match self.store.expiring_sessions().await {
-            Ok(v) => v,
-            Err(e) => {
-                debug!(error = %e, "could not read persisted session expiries");
-                return;
-            }
-        };
-        for (client, deadline) in persisted {
-            // Skip ones we already handle (online here, or already scheduled), and ones we
-            // do not own (a replica we hold for another node — its owner expires it).
+    /// Start the off-loop inherited-session scan (ADR 0042 T9, exhibit ⑥): enumerate
+    /// every stored session with its subscriptions and expiry deadline, and post the
+    /// result back to the loop as [`HubCommand::InheritedSessions`]. Off-loop because
+    /// the enumeration reads through the durable store and may trigger first-touch
+    /// group recovery (quorum reads) — exactly the eager recovery a takeover wants,
+    /// but never on the actor loop. One scan at a time.
+    fn spawn_inherited_session_scan(&mut self) {
+        if self.inherited_scan_inflight {
+            return;
+        }
+        self.inherited_scan_inflight = true;
+        let store = self.store.clone();
+        let tx = self.self_tx.clone();
+        debug!("inherited-session scan started");
+        tokio::spawn(async move {
+            let sessions = match store.all_sessions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(error = %e, "inherited-session scan failed; retried next tick");
+                    Vec::new()
+                }
+            };
+            debug!(sessions = sessions.len(), "inherited-session scan finished");
+            let _ = tx.send(HubCommand::InheritedSessions { sessions });
+        });
+    }
+
+    /// Materialize sessions a takeover handed this node, before their clients
+    /// re-attach (ADR 0042 T9, exhibit ⑥): register each OWNED, not-yet-known
+    /// session's subscriptions into the routing table (so a publish arriving now
+    /// enqueues durably instead of routing to nothing), mark it persistent, and
+    /// schedule its inherited absolute expiry deadline (ADR 0009 §3 — without
+    /// which an orphaned session would never expire on the new owner). A later
+    /// real attach takes over cleanly: registration is idempotent and
+    /// `finish_attach` overwrites the placeholder expiry interval.
+    async fn inherit_sessions(
+        &mut self,
+        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    ) {
+        self.inherited_scan_inflight = false;
+        let mut registered = false;
+        for (client, subs, deadline) in sessions {
+            // Skip ones already handled (online or attaching here) and ones this
+            // node does not own (a replica held for another node — its owner
+            // materializes it).
             if self.online.contains_key(&client)
-                || self.expiring.contains_key(&client)
+                || self.connecting.contains_key(&client)
                 || !self.owns_session(&client)
             {
+                debug!(client = %client.0, "inherited-session scan: skipped (online/attaching/unowned)");
                 continue;
             }
-            // Schedule its expiry at the inherited absolute deadline; the sweep discards it
-            // when due (discard_session removes the durable session and any local state).
-            self.expiring.insert(client, deadline);
+            if let Some(d) = deadline {
+                self.expiring.entry(client.clone()).or_insert(d);
+            }
+            debug!(
+                client = %client.0,
+                subs = subs.len(),
+                known = self.subs_by_client.contains_key(&client),
+                "inherited-session scan: owned offline session"
+            );
+            if subs.is_empty() || self.subs_by_client.contains_key(&client) {
+                continue; // nothing to route, or already materialized
+            }
+            for sub in subs {
+                if let Some((group, filter)) = parse_shared(&sub.filter) {
+                    self.shared
+                        .subscribe(client.clone(), group, filter, sub.max_qos);
+                } else {
+                    self.table.subscribe(client.clone(), sub.filter.clone());
+                }
+                self.subs_by_client
+                    .entry(client.clone())
+                    .or_default()
+                    .insert(sub.filter, sub.max_qos);
+            }
+            // Persistent from the routing path's point of view (offline enqueue).
+            // The placeholder interval is corrected by the next real attach; the
+            // inherited absolute deadline above still bounds the session's life.
+            self.session_expiry
+                .entry(client.clone())
+                .or_insert(u32::MAX);
+            debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
+            registered = true;
         }
+        if registered {
+            // Peers must know this node now routes the inherited filters — this is
+            // what re-targets acked forwards after a takeover (exhibit ⑤ re-route).
+            self.gossip_interest();
+        }
+        self.settle_pending_publishes().await;
+    }
+
+    /// A takeover-window re-delivery of pending publish `id` (ADR 0042 T9):
+    /// deliver the frame ONLY to routing state that could have missed the
+    /// original fan-out — offline persistent sessions (materialized since) and
+    /// clients attached after the publish. Clients online since BEFORE the
+    /// publish already received it live; re-sending would duplicate (dups are
+    /// legal at `QoS` 1, but a boot-window re-send to a steady subscriber is a
+    /// gratuitous one — observed as duplicate bridge forwards). Returns `false`
+    /// on a terminal durable-append failure (the caller withholds).
+    async fn redeliver_pending(&mut self, id: u64) -> bool {
+        let Some(p) = self.pending_publishes.get(&id) else {
+            return true;
+        };
+        let (topic, payload, qos, expiry, app, since) = (
+            p.topic.clone(),
+            p.payload.clone(),
+            p.qos,
+            p.message_expiry,
+            p.app.clone(),
+            p.created_at,
+        );
+        let targets: Vec<(ClientId, QoS)> = self
+            .table
+            .matching_clients(&topic)
+            .into_iter()
+            .filter(|c| self.online.get(c).is_none_or(|o| o.attached_at > since))
+            .map(|c| {
+                let granted = self.granted_qos(&c, &topic);
+                (c, granted)
+            })
+            .collect();
+        let mut all_durable = true;
+        for (c, granted) in targets {
+            all_durable &= self
+                .deliver_to_client(&c, &topic, &payload, min_qos(qos, granted), expiry, &app)
+                .await;
+        }
+        all_durable
+    }
+
+    /// The takeover window closed for this node (an inherited-session scan just
+    /// landed): every held pending publish re-delivers **locally** against the
+    /// just-materialized subscriptions (duplicates are legal at `QoS` 1 — the
+    /// alternative was an ack into the void, exhibit ⑥), then re-checks remote
+    /// interest via the sweep's re-route path before its ack can release.
+    async fn settle_pending_publishes(&mut self) {
+        let held: Vec<u64> = self
+            .pending_publishes
+            .iter()
+            .filter(|(_, p)| p.awaiting_settle || p.reroute_grace.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        // The hold clears only when the whole takeover WINDOW is over: one scan
+        // is not enough — the group leases reassign for seconds after the death,
+        // and a scan that ran before a lease landed saw nothing. Every scan in
+        // the window re-delivers (duplicates are legal); the last one releases.
+        let window_over = self.takeover_reconcile_ticks == 0;
+        for id in held {
+            if !self.redeliver_pending(id).await {
+                // The re-delivery's durable append failed terminally: withhold.
+                self.drop_pending(id);
+                continue;
+            }
+            // The successor may have materialized the subscriber on ANOTHER node
+            // and advertised its interest since this publish's original fan-out
+            // (which found nothing): forward to it now — a publish that arrived
+            // after the death dropped the dead node's interest has no obligation
+            // to re-route, so this is where it re-targets.
+            for node in self.reroute_candidates(id) {
+                self.send_acked_forward(id, &node);
+            }
+            if window_over {
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.awaiting_settle = false;
+                }
+            }
+            self.try_complete_pending(id);
+        }
+    }
+
+    /// Whether this node runs in a multi-node cluster (placement with >1 member).
+    fn clustered(&self) -> bool {
+        self.placement.as_ref().is_some_and(|p| {
+            p.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .member_count()
+                > 1
+        })
     }
 
     /// Whether this node is the placement owner of `client`'s session. Outside a cluster
@@ -2856,9 +3271,9 @@ impl Hub {
     }
 
     /// Persist the current subscription set for a client if its session is durable.
-    async fn persist_subscriptions(&mut self, client: &ClientId) {
+    async fn persist_subscriptions(&mut self, client: &ClientId) -> bool {
         if !self.is_persistent(client) {
-            return;
+            return true; // nothing durable is promised for a clean session
         }
         let subs: Vec<mqtt_core::Subscription> = self
             .subs_by_client
@@ -2871,7 +3286,13 @@ impl Hub {
                 no_local: false,
             })
             .collect();
-        let _ = self.store.set_subscriptions(client, &subs).await;
+        match self.store.set_subscriptions(client, &subs).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(client = %client.0, error = %e, "durable subscription write failed");
+                false
+            }
+        }
     }
 
     /// Remove all of a client's subscriptions from the routing table.
@@ -2893,31 +3314,358 @@ impl Hub {
     /// broadcast: caches are warmed by the owner's post-commit fan-out instead, so a
     /// retained publish forwards like any other — to interested peers, for live
     /// delivery only.
+    #[allow(clippy::too_many_arguments)]
     fn forward_to_peers(
-        &self,
+        &mut self,
         topic: &str,
         payload: &Bytes,
         qos: QoS,
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
+        gate: Option<u64>,
     ) {
         let retain_broadcasts = retain && self.durable_retained.is_none();
+        // A gated QoS ≥ 1 forward is ACKED (ADR 0042 T9, exhibit ⑤): the
+        // publisher's ack waits for each target's durability-gated answer, and
+        // the sweep retransmits while unanswered. Targets come from the INTEREST
+        // map, not the connected-peer map: a link-down (but not dead) peer's
+        // subscribers are still owed the publish — the obligation is recorded
+        // now, the frame flows when the link returns (sweep), or re-routes to
+        // the successor when membership confirms death (`peer_dead`). A proto-2
+        // peer (mixed-version window) keeps the fire-and-forget frame — the old
+        // semantics, honestly.
+        let gated = gate.is_some() && qos_num(qos) >= 1;
+        if gated {
+            let targets: Vec<NodeId> = self
+                .remote_interest
+                .iter()
+                .filter(|(_, filters)| filters.iter().any(|f| topic_matches(f, topic)))
+                .map(|(node, _)| node.clone())
+                .collect();
+            let id = gate.unwrap_or_default();
+            for node in targets {
+                if self.peers.get(&node).is_some_and(|p| p.proto < 3) {
+                    // Connected but old: fire-and-forget, as before proto 3.
+                    if let Some(peer) = self.peers.get(&node) {
+                        let _ = peer.tx.send(PeerMessage::Publish {
+                            topic: topic.to_string(),
+                            payload: payload.to_vec(),
+                            qos: qos as u8,
+                            retain,
+                            message_expiry,
+                            app: app_to_wire(app),
+                        });
+                    }
+                    continue;
+                }
+                self.send_acked_forward(id, &node);
+            }
+            if !retain_broadcasts {
+                return;
+            }
+        }
         for (node, peer) in &self.peers {
             let interested = self
                 .remote_interest
                 .get(node)
                 .is_some_and(|filters| filters.iter().any(|f| topic_matches(f, topic)));
-            if retain_broadcasts || interested {
-                let _ = peer.tx.send(PeerMessage::Publish {
-                    topic: topic.to_string(),
-                    payload: payload.to_vec(),
-                    qos: qos as u8,
-                    retain,
-                    message_expiry,
-                    app: app_to_wire(app),
+            if gated && interested {
+                continue; // already handled (acked or legacy) above
+            }
+            if !(retain_broadcasts || interested) {
+                continue;
+            }
+            let _ = peer.tx.send(PeerMessage::Publish {
+                topic: topic.to_string(),
+                payload: payload.to_vec(),
+                qos: qos as u8,
+                retain,
+                message_expiry,
+                app: app_to_wire(app),
+            });
+        }
+    }
+
+    /// Peers that now advertise matching interest for pending publish `id` but
+    /// have neither acked a forward nor have one outstanding — the re-route
+    /// targets after a takeover (the dead owner's successor materializes the
+    /// inherited sessions and re-advertises their filters).
+    fn reroute_candidates(&self, id: u64) -> Vec<NodeId> {
+        let Some(p) = self.pending_publishes.get(&id) else {
+            return Vec::new();
+        };
+        self.peers
+            .iter()
+            .filter(|(n, peer)| {
+                peer.proto >= 3
+                    && !p.acked_nodes.contains(*n)
+                    && !p.awaiting.values().any(|v| v == *n)
+                    && self
+                        .remote_interest
+                        .get(*n)
+                        .is_some_and(|fs| fs.iter().any(|f| topic_matches(f, &p.topic)))
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Send (or re-send, on re-route) one acked forward of pending publish `id` to
+    /// `node`, recording the obligation (ADR 0042 T9, exhibit ⑤).
+    fn send_acked_forward(&mut self, id: u64, node: &NodeId) {
+        self.forward_seq += 1;
+        let seq = self.forward_seq;
+        let Some(p) = self.pending_publishes.get_mut(&id) else {
+            return;
+        };
+        p.awaiting.insert(seq, node.clone());
+        self.forward_index.insert(seq, id);
+        debug!(publish = id, seq, target = %node.0, topic = %p.topic, "acked forward recorded");
+        let frame = PeerMessage::PublishAcked {
+            seq,
+            topic: p.topic.clone(),
+            payload: p.payload.to_vec(),
+            qos: p.qos as u8,
+            retain: p.retain,
+            message_expiry: p.message_expiry,
+            app: app_to_wire(&p.app),
+        };
+        if let Some(peer) = self.peers.get(node) {
+            let _ = peer.tx.send(frame);
+        }
+    }
+
+    /// Register a `QoS` 1 publish whose acknowledgement is gated on cluster-wide
+    /// durability (ADR 0042 T9). At the cap the oldest entry is dropped loudly —
+    /// its ack withheld, so its publisher retries.
+    #[allow(clippy::too_many_arguments)]
+    fn register_pending(
+        &mut self,
+        done: oneshot::Sender<PublishOutcome>,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        retain: bool,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+    ) -> u64 {
+        if self.pending_publishes.len() >= PENDING_PUBLISH_CAP {
+            if let Some((old_id, old)) = self.pending_publishes.pop_first() {
+                warn!(
+                    topic = %old.topic,
+                    cap = PENDING_PUBLISH_CAP,
+                    "pending-publish cap: dropped the OLDEST unacknowledged publish \
+                     (ack withheld; its publisher retries — ADR 0042 T9)"
+                );
+                self.forward_index.retain(|_, pid| *pid != old_id);
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("pending-cap");
+                }
+            }
+        }
+        self.publish_ids += 1;
+        let id = self.publish_ids;
+        self.pending_publishes.insert(
+            id,
+            PendingPublish {
+                done,
+                topic: topic.to_string(),
+                payload: payload.clone(),
+                qos,
+                retain,
+                message_expiry,
+                app: app.clone(),
+                awaiting: HashMap::new(),
+                acked_nodes: HashSet::new(),
+                awaiting_retained: false,
+                local_done: false,
+                created_at: Instant::now(),
+                reroute_grace: None,
+                // During a takeover window the routing table may not yet hold the
+                // sessions this node (or a successor) inherited — hold the ack
+                // until the scan lands and the publish re-delivers (exhibit ⑥).
+                // Only meaningful on a multi-node cluster: a standalone node has
+                // no takeovers, and holding its boot-time acks would just delay
+                // every early publish for nothing.
+                awaiting_settle: self.clustered()
+                    && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight),
+            },
+        );
+        id
+    }
+
+    /// The local fan-out obligation resolved OK (durable appends included).
+    fn pending_local_done(&mut self, id: u64) {
+        if let Some(p) = self.pending_publishes.get_mut(&id) {
+            p.local_done = true;
+        }
+        self.try_complete_pending(id);
+    }
+
+    /// The retained authority commit obligation resolved (ADR 0042 T9, exhibit ⑦).
+    fn pending_retained_done(&mut self, id: u64) {
+        if let Some(p) = self.pending_publishes.get_mut(&id) {
+            p.awaiting_retained = false;
+        }
+        self.try_complete_pending(id);
+    }
+
+    /// Drop a pending publish, WITHHOLDING its acknowledgement (the sender side
+    /// of fail-closed: the publisher's connection sees no ack and retries).
+    fn drop_pending(&mut self, id: u64) {
+        if self.pending_publishes.remove(&id).is_some() {
+            self.forward_index.retain(|_, pid| *pid != id);
+        }
+    }
+
+    /// Release the publisher's acknowledgement iff every cluster-wide durability
+    /// obligation has resolved (ADR 0042 T9).
+    fn try_complete_pending(&mut self, id: u64) {
+        let complete = self.pending_publishes.get(&id).is_some_and(|p| {
+            p.local_done
+                && !p.awaiting_retained
+                && !p.awaiting_settle
+                && p.awaiting.is_empty()
+                && p.reroute_grace.unwrap_or(0) == 0
+        });
+        if complete {
+            if let Some(p) = self.pending_publishes.remove(&id) {
+                debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
+                let _ = p.done.send(PublishOutcome::Accepted);
+            }
+        }
+    }
+
+    /// A peer's durability-gated answer to one acked forward (ADR 0042 T9,
+    /// exhibit ⑤). `ok = false` is a terminal durable failure on the peer: the
+    /// whole pending publish is dropped — ack withheld, publisher retries.
+    fn forward_acked(&mut self, node: &NodeId, seq: u64, ok: bool) {
+        let Some(id) = self.forward_index.remove(&seq) else {
+            return; // stale ack (entry dropped or already resolved)
+        };
+        let Some(p) = self.pending_publishes.get_mut(&id) else {
+            return;
+        };
+        if p.awaiting.get(&seq) != Some(node) {
+            return; // not the node this seq was sent to — ignore
+        }
+        p.awaiting.remove(&seq);
+        if ok {
+            debug!(publish = id, seq, from = %node.0, "forward ack");
+            p.acked_nodes.insert(node.clone());
+            self.try_complete_pending(id);
+        } else {
+            warn!(
+                peer = %node.0,
+                "peer reported a terminal durable failure for a forwarded publish; \
+                 ack withheld (the publisher retries — ADR 0042 T9)"
+            );
+            self.drop_pending(id);
+        }
+    }
+
+    /// The sweep-tick half of acked forwards (ADR 0042 T9, exhibit ⑤): retransmit
+    /// unanswered forwards whose target link is up (same seq — duplicates are
+    /// legal at `QoS` 1), and drive takeover re-routes: a forward whose target
+    /// DIED re-forwards to whichever peers now advertise matching interest (the
+    /// dead owner's successor, once it materializes inherited sessions —
+    /// exhibit ⑥); with no such interest for [`REROUTE_GRACE_TICKS`] ticks the
+    /// obligation is moot (the interest genuinely ended) and the ack releases.
+    // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
+    // splitting it would scatter the obligation lifecycle.
+    #[allow(clippy::too_many_lines)]
+    async fn sweep_pending_forwards(&mut self) {
+        let ids: Vec<u64> = self.pending_publishes.keys().copied().collect();
+        for id in ids {
+            // Retransmit outstanding forwards over live links.
+            let outstanding: Vec<(u64, NodeId)> = self
+                .pending_publishes
+                .get(&id)
+                .map(|p| p.awaiting.iter().map(|(s, n)| (*s, n.clone())).collect())
+                .unwrap_or_default();
+            for (seq, node) in &outstanding {
+                let Some(peer) = self.peers.get(node) else {
+                    continue; // link down (not dead): wait for it to return
+                };
+                let Some(p) = self.pending_publishes.get(&id) else {
+                    continue;
+                };
+                if peer.proto < 3 {
+                    // The target reconnected speaking an older proto (mixed-version
+                    // downgrade): fall back to fire-and-forget — the old semantics,
+                    // honestly — and release the unfulfillable obligation.
+                    let _ = peer.tx.send(PeerMessage::Publish {
+                        topic: p.topic.clone(),
+                        payload: p.payload.to_vec(),
+                        qos: p.qos as u8,
+                        retain: p.retain,
+                        message_expiry: p.message_expiry,
+                        app: app_to_wire(&p.app),
+                    });
+                    self.forward_index.remove(seq);
+                    if let Some(p) = self.pending_publishes.get_mut(&id) {
+                        p.awaiting.remove(seq);
+                    }
+                    self.try_complete_pending(id);
+                    continue;
+                }
+                let _ = peer.tx.send(PeerMessage::PublishAcked {
+                    seq: *seq,
+                    topic: p.topic.clone(),
+                    payload: p.payload.to_vec(),
+                    qos: p.qos as u8,
+                    retain: p.retain,
+                    message_expiry: p.message_expiry,
+                    app: app_to_wire(&p.app),
                 });
             }
+            // Re-route after a target death (grace engaged by peer_dead).
+            let Some(p) = self.pending_publishes.get(&id) else {
+                continue;
+            };
+            let Some(grace) = p.reroute_grace else {
+                continue;
+            };
+            let candidates = self.reroute_candidates(id);
+            if !candidates.is_empty() {
+                debug!(
+                    publish = id,
+                    targets = candidates.len(),
+                    "re-routing acked forward"
+                );
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.reroute_grace = None;
+                }
+                for node in candidates {
+                    self.send_acked_forward(id, &node);
+                }
+                continue;
+            }
+            let awaiting_empty = p.awaiting.is_empty();
+            if awaiting_empty && grace <= 1 {
+                // The grace ends with a FINAL local re-delivery: the subscriber
+                // may have materialized HERE in the meantime — via this node's
+                // takeover scan or its own re-attach — after this publish's
+                // original local fan-out ran against a not-yet-materialized
+                // table (exhibit ⑥'s race, both faces). Targeted: only routing
+                // state that could have missed the original fan-out.
+                debug!(
+                    publish = id,
+                    "re-route grace expired; final local re-delivery"
+                );
+                if !self.redeliver_pending(id).await {
+                    self.drop_pending(id);
+                    continue;
+                }
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.reroute_grace = None;
+                }
+            } else if awaiting_empty {
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.reroute_grace = Some(grace - 1);
+                }
+            }
+            self.try_complete_pending(id);
         }
     }
 
@@ -3159,6 +3907,7 @@ impl Hub {
         conn_id: u64,
         tx: PeerOutbound,
         cert_serial: Option<Vec<u8>>,
+        proto: u32,
     ) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest + shared membership so the peer can route to us
@@ -3180,6 +3929,7 @@ impl Hub {
                 conn_id,
                 tx,
                 cert_serial,
+                proto,
             },
         );
     }
@@ -3191,7 +3941,13 @@ impl Hub {
         }
         info!(peer = %node.0, "peer link lost");
         self.peers.remove(node);
-        self.remote_interest.remove(node);
+        // The peer's INTEREST is kept (ADR 0042 T9): a link-down peer is not a
+        // dead peer, and its subscribers are still owed matching publishes — a
+        // gated forward to it becomes a held obligation that retransmits when the
+        // link returns, or re-routes when membership confirms death (`peer_dead`,
+        // which does drop the interest). Dropping interest here was exhibit ⑤'s
+        // second face: a publish in the disconnect-to-confirmation window found
+        // no interest anywhere and acked a trivially-empty fan-out.
         self.remote_shared.remove(node);
         if let Some(plane) = &self.durable_plane {
             plane.fail(node);
@@ -3207,6 +3963,30 @@ impl Hub {
         let had_link = self.peers.remove(node).is_some();
         let had_interest = self.remote_interest.remove(node).is_some();
         self.remote_shared.remove(node);
+        // Acked forwards to the dead node re-route to its successor once it
+        // advertises the inherited interest (ADR 0042 T9, exhibit ⑤ + ⑥): drop
+        // the dead obligations and engage the sweep's re-route grace.
+        let mut dead_seqs: Vec<u64> = Vec::new();
+        for p in self.pending_publishes.values_mut() {
+            let seqs: Vec<u64> = p
+                .awaiting
+                .iter()
+                .filter(|(_, n)| *n == node)
+                .map(|(s, _)| *s)
+                .collect();
+            if seqs.is_empty() {
+                continue;
+            }
+            for seq in seqs {
+                p.awaiting.remove(&seq);
+                dead_seqs.push(seq);
+            }
+            debug!(peer = %node.0, topic = %p.topic, "forward target died; re-route grace engaged");
+            p.reroute_grace = Some(REROUTE_GRACE_TICKS);
+        }
+        for seq in dead_seqs {
+            self.forward_index.remove(&seq);
+        }
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
         }
@@ -3319,9 +4099,18 @@ impl Hub {
         payload: &Bytes,
         qos: u8,
         app: &AppProperties,
+        gate: Option<u64>,
     ) {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
+        }
+        // The gated publish's ack now waits for this authority commit (ADR 0042 T9,
+        // exhibit ⑦) — the obligation rides the mutation through re-queues and the
+        // handoff hold, however long the commit takes.
+        if let Some(id) = gate {
+            if let Some(p) = self.pending_publishes.get_mut(&id) {
+                p.awaiting_retained = true;
+            }
         }
         self.enqueue_retained_mutation(RetainedMutation {
             topic: topic.to_string(),
@@ -3329,6 +4118,7 @@ impl Hub {
             qos,
             app: app.clone(),
             reply: None,
+            publish: gate,
         });
         self.kick_retained_queue();
     }
@@ -3349,6 +4139,11 @@ impl Hub {
                     if self.retained_handoff_pending.get(&node) == Some(&seq) {
                         self.retained_handoff_pending.remove(&node);
                     }
+                }
+                // A gated publish whose authority commit was dropped never acks
+                // (ADR 0042 T9, exhibit ⑦): the publisher retries.
+                if let Some(id) = dropped.publish {
+                    self.drop_pending(id);
                 }
             }
             if let Some(m) = &self.metrics {
@@ -3393,6 +4188,7 @@ impl Hub {
             qos,
             app,
             reply: Some((node, seq)),
+            publish: None,
         });
         self.kick_retained_queue();
     }
@@ -3514,6 +4310,7 @@ impl Hub {
             qos,
             app,
             reply,
+            publish,
         } = mutation;
         tokio::spawn(async move {
             let result = if payload.is_empty() {
@@ -3547,6 +4344,7 @@ impl Hub {
                 app,
                 token,
                 reply,
+                publish,
             });
         });
     }
@@ -4334,6 +5132,7 @@ mod tests {
             conn_id,
             tx: peer_tx,
             cert_serial: None,
+            proto: mqtt_cluster::peer::PROTO_MAX,
         })
         .unwrap();
         peer_rx

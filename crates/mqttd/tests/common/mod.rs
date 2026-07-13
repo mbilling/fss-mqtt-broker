@@ -100,6 +100,7 @@ pub async fn start_node(name: &str) -> Node {
         tx.clone(),
         None,
         None,
+        None,
     ));
 
     Node {
@@ -136,11 +137,13 @@ pub fn link(a: &Node, b: &Node) -> Link {
         a.id.clone(),
         a.tx.clone(),
         None,
+        None,
     ));
     let d2 = tokio::spawn(mqttd::peer::dial_forever(
         a.peer_addr.to_string(),
         b.id.clone(),
         b.tx.clone(),
+        None,
         None,
     ));
     Link {
@@ -180,11 +183,13 @@ pub async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
         tx_a.clone(),
         None,
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::serve_listener(
         peer_b,
         id_b.clone(),
         tx_b.clone(),
+        None,
         None,
         None,
     ));
@@ -193,11 +198,13 @@ pub async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
         id_a,
         tx_a,
         None,
+        None,
     ));
     tokio::spawn(mqttd::peer::dial_forever(
         paddr_a.to_string(),
         id_b,
         tx_b,
+        None,
         None,
     ));
 
@@ -426,7 +433,7 @@ impl Client {
             properties: Properties::new(),
             protocol: V4,
             clean_session: clean,
-            keep_alive: 30,
+            keep_alive: 0, // disabled: harness phases can idle a conn arbitrarily long
             client_id: client_id.to_string(),
             last_will: None,
             username: None,
@@ -460,7 +467,7 @@ impl Client {
             properties: Properties::new(),
             protocol: V4,
             clean_session: clean,
-            keep_alive: 30,
+            keep_alive: 0, // disabled: harness phases can idle a conn arbitrarily long
             client_id: client_id.to_string(),
             last_will: None,
             username: None,
@@ -488,7 +495,7 @@ impl Client {
             properties: Properties(properties),
             protocol: V5,
             clean_session: clean_start,
-            keep_alive: 30,
+            keep_alive: 0, // disabled: harness phases can idle a conn arbitrarily long
             client_id: client_id.to_string(),
             last_will: None,
             username: None,

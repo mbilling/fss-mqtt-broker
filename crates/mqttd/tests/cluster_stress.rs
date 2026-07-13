@@ -31,55 +31,39 @@
 //!   never behind the last acked set (later unacked sets may legitimately have
 //!   committed — the candidate window runs from the last acked set onward).
 //!
-//! ## Exhibit ⑤ (found by this harness's first valid schedule, seed 0)
+//! Every ack is a **hard obligation** — acked means durable, cluster-wide
+//! (0042-T9). This harness's first schedules found six real defects, all faces
+//! of that one claim, each first waived-and-counted here and then fixed:
 //!
-//! A `QoS` 1 publish that lands on a **non-owner** node is acked once the
-//! origin's *local* durable work is done, while the forward to the subscriber's
-//! owner is **fire-and-forget** (`forward_to_peers` sends into the link writer
-//! with no ack and no durable gate — the session-queue twin of the retained
-//! handoff hole ADR 0037 T8 closed). A kill or link fault in that window loses
-//! an acked message. Until 0042-T9 lands the acked cross-node publish handoff,
-//! the obligations ledger records a **hard** obligation only when the publisher
-//! was connected to the subscriber's owner (the T5/T8-hardened local path);
-//! remote-origin acks are tracked as exhibit-⑤ candidates and their losses
-//! counted loudly, never silently.
-//!
-//! ## Exhibit ⑥ (same first schedule, seed 0)
-//!
-//! A publish acked by the **new owner itself**, after a takeover but **before
-//! the inherited session's first re-attach**, is never enqueued: the new owner
-//! has not materialized the session's durable subscriptions (they load on
-//! attach/recovery), so the publish routes to nothing, acks on trivially-empty
-//! local work, and the eventual resume replays a queue that never received it.
-//! Until 0042-T9, a hard obligation additionally requires that the subscriber's
-//! **last attach was on the publishing owner** (the state the owner has
-//! materialized); acked publishes in the takeover-to-reattach window are
-//! exhibit-⑥ candidates, counted loudly.
-//!
-//! ## Exhibit ⑦ (seed 2)
-//!
-//! A retained `PUBACK` is released after the **local** fan-out, while the
-//! authority commit rides ADR 0037's queue-until-heal on the landing node. If
-//! that node is killed before the mutation reaches the group owner, the acked
-//! retained set dies with its queue — the survivors converge on the previous
-//! value. Until 0042-T9 gates the retained ack on the authority commit (the
-//! `done` channel already exists), an acked set whose landing node was killed
-//! is an exhibit-⑦ candidate: the expected-value window extends back to the
-//! last acked set that landed on a survivor, and the event is counted loudly.
-//!
-//! ## Exhibit ⑧ (seed 2)
-//!
-//! Retained sets acked **during a fault window** (a severed bus, or the steps
-//! right after the owner kill) can strand: the acked mutation sits in the
-//! landing node's queue-until-heal while owner resolution points at the dead
-//! node, and the drain depends solely on link-event heal triggers — none fire
-//! again once the topology stabilizes — while the value the *survivors* hold
-//! never back-fills the flapped node's cache either. The survivors sit stably
-//! divergent (observed: one node serving an old value, one serving none, for
-//! 12s+ against 500ms redials). Non-convergence whose candidate window contains
-//! a fault-window ack is counted as exhibit ⑧ (0042-T9 investigates with
-//! `REPRO_SEED = Some(2)`); non-convergence in steady state stays a hard
-//! failure — that would be a new defect.
+//! - **Exhibit ⑤** (seed 0): the cross-node `QoS` 1 forward was fire-and-forget
+//!   — fixed by acked forwards (`PublishAcked`/`PublishAck`, proto 3): the
+//!   publisher's ack waits for each interested peer's durability-gated answer,
+//!   with sweep-tick retransmission and takeover re-routing.
+//! - **Exhibit ⑥** (seed 0): the new owner acked publishes into the void before
+//!   the inherited session's first re-attach — fixed by eager materialization
+//!   (the takeover scan registers inherited sessions' durable subscriptions
+//!   before their clients return, discovering keys **cluster-wide** via
+//!   `ReplicaKeys`, since quorum appends mean no single replica holds them
+//!   all), plus interest gossip on attach-recovery and the settle/re-route
+//!   passes that re-deliver held publishes once state materializes.
+//! - **Exhibit ⑦** (seed 2): the retained `PUBACK` preceded the authority
+//!   commit — fixed: the ack gates on the commit (local commit completion or
+//!   the commit-gated handoff ack), riding the mutation through re-queues.
+//! - **Exhibit ⑧** (seed 2): retained state sat stably divergent after a
+//!   takeover — a symptom of ⑥/⑦/⑩, gone with them.
+//! - **Exhibit ⑨**: the SUBACK preceded (and ignored the failure of) the
+//!   durable subscription write, so the durable session could claim **no
+//!   subscriptions** while the client held a granted SUBACK — every downstream
+//!   durability promise built on sand. Fixed: the SUBACK is durability-gated
+//!   (failure codes + routing-state rollback; the client retries).
+//! - **Exhibit ⑩** (the root cause underneath most observed losses): durable
+//!   replication REPLIES routed through the hub command queue **deadlocked
+//!   with on-loop appends** — the append awaited acks queued behind its own
+//!   dispatch, so every hub-path durable write (offline enqueue, subscription
+//!   persist, expiry write) failed with "no replication quorum" after the RPC
+//!   timeout on a perfectly healthy cluster. The pre-T9 suites never saw it:
+//!   their takeover tests drive the store directly. Fixed: reply frames bypass
+//!   the hub queue, straight from the link pump to the durable plane.
 //!
 //! This layer is **stress, honestly labelled** (ADR 0042 §3): tokio's scheduler
 //! and real I/O mean a seed reproduces the *scenario*, not a bit-identical
@@ -252,6 +236,9 @@ impl StressNode {
     }
 }
 
+// One linear node assembly, mirroring durable_sessions/main.rs — splitting it
+// would hide which pieces a real node wires.
+#[allow(clippy::too_many_lines)]
 async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
     let node_id = NodeId(id.to_string());
     let can_bootstrap = swim_seeds.is_empty();
@@ -307,6 +294,7 @@ async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
             hub_tx.clone(),
             None,
             None,
+            Some(plane_observer.clone()),
         ))
         .abort_handle(),
     );
@@ -347,6 +335,7 @@ async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
             None,
             Some(placement.clone()),
             None,
+            Some(plane_observer.clone()),
         ))
         .abort_handle(),
     );
@@ -367,13 +356,12 @@ async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
 // ---------------------------------------------------------------------------
 
 /// One retained set the schedule issued: its payload, whether the PUBACK
-/// arrived, the node it landed on, and whether a fault window was open.
+/// arrived. An acked set is durably committed — the retained `PUBACK` gates on
+/// the authority commit (0042-T9, exhibit ⑦) — whatever node it landed on.
 #[derive(Clone)]
 struct RetainedSet {
     payload: Vec<u8>,
     acked: bool,
-    landed_on: usize,
-    fault_window: bool,
 }
 
 /// One persistent `QoS` 1 subscriber the schedule churns through connect /
@@ -387,9 +375,6 @@ struct Subscriber {
     /// Whether any connect for this id has ever succeeded: from then on the
     /// durable session certainly exists and every resume must say so.
     established: bool,
-    /// The node of the most recent successful attach — the only node that has
-    /// certainly materialized this session's subscriptions (exhibit ⑥).
-    last_attached: Option<usize>,
     received: BTreeSet<Vec<u8>>,
 }
 
@@ -400,28 +385,16 @@ struct Stress {
     nodes: Vec<StressNode>,
     alive: Vec<bool>,
     subs: Vec<Subscriber>,
-    /// Per topic: payloads whose PUBACK arrived with the publisher connected to
-    /// the subscriber's owner — the HARD delivery obligations (the local durable
-    /// ack path, sound since 0041-T5/0042-T8).
+    /// Per topic: every payload whose PUBACK arrived — ALL of them HARD delivery
+    /// obligations (0042-T9: acked means durable, cluster-wide — whichever node
+    /// the publish landed on, whatever the takeover state).
     acked: BTreeMap<String, Vec<Vec<u8>>>,
-    /// Per topic: payloads acked from a NON-owner origin — exhibit ⑤ candidates
-    /// (fire-and-forget peer forward): losses are counted, not yet failed.
-    acked_remote: BTreeMap<String, Vec<Vec<u8>>>,
-    /// Per topic: payloads acked by the owner inside the takeover-to-reattach
-    /// window — exhibit ⑥ candidates: losses are counted, not yet failed.
-    acked_prereattach: BTreeMap<String, Vec<Vec<u8>>>,
     /// Per retained topic: the set history, newest last. The expected converged
-    /// value is any entry from the last *safe* acked one onward (safe = its
-    /// landing node survived; an acked set stranded on a killed landing node is
-    /// exhibit ⑦; one acked in a fault window that then fails to converge is
-    /// exhibit ⑧).
+    /// value is any entry from the last acked one onward (the retained PUBACK
+    /// gates on the authority commit — 0042-T9, exhibit ⑦).
     retained: BTreeMap<String, Vec<RetainedSet>>,
     /// Nodes whose inbound bus is currently severed.
     severed: Vec<usize>,
-    /// The schedule step the kill executed at, once it has.
-    killed_at_step: Option<u64>,
-    /// The current schedule step (for fault-window classification).
-    step: u64,
     payload_counter: u64,
 }
 
@@ -474,19 +447,38 @@ impl Stress {
     /// attempt** — a timed-out attach may still have claimed the session durably
     /// before the deadline, so the retry may legitimately resume it (the exact
     /// epistemic state `DurableTruth::Unknown` exists for).
-    async fn bring_subscriber_online(&mut self, i: usize) {
+    /// `must` distinguishes the two callers: the post-heal ORACLE requires the
+    /// resume to succeed (`true` — everything is healed, unavailability would be
+    /// a liveness violation); a MID-SCHEDULE churn resume may legitimately fail
+    /// (`false`) — a kill combined with an active severed bus can partition the
+    /// two survivors, and refusing session recovery without a reachable quorum
+    /// is exactly the CP behavior the plane promises (observed live in seed 5:
+    /// both survivors candidate, neither electable). The subscriber then simply
+    /// stays offline until a later resume.
+    async fn bring_subscriber_online(&mut self, i: usize, must: bool) {
         let mut truth = if self.subs[i].established {
             DurableTruth::Present
         } else {
             DurableTruth::Absent
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // Generous: a resume that lands inside a takeover window legitimately
+        // waits out SWIM confirmation, raft re-election, lease reassignment and
+        // the group's first-touch recovery, on a machine also running the soak.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let Some(owner) = self.owner_of(&self.subs[i].id) else {
                 self.fail("no alive node resolves a placement owner");
             };
             if !self.alive[owner] {
                 // The ring still names the dead node mid-handoff; wait it out.
+                if !must && Instant::now() >= deadline {
+                    let id = self.subs[i].id.clone();
+                    self.note(format!(
+                        "resume of {id} did not complete (owner never reassigned — \
+                         legitimate under an active partition); staying offline"
+                    ));
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 assert!(Instant::now() < deadline, "owner never reassigned");
                 continue;
@@ -511,7 +503,6 @@ impl Stress {
                 self.subs[i].conn = Some(client);
                 self.subs[i].on_node = owner;
                 self.subs[i].established = true;
-                self.subs[i].last_attached = Some(owner);
                 self.note(format!(
                     "subscriber {} online on {} (present={present})",
                     self.subs[i].id, self.nodes[owner].node_id.0
@@ -523,10 +514,18 @@ impl Stress {
             if matches!(truth, DurableTruth::Absent) {
                 truth = DurableTruth::Unknown;
             }
-            assert!(
-                Instant::now() < deadline,
-                "subscriber could not (re)connect within the deadline"
-            );
+            if Instant::now() >= deadline {
+                assert!(
+                    !must,
+                    "subscriber could not (re)connect within the deadline"
+                );
+                let id = self.subs[i].id.clone();
+                self.note(format!(
+                    "resume of {id} did not complete (no reachable quorum — \
+                     legitimate under an active partition); staying offline"
+                ));
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -579,7 +578,11 @@ impl Stress {
             publisher
                 .publish(&topic, &payload, QoS::AtLeastOnce, Some(7), vec![])
                 .await;
-            let deadline = Instant::now() + Duration::from_secs(4);
+            // Generous: under 0042-T9 an ack legitimately waits out a takeover
+            // window (SWIM confirmation + the successor's inherited-session scan +
+            // the re-route grace) before releasing. A publish still unacked after
+            // this is simply no obligation — safe, the publisher would retry.
+            let deadline = Instant::now() + Duration::from_secs(12);
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 match publisher.recv_bounded(left).await {
@@ -593,22 +596,13 @@ impl Stress {
         .is_some();
 
         if acked {
-            // Exhibits ⑤/⑥ (module docs): a hard obligation needs the durable
-            // local path end to end — the ack came from the subscriber's OWNER
-            // and that owner has materialized the session (its last attach was
-            // there). Anything else raced state 0042-T9 will make durable.
-            let owner_local = self.owner_of(&self.subs[s].id) == Some(node);
-            let materialized = self.subs[s].last_attached == Some(node);
-            let (book, label) = if owner_local && materialized {
-                (&mut self.acked, "obligation")
-            } else if owner_local {
-                (&mut self.acked_prereattach, "exhibit-6 candidate")
-            } else {
-                (&mut self.acked_remote, "exhibit-5 candidate")
-            };
-            book.entry(topic.clone()).or_default().push(payload);
+            // Every ack is a HARD obligation (0042-T9): acked means durable,
+            // cluster-wide — whichever node the publish landed on, whatever the
+            // takeover state. The exhibit-⑤/⑥ waivers this book once carried are
+            // gone with the fixes.
+            self.acked.entry(topic.clone()).or_default().push(payload);
             self.note(format!(
-                "publish #{} to {topic} via {}: ACKED ({label})",
+                "publish #{} to {topic} via {}: ACKED (obligation)",
                 self.payload_counter, self.nodes[node].node_id.0,
             ));
         } else {
@@ -619,15 +613,6 @@ impl Stress {
         }
         // Opportunistically drain online subscribers so live deliveries land.
         self.drain_subscriber(s).await;
-    }
-
-    /// Whether the schedule is inside a fault window: a bus is severed, or the
-    /// kill happened within the last two steps (the lease-handoff window).
-    fn fault_window(&self) -> bool {
-        !self.severed.is_empty()
-            || self
-                .killed_at_step
-                .is_some_and(|k| self.step.saturating_sub(k) <= 2)
     }
 
     /// One retained set on a seeded retained topic, from a seeded alive node.
@@ -647,7 +632,9 @@ impl Stress {
             publisher
                 .publish_full(&topic, &payload, QoS::AtLeastOnce, true, Some(9))
                 .await;
-            let deadline = Instant::now() + Duration::from_secs(4);
+            // Generous: the retained PUBACK gates on the authority commit
+            // (0042-T9, exhibit ⑦), which may wait out a takeover window.
+            let deadline = Instant::now() + Duration::from_secs(12);
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 match publisher.recv_bounded(left).await {
@@ -660,16 +647,10 @@ impl Stress {
         .await
         .is_some();
 
-        let fault = self.fault_window();
         self.retained
             .entry(topic.clone())
             .or_default()
-            .push(RetainedSet {
-                payload,
-                acked,
-                landed_on: node,
-                fault_window: fault,
-            });
+            .push(RetainedSet { payload, acked });
         self.note(format!(
             "retained set #{} on {topic} via {}: {}",
             self.payload_counter,
@@ -688,7 +669,7 @@ impl Stress {
             }
             self.note(format!("subscriber {} disconnected", self.subs[s].id));
         } else {
-            self.bring_subscriber_online(s).await;
+            self.bring_subscriber_online(s, false).await;
             self.drain_subscriber(s).await;
         }
     }
@@ -704,7 +685,6 @@ impl Stress {
         }
         self.nodes[owner].kill();
         self.alive[owner] = false;
-        self.killed_at_step = Some(self.step);
         self.note(format!(
             "KILLED {} (owner of {})",
             self.nodes[owner].node_id.0, self.subs[s].id
@@ -808,12 +788,8 @@ async fn run_schedule(seed: u64) {
         nodes,
         subs: Vec::new(),
         acked: BTreeMap::new(),
-        acked_remote: BTreeMap::new(),
-        acked_prereattach: BTreeMap::new(),
         retained: BTreeMap::new(),
         severed: Vec::new(),
-        killed_at_step: None,
-        step: 0,
         payload_counter: 0,
     };
 
@@ -826,22 +802,76 @@ async fn run_schedule(seed: u64) {
             conn: None,
             on_node: 0,
             established: false,
-            last_attached: None,
             received: BTreeSet::new(),
         });
-        stress.bring_subscriber_online(i).await;
+        stress.bring_subscriber_online(i, true).await;
         let topic = stress.subs[i].topic.clone();
-        let sub = stress.subs[i].conn.as_mut().unwrap();
-        sub.subscribe(1, &topic, QoS::AtLeastOnce).await;
+        // The SUBACK is durability-gated (0042 T9): a failure code means the
+        // durable subscription write could not reach quorum yet — retry until
+        // granted, as a real client would.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let sub = stress.subs[i].conn.as_mut().unwrap();
+            let ack = sub.subscribe(1, &topic, QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|c| *c != 0x80) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "seed {seed}: durable SUBSCRIBE for sub {i} never granted"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
-    stress.note("setup complete: 3 subscribers online + subscribed".into());
+    // Interest-propagation warm-up (observable state, not a sleep): a QoS 1
+    // publish from EVERY node to EVERY subscriber must deliver before the
+    // schedule starts. A SUBACK alone proves only the subscribed node's routing
+    // state — cross-node interest gossip is eventually consistent, and a publish
+    // racing it is silently unroutable (a noted semantic gap, not what this
+    // harness stresses). Warm payloads are delivered but never become
+    // obligations.
+    for n in 0..stress.nodes.len() {
+        for i in 0..3 {
+            let topic = stress.subs[i].topic.clone();
+            let warm = format!("warm-{seed}-{n}-{i}").into_bytes();
+            let addr = stress.nodes[n].client_addr;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                // Generous CONNECT deadline: a fresh clean-start id's CONNACK
+                // gates on a durable discard, whose group may need a first-ever
+                // lease grant (reconcile-driven, multi-second) — a real cold-path
+                // latency this warm-up absorbs so the schedule never pays it.
+                if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                    addr,
+                    &format!("warm-pub-{seed}-{n}-{i}"),
+                    true,
+                    Duration::from_secs(20),
+                )
+                .await
+                {
+                    publisher
+                        .publish(&topic, &warm, QoS::AtLeastOnce, Some(7), vec![])
+                        .await;
+                    let _ = publisher.recv_bounded(Duration::from_secs(2)).await;
+                }
+                stress.drain_subscriber(i).await;
+                if stress.subs[i].received.contains(&warm) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "seed {seed}: interest warm-up from node {n} to sub {i} did not converge"
+                );
+            }
+        }
+    }
+    stress.note("setup complete: 3 subscribers online + subscribed + warmed".into());
 
     // The seeded schedule: ~14 steps, one kill at a seeded position, flaps and
     // churn throughout.
     let steps = stress.rng.range(12, 17);
     let kill_at = stress.rng.range(3, steps - 2);
     for step in 0..steps {
-        stress.step = step;
         if step == kill_at {
             stress.kill_step();
             continue;
@@ -853,7 +883,6 @@ async fn run_schedule(seed: u64) {
             _ => stress.flap_step(),
         }
     }
-    stress.step = steps;
 
     // Heal every flap and quiesce on observable state: survivors agree the dead
     // node is gone and agree on every subscriber's owner.
@@ -891,8 +920,6 @@ async fn run_schedule(seed: u64) {
     }
 
     // ---- The oracle (post-quiesce facts only) ----
-    let mut exhibit5_lost = 0usize;
-    let mut exhibit6_lost = 0usize;
 
     // 1. Acked durability + recovery honesty: resume every subscriber (offline
     //    first, so the resume replays its queue) and drain; every acked payload
@@ -904,7 +931,7 @@ async fn run_schedule(seed: u64) {
                 conn.disconnect().await;
             }
         }
-        stress.bring_subscriber_online(i).await;
+        stress.bring_subscriber_online(i, true).await;
         stress.drain_subscriber(i).await;
         // A replay that raced the drain window settles with one more pass.
         stress.drain_subscriber(i).await;
@@ -923,49 +950,20 @@ async fn run_schedule(seed: u64) {
                 missing.len()
             ));
         }
-        // Exhibit ⑤/⑥ candidates: count losses loudly (removed by 0042-T9).
-        let remote = stress.acked_remote.get(&topic).cloned().unwrap_or_default();
-        exhibit5_lost += remote
-            .iter()
-            .filter(|p| !stress.subs[i].received.contains(*p))
-            .count();
-        let prereattach = stress
-            .acked_prereattach
-            .get(&topic)
-            .cloned()
-            .unwrap_or_default();
-        exhibit6_lost += prereattach
-            .iter()
-            .filter(|p| !stress.subs[i].received.contains(*p))
-            .count();
     }
 
     // 2. Retained convergence: every survivor serves the same value, and it is
-    //    never behind the last SAFE acked set — one whose landing node survived
-    //    (an acked set stranded on a killed landing node is exhibit ⑦; later
-    //    unacked sets may legitimately have committed). Fan-out and back-fill
-    //    are eventually consistent, so the oracle POLLS to a deadline instead
-    //    of reading once.
+    //    never behind the last acked set — a retained PUBACK now gates on the
+    //    authority commit (0042-T9, exhibit ⑦ fixed), so an acked set is durable
+    //    whatever happened to its landing node; later unacked sets may
+    //    legitimately have committed too. Fan-out and back-fill are eventually
+    //    consistent, so the oracle POLLS to a deadline instead of reading once.
     let mut probe = 0u64;
-    let mut exhibit7 = 0usize;
-    let mut exhibit8 = 0usize;
     for (topic, history) in stress.retained.clone() {
         let Some(last_acked) = history.iter().rposition(|r| r.acked) else {
             continue; // nothing was ever promised for this topic
         };
-        // The hard window starts at the last acked set that landed on a node
-        // still alive; acked sets stranded on the killed node extend the window
-        // backward (exhibit ⑦, counted below).
-        let last_safe_acked = history
-            .iter()
-            .rposition(|r| r.acked && stress.alive[r.landed_on]);
-        // Every acked set stranded (None) accepts the whole history from 0.
-        let window_start = last_safe_acked.unwrap_or_default();
-        if window_start < last_acked || last_safe_acked.is_none() {
-            exhibit7 += 1;
-        }
-        let candidates: Vec<&Vec<u8>> =
-            history[window_start..].iter().map(|r| &r.payload).collect();
+        let candidates: Vec<&Vec<u8>> = history[last_acked..].iter().map(|r| &r.payload).collect();
 
         let deadline = Instant::now() + Duration::from_secs(12);
         let (converged, last_seen) = loop {
@@ -1002,20 +1000,9 @@ async fn run_schedule(seed: u64) {
                     )
                 })
                 .collect();
-            // Exhibit ⑧ (module docs): a candidate window containing sets acked
-            // DURING a fault window may strand — counted, not failed, until
-            // 0042-T9. Steady-state divergence stays a hard failure.
-            let fault_tainted = history[window_start..].iter().any(|r| r.fault_window);
-            if fault_tainted {
-                exhibit8 += 1;
-                stress.note(format!(
-                    "exhibit-8: {topic} unconverged after fault-window acks: {detail:?}"
-                ));
-                continue;
-            }
             stress.fail(&format!(
                 "retained convergence violated for {topic}: survivors never \
-                 converged on a value at or beyond the last safe acked set: {detail:?}"
+                 converged on a value at or beyond the last acked set: {detail:?}"
             ));
         }
         // The catalog checker states the cross-node agreement claim once.
@@ -1032,24 +1019,6 @@ async fn run_schedule(seed: u64) {
         let violations = check_retained_convergence(&named_refs);
         stress.fail_violations("retained convergence", &violations);
     }
-    if exhibit7 > 0 || exhibit8 > 0 {
-        eprintln!(
-            "cluster_stress: seed {seed}: {exhibit7} exhibit-7 topic(s) (acked \
-             retained set stranded on a killed landing node) + {exhibit8} \
-             exhibit-8 topic(s) (fault-window acks unconverged after heal) — \
-             0042-T9 investigates/fixes"
-        );
-    }
-
-    if exhibit5_lost > 0 || exhibit6_lost > 0 {
-        eprintln!(
-            "cluster_stress: seed {seed}: {exhibit5_lost} exhibit-5 loss(es) \
-             (remote-origin ack, fire-and-forget forward) + {exhibit6_lost} \
-             exhibit-6 loss(es) (owner ack before the inherited session's first \
-             re-attach) — 0042-T9 fixes both"
-        );
-    }
-
     // Tear the cluster down so the next seed starts clean.
     for node in &stress.nodes {
         node.kill();
@@ -1060,6 +1029,12 @@ async fn run_schedule(seed: u64) {
 /// the T1 catalog (as MQTT-observable facts) is the post-quiesce oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn seeded_fault_schedules_hold_the_catalog_post_quiesce() {
+    // Debug aid: MQTTD_STRESS_LOG=1 wires broker tracing through to stderr.
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
     for seed in seeds() {
         run_schedule(seed).await;
         eprintln!("cluster_stress: seed {seed} held the catalog");

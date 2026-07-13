@@ -328,14 +328,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
     async fn keys(&self) -> Result<Vec<String>, ReplError> {
         // The replicated copies this node holds (ADR 0009 §3): the session metadata a new
         // owner inherited at takeover, and (on a persistent backend) what reopened from
-        // disk after a restart, live here. Sessions this node already owns and is actively
-        // managing are tracked in the hub's in-memory expiry map, so reading the replica
-        // keys is what the takeover-expiry reconcile needs.
-        Ok(self
+        // disk after a restart, live here — UNIONED with every reachable peer's key set
+        // (ADR 0042 T9, exhibit ⑥): quorum appends mean any single replica may lack a
+        // key, and a new owner that never held a copy of a group would otherwise never
+        // discover its sessions. Values are still read per key via quorum recovery.
+        let mut keys = self
             .local_replicas
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys())
+            .keys();
+        keys.append(&mut self.transport.list_remote_keys().await);
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
     }
 
     async fn epoch_for(&self, key: &String) -> Result<u64, ReplError> {
