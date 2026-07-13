@@ -28,10 +28,10 @@ use crate::durable_plane::DurablePlane;
 use crate::lease_assign::LeaseAssigner;
 use crate::lease_group::{config as lease_config, LeaseRaft};
 use crate::lease_membership::{apply_action, raft_view, FailureDomain, MembershipReconciler};
-use crate::lease_raft::RaftNodeId;
+use crate::lease_raft::{GroupId, RaftNodeId};
 use crate::lease_store::LeaseStore;
 use crate::node_registry::raft_id;
-use crate::placement::Placement;
+use crate::placement::{group_of_key, Placement, NUM_GROUPS};
 use crate::raft_mesh::MeshRaftNetwork;
 use crate::repl_net::PeerReplicaTransport;
 use crate::NodeId;
@@ -52,6 +52,18 @@ use tracing::{debug, warn};
 /// store every reconfiguration fsyncs, and a fast tick that re-fires the same
 /// membership/lease change before the previous one commits amplifies durable-store churn.
 const DRIVER_TICK: Duration = Duration::from_secs(1);
+
+/// Driver ticks between catch-up sweeps while one is armed (ADR 0043 P1): brisk
+/// enough that a joiner back-fills within seconds of entering a replica set, slow
+/// enough that the owner is not asked to re-commit the same key more often than a
+/// round of re-commits can complete.
+const CATCH_UP_SWEEP_EVERY: u32 = 5;
+
+/// Sweeps to attempt per membership change before standing down. A copy that stays
+/// hollow this long (~2 minutes) is not going to heal by asking again — the next
+/// membership event re-arms the sweep anyway. Bounds steady-state chatter from a
+/// key whose only remaining copies are stale leftovers the owner has superseded.
+const CATCH_UP_SWEEP_BUDGET: u32 = 24;
 
 /// Open a persistent store, briefly retrying transient file-lock contention.
 ///
@@ -154,6 +166,7 @@ pub async fn build_durable_node(
         network.clone(),
         transport.clone(),
         replicas.clone(),
+        placement.clone(),
     );
 
     // --- durable store over the shared transport ---
@@ -162,14 +175,17 @@ pub async fn build_durable_node(
     // through it, and the retained keyspace (ADR 0037) commits `r/<topic>` keys through
     // the same leases, epochs, and replica links — one durable plane, two keyspaces.
     let group_log = Arc::new(GroupRoutedLog::new(
-        node_id,
+        node_id.clone(),
         placement.clone(),
-        transport,
+        transport.clone(),
         lease_source,
-        replicas,
+        replicas.clone(),
     ));
+    // The plane serves inbound catch-up requests (ADR 0043 P1) through the store's
+    // group routing: a hollow replica asks, the owner re-commits the key's log.
+    plane.set_catch_up_source(group_log.clone());
     let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::new(group_log.clone()));
-    let retained: Arc<dyn DurableRetained> = Arc::new(ReplicatedRetained::new(group_log));
+    let retained: Arc<dyn DurableRetained> = Arc::new(ReplicatedRetained::new(group_log.clone()));
 
     // --- driver: membership + lease assignment over the live placement ---
     // The handle is returned so the caller can stop the driver on shutdown (otherwise
@@ -193,6 +209,12 @@ pub async fn build_durable_node(
         MembershipReconciler::new(local, can_bootstrap, voter_cap),
         LeaseAssigner::new(placement),
         domains,
+        CatchUp {
+            node: node_id,
+            transport,
+            replicas,
+            source: group_log,
+        },
     ));
 
     (store, retained, plane, driver)
@@ -221,8 +243,150 @@ fn admit_desired(
         .collect()
 }
 
+/// The handles the **catch-up sweep** (ADR 0043 P1) runs over: this node's
+/// identity, the shared replication transport (to discover keys and ask owners to
+/// re-commit), its own follower copy (to judge hollowness and stamp the durable
+/// caught-up watermark), and the local catch-up source (to heal keys of groups
+/// this node itself owns).
+struct CatchUp {
+    node: NodeId,
+    transport: Arc<PeerReplicaTransport>,
+    replicas: Arc<Mutex<ReplicaState>>,
+    source: Arc<dyn crate::durable_plane::CatchUpSource>,
+}
+
+impl CatchUp {
+    /// One sweep over every group this node replicates, driving each toward its
+    /// durable **caught-up stamp** (the watermark recovery reads trust):
+    ///
+    /// - stamp matches the current replica set → current, nothing to do;
+    /// - stamped for a **superset** of the current set (a pure shrink — every
+    ///   current member was in the cohort this node was already current with) →
+    ///   re-stamp immediately, no data moved;
+    /// - otherwise (never stamped, or new cohort members) → full catch-up: every
+    ///   other member of the set must answer key discovery, every discovered key
+    ///   of the group must be locally gap-free (hollow keys are healed by asking
+    ///   the owner to re-commit — or re-committing ourselves when we own the
+    ///   group), and only then is the group stamped.
+    ///
+    /// Returns how many groups are still pending (0 = swept clean).
+    async fn sweep(&self, placement: &Arc<RwLock<Placement>>) -> usize {
+        // Key discovery, attributed per peer: a group is only stamped once every
+        // OTHER member of its replica set has been heard (an unheard member may
+        // hold keys we would otherwise never learn we are missing).
+        let mut responses: BTreeMap<NodeId, Vec<String>> = BTreeMap::new();
+        for peer in self.transport.connected() {
+            if let Some(keys) = self.transport.keys_of(&peer).await {
+                responses.insert(peer, keys);
+            }
+        }
+        // Keys per group, unioned across our copy and every heard peer's.
+        let mut group_keys: BTreeMap<GroupId, BTreeSet<String>> = BTreeMap::new();
+        for key in self
+            .lock_replicas()
+            .keys()
+            .into_iter()
+            .chain(responses.values().flatten().cloned())
+        {
+            group_keys
+                .entry(group_of_key(&key))
+                .or_default()
+                .insert(key);
+        }
+
+        let mut pending = 0;
+        let mut stamps: Vec<(GroupId, Vec<NodeId>)> = Vec::new();
+        for group in 0..NUM_GROUPS {
+            let (set, owner) = {
+                let p = placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (p.group_replica_set(group), p.group_owner(group))
+            };
+            if !set.contains(&self.node) {
+                continue; // not ours to hold
+            }
+            let shrink_of_known_cohort = {
+                let r = self.lock_replicas();
+                if r.group_current(group, &set) {
+                    continue; // stamp already current
+                }
+                // A pure shrink keeps custody: we were current with a cohort that
+                // contained every remaining member, so our copy's completeness
+                // story is unchanged — no unknown-history member entered.
+                r.caught_up_set(group)
+                    .is_some_and(|stored| set.iter().all(|n| stored.contains(n)))
+            };
+            if shrink_of_known_cohort {
+                stamps.push((group, set));
+                continue;
+            }
+            // Full catch-up: every other member must have answered discovery.
+            if !set
+                .iter()
+                .filter(|n| **n != self.node)
+                .all(|n| responses.contains_key(n))
+            {
+                pending += 1;
+                continue;
+            }
+            // Heal every hollow key of the group; stamp only when none is left.
+            let mut hollow_keys = Vec::new();
+            for key in group_keys.get(&group).into_iter().flatten() {
+                let hollow = {
+                    let r = self.lock_replicas();
+                    // A discovered key we hold nothing of (no entries, no
+                    // truncation watermark) is hollow; so is a gappy copy.
+                    !r.complete(key) || (r.entries(key).is_empty() && r.watermark(key) == 0)
+                };
+                if hollow {
+                    hollow_keys.push(key.clone());
+                }
+            }
+            if hollow_keys.is_empty() {
+                stamps.push((group, set));
+                continue;
+            }
+            pending += 1;
+            for key in hollow_keys {
+                if owner == self.node {
+                    // We own the group: recover + re-commit locally (the same
+                    // path an inbound ReplicaCatchUp drives).
+                    self.source.catch_up_key(&key).await;
+                } else {
+                    self.transport.request_catch_up(&owner, &key);
+                }
+            }
+        }
+        if !stamps.is_empty() {
+            debug!(
+                stamped = stamps.len(),
+                pending, "catch-up sweep stamped groups current (ADR 0043 P1)"
+            );
+            // The stamp is one fsync'd batch; run it off the async worker.
+            let replicas = self.replicas.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                replicas
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_groups_current(&stamps);
+            })
+            .await;
+        }
+        pending
+    }
+
+    fn lock_replicas(&self) -> std::sync::MutexGuard<'_, ReplicaState> {
+        self.replicas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// The lease-group control loop: on each tick, reconcile the voter set toward the
 /// live membership and (as leader) keep each group's lease on its placement owner.
+/// A membership change (and boot) also arms the replica catch-up sweep (ADR 0043
+/// P1), which back-fills this node's copies of the groups it newly replicates.
 #[allow(clippy::too_many_arguments)]
 async fn run_driver(
     raft: LeaseRaft,
@@ -233,10 +397,17 @@ async fn run_driver(
     reconciler: MembershipReconciler,
     assigner: LeaseAssigner,
     domains: BTreeMap<RaftNodeId, FailureDomain>,
+    catch_up: CatchUp,
 ) {
     // A one-tick debounce: only act once the desired set is stable across a tick, so
     // a flapping member does not churn the voter set.
     let mut prev_desired: BTreeSet<RaftNodeId> = BTreeSet::new();
+    // Catch-up sweep state: armed (with a budget) on boot and on every placement
+    // membership change, run every few ticks until nothing is hollow or the budget
+    // is spent. `prev_members` starts empty so the first tick always arms.
+    let mut prev_members: BTreeSet<RaftNodeId> = BTreeSet::new();
+    let mut sweeps_left: u32 = 0;
+    let mut ticks_to_sweep: u32 = 0;
     // Static-seed overrides already warned about, so the mismatch is loud once per
     // (node, label) rather than per tick (ADR 0016 T6 loudness rule).
     let mut warned_overrides: BTreeSet<(RaftNodeId, FailureDomain)> = BTreeSet::new();
@@ -291,6 +462,26 @@ async fn run_driver(
             }
         }
         prev_desired = desired;
+
+        // --- replica catch-up (ADR 0043 P1) ---
+        let member_set: BTreeSet<RaftNodeId> = members.iter().copied().collect();
+        if member_set != prev_members {
+            prev_members = member_set;
+            sweeps_left = CATCH_UP_SWEEP_BUDGET;
+            ticks_to_sweep = 0;
+        }
+        if sweeps_left > 0 {
+            if ticks_to_sweep == 0 {
+                // Inline on the driver: bounded by per-peer RPC timeouts against
+                // *registered* (live-link) peers only, and it runs only around
+                // membership events — a short reconcile pause there is fine.
+                let pending = catch_up.sweep(&placement).await;
+                sweeps_left = if pending == 0 { 0 } else { sweeps_left - 1 };
+                ticks_to_sweep = CATCH_UP_SWEEP_EVERY;
+            } else {
+                ticks_to_sweep -= 1;
+            }
+        }
     }
 }
 

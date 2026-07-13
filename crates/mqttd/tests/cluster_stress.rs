@@ -1414,6 +1414,223 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
     }
 }
 
+/// ADR 0043 P1 — the laptop→server upgrade, end to end: a SINGLE durable node
+/// accumulates acked facts (an offline durable session owed three acked `QoS 1`
+/// payloads, plus an acked retained value), the cluster grows 1→3 under it, the
+/// catch-up sweep back-fills both joiners' replica copies behind the durable
+/// caught-up watermark — and then the FOUNDER dies, taking the only pre-grow
+/// copy of that history with it. Every acked fact must survive on the pair.
+// One linear story — laptop, ack, grow, catch up, founder dies, verify — like
+// the stop/start test above; splitting it would scatter the acked facts.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+
+    // --- the laptop: one durable node, serving alone ---
+    let mut a = start_stress_node("gw-a", vec![], &dir("a")).await;
+
+    // A persistent subscriber establishes its durable session + subscription,
+    // then goes OFFLINE. On a single node, that node owns everything.
+    let sub_id = "gw-sub";
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut sub, present) = loop {
+            // Retried: a fresh single node grants its first lease (and stamps its
+            // boot catch-up watermark) within its first driver ticks.
+            if let Some(ok) = common::Client::connect_v311_within(
+                a.client_addr,
+                sub_id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "subscriber never connected");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert!(!present, "brand-new session");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ack = sub.subscribe(1, "gw/t", QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|c| *c != 0x80) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        sub.disconnect().await;
+    }
+
+    // Acked facts, all committed at replica-set {a} / quorum 1 — history that
+    // exists NOWHERE else until the catch-up back-fills it.
+    for (i, payload) in [b"gw-m1".as_slice(), b"gw-m2", b"gw-m3"].iter().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                a.client_addr,
+                &format!("gw-pub-{i}"),
+                true,
+                Duration::from_secs(20),
+            )
+            .await
+            {
+                publisher
+                    .publish("gw/t", payload, QoS::AtLeastOnce, Some(7), vec![])
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(12);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "publish {i} never acked");
+        }
+    }
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                a.client_addr,
+                "gw-rpub",
+                true,
+                Duration::from_secs(20),
+            )
+            .await
+            {
+                publisher
+                    .publish_full("gw/r", b"gw-retained", QoS::AtLeastOnce, true, Some(9))
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(12);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 9 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "retained set never acked");
+        }
+    }
+
+    // --- the upgrade: grow 1 → 3 while serving ---
+    let b = start_stress_node("gw-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("gw-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+
+    // The P1 catch-up: BOTH joiners must hold the laptop-era history — the
+    // session's queue and metadata and the retained key — gap-free and stamped
+    // current behind the durable caught-up watermark. Only then is losing the
+    // founder survivable.
+    {
+        let keys = [
+            format!("q/{sub_id}"),
+            format!("m/{sub_id}"),
+            "r/gw/r".to_string(),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let caught_up = [&b, &c].iter().all(|n| {
+                let plane = n.plane.as_ref().expect("plane alive");
+                keys.iter().all(|k| plane.replica_caught_up(k))
+            });
+            if caught_up {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "joiners never caught up on the laptop-era history (ADR 0043 P1)"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // --- the founder dies. Its disk — the only pre-grow copy — is gone. ---
+    a.kill().await;
+
+    // Recovery honesty + acked durability on the survivors: the session resumes
+    // PRESENT on its new owner and replays every acked payload.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let (mut sub, present) = loop {
+        // The session attaches on its (post-death) placement owner, once SWIM
+        // has evicted the founder and ownership settled on a survivor.
+        let owner = b.placement.read().unwrap().owner(sub_id);
+        let addr = [&b, &c]
+            .iter()
+            .find(|n| n.node_id == owner)
+            .map(|n| n.client_addr);
+        if let Some(addr) = addr {
+            if let Some(ok) =
+                common::Client::connect_v311_within(addr, sub_id, false, Duration::from_secs(10))
+                    .await
+            {
+                break ok;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscriber could not resume on the survivors after the founder died"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        present,
+        "recovery honesty: the durable session must survive the founder via the back-filled replicas"
+    );
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain_deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < 3 && Instant::now() < drain_deadline {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    for payload in [b"gw-m1".as_slice(), b"gw-m2", b"gw-m3"] {
+        assert!(
+            got.contains(payload),
+            "acked payload {:?} (committed on the 1-node cluster) lost after the founder died",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    // The acked retained value serves from the survivors too.
+    let probe_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let seen = retained_seen(b.client_addr, "gw-probe", "gw/r").await;
+        if seen.as_deref() == Some(b"gw-retained".as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < probe_deadline,
+            "acked retained value not served by the survivors (got {seen:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Bring-up gate shared by the stop/start test: full membership + full voters.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
     let deadline = Instant::now() + Duration::from_secs(60);

@@ -552,6 +552,7 @@ fn forward_inbound(
         // at the RPC timeout ("no replication quorum" on a healthy cluster).
         frame @ (PeerMessage::ReplicateAck { .. }
         | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaReadReply2 { .. }
         | PeerMessage::ReplicaKeysReply { .. }
         | PeerMessage::RaftRpcReply { .. })
             if plane.is_some() =>
@@ -732,6 +733,9 @@ fn forward_inbound(
         | PeerMessage::RaftRpcReply { .. }
         | PeerMessage::ReplicaRead { .. }
         | PeerMessage::ReplicaReadReply { .. }
+        | PeerMessage::ReplicaRead2 { .. }
+        | PeerMessage::ReplicaReadReply2 { .. }
+        | PeerMessage::ReplicaCatchUp { .. }
         | PeerMessage::ReplicaKeys { .. }
         | PeerMessage::ReplicaKeysReply { .. }) => {
             // Durable-plane frames (ADR 0006/0007): consensus RPCs and session-log

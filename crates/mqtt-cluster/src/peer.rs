@@ -37,7 +37,7 @@ pub const PROTO_MIN: u32 = 2;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 3;
+pub const PROTO_MAX: u32 = 4;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -432,6 +432,41 @@ pub enum PeerMessage {
         req_id: u64,
         /// Every replicated log key in the sender's local replica store.
         keys: Vec<String>,
+    },
+    /// A recovery read that also asks for the replica's **completeness** verdict
+    /// (ADR 0043 P1; proto 4). Sent instead of
+    /// [`ReplicaRead`](PeerMessage::ReplicaRead) to proto-4 peers; the request's
+    /// own version tells the server which reply shape the sender can decode.
+    ReplicaRead2 {
+        /// Correlates this request with its reply on the same link.
+        req_id: u64,
+        /// The log (session key) to read.
+        key: String,
+    },
+    /// The reply to a [`ReplicaRead2`](PeerMessage::ReplicaRead2): the stored
+    /// entries plus whether the copy is gap-free (ADR 0043 P1) — a recovery
+    /// merge requires at least one complete copy, so a hollow joiner (entries
+    /// above a hole it never received) contributes data but never authority.
+    ReplicaReadReply2 {
+        /// The `req_id` of the [`ReplicaRead2`](PeerMessage::ReplicaRead2) answered.
+        req_id: u64,
+        /// The replica's truncation low-water for the key.
+        watermark: u64,
+        /// Whether the replica's copy is gap-free from its low-water to its tail.
+        complete: bool,
+        /// The stored entries, in offset order.
+        entries: Vec<ReplicaEntryWire>,
+    },
+    /// A hollow replica's request that `key`'s group **owner** re-commit the
+    /// key's committed log (ADR 0043 P1; proto 4): the owner re-delivers every
+    /// committed entry through the normal fenced replication path (idempotent —
+    /// replicas keep the highest `(epoch, seq)` version per offset), closing the
+    /// requester's gap. Fire-and-forget: the requester's catch-up sweep retries
+    /// while its copy stays incomplete. A non-owner receiver ignores it (the
+    /// sweep re-resolves the owner from placement on the next pass).
+    ReplicaCatchUp {
+        /// The log key to re-commit.
+        key: String,
     },
 }
 

@@ -115,10 +115,14 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   [0028](docs/adr/0028-link-gated-voter-admission.md)). Opt out with
   `MQTTD_DURABLE_SESSIONS=0` for the bounded in-memory store. Proven by a 3-node
   integration test (an enqueue is quorum-durable across the real peer mesh).
-  **Resizing a running durable cluster (adding/removing nodes) is not yet supported**:
-  new replicas are not back-filled with existing data, so form the cluster at its
-  intended size for now — elastic grow/shrink is planned as
-  [ADR 0043](docs/adr/0043-elastic-cluster-resize.md).
+  **Growing a running durable cluster is data-safe**
+  ([ADR 0043](docs/adr/0043-elastic-cluster-resize.md) P1): a node entering a group's
+  replica set back-fills the group's history behind a durable caught-up watermark and
+  cannot anchor a recovery until it has — so growing 1→3 re-replicates a single-node
+  broker's history automatically (verified end to end: grow under acked traffic, kill
+  the founder, zero acked loss). **Planned shrink is not yet supported** (decommission,
+  0043-P3): removing nodes on purpose can still walk committed replicas out the door —
+  until P3 lands, grow and crash-replacement only.
 - **Durable single-owner retained messages** ([ADR 0037](docs/adr/0037-durable-retained-messages.md),
   on whenever durable sessions are — the default). Retained conflicts are **prevented,
   not resolved**: every retained mutation commits through its topic's group lease-owner
