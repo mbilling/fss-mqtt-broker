@@ -588,6 +588,52 @@ mod tests {
         assert!(transport.read_replica(&b, "k").await.is_none());
     }
 
+    /// The rolling-upgrade proto window (ADR 0039 / ADR 0043 P4): catch-up
+    /// requests are version-gated per LINK, so a mixed-proto mesh degrades
+    /// honestly instead of sending frames a peer cannot decode. A proto-3 peer
+    /// receives no `ReplicaCatchUp` (P1's sweep keeps retrying — pending, not
+    /// wrong), a proto-4 peer receives no `ReplicaCatchUpTo` (P3's drain stays
+    /// pending — the decommission waits out the upgrade rather than lying),
+    /// and current peers receive both.
+    #[tokio::test]
+    async fn catch_up_requests_are_proto_gated_per_link() {
+        let transport = PeerReplicaTransport::new();
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        let (mid_tx, mut mid_rx) = mpsc::unbounded_channel();
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        transport.register(n("old"), old_tx, 3);
+        transport.register(n("mid"), mid_tx, 4);
+        transport.register(n("new"), new_tx, crate::peer::PROTO_MAX);
+
+        transport.request_catch_up(&n("old"), "q/c");
+        transport.request_catch_up_to(&n("old"), "q/c", &n("x"));
+        transport.request_catch_up(&n("mid"), "q/c");
+        transport.request_catch_up_to(&n("mid"), "q/c", &n("x"));
+        transport.request_catch_up(&n("new"), "q/c");
+        transport.request_catch_up_to(&n("new"), "q/c", &n("x"));
+
+        assert!(
+            old_rx.try_recv().is_err(),
+            "a proto-3 peer receives no catch-up frame of either kind"
+        );
+        assert!(
+            matches!(mid_rx.try_recv(), Ok(PeerMessage::ReplicaCatchUp { .. })),
+            "a proto-4 peer serves P1 catch-up"
+        );
+        assert!(
+            mid_rx.try_recv().is_err(),
+            "…but receives no targeted (proto-5) request"
+        );
+        assert!(matches!(
+            new_rx.try_recv(),
+            Ok(PeerMessage::ReplicaCatchUp { .. })
+        ));
+        assert!(
+            matches!(new_rx.try_recv(), Ok(PeerMessage::ReplicaCatchUpTo { target, .. }) if target == "x"),
+            "a current peer serves the targeted request"
+        );
+    }
+
     /// If a replica's link drops with a request in flight, `fail_node` resolves it
     /// to `false` rather than hanging forever.
     #[tokio::test]

@@ -41,7 +41,9 @@
 //! never materializes the whole queue.
 
 use crate::repl::{ReplError, ReplicatedLog};
-use crate::{Enqueued, QueueLimits, QueuedMessage, SessionClaim, SessionStore, StorageError};
+use crate::{
+    Enqueued, QueueLimits, QueuedMessage, SessionClaim, SessionScan, SessionStore, StorageError,
+};
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
 use std::collections::BTreeSet;
@@ -338,29 +340,37 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         Ok(out)
     }
 
-    async fn all_sessions(
-        &self,
-    ) -> Result<Vec<(ClientId, Vec<Subscription>, Option<u64>)>, StorageError> {
+    async fn all_sessions(&self) -> Result<SessionScan, StorageError> {
         // Enumerate the metadata keys this node holds (`m/{client}`) with their full
         // snapshots. Off the hot path — used at takeover to materialize inherited
         // sessions before their clients re-attach (ADR 0042 T9, exhibit ⑥). The keys
         // span every group this node REPLICATES, not just those it owns; the caller
         // filters by ownership.
         let mut out = Vec::new();
+        let mut complete = true;
         for key in self.log.keys().await? {
             let Some(id) = key.strip_prefix("m/") else {
                 continue;
             };
             let client = ClientId(id.to_string());
-            // A per-key error is skipped, not fatal: `NotOwner` is the common case
-            // (a replica copy held for another node — its owner materializes it),
-            // and a transient `NoQuorum`/`Unavailable` retries on the next scan.
-            // Reading an OWNED key eagerly recovers its cold group — intended.
-            if let Ok(Some(meta)) = self.load_meta(&client).await {
-                out.push((client, meta.subscriptions, meta.session_expiry_at));
+            // A per-key error is skipped, not fatal — but the KIND matters
+            // (0043-P4 exhibit ②): `NotOwner` is a clean skip (a replica copy
+            // held for another node — its owner materializes it), while a
+            // NoQuorum/Unavailable/Backend skip means a session THIS scan should
+            // have seen could not be read yet, so the scan is INCOMPLETE — the
+            // caller must not treat its view as the whole truth (and must not
+            // gossip an interest snapshot built from it). Reading an OWNED key
+            // eagerly recovers its cold group — intended.
+            match self.load_meta(&client).await {
+                Ok(Some(meta)) => out.push((client, meta.subscriptions, meta.session_expiry_at)),
+                Ok(None) | Err(StorageError::NotOwner) => {}
+                Err(_) => complete = false,
             }
         }
-        Ok(out)
+        Ok(SessionScan {
+            sessions: out,
+            complete,
+        })
     }
 
     async fn reserve_packet_ids(&self, client: &ClientId, count: u16) -> Result<u16, StorageError> {

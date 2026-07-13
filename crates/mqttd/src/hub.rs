@@ -803,6 +803,10 @@ pub enum HubCommand {
     InheritedSessions {
         /// `(client, subscriptions, expiry deadline)` per stored session.
         sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+        /// Whether the scan saw everything (0043-P4 exhibit ②): `false` when a
+        /// key was skipped for a transient reason — the view may be missing
+        /// sessions, so it must not settle the interest-authoritative flag.
+        complete: bool,
     },
     /// Liveness probe (the health endpoint): the hub replies as soon as the actor
     /// loop dequeues this command, proving the loop is draining and not wedged.
@@ -823,6 +827,13 @@ struct Peer {
     cert_serial: Option<Vec<u8>>,
     /// The peer-bus protocol version negotiated on the link (ADR 0038).
     proto: u32,
+    /// Whether this peer has sent an interest snapshot since the link formed
+    /// (0043-P4 exhibit ②). A freshly-booted peer SUPPRESSES its snapshot until
+    /// its own routing view is authoritative — so until one arrives, this node
+    /// cannot distinguish "the peer routes nothing" from "the peer has not
+    /// finished recovering what it routes", and a gated ack must not conclude
+    /// "nobody is owed this" (see [`Hub::mesh_settled`]).
+    interest_synced: bool,
 }
 
 /// The smaller of two `QoS` levels (delivery downgrade rule [MQTT-3.8.4-6]).
@@ -835,6 +846,10 @@ fn min_qos(a: QoS, b: QoS) -> QoS {
 }
 
 /// The broker routing actor.
+// Several independent one-way/observable state flags (brownout, scan-in-flight,
+// interest authority, cluster-configuredness) — orthogonal facts about one actor,
+// not an encoded state machine, so bools are the honest representation.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct Hub {
     rx: mpsc::UnboundedReceiver<HubCommand>,
@@ -942,6 +957,32 @@ pub struct Hub {
     /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
     /// exhibit ⑥) — one at a time.
     inherited_scan_inflight: bool,
+    /// Whether this hub's interest gossip is AUTHORITATIVE (0043-P4 exhibit ②):
+    /// a fresh hub's routing table is empty until its boot scan materializes the
+    /// durable sessions it owns, and gossiping that emptiness ERASES what peers
+    /// still correctly know from before a fast restart (one quicker than SWIM
+    /// death confirmation — no membership change, no takeover window anywhere).
+    /// Until the first COMPLETE scan lands over a whole mesh, no interest
+    /// snapshot is sent; peers keep their prior knowledge, their forwards keep
+    /// flowing, and this node answers ones it cannot yet serve with a retriable
+    /// refusal instead of a void OK.
+    interest_authoritative: bool,
+    /// Sweep ticks spent suppressed (liveness backstop: a node whose scans never
+    /// complete — quorum lost for good — eventually gossips its live-only
+    /// interest, loudly, rather than isolating its live clients forever).
+    interest_suppressed_ticks: u32,
+    /// Whether the LAST inherited-session scan saw everything (0043-P4 exhibit
+    /// ②): while it skipped keys — a restarted owner whose lease has not been
+    /// reassigned back yet, a group mid-recovery — this node's routing view is
+    /// missing sessions it owns, and a gated ack must not conclude "nobody is
+    /// owed this" no matter how many window ticks have elapsed. The settle
+    /// window closes on this OBSERVABLE state, never on time alone.
+    last_scan_complete: bool,
+    /// Whether peer networking is configured (set at startup, before `run`):
+    /// the stable half of [`clustered`](Self::clustered) — a restarted cluster
+    /// node must not be mistaken for a standalone broker while SWIM re-learns
+    /// its members (0043-P4 exhibit ②).
+    cluster_configured: bool,
     /// Sweep ticks remaining of eager takeover reconciliation: set on `PeerDead`
     /// so inherited sessions materialize within seconds, not on the slow
     /// [`EXPIRY_RECONCILE_EVERY`] cadence.
@@ -1221,6 +1262,10 @@ impl Hub {
                 forward_seq: 0,
                 forward_index: HashMap::new(),
                 inherited_scan_inflight: false,
+                interest_authoritative: false,
+                interest_suppressed_ticks: 0,
+                last_scan_complete: false,
+                cluster_configured: false,
                 // A boot window (like the post-PeerDead takeover window): a
                 // restarted or newly-joined node may already own groups with
                 // orphaned sessions, and eagerly recovering them BEFORE workload
@@ -1246,6 +1291,14 @@ impl Hub {
     /// peer (de)registration on the plane. Only set when durable sessions are on.
     pub fn attach_durable_plane(&mut self, plane: DurablePlane) {
         self.durable_plane = Some(plane);
+    }
+
+    /// Mark this node CLUSTER-CONFIGURED before [`run`](Self::run) — peer
+    /// networking (SWIM/peer bind/static peers) is set up, so the cluster
+    /// honesty gates apply from the first moment, not only once SWIM has
+    /// (re-)learned a second member (0043-P4 exhibit ②).
+    pub fn set_cluster_configured(&mut self) {
+        self.cluster_configured = true;
     }
 
     /// Replace the retained-message store before [`run`](Self::run) — used to swap the
@@ -1486,9 +1539,17 @@ impl Hub {
                 // after the local fan-out, durable offline enqueues included. A
                 // retransmission is delivered again (duplicates are legal at QoS 1),
                 // so no receiver dedup state is needed.
-                let ok = self
+                //
+                // A fan-out that matched NOBODY while this node's routing view is
+                // still settling (mid-boot, a takeover/membership window, a moved
+                // session just released) answers `ok = false` (0043-P4 exhibit ②):
+                // the sender forwarded because interest said someone here is owed
+                // this, and "I found no one" is not yet a claim this node can stand
+                // behind — the refusal makes the publisher retry until it is.
+                let (durable_ok, matched) = self
                     .deliver(&topic, &payload, qos, retain, message_expiry, &app)
                     .await;
+                let ok = durable_ok && !(matched == 0 && self.routing_unsettled());
                 if let Some(peer) = self.peers.get(&node) {
                     let _ = peer.tx.send(PeerMessage::PublishAck { seq, ok });
                 }
@@ -1509,7 +1570,8 @@ impl Hub {
                 // later local subscriber sees it (ADR 0014). The publisher's message
                 // expiry is carried over the link (ADR 0014 T9), so a queued cross-node
                 // copy keeps the same deadline. User Properties ride along (ADR 0030).
-                self.deliver(&topic, &payload, qos, retain, message_expiry, &app)
+                let _ = self
+                    .deliver(&topic, &payload, qos, retain, message_expiry, &app)
                     .await;
             }
             HubCommand::PeerConnected {
@@ -1542,8 +1604,8 @@ impl Hub {
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
             }
-            HubCommand::InheritedSessions { sessions } => {
-                self.inherit_sessions(sessions).await;
+            HubCommand::InheritedSessions { sessions, complete } => {
+                self.inherit_sessions(sessions, complete).await;
             }
             HubCommand::Ping { reply } => {
                 // Reached the loop → it is live. The receiver may be gone if the
@@ -1552,6 +1614,18 @@ impl Hub {
             }
             HubCommand::RemoteInterest { node, filters } => {
                 debug!(node = %node.0, filters = filters.len(), "remote interest updated");
+                // The peer's view is AUTHORITATIVE (it never gossips before it
+                // is — 0043-P4 exhibit ②): its link now counts toward
+                // `mesh_settled`, and a scan can settle held publishes against
+                // its (possibly new) interest.
+                if let Some(peer) = self.peers.get_mut(&node) {
+                    if !peer.interest_synced {
+                        peer.interest_synced = true;
+                        if !self.pending_publishes.is_empty() {
+                            self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
+                        }
+                    }
+                }
                 self.remote_interest
                     .insert(node, filters.into_iter().collect());
             }
@@ -1723,7 +1797,7 @@ impl Hub {
         app: &AppProperties,
         gate: Option<u64>,
     ) -> bool {
-        let durable_ok = self
+        let (durable_ok, _matched) = self
             .deliver(topic, payload, qos, retain, message_expiry, app)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
@@ -1756,7 +1830,11 @@ impl Hub {
     /// for local publishes (via
     /// [`publish`](Self::publish)) and for publishes received from a peer, which must
     /// never be re-forwarded.
-    /// Returns `false` when a durable offline enqueue failed (ADR 0041 T5).
+    /// Returns `(durable_ok, matched)`: `durable_ok = false` when a durable
+    /// offline enqueue failed (ADR 0041 T5), and `matched` is how many local
+    /// ordinary subscribers the topic found — a gated forward answered from a
+    /// zero-match fan-out while the routing view is unsettled must refuse, not
+    /// OK (0043-P4 exhibit ②).
     async fn deliver(
         &mut self,
         topic: &str,
@@ -1765,7 +1843,7 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) -> bool {
+    ) -> (bool, usize) {
         // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
         // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
         // untokened) flag here is exactly the everyday-race divergence the ADR removes.
@@ -2293,7 +2371,7 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) -> bool {
+    ) -> (bool, usize) {
         let targets: Vec<(ClientId, QoS)> = self
             .table
             .matching_clients(topic)
@@ -2304,6 +2382,7 @@ impl Hub {
             })
             .collect();
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
+        let matched = targets.len();
         let mut all_durable = true;
         for (c, granted) in targets {
             all_durable &= self
@@ -2317,7 +2396,7 @@ impl Hub {
                 )
                 .await;
         }
-        all_durable
+        (all_durable, matched)
     }
 
     /// Deliver one message to a single named recipient: live if online (tracking
@@ -3052,6 +3131,25 @@ impl Hub {
             }
         }
 
+        // Liveness backstop for the interest-authoritative gate (0043-P4 exhibit
+        // ②): a node whose scans NEVER complete (quorum lost for good) must not
+        // isolate its live clean-session clients forever — after a generous bound
+        // it gossips its live-only interest, loudly. In this degraded state the
+        // durable sessions it is hiding cannot be durably enqueued-to anywhere
+        // anyway (the same lost quorum withholds those acks).
+        if !self.interest_authoritative {
+            self.interest_suppressed_ticks += 1;
+            if self.interest_suppressed_ticks >= EXPIRY_RECONCILE_EVERY {
+                warn!(
+                    ticks = self.interest_suppressed_ticks,
+                    "interest gossip forced authoritative: the boot session scan never \
+                     completed (degraded durable plane?) — advertising live interest only"
+                );
+                self.interest_authoritative = true;
+                self.gossip_interest();
+            }
+        }
+
         // Periodically inherit sessions this node did not see disconnect — those handed
         // to it by a takeover: their persisted expiry deadlines (ADR 0009 §3) AND their
         // routing subscriptions (ADR 0042 T9, exhibit ⑥). Eagerly for a few ticks after
@@ -3097,15 +3195,26 @@ impl Hub {
         let tx = self.self_tx.clone();
         debug!("inherited-session scan started");
         tokio::spawn(async move {
-            let sessions = match store.all_sessions().await {
+            let scan = match store.all_sessions().await {
                 Ok(v) => v,
                 Err(e) => {
                     debug!(error = %e, "inherited-session scan failed; retried next tick");
-                    Vec::new()
+                    // A failed enumeration saw nothing — emphatically not complete.
+                    mqtt_storage::SessionScan {
+                        sessions: Vec::new(),
+                        complete: false,
+                    }
                 }
             };
-            debug!(sessions = sessions.len(), "inherited-session scan finished");
-            let _ = tx.send(HubCommand::InheritedSessions { sessions });
+            debug!(
+                sessions = scan.sessions.len(),
+                complete = scan.complete,
+                "inherited-session scan finished"
+            );
+            let _ = tx.send(HubCommand::InheritedSessions {
+                sessions: scan.sessions,
+                complete: scan.complete,
+            });
         });
     }
 
@@ -3120,8 +3229,18 @@ impl Hub {
     async fn inherit_sessions(
         &mut self,
         sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+        complete: bool,
     ) {
         self.inherited_scan_inflight = false;
+        self.last_scan_complete = complete;
+        // The interest-authoritative transition (0043-P4 exhibit ②): once one
+        // COMPLETE scan has landed over a WHOLE mesh, this hub's routing table
+        // reflects every durable session it owns, and its interest snapshots
+        // stop being lies of omission — gossip opens (below and from now on).
+        if !self.interest_authoritative && complete && self.mesh_whole() {
+            self.interest_authoritative = true;
+            debug!("interest gossip authoritative: first complete whole-mesh session scan landed");
+        }
         let mut registered = false;
         for (client, subs, deadline) in sessions {
             // Skip ones already handled (online or attaching here) and ones this
@@ -3167,9 +3286,11 @@ impl Hub {
             debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
             registered = true;
         }
-        if registered {
+        if registered || self.interest_authoritative {
             // Peers must know this node now routes the inherited filters — this is
             // what re-targets acked forwards after a takeover (exhibit ⑤ re-route).
+            // Sent unconditionally once authoritative: peers that connected while
+            // gossip was suppressed have no snapshot yet (0043-P4 exhibit ②).
             self.gossip_interest();
         }
         self.release_moved_sessions();
@@ -3270,9 +3391,13 @@ impl Hub {
         // is not enough — the group leases reassign for seconds after the death,
         // and a scan that ran before a lease landed saw nothing. Every scan in
         // the window re-delivers (duplicates are legal); the last one releases.
-        // And never on a broken mesh: an unreachable-but-alive peer may hold
-        // interest this node cannot see (seed 4).
-        let window_over = self.takeover_reconcile_ticks == 0 && self.mesh_whole();
+        // Never on a broken mesh (an unreachable-but-alive peer may hold
+        // interest this node cannot see — T4 seed 4), and never on TIME alone
+        // while the last scan still SKIPPED sessions (0043-P4 exhibit ②: a
+        // restarted owner whose lease reassignment outlives the tick window
+        // must keep holding, not ack into the void) — `routing_unsettled` is
+        // the one observable-state predicate for all of it.
+        let window_over = !self.routing_unsettled();
         for id in held {
             if !self.redeliver_pending(id).await {
                 // The re-delivery's durable append failed terminally: withhold.
@@ -3320,14 +3445,60 @@ impl Hub {
             .all(|m| self.peers.contains_key(m))
     }
 
-    /// Whether this node runs in a multi-node cluster (placement with >1 member).
+    /// Whether this node's ROUTING VIEW is still settling (ADR 0042 T9 /
+    /// 0043 P2/P4): a takeover or membership window is open, a session scan is
+    /// in flight, the mesh is not whole, or this hub's own boot scan has not
+    /// yet made its interest authoritative. While true, "I found no interested
+    /// party" is an unsafe conclusion — for gating a local publish's ack
+    /// (`register_pending`) and for answering a peer's gated forward that
+    /// matched nothing here (the receiver-side twin). Only meaningful on a
+    /// multi-node cluster.
+    fn routing_unsettled(&self) -> bool {
+        self.clustered()
+            && (self.takeover_reconcile_ticks > 0
+                || self.inherited_scan_inflight
+                || !self.interest_authoritative
+                || !self.last_scan_complete
+                || !self.mesh_settled())
+    }
+
+    /// [`mesh_whole`](Self::mesh_whole), strengthened (0043-P4 exhibit ②):
+    /// every membership-alive peer has a live link AND has sent an interest
+    /// snapshot on it. A freshly-restarted peer suppresses its snapshot until
+    /// its own routing view is authoritative — so until it speaks, this node
+    /// cannot tell "it routes nothing" from "it has not finished recovering
+    /// what it routes", and no gated ack may conclude "nobody is owed this".
+    fn mesh_settled(&self) -> bool {
+        let Some(placement) = &self.placement else {
+            return true;
+        };
+        let members: Vec<NodeId> = {
+            let p = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.members()
+        };
+        members
+            .iter()
+            .filter(|m| **m != self.node_id)
+            .all(|m| self.peers.get(m).is_some_and(|p| p.interest_synced))
+    }
+
+    /// Whether this node is part of a cluster: peer networking is CONFIGURED
+    /// (set at startup), or the live placement already shows more than one
+    /// member. The configured flag matters on a freshly (re)started node
+    /// (0043-P4 exhibit ②): for its first moments it sees a single-member ring
+    /// — indistinguishable, by membership alone, from a standalone broker —
+    /// and judging by live membership would switch every cluster honesty gate
+    /// off exactly while its view is at its most incomplete.
     fn clustered(&self) -> bool {
-        self.placement.as_ref().is_some_and(|p| {
-            p.read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .member_count()
-                > 1
-        })
+        self.cluster_configured
+            || self.placement.as_ref().is_some_and(|p| {
+                p.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .member_count()
+                    > 1
+            })
     }
 
     /// Whether this node is the placement owner of `client`'s session. Outside a cluster
@@ -3589,10 +3760,7 @@ impl Hub {
                 // Only meaningful on a multi-node cluster: a standalone node has
                 // no takeovers, and holding its boot-time acks would just delay
                 // every early publish for nothing.
-                awaiting_settle: self.clustered()
-                    && (self.takeover_reconcile_ticks > 0
-                        || self.inherited_scan_inflight
-                        || !self.mesh_whole()),
+                awaiting_settle: self.routing_unsettled(),
             },
         );
         id
@@ -4022,13 +4190,19 @@ impl Hub {
     ) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest + shared membership so the peer can route to us
-        // immediately (ordinary fan-out and cluster-wide shared selection, ADR 0015).
-        let _ = tx.send(PeerMessage::Interest {
-            filters: self.local_interest(),
-        });
-        let _ = tx.send(PeerMessage::SharedInterest {
-            groups: self.shared_snapshot(),
-        });
+        // immediately (ordinary fan-out and cluster-wide shared selection, ADR 0015)
+        // — unless this hub is fresh and its boot scan has not yet landed: an EMPTY
+        // snapshot from a mid-boot hub erases interest the peer still correctly
+        // holds from before a fast restart (0043-P4 exhibit ②). The peer keeps its
+        // prior knowledge; the real snapshot follows when the scan settles.
+        if self.interest_authoritative {
+            let _ = tx.send(PeerMessage::Interest {
+                filters: self.local_interest(),
+            });
+            let _ = tx.send(PeerMessage::SharedInterest {
+                groups: self.shared_snapshot(),
+            });
+        }
         // Register the link with the durable plane (consensus + replication) so its
         // RPCs to this peer route over the same channel.
         if let Some(plane) = &self.durable_plane {
@@ -4041,6 +4215,7 @@ impl Hub {
                 tx,
                 cert_serial,
                 proto,
+                interest_synced: false,
             },
         );
         // A link (re)forming while gated publishes are held: schedule a scan so
@@ -4188,7 +4363,11 @@ impl Hub {
     /// Gossip this node's ordinary interest and shared membership to all peers.
     /// Called whenever local subscriptions change.
     fn gossip_interest(&self) {
-        if self.peers.is_empty() {
+        // No snapshots from a hub that cannot stand behind them (0043-P4
+        // exhibit ②): until the boot scan has materialized every owned durable
+        // session, an interest snapshot is a lie of omission that ERASES what
+        // peers still correctly advertise-to and forward for.
+        if !self.interest_authoritative || self.peers.is_empty() {
             return;
         }
         let filters = self.local_interest();
@@ -5324,6 +5503,20 @@ mod tests {
         }
     }
 
+    /// [`recv_peer`], additionally skipping the link-up handshake frames whose
+    /// ORDER is not fixed: interest snapshots (which since 0043-P4 exhibit ②
+    /// follow the boot scan instead of leading the link) and retained digest
+    /// offers. For tests about data frames; tests about the handshake itself
+    /// keep using [`recv_peer`].
+    async fn recv_peer_data(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> Option<PeerMessage> {
+        loop {
+            match recv_peer(rx).await {
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => return other,
+            }
+        }
+    }
+
     fn payload_of(packet: &Packet) -> &[u8] {
         match packet {
             Packet::Publish(p) => &p.payload,
@@ -5805,17 +5998,18 @@ mod tests {
         publish_retained(&tx, "t", b"r");
         let mut peer = connect_peer(&tx, "n", 1);
 
-        // The peer gets our interest snapshot, then our retained digest.
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::Interest { .. })
-        ));
-        match recv_peer(&mut peer).await {
-            Some(PeerMessage::RetainedDigest { count, hash, .. }) => {
-                assert_eq!(count, 1);
-                assert_ne!(hash, 0, "one topic hashes to a non-zero digest");
+        // The peer gets our retained digest at link-up (the interest snapshot
+        // arrives on its own schedule — after the boot scan — and is skipped).
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedDigest { count, hash, .. }) => {
+                    assert_eq!(count, 1);
+                    assert_ne!(hash, 0, "one topic hashes to a non-zero digest");
+                    break;
+                }
+                Some(PeerMessage::Interest { .. }) => {}
+                other => panic!("expected RetainedDigest, got {other:?}"),
             }
-            other => panic!("expected RetainedDigest, got {other:?}"),
         }
 
         // The peer's set differed, so it pulls — and gets the snapshot.
@@ -5823,7 +6017,7 @@ mod tests {
             node: NodeId("n".into()),
         })
         .unwrap();
-        match recv_peer(&mut peer).await {
+        match recv_peer_data(&mut peer).await {
             Some(PeerMessage::RetainedSnapshot { messages }) => {
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].topic, "t");
@@ -5840,14 +6034,6 @@ mod tests {
         let tx = start_hub();
         publish_retained(&tx, "t", b"r");
         let mut peer = connect_peer(&tx, "n", 1);
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::Interest { .. })
-        ));
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::RetainedDigest { .. })
-        ));
 
         // The peer claims the same single (topic, value, qos) we hold: same digest, no pull.
         let (count, hash, value_hash) =
@@ -5859,9 +6045,12 @@ mod tests {
             value_hash,
         })
         .unwrap();
-        // Nothing further arrives on the link (probe with a bounded wait).
-        let quiet =
-            tokio::time::timeout(std::time::Duration::from_millis(200), recv_peer(&mut peer)).await;
+        // No retained transfer follows — only the (order-free) handshake frames.
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            recv_peer_data(&mut peer),
+        )
+        .await;
         assert!(quiet.is_err(), "matching digests must transfer nothing");
     }
 
@@ -5871,14 +6060,6 @@ mod tests {
         let tx = start_hub();
         publish_retained(&tx, "t", b"r");
         let mut peer = connect_peer(&tx, "n", 1);
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::Interest { .. })
-        ));
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::RetainedDigest { .. })
-        ));
 
         // The peer holds a different set: we answer its digest with a pull.
         let (count, hash, value_hash) = super::retained_digest(
@@ -5896,7 +6077,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            recv_peer(&mut peer).await,
+            recv_peer_data(&mut peer).await,
             Some(PeerMessage::RetainedRequest)
         ));
     }
@@ -5909,14 +6090,6 @@ mod tests {
         let tx = start_hub();
         publish_retained(&tx, "t", b"ours");
         let mut peer = connect_peer(&tx, "n", 1);
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::Interest { .. })
-        ));
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::RetainedDigest { .. })
-        ));
 
         // Same single topic, different value: set hash matches, value hash differs.
         let (count, hash, value_hash) =
@@ -5929,7 +6102,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            recv_peer(&mut peer).await,
+            recv_peer_data(&mut peer).await,
             Some(PeerMessage::RetainedRequest)
         ));
     }
@@ -7373,7 +7546,7 @@ mod tests {
                     assert_eq!(payload, b"v1");
                     break seq;
                 }
-                Some(PeerMessage::Interest { .. }) => {}
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
                 other => panic!("unexpected peer frame {other:?}"),
             }
         };
@@ -7382,7 +7555,7 @@ mod tests {
         // the clock, so sweep-tick retransmissions of v1 can legitimately land in
         // this window; what must never appear is a different seq.)
         loop {
-            match recv_peer(&mut peer).await {
+            match recv_peer_data(&mut peer).await {
                 None => break,
                 Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
                     assert_eq!(payload, b"v1");
@@ -7397,7 +7570,7 @@ mod tests {
 
         // Unanswered: the sweep tick retransmits with the SAME seq.
         tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
-        match recv_peer(&mut peer).await {
+        match recv_peer_data(&mut peer).await {
             Some(PeerMessage::RetainedCommit { payload, seq, .. }) => {
                 assert_eq!(payload, b"v1");
                 assert_eq!(
@@ -7416,7 +7589,7 @@ mod tests {
         })
         .unwrap();
         loop {
-            match recv_peer(&mut peer).await {
+            match recv_peer_data(&mut peer).await {
                 // Late retransmissions of the acked handoff may already be in the
                 // channel (one per elapsed sweep) — the owner-side dedup would
                 // swallow them; the test just skips past.
@@ -7438,10 +7611,6 @@ mod tests {
     async fn an_owner_dedups_a_retransmitted_handoff() {
         let (tx, durable, _placement) = start_hub_with_durable_retained(&[]);
         let mut peer = connect_peer(&tx, "n", 1);
-        assert!(matches!(
-            recv_peer(&mut peer).await,
-            Some(PeerMessage::Interest { .. })
-        ));
 
         let send = |seq: u64| {
             tx.send(HubCommand::RemoteRetainedCommit {
@@ -7463,7 +7632,7 @@ mod tests {
         // The committed handoff answers: fan-out first, then the commit-gated ack.
         let mut acked = 0;
         for _ in 0..2 {
-            match recv_peer(&mut peer).await {
+            match recv_peer_data(&mut peer).await {
                 Some(PeerMessage::RetainedUpdate { offset, .. }) => assert_eq!(offset, 1),
                 Some(PeerMessage::RetainedCommitAck { seq, token }) => {
                     assert_eq!((seq, token), (7, Some((0, 1))));
@@ -7476,7 +7645,7 @@ mod tests {
 
         // A late retransmission (ack was lost): re-acked from `seen`, no recommit.
         send(7);
-        match recv_peer(&mut peer).await {
+        match recv_peer_data(&mut peer).await {
             Some(PeerMessage::RetainedCommitAck { seq, token }) => {
                 assert_eq!((seq, token), (7, Some((0, 1))));
             }
@@ -7541,7 +7710,7 @@ mod tests {
         let seq = loop {
             match recv_peer(&mut peer).await {
                 Some(PeerMessage::RetainedCommit { seq, .. }) => break seq,
-                Some(PeerMessage::Interest { .. }) => {}
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
                 other => panic!("unexpected peer frame {other:?}"),
             }
         };
@@ -7999,11 +8168,10 @@ mod tests {
     async fn forwarded_publish_carries_message_expiry() {
         let tx = start_hub();
         let mut p1 = connect_peer(&tx, "n1", 1);
-        recv_peer(&mut p1).await; // initial interest snapshot
         remote_interest(&tx, "n1", &["a/#"]);
 
         publish_with_expiry(&tx, "a/x", b"ttl", Some(45));
-        match recv_peer(&mut p1).await {
+        match recv_peer_data(&mut p1).await {
             Some(PeerMessage::Publish {
                 topic,
                 message_expiry,
@@ -8023,19 +8191,17 @@ mod tests {
         let tx = start_hub();
         let mut p1 = connect_peer(&tx, "n1", 1);
         let mut p2 = connect_peer(&tx, "n2", 2);
-        recv_peer(&mut p1).await; // initial interest snapshots
-        recv_peer(&mut p2).await;
         remote_interest(&tx, "n1", &["a/+/b"]);
         remote_interest(&tx, "n2", &["x/#"]);
 
         publish(&tx, "a/q/b", b"to-n1");
-        match recv_peer(&mut p1).await {
+        match recv_peer_data(&mut p1).await {
             Some(PeerMessage::Publish { topic, .. }) => assert_eq!(topic, "a/q/b"),
             other => panic!("n1 should receive the publish, got {other:?}"),
         }
 
         publish(&tx, "x/1", b"to-n2");
-        match recv_peer(&mut p2).await {
+        match recv_peer_data(&mut p2).await {
             Some(PeerMessage::Publish { topic, .. }) => assert_eq!(topic, "x/1"),
             other => panic!("n2 should receive the publish, got {other:?}"),
         }
@@ -8050,9 +8216,16 @@ mod tests {
             app: AppProperties::default(),
         })
         .unwrap();
-        // Neither peer may see anything further (n1's non-match included).
-        assert!(recv_peer(&mut p2).await.is_none(), "remote publish relayed");
-        assert!(p1.try_recv().is_err(), "n1 got a non-matching publish");
+        // Neither peer may see any further DATA frame (n1's non-match included;
+        // late handshake frames are order-free and skipped).
+        assert!(
+            recv_peer_data(&mut p2).await.is_none(),
+            "remote publish relayed"
+        );
+        assert!(
+            recv_peer_data(&mut p1).await.is_none(),
+            "n1 got a non-matching publish"
+        );
     }
 
     /// Local interest changes (subscribe / unsubscribe / clean-session detach)

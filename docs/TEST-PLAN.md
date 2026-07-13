@@ -85,11 +85,15 @@ question ([ADR 0042](adr/0042-durable-plane-stress-harness.md)):
   cluster (production wiring + a severable relay per node) under seed-composed fault
   schedules — owner kills, restarts over surviving data dirs, asymmetric link flaps,
   disk write-fault injection, brownout entry/exit, client churn — against an
-  obligations ledger of **acked facts only**, judged post-quiesce by the catalog. A
-  separate test power-cycles the whole cluster, and another grows 1→3 under acked
-  facts then kills the founder (the ADR 0043 P1 catch-up path). The seed reproduces
-  the *scenario* (tokio/I-O timing is real); every failure prints the seed and full
-  schedule trace.
+  obligations ledger of **acked facts only**, judged post-quiesce by the catalog. The
+  schedules also compose **resize** (ADR 0043 P4): seeded `join` steps grow the
+  cluster mid-schedule and seeded `decommission` steps drain-then-leave (aborting
+  honestly when the drain cannot converge under the running faults). Dedicated path
+  tests cover the whole-cluster power cycle, grow 1→3 then kill the founder (P1),
+  grow with a moved session and no deaths (P2), a 4-node decommission (P3), 3→5
+  with live zone labels then losing two originals, 5→3 via two drains, and the
+  rolling host replacement. The seed reproduces the *scenario* (tokio/I-O timing is
+  real); every failure prints the seed and full schedule trace.
 
 **Profiles:** every push runs the CI profile (1000 sim seeds; 1 stress seed, ~60–90 s;
 the stop/start test, ~10 s) inside `cargo test --all`. Soak runs opt in via env:

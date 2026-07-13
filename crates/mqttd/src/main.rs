@@ -915,6 +915,14 @@ async fn start_hub(
     // Durable is the **default** (ADR 0029): the consensus-backed replicated store is on
     // unless explicitly opted out. `0/false/off/no` selects the lightweight in-memory store.
     let durable = durable_enabled(non_empty_env("MQTTD_DURABLE_SESSIONS").as_deref());
+    // Cluster-configured = peer networking is set up. Told to the hub explicitly
+    // (0043-P4 exhibit ②): a restarted cluster node sees a single-member ring for
+    // its first moments, and judging "clustered" by live membership would switch
+    // every cluster honesty gate off exactly while its view is most incomplete.
+    let cluster_configured = non_empty_env("MQTTD_PEER_BIND").is_some()
+        || non_empty_env("MQTTD_PEERS").is_some()
+        || non_empty_env("MQTTD_SWIM_BIND").is_some()
+        || non_empty_env("MQTTD_SWIM_SEEDS").is_some();
     if durable {
         // A node started with no SWIM seeds is the cluster founder — only it
         // bootstraps the lease group (ADR 0007 §2). Exactly one founder per cluster.
@@ -953,6 +961,9 @@ async fn start_hub(
             store.clone(),
             Some(placement.clone()),
         );
+        if cluster_configured {
+            hub.set_cluster_configured();
+        }
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
         hub.attach_durable_plane(plane);
@@ -985,6 +996,9 @@ async fn start_hub(
             store.clone(),
             Some(placement.clone()),
         );
+        if cluster_configured {
+            hub.set_cluster_configured();
+        }
         hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
         hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
@@ -997,6 +1011,9 @@ async fn start_hub(
             store.clone(),
             Some(placement.clone()),
         );
+        if cluster_configured {
+            hub.set_cluster_configured();
+        }
         hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
