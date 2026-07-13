@@ -1631,6 +1631,165 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
     }
 }
 
+/// ADR 0043 P2 — eager migration on ring change, no deaths involved: an offline
+/// durable session's group MOVES to a joiner when the cluster grows 1→3, and
+/// publishes acked **after** the grow (never touched by any client) must land in
+/// the moved session's durable queue via the new owner's eager materialization —
+/// an ack released while the moved session was materialized nowhere would be an
+/// ack into the void (exhibit ⑥'s shape, reopened by resize). The subscriber then
+/// resumes on the NEW owner and must replay both the pre-grow and post-grow
+/// acked payloads.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+
+    // A subscriber whose session the founder owns alone but a JOINER owns in the
+    // grown ring — the moved-ownership case P2 exists for.
+    let sub_id = {
+        let a = NodeId("em-a".to_string());
+        let mut grown = Placement::new(a.clone(), DEFAULT_REPLICAS);
+        for j in ["em-b", "em-c"] {
+            grown.observe(
+                &NodeId(j.to_string()),
+                mqtt_cluster::swim::MemberState::Alive,
+                "x:7000",
+                None,
+            );
+        }
+        (0..100_000)
+            .map(|i| format!("em-sub-{i}"))
+            .find(|c| grown.owner(c) != a)
+            .expect("some session moves to a joiner")
+    };
+
+    // --- the laptop: establish the durable session, ack two payloads ---
+    let a = start_stress_node("em-a", vec![], &dir("a")).await;
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut sub, _present) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                a.client_addr,
+                &sub_id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "subscriber never connected");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ack = sub.subscribe(1, "em/t", QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|c| *c != 0x80) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        sub.disconnect().await;
+    }
+    let publish_acked = |addr: SocketAddr, pub_id: String, payload: &'static [u8]| async move {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) =
+                common::Client::connect_v311_within(addr, &pub_id, true, Duration::from_secs(20))
+                    .await
+            {
+                publisher
+                    .publish("em/t", payload, QoS::AtLeastOnce, Some(7), vec![])
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "publish {payload:?} never acked");
+        }
+    };
+    publish_acked(a.client_addr, "em-pub-0".into(), b"em-m1").await;
+    publish_acked(a.client_addr, "em-pub-1".into(), b"em-m2").await;
+
+    // --- the grow: 1 → 3, everyone stays alive ---
+    let b = start_stress_node("em-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("em-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+
+    // Post-grow publishes, landing on the OLD owner, for a session that now
+    // belongs to a joiner nobody has touched: each ack may be held through the
+    // migration window, but once released it is a durable cluster-wide promise.
+    publish_acked(a.client_addr, "em-pub-2".into(), b"em-m3").await;
+    publish_acked(a.client_addr, "em-pub-3".into(), b"em-m4").await;
+    publish_acked(a.client_addr, "em-pub-4".into(), b"em-m5").await;
+
+    // The subscriber resumes on the session's NEW owner (a joiner): the session
+    // is present and EVERY acked payload — before and after the grow — replays.
+    let owner = a.placement.read().unwrap().owner(&sub_id);
+    assert_ne!(owner, a.node_id, "the picked session must have moved");
+    let owner_addr = [&a, &b, &c]
+        .iter()
+        .find(|n| n.node_id == owner)
+        .expect("owner is a live node")
+        .client_addr;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut sub, present) = loop {
+        if let Some(ok) =
+            common::Client::connect_v311_within(owner_addr, &sub_id, false, Duration::from_secs(10))
+                .await
+        {
+            break ok;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscriber could not resume on the new owner after the grow"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        present,
+        "recovery honesty: the moved durable session must be present on its new owner"
+    );
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain_deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < 5 && Instant::now() < drain_deadline {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    for payload in [b"em-m1".as_slice(), b"em-m2", b"em-m3", b"em-m4", b"em-m5"] {
+        assert!(
+            got.contains(payload),
+            "acked payload {:?} lost across the ownership move (ADR 0043 P2)",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
 /// Bring-up gate shared by the stop/start test: full membership + full voters.
 async fn wait_cluster_ready(nodes: &[&StressNode]) {
     let deadline = Instant::now() + Duration::from_secs(60);

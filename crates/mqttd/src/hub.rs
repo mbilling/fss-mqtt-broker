@@ -48,7 +48,7 @@ use mqtt_storage::{
     Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionClaim, SessionStore,
     StorageError,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -946,6 +946,12 @@ pub struct Hub {
     /// so inherited sessions materialize within seconds, not on the slow
     /// [`EXPIRY_RECONCILE_EVERY`] cadence.
     takeover_reconcile_ticks: u8,
+    /// The placement member set as of the last sweep tick (ADR 0043 P2). A change
+    /// — growth especially: `PeerDead` already arms the window for shrink — means
+    /// group ownership moved, so the takeover window re-arms: moved sessions
+    /// materialize eagerly on their NEW owners and un-materialize on their old
+    /// ones, instead of waiting for first touch.
+    known_members: BTreeSet<NodeId>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -1221,6 +1227,10 @@ impl Hub {
                 // arrives keeps the first-touch epoch bumps (which transiently
                 // break quorum for concurrent appends) out of the hot path.
                 takeover_reconcile_ticks: 8,
+                // Seeded empty on purpose: the first sweep observes the real
+                // member set as a "change", which (re)arms the boot window —
+                // harmless overlap with the 8 ticks above.
+                known_members: BTreeSet::new(),
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
@@ -3015,6 +3025,33 @@ impl Hub {
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
     /// (ADR 0009). Runs on the hub's periodic sweep tick.
     async fn sweep_expired_sessions(&mut self) {
+        // Ring-change watch (ADR 0043 P2): any placement member-set change moves
+        // group ownership (growth moves ~1/N of the groups onto the joiner), so it
+        // re-arms the takeover window — every node then scans eagerly (the NEW
+        // owner materializes the moved sessions and advertises their interest; the
+        // OLD owner un-materializes them, below) and gated publish acks hold until
+        // the window settles, instead of waiting for a client to touch the moved
+        // groups. Shrink arrives here too (via SWIM eviction), overlapping the
+        // `PeerDead` arm — harmless.
+        if let Some(placement) = &self.placement {
+            let members: BTreeSet<NodeId> = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .members()
+                .into_iter()
+                .collect();
+            if members != self.known_members {
+                if !self.known_members.is_empty() {
+                    info!(
+                        members = members.len(),
+                        "placement membership changed; eager migration window armed (ADR 0043 P2)"
+                    );
+                }
+                self.known_members = members;
+                self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(8);
+            }
+        }
+
         // Periodically inherit sessions this node did not see disconnect — those handed
         // to it by a takeover: their persisted expiry deadlines (ADR 0009 §3) AND their
         // routing subscriptions (ADR 0042 T9, exhibit ⑥). Eagerly for a few ticks after
@@ -3135,7 +3172,47 @@ impl Hub {
             // what re-targets acked forwards after a takeover (exhibit ⑤ re-route).
             self.gossip_interest();
         }
+        self.release_moved_sessions();
         self.settle_pending_publishes().await;
+    }
+
+    /// The mirror of [`inherit_sessions`] for a ring that GREW (ADR 0043 P2):
+    /// un-materialize offline sessions whose group this node no longer owns.
+    /// Keeping them routed would keep attracting publishes and forwards this node
+    /// can no longer durably enqueue (`NotOwner` — every such ack is withheld),
+    /// and its stale gossiped interest would keep re-targeting them here. Only the
+    /// in-memory routing state is dropped — the durable data stays (this node is
+    /// usually still a replica); the NEW owner's own scan materializes and
+    /// advertises the session, and the client re-attaches there (ADR 0005).
+    /// Durable-cluster mode only: with local-only session storage the data cannot
+    /// follow the ownership move, so dropping routing would drop delivery.
+    fn release_moved_sessions(&mut self) {
+        if self.durable_plane.is_none() || !self.clustered() {
+            return;
+        }
+        let moved: Vec<ClientId> = self
+            .subs_by_client
+            .keys()
+            .filter(|c| {
+                !self.online.contains_key(*c)
+                    && !self.connecting.contains_key(*c)
+                    && !self.owns_session(c)
+            })
+            .cloned()
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        for client in &moved {
+            self.discard_session_local(client);
+            debug!(
+                client = %client.0,
+                "session's group moved to another owner; local routing released (ADR 0043 P2)"
+            );
+        }
+        // Peers must see the shrunken interest, so forwards stop targeting this
+        // node for filters it no longer serves.
+        self.gossip_interest();
     }
 
     /// A takeover-window re-delivery of pending publish `id` (ADR 0042 T9):
@@ -7792,6 +7869,101 @@ mod tests {
             store.subscriptions(&client).await.unwrap().is_empty(),
             "the durable session was removed"
         );
+    }
+
+    /// ADR 0043 P2: when the ring GROWS and a materialized offline session's group
+    /// moves to the joiner, the old owner **releases** its local routing for it —
+    /// observable as re-gossiped interest without the moved filter — instead of
+    /// keeping stale interest that attracts forwards it can no longer durably
+    /// enqueue (`NotOwner`). The durable data stays; the joiner's own scan
+    /// materializes the session there.
+    #[tokio::test(start_paused = true)]
+    async fn growth_releases_moved_sessions_on_the_old_owner() {
+        let local = NodeId("old-owner".into());
+        let joiner = NodeId("joiner".into());
+        // A client whose session the joiner owns once it enters the ring (and the
+        // local node owns while alone — a single member owns everything).
+        let mover = {
+            let mut two = Placement::new(local.clone(), DEFAULT_REPLICAS);
+            two.observe(&joiner, MemberState::Alive, "j:7000", None);
+            (0..100_000)
+                .map(|i| format!("mover-{i}"))
+                .find(|c| two.owner(c) == joiner)
+                .expect("some client moves to the joiner")
+        };
+
+        // The durable store already holds the persistent session + subscription
+        // (as if it attached and disconnected before this hub's lifetime).
+        let store = Arc::new(MemorySessionStore::new());
+        let client = ClientId(mover.clone());
+        store.ensure_session(&client).await.unwrap();
+        store
+            .set_subscriptions(
+                &client,
+                &[mqtt_core::Subscription {
+                    filter: "mv/t".into(),
+                    max_qos: QoS::AtLeastOnce,
+                    no_local: false,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        let (mut hub, tx) =
+            Hub::with_config_and_placement(local.clone(), store, Some(placement.clone()));
+        // The release path is durable-cluster-only: attach a real (idle) plane.
+        let (_store, _retained, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
+            local.clone(),
+            placement.clone(),
+            false,
+            5,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .await;
+        driver.abort();
+        hub.attach_durable_plane(plane);
+        tokio::spawn(hub.run());
+        let mut peer = connect_peer(&tx, "joiner", 1);
+
+        // Boot scan: the owned offline session materializes and its filter gossips.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::Interest { filters }) if filters.contains(&"mv/t".into()) => {
+                    break;
+                }
+                // A quiet 300ms (recv_peer's bound) or another frame: keep waiting.
+                _ => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the materialized session's filter was never gossiped"
+                ),
+            }
+        }
+
+        // The ring grows; the session's group now belongs to the joiner.
+        placement
+            .write()
+            .unwrap()
+            .observe(&joiner, MemberState::Alive, "j:7000", None);
+        assert_eq!(placement.read().unwrap().owner(&mover), joiner);
+
+        // The sweep observes the member-set change, re-arms the window, and the
+        // next scan RELEASES the moved session: interest re-gossips without it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::Interest { filters }) if !filters.contains(&"mv/t".into()) => {
+                    break;
+                }
+                _ => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the moved session's filter was never released from gossiped interest"
+                ),
+            }
+        }
     }
 
     /// ADR 0007 T9: a new owner allocates outbound packet ids **past** the durable
