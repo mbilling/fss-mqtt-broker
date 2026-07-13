@@ -1346,6 +1346,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pki-types",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

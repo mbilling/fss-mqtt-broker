@@ -775,3 +775,182 @@ pub mod enhanced {
             .expect("an AUTH challenge nonce")
     }
 }
+
+// ---------------------------------------------------------------------------
+// FlakyStore — the fault-injecting SessionStore, promoted from the hub's unit
+// test module to a shared harness fixture (ADR 0042 T4). Wraps ANY store and,
+// while `fail_writes` is set, fails every durable WRITE with a terminal
+// `Backend` error — the disk-full / write-error shape. Reads keep working
+// (a full disk still serves what it has). The broker under test must respond
+// by WITHHOLDING the corresponding acknowledgements (fail closed): a PUBACK,
+// SUBACK, or CONNACK granted while the write failed would be a durability lie
+// (ADR 0041 T5, 0042 T9).
+// ---------------------------------------------------------------------------
+
+/// See the module note above. `fail_writes` is shared with the harness, which
+/// toggles it mid-schedule (the disk-fault step).
+#[derive(Debug)]
+pub struct FlakyStore {
+    inner: std::sync::Arc<dyn mqtt_storage::SessionStore>,
+    pub fail_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FlakyStore {
+    pub fn wrap(inner: std::sync::Arc<dyn mqtt_storage::SessionStore>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            fail_writes: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn check_write(&self) -> Result<(), mqtt_storage::StorageError> {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(mqtt_storage::StorageError::Backend(
+                "injected disk fault (ADR 0042 T4)".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl mqtt_storage::SessionStore for FlakyStore {
+    async fn ensure_session(
+        &self,
+        client: &mqtt_core::ClientId,
+    ) -> Result<bool, mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.ensure_session(client).await
+    }
+
+    async fn claim_session(
+        &self,
+        client: &mqtt_core::ClientId,
+        owner: &str,
+    ) -> Result<mqtt_storage::SessionClaim, mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.claim_session(client, owner).await
+    }
+
+    async fn set_subscriptions(
+        &self,
+        client: &mqtt_core::ClientId,
+        subs: &[mqtt_core::Subscription],
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.set_subscriptions(client, subs).await
+    }
+
+    async fn subscriptions(
+        &self,
+        client: &mqtt_core::ClientId,
+    ) -> Result<Vec<mqtt_core::Subscription>, mqtt_storage::StorageError> {
+        self.inner.subscriptions(client).await
+    }
+
+    async fn enqueue_with_expiry(
+        &self,
+        client: &mqtt_core::ClientId,
+        message: &mqtt_core::Message,
+        expiry_at: Option<u64>,
+    ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner
+            .enqueue_with_expiry(client, message, expiry_at)
+            .await
+    }
+
+    async fn pending(
+        &self,
+        client: &mqtt_core::ClientId,
+        after: mqtt_storage::Offset,
+        limit: usize,
+    ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+        self.inner.pending(client, after, limit).await
+    }
+
+    async fn ack(
+        &self,
+        client: &mqtt_core::ClientId,
+        up_to: mqtt_storage::Offset,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.ack(client, up_to).await
+    }
+
+    async fn record_received(
+        &self,
+        client: &mqtt_core::ClientId,
+        packet_id: u16,
+    ) -> Result<bool, mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.record_received(client, packet_id).await
+    }
+
+    async fn clear_received(
+        &self,
+        client: &mqtt_core::ClientId,
+        packet_id: u16,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.clear_received(client, packet_id).await
+    }
+
+    async fn received(
+        &self,
+        client: &mqtt_core::ClientId,
+    ) -> Result<Vec<u16>, mqtt_storage::StorageError> {
+        self.inner.received(client).await
+    }
+
+    async fn next_packet_id(
+        &self,
+        client: &mqtt_core::ClientId,
+    ) -> Result<u16, mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.next_packet_id(client).await
+    }
+
+    async fn reserve_packet_ids(
+        &self,
+        client: &mqtt_core::ClientId,
+        count: u16,
+    ) -> Result<u16, mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.reserve_packet_ids(client, count).await
+    }
+
+    async fn remove(&self, client: &mqtt_core::ClientId) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.remove(client).await
+    }
+
+    async fn set_session_expiry(
+        &self,
+        client: &mqtt_core::ClientId,
+        deadline: Option<u64>,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.set_session_expiry(client, deadline).await
+    }
+
+    async fn expiring_sessions(
+        &self,
+    ) -> Result<Vec<(mqtt_core::ClientId, u64)>, mqtt_storage::StorageError> {
+        self.inner.expiring_sessions().await
+    }
+
+    async fn all_sessions(
+        &self,
+    ) -> Result<
+        Vec<(
+            mqtt_core::ClientId,
+            Vec<mqtt_core::Subscription>,
+            Option<u64>,
+        )>,
+        mqtt_storage::StorageError,
+    > {
+        self.inner.all_sessions().await
+    }
+}

@@ -7,14 +7,36 @@
 //! with everything wired exactly as production wires it (the node assembly
 //! mirrors `durable_sessions.rs`, which mirrors `main.rs`).
 //!
-//! One seed composes a **fault schedule** (an owner kill mid-workload — a real
-//! takeover of live sessions; asymmetric peer-bus link flaps through a relay in
-//! front of each node's peer listener; client churn — disconnects and resumes
-//! riding lease handoffs) interleaved with a **workload** (`QoS` 1 publishes to
-//! persistent subscribers, retained mutations, resumes), while an obligations
-//! ledger records only **acked facts**: a payload becomes a delivery obligation
-//! only when its PUBACK arrived; a retained value becomes the expected converged
-//! value only from its acked set onward.
+//! One seed composes a **fault schedule** interleaved with a **workload**
+//! (`QoS` 1 publishes to persistent subscribers, retained mutations, resumes),
+//! while an obligations ledger records only **acked facts**: a payload becomes
+//! a delivery obligation only when its PUBACK arrived; a retained value becomes
+//! the expected converged value only from its acked set onward. The fault
+//! vocabulary (ADR 0042 §4):
+//!
+//! - an **owner kill** mid-workload — a real takeover of live sessions;
+//! - a **restart** of the killed node over its SURVIVING data dir (half the
+//!   seeds): the redb lease/replica/session stores reopen and feed recovery —
+//!   the ADR 0018 crash path inside a live, still-faulted cluster;
+//! - **asymmetric peer-bus link flaps** through a relay in front of each node's
+//!   peer listener;
+//! - **disk write-fault injection** at the hub's session-store seam (the shared
+//!   [`common::FlakyStore`] fixture): while on, durable session writes fail
+//!   terminally and the broker must WITHHOLD the corresponding acks;
+//! - **brownout entry/exit** (ADR 0041 T5), driven exactly as the store-size
+//!   watcher drives it — under brownout an offline enqueue is refused-but-acked,
+//!   ADR 0041's documented trade, so such acks are recorded as non-obligations;
+//! - **client churn** — disconnects and resumes riding lease handoffs.
+//!
+//! A separate test drives the **full-cluster stop/start**: every node crashes,
+//! every node restarts over its surviving dir, and every acked fact must be
+//! there afterwards — session present, payloads replayed, retained served.
+//!
+//! Under an active partition a gated ack HOLDS (the mesh-whole rule, found by
+//! seed 4 of this vocabulary): an alive-but-unreachable peer may hold interest
+//! this node cannot see, so "nobody is owed this" is only concluded on a whole
+//! mesh — the same CP posture as the durable attach path. A publisher that
+//! times out simply retries; an unacked publish is never an obligation.
 //!
 //! After the schedule: heal everything, **quiesce on observable state** (never
 //! wall-clock guesses — membership counts and cross-node owner agreement), then
@@ -223,15 +245,35 @@ struct StressNode {
     client_addr: SocketAddr,
     relay: RelayCtl,
     /// Kept to observe lease-group readiness (`voter_count`) at bring-up.
-    plane: mqtt_cluster::durable_plane::DurablePlane,
+    /// `None` after a kill: the plane holds the node's redb handles, and a
+    /// restart over the same data dir needs them RELEASED (ADR 0042 T4).
+    plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    /// The node's on-disk state (redb lease/replica/session stores) — SURVIVES a
+    /// kill, so a restart over the same dir exercises the ADR 0018 recovery path.
+    data_dir: std::path::PathBuf,
+    /// Toggles write-error injection on the hub's session-store seam
+    /// (ADR 0042 T4): while `true`, durable session writes fail `Backend` and
+    /// the broker must withhold the corresponding acks (fail closed).
+    disk_faults: Arc<std::sync::atomic::AtomicBool>,
+    /// The hub's command channel — the harness drives brownout entry/exit
+    /// through it (ADR 0041 T5), exactly like the store-size watcher does.
+    hub_tx: mpsc::UnboundedSender<mqttd::hub::HubCommand>,
     aborts: Vec<AbortHandle>,
 }
 
 impl StressNode {
-    /// Crash the node: abort every task it spawned, so peers detect it dead.
-    fn kill(&self) {
+    /// Crash the node: abort every task it spawned, so peers detect it dead,
+    /// and release every redb handle so the data dir can reopen on a restart
+    /// (the on-disk state itself SURVIVES — that is the point). The raft core
+    /// task is not ours to abort, so it gets an explicit shutdown — the
+    /// in-process stand-in for the OS reclaiming a crashed process's file
+    /// handles.
+    async fn kill(&mut self) {
         for a in &self.aborts {
             a.abort();
+        }
+        if let Some(plane) = self.plane.take() {
+            let _ = plane.raft().shutdown().await;
         }
     }
 }
@@ -239,7 +281,11 @@ impl StressNode {
 // One linear node assembly, mirroring durable_sessions/main.rs — splitting it
 // would hide which pieces a real node wires.
 #[allow(clippy::too_many_lines)]
-async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
+async fn start_stress_node(
+    id: &str,
+    swim_seeds: Vec<String>,
+    data_dir: &std::path::Path,
+) -> StressNode {
     let node_id = NodeId(id.to_string());
     let can_bootstrap = swim_seeds.is_empty();
     let placement = Arc::new(RwLock::new(Placement::new(
@@ -253,15 +299,30 @@ async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
         can_bootstrap,
         5, // every node votes in this 3-node cluster (ADR 0021)
         &std::collections::BTreeMap::new(),
-        None,
+        Some(data_dir), // on-disk state: a kill leaves it for the restart (T4)
         None,
     )
     .await;
+    // The hub's session-store seam, wrapped for write-error injection (T4):
+    // while a disk fault is on, durable session writes fail `Backend` and the
+    // broker withholds the corresponding acks — fail closed, never a lie.
+    let store = common::FlakyStore::wrap(store);
+    let disk_faults = store.fail_writes.clone();
     let plane_observer = plane.clone();
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store, Some(placement.clone()));
     hub.attach_durable_plane(plane);
     hub.attach_durable_retained(durable_retained);
+    // The disk-backed retained CACHE, exactly as production wires it with a
+    // data dir (main.rs): after a full-cluster stop/start every in-memory
+    // cache is gone, and this reopened copy is what serves retained state
+    // until fan-out/back-fill warm it again (ADR 0018 phase 4).
+    hub.attach_retained_store(Box::new(
+        mqtt_storage::persistent_retained::PersistentRetainedStore::open(
+            data_dir.join("retained.redb"),
+        )
+        .expect("retained store opens"),
+    ));
     let mut aborts = vec![
         tokio::spawn(hub.run()).abort_handle(),
         driver.abort_handle(),
@@ -331,7 +392,7 @@ async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
         tokio::spawn(mqttd::cluster::maintain_peer_links(
             event_rx,
             node_id.clone(),
-            hub_tx,
+            hub_tx.clone(),
             None,
             Some(placement.clone()),
             None,
@@ -346,7 +407,10 @@ async fn start_stress_node(id: &str, swim_seeds: Vec<String>) -> StressNode {
         swim_addr,
         client_addr,
         relay,
-        plane: plane_observer,
+        plane: Some(plane_observer),
+        data_dir: data_dir.to_path_buf(),
+        disk_faults,
+        hub_tx,
         aborts,
     }
 }
@@ -395,6 +459,8 @@ struct Stress {
     retained: BTreeMap<String, Vec<RetainedSet>>,
     /// Nodes whose inbound bus is currently severed.
     severed: Vec<usize>,
+    /// Per node: whether the harness has driven it into brownout (ADR 0041 T5).
+    brownout: Vec<bool>,
     payload_counter: u64,
 }
 
@@ -598,13 +664,24 @@ impl Stress {
         if acked {
             // Every ack is a HARD obligation (0042-T9): acked means durable,
             // cluster-wide — whichever node the publish landed on, whatever the
-            // takeover state. The exhibit-⑤/⑥ waivers this book once carried are
-            // gone with the fixes.
-            self.acked.entry(topic.clone()).or_default().push(payload);
-            self.note(format!(
-                "publish #{} to {topic} via {}: ACKED (obligation)",
-                self.payload_counter, self.nodes[node].node_id.0,
-            ));
+            // takeover state. ONE documented exception (ADR 0041 T5): under
+            // brownout an offline enqueue is REFUSED BUT ACKED — the explicit,
+            // loudly-counted availability trade — so an ack for an OFFLINE
+            // subscriber while any node is browned out is not owed.
+            let brownout_window = self.brownout.iter().any(|b| *b) && self.subs[s].conn.is_none();
+            if brownout_window {
+                self.note(format!(
+                    "publish #{} to {topic} via {}: ACKED (brownout window — \
+                     ADR 0041 documented trade, not owed)",
+                    self.payload_counter, self.nodes[node].node_id.0,
+                ));
+            } else {
+                self.acked.entry(topic.clone()).or_default().push(payload);
+                self.note(format!(
+                    "publish #{} to {topic} via {}: ACKED (obligation)",
+                    self.payload_counter, self.nodes[node].node_id.0,
+                ));
+            }
         } else {
             self.note(format!(
                 "publish #{} to {topic} via {}: unacked (no obligation)",
@@ -675,7 +752,7 @@ impl Stress {
     }
 
     /// THE takeover: kill the node owning a seeded subscriber's session.
-    fn kill_step(&mut self) {
+    async fn kill_step(&mut self) {
         let s = self.rng.pick(self.subs.len());
         let Some(owner) = self.owner_of(&self.subs[s].id) else {
             self.fail("no owner resolvable for the kill step");
@@ -683,7 +760,7 @@ impl Stress {
         if !self.alive[owner] || self.alive_nodes().len() < 3 {
             return; // already killed one — the schedule kills at most one node
         }
-        self.nodes[owner].kill();
+        self.nodes[owner].kill().await;
         self.alive[owner] = false;
         self.note(format!(
             "KILLED {} (owner of {})",
@@ -695,6 +772,69 @@ impl Stress {
                 sub.conn = None;
             }
         }
+    }
+
+    /// Restart the killed node over its SURVIVING data dir (ADR 0042 T4): the
+    /// redb lease/replica/session stores reopen and feed recovery — the
+    /// ADR 0018 crash/restart path, inside a live cluster. New ports are fine;
+    /// SWIM re-keys the node by its stable id. A no-op when nothing is dead.
+    async fn restart_step(&mut self) {
+        let Some(dead) = (0..self.nodes.len()).find(|i| !self.alive[*i]) else {
+            self.publish_step().await; // nothing to restart: schedule density
+            return;
+        };
+        // `kill()` released the plane's redb handles; the hub task holding the
+        // store handle was aborted then too. A short grace lets any in-flight
+        // blocking apply drop its file handle before the same dir reopens (the
+        // single-node restart test's teardown discipline).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let id = self.nodes[dead].node_id.0.clone();
+        let dir = self.nodes[dead].data_dir.clone();
+        let seeds: Vec<String> = self
+            .alive_nodes()
+            .into_iter()
+            .map(|i| self.nodes[i].swim_addr.clone())
+            .collect();
+        self.nodes[dead] = start_stress_node(&id, seeds, &dir).await;
+        self.alive[dead] = true;
+        self.severed.retain(|n| *n != dead); // the old relay died with the node
+        self.note(format!("RESTARTED {id} over its surviving data dir"));
+    }
+
+    /// Toggle write-error injection on one alive node's session-store seam
+    /// (ADR 0042 T4): while on, that node's durable session writes fail
+    /// terminally and the broker must withhold the corresponding acks. The
+    /// obligations ledger needs no special case — an unacked publish is no
+    /// obligation, and an acked one proves the write path did not lie.
+    fn disk_fault_step(&mut self) {
+        let node = self.pick_alive();
+        let flag = &self.nodes[node].disk_faults;
+        let on = !flag.load(std::sync::atomic::Ordering::SeqCst);
+        flag.store(on, std::sync::atomic::Ordering::SeqCst);
+        self.note(format!(
+            "DISK FAULTS {} on {}",
+            if on { "injected" } else { "cleared" },
+            self.nodes[node].node_id.0
+        ));
+    }
+
+    /// Toggle brownout on one alive node (ADR 0041 T5), as the store-size
+    /// watcher would on a watermark transition. Under brownout, offline
+    /// enqueues are REFUSED BUT ACKED — ADR 0041's explicit, loudly-counted
+    /// availability trade — so publishes acked while any node is browned out
+    /// are recorded as non-obligations (see `publish_step`).
+    fn brownout_step(&mut self) {
+        let node = self.pick_alive();
+        let on = !self.brownout[node];
+        self.brownout[node] = on;
+        let _ = self.nodes[node]
+            .hub_tx
+            .send(mqttd::hub::HubCommand::SetBrownout(on));
+        self.note(format!(
+            "BROWNOUT {} on {}",
+            if on { "entered" } else { "lifted" },
+            self.nodes[node].node_id.0
+        ));
     }
 
     /// A seeded asymmetric link flap: sever one alive node's inbound peer bus
@@ -756,9 +896,17 @@ async fn retained_seen(addr: SocketAddr, client_id: &str, topic: &str) -> Option
 // dispatch: splitting it would scatter the seed's story across helpers.
 #[allow(clippy::too_many_lines)]
 async fn run_schedule(seed: u64) {
-    let a = start_stress_node(&format!("st{seed}-a"), vec![]).await;
-    let b = start_stress_node(&format!("st{seed}-b"), vec![a.swim_addr.clone()]).await;
-    let c = start_stress_node(&format!("st{seed}-c"), vec![a.swim_addr.clone()]).await;
+    // Per-node on-disk state (ADR 0042 T4): a kill leaves the redb stores on
+    // disk, and a restart over the same dir must recover them (ADR 0018).
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node(&format!("st{seed}-a"), vec![], &dir("a")).await;
+    let b = start_stress_node(&format!("st{seed}-b"), vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node(&format!("st{seed}-c"), vec![a.swim_addr.clone()], &dir("c")).await;
     let nodes = vec![a, b, c];
 
     // Bring-up: full membership everywhere (the lease group follows; attaches
@@ -774,7 +922,9 @@ async fn run_schedule(seed: u64) {
     );
     assert!(
         wait_until(Duration::from_secs(30), || {
-            nodes.iter().all(|n| n.plane.voter_count() == 3)
+            nodes
+                .iter()
+                .all(|n| n.plane.as_ref().is_some_and(|p| p.voter_count() == 3))
         })
         .await,
         "seed {seed}: lease group never reached full membership"
@@ -790,6 +940,7 @@ async fn run_schedule(seed: u64) {
         acked: BTreeMap::new(),
         retained: BTreeMap::new(),
         severed: Vec::new(),
+        brownout: vec![false; 3],
         payload_counter: 0,
     };
 
@@ -871,16 +1022,59 @@ async fn run_schedule(seed: u64) {
     // churn throughout.
     let steps = stress.rng.range(12, 17);
     let kill_at = stress.rng.range(3, steps - 2);
+    // Half the seeds RESTART the killed node a few steps later (ADR 0042 T4):
+    // its data dir survived the kill, so the restart drives the ADR 0018
+    // crash/restart recovery inside a live, still-faulted cluster.
+    let restart_at = if stress.rng.range(0, 2) == 0 {
+        Some(kill_at + stress.rng.range(2, 4))
+    } else {
+        None
+    };
     for step in 0..steps {
         if step == kill_at {
-            stress.kill_step();
+            stress.kill_step().await;
+            continue;
+        }
+        if Some(step) == restart_at {
+            stress.restart_step().await;
             continue;
         }
         match stress.rng.range(0, 100) {
-            0..=44 => stress.publish_step().await,
-            45..=64 => stress.retained_step().await,
-            65..=84 => stress.churn_step().await,
-            _ => stress.flap_step(),
+            0..=39 => stress.publish_step().await,
+            40..=57 => stress.retained_step().await,
+            58..=74 => stress.churn_step().await,
+            75..=84 => stress.flap_step(),
+            85..=89 => stress.restart_step().await,
+            90..=94 => stress.disk_fault_step(),
+            _ => stress.brownout_step(),
+        }
+    }
+    // A compact composition line per seed, so a green sweep still shows what
+    // the schedules exercised (kills, restarts, disk faults, brownouts...).
+    let count = |needle: &str| stress.trace.iter().filter(|l| l.contains(needle)).count();
+    eprintln!(
+        "cluster_stress: seed {seed} schedule: {} publishes ({} owed), {} retained, \
+         {} kills, {} restarts, {} flaps, {} disk-fault toggles, {} brownout toggles",
+        count("publish #"),
+        count("ACKED (obligation)"),
+        count("retained set #"),
+        count("KILLED"),
+        count("RESTARTED"),
+        count("SEVERED"),
+        count("DISK FAULTS"),
+        count("BROWNOUT"),
+    );
+    // Clear injected faults before quiesce: the oracle judges the HEALED
+    // cluster (disk faults and brownout are conditions, not obligations).
+    for i in 0..stress.nodes.len() {
+        stress.nodes[i]
+            .disk_faults
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if stress.brownout[i] {
+            let _ = stress.nodes[i]
+                .hub_tx
+                .send(mqttd::hub::HubCommand::SetBrownout(false));
+            stress.brownout[i] = false;
         }
     }
 
@@ -1020,8 +1214,221 @@ async fn run_schedule(seed: u64) {
         stress.fail_violations("retained convergence", &violations);
     }
     // Tear the cluster down so the next seed starts clean.
-    for node in &stress.nodes {
-        node.kill();
+    for node in &mut stress.nodes {
+        node.kill().await;
+    }
+}
+
+/// Full-cluster stop/start (ADR 0042 T4, the ADR 0018 recovery path at cluster
+/// scale): every node crashes, every node restarts over its surviving data dir,
+/// and everything ACKED before the outage must be there after it — the durable
+/// session resumes `present = true`, its acked payloads replay, and the acked
+/// retained value is served. This is the "datacenter power cycle": no survivor
+/// carries state across in memory; disk is all there is.
+// One linear story — establish, ack, outage, restart, verify — like the
+// seeded schedule; splitting it would scatter the acked facts from the checks.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let mut a = start_stress_node("fc-a", vec![], &dir("a")).await;
+    let mut b = start_stress_node("fc-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let mut c = start_stress_node("fc-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+
+    // A persistent subscriber establishes its durable session + subscription,
+    // then goes OFFLINE — everything it is owed must ride the disk.
+    let sub_id = "fc-sub";
+    // A persistent session attaches ON its placement owner (the pre-proxy
+    // contract, ADR 0005 step 2 pending) — resolve it like every client
+    // helper in this harness does.
+    let owner_addr = |nodes: &[&StressNode]| {
+        let owner = nodes[0].placement.read().unwrap().owner(sub_id);
+        nodes
+            .iter()
+            .find(|n| n.node_id == owner)
+            .expect("owner is a live node")
+            .client_addr
+    };
+    {
+        // Retried: the first CONNECT for a fresh id can be refused while its
+        // session group's first-ever lease grants (reconcile-driven).
+        let addr = owner_addr(&[&a, &b, &c]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut sub, present) = loop {
+            if let Some(ok) =
+                common::Client::connect_v311_within(addr, sub_id, false, Duration::from_secs(10))
+                    .await
+            {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "subscriber never connected");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert!(!present, "brand-new session");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ack = sub.subscribe(1, "fc/t", QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|c| *c != 0x80) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        sub.disconnect().await;
+    }
+
+    // Acked facts: three QoS 1 payloads for the offline subscriber (each retried
+    // until its PUBACK arrives — acked means durably owed) and one retained set.
+    let nodes = [&a, &b, &c];
+    for (i, payload) in [b"fc-m1".as_slice(), b"fc-m2", b"fc-m3"].iter().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                nodes[i % 3].client_addr,
+                &format!("fc-pub-{i}"),
+                true,
+                Duration::from_secs(20),
+            )
+            .await
+            {
+                publisher
+                    .publish("fc/t", payload, QoS::AtLeastOnce, Some(7), vec![])
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(12);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "publish {i} never acked");
+        }
+    }
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        'acked: loop {
+            if let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                b.client_addr,
+                "fc-rpub",
+                true,
+                Duration::from_secs(20),
+            )
+            .await
+            {
+                publisher
+                    .publish_full("fc/r", b"fc-retained", QoS::AtLeastOnce, true, Some(9))
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(12);
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 9 => break 'acked,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break,
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "retained set never acked");
+        }
+    }
+
+    // The outage: EVERY node crashes. No memory survives; the dirs do.
+    a.kill().await;
+    b.kill().await;
+    c.kill().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The restart, over the same dirs.
+    let a = start_stress_node("fc-a", vec![], &dir("a")).await;
+    let b = start_stress_node("fc-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("fc-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+
+    // Recovery honesty + acked durability: the session is PRESENT and replays
+    // every acked payload; the acked retained value is served cluster-wide.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let resume_addr = owner_addr(&[&a, &b, &c]);
+    let (mut sub, present) = loop {
+        if let Some(ok) =
+            common::Client::connect_v311_within(resume_addr, sub_id, false, Duration::from_secs(10))
+                .await
+        {
+            break ok;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscriber could not resume after the full-cluster restart"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        present,
+        "recovery honesty: the durable session must survive a full-cluster stop/start"
+    );
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain_deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < 3 && Instant::now() < drain_deadline {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    for payload in [b"fc-m1".as_slice(), b"fc-m2", b"fc-m3"] {
+        assert!(
+            got.contains(payload),
+            "acked payload {:?} lost across the full-cluster stop/start",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    let probe_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let seen = retained_seen(a.client_addr, "fc-probe", "fc/r").await;
+        if seen.as_deref() == Some(b"fc-retained".as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < probe_deadline,
+            "acked retained value not served after the full-cluster stop/start (got {seen:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Bring-up gate shared by the stop/start test: full membership + full voters.
+async fn wait_cluster_ready(nodes: &[&StressNode]) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let members = nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3);
+        let voters = nodes
+            .iter()
+            .all(|n| n.plane.as_ref().is_some_and(|p| p.voter_count() == 3));
+        if members && voters {
+            return;
+        }
+        assert!(Instant::now() < deadline, "cluster never became ready");
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 

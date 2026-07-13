@@ -3194,7 +3194,9 @@ impl Hub {
         // is not enough — the group leases reassign for seconds after the death,
         // and a scan that ran before a lease landed saw nothing. Every scan in
         // the window re-delivers (duplicates are legal); the last one releases.
-        let window_over = self.takeover_reconcile_ticks == 0;
+        // And never on a broken mesh: an unreachable-but-alive peer may hold
+        // interest this node cannot see (seed 4).
+        let window_over = self.takeover_reconcile_ticks == 0 && self.mesh_whole();
         for id in held {
             if !self.redeliver_pending(id).await {
                 // The re-delivery's durable append failed terminally: withhold.
@@ -3216,6 +3218,30 @@ impl Hub {
             }
             self.try_complete_pending(id);
         }
+    }
+
+    /// Whether every membership-alive peer has a live link (the mesh is
+    /// WHOLE). While it is not — a peer is alive per membership but its link is
+    /// down — this node cannot see that peer's interest, so a gated publish
+    /// must not conclude "nobody is owed this" (ADR 0042 T4, seed 4: the
+    /// takeover successor materialized the subscriber behind an active
+    /// partition, and the grace expired into an ack for a message the
+    /// partitioned owner never received). Withholding under partition is the
+    /// same CP posture the durable attach path already takes.
+    fn mesh_whole(&self) -> bool {
+        let Some(placement) = &self.placement else {
+            return true;
+        };
+        let members: Vec<NodeId> = {
+            let p = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.members()
+        };
+        members
+            .iter()
+            .filter(|m| **m != self.node_id)
+            .all(|m| self.peers.contains_key(m))
     }
 
     /// Whether this node runs in a multi-node cluster (placement with >1 member).
@@ -3488,7 +3514,9 @@ impl Hub {
                 // no takeovers, and holding its boot-time acks would just delay
                 // every early publish for nothing.
                 awaiting_settle: self.clustered()
-                    && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight),
+                    && (self.takeover_reconcile_ticks > 0
+                        || self.inherited_scan_inflight
+                        || !self.mesh_whole()),
             },
         );
         id
@@ -3642,6 +3670,13 @@ impl Hub {
                 continue;
             }
             let awaiting_empty = p.awaiting.is_empty();
+            if awaiting_empty && grace <= 1 && !self.mesh_whole() {
+                // An alive peer is unreachable: its interest is invisible, so
+                // "no candidates" proves nothing. Hold at the last grace tick
+                // until the mesh heals (seed 4) — the publisher waits, exactly
+                // like a durable attach under partition.
+                continue;
+            }
             if awaiting_empty && grace <= 1 {
                 // The grace ends with a FINAL local re-delivery: the subscriber
                 // may have materialized HERE in the meantime — via this node's
@@ -3932,6 +3967,12 @@ impl Hub {
                 proto,
             },
         );
+        // A link (re)forming while gated publishes are held: schedule a scan so
+        // the settle pass re-runs against the now-visible peer state (its
+        // Interest snapshot arrives with the link) and releases what it can.
+        if !self.pending_publishes.is_empty() {
+            self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
+        }
     }
 
     fn peer_disconnected(&mut self, node: &NodeId, conn_id: u64) {
