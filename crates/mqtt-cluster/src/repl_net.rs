@@ -221,6 +221,23 @@ impl PeerReplicaTransport {
         }
     }
 
+    /// Ask `owner` to re-commit `key`'s committed log to `target` (ADR 0043 P3) —
+    /// the decommission drain's hand-off request for a post-departure replica-set
+    /// member the owner's fan-out does not reach yet. Fire-and-forget; a no-op
+    /// toward a peer that cannot speak it (pre-proto-5) or has no live link —
+    /// the drain re-verifies and re-asks.
+    pub fn request_catch_up_to(&self, owner: &NodeId, key: &str, target: &NodeId) {
+        let inner = self.lock();
+        if let Some((tx, proto)) = inner.followers.get(owner) {
+            if *proto >= 5 {
+                let _ = tx.send(PeerMessage::ReplicaCatchUpTo {
+                    key: key.to_string(),
+                    target: target.0.clone(),
+                });
+            }
+        }
+    }
+
     /// Resolve a pending key-discovery request with the replica's local key set.
     ///
     /// Called by the link handler when a [`PeerMessage::ReplicaKeysReply`] arrives.

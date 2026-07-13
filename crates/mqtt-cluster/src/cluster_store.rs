@@ -351,6 +351,20 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> crate::durable_plane
             let _ = log.truncate(&key.to_string(), floor).await;
         }
     }
+
+    async fn catch_up_key_to(&self, key: &str, target: &NodeId) {
+        // Route (recovering on first touch as usual), then hand the committed
+        // log to the ONE requested node — the decommission drain's targeted
+        // re-commit (ADR 0043 P3). Best-effort: the drain verifies and re-asks.
+        let log = match self.log_for_key(key).await {
+            Ok(log) => log,
+            Err(e) => {
+                tracing::debug!(key, error = ?e, "targeted catch-up: cannot route/recover key; drain will retry");
+                return;
+            }
+        };
+        log.recommit_key_to(key, target).await;
+    }
 }
 
 #[async_trait]

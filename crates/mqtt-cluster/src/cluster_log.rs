@@ -950,6 +950,49 @@ impl<T: ReplicaTransport> ClusterLog<T> {
             .get(key)
             .map_or(0, |ks| ks.truncated)
     }
+
+    /// Re-commit `key`'s committed log to ONE node (ADR 0043 P3): the
+    /// decommission hand-off. Every committed entry is re-delivered to `target`
+    /// re-tagged at this owner's epoch with seqs `1..=n` in offset order (the
+    /// recommit convention, ADR 0042 T7 — a target already holding an offset at
+    /// a higher `(epoch, seq)` keeps its version), followed by the truncation
+    /// floor so an acked-away prefix reads as truncated, not missing. Additive
+    /// and best-effort: no quorum gate — the requesting drain verifies by
+    /// reading the target back, and re-asks while its content falls short.
+    pub async fn recommit_key_to(&self, key: &str, target: &NodeId) {
+        let (entries, floor) = {
+            let state = self.state.lock().await;
+            match state.get(key) {
+                Some(ks) => (
+                    ks.entries
+                        .range(..=ks.committed)
+                        .map(|(offset, record)| LogEntry {
+                            offset: *offset,
+                            record: record.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                    ks.truncated,
+                ),
+                None => return,
+            }
+        };
+        for (i, entry) in entries.iter().enumerate() {
+            let op = ReplOp::Append {
+                key: key.to_string(),
+                offset: entry.offset,
+                seq: u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1),
+                record: entry.record.clone(),
+            };
+            let _ = self.transport.deliver(target, self.lease.epoch, &op).await;
+        }
+        if floor > 0 {
+            let op = ReplOp::Truncate {
+                key: key.to_string(),
+                up_to: floor,
+            };
+            let _ = self.transport.deliver(target, self.lease.epoch, &op).await;
+        }
+    }
 }
 
 impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {

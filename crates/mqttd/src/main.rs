@@ -114,6 +114,14 @@
 //! - `MQTTD_SHUTDOWN_GRACE` — seconds to drain live client connections after a
 //!   `SIGTERM`/`SIGINT` before forcing shutdown (ADR 0019; default 30). `/readyz`
 //!   flips to draining immediately so orchestrators stop routing new connections.
+//!
+//! Signals: `SIGTERM`/`SIGINT` begin the ADR 0019 graceful shutdown (a second one
+//! forces immediate exit). **`SIGUSR1` begins a DECOMMISSION** (ADR 0043 P3): the
+//! node first hands every durable key it holds to each group's post-departure
+//! replica set and verifies the copies landed (progress on `/readyz` as
+//! `decommission{pending,rounds,complete}`), and only then runs the graceful
+//! leave — so a planned removal loses nothing, unlike pulling the plug. A
+//! `SIGTERM` during the drain escalates to a plain shutdown (crash semantics).
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
@@ -216,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
-    let draining =
+    let (draining, decommission_slot) =
         start_health_from_env(&hub_tx, &placement, durable_plane.clone(), metrics.clone()).await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
@@ -398,6 +406,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &draining,
         plane_for_shutdown,
         lease_driver,
+        node_id,
+        decommission_slot,
     )
     .await;
     // Push a final OTLP batch so the last counters are not lost on exit (no-op without
@@ -1009,13 +1019,22 @@ async fn start_health_from_env(
     placement: &Arc<RwLock<Placement>>,
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
-) -> Result<Arc<std::sync::atomic::AtomicBool>, Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::OnceLock<Arc<mqtt_cluster::decommission::DrainStatus>>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let health_bind = non_empty_env("MQTTD_HEALTH_BIND");
     let metrics_bind = non_empty_env("MQTTD_METRICS_BIND");
     if health_bind.is_none() && metrics_bind.is_none() {
-        // Neither server: hand back a standalone flag so the caller's shutdown path is
-        // uniform (nothing reads it).
-        return Ok(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // Neither server: hand back standalone handles so the caller's shutdown
+        // path is uniform (nothing reads them).
+        return Ok((
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::OnceLock::new()),
+        ));
     }
     let min_members = match non_empty_env("MQTTD_READY_MIN_MEMBERS") {
         Some(raw) => raw
@@ -1032,6 +1051,7 @@ async fn start_health_from_env(
     )
     .with_metrics(metrics);
     let draining = state.draining_handle();
+    let decommission = state.decommission_slot();
     if let Some(bind) = &health_bind {
         let listener = TcpListener::bind(bind).await?;
         info!(%bind, min_members, "serving health endpoints (/livez, /readyz, /healthz, /metrics)");
@@ -1045,7 +1065,7 @@ async fn start_health_from_env(
             tokio::spawn(mqttd::health::serve(listener, state));
         }
     }
-    Ok(draining)
+    Ok((draining, decommission))
 }
 
 fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
@@ -1937,15 +1957,47 @@ fn shutdown_grace_from_env() -> Duration {
 /// Run until a shutdown signal, then drain gracefully (ADR 0019): fail readiness, stop
 /// accepting and drain live connections, all bounded by the grace deadline (or a second
 /// signal), then stop the lease consensus core cleanly.
+///
+/// `SIGUSR1` instead begins a **decommission** (ADR 0043 P3): readiness fails
+/// immediately, the drain hands every held key to its group's post-departure
+/// replica set and verifies it landed, and only then does the ordinary graceful
+/// shutdown (whose SWIM leave moves ownership and triggers voter demotion) run.
+/// A `SIGTERM`/`SIGINT` during the drain escalates to a plain shutdown — a
+/// crash mid-decommission is just a crash, handled by the survivors.
+#[allow(clippy::too_many_arguments)]
 async fn graceful_shutdown(
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
     draining: &std::sync::atomic::AtomicBool,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     lease_driver: Option<tokio::task::JoinHandle<()>>,
+    node_id: NodeId,
+    decommission_slot: Arc<std::sync::OnceLock<Arc<mqtt_cluster::decommission::DrainStatus>>>,
 ) {
     connections.close(); // no more spawns once the accept loops stop
-    wait_for_shutdown_signal().await;
+    tokio::select! {
+        () = wait_for_shutdown_signal() => {}
+        () = wait_for_decommission_signal() => {
+            // Fail readiness for the whole drain: orchestrators steer new
+            // traffic elsewhere while this node hands its data off.
+            draining.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(plane) = &plane {
+                warn!("SIGUSR1: decommission requested; draining data to the post-departure replica sets (ADR 0043 P3)");
+                let drain = plane.decommission_drain(node_id);
+                let _ = decommission_slot.set(drain.status());
+                tokio::select! {
+                    () = drain.run() => {
+                        warn!("decommission drain complete; proceeding with the graceful leave");
+                    }
+                    () = wait_for_shutdown_signal() => {
+                        warn!("shutdown signal during decommission drain; leaving with crash semantics (survivors recover)");
+                    }
+                }
+            } else {
+                warn!("SIGUSR1: decommission requested without a durable plane; proceeding as a plain graceful shutdown");
+            }
+        }
+    }
     let grace = shutdown_grace_from_env();
     warn!(
         grace_secs = grace.as_secs(),
@@ -1977,6 +2029,26 @@ async fn graceful_shutdown(
         let _ = plane.raft().shutdown().await;
     }
     info!("shutdown complete");
+}
+
+/// Resolve once a decommission is requested: `SIGUSR1` (ADR 0043 P3). Pends
+/// forever on platforms without it (or if the handler cannot install) — plain
+/// shutdown signals still work.
+async fn wait_for_decommission_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::user_defined1()) {
+            Ok(mut usr1) => {
+                let _ = usr1.recv().await;
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "cannot install SIGUSR1 handler; decommission unavailable");
+            }
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 /// Resolve once a shutdown signal arrives: `SIGTERM` (the orchestrator stop signal) or

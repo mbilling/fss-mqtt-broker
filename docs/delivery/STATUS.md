@@ -50,7 +50,7 @@
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
-| [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Proposed | [2/5 done](0043-elastic-cluster-resize.md) | 3 open |
+| [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Proposed | [3/5 done](0043-elastic-cluster-resize.md) | 2 open |
 
 ## Open and deferred work
 
@@ -116,6 +116,5 @@
 
 **0043 — Elastic cluster resize (grow, shrink, replace)**
 
-- `0043-P3` ⬜ planned: Decommission — an explicit drain (stop new sessions → successors caught up + replica counts restored among remaining members → voter demotion → ADR 0019 leave), observable via the health endpoint, interruptible (crash mid-drain = crash); operator trigger chosen here (signal vs admin endpoint)
 - `0043-P4` ⬜ planned: Resize test vocabulary — join/decommission steps in the ADR 0042 stress schedules, plus dedicated upgrade-path tests (1→3 laptop-to-server, 3→5 zone-spread, 5→3 cost reduction, rolling host replacement, rolling binary upgrade across the proto window) under the unchanged acked-obligations oracle
 - `0043-P5` ⬜ planned: Operator docs — the "grow your broker" guide (one paragraph per direction), the two-node-waypoint honesty note (quorum 2-of-2; recommend 1→3), README interim warning that durable resize is unsupported until P1 lands

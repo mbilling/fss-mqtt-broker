@@ -49,6 +49,12 @@ pub trait CatchUpSource: Send + Sync {
     /// Best-effort: a failure (not owner / no quorum) is left for the
     /// requester's sweep to retry.
     async fn catch_up_key(&self, key: &str);
+
+    /// Re-commit `key`'s committed log to ONE node (ADR 0043 P3) — the
+    /// decommission hand-off toward a post-departure replica-set member the
+    /// owner's fan-out does not reach yet. Additive, idempotent, best-effort:
+    /// the requesting drain verifies by reading the target back.
+    async fn catch_up_key_to(&self, key: &str, target: &NodeId);
 }
 
 /// A node's endpoint on the durable plane: its lease-group consensus handle, its
@@ -181,6 +187,27 @@ impl DurablePlane {
                 .membership_config
                 .voter_ids()
                 .any(|id| id == metrics.id)
+    }
+
+    /// Assemble the decommission drain (ADR 0043 P3) over this plane's shared
+    /// handles: it verifies every held key against each group's post-departure
+    /// replica set and asks owners for targeted re-commits until nothing falls
+    /// short — after which the ordinary graceful-shutdown leave (ADR 0019) is
+    /// lossless. `node` is this node's identity (the one departing).
+    #[must_use]
+    pub fn decommission_drain(&self, node: NodeId) -> crate::decommission::Drain {
+        let source = self
+            .catch_up
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        crate::decommission::Drain::new(
+            node,
+            self.placement.clone(),
+            self.transport.clone(),
+            self.replicas.clone(),
+            source,
+        )
     }
 
     /// Whether this node's replica copy of `key` is **caught up** (ADR 0043 P1):
@@ -354,6 +381,22 @@ impl DurablePlane {
                     source.catch_up_key(&key).await;
                 } else {
                     tracing::debug!(key, "catch-up request before store wired; dropped");
+                }
+                None
+            }
+            // Targeted catch-up (ADR 0043 P3): a decommissioning node asks us —
+            // the owner — to hand `key`'s committed log to one specific member
+            // of the post-departure replica set. Best-effort, like ReplicaCatchUp.
+            PeerMessage::ReplicaCatchUpTo { key, target } => {
+                let source = self
+                    .catch_up
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(source) = source {
+                    source.catch_up_key_to(&key, &NodeId(target)).await;
+                } else {
+                    tracing::debug!(key, "targeted catch-up before store wired; dropped");
                 }
                 None
             }
@@ -676,12 +719,16 @@ mod tests {
     /// `ReplicaCatchUp` request routes to the owner plane's [`CatchUpSource`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn proto4_reads_carry_completeness_and_catch_up_reaches_the_source() {
-        /// Records every key the owner plane is asked to catch up.
+        /// Records every key the owner plane is asked to catch up (targeted
+        /// requests as `key -> node`).
         struct Recorder(mpsc::UnboundedSender<String>);
         #[async_trait::async_trait]
         impl super::CatchUpSource for Recorder {
             async fn catch_up_key(&self, key: &str) {
                 let _ = self.0.send(key.to_string());
+            }
+            async fn catch_up_key_to(&self, key: &str, target: &NodeId) {
+                let _ = self.0.send(format!("{key} -> {}", target.0));
             }
         }
 
@@ -745,6 +792,16 @@ mod tests {
             .expect("catch-up request reaches the owner")
             .unwrap();
         assert_eq!(asked, "q/c");
+
+        // The targeted variant (ADR 0043 P3, proto 5): a decommissioning node
+        // asks the owner to hand the key to ONE specific successor.
+        p2.transport()
+            .request_catch_up_to(&n("node-1"), "q/c", &n("node-3"));
+        let asked = tokio::time::timeout(Duration::from_secs(5), rec_rx.recv())
+            .await
+            .expect("targeted catch-up request reaches the owner")
+            .unwrap();
+        assert_eq!(asked, "q/c -> node-3");
 
         p1.raft().shutdown().await.unwrap();
         p2.raft().shutdown().await.unwrap();
