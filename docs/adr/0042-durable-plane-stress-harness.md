@@ -1,6 +1,6 @@
 # ADR 0042 — Durable-plane stress and simulation harness
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-10
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0042-durable-plane-stress-harness.md](../delivery/0042-durable-plane-stress-harness.md) — plan, progress, and changelog

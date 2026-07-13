@@ -52,14 +52,19 @@ use std::collections::BTreeMap;
 const REPRO_SEED: Option<u64> = None;
 
 /// How many seeds each scenario sweeps (the pure core is cheap; a full sweep runs
-/// in seconds). `REPRO_SEED` narrows it to one.
+/// in seconds). `REPRO_SEED` narrows it to one; `MQTTD_SIM_SEEDS=N` widens it
+/// for a soak run (ADR 0042 §5 — the CI default stays inside the push budget).
 const SEED_SWEEP: u64 = 1000;
 
 fn seeds() -> Vec<u64> {
-    match REPRO_SEED {
-        Some(s) => vec![s],
-        None => (0..SEED_SWEEP).collect(),
+    if let Some(s) = REPRO_SEED {
+        return vec![s];
     }
+    let n = std::env::var("MQTTD_SIM_SEEDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SEED_SWEEP);
+    (0..n).collect()
 }
 
 /// A seeded xorshift64 RNG — deterministic, matching `swim_sim` (no `rand`).

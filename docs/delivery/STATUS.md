@@ -49,7 +49,8 @@
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
-| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Proposed | [8/9 done](0042-durable-plane-stress-harness.md) | 1 open |
+| [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
+| [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Proposed | [0/5 done](0043-elastic-cluster-resize.md) | 5 open |
 
 ## Open and deferred work
 
@@ -113,6 +114,10 @@
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
 
-**0042 — Durable-plane stress and simulation harness**
+**0043 — Elastic cluster resize (grow, shrink, replace)**
 
-- `0042-T5` ⬜ planned: Profiles + exhibits + closure — bounded CI profile on every push, env-tunable soak profile, exhibit ledger opened with the takeover flake (reproduced-and-fixed or explained), TEST-PLAN/docs updated, ADR acceptance
+- `0043-P1` ⬜ planned: Catch-up replicas — a node entering a group's replica set back-fills the group's log (ReplicaKeys discovery + recover_key quorum reads) behind a durable caught-up watermark, and counts toward NO quorum (append or recovery) until caught up; growing 1→N back-fills laptop-mode single-replica history as the same rule
+- `0043-P2` ⬜ planned: Eager migration on ring change — membership growth triggers the takeover-scan materialization (sessions, retained, interest) for groups whose owner moved, instead of first-touch; the settle/re-route + mesh-whole ack machinery holds acks honest during the window
+- `0043-P3` ⬜ planned: Decommission — an explicit drain (stop new sessions → successors caught up + replica counts restored among remaining members → voter demotion → ADR 0019 leave), observable via the health endpoint, interruptible (crash mid-drain = crash); operator trigger chosen here (signal vs admin endpoint)
+- `0043-P4` ⬜ planned: Resize test vocabulary — join/decommission steps in the ADR 0042 stress schedules, plus dedicated upgrade-path tests (1→3 laptop-to-server, 3→5 zone-spread, 5→3 cost reduction, rolling host replacement, rolling binary upgrade across the proto window) under the unchanged acked-obligations oracle
+- `0043-P5` ⬜ planned: Operator docs — the "grow your broker" guide (one paragraph per direction), the two-node-waypoint honesty note (quorum 2-of-2; recommend 1→3), README interim warning that durable resize is unsupported until P1 lands

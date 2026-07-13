@@ -63,9 +63,37 @@ Keep **both** client styles, deliberately:
 3. ✅ Cluster routing gaps (cross-node QoS 1; shared per-node; retained-not-replicated).
 4. ✅ Binary smoke test.
 5. ✅ Real-client interop — non-Rust (Mosquitto) oracle, ADR 0034 (see Strategy).
-6. Deeper cluster chaos: partition+heal reconvergence, owner-dies-mid-publish,
-   takeover-across-nodes with in-flight messages, QoS 2 across nodes.
+6. ✅ Deeper cluster chaos — superseded by the ADR 0042 harness (below), which
+   composes these faults from seeds instead of scripting them one at a time.
 7. Retrofit the existing 13 files onto the shared harness (mechanical; lowest value).
+
+### The durable-plane harness (ADR 0042) — done
+
+Three layers guard the hardest correctness surface, each answering a different
+question ([ADR 0042](adr/0042-durable-plane-stress-harness.md)):
+
+- **Invariant catalog** (`mqtt_cluster::invariants`): the durable plane's guarantees
+  stated once as executable checkers — acked durability, epoch fencing, lease
+  monotonicity, retained tokens, session singularity, recovery honesty, bounded
+  structures. Scenarios choose *what to do*; the catalog is always *what must hold*.
+- **Deterministic simulation** (`mqtt-cluster/tests/durable_sim.rs`): the pure core
+  (lease map, replica/fencing logic, token application, HRW placement) driven through
+  seeded schedules — reorderings, drops, duplications — with the catalog asserted after
+  every step. 1000 seeds per scenario on every push (cheap); a failure panics with its
+  seed and `REPRO_SEED` replays it exactly.
+- **Whole-cluster stress** (`mqttd/tests/cluster_stress.rs`): a real 3-node durable
+  cluster (production wiring + a severable relay per node) under seed-composed fault
+  schedules — owner kills, restarts over surviving data dirs, asymmetric link flaps,
+  disk write-fault injection, brownout entry/exit, client churn — against an
+  obligations ledger of **acked facts only**, judged post-quiesce by the catalog. A
+  separate test power-cycles the whole cluster. The seed reproduces the *scenario*
+  (tokio/I-O timing is real); every failure prints the seed and full schedule trace.
+
+**Profiles:** every push runs the CI profile (1000 sim seeds; 1 stress seed, ~60–90 s;
+the stop/start test, ~10 s) inside `cargo test --all`. Soak runs opt in via env:
+`MQTTD_SIM_SEEDS=N` (simulation) and `MQTTD_STRESS_SEEDS=N` (whole-cluster). Findings
+land in the [exhibit ledger](delivery/0042-durable-plane-stress-harness.md) — twelve
+real defects found and fixed by this program to date.
 
 ## Scenario catalog
 
