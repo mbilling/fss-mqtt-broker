@@ -2748,8 +2748,7 @@ impl Hub {
             .retained
             .matching(topic)
             .await
-            .map(|m| m.iter().any(|r| r.topic == topic))
-            .unwrap_or(false)
+            .is_ok_and(|m| m.iter().any(|r| r.topic == topic))
     }
 
     /// The node's session count for the quota (ADR 0041 T4): every online session
