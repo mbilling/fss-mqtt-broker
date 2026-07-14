@@ -350,7 +350,7 @@ where
     // The dialer announces itself first; the accept side reads first so it can
     // detect a session-proxy connection (ADR 0005) before announcing itself —
     // a proxied client expects raw MQTT back, not our peer Hello.
-    let (remote, proto) = if initiated {
+    let remote = if initiated {
         write_frame(
             &mut wh,
             &PeerMessage::Hello {
@@ -369,12 +369,7 @@ where
                 if !proto_compatible(&node_id, proto_min, proto_max) {
                     return Ok(LinkOutcome::Closed);
                 }
-                let proto = peer::negotiate_proto(
-                    (peer::PROTO_MIN, peer::PROTO_MAX),
-                    (proto_min, proto_max),
-                )
-                .unwrap_or(peer::PROTO_MIN);
-                (NodeId(node_id), proto)
+                NodeId(node_id)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -419,12 +414,7 @@ where
                     },
                 )
                 .await?;
-                let proto = peer::negotiate_proto(
-                    (peer::PROTO_MIN, peer::PROTO_MAX),
-                    (proto_min, proto_max),
-                )
-                .unwrap_or(peer::PROTO_MIN);
-                (NodeId(node_id), proto)
+                NodeId(node_id)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -469,7 +459,6 @@ where
             conn_id,
             tx: out_tx,
             cert_serial,
-            proto,
         })
         .is_err()
     {
@@ -552,7 +541,6 @@ fn forward_inbound(
         // at the RPC timeout ("no replication quorum" on a healthy cluster).
         frame @ (PeerMessage::ReplicateAck { .. }
         | PeerMessage::ReplicaReadReply { .. }
-        | PeerMessage::ReplicaReadReply2 { .. }
         | PeerMessage::ReplicaKeysReply { .. }
         | PeerMessage::RaftRpcReply { .. })
             if plane.is_some() =>
@@ -733,8 +721,6 @@ fn forward_inbound(
         | PeerMessage::RaftRpcReply { .. }
         | PeerMessage::ReplicaRead { .. }
         | PeerMessage::ReplicaReadReply { .. }
-        | PeerMessage::ReplicaRead2 { .. }
-        | PeerMessage::ReplicaReadReply2 { .. }
         | PeerMessage::ReplicaCatchUp { .. }
         | PeerMessage::ReplicaCatchUpTo { .. }
         | PeerMessage::ReplicaKeys { .. }

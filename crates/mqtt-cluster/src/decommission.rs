@@ -263,7 +263,7 @@ mod tests {
                         let accepted = state.lock().unwrap().apply(epoch, &op);
                         transport.complete_ack(req_id, accepted);
                     }
-                    PeerMessage::ReplicaRead2 { req_id, key } => {
+                    PeerMessage::ReplicaRead { req_id, key } => {
                         let (watermark, complete, entries) = {
                             let s = state.lock().unwrap();
                             (
@@ -280,7 +280,7 @@ mod tests {
                                     .collect(),
                             )
                         };
-                        transport.complete_read2(req_id, watermark, complete, entries);
+                        transport.complete_read(req_id, watermark, complete, entries);
                     }
                     _ => {}
                 }
@@ -371,7 +371,7 @@ mod tests {
         let transport = Arc::new(PeerReplicaTransport::new());
         let succ_state = Arc::new(Mutex::new(ReplicaState::new()));
         let (tx, rx) = mpsc::unbounded_channel();
-        transport.register(succ.clone(), tx, crate::peer::PROTO_MAX);
+        transport.register(succ.clone(), tx);
         spawn_successor(transport.clone(), succ_state.clone(), rx);
 
         // The owner-side catch-up source: the real group-routed store.
