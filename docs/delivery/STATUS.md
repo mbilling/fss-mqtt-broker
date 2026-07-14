@@ -50,7 +50,7 @@
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
-| [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Proposed | [4/5 done](0043-elastic-cluster-resize.md) | 1 open |
+| [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 
 ## Open and deferred work
 
@@ -113,7 +113,3 @@
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
-
-**0043 — Elastic cluster resize (grow, shrink, replace)**
-
-- `0043-P5` ⬜ planned: Operator docs — the "grow your broker" guide (one paragraph per direction), the two-node-waypoint honesty note (quorum 2-of-2; recommend 1→3), README interim warning that durable resize is unsupported until P1 lands

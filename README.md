@@ -402,6 +402,43 @@ under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
 [0027](docs/adr/0027-replica-group-commit.md) /
 [0028](docs/adr/0028-link-gated-voter-admission.md)).
 
+## Resizing the cluster
+
+Grow, shrink, and replace are first-class, **data-safe** operations on a running
+durable cluster ([ADR 0043](docs/adr/0043-elastic-cluster-resize.md)) — verified by
+the same acked-facts stress oracle as every crash fault. Pulling a plug instead is
+always allowed: that is crash semantics, and the survivors recover from their
+replicas.
+
+**Grow.** Start the new node with `MQTTD_SWIM_SEEDS` pointing at any member (and its
+own `MQTTD_DATA_DIR` / cluster-bus cert). The cluster does the rest: the joiner
+back-fills every replica set it enters behind a durable caught-up watermark — until
+then it counts toward no recovery — and ownership it gains is materialized eagerly,
+with publisher acknowledgements held honest through the window. Growing a 1-node
+broker re-replicates its whole history the same way: the laptop→server upgrade is
+just "start two more nodes". Watch `/readyz` on the joiner (`lease_group_ready`) and
+route client traffic to it once ready.
+
+**The two-node truth.** Two members mean replica sets of two and a write quorum of
+2-of-2 — a two-node durable cluster has *strictly worse* write availability than one
+node (either node down blocks durable writes). Two nodes are supported as a
+waypoint, but the recommended upgrade is **1→3 in one motion**: start both new nodes,
+then treat the pair-state as transient.
+
+**Shrink (decommission).** Send the node `SIGUSR1`. It fails readiness immediately,
+then **drains**: every durable key it holds is handed to the replica set each group
+will have after its departure, and verified there — progress is visible on `/readyz`
+as `decommission{pending,rounds,complete}` — and only then does it run the ordinary
+graceful leave (ownership moves, voters rebalance). A drain that cannot converge
+(unreachable successors) waits rather than lies; `SIGTERM` escalates to a plain
+shutdown at any time, and a mid-drain crash is just a crash. Repeat one node at a
+time for a 5→3 cost reduction, letting membership settle between steps.
+
+**Replace a host.** Grow by the replacement first, then decommission the old node —
+same size before and after, zero acked loss. Rolling binary upgrades
+([ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md)) ride the same
+one-node-at-a-time motion.
+
 ## Upgrades & versioning
 
 From **1.0.0** ([ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md); until then

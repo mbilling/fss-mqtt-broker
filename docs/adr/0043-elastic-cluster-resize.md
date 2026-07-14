@@ -1,7 +1,7 @@
 # ADR 0043 — Elastic cluster resize (grow, shrink, replace)
 
-- **Status:** Proposed
-- **Date:** 2026-07-13
+- **Status:** Accepted
+- **Date:** 2026-07-13 (accepted 2026-07-14 — P1–P5 delivered; see the delivery doc)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0043-elastic-cluster-resize.md](../delivery/0043-elastic-cluster-resize.md) — plan, progress, and changelog
 - **Related:** [ADR 0021](0021-bounded-lease-voters.md) (voter cap, stickiness, demote-to-learner —
@@ -112,10 +112,10 @@ negotiation window.
   any member, and the cluster does the rest — the operator guide is one paragraph.
 - Writes to a group pay no new cost in steady state; catch-up cost is paid once per
   joined replica, off the hot path.
-- Until part 1 lands, resize of a durable cluster is **unsupported and unsafe**; the
-  README says so to keep early adopters off the hazard.
 - Decommission gives the 5→3 cost-reduction exercise a supported path; pulling plugs
   remains crash semantics, handled by the existing takeover machinery.
+- (Historical: until part 1 landed, resize of a durable cluster was unsupported and
+  the README said so; that warning is gone — the README now carries the resize guide.)
 
 ## Alternatives considered
 
