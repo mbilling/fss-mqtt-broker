@@ -72,7 +72,7 @@ impl Default for PeerReplicaTransport {
 
 #[derive(Debug, Default)]
 struct Inner {
-    followers: HashMap<NodeId, (mpsc::UnboundedSender<PeerMessage>, u32)>,
+    followers: HashMap<NodeId, mpsc::UnboundedSender<PeerMessage>>,
     pending: HashMap<u64, Pending>,
     /// In-flight recovery-reads (workstream F), keyed by `req_id`.
     pending_reads: HashMap<u64, PendingRead>,
@@ -93,14 +93,13 @@ struct Pending {
 }
 
 /// A recovery-read reply: the replica's truncation low-water, its completeness
-/// verdict (ADR 0043 P1 — `false` for replies from pre-proto-4 peers), and its
-/// stored entries.
+/// verdict (ADR 0043 P1), and its stored entries.
 type ReadReply = (u64, bool, Vec<ReplicaEntryWire>);
 
 #[derive(Debug)]
 struct PendingRead {
     node: NodeId,
-    /// Resolves with the replica's `(watermark, entries)`.
+    /// Resolves with the replica's `(watermark, complete, entries)`.
     reply: oneshot::Sender<ReadReply>,
 }
 
@@ -128,8 +127,8 @@ impl PeerReplicaTransport {
     ///
     /// `tx` is the sender into that peer's link — the same channel the hub holds
     /// for the node. Called when a peer link is (re)established.
-    pub fn register(&self, node: NodeId, tx: mpsc::UnboundedSender<PeerMessage>, proto: u32) {
-        self.lock().followers.insert(node, (tx, proto));
+    pub fn register(&self, node: NodeId, tx: mpsc::UnboundedSender<PeerMessage>) {
+        self.lock().followers.insert(node, tx);
     }
 
     /// Drop a replica and fail every request in flight to it.
@@ -182,19 +181,11 @@ impl PeerReplicaTransport {
         }
     }
 
-    /// Resolve a pending recovery-read with the replica's watermark and entries.
+    /// Resolve a pending recovery-read with the replica's watermark, completeness
+    /// verdict (ADR 0043 P1), and entries.
     ///
     /// Called by the link handler when a [`PeerMessage::ReplicaReadReply`] arrives.
-    pub fn complete_read(&self, req_id: u64, watermark: u64, entries: Vec<ReplicaEntryWire>) {
-        if let Some(p) = self.lock().pending_reads.remove(&req_id) {
-            // A legacy reply carries no completeness verdict: conservative false.
-            let _ = p.reply.send((watermark, false, entries));
-        }
-    }
-
-    /// Resolve a pending recovery-read from a proto-4 reply, completeness included
-    /// (ADR 0043 P1).
-    pub fn complete_read2(
+    pub fn complete_read(
         &self,
         req_id: u64,
         watermark: u64,
@@ -208,33 +199,25 @@ impl PeerReplicaTransport {
 
     /// Ask `owner` to re-commit `key`'s committed log (ADR 0043 P1) — the
     /// catch-up request a hollow replica sends. Fire-and-forget; a no-op toward
-    /// a peer that cannot speak it (pre-proto-4) or has no live link — the
-    /// sweep retries.
+    /// a peer with no live link — the sweep retries.
     pub fn request_catch_up(&self, owner: &NodeId, key: &str) {
-        let inner = self.lock();
-        if let Some((tx, proto)) = inner.followers.get(owner) {
-            if *proto >= 4 {
-                let _ = tx.send(PeerMessage::ReplicaCatchUp {
-                    key: key.to_string(),
-                });
-            }
+        if let Some(tx) = self.lock().followers.get(owner) {
+            let _ = tx.send(PeerMessage::ReplicaCatchUp {
+                key: key.to_string(),
+            });
         }
     }
 
     /// Ask `owner` to re-commit `key`'s committed log to `target` (ADR 0043 P3) —
     /// the decommission drain's hand-off request for a post-departure replica-set
     /// member the owner's fan-out does not reach yet. Fire-and-forget; a no-op
-    /// toward a peer that cannot speak it (pre-proto-5) or has no live link —
-    /// the drain re-verifies and re-asks.
+    /// toward a peer with no live link — the drain re-verifies and re-asks.
     pub fn request_catch_up_to(&self, owner: &NodeId, key: &str, target: &NodeId) {
-        let inner = self.lock();
-        if let Some((tx, proto)) = inner.followers.get(owner) {
-            if *proto >= 5 {
-                let _ = tx.send(PeerMessage::ReplicaCatchUpTo {
-                    key: key.to_string(),
-                    target: target.0.clone(),
-                });
-            }
+        if let Some(tx) = self.lock().followers.get(owner) {
+            let _ = tx.send(PeerMessage::ReplicaCatchUpTo {
+                key: key.to_string(),
+                target: target.0.clone(),
+            });
         }
     }
 
@@ -263,7 +246,7 @@ impl PeerReplicaTransport {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut inner = self.lock();
-            let Some((tx, _)) = inner.followers.get(replica).cloned() else {
+            let Some(tx) = inner.followers.get(replica).cloned() else {
                 return None; // replica not connected
             };
             inner.pending_keys.insert(
@@ -306,7 +289,7 @@ impl ReplicaTransport for PeerReplicaTransport {
         {
             let mut inner = self.lock();
             // Clone the sender so we hold no borrow of `inner` across the insert.
-            let Some((tx, _)) = inner.followers.get(replica).cloned() else {
+            let Some(tx) = inner.followers.get(replica).cloned() else {
                 tracing::debug!(replica = %replica.0, "replicate: follower not registered");
                 return false; // replica not connected → no ack toward quorum
             };
@@ -347,7 +330,7 @@ impl ReplicaTransport for PeerReplicaTransport {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut inner = self.lock();
-            let Some((tx, proto)) = inner.followers.get(replica).cloned() else {
+            let Some(tx) = inner.followers.get(replica).cloned() else {
                 return None; // replica not connected
             };
             inner.pending_reads.insert(
@@ -357,18 +340,9 @@ impl ReplicaTransport for PeerReplicaTransport {
                     reply: reply_tx,
                 },
             );
-            // Proto 4 peers answer with their completeness verdict (ADR 0043 P1);
-            // the request's version tells the server which reply we can decode.
-            let frame = if proto >= 4 {
-                PeerMessage::ReplicaRead2 {
-                    req_id,
-                    key: key.to_string(),
-                }
-            } else {
-                PeerMessage::ReplicaRead {
-                    req_id,
-                    key: key.to_string(),
-                }
+            let frame = PeerMessage::ReplicaRead {
+                req_id,
+                key: key.to_string(),
             };
             if tx.send(frame).is_err() {
                 inner.pending_reads.remove(&req_id);
@@ -518,7 +492,7 @@ mod tests {
         let state = Arc::new(Mutex::new(ReplicaState::new()));
         let (leader_io, follower_io) = tokio::io::duplex(64 * 1024);
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        transport.register(follower.clone(), out_tx, crate::peer::PROTO_MAX);
+        transport.register(follower.clone(), out_tx);
         spawn_leader_link(transport.clone(), leader_io, out_rx);
         spawn_follower_link(state.clone(), follower_io);
         (transport, state, follower)
@@ -571,7 +545,7 @@ mod tests {
         let b = n("b");
         // Registered (so the send succeeds) but never serviced — no ack ever comes.
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
-        transport.register(b.clone(), out_tx, crate::peer::PROTO_MAX);
+        transport.register(b.clone(), out_tx);
         assert!(!transport.deliver(&b, 1, &append("c", 1)).await);
     }
 
@@ -584,54 +558,33 @@ mod tests {
         )));
         let b = n("b");
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
-        transport.register(b.clone(), out_tx, crate::peer::PROTO_MAX);
+        transport.register(b.clone(), out_tx);
         assert!(transport.read_replica(&b, "k").await.is_none());
     }
 
-    /// The rolling-upgrade proto window (ADR 0039 / ADR 0043 P4): catch-up
-    /// requests are version-gated per LINK, so a mixed-proto mesh degrades
-    /// honestly instead of sending frames a peer cannot decode. A proto-3 peer
-    /// receives no `ReplicaCatchUp` (P1's sweep keeps retrying — pending, not
-    /// wrong), a proto-4 peer receives no `ReplicaCatchUpTo` (P3's drain stays
-    /// pending — the decommission waits out the upgrade rather than lying),
-    /// and current peers receive both.
+    /// Catch-up requests (ADR 0043 P1/P3) reach a connected owner's link and
+    /// silently no-op toward a disconnected one — the callers (sweep, drain)
+    /// retry, so "no link yet" must be pending, never an error.
     #[tokio::test]
-    async fn catch_up_requests_are_proto_gated_per_link() {
+    async fn catch_up_requests_reach_the_owner_link() {
         let transport = PeerReplicaTransport::new();
-        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
-        let (mid_tx, mut mid_rx) = mpsc::unbounded_channel();
-        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
-        transport.register(n("old"), old_tx, 3);
-        transport.register(n("mid"), mid_tx, 4);
-        transport.register(n("new"), new_tx, crate::peer::PROTO_MAX);
+        let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
+        transport.register(n("owner"), owner_tx);
 
-        transport.request_catch_up(&n("old"), "q/c");
-        transport.request_catch_up_to(&n("old"), "q/c", &n("x"));
-        transport.request_catch_up(&n("mid"), "q/c");
-        transport.request_catch_up_to(&n("mid"), "q/c", &n("x"));
-        transport.request_catch_up(&n("new"), "q/c");
-        transport.request_catch_up_to(&n("new"), "q/c", &n("x"));
+        transport.request_catch_up(&n("ghost"), "q/c"); // not connected: no-op
+        transport.request_catch_up_to(&n("ghost"), "q/c", &n("x"));
+        transport.request_catch_up(&n("owner"), "q/c");
+        transport.request_catch_up_to(&n("owner"), "q/c", &n("x"));
 
-        assert!(
-            old_rx.try_recv().is_err(),
-            "a proto-3 peer receives no catch-up frame of either kind"
-        );
-        assert!(
-            matches!(mid_rx.try_recv(), Ok(PeerMessage::ReplicaCatchUp { .. })),
-            "a proto-4 peer serves P1 catch-up"
-        );
-        assert!(
-            mid_rx.try_recv().is_err(),
-            "…but receives no targeted (proto-5) request"
-        );
         assert!(matches!(
-            new_rx.try_recv(),
-            Ok(PeerMessage::ReplicaCatchUp { .. })
+            owner_rx.try_recv(),
+            Ok(PeerMessage::ReplicaCatchUp { key }) if key == "q/c"
         ));
         assert!(
-            matches!(new_rx.try_recv(), Ok(PeerMessage::ReplicaCatchUpTo { target, .. }) if target == "x"),
-            "a current peer serves the targeted request"
+            matches!(owner_rx.try_recv(), Ok(PeerMessage::ReplicaCatchUpTo { target, .. }) if target == "x"),
+            "the targeted request reaches the owner"
         );
+        assert!(owner_rx.try_recv().is_err(), "nothing for the ghost leaked");
     }
 
     /// If a replica's link drops with a request in flight, `fail_node` resolves it
@@ -643,7 +596,7 @@ mod tests {
         // Register a follower whose receiver we keep alive (so the send succeeds)
         // but never service — no acks are ever produced.
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
-        transport.register(b.clone(), out_tx, crate::peer::PROTO_MAX);
+        transport.register(b.clone(), out_tx);
 
         let t2 = transport.clone();
         let b2 = b.clone();

@@ -820,8 +820,8 @@ mod tests {
         let (io1, io2) = tokio::io::duplex(256 * 1024);
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
-        p1.register(&n("m-node-2"), out1_tx.clone(), crate::peer::PROTO_MAX);
-        p2.register(&n("m-node-1"), out2_tx.clone(), crate::peer::PROTO_MAX);
+        p1.register(&n("m-node-2"), out1_tx.clone());
+        p2.register(&n("m-node-1"), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 

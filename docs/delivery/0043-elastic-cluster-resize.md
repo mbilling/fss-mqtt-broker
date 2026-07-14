@@ -66,7 +66,22 @@ Order: P1 → P2 → P3 (each unblocks the next), P4 grows alongside each, P5 la
 
 ## Changelog
 
-- **2026-07-14** — **0043-P5 done; ADR 0043 ACCEPTED — elastic resize is delivered.**
+- **2026-07-14** — **Pre-release proto collapse.** The project is pre-release:
+  breaking changes are free and no protocol/schema version coexistence is
+  supported until after 1.0.0 (rolling upgrades are a post-release capability).
+  The version ceremony P1/P3 had added is folded away accordingly: the
+  `ReplicaRead2`/`ReplicaReadReply2` side-by-side variants are gone —
+  `ReplicaReadReply` itself now carries the completeness verdict — and the
+  per-link proto gating (request-version-selects-reply-shape, the ≥4/≥5 guards
+  on catch-up frames, the hub's pre-proto-3 fire-and-forget fallbacks, the
+  negotiated version threaded through `PeerConnected`) is deleted, with
+  `PROTO_MIN` raised to the ceiling (5) — the same floor-with-ceiling motion as
+  the ADR 0042 T7 reshape, legal exactly because no release exists. The ADR 0038
+  fail-closed `Hello` range negotiation itself stays (a mismatched build still
+  gets a clean refusal at handshake), as does the schema fail-closed gate; what
+  is deferred until post-1.0.0 is *serving* multiple versions concurrently. The
+  earlier changelog/evidence entries below describe the versioned shapes as they
+  were built and are left as history.
   The README gains the "Resizing the cluster" operator guide (grow = one paragraph:
   seeds + watch `/readyz`; the two-node 2-of-2 truth with the 1→3 recommendation;
   shrink = the SIGUSR1 decommission with its observable drain; replace = grow then

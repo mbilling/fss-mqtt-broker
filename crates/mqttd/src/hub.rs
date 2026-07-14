@@ -576,9 +576,6 @@ pub enum HubCommand {
         /// The remote leaf certificate's serial from the mTLS handshake
         /// (ADR 0040 T4); `None` on a plaintext mesh.
         cert_serial: Option<Vec<u8>>,
-        /// The peer-bus protocol version negotiated on the link (ADR 0038): the
-        /// hub sends a frame introduced in proto N only when `proto >= N`.
-        proto: u32,
     },
     /// A peer node's link went down.
     PeerDisconnected {
@@ -825,8 +822,6 @@ struct Peer {
     /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
     /// (ADR 0040 T4). `None` on a plaintext mesh.
     cert_serial: Option<Vec<u8>>,
-    /// The peer-bus protocol version negotiated on the link (ADR 0038).
-    proto: u32,
     /// Whether this peer has sent an interest snapshot since the link formed
     /// (0043-P4 exhibit ②). A freshly-booted peer SUPPRESSES its snapshot until
     /// its own routing view is authoritative — so until one arrives, this node
@@ -1579,9 +1574,8 @@ impl Hub {
                 conn_id,
                 tx,
                 cert_serial,
-                proto,
             } => {
-                self.peer_connected(node.clone(), conn_id, tx, cert_serial, proto);
+                self.peer_connected(node.clone(), conn_id, tx, cert_serial);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -3605,9 +3599,7 @@ impl Hub {
         // map, not the connected-peer map: a link-down (but not dead) peer's
         // subscribers are still owed the publish — the obligation is recorded
         // now, the frame flows when the link returns (sweep), or re-routes to
-        // the successor when membership confirms death (`peer_dead`). A proto-2
-        // peer (mixed-version window) keeps the fire-and-forget frame — the old
-        // semantics, honestly.
+        // the successor when membership confirms death (`peer_dead`).
         let gated = gate.is_some() && qos_num(qos) >= 1;
         if gated {
             let targets: Vec<NodeId> = self
@@ -3618,20 +3610,6 @@ impl Hub {
                 .collect();
             let id = gate.unwrap_or_default();
             for node in targets {
-                if self.peers.get(&node).is_some_and(|p| p.proto < 3) {
-                    // Connected but old: fire-and-forget, as before proto 3.
-                    if let Some(peer) = self.peers.get(&node) {
-                        let _ = peer.tx.send(PeerMessage::Publish {
-                            topic: topic.to_string(),
-                            payload: payload.to_vec(),
-                            qos: qos as u8,
-                            retain,
-                            message_expiry,
-                            app: app_to_wire(app),
-                        });
-                    }
-                    continue;
-                }
                 self.send_acked_forward(id, &node);
             }
             if !retain_broadcasts {
@@ -3670,9 +3648,8 @@ impl Hub {
         };
         self.peers
             .iter()
-            .filter(|(n, peer)| {
-                peer.proto >= 3
-                    && !p.acked_nodes.contains(*n)
+            .filter(|(n, _)| {
+                !p.acked_nodes.contains(*n)
                     && !p.awaiting.values().any(|v| v == *n)
                     && self
                         .remote_interest
@@ -3862,25 +3839,6 @@ impl Hub {
                 let Some(p) = self.pending_publishes.get(&id) else {
                     continue;
                 };
-                if peer.proto < 3 {
-                    // The target reconnected speaking an older proto (mixed-version
-                    // downgrade): fall back to fire-and-forget — the old semantics,
-                    // honestly — and release the unfulfillable obligation.
-                    let _ = peer.tx.send(PeerMessage::Publish {
-                        topic: p.topic.clone(),
-                        payload: p.payload.to_vec(),
-                        qos: p.qos as u8,
-                        retain: p.retain,
-                        message_expiry: p.message_expiry,
-                        app: app_to_wire(&p.app),
-                    });
-                    self.forward_index.remove(seq);
-                    if let Some(p) = self.pending_publishes.get_mut(&id) {
-                        p.awaiting.remove(seq);
-                    }
-                    self.try_complete_pending(id);
-                    continue;
-                }
                 let _ = peer.tx.send(PeerMessage::PublishAcked {
                     seq: *seq,
                     topic: p.topic.clone(),
@@ -4186,7 +4144,6 @@ impl Hub {
         conn_id: u64,
         tx: PeerOutbound,
         cert_serial: Option<Vec<u8>>,
-        proto: u32,
     ) {
         info!(local = %self.node_id.0, peer = %node.0, "peer link established");
         // Send our current interest + shared membership so the peer can route to us
@@ -4206,7 +4163,7 @@ impl Hub {
         // Register the link with the durable plane (consensus + replication) so its
         // RPCs to this peer route over the same channel.
         if let Some(plane) = &self.durable_plane {
-            plane.register(&node, tx.clone(), proto);
+            plane.register(&node, tx.clone());
         }
         self.peers.insert(
             node,
@@ -4214,7 +4171,6 @@ impl Hub {
                 conn_id,
                 tx,
                 cert_serial,
-                proto,
                 interest_synced: false,
             },
         );
@@ -5428,7 +5384,6 @@ mod tests {
             conn_id,
             tx: peer_tx,
             cert_serial: None,
-            proto: mqtt_cluster::peer::PROTO_MAX,
         })
         .unwrap();
         peer_rx

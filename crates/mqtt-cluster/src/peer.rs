@@ -25,11 +25,16 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// what makes "upgrade to the gateway before rolling to the next major" fail closed
 /// at `Hello` instead of being release-notes prose.
 /// Pre-release history: proto 2 (ADR 0042 T7) tagged `ReplicaEntryWire` and
-/// `ReplOp::Append` with the writing `(epoch, seq)` — an incompatible reshape of
-/// the replication frames, so the floor rose with the ceiling. Legal exactly
-/// because no release exists yet; after the first release this kind of raise is
-/// the MAJOR-release act described above.
-pub const PROTO_MIN: u32 = 2;
+/// `ReplOp::Append` with the writing `(epoch, seq)`; proto 5 (ADR 0043)
+/// reshaped [`ReplicaReadReply`](PeerMessage::ReplicaReadReply) with the
+/// replica's completeness verdict and added the catch-up frames — incompatible
+/// reshapes of the replication frames, so the floor rose with the ceiling both
+/// times. Legal exactly because no release exists yet: until 1.0.0 there is no
+/// version compatibility to keep, so frames are reshaped in place rather than
+/// versioned side-by-side. After the first release this kind of raise is the
+/// MAJOR-release act described above, and additive changes ship as new frames
+/// under a raised [`PROTO_MAX`] with per-link gating.
+pub const PROTO_MIN: u32 = 5;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
 /// negotiated version is `min(proto_max_a, proto_max_b)`.
 ///
@@ -305,14 +310,19 @@ pub enum PeerMessage {
         key: String,
     },
     /// The reply to a [`ReplicaRead`](PeerMessage::ReplicaRead): the replica's stored
-    /// entries for the key, plus its truncation low-water so a recovery cannot
-    /// resurrect an already-acked prefix (ADR 0018 §3b).
+    /// entries for the key, its truncation low-water so a recovery cannot
+    /// resurrect an already-acked prefix (ADR 0018 §3b), and its **completeness**
+    /// verdict (ADR 0043 P1) — a recovery merge requires at least one complete
+    /// copy, so a hollow joiner (entries above a hole it never received)
+    /// contributes data but never authority.
     ReplicaReadReply {
         /// The `req_id` of the [`ReplicaRead`](PeerMessage::ReplicaRead) answered.
         req_id: u64,
         /// The replica's truncation low-water for the key.
-        #[serde(default)]
         watermark: u64,
+        /// Whether the replica's copy is gap-free from its low-water to its tail
+        /// AND stamped caught-up for the key's group.
+        complete: bool,
         /// The stored entries, in offset order.
         entries: Vec<ReplicaEntryWire>,
     },
@@ -433,32 +443,8 @@ pub enum PeerMessage {
         /// Every replicated log key in the sender's local replica store.
         keys: Vec<String>,
     },
-    /// A recovery read that also asks for the replica's **completeness** verdict
-    /// (ADR 0043 P1; proto 4). Sent instead of
-    /// [`ReplicaRead`](PeerMessage::ReplicaRead) to proto-4 peers; the request's
-    /// own version tells the server which reply shape the sender can decode.
-    ReplicaRead2 {
-        /// Correlates this request with its reply on the same link.
-        req_id: u64,
-        /// The log (session key) to read.
-        key: String,
-    },
-    /// The reply to a [`ReplicaRead2`](PeerMessage::ReplicaRead2): the stored
-    /// entries plus whether the copy is gap-free (ADR 0043 P1) — a recovery
-    /// merge requires at least one complete copy, so a hollow joiner (entries
-    /// above a hole it never received) contributes data but never authority.
-    ReplicaReadReply2 {
-        /// The `req_id` of the [`ReplicaRead2`](PeerMessage::ReplicaRead2) answered.
-        req_id: u64,
-        /// The replica's truncation low-water for the key.
-        watermark: u64,
-        /// Whether the replica's copy is gap-free from its low-water to its tail.
-        complete: bool,
-        /// The stored entries, in offset order.
-        entries: Vec<ReplicaEntryWire>,
-    },
     /// A hollow replica's request that `key`'s group **owner** re-commit the
-    /// key's committed log (ADR 0043 P1; proto 4): the owner re-delivers every
+    /// key's committed log (ADR 0043 P1; proto 5): the owner re-delivers every
     /// committed entry through the normal fenced replication path (idempotent —
     /// replicas keep the highest `(epoch, seq)` version per offset), closing the
     /// requester's gap. Fire-and-forget: the requester's catch-up sweep retries
@@ -679,6 +665,7 @@ mod tests {
         roundtrip(&PeerMessage::ReplicaReadReply {
             req_id: 3,
             watermark: 4,
+            complete: true,
             entries: vec![
                 ReplicaEntryWire {
                     offset: 1,

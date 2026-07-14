@@ -483,27 +483,9 @@ mod tests {
                         let accepted = state.lock().unwrap().apply(epoch, &op);
                         transport.complete_ack(req_id, accepted);
                     }
+                    // The recovery-read, with the completeness verdict
+                    // (ADR 0043 P1) — what the plane serves on a real link.
                     PeerMessage::ReplicaRead { req_id, key } => {
-                        let (watermark, entries) = {
-                            let s = state.lock().unwrap();
-                            (
-                                s.watermark(&key),
-                                s.epoch_entries(&key)
-                                    .into_iter()
-                                    .map(|e| crate::peer::ReplicaEntryWire {
-                                        offset: e.offset,
-                                        epoch: e.epoch,
-                                        seq: e.seq,
-                                        record: e.record,
-                                    })
-                                    .collect(),
-                            )
-                        };
-                        transport.complete_read(req_id, watermark, entries);
-                    }
-                    // The proto-4 read (ADR 0043 P1): same, plus the completeness
-                    // verdict — what the plane serves on a real link.
-                    PeerMessage::ReplicaRead2 { req_id, key } => {
                         let (watermark, complete, entries) = {
                             let s = state.lock().unwrap();
                             (
@@ -520,7 +502,7 @@ mod tests {
                                     .collect(),
                             )
                         };
-                        transport.complete_read2(req_id, watermark, complete, entries);
+                        transport.complete_read(req_id, watermark, complete, entries);
                     }
                     _ => {}
                 }
@@ -582,7 +564,7 @@ mod tests {
         let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
         for (node, state) in [(nid("f1"), &f1_state), (nid("f2"), &f2_state)] {
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx, crate::peer::PROTO_MAX);
+            transport.register(node, tx);
             spawn_follower(transport.clone(), state.clone(), rx);
         }
 
@@ -787,7 +769,7 @@ mod tests {
         for node in [nid("f1"), nid("f2")] {
             let state = Arc::new(Mutex::new(ReplicaState::new()));
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx, crate::peer::PROTO_MAX);
+            transport.register(node, tx);
             spawn_follower(transport.clone(), state.clone(), rx);
             follower_states.push(state);
         }
@@ -856,7 +838,7 @@ mod tests {
         let transport = Arc::new(PeerReplicaTransport::new());
         let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
         let (f1_tx, f1_rx) = mpsc::unbounded_channel();
-        transport.register(nid("f1"), f1_tx, crate::peer::PROTO_MAX);
+        transport.register(nid("f1"), f1_tx);
         spawn_follower(transport.clone(), f1_state.clone(), f1_rx);
 
         // The node's own durable replica copy — it survives the "restart" below.
@@ -884,7 +866,7 @@ mod tests {
         transport.fail_node(&nid("f1"));
         let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
         let (f2_tx, f2_rx) = mpsc::unbounded_channel();
-        transport.register(nid("f2"), f2_tx, crate::peer::PROTO_MAX);
+        transport.register(nid("f2"), f2_tx);
         spawn_follower(transport.clone(), f2_state.clone(), f2_rx);
         epoch.store(3, Ordering::Relaxed); // the restart won a fresh lease epoch
 
@@ -1081,7 +1063,7 @@ mod tests {
         let transport = Arc::new(PeerReplicaTransport::new());
         let f1_state = Arc::new(Mutex::new(hollow(&qkey)));
         let (f1_tx, f1_rx) = mpsc::unbounded_channel();
-        transport.register(nid("f1"), f1_tx, crate::peer::PROTO_MAX);
+        transport.register(nid("f1"), f1_tx);
         spawn_follower(transport.clone(), f1_state.clone(), f1_rx);
 
         let log = GroupRoutedLog::new(
@@ -1114,7 +1096,7 @@ mod tests {
             ));
         }
         let (f2_tx, f2_rx) = mpsc::unbounded_channel();
-        transport.register(nid("f2"), f2_tx, crate::peer::PROTO_MAX);
+        transport.register(nid("f2"), f2_tx);
         spawn_follower(transport.clone(), Arc::new(Mutex::new(full)), f2_rx);
 
         let served = log.read(&qkey, 0, 100).await.unwrap();
@@ -1175,7 +1157,7 @@ mod tests {
                 .observe(&node, MemberState::Alive, "x:7000", None);
             let state = Arc::new(Mutex::new(ReplicaState::new()));
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx, crate::peer::PROTO_MAX);
+            transport.register(node, tx);
             spawn_follower(transport.clone(), state.clone(), rx);
             follower_states.push(state);
         }
@@ -1303,7 +1285,7 @@ mod tests {
         let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
         for (node, state) in [(nid("f1"), &f1_state), (nid("f2"), &f2_state)] {
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx, crate::peer::PROTO_MAX);
+            transport.register(node, tx);
             spawn_follower(transport.clone(), state.clone(), rx);
         }
 
@@ -1445,7 +1427,7 @@ mod tests {
                 },
             );
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx, crate::peer::PROTO_MAX);
+            transport.register(node, tx);
             spawn_follower(transport.clone(), state, rx);
         }
 
@@ -1491,7 +1473,7 @@ mod tests {
         for node in [nid("f1"), nid("f2")] {
             let state = Arc::new(Mutex::new(ReplicaState::new()));
             let (tx, rx) = mpsc::unbounded_channel();
-            transport.register(node, tx, crate::peer::PROTO_MAX);
+            transport.register(node, tx);
             spawn_follower(transport.clone(), state, rx);
         }
 

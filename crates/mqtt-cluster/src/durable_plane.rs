@@ -76,7 +76,7 @@ pub struct DurablePlane {
     /// the group-routed store is built on top of the plane's shared handles; a
     /// `ReplicaCatchUp` arriving before it is set is dropped (the sweep retries).
     catch_up: Arc<Mutex<Option<Arc<dyn CatchUpSource>>>>,
-    /// The live placement ring — a proto-4 recovery read's completeness verdict
+    /// The live placement ring — a recovery read's completeness verdict
     /// (ADR 0043 P1) compares this node's durable caught-up stamp against the
     /// group's **current** replica set.
     placement: Arc<RwLock<Placement>>,
@@ -229,9 +229,9 @@ impl DurablePlane {
     /// Register a peer's outbound link channel for *both* planes — consensus
     /// (keyed by the peer's [`raft_id`]) and replication (keyed by its [`NodeId`]).
     /// Called when a peer link is established.
-    pub fn register(&self, node: &NodeId, tx: mpsc::UnboundedSender<PeerMessage>, proto: u32) {
+    pub fn register(&self, node: &NodeId, tx: mpsc::UnboundedSender<PeerMessage>) {
         self.network.register(raft_id(node), tx.clone());
-        self.transport.register(node.clone(), tx, proto);
+        self.transport.register(node.clone(), tx);
     }
 
     /// Fail a peer on both planes when its link drops, so in-flight consensus RPCs
@@ -287,42 +287,10 @@ impl DurablePlane {
             }
             // Recovery-read (workstream F): answer from our follower copy of the key,
             // with its truncation low-water so the recovering owner cannot resurrect an
-            // already-acked prefix from a stale replica (ADR 0018 §3b).
+            // already-acked prefix from a stale replica (ADR 0018 §3b), and our
+            // completeness verdict (ADR 0043 P1) so the recovering owner can refuse
+            // a merge whose every read might be a hollow joiner's.
             PeerMessage::ReplicaRead { req_id, key } => {
-                let (watermark, entries) = {
-                    let r = self.lock_replicas();
-                    (
-                        r.watermark(&key),
-                        r.epoch_entries(&key)
-                            .into_iter()
-                            .map(|e| crate::peer::ReplicaEntryWire {
-                                offset: e.offset,
-                                epoch: e.epoch,
-                                seq: e.seq,
-                                record: e.record,
-                            })
-                            .collect(),
-                    )
-                };
-                Some(PeerMessage::ReplicaReadReply {
-                    req_id,
-                    watermark,
-                    entries,
-                })
-            }
-            // Recovery-read reply → wake the waiting read.
-            PeerMessage::ReplicaReadReply {
-                req_id,
-                watermark,
-                entries,
-            } => {
-                self.transport.complete_read(req_id, watermark, entries);
-                None
-            }
-            // Proto-4 recovery-read (ADR 0043 P1): same as ReplicaRead plus this
-            // replica's completeness verdict, so the recovering owner can refuse a
-            // merge whose every read might be a hollow joiner's.
-            PeerMessage::ReplicaRead2 { req_id, key } => {
                 // Complete = gap-free AND stamped current for the group's replica
                 // set (the durable caught-up watermark): a hollow joiner — even an
                 // EMPTY one — must not anchor a recovery merge as authority that
@@ -349,21 +317,22 @@ impl DurablePlane {
                             .collect(),
                     )
                 };
-                Some(PeerMessage::ReplicaReadReply2 {
+                Some(PeerMessage::ReplicaReadReply {
                     req_id,
                     watermark,
                     complete,
                     entries,
                 })
             }
-            PeerMessage::ReplicaReadReply2 {
+            // Recovery-read reply → wake the waiting read.
+            PeerMessage::ReplicaReadReply {
                 req_id,
                 watermark,
                 complete,
                 entries,
             } => {
                 self.transport
-                    .complete_read2(req_id, watermark, complete, entries);
+                    .complete_read(req_id, watermark, complete, entries);
                 None
             }
             // Catch-up request (ADR 0043 P1): a replica that entered `key`'s
@@ -584,8 +553,8 @@ mod tests {
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
         // Each plane reaches the other peer via the other's outbound channel.
-        p1.register(&n("node-2"), out1_tx.clone(), peer::PROTO_MAX);
-        p2.register(&n("node-1"), out2_tx.clone(), peer::PROTO_MAX);
+        p1.register(&n("node-2"), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -675,8 +644,8 @@ mod tests {
         let (io1, io2) = tokio::io::duplex(256 * 1024);
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
-        p1.register(&n("node-2"), out1_tx.clone(), peer::PROTO_MAX);
-        p2.register(&n("node-1"), out2_tx.clone(), peer::PROTO_MAX);
+        p1.register(&n("node-2"), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -714,11 +683,11 @@ mod tests {
         p2.raft().shutdown().await.unwrap();
     }
 
-    /// ADR 0043 P1 over the wire: a proto-4 recovery-read round-trips the replica's
+    /// ADR 0043 P1 over the wire: a recovery-read round-trips the replica's
     /// **completeness** verdict (hollow → false, back-filled → true), and a
     /// `ReplicaCatchUp` request routes to the owner plane's [`CatchUpSource`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn proto4_reads_carry_completeness_and_catch_up_reaches_the_source() {
+    async fn reads_carry_completeness_and_catch_up_reaches_the_source() {
         /// Records every key the owner plane is asked to catch up (targeted
         /// requests as `key -> node`).
         struct Recorder(mpsc::UnboundedSender<String>);
@@ -738,8 +707,8 @@ mod tests {
         let (io1, io2) = tokio::io::duplex(256 * 1024);
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
-        p1.register(&n("node-2"), out1_tx.clone(), peer::PROTO_MAX);
-        p2.register(&n("node-1"), out2_tx.clone(), peer::PROTO_MAX);
+        p1.register(&n("node-2"), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -793,7 +762,7 @@ mod tests {
             .unwrap();
         assert_eq!(asked, "q/c");
 
-        // The targeted variant (ADR 0043 P3, proto 5): a decommissioning node
+        // The targeted variant (ADR 0043 P3): a decommissioning node
         // asks the owner to hand the key to ONE specific successor.
         p2.transport()
             .request_catch_up_to(&n("node-1"), "q/c", &n("node-3"));
