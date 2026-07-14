@@ -166,6 +166,30 @@ pub enum SessionClaim {
 /// QoS≥1 PUBACK may be released. See [ADR 0001].
 ///
 /// [ADR 0001]: ../../../docs/adr/0001-session-durability.md
+/// The result of enumerating every stored session
+/// ([`SessionStore::all_sessions`]): the sessions readable now, and whether the
+/// scan saw everything (`complete = false` means at least one key was skipped
+/// for a *transient* reason — retry the scan rather than treating the view as
+/// the whole truth).
+#[derive(Debug)]
+pub struct SessionScan {
+    /// Each readable session: `(client, subscriptions, expiry deadline)`.
+    pub sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    /// Whether every stored key was either read or cleanly foreign.
+    pub complete: bool,
+}
+
+impl SessionScan {
+    /// A complete scan over `sessions`.
+    #[must_use]
+    pub fn complete(sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>) -> Self {
+        Self {
+            sessions,
+            complete: true,
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// Ensure a persistent session record exists for `client`.
@@ -298,11 +322,17 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// inherited sessions into its routing table before their clients re-attach
     /// (ADR 0042 T9, exhibit ⑥) — without it, a publish arriving between the takeover
     /// and the first re-attach routes to nothing and is lost despite being acked.
-    /// Off the hot path. Default: empty (stores without durable metadata).
-    async fn all_sessions(
-        &self,
-    ) -> Result<Vec<(ClientId, Vec<Subscription>, Option<u64>)>, StorageError> {
-        Ok(Vec::new())
+    ///
+    /// The scan also reports whether it is **complete** ([`SessionScan::complete`]):
+    /// a replicated store skips a key whose group cannot be read *yet* (no quorum
+    /// mid-recovery), and the caller must know its view may be missing sessions —
+    /// an interest snapshot gossiped from an incomplete view erases knowledge peers
+    /// still need (0043-P4 exhibit ②: the fast-restart void ack). A clean skip of a
+    /// key owned by another node does NOT make the scan incomplete.
+    ///
+    /// Off the hot path. Default: empty and complete (stores without durable metadata).
+    async fn all_sessions(&self) -> Result<SessionScan, StorageError> {
+        Ok(SessionScan::complete(Vec::new()))
     }
 
     /// Ensure a persistent session for `client` and bind/verify its **owning identity** in
@@ -600,14 +630,13 @@ impl SessionStore for MemorySessionStore {
             .collect())
     }
 
-    async fn all_sessions(
-        &self,
-    ) -> Result<Vec<(ClientId, Vec<Subscription>, Option<u64>)>, StorageError> {
-        Ok(self
-            .lock()
-            .iter()
-            .map(|(c, e)| (c.clone(), e.subscriptions.clone(), e.session_expiry_at))
-            .collect())
+    async fn all_sessions(&self) -> Result<SessionScan, StorageError> {
+        Ok(SessionScan::complete(
+            self.lock()
+                .iter()
+                .map(|(c, e)| (c.clone(), e.subscriptions.clone(), e.session_expiry_at))
+                .collect(),
+        ))
     }
 
     async fn reserve_packet_ids(&self, client: &ClientId, count: u16) -> Result<u16, StorageError> {

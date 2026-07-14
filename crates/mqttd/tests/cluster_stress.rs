@@ -280,18 +280,30 @@ impl StressNode {
 
 // One linear node assembly, mirroring durable_sessions/main.rs — splitting it
 // would hide which pieces a real node wires.
-#[allow(clippy::too_many_lines)]
 async fn start_stress_node(
     id: &str,
     swim_seeds: Vec<String>,
     data_dir: &std::path::Path,
 ) -> StressNode {
+    start_stress_node_in_zone(id, swim_seeds, data_dir, None).await
+}
+
+/// [`start_stress_node`] with a failure-domain label (ADR 0016 T5): the zone is
+/// advertised over SWIM gossip exactly as `MQTTD_FAILURE_DOMAIN` does, so the
+/// 3→5 zone-spread test (ADR 0043 P4) exercises the live label plumbing.
+#[allow(clippy::too_many_lines)]
+async fn start_stress_node_in_zone(
+    id: &str,
+    swim_seeds: Vec<String>,
+    data_dir: &std::path::Path,
+    zone: Option<&str>,
+) -> StressNode {
     let node_id = NodeId(id.to_string());
     let can_bootstrap = swim_seeds.is_empty();
-    let placement = Arc::new(RwLock::new(Placement::new(
-        node_id.clone(),
-        DEFAULT_REPLICAS,
-    )));
+    let placement = Arc::new(RwLock::new(
+        Placement::new(node_id.clone(), DEFAULT_REPLICAS)
+            .with_local_domain(zone.map(str::to_string)),
+    ));
 
     let (store, durable_retained, plane, driver) = build_durable_node(
         node_id.clone(),
@@ -311,6 +323,10 @@ async fn start_stress_node(
     let plane_observer = plane.clone();
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store, Some(placement.clone()));
+    // Every stress node is cluster-configured (0043-P4 exhibit ②): the honesty
+    // gates must hold from the first moment of a (re)start, before SWIM has
+    // re-learned the membership, exactly as main.rs wires it.
+    hub.set_cluster_configured();
     hub.attach_durable_plane(plane);
     hub.attach_durable_retained(durable_retained);
     // The disk-backed retained CACHE, exactly as production wires it with a
@@ -369,7 +385,7 @@ async fn start_stress_node(
         node_id.clone(),
         swim_addr.clone(),
         relay_addr,
-        None,
+        zone.map(str::to_string),
         swim_cfg(),
         swim_seeds,
     );
@@ -462,6 +478,11 @@ struct Stress {
     /// Per node: whether the harness has driven it into brownout (ADR 0041 T5).
     brownout: Vec<bool>,
     payload_counter: u64,
+    /// Root of the per-node data dirs — a JOIN step (ADR 0043 P4) creates a
+    /// fresh dir for the node it starts.
+    disk_root: std::path::PathBuf,
+    /// Nodes started by join steps this schedule (bounds the growth).
+    joins: usize,
 }
 
 impl Stress {
@@ -837,6 +858,71 @@ impl Stress {
         ));
     }
 
+    /// A seeded JOIN (ADR 0043 P4): grow the cluster by one fresh node
+    /// mid-schedule. The joiner's catch-up sweep (0043 P1) back-fills the
+    /// replica sets it enters and the eager-migration window (0043 P2) holds
+    /// acks honest while ownership moves — under whatever other faults the
+    /// schedule is running. Bounded to two joins per schedule.
+    async fn join_step(&mut self) {
+        if self.joins >= 2 {
+            self.publish_step().await; // growth exhausted: schedule density
+            return;
+        }
+        self.joins += 1;
+        let id = format!("st{}-j{}", self.seed, self.joins);
+        let dir = self.disk_root.join(&id);
+        std::fs::create_dir_all(&dir).expect("join node dir");
+        let seeds: Vec<String> = self
+            .alive_nodes()
+            .into_iter()
+            .map(|i| self.nodes[i].swim_addr.clone())
+            .collect();
+        self.nodes.push(start_stress_node(&id, seeds, &dir).await);
+        self.alive.push(true);
+        self.brownout.push(false);
+        self.note(format!("JOINED {id} (cluster grows to {})", {
+            self.alive_nodes().len()
+        }));
+    }
+
+    /// A seeded DECOMMISSION (ADR 0043 P3/P4): drain one alive node's data to
+    /// its post-departure replica sets, and only if the drain CONVERGES kill
+    /// it (the graceful leave). A drain that cannot converge inside its bound
+    /// — successors severed, disk faults — is ABORTED and the node stays: the
+    /// operator semantics (a decommission is interruptible and never lies).
+    /// Requires ≥4 alive so the schedule's one kill can still land afterwards
+    /// without dropping below a serviceable cluster.
+    async fn decommission_step(&mut self) {
+        if self.alive_nodes().len() < 4 {
+            self.publish_step().await; // too small to shrink: schedule density
+            return;
+        }
+        let node = self.pick_alive();
+        let id = self.nodes[node].node_id.0.clone();
+        let drain = self.nodes[node]
+            .plane
+            .as_ref()
+            .expect("plane alive")
+            .decommission_drain(self.nodes[node].node_id.clone());
+        let converged = tokio::time::timeout(Duration::from_secs(45), drain.run())
+            .await
+            .is_ok();
+        if !converged {
+            self.note(format!(
+                "DECOMMISSION of {id} aborted (drain did not converge under faults); node stays"
+            ));
+            return;
+        }
+        self.nodes[node].kill().await;
+        self.alive[node] = false;
+        for sub in &mut self.subs {
+            if sub.conn.is_some() && sub.on_node == node {
+                sub.conn = None;
+            }
+        }
+        self.note(format!("DECOMMISSIONED {id} (drained, then left)"));
+    }
+
     /// A seeded asymmetric link flap: sever one alive node's inbound peer bus
     /// (healed at quiesce, or by a later flap step on the same node).
     fn flap_step(&mut self) {
@@ -942,6 +1028,8 @@ async fn run_schedule(seed: u64) {
         severed: Vec::new(),
         brownout: vec![false; 3],
         payload_counter: 0,
+        disk_root: disk.path().to_path_buf(),
+        joins: 0,
     };
 
     // Three persistent subscribers, each on its own topic, established online
@@ -1040,13 +1128,18 @@ async fn run_schedule(seed: u64) {
             continue;
         }
         match stress.rng.range(0, 100) {
-            0..=39 => stress.publish_step().await,
-            40..=57 => stress.retained_step().await,
-            58..=74 => stress.churn_step().await,
-            75..=84 => stress.flap_step(),
-            85..=89 => stress.restart_step().await,
-            90..=94 => stress.disk_fault_step(),
-            _ => stress.brownout_step(),
+            0..=37 => stress.publish_step().await,
+            38..=53 => stress.retained_step().await,
+            54..=69 => stress.churn_step().await,
+            70..=79 => stress.flap_step(),
+            80..=85 => stress.restart_step().await,
+            86..=89 => stress.disk_fault_step(),
+            90..=92 => stress.brownout_step(),
+            // Resize vocabulary (ADR 0043 P4): grow mid-schedule; shrink via a
+            // drained decommission (only lands on a big-enough cluster — the
+            // steps degrade to publish density otherwise).
+            93..=96 => stress.join_step().await,
+            _ => stress.decommission_step().await,
         }
     }
     // A compact composition line per seed, so a green sweep still shows what
@@ -1054,7 +1147,8 @@ async fn run_schedule(seed: u64) {
     let count = |needle: &str| stress.trace.iter().filter(|l| l.contains(needle)).count();
     eprintln!(
         "cluster_stress: seed {seed} schedule: {} publishes ({} owed), {} retained, \
-         {} kills, {} restarts, {} flaps, {} disk-fault toggles, {} brownout toggles",
+         {} kills, {} restarts, {} flaps, {} disk-fault toggles, {} brownout toggles, \
+         {} joins, {} decommissions",
         count("publish #"),
         count("ACKED (obligation)"),
         count("retained set #"),
@@ -1063,6 +1157,8 @@ async fn run_schedule(seed: u64) {
         count("SEVERED"),
         count("DISK FAULTS"),
         count("BROWNOUT"),
+        count("JOINED"),
+        count("DECOMMISSIONED "),
     );
     // Clear injected faults before quiesce: the oracle judges the HEALED
     // cluster (disk faults and brownout are conditions, not obligations).
@@ -1995,6 +2091,400 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0043 P4 — the dedicated upgrade-path tests (3→5 zone-spread, 5→3 cost
+// reduction, rolling host replacement), sharing one acked-facts vocabulary.
+// ---------------------------------------------------------------------------
+
+/// Establish `sub_id` as an OFFLINE durable subscriber of `topic`: connect on
+/// its placement OWNER (the pre-proxy attach contract, ADR 0005 — resolved per
+/// retry, since first-lease grants take a few reconcile ticks), durable-
+/// SUBSCRIBE (retried through 0x80), disconnect.
+async fn establish_offline_subscriber(nodes: &[&StressNode], sub_id: &str, topic: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut sub, _present) = loop {
+        let owner = nodes[0].placement.read().unwrap().owner(sub_id);
+        let addr = nodes
+            .iter()
+            .find(|n| n.node_id == owner)
+            .map(|n| n.client_addr);
+        if let Some(addr) = addr {
+            if let Some(ok) =
+                common::Client::connect_v311_within(addr, sub_id, false, Duration::from_secs(10))
+                    .await
+            {
+                break ok;
+            }
+        }
+        assert!(Instant::now() < deadline, "subscriber never connected");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ack = sub.subscribe(1, topic, QoS::AtLeastOnce).await;
+        if ack.return_codes.iter().all(|c| *c != 0x80) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    sub.disconnect().await;
+}
+
+/// Publish `payload` to `topic` on `addr` at `QoS` 1, retried (fresh connection
+/// each attempt) until its PUBACK arrives — an acked fact.
+async fn publish_until_acked(addr: SocketAddr, pub_id: &str, topic: &str, payload: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    'acked: loop {
+        if let Some((mut publisher, _)) =
+            common::Client::connect_v311_within(addr, pub_id, true, Duration::from_secs(20)).await
+        {
+            publisher
+                .publish(topic, payload, QoS::AtLeastOnce, Some(7), vec![])
+                .await;
+            let wait = Instant::now() + Duration::from_secs(15);
+            loop {
+                let left = wait.saturating_duration_since(Instant::now());
+                match publisher.recv_bounded(left).await {
+                    common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break 'acked,
+                    common::Recv::Packet(_) => {}
+                    common::Recv::Quiet | common::Recv::Closed => break,
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "publish never acked");
+    }
+}
+
+/// Publish an acked RETAINED value to `topic` on `addr`.
+async fn publish_retained_until_acked(addr: SocketAddr, pub_id: &str, topic: &str, payload: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    'acked: loop {
+        if let Some((mut publisher, _)) =
+            common::Client::connect_v311_within(addr, pub_id, true, Duration::from_secs(20)).await
+        {
+            publisher
+                .publish_full(topic, payload, QoS::AtLeastOnce, true, Some(9))
+                .await;
+            let wait = Instant::now() + Duration::from_secs(15);
+            loop {
+                let left = wait.saturating_duration_since(Instant::now());
+                match publisher.recv_bounded(left).await {
+                    common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 9 => break 'acked,
+                    common::Recv::Packet(_) => {}
+                    common::Recv::Quiet | common::Recv::Closed => break,
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "retained set never acked");
+    }
+}
+
+/// Resume `sub_id` on its placement owner among `survivors` (present = true)
+/// and assert every payload in `owed` replays.
+async fn resume_and_verify(survivors: &[&StressNode], sub_id: &str, owed: &[&[u8]]) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let (mut sub, present) = loop {
+        let owner = survivors[0].placement.read().unwrap().owner(sub_id);
+        let addr = survivors
+            .iter()
+            .find(|n| n.node_id == owner)
+            .map(|n| n.client_addr);
+        if let Some(addr) = addr {
+            if let Some(ok) =
+                common::Client::connect_v311_within(addr, sub_id, false, Duration::from_secs(10))
+                    .await
+            {
+                break ok;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscriber could not resume on the survivors"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        present,
+        "recovery honesty: the durable session must survive"
+    );
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain_deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < owed.len() && Instant::now() < drain_deadline {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    for payload in owed {
+        assert!(
+            got.contains(*payload),
+            "acked payload {:?} lost across the resize (ADR 0043 P4)",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+/// Poll until the retained `topic` on `addr` serves `expected`.
+async fn verify_retained(addr: SocketAddr, probe_id: &str, topic: &str, expected: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let seen = retained_seen(addr, probe_id, topic).await;
+        if seen.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acked retained value not served after the resize (got {seen:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Drain-then-kill one node (the decommission motion, as SIGUSR1 drives it):
+/// the drain must converge and report complete before the node dies.
+async fn decommission_node(node: &mut StressNode) {
+    let drain = node
+        .plane
+        .as_ref()
+        .expect("plane alive")
+        .decommission_drain(node.node_id.clone());
+    let status = drain.status();
+    tokio::time::timeout(Duration::from_secs(120), drain.run())
+        .await
+        .expect("the drain must converge on a healthy cluster");
+    assert!(status.complete.load(std::sync::atomic::Ordering::Acquire));
+    node.kill().await;
+}
+
+/// Wait until every node in `nodes` agrees the membership is exactly `n`.
+async fn wait_members(nodes: &[&StressNode], n: usize) {
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            nodes
+                .iter()
+                .all(|node| node.placement.read().unwrap().member_count() == n)
+        })
+        .await,
+        "membership never converged to {n}"
+    );
+}
+
+/// ADR 0043 P4 — the 3→5 zone-spread grow, then losing BOTH added-to zones'
+/// originals at once: a 3-node cluster (one node per zone) accumulates acked
+/// facts, grows to five (the joiners land in existing zones, advertised over
+/// the live gossip-label plumbing of ADR 0016 T5), the P1 catch-up brings every
+/// member of every key's new replica set to the caught-up watermark — and then
+/// TWO of the three originals die simultaneously. Every acked fact must
+/// survive on {original, joiner, joiner}.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn growing_three_to_five_zone_spread_survives_losing_two_originals() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let mut a = start_stress_node_in_zone("z5-a", vec![], &dir("a"), Some("zone-1")).await;
+    let mut b =
+        start_stress_node_in_zone("z5-b", vec![a.swim_addr.clone()], &dir("b"), Some("zone-2"))
+            .await;
+    let c = start_stress_node_in_zone("z5-c", vec![a.swim_addr.clone()], &dir("c"), Some("zone-3"))
+        .await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+
+    let sub_id = "z5-sub";
+    establish_offline_subscriber(&[&a, &b, &c], sub_id, "z5/t").await;
+    for (i, payload) in [b"z5-m1".as_slice(), b"z5-m2", b"z5-m3"].iter().enumerate() {
+        publish_until_acked(
+            [&a, &b, &c][i % 3].client_addr,
+            &format!("z5-pub-{i}"),
+            "z5/t",
+            payload,
+        )
+        .await;
+    }
+    publish_retained_until_acked(b.client_addr, "z5-rpub", "z5/r", b"z5-retained").await;
+
+    // Grow 3→5 into the existing zones.
+    let d4 =
+        start_stress_node_in_zone("z5-d", vec![a.swim_addr.clone()], &dir("d"), Some("zone-1"))
+            .await;
+    let e5 =
+        start_stress_node_in_zone("z5-e", vec![a.swim_addr.clone()], &dir("e"), Some("zone-2"))
+            .await;
+    wait_cluster_ready(&[&a, &b, &c, &d4, &e5]).await;
+
+    // The P1 promise, at 5 nodes: every member of each fact key's (new) replica
+    // set holds a caught-up copy before we take losses.
+    {
+        let all = [&a, &b, &c, &d4, &e5];
+        let keys = [
+            format!("q/{sub_id}"),
+            format!("m/{sub_id}"),
+            "r/z5/r".to_string(),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let caught_up = keys.iter().all(|key| {
+                let set = a
+                    .placement
+                    .read()
+                    .unwrap()
+                    .group_replica_set(mqtt_cluster::placement::group_of_key(key));
+                set.iter().all(|member| {
+                    all.iter()
+                        .find(|n| n.node_id == *member)
+                        .is_some_and(|n| n.plane.as_ref().is_some_and(|p| p.replica_caught_up(key)))
+                })
+            });
+            if caught_up {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the grown replica sets never caught up (ADR 0043 P1 at 3→5)"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // Two originals die AT ONCE (5 voters → 3 alive: still a quorum).
+    a.kill().await;
+    b.kill().await;
+
+    resume_and_verify(
+        &[&c, &d4, &e5],
+        sub_id,
+        &[b"z5-m1".as_slice(), b"z5-m2", b"z5-m3"],
+    )
+    .await;
+    verify_retained(c.client_addr, "z5-probe", "z5/r", b"z5-retained").await;
+}
+
+/// ADR 0043 P4 — the 5→3 cost-reduction exercise: two sequential
+/// decommissions (drain → leave, waiting out each membership step), with the
+/// acked facts established while all five served. Everything survives on the
+/// remaining three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cost_reduction_five_to_three_via_two_decommissions() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node("c53-a", vec![], &dir("a")).await;
+    let b = start_stress_node("c53-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("c53-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    let mut d4 = start_stress_node("c53-d", vec![a.swim_addr.clone()], &dir("d")).await;
+    let mut e5 = start_stress_node("c53-e", vec![a.swim_addr.clone()], &dir("e")).await;
+    wait_cluster_ready(&[&a, &b, &c, &d4, &e5]).await;
+
+    let sub_id = "c53-sub";
+    establish_offline_subscriber(&[&a, &b, &c, &d4, &e5], sub_id, "c53/t").await;
+    for (i, payload) in [b"c53-m1".as_slice(), b"c53-m2", b"c53-m3"]
+        .iter()
+        .enumerate()
+    {
+        publish_until_acked(
+            [&a, &b, &c, &d4, &e5][i % 5].client_addr,
+            &format!("c53-pub-{i}"),
+            "c53/t",
+            payload,
+        )
+        .await;
+    }
+    publish_retained_until_acked(e5.client_addr, "c53-rpub", "c53/r", b"c53-retained").await;
+
+    // Decommission e5, wait for its eviction to settle, then decommission d4.
+    decommission_node(&mut e5).await;
+    wait_members(&[&a, &b, &c, &d4], 4).await;
+    decommission_node(&mut d4).await;
+    wait_members(&[&a, &b, &c], 3).await;
+
+    resume_and_verify(
+        &[&a, &b, &c],
+        sub_id,
+        &[b"c53-m1".as_slice(), b"c53-m2", b"c53-m3"],
+    )
+    .await;
+    verify_retained(a.client_addr, "c53-probe", "c53/r", b"c53-retained").await;
+}
+
+/// ADR 0043 P4 — rolling host replacement: add one node, decommission another
+/// (the one owning the durable subscriber), same cluster size before and
+/// after. The rolling binary upgrade (ADR 0039) rides exactly this motion —
+/// one node at a time, drain before leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rolling_replacement_swaps_a_node_without_loss() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let mut a = start_stress_node("rr-a", vec![], &dir("a")).await;
+    let b = start_stress_node("rr-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("rr-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+
+    // The subscriber lives on the node being replaced.
+    let sub_id = {
+        let p = a.placement.read().unwrap();
+        (0..100_000)
+            .map(|i| format!("rr-sub-{i}"))
+            .find(|s| p.owner(s) == a.node_id)
+            .expect("some session is owned by the replaced node")
+    };
+    establish_offline_subscriber(&[&a, &b, &c], &sub_id, "rr/t").await;
+    for (i, payload) in [b"rr-m1".as_slice(), b"rr-m2", b"rr-m3"].iter().enumerate() {
+        publish_until_acked(
+            [&a, &b, &c][i % 3].client_addr,
+            &format!("rr-pub-{i}"),
+            "rr/t",
+            payload,
+        )
+        .await;
+    }
+    publish_retained_until_acked(b.client_addr, "rr-rpub", "rr/r", b"rr-retained").await;
+
+    // The replacement arrives first (grow to 4), then the old host drains out.
+    let d = start_stress_node("rr-d", vec![b.swim_addr.clone()], &dir("d")).await;
+    wait_cluster_ready(&[&a, &b, &c, &d]).await;
+    decommission_node(&mut a).await;
+    wait_members(&[&b, &c, &d], 3).await;
+
+    resume_and_verify(
+        &[&b, &c, &d],
+        &sub_id,
+        &[b"rr-m1".as_slice(), b"rr-m2", b"rr-m3"],
+    )
+    .await;
+    verify_retained(b.client_addr, "rr-probe", "rr/r", b"rr-retained").await;
 }
 
 /// Bring-up gate shared by the resize/restart tests: full membership + full

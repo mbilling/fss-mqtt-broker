@@ -941,16 +941,7 @@ impl mqtt_storage::SessionStore for FlakyStore {
         self.inner.expiring_sessions().await
     }
 
-    async fn all_sessions(
-        &self,
-    ) -> Result<
-        Vec<(
-            mqtt_core::ClientId,
-            Vec<mqtt_core::Subscription>,
-            Option<u64>,
-        )>,
-        mqtt_storage::StorageError,
-    > {
+    async fn all_sessions(&self) -> Result<mqtt_storage::SessionScan, mqtt_storage::StorageError> {
         self.inner.all_sessions().await
     }
 }
