@@ -76,6 +76,22 @@ is a worse property than the gap it would close. JWT-authenticated principals ar
 by their token's own expiry plus the ACL sweep, and MQTT 5 re-auth remains available to
 clients (ADR 0013).
 
+**Certificate *expiry* is deliberately not a live-eviction trigger.** A client
+certificate's validity window is enforced at the TLS handshake (and again at every
+reconnect); a connection that outlives its cert's `notAfter` is **not** swept. Expiry
+and revocation are different threats: expiry is scheduled rotation hygiene — a cert does
+not become hostile at midnight, and wall-clock enforcement would manufacture fleet-wide
+disconnects when a device batch's certs age out together — while "this identity must
+lose access *now*" (key compromise, decommissioned device) is revocation, which this
+ADR's CRL-reload sweep already delivers to live connections. That is the operator's
+escape hatch for an expired-but-connected client that genuinely worries them: revoke
+its serial and reload. (The gossip plane checking validity per datagram — ADR 0022 T7 —
+is the same principle, not an exception: connectionless datagrams re-authenticate on
+every message, so the window applies each time; a connection authenticates once.)
+Consequently, server-initiated MQTT 5 re-auth (the deferred ADR 0013 T8) is scoped to
+token/SCRAM deployments only — an AUTH exchange re-runs the enhanced-auth mechanism,
+not the TLS handshake, so it can never re-validate a certificate.
+
 ### 2. Identity revoked → session terminated
 
 Each connection records at admission: the principal, how it authenticated (anonymous,
