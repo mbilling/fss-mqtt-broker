@@ -51,7 +51,7 @@
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
-| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [0/7 done](0044-release-readiness-assurance.md) | 7 open |
+| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [1/7 done](0044-release-readiness-assurance.md) | 6 open |
 
 ## Open and deferred work
 
@@ -117,7 +117,6 @@
 
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
-- `0044-P1` ⬜ planned: Out-of-process harness skeleton — spawn real mqttd binaries (Cargo test-binary paths) with real data dirs, listeners, and gossip sockets; per-node unprivileged TCP relays on the peer links; port the schedule vocabulary and acked-facts oracle; first schedules run kill (SIGKILL) / restart / publish / retained / churn against a 3-node cluster
 - `0044-P2` ⬜ planned: OS-real fault vocabulary — SIGKILL at any instant including mid-write (0018-T7 lands here), disk-full against a real filesystem bound, restart from surviving dirs, membership flap at SWIM-confusing rates (0007-T8 lands here), partitions/brownouts/half-open links via the relays
 - `0044-P3` ⬜ planned: Two-binary rolling upgrade — build HEAD + a pinned baseline ref, roll a live cluster one node at a time in both directions under the oracle, reopen data dirs across versions (ADR 0038 gates fire for real); closes the ADR 0043 recorded gap and builds the machinery 0039-T3 rides at 1.0
 - `0044-P4` ⬜ planned: Nightly tier + soak — scheduled CI workflow running the out-of-process schedules over a wide seed sweep, the upgrade paths, fuzz time, and an hours-long soak under sustained mixed load watching RSS / FDs / tail latency against declared drift watermarks (ADR 0041 caps, ADR 0020 gauges)

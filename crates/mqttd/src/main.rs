@@ -63,6 +63,10 @@
 //!   changes on disk, reload through the same fail-safe routine as `SIGHUP` (no restart).
 //!   Unset/`0` = disabled (signal-only, the default). For declarative/Kubernetes-ConfigMap use
 //! - `MQTTD_PEER_BIND`      — inter-node listener bind, e.g. `127.0.0.1:7001`
+//! - `MQTTD_PEER_ADVERTISE` — the peer-link address gossip advertises to other
+//!   nodes (default: the `MQTTD_PEER_BIND` value). Set it when the address
+//!   peers can dial differs from the bound one — NAT, container port mapping,
+//!   or a fronting proxy/relay.
 //! - `MQTTD_PEER_TLS_CA` / `MQTTD_PEER_TLS_CERT` / `MQTTD_PEER_TLS_KEY` —
 //!   cluster-bus mTLS material (set all three); without them peer links are
 //!   plaintext and loudly logged. A leaf whose SANs carry
@@ -1464,6 +1468,11 @@ async fn start_swim_from_env(
                     gossips the peer-link address so other nodes can dial us"
             .into());
     };
+    // The address gossip ADVERTISES for this node's peer links (ADR 0044 P1):
+    // defaults to the bind, overridable where the dialable address differs from
+    // the bound one — NAT, container port mapping, or a fronting relay (the
+    // out-of-process harness fronts each peer listener with one).
+    let peer_addr = non_empty_env("MQTTD_PEER_ADVERTISE").unwrap_or(peer_addr);
     // Gossip authentication (ADR 0003): keyed = membership claims require the
     // cluster key; unkeyed is possible but loudly insecure.
     let auth = if let Some(hex) = non_empty_env("MQTTD_SWIM_KEY") {
