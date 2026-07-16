@@ -14,7 +14,7 @@
 | [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [8/11 done](0004-identity-and-authentication.md) | 3 deferred |
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [4/6 done](0005-session-affinity.md) | 2 deferred |
 | [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [11/11 done](0006-consensus-and-replication.md) | — |
-| [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [8/9 done](0007-durable-store-integration.md) | 1 deferred |
+| [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [9/9 done](0007-durable-store-integration.md) | — |
 | [0008](../adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec | Accepted | [8/8 done](0008-mqtt-5-codec.md) | — |
 | [0009](../adr/0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [3/3 done](0009-mqtt5-expiry.md) | — |
 | [0010](../adr/0010-shared-subscriptions.md) | Shared subscriptions | Accepted | [7/8 done](0010-shared-subscriptions.md) | 1 deferred |
@@ -25,7 +25,7 @@
 | [0015](../adr/0015-cluster-shared-subscriptions.md) | Cluster-wide shared subscriptions | Accepted | [8/8 done](0015-cluster-shared-subscriptions.md) | — |
 | [0016](../adr/0016-swim-membership-stability.md) | SWIM membership stability (dead-node fencing + false-positive resistance) | Accepted | [6/6 done](0016-swim-membership-stability.md) | — |
 | [0017](../adr/0017-durable-attach-readiness.md) | Durable attach waits for an authoritative session, never downgrades | Accepted | [8/9 done](0017-durable-attach-readiness.md) | 1 deferred |
-| [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [7/8 done](0018-on-disk-persistence.md) | 1 deferred |
+| [0018](../adr/0018-on-disk-persistence.md) | On-disk persistence for durable state | Accepted | [8/8 done](0018-on-disk-persistence.md) | — |
 | [0019](../adr/0019-graceful-shutdown.md) | Graceful shutdown and connection draining | Accepted | [7/9 done](0019-graceful-shutdown.md) | 2 deferred |
 | [0020](../adr/0020-metrics-and-observability.md) | Metrics and runtime observability | Accepted | [9/9 done](0020-metrics-and-observability.md) | — |
 | [0021](../adr/0021-bounded-lease-voters.md) | Bounded lease-consensus voter set | Accepted | [9/9 done](0021-bounded-lease-voters.md) | — |
@@ -51,7 +51,7 @@
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
-| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [1/7 done](0044-release-readiness-assurance.md) | 6 open |
+| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [2/7 done](0044-release-readiness-assurance.md) | 5 open |
 
 ## Open and deferred work
 
@@ -70,10 +70,6 @@
 - `0005-P2c` 💤 deferred: Delivery/lifecycle hardening of the splice (best-effort on half-close) — splice is best-effort on half-close; a delivery/lifecycle hardening pass is a documented follow-up
 - `0005-P3` 💤 deferred: MQTT 5 Server-Reference redirect replacing the relay for v5 clients — "Re-assessed 2026-07-02: the original blocker (no v5 codec) is gone (ADR 0008), so this is now buildable — but parked on the OTHER half of the original condition: mainstream v5 clients (paho, mosquitto) do not auto-follow Server Reference / 0x9C redirects, so the relay must remain the universal path regardless and a redirect would only serve clients that opt into handling it. Revisit if a redirect-capable client population materialises; the proxy serves 3.1.1 and v5 alike meanwhile."
 
-**0007 — Wiring the durable cluster session store into the broker**
-
-- `0007-T8` 💤 deferred: Dynamic-reconfiguration hardening under rapid churn (flap -> ephemeral degrade) — v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
-
 **0010 — Shared subscriptions**
 
 - `0010-T7` 💤 deferred: Subscription-Identifier handling for shared subscriptions — ADR 0010 Consequences notes no Subscription-Identifier handling yet; out of scope for the routing lever
@@ -85,10 +81,6 @@
 **0017 — Durable attach waits for an authoritative session, never downgrades**
 
 - `0017-T9` 💤 deferred: Make recovery deadline/backoff configurable (currently constants) — ATTACH_RECOVERY_TIMEOUT/BACKOFF are constants for now; ADR defers promoting them to config until an operator need appears
-
-**0018 — On-disk persistence for durable state**
-
-- `0018-T7` 💤 deferred: Process-kill (SIGKILL mid-write) crash-consistency test — rests on redb's own ACID/crash suite; an in-repo subprocess kill test adds machinery for modest marginal coverage
 
 **0019 — Graceful shutdown and connection draining**
 
@@ -117,7 +109,6 @@
 
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
-- `0044-P2` ⬜ planned: OS-real fault vocabulary — SIGKILL at any instant including mid-write (0018-T7 lands here), disk-full against a real filesystem bound, restart from surviving dirs, membership flap at SWIM-confusing rates (0007-T8 lands here), partitions/brownouts/half-open links via the relays
 - `0044-P3` ⬜ planned: Two-binary rolling upgrade — build HEAD + a pinned baseline ref, roll a live cluster one node at a time in both directions under the oracle, reopen data dirs across versions (ADR 0038 gates fire for real); closes the ADR 0043 recorded gap and builds the machinery 0039-T3 rides at 1.0
 - `0044-P4` ⬜ planned: Nightly tier + soak — scheduled CI workflow running the out-of-process schedules over a wide seed sweep, the upgrade paths, fuzz time, and an hours-long soak under sustained mixed load watching RSS / FDs / tail latency against declared drift watermarks (ADR 0041 caps, ADR 0020 gauges)
 - `0044-P5` ⬜ planned: Continuous security program — fuzz targets for every attacker-reachable parser (MQTT packets exist; add peer frames, gossip datagram verify, bridge frames, WS/QUIC framing, auth/config parsers) with in-repo corpora, wired into the nightly tier; every find becomes a darksky regression; SECURITY.md response process (private reporting, triage bounds, advisory path)

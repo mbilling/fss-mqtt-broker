@@ -40,8 +40,9 @@ tasks:
     evidence: persistence.rs; durable_node::a_persistent_durable_node_restarts_from_its_data_dir
   - id: 0018-T7
     title: Process-kill (SIGKILL mid-write) crash-consistency test
-    status: deferred
-    notes: rests on redb's own ACID/crash suite; an in-repo subprocess kill test adds machinery for modest marginal coverage
+    status: done
+    date: 2026-07-16
+    evidence: "Delivered by the ADR 0044 P2 out-of-process harness (the machinery whose absence deferred it): cluster_proc::a_disk_bound_crash_mid_write_loses_no_acked_fact runs one spawned production-binary node under a kernel-enforced RLIMIT_FSIZE (8MB per file, sh ulimit -f — unprivileged) and blasts acked 64KB durable enqueues until a store write crosses the bound and the kernel delivers SIGXFSZ — the process dies exactly ON a write syscall, the sharpest mid-write crash point available (no timed SIGKILL guessing). The survivors keep quorum; the restart reopens the possibly-torn dir UNBOUNDED, redb rolls back any torn write on reopen, ADR 0043 P1 catch-up back-fills the gap, and every acked payload (~29 × 64KB per run) replays to the resumed subscriber. The seeded cluster_proc schedules additionally SIGKILL a node mid-acked-burst every seed."
 ---
 
 # Delivery — ADR 0018: On-disk persistence for durable state
@@ -76,7 +77,7 @@ proven (engine, fsync semantics, reopen recovery) before the next builds on it.
 | 0018-P4 | ✅ done | 2026-06-19 | persistent_retained.rs reopen + wildcard/QoS fidelity test |
 | 0018-P5 | ✅ done | 2026-06-21 | data_dir.rs guard test; a_durable_session_log_survives_a_full_restart_via_persisted_replicas |
 | 0018-T6 | ✅ done | 2026-06-22 | persistence.rs; durable_node::a_persistent_durable_node_restarts_from_its_data_dir |
-| 0018-T7 | 💤 deferred | — | rests on redb's own ACID/crash suite; an in-repo subprocess kill test adds machinery for modest marginal coverage |
+| 0018-T7 | ✅ done | 2026-07-16 | "Delivered by the ADR 0044 P2 out-of-process harness (the machinery whose absence deferred it): cluster_proc::a_disk_bound_crash_mid_write_loses_no_acked_fact runs one spawned production-binary node under a kernel-enforced RLIMIT_FSIZE (8MB per file, sh ulimit -f — unprivileged) and blasts acked 64KB durable enqueues until a store write crosses the bound and the kernel delivers SIGXFSZ — the process dies exactly ON a write syscall, the sharpest mid-write crash point available (no timed SIGKILL guessing). The survivors keep quorum; the restart reopens the possibly-torn dir UNBOUNDED, redb rolls back any torn write on reopen, ADR 0043 P1 catch-up back-fills the gap, and every acked payload (~29 × 64KB per run) replays to the resumed subscriber. The seeded cluster_proc schedules additionally SIGKILL a node mid-acked-burst every seed." |
 <!-- /status-table:0018 -->
 
 **Architectural note carried from P5:** single-node session-content restart-durability is
