@@ -64,6 +64,15 @@ permission tightened → grant removed.
 
 ## Changelog
 
+- **2026-07-14** — Decision note added to ADR §1: certificate **expiry** is
+  deliberately not a live-eviction trigger. Validity is enforced at handshake
+  (and every reconnect); mid-connection eviction is the CRL's job — revoke the
+  serial and reload. Rationale recorded (expiry = scheduled rotation hygiene vs.
+  revocation = urgent access removal; wall-clock enforcement would mass-disconnect
+  device fleets whose cert batches age out together), along with why the
+  per-datagram gossip check (ADR 0022 T7) is consistent, and why server-initiated
+  MQTT 5 re-auth (deferred ADR 0013 T8) stays scoped to token deployments — an
+  AUTH exchange cannot re-validate a TLS certificate. No code change.
 - **2026-07-05** — T5 (audit/metrics + closure) landed, **closing ADR 0040**
   (Proposed → Accepted): revocation_evictions_total{reason} counts every sweep action,
   each sweep leaves a security.sweep summary record, the ADR §5 inert-durable-state
