@@ -5,7 +5,9 @@ adr_status: Proposed
 tasks:
   - id: 0044-P1
     title: Out-of-process harness skeleton — spawn real mqttd binaries (Cargo test-binary paths) with real data dirs, listeners, and gossip sockets; per-node unprivileged TCP relays on the peer links; port the schedule vocabulary and acked-facts oracle; first schedules run kill (SIGKILL) / restart / publish / retained / churn against a 3-node cluster
-    status: planned
+    status: done
+    date: 2026-07-16
+    evidence: "The out-of-process tier exists: crates/mqttd/tests/cluster_proc.rs spawns the COMPILED PRODUCTION BINARY (CARGO_BIN_EXE_mqttd) per node — real processes, real data dirs, real TCP/MQTT listeners, real UDP gossip sockets — configured purely through the documented MQTTD_* environment exactly as an operator would (node assembly is main.rs itself, not a test-side mirror of it). New env: MQTTD_PEER_ADVERTISE (default: the bind) lets gossip advertise a dialable peer address that differs from the bound one — NAT, container port mapping, or a fronting relay; the harness fronts every node's peer listener with an unprivileged in-test TCP relay and advertises the relay's address (the severable per-link seam the P2 fault vocabulary grows on — the relays carry ALL peer traffic here, proving the seam under no privileges). Bring-up, restart admission, and quiesce all read /readyz (members + lease_group_ready) — the operator's own convergence signal, never internal state; placement is deliberately invisible, so clients attach through ANY node and the ADR 0005 owner-relay routes them: the production client path, black-box. Kill is kernel SIGKILL (no in-process stand-in deciding what crash means); restart reopens the surviving redb dirs COLD over the same fixed ports (the relay keeps the advertised address valid across cycles), with re-seeding so a restarted founder REJOINS instead of re-bootstrapping — the tier's first live find: an all-seeded topology has no founder, never bootstraps the lease group, and never becomes ready (main.rs's no-seeds-is-the-founder rule, invisible to the in-process tier which bootstraps directly). Schedule vocabulary + acked-facts oracle ported from ADR 0042: publish (owed only from its PUBACK), retained (expected value from the last acked set onward), churn, a SIGKILL at a seeded position and a restart 2-3 steps later — EVERY seed exercises the full crash/recover cycle, under production SWIM timings (no test-tuned knobs; windows sized accordingly). Oracle judged entirely through MQTT + /readyz: every resume present=true (check_recovery_honesty), every acked payload replayed, retained converged across all nodes at-or-beyond the last acked set. Failures are self-diagnosing: log tails of every spawned node + the full schedule trace + REPRO_SEED printed on panic. CI profile runs one seed (~20-35s in the ordinary workspace test run); MQTTD_PROC_SEEDS widens for the nightly tier (3-seed sweep green, ~100s, every seed 1 sigkill + 1 restart). Workspace green, clippy zero warnings."
   - id: 0044-P2
     title: OS-real fault vocabulary — SIGKILL at any instant including mid-write (0018-T7 lands here), disk-full against a real filesystem bound, restart from surviving dirs, membership flap at SWIM-confusing rates (0007-T8 lands here), partitions/brownouts/half-open links via the relays
     status: planned
@@ -34,7 +36,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 <!-- status-table:0044 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0044-P1 | ⬜ planned | — |  |
+| 0044-P1 | ✅ done | 2026-07-16 | "The out-of-process tier exists: crates/mqttd/tests/cluster_proc.rs spawns the COMPILED PRODUCTION BINARY (CARGO_BIN_EXE_mqttd) per node — real processes, real data dirs, real TCP/MQTT listeners, real UDP gossip sockets — configured purely through the documented MQTTD_* environment exactly as an operator would (node assembly is main.rs itself, not a test-side mirror of it). New env: MQTTD_PEER_ADVERTISE (default: the bind) lets gossip advertise a dialable peer address that differs from the bound one — NAT, container port mapping, or a fronting relay; the harness fronts every node's peer listener with an unprivileged in-test TCP relay and advertises the relay's address (the severable per-link seam the P2 fault vocabulary grows on — the relays carry ALL peer traffic here, proving the seam under no privileges). Bring-up, restart admission, and quiesce all read /readyz (members + lease_group_ready) — the operator's own convergence signal, never internal state; placement is deliberately invisible, so clients attach through ANY node and the ADR 0005 owner-relay routes them: the production client path, black-box. Kill is kernel SIGKILL (no in-process stand-in deciding what crash means); restart reopens the surviving redb dirs COLD over the same fixed ports (the relay keeps the advertised address valid across cycles), with re-seeding so a restarted founder REJOINS instead of re-bootstrapping — the tier's first live find: an all-seeded topology has no founder, never bootstraps the lease group, and never becomes ready (main.rs's no-seeds-is-the-founder rule, invisible to the in-process tier which bootstraps directly). Schedule vocabulary + acked-facts oracle ported from ADR 0042: publish (owed only from its PUBACK), retained (expected value from the last acked set onward), churn, a SIGKILL at a seeded position and a restart 2-3 steps later — EVERY seed exercises the full crash/recover cycle, under production SWIM timings (no test-tuned knobs; windows sized accordingly). Oracle judged entirely through MQTT + /readyz: every resume present=true (check_recovery_honesty), every acked payload replayed, retained converged across all nodes at-or-beyond the last acked set. Failures are self-diagnosing: log tails of every spawned node + the full schedule trace + REPRO_SEED printed on panic. CI profile runs one seed (~20-35s in the ordinary workspace test run); MQTTD_PROC_SEEDS widens for the nightly tier (3-seed sweep green, ~100s, every seed 1 sigkill + 1 restart). Workspace green, clippy zero warnings." |
 | 0044-P2 | ⬜ planned | — |  |
 | 0044-P3 | ⬜ planned | — |  |
 | 0044-P4 | ⬜ planned | — |  |
@@ -66,6 +68,19 @@ P5/P6 parallel after P1, P7 last.
 
 ## Changelog
 
+- **2026-07-16** — **0044-P1 done: the out-of-process harness skeleton.** A real
+  3-node cluster of spawned production binaries (`CARGO_BIN_EXE_mqttd`), configured
+  purely through the documented `MQTTD_*` environment, observed purely through
+  `/readyz` and MQTT — kill is kernel `SIGKILL`, restart reopens the surviving data
+  dirs cold, clients attach through any node via the ADR 0005 owner-relay, and the
+  ADR 0042 acked-facts oracle holds black-box. Every node's peer listener sits
+  behind an unprivileged in-test TCP relay advertised via the new
+  `MQTTD_PEER_ADVERTISE` (also a real operator knob: NAT/container/fronting-proxy
+  deployments), giving P2's fault vocabulary its severable per-link seam. First
+  live find, before the first schedule even ran: an all-seeded topology has no
+  founder and never becomes ready — the no-seeds-is-the-founder bootstrap rule is
+  invisible to the in-process tier, exactly the class of gap this tier exists to
+  surface. One seed in per-PR CI; `MQTTD_PROC_SEEDS` widens for the nightly tier.
 - **2026-07-15** — ADR 0044 drafted with delivery plan P1–P7, from the assurance
   inventory (in-process harness strong but single-process/single-binary; fuzzing
   dormant; no benchmarks, soak, or second interop oracle). Motivated by the release
