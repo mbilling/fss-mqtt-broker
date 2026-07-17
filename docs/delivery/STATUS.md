@@ -51,7 +51,7 @@
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
-| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [2/7 done](0044-release-readiness-assurance.md) | 5 open |
+| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [3/7 done](0044-release-readiness-assurance.md) | 4 open |
 
 ## Open and deferred work
 
@@ -105,11 +105,10 @@
 
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
-- `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
+- `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. THE MACHINERY NOW EXISTS (ADR 0044 P3, 2026-07-17): cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact rolls a live cluster between a pinned baseline binary and HEAD one node at a time in both directions under the acked-facts oracle; at 1.0 this task is that test pointed at two release tags plus a scheduled CI job. Until then the pinned baseline doubles as the pre-release compatibility tripwire."
 
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
-- `0044-P3` ⬜ planned: Two-binary rolling upgrade — build HEAD + a pinned baseline ref, roll a live cluster one node at a time in both directions under the oracle, reopen data dirs across versions (ADR 0038 gates fire for real); closes the ADR 0043 recorded gap and builds the machinery 0039-T3 rides at 1.0
 - `0044-P4` ⬜ planned: Nightly tier + soak — scheduled CI workflow running the out-of-process schedules over a wide seed sweep, the upgrade paths, fuzz time, and an hours-long soak under sustained mixed load watching RSS / FDs / tail latency against declared drift watermarks (ADR 0041 caps, ADR 0020 gauges)
 - `0044-P5` ⬜ planned: Continuous security program — fuzz targets for every attacker-reachable parser (MQTT packets exist; add peer frames, gossip datagram verify, bridge frames, WS/QUIC framing, auth/config parsers) with in-repo corpora, wired into the nightly tier; every find becomes a darksky regression; SECURITY.md response process (private reporting, triage bounds, advisory path)
 - `0044-P6` ⬜ planned: Performance baselines + regression gates — criterion micro-benches (codec, hub fan-out, replica apply/group-commit) and a harness macro-bench (connection ramp, sustained msgs/sec, p99 durable QoS 1) with recorded baselines; nightly comparison flags regressions beyond stated tolerance

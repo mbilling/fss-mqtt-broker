@@ -66,6 +66,12 @@ Order: P1 → P2 → P3 (each unblocks the next), P4 grows alongside each, P5 la
 
 ## Changelog
 
+- **2026-07-17** — **The recorded gap is closed.** The whole-cluster two-binary
+  rolling-upgrade test that P4/P5 recorded as awaiting an out-of-process harness
+  now exists: ADR 0044 P3's `cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact`
+  rolls a live 3-node cluster from a pinned baseline binary to HEAD one node at
+  a time and back, under acked load, dirs reopened across versions — the resize
+  replace motion ridden with two real binaries.
 - **2026-07-14** — **Pre-release proto collapse.** The project is pre-release:
   breaking changes are free and no protocol/schema version coexistence is
   supported until after 1.0.0 (rolling upgrades are a post-release capability).

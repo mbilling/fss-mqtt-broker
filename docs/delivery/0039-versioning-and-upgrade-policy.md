@@ -16,7 +16,7 @@ tasks:
   - id: 0039-T3
     title: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then
     status: deferred
-    notes: "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)."
+    notes: "Needs two released versions to exist — impossible before 1.0 by definition. THE MACHINERY NOW EXISTS (ADR 0044 P3, 2026-07-17): cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact rolls a live cluster between a pinned baseline binary and HEAD one node at a time in both directions under the acked-facts oracle; at 1.0 this task is that test pointed at two release tags plus a scheduled CI job. Until then the pinned baseline doubles as the pre-release compatibility tripwire."
 ---
 
 # Delivery — ADR 0039: Release versioning and upgrade policy
@@ -44,7 +44,7 @@ the pre-release freeze regime (ADR 0038) governs until then.
 |------|--------|------|------------------|
 | 0039-T1 | ✅ done | 2026-07-05 | "ADR 0039 states the full policy with the model survey (Kubernetes skew + 3-line maintenance, etcd/Cassandra adjacent stepping, Elasticsearch gateway-minor major rolls, Kafka negotiation, Postgres offline majors) and the reasoning for the composite; README gains an 'Upgrades & versioning' section stating, operator-facing: semver defined by wire/disk breakage, adjacent-only skew, sequential majors rolled through a designated gateway minor (the previous major's last minor, where known upgrade issues are fixed first) and dispatched on schema stamps, three supported lines, the MQTT-client carve-out, and the explicit pre-1.0 (ADR 0038 freeze) regime until activation." |
 | 0039-T2 | ✅ done | 2026-07-05 | "PROTO_MIN's doc now states the release rule (frozen for a major's lifetime; a new major sets it to the gateway minor's proto — raising it is a MAJOR act) and PROTO_MAX's doc states the additive-minor rule (minors may bump it while still speaking every proto back to the floor; dropping an old proto is a PROTO_MIN raise, i.e. a MAJOR). The mqtt_storage::schema module docs state the migration rule (store versions bump only in majors; each major migrates exactly one major back; the rolling path starts from the gateway minor, enforced by the handshake). The policy lives beside the constants that enforce it, so they cannot drift apart silently." |
-| 0039-T3 | 💤 deferred | — | "Needs two released versions to exist — impossible before 1.0 by definition. Recorded so the promise is not forgotten: when the first post-1.0 release ships, CI gains a mixed adjacent-pair rolling-upgrade smoke (join, serve, converge)." |
+| 0039-T3 | 💤 deferred | — | "Needs two released versions to exist — impossible before 1.0 by definition. THE MACHINERY NOW EXISTS (ADR 0044 P3, 2026-07-17): cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact rolls a live cluster between a pinned baseline binary and HEAD one node at a time in both directions under the acked-facts oracle; at 1.0 this task is that test pointed at two release tags plus a scheduled CI job. Until then the pinned baseline doubles as the pre-release compatibility tripwire." |
 <!-- /status-table:0039 -->
 
 ## Changelog
