@@ -1,0 +1,7 @@
+default = "deny"
+
+[[rules]]
+identities = ["svc/ingest"]
+actions = ["publish", "subscribe"]
+effect = "allow"
+topics = ["sensors/#"]

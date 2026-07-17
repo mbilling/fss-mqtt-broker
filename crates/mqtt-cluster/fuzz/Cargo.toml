@@ -1,0 +1,43 @@
+# Fuzz harness for the cluster crate's untrusted-input boundaries (ADR 0044 P5):
+# the peer-bus frame decoder, the SWIM gossip-message decoder, and the gossip
+# datagram opener. Requires nightly + cargo-fuzz:  cargo install cargo-fuzz
+# Run:  cargo +nightly fuzz run peer_decode
+#
+# The empty [workspace] table detaches this crate from the parent workspace so
+# the stable build/CI never tries to compile the nightly-only libfuzzer harness.
+[package]
+name = "mqtt-cluster-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+mqtt-cluster = { path = ".." }
+
+[[bin]]
+name = "peer_decode"
+path = "fuzz_targets/peer_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "swim_message"
+path = "fuzz_targets/swim_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gossip_open"
+path = "fuzz_targets/gossip_open.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

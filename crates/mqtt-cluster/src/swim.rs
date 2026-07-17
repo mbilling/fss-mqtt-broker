@@ -211,6 +211,17 @@ pub struct Message {
     pub gossip: Vec<Update>,
 }
 
+impl Message {
+    /// Decode a SWIM datagram payload exactly as the driver does after it
+    /// clears authentication (`bincode::deserialize`). Returns `None` on any
+    /// malformed input — never panics. Public so the ADR 0044 P5 fuzz target
+    /// exercises the real gossip parser rather than a reimplementation.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        bincode::deserialize(payload).ok()
+    }
+}
+
 /// An effect the driver must carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {

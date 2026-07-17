@@ -121,7 +121,7 @@ pub async fn run(
                 } else {
                     Opened { payload: &buf[..n], identity: None, seq: None, domain: None }
                 };
-                let Ok(msg) = bincode::deserialize::<Message>(opened.payload) else {
+                let Some(msg) = Message::decode(opened.payload) else {
                     trace!(%src, "dropping undecodable SWIM datagram");
                     count_reject("decode");
                     continue;

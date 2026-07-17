@@ -1,0 +1,36 @@
+# Fuzz harness for the auth crate's untrusted-input parsers (ADR 0044 P5): the
+# certificate-revocation-list decoder (DER from an operator-supplied file, hot-
+# reloaded) and the topic-ACL policy parser (TOML from an operator-supplied
+# file). Requires nightly + cargo-fuzz:  cargo install cargo-fuzz
+# Run:  cargo +nightly fuzz run crl_parse
+#
+# The empty [workspace] table detaches this crate from the parent workspace so
+# the stable build/CI never tries to compile the nightly-only libfuzzer harness.
+[package]
+name = "mqtt-auth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mqtt-auth = { path = ".." }
+
+[[bin]]
+name = "crl_parse"
+path = "fuzz_targets/crl_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acl_parse"
+path = "fuzz_targets/acl_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
