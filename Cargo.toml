@@ -71,6 +71,8 @@ futures-util = "0.3"
 # QUIC transport (ADR 0036): MQTT-over-QUIC. Pinned to the `ring` rustls provider (no aws-lc),
 # matching the rest of the broker; already in-tree transitively on our rustls 0.23.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# Micro-benchmarks (ADR 0044 P6): dev-only, statistical timing of the hot paths.
+criterion = "0.5"
 
 # Test/dev builds keep file:line panic locations but drop full debuginfo:
 # the workspace's ~30 integration-test binaries at debug=2 exceed 20 GiB of

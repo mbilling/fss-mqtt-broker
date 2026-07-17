@@ -176,9 +176,17 @@ cargo test
 cargo clippy --all-targets
 cargo deny check          # supply-chain: licenses, advisories, bans, sources
 
-# Fuzz the codec (the untrusted-input boundary). Requires nightly + cargo-fuzz:
+# Fuzz any attacker-reachable parser (ADR 0044 P5). Requires nightly + cargo-fuzz:
 #   cargo install cargo-fuzz
-cargo +nightly fuzz run packet_decode --fuzz-dir crates/mqtt-codec/fuzz
+cargo +nightly fuzz run packet_decode --fuzz-dir crates/mqtt-codec/fuzz    # MQTT client codec
+cargo +nightly fuzz run gossip_open  --fuzz-dir crates/mqtt-cluster/fuzz   # pre-auth SWIM datagram
+cargo +nightly fuzz run peer_decode  --fuzz-dir crates/mqtt-cluster/fuzz   # peer-bus frames
+# also: swim_message (mqtt-cluster), crl_parse + acl_parse (mqtt-auth)
+
+# Hot-path benchmarks + the per-PR regression floor (ADR 0044 P6; see docs/benchmarks/BASELINE.md):
+cargo bench -p mqtt-codec                     # codec encode/decode
+cargo bench -p mqtt-cluster                   # replica apply + peer frame codec
+cargo test  -p mqtt-codec --test perf_gate    # the throughput floor that runs on every PR
 
 # Foreign-client interop conformance (ADR 0034): drives the real mqttd binary with the
 # Eclipse Mosquitto CLI — a non-Rust client that shares no code with the broker's codec, so
@@ -186,6 +194,9 @@ cargo +nightly fuzz run packet_decode --fuzz-dir crates/mqtt-codec/fuzz
 # `openssl`, `python3`, `curl` on PATH; adds NO crate to the dependency tree. Runs in CI.
 ./scripts/interop/run.sh
 ```
+
+Security reporting and the continuous-assurance posture (fuzzing, the acked-facts oracle,
+soak, rolling-upgrade tests) are documented in [SECURITY.md](SECURITY.md).
 
 The interop suite asserts v3.1.1 round-trips at QoS 0/1/2, a retained message to a late
 subscriber, an MQTT 5 **User Property** surviving a hop (ADR 0030), and OpenSSL↔rustls TLS 1.3
@@ -461,6 +472,24 @@ applies — formats may change freely, wipe-and-rejoin on schema bumps):
   lines; older lines are EOL.
 - **MQTT clients are exempt**: client compatibility is governed by the MQTT
   specifications (3.1.1 / 5.0), not by this policy — clients of any age keep working.
+
+## Performance
+
+Hot-path CPU costs, measured with [criterion](https://github.com/bheisler/criterion.rs)
+on a 4-core Xeon, `--release` (full numbers and method in
+[docs/benchmarks/BASELINE.md](docs/benchmarks/BASELINE.md)):
+
+- **MQTT codec** — a 256-byte PUBLISH encodes in ~270 ns and decodes in ~190 ns; the
+  codec alone sustains on the order of a couple of million messages per second per core.
+- **Durable plane** — an in-memory replica apply runs in ~290 ns; a peer replication
+  frame encodes in ~280 ns and decodes in ~420 ns (the fsync cost is the disk's, not the
+  broker's — this is the CPU work a code change can regress).
+
+These are micro-benchmarks — the broker's own CPU work, isolated from network and disk —
+not an end-to-end throughput claim; what they guarantee is that the broker is not the
+bottleneck and does not silently regress. A per-PR **regression floor**
+(`cargo test -p mqtt-codec --test perf_gate`) fails the build on a gross slowdown, and the
+nightly tier re-runs the full benches ([ADR 0044](docs/adr/0044-release-readiness-assurance.md) P6).
 
 ## Architecture decisions
 
