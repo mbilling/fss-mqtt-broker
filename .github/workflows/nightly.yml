@@ -1,0 +1,81 @@
+# The nightly deep tier (ADR 0044 P4): what per-PR minutes cannot buy —
+# wide seed sweeps over real processes, the two-binary rolling upgrade,
+# an hour-long soak judged on drift watermarks, and fuzz time.
+#
+# A nightly failure is triaged with the ADR 0042 exhibit-ledger discipline:
+# it lands as a row in the ADR 0044 findings ledger (docs/delivery/
+# 0044-release-readiness-assurance.md) before it is fixed or waived.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily (off the :00 stampede)
+  workflow_dispatch: # and on demand
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  proc-sweep:
+    name: out-of-process seed sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 8 seeds ≈ 8 full spawn/kill/restart schedules (serialized by design).
+      - name: cluster_proc sweep
+        run: MQTTD_PROC_SEEDS=8 cargo test -p mqttd --test cluster_proc -- --nocapture
+
+  stress-sweep:
+    name: in-process stress sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The ADR 0042 soak profile: widen the seeded fault schedules.
+      - name: cluster_stress sweep
+        run: MQTTD_STRESS_SEEDS=8 cargo test -p mqttd --test cluster_stress -- --nocapture
+
+  upgrade:
+    name: two-binary rolling upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the baseline is built from a pinned historic ref
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rolling upgrade + rollback (ADR 0044 P3)
+        run: cargo test -p mqttd --test cluster_upgrade -- --ignored --nocapture
+
+  soak:
+    name: one-hour soak (drift watermarks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: soak (RSS / FD / p99 drift)
+        run: MQTTD_SOAK_SECS=3600 cargo test -p mqttd --test cluster_soak -- --ignored --nocapture
+
+  fuzz:
+    name: fuzz time (ADR 0044 P5 grows the targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly # libFuzzer needs nightly rustc
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # 15 minutes on the packet decoder (the one existing target; P5 adds the
+      # rest of the attacker-reachable parsers plus persisted corpora).
+      - name: fuzz packet_decode
+        working-directory: crates/mqtt-codec
+        run: cargo +nightly fuzz run packet_decode -- -max_total_time=900

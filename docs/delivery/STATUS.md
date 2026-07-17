@@ -51,7 +51,7 @@
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
-| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [3/7 done](0044-release-readiness-assurance.md) | 4 open |
+| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [4/7 done](0044-release-readiness-assurance.md) | 3 open |
 
 ## Open and deferred work
 
@@ -109,7 +109,6 @@
 
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
-- `0044-P4` ⬜ planned: Nightly tier + soak — scheduled CI workflow running the out-of-process schedules over a wide seed sweep, the upgrade paths, fuzz time, and an hours-long soak under sustained mixed load watching RSS / FDs / tail latency against declared drift watermarks (ADR 0041 caps, ADR 0020 gauges)
 - `0044-P5` ⬜ planned: Continuous security program — fuzz targets for every attacker-reachable parser (MQTT packets exist; add peer frames, gossip datagram verify, bridge frames, WS/QUIC framing, auth/config parsers) with in-repo corpora, wired into the nightly tier; every find becomes a darksky regression; SECURITY.md response process (private reporting, triage bounds, advisory path)
 - `0044-P6` ⬜ planned: Performance baselines + regression gates — criterion micro-benches (codec, hub fan-out, replica apply/group-commit) and a harness macro-bench (connection ramp, sustained msgs/sec, p99 durable QoS 1) with recorded baselines; nightly comparison flags regressions beyond stated tolerance
 - `0044-P7` ⬜ planned: Conformance breadth + operator-experience smoke + closure — Paho as the second interop oracle (0034-T7 lands here) with richer assertions; a quickstart smoke test standing up the documented 3-node cluster from the README's own commands; the release-readiness checklist assembled and the ADR closed
