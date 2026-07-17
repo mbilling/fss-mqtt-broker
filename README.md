@@ -4,19 +4,28 @@
 > broker available, with linear horizontal scalability and a 100% open feature
 > set.
 
-**Status:** single-node MQTT 3.1.1 is feature-complete (QoS 0/1/2, retained
-messages, wills, keepalive, persistent sessions). Transport security
+**Status:** MQTT **3.1.1 and 5.0** are served — over TCP, TLS 1.3, WebSocket
+(`ws://`/`wss://`), and QUIC. The v5 semantics are in place (session/message
+expiry, topic aliases, flow control, shared subscriptions, User Properties,
+enhanced `AUTH`), not just the wire codec. Transport security
 (TLS 1.3 + mutually-authenticated cluster bus), authenticated gossip membership
 with dynamic cross-node routing, and a full identity/authorization stack
 (mTLS-CN / password / JWT → topic ACLs → tamper-evident audit) are in place.
 **Durable, consensus-backed replicated session storage** (openraft lease group +
-epoch-fenced quorum replication, opt-in via `MQTTD_DURABLE_SESSIONS`) is built and
-proven over a real cluster, with **cross-node takeover** (a replica serves a session
-after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
-**negotiates v5 at CONNECT**; the v5 *semantics* are the next milestone. See
-[`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
+epoch-fenced quorum replication) is **on by default** and proven over a real
+cluster, with **cross-node takeover** (a replica serves a session after its
+owner dies) and **data-safe elastic resize** (grow, shrink, and rolling
+replacement without losing an acknowledged fact). Prometheus metrics, resource
+governance (connection caps, per-client quotas, publish-rate limits, bounded
+queues), and a continuous-assurance program (out-of-process fault/upgrade
+harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
+performance baselines, and two independent foreign-client conformance oracles)
+all ship. The main thing not yet done is cutting a tagged release.
+
+See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
-[**delivery dashboard**](docs/delivery/STATUS.md) for live build status.
+[**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
+record of exactly what is built (44 ADRs, per-task status).
 
 ## Principles
 
@@ -43,6 +52,27 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
 - **Keepalive enforcement** (1.5× grace), and persistent sessions
   (`clean_session=0`) with offline queueing and replay.
 - Zero-trust wire codec with a `cargo-fuzz` harness.
+
+### Protocol (MQTT 5.0)
+A v5 client connects, gets a v5 CONNACK with v5 reason codes, and exchanges
+v5-framed packets with properties. The semantics are implemented, not just the codec:
+- **Session & message expiry** ([ADR 0009](docs/adr/0009-mqtt5-expiry.md)):
+  Session Expiry Interval and per-message Message Expiry Interval, honoured on
+  queueing and replay.
+- **Topic aliases** ([ADR 0011](docs/adr/0011-topic-aliases.md)) and **flow
+  control** (Receive Maximum, [ADR 0012](docs/adr/0012-flow-control.md)).
+- **Shared subscriptions** (`$share/<group>/<filter>`), including
+  **cluster-wide** shared groups selected across the mesh
+  ([ADR 0010](docs/adr/0010-shared-subscriptions.md),
+  [0015](docs/adr/0015-cluster-shared-subscriptions.md)) — the linear-scaling lever.
+- **User Properties** forwarded end to end through delivery
+  ([ADR 0030](docs/adr/0030-user-property-forwarding.md)).
+- **Enhanced authentication** — the v5 `AUTH` exchange, e.g. challenge/response
+  ([ADR 0013](docs/adr/0013-enhanced-authentication.md)).
+- Reason codes and DISCONNECT with reason on protocol/quota violations.
+
+Both protocol versions round-trip against two independent foreign clients
+(Mosquitto CLI + Eclipse Paho) in CI — see [Build & test](#build--test).
 
 ### Security
 - **TLS 1.3** client listener (`rustls` + `ring`), optional per-listener client
@@ -100,9 +130,10 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   persistent session connecting to a node that is not its owner is relayed to the
   owner over the mTLS bus and served there — sharded session capacity. The
   landing node vouches for the client's authenticated identity within the
-  cluster-CA trust boundary. With `MQTTD_DURABLE_SESSIONS` the owner's session log
-  is quorum-replicated (below); on the default in-memory path an owner's death
-  still drops its sessions.
+  cluster-CA trust boundary. By default the owner's session log is
+  quorum-replicated (below), so its death does not lose the session; opting out
+  to the bounded in-memory store (`MQTTD_DURABLE_SESSIONS=0`) trades that
+  durability for lower overhead, and there an owner's death does drop its sessions.
 
 - **Durable, replicated session storage** ([ADR 0001](docs/adr/0001-session-durability.md),
   [0006](docs/adr/0006-consensus-and-replication.md),
@@ -141,18 +172,40 @@ after its owner dies). The **MQTT 5.0 wire codec** is complete and the broker
   divergent writes across a severed-and-healed partition both converge cluster-wide
   (`retained_divergence_total` stays 0).
 
-### In progress / planned
-- **MQTT 5.0**: session/message expiry, topic aliases, flow control, shared
-  subscriptions, enhanced auth. (Per [ADR 0008](docs/adr/0008-mqtt-5-codec.md), the
-  v5 **wire codec is complete** and the broker **negotiates v5 at CONNECT** — a v5
-  client connects, gets a v5 CONNACK with v5 reason codes, and exchanges v5-framed
-  packets. The v5 *semantics* listed above are the remaining work.)
-- Subscription digests (bloom) for sub-linear fan-out.
-- WebSocket/WSS listener; Prometheus metrics; admin/management API. (Kubernetes-style
-  `GET /livez` + `/readyz` health probes already ship — see `MQTTD_HEALTH_BIND`.)
-- Bounded outbound queues, rate limits, connection caps.
-- MQTT conformance suite, continuous fuzzing, SBOM + signed reproducible
-  releases.
+### Observability & resource governance
+- **Prometheus metrics** on `GET /metrics` (`MQTTD_METRICS_BIND`), plus optional
+  OTLP push to an OpenTelemetry Collector; Kubernetes-style `GET /livez` +
+  `/readyz` health probes (`MQTTD_HEALTH_BIND`), the latter reporting membership,
+  lease-group readiness, and any in-progress decommission
+  ([ADR 0020](docs/adr/0020-metrics-and-observability.md)).
+- **Resource governance** ([ADR 0041](docs/adr/0041-resource-governance.md)):
+  global and per-IP **connection caps** (`MQTTD_MAX_CONNECTIONS[_PER_IP]`,
+  enforced at accept before any TLS work), an **auth-failure penalty box**,
+  per-client **subscription/session quotas**, **publish-rate limiting** by TCP
+  backpressure (nothing dropped, nothing disconnected), a **retained-topic cap**,
+  and a **disk watermark** that sheds load before the store fills.
+- **Operator control is signal-driven, not an admin API** (deliberate: the
+  health listener stays read-only and unauthenticated): `SIGHUP` reloads the
+  security policy on live connections, `SIGUSR1` begins a decommission drain,
+  `SIGTERM` graceful-shuts-down.
+
+### Assurance
+Continuous, not audited-once ([ADR 0044](docs/adr/0044-release-readiness-assurance.md)):
+an in-process **acked-facts oracle** over seeded fault schedules and an
+**out-of-process harness** driving real spawned binaries through kernel
+`SIGKILL` (incl. mid-write), disk-full, partitions, and a **two-binary rolling
+upgrade + rollback**; an hour-long **soak** watched for memory/FD/latency drift;
+**fuzzing** of every attacker-reachable parser; recorded **performance
+baselines** with a per-PR regression gate; and **two independent foreign-client
+conformance oracles** (Mosquitto + Paho) plus a quickstart-as-test that runs the
+README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.md).
+
+### Planned
+- **Subscription digests (bloom)** for sub-linear fan-out.
+- **Signed, reproducible releases with an SBOM** — and the first tagged release
+  itself (no release exists yet).
+- MQTT 5 **Server-Reference redirect** for v5 clients that opt into following it
+  (the session relay remains the universal path meanwhile — ADR 0005 P3).
 
 ## Workspace layout
 
