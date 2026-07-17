@@ -40,8 +40,9 @@ tasks:
     evidence: cluster_store::takeover_recovers_a_keys_log_from_the_shared_replica_state; durable_sessions::a_replica_serves_the_session_after_the_owner_dies
   - id: 0007-T8
     title: Dynamic-reconfiguration hardening under rapid churn (flap -> ephemeral degrade)
-    status: deferred
-    notes: v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet
+    status: done
+    date: 2026-07-16
+    evidence: "The flap-stress proof exists (ADR 0044 P2, the out-of-process harness): cluster_proc::rapid_kill_restart_flapping_loses_no_acked_fact drives three cycles of SIGKILL + IMMEDIATE respawn of a member — faster than SWIM suspicion confirms a death, the fast-restart shape that produced the 0043-P4 void-ack exhibit — with acked QoS 1 publishes flowing through the survivors while the flapped process rejoins over its surviving dir. Every ack collected anywhere in the storm is a hard obligation; after the storm the cluster quiesces on /readyz and every owed payload replays with session_present honesty intact. The accepted v1 posture stands (debounced stable join/leave; the honesty gates — interest-gossip suppression, routing_unsettled refusals, cluster-configured — keep acks truthful THROUGH the flap rather than degrading affected groups to ephemeral)."
   - id: 0007-T9
     title: Connection-driven next_packet_id over the durable store
     status: done
@@ -83,7 +84,7 @@ independently shippable and test-first, with the live store swap last. Workstrea
 | 0007-T5 | ✅ done | 2026-06-22 | enqueue_replicates_to_a_follower |
 | 0007-T6 | ✅ done | 2026-06-22 | qos2_dedup_window_is_backed_by_the_store; durable_sessions::enqueue_is_durable_across_a_three_node_cluster |
 | 0007-T7 | ✅ done | 2026-06-22 | cluster_store::takeover_recovers_a_keys_log_from_the_shared_replica_state; durable_sessions::a_replica_serves_the_session_after_the_owner_dies |
-| 0007-T8 | 💤 deferred | — | v1 debounces stable join/leave; rapid flapping / lost-quorum degrades to ADR 0005 ephemeral per the accepted limitation; no flap-stress proof exists yet |
+| 0007-T8 | ✅ done | 2026-07-16 | "The flap-stress proof exists (ADR 0044 P2, the out-of-process harness): cluster_proc::rapid_kill_restart_flapping_loses_no_acked_fact drives three cycles of SIGKILL + IMMEDIATE respawn of a member — faster than SWIM suspicion confirms a death, the fast-restart shape that produced the 0043-P4 void-ack exhibit — with acked QoS 1 publishes flowing through the survivors while the flapped process rejoins over its surviving dir. Every ack collected anywhere in the storm is a hard obligation; after the storm the cluster quiesces on /readyz and every owed payload replays with session_present honesty intact. The accepted v1 posture stands (debounced stable join/leave; the honesty gates — interest-gossip suppression, routing_unsettled refusals, cluster-configured — keep acks truthful THROUGH the flap rather than degrading affected groups to ephemeral)." |
 | 0007-T9 | ✅ done | 2026-06-25 | "SessionStore::reserve_packet_ids reserves a block of outbound packet ids in one durable snapshot write (advancing last_packet_id; only against an existing/persistent session, so clean sessions don't materialise metadata). The hub's per-session cursor (Inflight.next_pkid/block_remaining) is seeded from each block and refills via PKID_BLOCK=1024 reservations, so the per-message path is write-free; a fresh Inflight on a takeover owner reserves from the durable high-water and resumes past it. Tests reserve_packet_ids_advances_a_durable_high_water (storage) and outbound_packet_ids_resume_past_the_durable_high_water (hub); full workspace green after the send-path async ripple." |
 <!-- /status-table:0007 -->
 

@@ -673,9 +673,37 @@ impl Swim {
 
         if now >= self.next_probe_at && self.probe.is_none() {
             self.start_probe(now, &mut out);
+            // Re-greet every seed we are not yet acquainted with, once per
+            // protocol period (ADR 0044 P2 find): the one-shot bootstrap
+            // greeting races the seed's own socket bind when a fleet starts
+            // simultaneously (systemd, k8s) — a lost first Join otherwise
+            // leaves this node PERMANENTLY outside a cluster that formed
+            // around it. Alive-member seeds cost nothing here; a dead seed
+            // gets a harmless periodic dribble that doubles as its re-entry
+            // greeting after a restart.
+            self.greet_unacquainted_seeds(&mut out);
             self.next_probe_at = now + self.cfg.protocol_period_ms;
         }
         out
+    }
+
+    /// Send a `Join` greeting to every configured seed address that is not yet
+    /// an alive member of our view (see `tick` for why this must repeat).
+    fn greet_unacquainted_seeds(&mut self, out: &mut Vec<Action>) {
+        let seeds = self.seeds.clone();
+        for addr in seeds {
+            if addr == self.local_addr {
+                continue;
+            }
+            let acquainted = self
+                .members
+                .values()
+                .any(|m| m.addr == addr && m.state == MemberState::Alive);
+            if !acquainted {
+                let msg = self.message(Kind::Join);
+                out.push(Action::Send { to: addr, msg });
+            }
+        }
     }
 
     fn advance_probe(&mut self, now: u64, out: &mut Vec<Action>) {
@@ -1482,6 +1510,39 @@ mod tests {
         let sync = sync.expect("a Sync reply");
         assert!(sync.gossip.iter().any(|u| u.id == "a"));
         assert!(sync.gossip.iter().any(|u| u.id == "c"));
+    }
+
+    /// A seed whose first greeting was lost (its socket bound late — the
+    /// simultaneous fleet start, ADR 0044 P2) is RE-greeted on every protocol
+    /// period until acquainted; once the seed is an alive member the greeting
+    /// stops. Without the retry, a node whose one-shot bootstrap Join raced
+    /// the seed's bind stays outside the cluster forever.
+    #[test]
+    fn an_unacquainted_seed_is_re_greeted_until_it_answers() {
+        let period = fast_cfg().protocol_period_ms;
+        let mut s = node("b", "b:1", &["a:1"]);
+        let joins_to_a = |actions: &[Action]| {
+            actions
+                .iter()
+                .filter(|a| {
+                    matches!(a, Action::Send { to, msg } if to == "a:1" && matches!(msg.kind, Kind::Join))
+                })
+                .count()
+        };
+        // Bootstrap tick greets the seed once (the original behaviour)...
+        assert_eq!(joins_to_a(&s.tick(0)), 1, "bootstrap greeting");
+        // ...and, the greeting having gone unanswered, every protocol period
+        // re-greets it.
+        assert_eq!(joins_to_a(&s.tick(period)), 1, "first re-greeting");
+        assert_eq!(joins_to_a(&s.tick(period * 2)), 1, "second re-greeting");
+        // The seed answers (its socket finally bound): acquainted — silence.
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("a", "a:1", 1), period * 2, &mut out);
+        assert_eq!(
+            joins_to_a(&s.tick(period * 3)),
+            0,
+            "an acquainted seed is not greeted again"
+        );
     }
 
     // --- ADR 0016 phase 2 §2: Lifeguard local-health awareness -----------------

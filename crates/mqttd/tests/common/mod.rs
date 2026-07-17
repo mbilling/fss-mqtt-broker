@@ -462,7 +462,17 @@ impl Client {
         clean: bool,
         wait: Duration,
     ) -> Option<(Self, bool)> {
-        let mut c = Self::open(addr, V4).await;
+        // A refused/unreachable TCP connect is also a `None` (not a panic):
+        // the out-of-process harness (ADR 0044) dials brokers that may still
+        // be booting — or be SIGKILLED — and its callers retry.
+        let Ok(Ok(stream)) = timeout(wait, TcpStream::connect(addr)).await else {
+            return None;
+        };
+        let (rh, wh) = stream.into_split();
+        let mut c = Client {
+            reader: mqtt_net::FrameReader::new(rh, V4),
+            writer: mqtt_net::FrameWriter::new(wh, V4),
+        };
         c.send(&Packet::Connect(Connect {
             properties: Properties::new(),
             protocol: V4,

@@ -19,9 +19,12 @@
 //!   ADR 0005 owner-relay routes them — the production client path, black-box.
 //!
 //! Each node's peer listener is fronted by an **unprivileged TCP relay** in
-//! the test process, advertised via `MQTTD_PEER_ADVERTISE` — the severable
-//! per-link seam the fault vocabulary grows on (partitions/brownouts land in
-//! 0044-P2; here the relays carry all peer traffic, proving the seam).
+//! the test process, advertised via `MQTTD_PEER_ADVERTISE`. The 0044-P2 fault
+//! vocabulary drives it — sever (asymmetric partition / half-open link) and
+//! slow (browned-out link) — and adds the faults only the OS can deliver:
+//! `SIGKILL` mid-burst, the kernel's `SIGXFSZ` disk-full death on a real
+//! `RLIMIT_FSIZE` bound (0018-T7), and kill/respawn flapping faster than
+//! death confirmation (0007-T8).
 //!
 //! The schedule vocabulary and the **acked-facts oracle** are the ADR 0042
 //! ones, ported: a payload is owed only from its PUBACK; a retained value
@@ -47,6 +50,11 @@ use tokio::task::AbortHandle;
 
 /// Set to `Some(seed)` to run a single seed (e.g. to reproduce a reported failure).
 const REPRO_SEED: Option<u64> = None;
+
+/// One spawned cluster at a time: each test stands up 3 broker PROCESSES and
+/// judges them against real-time windows (ack deadlines, bring-up bounds);
+/// three clusters contending for one runner starve each other into flakes.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Spawned processes with production SWIM timings are expensive (~2 min per
 /// seed), so the CI profile runs ONE seed; `MQTTD_PROC_SEEDS=N` widens the
@@ -98,20 +106,61 @@ impl Rng {
 // restarted process re-binding the same peer port is reachable immediately.
 // ---------------------------------------------------------------------------
 
-/// Controls one node's **inbound** peer-bus links. Severing (0044-P2
-/// vocabulary) drops every relayed connection and refuses new ones.
+/// One inbound peer link's condition (0044-P2 fault vocabulary).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkMode {
+    Healthy,
+    /// Refuse new relayed connections and drop existing ones — an *asymmetric*
+    /// bus fault (the node's own outbound dials stay up, SWIM keeps flowing):
+    /// the half-open-link shape ADR 0037 T8 hardened the retained handoff
+    /// against, now injected against a real process.
+    Severed,
+    /// Delay every relayed chunk — a browned-out (degraded, not dead) link:
+    /// slow enough to stall replication RPC round-trips into their timeouts,
+    /// alive enough that nothing detects a death.
+    Slow(u64),
+}
+
+/// Controls one node's **inbound** peer-bus links.
 #[derive(Clone)]
 struct RelayCtl {
-    severed: watch::Sender<bool>,
+    mode: watch::Sender<LinkMode>,
 }
 
 impl RelayCtl {
-    #[allow(dead_code)] // the P2 fault vocabulary drives this
     fn sever(&self) {
-        let _ = self.severed.send(true);
+        let _ = self.mode.send(LinkMode::Severed);
+    }
+    fn slow(&self, per_chunk_ms: u64) {
+        let _ = self.mode.send(LinkMode::Slow(per_chunk_ms));
     }
     fn heal(&self) {
-        let _ = self.severed.send(false);
+        let _ = self.mode.send(LinkMode::Healthy);
+    }
+}
+
+/// One direction of a relayed connection: copy chunks, honoring the link mode
+/// (delay under `Slow`; the caller's select breaks the pump on `Severed`).
+async fn pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    mode: watch::Receiver<LinkMode>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        let Ok(n) = from.read(&mut buf).await else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        let current = *mode.borrow(); // copy out: the Ref must not span the await
+        if let LinkMode::Slow(ms) = current {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -119,26 +168,29 @@ impl RelayCtl {
 async fn spawn_relay(target: SocketAddr) -> (String, RelayCtl, AbortHandle) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let (severed_tx, severed_rx) = watch::channel(false);
-    let ctl = RelayCtl {
-        severed: severed_tx,
-    };
+    let (mode_tx, mode_rx) = watch::channel(LinkMode::Healthy);
+    let ctl = RelayCtl { mode: mode_tx };
     let accept = tokio::spawn(async move {
         loop {
-            let Ok((mut inbound, _)) = listener.accept().await else {
+            let Ok((inbound, _)) = listener.accept().await else {
                 break;
             };
-            if *severed_rx.borrow() {
+            if *mode_rx.borrow() == LinkMode::Severed {
                 continue; // refuse while severed (the dial will retry)
             }
-            let mut severed = severed_rx.clone();
+            let mut severed = mode_rx.clone();
+            let mode = mode_rx.clone();
             tokio::spawn(async move {
-                let Ok(mut outbound) = TcpStream::connect(target).await else {
+                let Ok(outbound) = TcpStream::connect(target).await else {
                     return;
                 };
+                let (in_r, in_w) = inbound.into_split();
+                let (out_r, out_w) = outbound.into_split();
                 tokio::select! {
-                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
-                    _ = severed.wait_for(|s| *s) => {}
+                    () = pump(in_r, out_w, mode.clone()) => {}
+                    () = pump(out_r, in_w, mode) => {}
+                    // A sever mid-connection drops the relayed link on the floor.
+                    _ = severed.wait_for(|s| *s == LinkMode::Severed) => {}
                 }
             });
         }
@@ -170,6 +222,12 @@ struct ProcNode {
     relay_addr: String,
     relay: RelayCtl,
     _relay_abort: AbortHandle,
+    /// When set, the process runs under an OS-enforced `RLIMIT_FSIZE` of this
+    /// many 512-byte blocks (`sh -c 'ulimit -f N; exec …'` — unprivileged): a
+    /// real filesystem bound. A write crossing it gets `SIGXFSZ` from the
+    /// kernel — the process dies exactly ON a write syscall, the harshest
+    /// honest form of "the disk ran out mid-operation" (0018-T7).
+    file_size_limit_blocks: Option<u64>,
 }
 
 /// A fixed (test-only) gossip key so the mesh runs authenticated, as deployed.
@@ -204,7 +262,19 @@ impl ProcNode {
             .append(true)
             .open(&self.log_path)
             .expect("node log file");
-        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mqttd"))
+        // With a file-size bound, run the binary under an OS-enforced
+        // RLIMIT_FSIZE via the shell (`exec` keeps one process to kill/reap).
+        let mut cmd = match self.file_size_limit_blocks {
+            Some(blocks) => {
+                let mut c = tokio::process::Command::new("/bin/sh");
+                c.arg("-c")
+                    .arg(format!("ulimit -f {blocks}; exec \"$0\""))
+                    .arg(env!("CARGO_BIN_EXE_mqttd"));
+                c
+            }
+            None => tokio::process::Command::new(env!("CARGO_BIN_EXE_mqttd")),
+        };
+        let child = cmd
             .env("MQTTD_NODE_ID", &self.id)
             .env("MQTTD_PLAINTEXT_BIND", self.client_addr.to_string())
             .env("MQTTD_ALLOW_ANONYMOUS", "1")
@@ -230,6 +300,21 @@ impl ProcNode {
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
+        }
+    }
+
+    /// Whether the process has exited on its own (e.g. the kernel's `SIGXFSZ`
+    /// on crossing a file-size bound — the disk-full death, 0018-T7). Reaps it.
+    fn died(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true; // already killed/reaped
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.child = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -320,6 +405,7 @@ async fn build_topology(seed: u64, root: &std::path::Path) -> Vec<ProcNode> {
             relay_addr,
             relay,
             _relay_abort: relay_abort,
+            file_size_limit_blocks: None,
         });
     }
     nodes
@@ -360,6 +446,9 @@ struct Proc {
     acked: BTreeMap<String, Vec<Vec<u8>>>,
     /// Per retained topic: the set history, newest last.
     retained: BTreeMap<String, Vec<RetainedSet>>,
+    /// Nodes whose inbound bus is currently severed / slowed (healed at quiesce).
+    severed: Vec<usize>,
+    slowed: Vec<usize>,
     payload_counter: u64,
 }
 
@@ -590,21 +679,115 @@ impl Proc {
         }
     }
 
-    /// THE crash: `SIGKILL` a seeded alive node. Placement being invisible,
-    /// the victim is any member — across seeds that includes session owners.
+    /// THE crash: `SIGKILL` a seeded alive node **while an acked publish burst
+    /// is in flight through another** (0044-P2: the mid-write kill). The burst
+    /// runs concurrently; the kill lands wherever the writes are — inside a
+    /// quorum append, a replica fsync, an ack round-trip. Whatever the burst
+    /// got ACKED before/through the crash is owed like any other ack.
     async fn kill_step(&mut self) {
         if self.alive_nodes().len() < 3 {
             return; // at most one node down at a time in this schedule
         }
-        let node = self.pick_alive();
-        self.nodes[node].kill().await;
-        self.alive[node] = false;
-        let id = self.nodes[node].id.clone();
-        self.note(format!("SIGKILLED {id}"));
+        let victim = self.pick_alive();
+        let s = self.rng.pick(self.subs.len());
+        let via = *self
+            .alive_nodes()
+            .iter()
+            .find(|i| **i != victim)
+            .expect("two alive");
+        let topic = self.subs[s].topic.clone();
+        let addr = self.nodes[via].client_addr;
+        let base = self.payload_counter + 1;
+        self.payload_counter += 8;
+        let seed = self.seed;
+        let delay_ms = self.rng.range(50, 400);
+
+        // The concurrent burst: 8 sequential QoS 1 publishes, each awaiting its
+        // ack; returns every payload whose PUBACK arrived.
+        let burst = tokio::spawn(async move {
+            let mut acked = Vec::new();
+            let Some((mut publisher, _)) = common::Client::connect_v311_within(
+                addr,
+                &format!("burst-{seed}-{base}"),
+                true,
+                Duration::from_secs(8),
+            )
+            .await
+            else {
+                return acked;
+            };
+            for k in 0..8u64 {
+                let payload = format!("m-{seed}-{}", base + k).into_bytes();
+                publisher
+                    .publish(&topic, &payload, QoS::AtLeastOnce, Some(7), vec![])
+                    .await;
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let got = loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(a)) if a.pkid == 7 => break true,
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet | common::Recv::Closed => break false,
+                    }
+                };
+                if got {
+                    acked.push(payload);
+                } else {
+                    break; // connection wedged/closed: the rest never acked
+                }
+            }
+            acked
+        });
+
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        self.nodes[victim].kill().await;
+        self.alive[victim] = false;
+        let id = self.nodes[victim].id.clone();
         for sub in &mut self.subs {
-            if sub.conn.is_some() && sub.via_node == node {
+            if sub.conn.is_some() && sub.via_node == victim {
                 sub.conn = None; // its connection died with the process
             }
+        }
+        let acked = burst.await.unwrap_or_default();
+        let owed = acked.len();
+        let topic = self.subs[s].topic.clone();
+        self.acked.entry(topic.clone()).or_default().extend(acked);
+        self.note(format!(
+            "SIGKILLED {id} at {delay_ms}ms into a burst to {topic} ({owed}/8 acked → owed)"
+        ));
+    }
+
+    /// A seeded asymmetric link fault: sever one alive node's inbound peer bus
+    /// (healed by a later flap on the same node, or at quiesce).
+    fn flap_step(&mut self) {
+        let node = self.pick_alive();
+        if self.severed.contains(&node) {
+            self.nodes[node].relay.heal();
+            self.severed.retain(|n| *n != node);
+            self.note(format!("HEALED inbound bus of {}", self.nodes[node].id));
+        } else {
+            self.nodes[node].relay.sever();
+            self.severed.push(node);
+            self.note(format!("SEVERED inbound bus of {}", self.nodes[node].id));
+        }
+    }
+
+    /// A seeded link brownout: delay every relayed chunk into one alive node —
+    /// degraded, not dead; slow enough to stall replication round-trips, alive
+    /// enough that membership never confirms a death.
+    fn slow_step(&mut self) {
+        let node = self.pick_alive();
+        if self.slowed.contains(&node) {
+            self.nodes[node].relay.heal();
+            self.slowed.retain(|n| *n != node);
+            self.note(format!("UNSLOWED inbound bus of {}", self.nodes[node].id));
+        } else {
+            self.nodes[node].relay.slow(250);
+            self.slowed.push(node);
+            self.note(format!(
+                "SLOWED inbound bus of {} (250ms/chunk)",
+                self.nodes[node].id
+            ));
         }
     }
 
@@ -709,28 +892,16 @@ async fn retained_seen(addr: SocketAddr, client_id: &str, topic: &str) -> Option
     }
 }
 
-/// One full seeded schedule over spawned processes: bring up a real 3-node
-/// cluster, run the seeded workload with a SIGKILL and a restart, quiesce on
-/// `/readyz`, and run the acked-facts oracle black-box.
-// One deliberately linear narrative — bring-up, schedule, quiesce, oracle —
-// matching the in-process harness; splitting it would scatter the seed's story.
-#[allow(clippy::too_many_lines)]
-async fn run_schedule(seed: u64) {
-    let disk = tempfile::tempdir().expect("tempdir");
-    let mut nodes = build_topology(seed, disk.path()).await;
-    for n in &mut nodes {
-        n.spawn();
-    }
-
-    // Bring-up on the operator's signal: every node's /readyz reports full
-    // membership and a ready lease group.
+/// Bring-up on the operator's signal: every spawned node's `/readyz` reports
+/// full membership and a ready lease group.
+async fn wait_all_ready(nodes: &[ProcNode], seed: u64) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let mut all = true;
-        for n in &nodes {
+        for n in nodes {
             match n.readyz().await {
                 Some((ready, members, _)) => {
-                    if !ready || members != 3 {
+                    if !ready || members != nodes.len() {
                         all = false;
                     }
                 }
@@ -738,18 +909,21 @@ async fn run_schedule(seed: u64) {
             }
         }
         if all {
-            break;
+            return;
         }
         if Instant::now() >= deadline {
-            for n in &nodes {
+            for n in nodes {
                 eprintln!("---- log tail of {} ----\n{}", n.id, log_tail(&n.log_path));
             }
             panic!("seed {seed}: spawned cluster never became ready (log tails above)");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
 
-    let mut proc = Proc {
+/// Wrap a ready topology in the schedule/oracle state machine.
+fn proc_over(seed: u64, nodes: Vec<ProcNode>) -> Proc {
+    Proc {
         seed,
         rng: Rng::new(seed),
         trace: Vec::new(),
@@ -758,11 +932,20 @@ async fn run_schedule(seed: u64) {
         subs: Vec::new(),
         acked: BTreeMap::new(),
         retained: BTreeMap::new(),
+        severed: Vec::new(),
+        slowed: Vec::new(),
         payload_counter: 0,
-    };
+    }
+}
 
-    // Two persistent subscribers, established online + durably subscribed.
-    for i in 0..2 {
+/// Establish `n` persistent subscribers: online, durably subscribed (the SUBACK
+/// is durability-gated — retry until granted), and interest-warmed: a publish
+/// from EVERY node to EVERY subscriber must deliver before the schedule starts
+/// (cross-node interest gossip is eventually consistent; observable state, not
+/// a sleep).
+async fn establish_subscribers(proc: &mut Proc, n: usize) {
+    let seed = proc.seed;
+    for i in 0..n {
         proc.subs.push(Subscriber {
             id: format!("psub-{seed}-{i}"),
             topic: format!("pr/{seed}/{i}"),
@@ -773,7 +956,6 @@ async fn run_schedule(seed: u64) {
         });
         proc.bring_subscriber_online(i, true).await;
         let topic = proc.subs[i].topic.clone();
-        // The SUBACK is durability-gated (0042-T9): retry until granted.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let sub = proc.subs[i].conn.as_mut().unwrap();
@@ -788,19 +970,16 @@ async fn run_schedule(seed: u64) {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
-    // Interest warm-up (observable state, not a sleep): a publish from EVERY
-    // node to EVERY subscriber must deliver before the schedule starts —
-    // cross-node interest gossip is eventually consistent.
-    for n in 0..proc.nodes.len() {
+    for node in 0..proc.nodes.len() {
         for i in 0..proc.subs.len() {
             let topic = proc.subs[i].topic.clone();
-            let warm = format!("warm-{seed}-{n}-{i}").into_bytes();
-            let addr = proc.nodes[n].client_addr;
+            let warm = format!("warm-{seed}-{node}-{i}").into_bytes();
+            let addr = proc.nodes[node].client_addr;
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                     addr,
-                    &format!("warm-pub-{seed}-{n}-{i}"),
+                    &format!("warm-pub-{seed}-{node}-{i}"),
                     true,
                     Duration::from_secs(20),
                 )
@@ -817,56 +996,18 @@ async fn run_schedule(seed: u64) {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "seed {seed}: interest warm-up from node {n} to sub {i} did not converge"
+                    "seed {seed}: interest warm-up from node {node} to sub {i} did not converge"
                 );
             }
         }
     }
     proc.note("setup complete: subscribers online + subscribed + warmed".into());
+}
 
-    // The seeded schedule: ~10 steps with a SIGKILL at a seeded position and a
-    // restart a couple of steps later — every seed exercises the whole
-    // crash/recover cycle; the mix between them is seeded.
-    let steps = proc.rng.range(8, 12);
-    let kill_at = proc.rng.range(2, steps - 3);
-    let restart_at = kill_at + proc.rng.range(2, 3);
-    for step in 0..steps {
-        if step == kill_at {
-            proc.kill_step().await;
-            continue;
-        }
-        if step == restart_at {
-            proc.restart_step().await;
-            continue;
-        }
-        match proc.rng.range(0, 100) {
-            0..=44 => proc.publish_step().await,
-            45..=74 => proc.retained_step().await,
-            _ => proc.churn_step().await,
-        }
-    }
-    let count = |needle: &str| proc.trace.iter().filter(|l| l.contains(needle)).count();
-    eprintln!(
-        "cluster_proc: seed {seed} schedule: {} publishes ({} owed), {} retained, \
-         {} sigkills, {} restarts",
-        count("publish #"),
-        count("ACKED (obligation)"),
-        count("retained set #"),
-        count("SIGKILLED"),
-        count("RESTARTED"),
-    );
-
-    // Heal any (P2-vocabulary) severs and quiesce on /readyz.
-    for i in proc.alive_nodes() {
-        proc.nodes[i].relay.heal();
-    }
-    proc.quiesce().await;
-
-    // ---- The oracle (post-quiesce facts only, all black-box) ----
-
-    // 1. Acked durability + recovery honesty: resume every subscriber offline
-    //    (so the resume replays its queue) and drain; every acked payload for
-    //    its topic must have been received at some point (duplicates legal).
+/// Oracle part 1 — acked durability + recovery honesty: resume every
+/// subscriber offline (so the resume replays its queue) and drain; every acked
+/// payload for its topic must have been received at some point (dups legal).
+async fn oracle_acked_facts(proc: &mut Proc) {
     for i in 0..proc.subs.len() {
         if proc.subs[i].conn.is_some() {
             proc.drain_subscriber(i).await;
@@ -893,6 +1034,70 @@ async fn run_schedule(seed: u64) {
             ));
         }
     }
+}
+
+/// One full seeded schedule over spawned processes: bring up a real 3-node
+/// cluster, run the seeded workload with a mid-burst SIGKILL and a restart,
+/// quiesce on `/readyz`, and run the acked-facts oracle black-box.
+// One deliberately linear narrative — bring-up, schedule, quiesce, oracle —
+// matching the in-process harness; splitting it would scatter the seed's story.
+#[allow(clippy::too_many_lines)]
+async fn run_schedule(seed: u64) {
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build_topology(seed, disk.path()).await;
+    for n in &mut nodes {
+        n.spawn();
+    }
+    wait_all_ready(&nodes, seed).await;
+    let mut proc = proc_over(seed, nodes);
+    establish_subscribers(&mut proc, 2).await;
+
+    // The seeded schedule: ~10 steps with a SIGKILL at a seeded position and a
+    // restart a couple of steps later — every seed exercises the whole
+    // crash/recover cycle; the mix between them is seeded.
+    let steps = proc.rng.range(8, 12);
+    let kill_at = proc.rng.range(2, steps - 3);
+    let restart_at = kill_at + proc.rng.range(2, 3);
+    for step in 0..steps {
+        if step == kill_at {
+            proc.kill_step().await;
+            continue;
+        }
+        if step == restart_at {
+            proc.restart_step().await;
+            continue;
+        }
+        match proc.rng.range(0, 100) {
+            0..=34 => proc.publish_step().await,
+            35..=57 => proc.retained_step().await,
+            58..=73 => proc.churn_step().await,
+            74..=87 => proc.flap_step(),
+            _ => proc.slow_step(),
+        }
+    }
+    let count = |needle: &str| proc.trace.iter().filter(|l| l.contains(needle)).count();
+    eprintln!(
+        "cluster_proc: seed {seed} schedule: {} publishes ({} owed), {} retained, \
+         {} sigkills (mid-burst), {} restarts, {} severs, {} slows",
+        count("publish #"),
+        count("ACKED (obligation)"),
+        count("retained set #"),
+        count("SIGKILLED"),
+        count("RESTARTED"),
+        count("SEVERED"),
+        count("SLOWED"),
+    );
+
+    // Heal any (P2-vocabulary) severs and quiesce on /readyz.
+    for i in proc.alive_nodes() {
+        proc.nodes[i].relay.heal();
+    }
+    proc.quiesce().await;
+
+    // ---- The oracle (post-quiesce facts only, all black-box) ----
+
+    // 1. Acked durability + recovery honesty.
+    oracle_acked_facts(&mut proc).await;
 
     // 2. Retained convergence: every alive node serves the same value, never
     //    behind the last acked set; fan-out is eventually consistent, so poll.
@@ -955,7 +1160,177 @@ async fn run_schedule(seed: u64) {
 /// the surviving dir, and the acked-facts oracle — black-box end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn spawned_process_schedules_hold_acked_facts() {
+    let _serial = SERIAL.lock().await;
     for seed in seeds() {
         run_schedule(seed).await;
+    }
+}
+
+/// 0018-T7, un-deferred (ADR 0044 P2): the **disk-full crash mid-write**. One
+/// node runs under a kernel-enforced `RLIMIT_FSIZE` (a real filesystem bound,
+/// no privileges); acked 64KB publishes to an offline durable subscriber grow
+/// every replica's store until the bounded node's next write crosses the limit
+/// and the kernel delivers `SIGXFSZ` — death exactly ON a write syscall, the
+/// harshest honest form of "the disk ran out mid-operation". The survivors
+/// keep quorum (acks keep flowing); the restart reopens the possibly-torn dir
+/// UNBOUNDED, redb must roll back any torn write on reopen, catch-up (ADR 0043
+/// P1) back-fills what the node missed while dead, and every acked payload
+/// must replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_disk_bound_crash_mid_write_loses_no_acked_fact() {
+    let _serial = SERIAL.lock().await;
+    let seed = 918;
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build_topology(seed, disk.path()).await;
+    // 16384 × 512B blocks = 8MB per file: roomy for formation, fatal under the
+    // blast (each 64KB enqueue lands on every replica's store — R=3 on 3 nodes).
+    nodes[2].file_size_limit_blocks = Some(16384);
+    for n in &mut nodes {
+        n.spawn();
+    }
+    wait_all_ready(&nodes, seed).await;
+    let mut proc = proc_over(seed, nodes);
+    establish_subscribers(&mut proc, 1).await;
+
+    // Take the subscriber offline: every acked publish from here is a durable
+    // offline enqueue — quorum-replicated bytes on disk, nothing in a session.
+    proc.drain_subscriber(0).await;
+    if let Some(mut conn) = proc.subs[0].conn.take() {
+        conn.disconnect().await;
+    }
+
+    // Blast through the UNBOUNDED nodes until the kernel kills the bounded one.
+    let topic = proc.subs[0].topic.clone();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut publisher: Option<common::Client> = None;
+    let mut i = 0u64;
+    loop {
+        if proc.nodes[2].died() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bounded node never crossed its file-size limit under the blast"
+        );
+        i += 1;
+        let mut payload = format!("dd-{seed}-{i}-").into_bytes();
+        payload.resize(64 * 1024, b'x');
+        if publisher.is_none() {
+            publisher = common::Client::connect_v311_within(
+                proc.nodes[0].client_addr,
+                &format!("dd-pub-{seed}"),
+                true,
+                Duration::from_secs(8),
+            )
+            .await
+            .map(|(c, _)| c);
+        }
+        let Some(p) = publisher.as_mut() else {
+            continue;
+        };
+        p.publish(&topic, &payload, QoS::AtLeastOnce, Some(7), vec![])
+            .await;
+        let ack_deadline = Instant::now() + Duration::from_secs(10);
+        let mut closed = false;
+        let got = loop {
+            let left = ack_deadline.saturating_duration_since(Instant::now());
+            match p.recv_bounded(left).await {
+                common::Recv::Packet(Packet::PubAck(a)) if a.pkid == 7 => break true,
+                common::Recv::Packet(_) => {}
+                common::Recv::Closed => {
+                    closed = true;
+                    break false;
+                }
+                common::Recv::Quiet => break false,
+            }
+        };
+        if closed {
+            publisher = None; // reconnect on the next pass
+        }
+        if got {
+            proc.acked.entry(topic.clone()).or_default().push(payload);
+        }
+    }
+    proc.alive[2] = false;
+    let owed = proc.acked.get(&topic).map_or(0, Vec::len);
+    proc.note(format!(
+        "bounded node died on a write (SIGXFSZ) after {owed} acked 64KB publishes"
+    ));
+    assert!(owed > 0, "vacuous: nothing was acked before the crash");
+
+    // Restart UNBOUNDED over the surviving (possibly torn) dir and verify.
+    proc.nodes[2].file_size_limit_blocks = None;
+    proc.restart_step().await;
+    proc.quiesce().await;
+    oracle_acked_facts(&mut proc).await;
+    eprintln!("cluster_proc: disk-bound crash held {owed} acked 64KB obligations");
+    for node in &mut proc.nodes {
+        node.kill().await;
+    }
+}
+
+/// 0007-T8, un-deferred (ADR 0044 P2): **membership flap at SWIM-confusing
+/// rates**. Three cycles of SIGKILL + IMMEDIATE respawn — faster than
+/// suspicion can confirm a death, the fast-restart shape that produced the
+/// 0043-P4 void-ack exhibit — with acked publishes flowing through the
+/// survivors while the flapped node rejoins. Every ack collected anywhere in
+/// the storm is a hard obligation; the oracle runs after the last cycle
+/// settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rapid_kill_restart_flapping_loses_no_acked_fact() {
+    let _serial = SERIAL.lock().await;
+    let seed = 717;
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build_topology(seed, disk.path()).await;
+    for n in &mut nodes {
+        n.spawn();
+    }
+    wait_all_ready(&nodes, seed).await;
+    let mut proc = proc_over(seed, nodes);
+    establish_subscribers(&mut proc, 2).await;
+
+    for cycle in 0..3usize {
+        let victim = 1 + (cycle % 2); // one node down at a time; the founder anchors
+        proc.nodes[victim].kill().await;
+        for sub in &mut proc.subs {
+            if sub.conn.is_some() && sub.via_node == victim {
+                sub.conn = None;
+            }
+        }
+        // IMMEDIATE respawn over the surviving dir — no death-confirmation
+        // wait, the exact window the fast-restart honesty fixes guard.
+        proc.nodes[victim].spawn();
+        let id = proc.nodes[victim].id.clone();
+        proc.note(format!(
+            "FLAP cycle {cycle}: SIGKILL + immediate respawn of {id}"
+        ));
+        // Acked load while the flapped node rejoins.
+        proc.publish_step().await;
+        proc.publish_step().await;
+        // Re-admission before the next flap (never two nodes down at once). A
+        // respawn that lost the port-rebind race is respawned once more.
+        if !proc
+            .wait_node_serving(victim, Duration::from_secs(30))
+            .await
+            && proc.nodes[victim].died()
+        {
+            proc.nodes[victim].spawn();
+        }
+        assert!(
+            proc.wait_node_serving(victim, Duration::from_secs(60))
+                .await,
+            "flapped node {id} never re-admitted (cycle {cycle})"
+        );
+    }
+    proc.quiesce().await;
+    oracle_acked_facts(&mut proc).await;
+    let count = |needle: &str| proc.trace.iter().filter(|l| l.contains(needle)).count();
+    eprintln!(
+        "cluster_proc: flap storm: 3 kill/respawn cycles, {} publishes ({} owed)",
+        count("publish #"),
+        count("ACKED (obligation)"),
+    );
+    for node in &mut proc.nodes {
+        node.kill().await;
     }
 }
