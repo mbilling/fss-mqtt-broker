@@ -52,6 +52,10 @@
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/7 done](0044-release-readiness-assurance.md) | — |
+| [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [0/5 done](0045-release-engineering-and-distribution.md) | 5 open |
+| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Proposed | [0/5 done](0046-file-based-configuration.md) | 5 open |
+| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Proposed | [0/5 done](0047-kubernetes-deployment.md) | 5 open |
+| [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Proposed | [0/4 done](0048-comparative-benchmarking.md) | 4 open |
 
 ## Open and deferred work
 
@@ -102,3 +106,34 @@
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. THE MACHINERY NOW EXISTS (ADR 0044 P3, 2026-07-17): cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact rolls a live cluster between a pinned baseline binary and HEAD one node at a time in both directions under the acked-facts oracle; at 1.0 this task is that test pointed at two release tags plus a scheduled CI job. Until then the pinned baseline doubles as the pre-release compatibility tripwire."
+
+**0045 — Release engineering and distribution (signed, reproducible, SBOM-attested)**
+
+- `0045-T1` ⬜ planned: Release CI pipeline triggered by a signed semver tag — builds from the tag alone, nothing else; produces the artifact set (binaries, checksums, image, SBOM) as workflow outputs
+- `0045-T2` ⬜ planned: Reproducible multi-platform binaries — pinned toolchain, committed lockfile, stripped of build paths/timestamps; linux/amd64 + linux/arm64 with per-artifact checksums; a rebuild-the-tag check proves byte-identity
+- `0045-T3` ⬜ planned: Keyless signing + provenance — cosign/sigstore signatures on every artifact and image, build-provenance attestation, transparency-log entry; a one-command documented verify path
+- `0045-T4` ⬜ planned: Hardened container image — distroless/scratch, non-root, broker + CA bundle only; published per tag and as latest for newest stable
+- `0045-T5` ⬜ planned: SBOM per release (CycloneDX or SPDX) attached to the release and image; cargo-deny/cargo-audit run on the release commit; RELEASING.md + README verify docs; cut the first 0.x release
+
+**0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
+
+- `0046-T1` ⬜ planned: TOML config schema + parser — sections mirroring the MQTTD_* env groups; strict (unknown keys rejected, types/ranges checked); reuses the hardened ACL TOML parsing posture
+- `0046-T2` ⬜ planned: Layering + precedence — defaults < config file < env vars < flags; --config path and MQTTD_CONFIG; effective config logged at startup with secrets redacted; a test asserts every MQTTD_* var maps to exactly one config key and vice versa
+- `0046-T3` ⬜ planned: mqttd --check-config subcommand — validates a file and exits without binding ports; for GitOps CI and pre-rollout operator checks; clear located errors
+- `0046-T4` ⬜ planned: Whole-config hot reload — SIGHUP/watch reloads the full config through the ADR 0032 validate-before-swap path; live-swappable settings change without restart, non-live ones logged as requires-restart; audited + metered
+- `0046-T5` ⬜ planned: Secrets by reference (paths only, never inlined); docs (README config section + example file) and the container image documenting file + env paths
+
+**0047 — Kubernetes deployment (Helm chart, StatefulSet, safe scale-down)**
+
+- `0047-T1` ⬜ planned: StatefulSet + per-pod PVC — volumeClaimTemplate for the redb data dir; node id from the stable pod name; headless service backs gossip discovery so the mesh self-forms
+- `0047-T2` ⬜ planned: ConfigMap-mounted config (ADR 0046) + Secret-mounted TLS/keys/gossip-key by path; --check-config as an init container so a bad config fails the rollout before serving
+- `0047-T3` ⬜ planned: Probes + services wired — readinessProbe /readyz, livenessProbe /livez, /metrics scrape annotation/ServiceMonitor; client Service + headless peer/gossip Service
+- `0047-T4` ⬜ planned: Safe scale-down — preStop hook sends SIGUSR1 (ADR 0043 decommission drain); terminationGracePeriodSeconds sized for drain + ADR 0019 graceful shutdown; hard-kill falls back to crash semantics survivors handle
+- `0047-T5` ⬜ planned: Quorum-safe rollout — StatefulSet one-at-a-time RollingUpdate (ADR 0039 motion) + PodDisruptionBudget maxUnavailable 1; a kind/k3d smoke test in CI stands up a cluster, scales, and rolls, asserting no acked loss
+
+**0048 — Comparative performance benchmarking (published, reproducible, honest)**
+
+- `0048-T1` ⬜ planned: Containerized load harness — an established MQTT benchmark client + docker-compose that stands up each broker (ours, Mosquitto, EMQX) from its published image with documented reasonable config; same hardware, pinned versions, security posture held constant and disclosed
+- `0048-T2` ⬜ planned: The selection metrics — sustained throughput (QoS 0/1/2), end-to-end latency p50/p99/p999, memory per idle connection at scale, connection-establishment rate (mTLS included); full distributions, never a single number
+- `0048-T3` ⬜ planned: The scaling curve — the same workload against 1/3/5 nodes, throughput and p99 vs node count; tests capability claim 1 and the ADR 0015 shared-subscription mechanism end to end; a flat curve is a finding to fix
+- `0048-T4` ⬜ planned: Honesty rules + publication — versions/hardware/config/date stated; losing dimensions reported as prominently as winning ones; results in docs/benchmarks/ linked from the README; self-benchmark runs nightly (ADR 0044 P4), cross-broker re-run per release
