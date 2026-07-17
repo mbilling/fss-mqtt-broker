@@ -1,7 +1,7 @@
 # ADR 0044 — Release readiness: out-of-process cluster harness and continuous assurance
 
-- **Status:** Proposed
-- **Date:** 2026-07-15
+- **Status:** Accepted
+- **Date:** 2026-07-15 (accepted 2026-07-17 — P1–P7 delivered; see the delivery doc)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0044-release-readiness-assurance.md](../delivery/0044-release-readiness-assurance.md) — plan, progress, and changelog
 - **Related:** [ADR 0042](0042-durable-plane-stress-harness.md) (the in-process stress
@@ -140,6 +140,32 @@ parts 1–7, and 1.0 ships only when it holds.
   accepted: it exists precisely to cover what determinism cannot reach, and every
   schedule stays seeded and logged for best-effort reproduction.
 - No license gate ships: the same binary serves commercial and non-commercial use.
+
+## Release-readiness checklist
+
+The 1.0 gate, assembled from parts 1–7. Each line is a green CI signal, not a
+judgement call. All hold as of ADR acceptance (2026-07-17):
+
+- [x] **Acked-facts oracle holds in-process** across the ADR 0042 seeded fault
+      schedules (kill, restart, disk fault, brownout, join, decommission).
+- [x] **Acked-facts oracle holds out-of-process** (P1/P2): real spawned binaries,
+      kernel `SIGKILL` (incl. mid-write), `SIGXFSZ` disk-full, SWIM-rate flap,
+      relay partitions/half-open/brownout links.
+- [x] **Two-binary rolling upgrade + rollback** loses no acked fact, dirs reopened
+      across versions (P3) — the ADR 0043 gap closed.
+- [x] **Soak** shows no RSS/FD/tail-latency drift over an hour (P4).
+- [x] **Every attacker-reachable parser is fuzzed** with a clean pass, and a
+      `SECURITY.md` response process ships (P5).
+- [x] **Benchmarks recorded and gated**: hot-path numbers in the baseline doc, a
+      per-PR throughput floor, nightly comparison (P6).
+- [x] **Two independent foreign-client oracles green** (Mosquitto CLI + Paho
+      Python), and the **README quickstart executes verbatim** (P7).
+- [ ] **Adjacent-release skew smoke in CI** (0039-T3): the machinery exists (P3);
+      the test itself needs two released versions — impossible before 1.0 by
+      definition. This is the one gate that opens *at* 1.0, not before.
+
+When the first release ships, 0039-T3's box is checked by pointing P3's
+rolling-upgrade test at two release tags; nothing else on the list moves.
 
 ## Alternatives considered
 
