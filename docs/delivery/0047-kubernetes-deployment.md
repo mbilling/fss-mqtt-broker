@@ -53,3 +53,8 @@ Order: T1 → T2 → T3 → T4 → T5. Depends on the ADR 0045 image and ADR 004
   the durability/safe-shrink/safe-upgrade guarantees (ADR 0018/0043/0039) rather than lose
   them to misconfiguration (ephemeral storage, crash-on-scale, quorum-breaking rollouts).
   Priority **P1**.
+- **2026-07-17** — Alternatives sharpened: added "N single-replica Deployments, each with its
+  own PVC" (the *manual StatefulSet*) as a named, fairly-argued rejected option — it gets
+  per-node durable storage right but rebuilds ordered rollout and template PVC provisioning by
+  hand and walks into the `ReadWriteOnce` Multi-Attach rollout trap. Decision unchanged: keep
+  the StatefulSet.

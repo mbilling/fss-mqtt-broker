@@ -99,6 +99,24 @@ voluntary disruption from taking two nodes — and thus quorum — at once.
 - **Deployment + ephemeral storage:** the common default, and wrong here — it discards the
   durable store on reschedule. A StatefulSet with a PVC is the only correct shape for a
   stateful, durable broker. Rejected.
+- **N single-replica Deployments, each with its own dedicated PVC (the "manual
+  StatefulSet"):** a legitimate pattern, and it gets the thing that matters most right — each
+  node keeps a stable, dedicated PersistentVolume that survives reschedule, so on the
+  *durability* axis it is a wash with a StatefulSet. It loses on the *lifecycle mechanics*,
+  and in three concrete ways. (a) The redb data dir is a `ReadWriteOnce` volume, and a
+  Deployment's default `RollingUpdate` surges the new pod up before the old releases the
+  volume — a Multi-Attach deadlock that forces `strategy: Recreate` (our replication makes the
+  resulting per-node gap survivable, but it is a trap you must know to avoid). (b) Nothing
+  coordinates independent Deployments, so a single `apply`/GitOps sync rolls all of them at
+  once and takes out quorum — the one-at-a-time ordering ADR 0039 and part 5 depend on must be
+  re-imposed by hand (sync-waves, `dependsOn`, a per-Deployment PDB). (c) Scaling becomes
+  hand-authored boilerplate — a new node is a whole new Deployment *and* PVC manifest rather
+  than one replica count against a `volumeClaimTemplate`. A StatefulSet packages exactly our
+  topology — *N pods, each with a stable identity and its own volume, updated one at a time* —
+  so the manual approach rebuilds ordered rollout and template provisioning worse. Our
+  replication makes each failure mode gentler (a quorum survives a clumsy rollout; a lost
+  volume triggers catch-up, not data loss), so this is not *wrong* — just more moving parts for
+  guarantees the StatefulSet gives in one object. Rejected.
 - **A custom operator (CRD + controller) instead of a Helm chart:** more power (automated
   decommission on scale, orchestrated upgrades), but a large surface to build and maintain
   before there are users. A Helm chart that encodes the contracts covers the need now; an
