@@ -64,6 +64,23 @@ jobs:
       - name: soak (RSS / FD / p99 drift)
         run: MQTTD_SOAK_SECS=3600 cargo test -p mqttd --test cluster_soak -- --ignored --nocapture
 
+  bench:
+    name: hot-path benchmarks (ADR 0044 P6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Print current criterion numbers for comparison against
+      # docs/benchmarks/BASELINE.md. A meaningful shift is investigated and the
+      # baseline updated with the commit that moved it (the per-PR perf_gate
+      # test is the automatic floor; this is the human-read record).
+      - name: codec + durable-plane benches
+        run: |
+          cargo bench -p mqtt-codec --bench codec
+          cargo bench -p mqtt-cluster --bench durable_hotpaths
+
   fuzz:
     name: fuzz every attacker-reachable parser (ADR 0044 P5)
     runs-on: ubuntu-latest

@@ -51,7 +51,7 @@
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
-| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [5/7 done](0044-release-readiness-assurance.md) | 2 open |
+| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Proposed | [6/7 done](0044-release-readiness-assurance.md) | 1 open |
 
 ## Open and deferred work
 
@@ -109,5 +109,4 @@
 
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
-- `0044-P6` ⬜ planned: Performance baselines + regression gates — criterion micro-benches (codec, hub fan-out, replica apply/group-commit) and a harness macro-bench (connection ramp, sustained msgs/sec, p99 durable QoS 1) with recorded baselines; nightly comparison flags regressions beyond stated tolerance
 - `0044-P7` ⬜ planned: Conformance breadth + operator-experience smoke + closure — Paho as the second interop oracle (0034-T7 lands here) with richer assertions; a quickstart smoke test standing up the documented 3-node cluster from the README's own commands; the release-readiness checklist assembled and the ADR closed
