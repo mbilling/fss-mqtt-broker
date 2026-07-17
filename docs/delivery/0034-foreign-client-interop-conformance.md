@@ -35,8 +35,9 @@ tasks:
     evidence: "README Build & test: how to run scripts/interop/run.sh, what it asserts, the no-new-crate property. docs/TEST-PLAN.md priority #5 marked done with the non-Rust-oracle rationale (chosen over rumqttc)."
   - id: 0034-T7
     title: Follow-on — a second foreign client (Paho Python) behind the same harness for richer assertions (reason codes, properties, flow control)
-    status: deferred
-    notes: start with one independent oracle (Mosquitto) to bound CI surface and flake sources; a second client adds coverage on the same harness once the first is stable in CI.
+    status: done
+    date: 2026-07-17
+    evidence: "Delivered by ADR 0044 P7: scripts/interop/paho_conformance.py drives Eclipse Paho (Python) programmatically — a second independent MQTT implementation — to assert the control-plane semantics the Mosquitto CLI cannot surface: v5 CONNACK reason code + session-present flag, per-filter SUBACK GRANTED QoS (QoS-1 filter granted 1, QoS-2 granted 2), a User Property surviving the hop (both keys), retained delivery with the retain flag SET on the late-subscriber delivery, and session-present TRUE on resume of a persistent (SessionExpiryInterval) session across a disconnect. External process (pip), zero cargo-supply-chain addition, wired into the per-PR interop CI job alongside the Mosquitto suite (which installs paho-mqtt too). 10/10 assertions green. Two independent foreign oracles now gate every PR."
 ---
 
 # Delivery — ADR 0034: Foreign-client interop conformance testing
@@ -73,7 +74,7 @@ adversarial/malformed input; this complements it for well-formed foreign-encodin
 | 0034-T4 | ✅ done | 2026-06-26 | "gen_pki() mints a CA + 127.0.0.1 server leaf + client leaf via openssl. Phase A: OpenSSL client ↔ rustls server TLS 1.3 round-trip. Phase B: mTLS — a CA-signed client cert round-trips; a client with no cert is refused (empty receive). All pass." |
 | 0034-T5 | ✅ done | 2026-06-26 | ".github/workflows/ci.yml `interop` job: installs mosquitto-clients (apt), cargo build -p mqttd, runs MQTTD_BIN=target/debug/mqttd ./scripts/interop/run.sh; isolated from the unit `test` job. Determinism via readiness-gating + unique client ids + per-test timeouts." |
 | 0034-T6 | ✅ done | 2026-06-26 | "README Build & test: how to run scripts/interop/run.sh, what it asserts, the no-new-crate property. docs/TEST-PLAN.md priority #5 marked done with the non-Rust-oracle rationale (chosen over rumqttc)." |
-| 0034-T7 | 💤 deferred | — | start with one independent oracle (Mosquitto) to bound CI surface and flake sources; a second client adds coverage on the same harness once the first is stable in CI. |
+| 0034-T7 | ✅ done | 2026-07-17 | "Delivered by ADR 0044 P7: scripts/interop/paho_conformance.py drives Eclipse Paho (Python) programmatically — a second independent MQTT implementation — to assert the control-plane semantics the Mosquitto CLI cannot surface: v5 CONNACK reason code + session-present flag, per-filter SUBACK GRANTED QoS (QoS-1 filter granted 1, QoS-2 granted 2), a User Property surviving the hop (both keys), retained delivery with the retain flag SET on the late-subscriber delivery, and session-present TRUE on resume of a persistent (SessionExpiryInterval) session across a disconnect. External process (pip), zero cargo-supply-chain addition, wired into the per-PR interop CI job alongside the Mosquitto suite (which installs paho-mqtt too). 10/10 assertions green. Two independent foreign oracles now gate every PR." |
 <!-- /status-table:0034 -->
 
 ## Changelog

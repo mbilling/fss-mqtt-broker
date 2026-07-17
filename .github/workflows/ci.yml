@@ -51,20 +51,33 @@ jobs:
         run: python3 scripts/gen-status.py --check
 
   interop:
-    name: foreign-client interop (mosquitto)
+    name: foreign-client interop (mosquitto + paho)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # ADR 0034: drive the real mqttd binary with a non-Rust client (Eclipse Mosquitto).
-      # An external process, not a cargo dep — no addition to the broker's supply chain.
+      # ADR 0034 / ADR 0044 P7: drive the real mqttd binary with TWO independent
+      # non-Rust clients (Eclipse Mosquitto CLI + Eclipse Paho Python). Both are
+      # external processes, not cargo deps — no addition to the broker's supply chain.
       - name: Install mosquitto clients
         run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
+      - name: Install Paho
+        run: python3 -m pip install --quiet paho-mqtt
       - name: Build broker
         run: cargo build --quiet -p mqttd
-      - name: Interop conformance
+      - name: Interop conformance (mosquitto)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/interop/run.sh
+      - name: Interop conformance (paho — reason codes, properties, session)
+        run: |
+          PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+          HPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+          MQTTD_PLAINTEXT_BIND=127.0.0.1:$PORT MQTTD_ALLOW_ANONYMOUS=1 \
+            MQTTD_HEALTH_BIND=127.0.0.1:$HPORT RUST_LOG=off target/debug/mqttd &
+          for _ in $(seq 1 100); do curl -fsS http://127.0.0.1:$HPORT/readyz >/dev/null 2>&1 && break; sleep 0.1; done
+          MQTT_PORT=$PORT python3 scripts/interop/paho_conformance.py
+      - name: Quickstart smoke (the README's own two-node cluster)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 
   supply-chain:
     name: supply-chain audit
