@@ -65,17 +65,38 @@ jobs:
         run: MQTTD_SOAK_SECS=3600 cargo test -p mqttd --test cluster_soak -- --ignored --nocapture
 
   fuzz:
-    name: fuzz time (ADR 0044 P5 grows the targets)
+    name: fuzz every attacker-reachable parser (ADR 0044 P5)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false # one target's finding must not hide the others' runs
+      matrix:
+        include:
+          - crate: crates/mqtt-codec
+            target: packet_decode # client-facing MQTT packets
+          - crate: crates/mqtt-cluster
+            target: peer_decode # peer-bus frames
+          - crate: crates/mqtt-cluster
+            target: swim_message # gossip message body (post-auth)
+          - crate: crates/mqtt-cluster
+            target: gossip_open # gossip datagram (pre-auth, most exposed)
+          - crate: crates/mqtt-auth
+            target: crl_parse # CRL DER (operator file, hot-reloaded)
+          - crate: crates/mqtt-auth
+            target: acl_parse # ACL TOML (operator file, hot-reloaded)
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly # libFuzzer needs nightly rustc
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      # 15 minutes on the packet decoder (the one existing target; P5 adds the
-      # rest of the attacker-reachable parsers plus persisted corpora).
-      - name: fuzz packet_decode
-        working-directory: crates/mqtt-codec
-        run: cargo +nightly fuzz run packet_decode -- -max_total_time=900
+      # 12 minutes per target. The first corpus dir (gitignored, ephemeral in
+      # CI) is where libFuzzer writes coverage-expanding units; the committed
+      # seed corpus is passed read-only as an additional input. A crash writes a
+      # fuzz/artifacts/ reproducer and fails the job (see SECURITY.md).
+      - name: fuzz ${{ matrix.target }}
+        working-directory: ${{ matrix.crate }}
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
+            -- -max_total_time=720
