@@ -202,10 +202,12 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 
 ### Planned
 - **Subscription digests (bloom)** for sub-linear fan-out.
-- **Signed, reproducible releases with an SBOM** — and the first tagged release
-  itself (no release exists yet).
 - MQTT 5 **Server-Reference redirect** for v5 clients that opt into following it
   (the session relay remains the universal path meanwhile — ADR 0005 P3).
+- **The first tagged release.** The signed, reproducible, SBOM-attested release
+  pipeline ([ADR 0045](docs/adr/0045-release-engineering-and-distribution.md)) is
+  in place; pushing the first `v0.x` tag cuts the first release — see
+  [Install](#install) and [RELEASING.md](RELEASING.md).
 
 ## Workspace layout
 
@@ -254,6 +256,31 @@ soak, rolling-upgrade tests) are documented in [SECURITY.md](SECURITY.md).
 The interop suite asserts v3.1.1 round-trips at QoS 0/1/2, a retained message to a late
 subscriber, an MQTT 5 **User Property** surviving a hop (ADR 0030), and OpenSSL↔rustls TLS 1.3
 plus mTLS — all against an independent implementation.
+
+## Install
+
+Releases are cut from signed semver tags by an automated, security-grade pipeline
+([ADR 0045](docs/adr/0045-release-engineering-and-distribution.md)): every artifact
+is **reproducible**, **cosign-signed** (keyless, transparency-logged), carries **SLSA
+build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook:
+[RELEASING.md](RELEASING.md).
+
+```sh
+# Container image — fully-static musl binary on distroless/static, non-root,
+# multi-arch (linux/amd64 + linux/arm64), nothing but the broker and a CA bundle:
+docker run --rm ghcr.io/mbilling/fss-mqtt-broker:latest --version   # (once the first tag is cut)
+
+# Verify the image signature before trusting it:
+cosign verify ghcr.io/mbilling/fss-mqtt-broker:<version> \
+  --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Or download a binary from the GitHub Release and verify + reproduce it — see RELEASING.md.
+```
+
+> The signed, reproducible, SBOM-attested pipeline is in place; the **first `v0.x`
+> tag** cuts the first published release. Until then, build from source
+> ([Build & test](#build--test)).
 
 ## Running
 

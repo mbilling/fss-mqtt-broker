@@ -1,0 +1,284 @@
+name: Release
+
+# ADR 0045 — a release is a signed, annotated semver tag and NOTHING else drives
+# it. Pushing `vX.Y.Z` builds, signs, and publishes reproducible binaries, a
+# hardened image, and an SBOM entirely from the tagged commit. Per-PR CI (ci.yml)
+# is untouched; this workflow runs only on tags.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Least privilege, granted only where needed:
+#   contents: write        — create the GitHub Release and upload assets
+#   packages: write        — push the image to GHCR
+#   id-token: write        — keyless OIDC signing (cosign) + provenance attestation
+#   attestations: write    — record SLSA build-provenance attestations
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ── Gate: the release commit must pass the same supply-chain audit CI runs ──
+  audit:
+    name: supply-chain audit (release commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny and cargo-audit
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-audit --locked
+      - run: cargo deny check
+      - run: cargo audit
+
+  # ── Build the reproducible binary + single-arch image, per architecture ──
+  build:
+    name: build ${{ matrix.target }}
+    needs: audit
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins the version; install the matching static-musl target.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          targets: ${{ matrix.target }}
+      # musl-tools gives the native-arch `musl-gcc` that aws-lc-rs / ring's C
+      # build needs; each arch builds on its own native runner (no cross).
+      - name: Install musl C toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Reproducible build
+        run: scripts/release/build-repro.sh ${{ matrix.target }}
+
+      # Independent proof of byte-reproducibility: fully clean and rebuild from
+      # the same tag, then assert the two binaries are identical.
+      - name: Verify reproducibility (clean rebuild is byte-identical)
+        run: |
+          BIN="target/${{ matrix.target }}/release/mqttd"
+          sha256sum "$BIN" | awk '{print $1}' > first.sha256
+          cargo clean
+          scripts/release/build-repro.sh ${{ matrix.target }}
+          sha256sum "$BIN" | awk '{print $1}' > second.sha256
+          if ! diff -q first.sha256 second.sha256; then
+            echo "::error title=Reproducibility::rebuild of the tag was not byte-identical"
+            echo "first:  $(cat first.sha256)"; echo "second: $(cat second.sha256)"
+            exit 1
+          fi
+          echo "reproducible: $(cat first.sha256)"
+
+      - name: Stage artifact + checksum
+        id: stage
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="mqttd-${VERSION}-${{ matrix.target }}"
+          mkdir -p dist out
+          cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
+          # The container image copies from dist/mqttd (arch-native).
+          cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
+          ( cd out && sha256sum "${NAME}" > "${NAME}.sha256" )
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # SLSA build provenance for the binary — what commit/workflow produced it.
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/${{ steps.stage.outputs.name }}
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: out/*
+          retention-days: 7
+
+      # ── Single-arch image, pushed by digest to GHCR ──
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push single-arch image by digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.stage.outputs.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      # Hand the per-arch digest to the release job via an artifact. (Matrix job
+      # outputs are last-writer-wins across legs, so they cannot carry one value
+      # per arch — a file-per-arch artifact is the correct handoff.)
+      - name: Record image digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.arch }}"
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          retention-days: 7
+
+  # ── Assemble the multi-arch manifest, SBOM, signatures, and the Release ──
+  release:
+    name: sign + publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: sigstore/cosign-installer@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Set version
+        id: v
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # A pre-release tag (contains a hyphen, e.g. 0.1.0-rc.1) is NOT `latest`.
+          if [[ "${VERSION}" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT";
+          else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: assets
+          merge-multiple: true
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      # ── Multi-arch manifest from the per-arch digests pushed by `build` ──
+      - name: Create and push multi-arch manifest
+        id: manifest
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          TAGS=(--tag "${IMAGE}:${{ steps.v.outputs.version }}")
+          if [[ "${{ steps.v.outputs.prerelease }}" == "false" ]]; then
+            TAGS+=(--tag "${IMAGE}:latest")
+          fi
+          REFS=()
+          for f in digests/*; do
+            REFS+=("${IMAGE}@$(cat "$f")")
+          done
+          if [ "${#REFS[@]}" -eq 0 ]; then
+            echo "::error title=Manifest::no per-arch digests found"; exit 1
+          fi
+          docker buildx imagetools create "${TAGS[@]}" "${REFS[@]}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${{ steps.v.outputs.version }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # ── SBOM: CycloneDX for the broker binary, from the locked source graph ──
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          # Emit per-crate SBOMs (each the crate's transitive graph, as pinned by
+          # Cargo.lock). cargo-cyclonedx writes <package>.cdx.json next to each
+          # crate manifest; we ship the mqttd binary's as the headline SBOM.
+          cargo cyclonedx --locked --format json
+          SBOM="$(find . -name 'mqttd.cdx.json' -print -quit)"
+          if [ -z "$SBOM" ]; then
+            echo "::error title=SBOM::cargo-cyclonedx produced no mqttd.cdx.json"; exit 1
+          fi
+          mkdir -p assets
+          cp "$SBOM" "assets/sbom-${{ steps.v.outputs.version }}.cdx.json"
+          echo "SBOM: $SBOM ($(wc -c < "$SBOM") bytes)"
+
+      # ── Keyless signatures (cosign) over every release asset ──
+      - name: Sign binaries, checksums, and SBOM (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cd assets
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sig|*.pem) continue;; esac
+            cosign sign-blob --yes "$f" \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem"
+          done
+
+      # ── Sign the image and attest its provenance ──
+      - name: Sign image (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${{ steps.manifest.outputs.digest }}"
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+      - name: Attest image SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          sbom-path: assets/sbom-${{ steps.v.outputs.version }}.cdx.json
+          push-to-registry: true
+
+      # ── Publish the GitHub Release with all verifiable assets ──
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+          IMG_DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          {
+            printf 'Reproducible, signed release of mqttd %s.\n\n' "$VERSION"
+            printf '**Image:** `%s/%s:%s`\n' "$REGISTRY" "$IMAGE_NAME" "$VERSION"
+            printf '(digest `%s`)\n\n' "$IMG_DIGEST"
+            printf 'Every asset below is cosign-signed (keyless, transparency-logged)\n'
+            printf 'and the binaries are byte-reproducible from this tag. See\n'
+            printf 'RELEASING.md for the one-command verify path.\n'
+          } > release-notes.md
+          PRERELEASE_FLAG=""
+          [[ "${{ steps.v.outputs.prerelease }}" == "true" ]] && PRERELEASE_FLAG="--prerelease"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "mqttd ${VERSION}" \
+            --notes-file release-notes.md \
+            ${PRERELEASE_FLAG} \
+            assets/*

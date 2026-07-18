@@ -1,0 +1,14 @@
+# Pinned toolchain — the reproducible-build anchor (ADR 0045 T2).
+#
+# A release binary is only byte-reproducible if everyone rebuilds it with the
+# *same* rustc. This file pins that version for every `cargo` invocation in the
+# repo (dev, CI, and the release pipeline alike), so "rebuild the tag and get
+# identical bytes" is a property anyone can reproduce, not a CI secret.
+#
+# Bumping this is a deliberate, reviewed change: it moves the reproducibility
+# baseline and must be paired with a re-run of the ADR 0045 rebuild-and-compare
+# check. Keep it at a released stable version (never `stable`, which drifts).
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

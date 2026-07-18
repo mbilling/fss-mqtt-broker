@@ -17,3 +17,6 @@ Cargo.lock.orig
 # Python bytecode cache (scripts/)
 __pycache__/
 *.pyc
+
+# Release binary staging area for the container image build (ADR 0045)
+dist/

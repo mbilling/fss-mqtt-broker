@@ -52,7 +52,7 @@
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/7 done](0044-release-readiness-assurance.md) | — |
-| [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [0/5 done](0045-release-engineering-and-distribution.md) | 5 open |
+| [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [3/5 done](0045-release-engineering-and-distribution.md) | 2 open |
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Proposed | [0/5 done](0046-file-based-configuration.md) | 5 open |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Proposed | [0/5 done](0047-kubernetes-deployment.md) | 5 open |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Proposed | [0/4 done](0048-comparative-benchmarking.md) | 4 open |
@@ -109,11 +109,8 @@
 
 **0045 — Release engineering and distribution (signed, reproducible, SBOM-attested)**
 
-- `0045-T1` ⬜ planned: Release CI pipeline triggered by a signed semver tag — builds from the tag alone, nothing else; produces the artifact set (binaries, checksums, image, SBOM) as workflow outputs
-- `0045-T2` ⬜ planned: Reproducible multi-platform binaries — pinned toolchain, committed lockfile, stripped of build paths/timestamps; linux/amd64 + linux/arm64 with per-artifact checksums; a rebuild-the-tag check proves byte-identity
-- `0045-T3` ⬜ planned: Keyless signing + provenance — cosign/sigstore signatures on every artifact and image, build-provenance attestation, transparency-log entry; a one-command documented verify path
-- `0045-T4` ⬜ planned: Hardened container image — distroless/scratch, non-root, broker + CA bundle only; published per tag and as latest for newest stable
-- `0045-T5` ⬜ planned: SBOM per release (CycloneDX or SPDX) attached to the release and image; cargo-deny/cargo-audit run on the release commit; RELEASING.md + README verify docs; cut the first 0.x release
+- `0045-T3` 🚧 in-progress: Keyless signing + provenance — cosign/sigstore signatures on every artifact and image, build-provenance attestation, transparency-log entry; a one-command documented verify path — "cosign keyless sign-blob (binaries/checksums/SBOM) + sign image + attest-build-provenance + attest-sbom all wired; RELEASING.md + README document the one-command verify; first real signatures/Rekor entries are produced by the first tag run (OIDC exists only in Actions)"
+- `0045-T5` 🚧 in-progress: SBOM per release (CycloneDX or SPDX) attached to the release and image; cargo-deny/cargo-audit run on the release commit; RELEASING.md + README verify docs; cut the first 0.x release — "CycloneDX SBOM (cargo-cyclonedx) + cargo-deny/cargo-audit gate on the release commit + RELEASING.md + README Install/verify — all in place; remaining: cut the first 0.x release (a maintainer signed-tag push, gated on the ADR 0044 readiness checklist)"
 
 **0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
 
