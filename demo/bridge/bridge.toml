@@ -1,0 +1,42 @@
+# Demo boundary-bridge config (ADR 0025). Bridges the local fss cluster to a SEPARATE,
+# isolated "partner" broker that is NOT part of the cluster — a different security zone.
+#
+# Plaintext is used here for the demo only (like the brokers); a real boundary uses mTLS
+# per upstream and a least-privilege account on each side.
+
+hop_count_limit = 8
+# Single demo instance; an empty share group disables the cluster-side shared subscription
+# (set a name + run >=2 instances for HA).
+share_group = ""
+metrics_bind = "0.0.0.0:8090"
+
+[local]
+# Connect to the cluster as an ordinary MQTT client (any node; here node 1).
+url = "mqttd-1:1883"
+client_id = "fss-bridge-demo"
+
+[spool]
+dir = "/data"          # disk-backed spool survives a bridge restart
+max_messages = 10000
+
+[[upstreams]]
+name = "partner"
+url = "partner-broker:1883"
+client_id = "fss-bridge-from-cluster"
+
+# Rule 1 — UNIDIRECTIONAL (out): cluster telemetry flows to the partner only, remapped
+# under the partner's namespace. The bridge never subscribes to this topic on the partner,
+# so nothing flows back (the data-diode direction is enforced in code, not just config).
+[[upstreams.rules]]
+direction = "out"
+filter = "telemetry/#"
+qos = 1
+remap = { strip_prefix = "telemetry/", prefix = "from-cluster/telemetry/" }
+
+# Rule 2 — BIDIRECTIONAL (both): a shared command/response channel crosses both ways. The
+# remap keeps a forwarded message from immediately echoing, and the hop-count limit bounds
+# any residual loop.
+[[upstreams.rules]]
+direction = "both"
+filter = "shared/#"
+qos = 1
