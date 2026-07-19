@@ -56,7 +56,7 @@
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Proposed | [0/5 done](0046-file-based-configuration.md) | 5 open |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Proposed | [0/5 done](0047-kubernetes-deployment.md) | 5 open |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Proposed | [0/4 done](0048-comparative-benchmarking.md) | 4 open |
-| [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Proposed | [1/3 done](0049-voter-eligible-durable-ownership.md) | 2 open |
+| [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Proposed | [2/3 done](0049-voter-eligible-durable-ownership.md) | 1 open |
 
 ## Open and deferred work
 
@@ -138,5 +138,4 @@
 
 **0049 — Durable ownership must be lease-eligible, and a degraded durable plane must be visible**
 
-- `0049-P2` ⬜ planned: Durable-plane visibility — new counters durable_recovery_failures_total (at the attach refusal) and lease_rpc_timeouts_total (follower AppendEntries/replication timeouts); readiness augmented (not inverted) so a verbose /readyz probe reports durable-serviceability signals without flapping the k8s-facing ready gate
 - `0049-P3` ⬜ planned: Docs + closure — demo sizing note (≥5 durable nodes on one host is fsync-bound), fix the stale hub.rs note_session_ownership "(ephemeral mode)" log line, cross-link the ADR 0021 §2 amendment, and record the leader /readyz-hang as a tracked open investigation

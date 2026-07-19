@@ -18,7 +18,10 @@
 //! No HTTP framework is pulled in: the server parses the request line, routes on the
 //! path, and writes a small JSON body with `Connection: close`. It is deliberately
 //! minimal — it serves only these probes and exposes no broker state beyond the
-//! liveness/readiness booleans, the member count, and the lease-group-ready flag.
+//! liveness/readiness booleans, the member count, the lease-group-ready flag, and
+//! (ADR 0049) durable-serviceability detail — the voter count and the leader's
+//! quorum-ack age — so a *green-but-degraded* durable plane is visible in the body
+//! without changing the ready/NotReady status the probe returns.
 
 use crate::hub::HubCommand;
 use mqtt_cluster::decommission::DrainStatus;
@@ -77,6 +80,14 @@ struct Report {
     /// `(pending hand-offs, rounds, complete)` when a decommission drain is
     /// active (ADR 0043 P3).
     decommission: Option<(usize, u64, bool)>,
+    /// Durable-serviceability signals (ADR 0049), reported in the body so an operator
+    /// probing a suspect node can see a *green-but-degraded* durable plane — without
+    /// changing the ready/NotReady contract the plain `/readyz` status code carries.
+    /// `voters`: current lease-group voter count; `quorum_ack_age_ms`: ms since the
+    /// leader last had a quorum ack (a growing value is the fsync-bound degradation
+    /// behind the 2026-07-14 incident).
+    voters: Option<usize>,
+    quorum_ack_age_ms: Option<u64>,
 }
 
 impl Report {
@@ -98,6 +109,12 @@ impl Report {
                 s,
                 ",\"decommission\":{{\"pending\":{pending},\"rounds\":{rounds},\"complete\":{complete}}}"
             );
+        }
+        if let Some(v) = self.voters {
+            let _ = write!(s, ",\"voters\":{v}");
+        }
+        if let Some(ms) = self.quorum_ack_age_ms {
+            let _ = write!(s, ",\"quorum_ack_age_ms\":{ms}");
         }
         s.push('}');
         s
@@ -186,12 +203,21 @@ impl HealthState {
                 d.complete.load(Acquire),
             )
         });
+        // Durable-serviceability detail (ADR 0049): voter count + quorum-ack age, so a
+        // degraded-but-green durable plane is visible in the body (status code unchanged).
+        let voters = self.durable.as_ref().map(DurablePlane::voter_count);
+        let quorum_ack_age_ms = self
+            .durable
+            .as_ref()
+            .and_then(DurablePlane::quorum_ack_age_ms);
         Report {
             live,
             ready,
             members,
             lease_group_ready,
             decommission,
+            voters,
+            quorum_ack_age_ms,
         }
     }
 }

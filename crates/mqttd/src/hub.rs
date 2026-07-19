@@ -1948,6 +1948,11 @@ impl Hub {
                     client = %pending.client.0,
                     "durable session recovery stayed unavailable past deadline; rejecting CONNECT (ADR 0017)"
                 );
+                // ADR 0049: the exact fingerprint that was invisible for 11 h in the
+                // 2026-07-14 incident — a persistent attach refused (0x88), not an append.
+                if let Some(m) = &self.metrics {
+                    m.durable_recovery_failed("deadline");
+                }
                 let _ = pending.reply.send(AttachOutcome::Unavailable);
             }
             SessionRecovery::Denied { owner } => {
@@ -3534,6 +3539,14 @@ impl Hub {
         if let Some(plane) = &self.durable_plane {
             let (is_leader, epoch) = plane.lease_role();
             m.set_lease_role(is_leader, epoch);
+            // ADR 0049: mirror the leader's quorum-ack age — the leading indicator of the
+            // fsync-bound consensus degradation the 2026-07-14 incident hid. 0 when this
+            // node is not the leader (only the leader has a quorum-ack clock).
+            let ack_ms = plane
+                .quorum_ack_age_ms()
+                .and_then(|v| i64::try_from(v).ok())
+                .unwrap_or(0);
+            m.set_lease_quorum_ack_ms(ack_ms);
         }
     }
 
@@ -8320,6 +8333,35 @@ mod tests {
         assert!(
             matches!(outcome, AttachOutcome::Unavailable),
             "a never-ready store must reject the CONNECT, not downgrade; got {outcome:?}"
+        );
+    }
+
+    /// ADR 0049 P2: a durable session recovery refused past its deadline (CONNACK 0x88)
+    /// increments `durable_recovery_failures_total` — the exact signal that was silent
+    /// through the 2026-07-14 incident. An *append* failure does not move this counter.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_durable_recovery_is_counted() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(NodeId("h".into()), FlakyStore::new(usize::MAX));
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let outcome = attach_outcome(&tx, "c", 1).await;
+        assert!(
+            matches!(outcome, AttachOutcome::Unavailable),
+            "a never-ready store must reject; got {outcome:?}"
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("mqttd_durable_recovery_failures_total{reason=\"deadline\"} 1"),
+            "the recovery refusal must be counted; got:\n{rendered}"
+        );
+        // A recovery refusal is NOT an append failure — the counter that stayed at zero
+        // through the incident must remain untouched here.
+        assert!(
+            !rendered.contains("mqttd_durable_append_failures_total{reason=\"deadline\"}"),
+            "a recovery refusal must not be miscounted as an append failure"
         );
     }
 
