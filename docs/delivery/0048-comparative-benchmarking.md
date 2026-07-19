@@ -42,8 +42,39 @@ above · this file is the plan, progress log, and changelog.
 
 Order: T1 → T2 → T3 → T4.
 
+## Phased execution plan
+
+Phased so **each step delivers value even if we stop there**, and so cost is deferred to the
+last responsible moment — the harness and the numbers that *guide* us cost nothing; only the
+numbers we *publish* cost money.
+
+| Phase | Task | Cost | Output |
+|---|---|---|---|
+| **1. Harness** | T1 | none — start now | Containerized rig: fss / Mosquitto / EMQX from **pinned published images**, documented *reasonable* configs (theirs not crippled, ours not tuned), driven by **`emqtt-bench`** (EMQX's own load tool — a built-in honesty signal). **Two postures per broker: plaintext and TLS/mTLS**, disclosed. |
+| **2. Dev-grade numbers** | T2 | none — local | Throughput QoS 0/1/2, latency p50/p99/p999, memory per 10k idle connections, mTLS connect rate — **full distributions**. Run on a workstation, labeled **development-grade**: they *guide* decisions, they are **not published and never quoted**. |
+| **3. Publishable run** | T2 | small — one rented box for an afternoon (optionally two: driver + broker) | The same metrics, pinned everything, **raw output committed**. The **only** step with a cash cost, and the **only** numbers that go into `docs/benchmarks/`. |
+| **4. Scaling curve** | T3 | small — 3–5 small cloud VMs for hours | 1/3/5-node throughput + p99 vs node count, **on separate hosts with independent disks**. A durable cluster is fsync-bound (ADR 0026/0027); a single-host curve would scale *negatively* and manufacture false evidence against us — so this runs on real separate hosts or it is not published. |
+| **5. Publish** | T4 | none | `docs/benchmarks/` with versions/hardware/date, **losses printed as prominently as wins**, README Performance section links it. Nightly self-benchmark (ADR 0044 P4) guards regression; the cross-broker comparison is re-run per release. |
+
+**The dev-grade / publishable line is the crux of the honesty story:** local numbers are
+cheap and plentiful but run on shared, noisy, un-pinned hardware, so they steer the work
+without ever becoming a quotable claim. A number only earns publication once it comes from
+the pinned, dedicated, disclosed environment of phases 3–4.
+
 ## Changelog
 
 - **2026-07-17** — ADR 0048 drafted. Differentiation/credibility: "Fast" and "linearly
   scalable" are in the product's own name but unproven; extends ADR 0044 P6's internal
   baselines to published, reproducible, self-critical cross-broker numbers. Priority **P2**.
+- **2026-07-19** — Phased execution plan added (above), and two decision-level refinements
+  folded into the ADR:
+  - **`emqtt-bench` named as the load driver** — measuring ourselves with EMQX's own tool is
+    an honesty signal; each broker measured in two disclosed postures (plaintext + TLS/mTLS).
+  - **The scaling curve must run on separate hosts/disks.** A durable cluster is fsync-bound
+    (ADR 0026/0027 — group-commit exists because per-message follower fsyncs were the
+    bottleneck); a single-host N-node curve contends on one disk queue, scales negatively, and
+    would publish false evidence *against* the broker. Curve runs on real separate hosts or not
+    at all.
+  Cost stays bounded: phases 1–2 (harness + dev-grade local numbers) are free and only guide;
+  the sole cash outlay is the one publishable run (a rented box) plus a few VM-hours for the
+  curve. Tasks remain **planned** — this is planning, not execution.

@@ -9,7 +9,10 @@
   [ADR 0001](0001-session-durability.md) (the linear-scaling thesis the scaling curve tests),
   [ADR 0015](0015-cluster-shared-subscriptions.md) (cluster-wide shared subscriptions — the
   mechanism that should make throughput scale with nodes), [ADR 0024](0024-deterministic-testing.md)
-  (the reproducibility discipline a credible benchmark demands)
+  (the reproducibility discipline a credible benchmark demands),
+  [ADR 0026](0026-lease-timing-durable-storage.md) + [ADR 0027](0027-replica-group-commit.md)
+  (the fsync-bound durable-commit reality that forces the scaling curve onto separate hosts —
+  see decision §2)
 
 > This record states the decision only. How it is being built and how far along it is live
 > in the [delivery doc](../delivery/0048-comparative-benchmarking.md).
@@ -50,13 +53,27 @@ true if the curve shows it — and cluster-wide shared subscriptions (ADR 0015) 
 mechanism that should make it so. This curve is the single most important, most falsifiable
 result; publishing a *flat* curve honestly would be a finding to fix, not a number to bury.
 
+**The scaling curve must run on separate hosts with independent disks — never many nodes on
+one machine.** Our own durable-plane work established that a consensus-backed cluster is
+**fsync-bound**: the follower replica fsyncs on the commit path (ADR 0026/0027 — group-commit
+was added precisely because per-message follower fsyncs were the bottleneck). Co-locating
+N nodes on one host makes them contend for the *same* disk queue, so a single-host "cluster"
+scales *negatively* — adding a node subtracts throughput. That is a laptop artifact, not a
+property of the system, and publishing it would manufacture false evidence *against* the
+broker. The curve therefore requires one small host (and one disk) per node — a handful of
+cloud VMs for a few hours — or it is not published at all.
+
 ### 3. Reproducible, containerized, and fair
 
 The whole harness is **containerized and scripted** — every broker (ours, Mosquitto, EMQX)
-run from its published image with documented, *reasonable* configuration (not ours tuned and
-theirs default), the same load tool (an established one, e.g. an MQTT benchmark client),
-the same hardware, pinned versions. Anyone can `docker compose up` the harness and reproduce
-the table. The methodology, configs, and raw output are published alongside the summary.
+run from its **pinned published image** with documented, *reasonable* configuration (not ours
+tuned and theirs default), the same hardware, pinned versions. The load driver is
+**`emqtt-bench`** — deliberately **EMQX's own load tool**: measuring ourselves with a
+competitor's instrument is itself an honesty signal (no home-field driver quietly tuned to
+flatter us). Each broker is measured in **two disclosed postures — plaintext and TLS/mTLS —**
+so the security cost is shown, never hidden or silently avoided. Anyone can `docker compose up`
+the harness and reproduce the table; the methodology, configs, and raw output are published
+alongside the summary.
 
 ### 4. Honesty rules, stated up front
 
@@ -87,6 +104,11 @@ re-run and re-published per release (competitor versions move too).
 - Maintenance cost is real: competitor images and versions drift, so the comparison is
   re-run per release, not continuously. The *self* benchmark (our broker over time) runs
   nightly and is cheap.
+- **Cost is bounded and mostly zero.** The work is phased so each step stands alone (harness
+  and dev-grade local numbers cost nothing and guide but are never quoted); the only cash
+  outlay is renting a dedicated box for an afternoon for the one *publishable* run, plus a
+  handful of small VMs for a few hours for the scaling curve. Delivery plan and the
+  dev-grade/publishable line are in the [delivery doc](../delivery/0048-comparative-benchmarking.md).
 
 ## Alternatives considered
 
