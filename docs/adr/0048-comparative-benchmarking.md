@@ -12,7 +12,8 @@
   (the reproducibility discipline a credible benchmark demands),
   [ADR 0026](0026-lease-timing-durable-storage.md) + [ADR 0027](0027-replica-group-commit.md)
   (the fsync-bound durable-commit reality that forces the scaling curve onto separate hosts —
-  see decision §2)
+  see decision §2), the [7-node single-host post-mortem](../postmortems/2026-07-14-ha-bridge-durable-refused.md)
+  (the incident that proved it)
 
 > This record states the decision only. How it is being built and how far along it is live
 > in the [delivery doc](../delivery/0048-comparative-benchmarking.md).
@@ -54,14 +55,16 @@ mechanism that should make it so. This curve is the single most important, most 
 result; publishing a *flat* curve honestly would be a finding to fix, not a number to bury.
 
 **The scaling curve must run on separate hosts with independent disks — never many nodes on
-one machine.** Our own durable-plane work established that a consensus-backed cluster is
-**fsync-bound**: the follower replica fsyncs on the commit path (ADR 0026/0027 — group-commit
-was added precisely because per-message follower fsyncs were the bottleneck). Co-locating
-N nodes on one host makes them contend for the *same* disk queue, so a single-host "cluster"
-scales *negatively* — adding a node subtracts throughput. That is a laptop artifact, not a
-property of the system, and publishing it would manufacture false evidence *against* the
-broker. The curve therefore requires one small host (and one disk) per node — a handful of
-cloud VMs for a few hours — or it is not published at all.
+one machine.** This is not a precaution, it is a lesson learned: a
+[7-node single-host demo](../postmortems/2026-07-14-ha-bridge-durable-refused.md) drove the
+follower `AppendEntries` commit path past its deadline and refused **100% of durable sessions
+for 11 hours**. A consensus-backed cluster is **fsync-bound** — the follower replica persists
+before answering (ADR 0026/0027 — group-commit was added precisely because per-message
+follower fsyncs were the bottleneck) — so co-locating N nodes on one host makes them contend
+for the *same* disk queue, and the "cluster" scales *negatively*: adding a node subtracts
+throughput. That is a laptop artifact, not a property of the system, and publishing it would
+manufacture false evidence *against* the broker. The curve therefore requires one small host
+(and one disk) per node — a handful of cloud VMs for a few hours — or it is not published at all.
 
 ### 3. Reproducible, containerized, and fair
 
