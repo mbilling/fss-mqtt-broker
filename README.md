@@ -317,8 +317,33 @@ mosquitto_pub -h 127.0.0.1 -p 1884 -t 'fleet/truck7/telemetry' -m hi  # on node 
 
 ## Configuration
 
-Configuration is via environment variables until file-based config lands. Unset
-or empty means "off"; every insecure fallback is logged at startup.
+The broker is configured by a **TOML file**, environment variables, or both, layered in the
+order **defaults < config file < `MQTTD_*` env vars < CLI flags** (ADR 0046). Point at the file
+with `--config <path>` or `MQTTD_CONFIG`; with neither, the config is defaults + the env overlay,
+so env-var-only deployments keep working exactly as before. Unset or empty means "off"; every
+insecure fallback is logged at startup, and the effective config is logged at boot (secrets
+redacted).
+
+- **Example file:** [`docs/mqttd.example.toml`](docs/mqttd.example.toml) — a fully-commented
+  template. Every setting below has a matching TOML key; the file's sections (`[node]`,
+  `[listeners]`, `[tls]`, `[security]`, `[cluster]`, `[durable]`, `[limits]`, `[observability]`,
+  `[runtime]`) mirror these env groups, and a CI test enforces the one-to-one mapping.
+- **Strict schema:** unknown keys and wrong types fail the load with a **located** error — a typo
+  is caught up front, never silently ignored.
+- **Pre-flight check:** `mqttd --check-config [--config <path>]` validates the config the broker
+  would boot with and exits **without binding any port** — the GitOps CI / pre-rollout gate.
+  Exit `0` = OK, `1` = a clear located error.
+- **Hot reload:** edit the file and send `SIGHUP` (or set `[runtime] config_watch_secs` /
+  `MQTTD_CONFIG_WATCH` to watch it) to reload the whole config through the validate-before-swap
+  path — a bad edit is rejected and the running config kept. Live-swappable settings (ACL/auth,
+  TLS material, `allow_anonymous`, the state quotas) change without a restart; everything else is
+  logged + audited as **requires-restart**.
+- **Secrets by reference:** the config file is safe to commit / mount from a ConfigMap — all
+  secret material is referenced **by path** (TLS keys, `password_file`, the JWT keys via
+  `…_FILE`, the gossip key via `MQTTD_SWIM_KEY_FILE`), mounted from a Secret. The only raw secret
+  a value can hold is the inline `MQTTD_SWIM_KEY`; prefer `MQTTD_SWIM_KEY_FILE`.
+
+The tables below are the authoritative reference for every `MQTTD_*` variable (and its TOML key).
 
 ### Identity & client listeners
 | Variable | Purpose |
@@ -358,10 +383,11 @@ or empty means "off"; every insecure fallback is logged at startup.
 |---|---|
 | `MQTTD_ALLOW_ANONYMOUS` | **Insecure**: permit clients with no credentials |
 | `MQTTD_PASSWORD_FILE` | Argon2id `username:phc-hash` password file |
-| `MQTTD_JWT_HS256_SECRET` / `MQTTD_JWT_RS256_PEM` | JWT verification key |
+| `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` | JWT verification key, **by file** (ADR 0046 T5): the HS256 shared secret and the RS256 public key are both read from a path, so the key is mounted from a Secret, never inlined. A trailing newline in the HS256 file is trimmed |
 | `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` | Optional JWT `iss`/`aud` constraints |
 | `MQTTD_ACL_FILE` | TOML topic-ACL policy (deny by default) |
-| `MQTTD_CONFIG_WATCH` | Opt-in filesystem auto-reload (ADR 0033): poll interval in **seconds**. When a configured policy file changes on disk, reload via the same validate-before-swap routine as `SIGHUP` (no restart) — the Kubernetes ConfigMap case. Unset/`0` = disabled (signal-only default) |
+| `MQTTD_CONFIG` | Path to the TOML config file (ADR 0046); `--config <path>` overrides it. Unset = defaults + this env overlay |
+| `MQTTD_CONFIG_WATCH` | Opt-in filesystem auto-reload (ADR 0033): poll interval in **seconds**. When the config file **or** a referenced policy file changes on disk, reload the whole config via the same validate-before-swap routine as `SIGHUP` (no restart) — the Kubernetes ConfigMap case. Unset/`0` = disabled (signal-only default) |
 
 ### Cluster transport & membership
 | Variable | Purpose |
@@ -372,7 +398,8 @@ or empty means "off"; every insecure fallback is logged at startup.
 | `MQTTD_PEERS` | Comma-separated static peer addresses (alternative to gossip) |
 | `MQTTD_SWIM_BIND` | SWIM gossip UDP bind (needs `MQTTD_PEER_BIND`) |
 | `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
-| `MQTTD_SWIM_KEY` | 64-hex-char cluster gossip key (`openssl rand -hex 32`) |
+| `MQTTD_SWIM_KEY` | 64-hex-char cluster gossip key, **inline** (`openssl rand -hex 32`). A raw secret |
+| `MQTTD_SWIM_KEY_FILE` | Path to a file holding the 64-hex gossip key (ADR 0046 T5): the secret-by-reference form, mountable from a Secret so it stays out of the config file. Mutually exclusive with the inline `MQTTD_SWIM_KEY` |
 | `MQTTD_HEALTH_BIND` | HTTP health-probe bind, e.g. `0.0.0.0:8080` — serves `GET /livez`, `/readyz` & `/metrics` (Prometheus) |
 | `MQTTD_READY_MIN_MEMBERS` | Smallest mesh size `/readyz` accepts (default 1) |
 | `MQTTD_METRICS_BIND` | Optional separate bind for `GET /metrics`, to isolate the scrape from the health probes (internal/ops network only) |

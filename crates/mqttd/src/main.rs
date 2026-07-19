@@ -67,8 +67,8 @@
 //! - `MQTTD_ALLOW_ANONYMOUS` — any non-empty value permits clients that present
 //!   no credentials at all; default-off and loudly logged as insecure
 //! - `MQTTD_PASSWORD_FILE`  — Argon2id `username:phc-hash` file (ADR 0004 step 6)
-//! - `MQTTD_JWT_HS256_SECRET` / `MQTTD_JWT_RS256_PEM` — JWT verification key;
-//!   optional `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` constraints
+//! - `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` — JWT verification key, read from a
+//!   file (ADR 0046 T5 secret-by-reference); optional `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE`
 //! - `MQTTD_CONFIG_WATCH`   — opt-in filesystem auto-reload (ADR 0033): poll interval in
 //!   seconds; when a configured policy file (ACL, password, JWT PEM, TLS cert/key/CA/CRL)
 //!   changes on disk, reload through the same fail-safe routine as `SIGHUP` (no restart).
@@ -94,9 +94,11 @@
 //!   (requires `MQTTD_PEER_BIND`; peer links are then established from
 //!   membership, no `MQTTD_PEERS` needed)
 //! - `MQTTD_SWIM_SEEDS`     — comma-separated SWIM addresses of existing members
-//! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), e.g.
-//!   from `openssl rand -hex 32`; without it gossip is unauthenticated and
-//!   loudly logged
+//! - `MQTTD_SWIM_KEY`       — 64-hex-char cluster gossip key (ADR 0003), inline, e.g.
+//!   from `openssl rand -hex 32`; without it (or `MQTTD_SWIM_KEY_FILE`) gossip is
+//!   unauthenticated and loudly logged
+//! - `MQTTD_SWIM_KEY_FILE`  — path to a file holding the 64-hex gossip key (ADR 0046 T5
+//!   secret-by-reference); mutually exclusive with the inline `MQTTD_SWIM_KEY`
 //! - `MQTTD_SWIM_KEY_ACCEPT` — comma-separated extra 64-hex keys that incoming
 //!   gossip may also be sealed with (ADR 0003 zero-downtime rotation): datagrams
 //!   are sealed with `MQTTD_SWIM_KEY` but opened with it *or* any of these. Rotate
@@ -768,6 +770,7 @@ fn watched_policy_paths(config: &Config) -> Vec<std::path::PathBuf> {
     [
         config.security.acl_file.as_ref(),
         config.security.password_file.as_ref(),
+        config.security.jwt.hs256_secret_file.as_ref(),
         config.security.jwt.rs256_pem_file.as_ref(),
         config.tls.cert.as_ref(),
         config.tls.key.as_ref(),
@@ -841,13 +844,16 @@ fn authenticator_from_config(
         members.push(Arc::new(pw));
     }
 
-    // NOTE (ADR 0046 T5): `hs256_secret_file` currently carries the HS256 secret *inline*
-    // (matching the historical `MQTTD_JWT_HS256_SECRET` value semantics); moving it to a true
-    // path reference is T5. `rs256_pem_file` is already a file path.
-    if let Some(secret) = &config.security.jwt.hs256_secret_file {
-        info!("JWT HS256 verification enabled");
+    // Secrets by reference (ADR 0046 T5): the HS256 shared secret is read from the file at
+    // `hs256_secret_file` (like the RS256 PEM), so the HMAC key is mounted from a Secret, never
+    // inlined in the config. A trailing newline (the common `echo secret > file` case) is
+    // trimmed so the on-disk file and an inline value agree.
+    if let Some(path) = &config.security.jwt.hs256_secret_file {
+        let secret = std::fs::read(path)?;
+        let secret = trim_trailing_newline(&secret);
+        info!(%path, "JWT HS256 verification enabled (secret from file)");
         members.push(Arc::new(mqtt_auth::token::TokenAuthenticator::hs256(
-            secret.as_bytes(),
+            secret,
             jwt_config(config),
         )));
     } else if let Some(pem_path) = &config.security.jwt.rs256_pem_file {
@@ -867,6 +873,14 @@ fn jwt_config(config: &Config) -> mqtt_auth::token::TokenConfig {
         audience: config.security.jwt.audience.clone(),
         ..Default::default()
     }
+}
+
+/// Trim a single trailing `\n` (or `\r\n`) from a secret read from a file — the ubiquitous
+/// `echo secret > file` / editor-newline case — so a file-mounted secret matches the literal
+/// value an operator typed (ADR 0046 T5).
+fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
+    let b = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    b.strip_suffix(b"\r").unwrap_or(b)
 }
 
 /// Per-session offline-queue bounds (ADR 0001 §6) from `MQTTD_MAX_QUEUED_MESSAGES`
@@ -1465,8 +1479,20 @@ async fn start_swim(
     // out-of-process harness fronts each peer listener with one).
     let peer_addr = config.cluster.peer_advertise.clone().unwrap_or(peer_addr);
     // Gossip authentication (ADR 0003): keyed = membership claims require the
-    // cluster key; unkeyed is possible but loudly insecure.
-    let auth = if let Some(hex) = &config.cluster.swim.key {
+    // cluster key; unkeyed is possible but loudly insecure. The key is either inline
+    // (`swim.key`) or read from a file (`swim.key_file`, ADR 0046 T5 secret-by-reference);
+    // `validate()` guarantees at most one is set.
+    let primary_key: Option<String> =
+        match (&config.cluster.swim.key, &config.cluster.swim.key_file) {
+            (Some(hex), _) => Some(hex.clone()),
+            (None, Some(path)) => Some(
+                String::from_utf8_lossy(trim_trailing_newline(&std::fs::read(path)?))
+                    .trim()
+                    .to_string(),
+            ),
+            (None, None) => None,
+        };
+    let auth = if let Some(hex) = &primary_key {
         let mut auth = SwimAuth::from_hex_key(hex)?;
         // Additional keys accepted (but not used to seal) during a rotation window (ADR
         // 0003): an old key still opens peers' datagrams while the cluster migrates to the
@@ -2139,9 +2165,8 @@ fn log_effective_config(config: &Config) {
         let n = redacted.cluster.swim.key_accept.len();
         redacted.cluster.swim.key_accept = vec![format!("<{n} key(s) redacted>")];
     }
-    if redacted.security.jwt.hs256_secret_file.is_some() {
-        redacted.security.jwt.hs256_secret_file = Some("<redacted>".to_string());
-    }
+    // Every other secret is now referenced by path (ADR 0046 T5) — paths are safe to log; only
+    // the inline gossip key(s) above are raw secrets. The HS256 secret is a file path.
     info!(config = ?redacted, "effective configuration (ADR 0046; secrets redacted)");
 }
 

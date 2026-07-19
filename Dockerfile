@@ -38,5 +38,15 @@ COPY --chmod=0755 dist/mqttd /usr/local/bin/mqttd
 # MQTTD_* config; EXPOSE here is documentation, not a binding.
 EXPOSE 1883 8883
 
+# Configuration (ADR 0046): configure via a TOML file, MQTTD_* env vars, or both —
+# precedence is defaults < file < MQTTD_* env < CLI flags.
+#   - File:    mount a ConfigMap and point at it, e.g.
+#                -v ./mqttd.toml:/etc/mqttd/mqttd.toml  +  MQTTD_CONFIG=/etc/mqttd/mqttd.toml
+#              (or append `--config /etc/mqttd/mqttd.toml` after the entrypoint).
+#              See docs/mqttd.example.toml for a fully-commented template.
+#   - Env:     pass -e MQTTD_*=... ; env overrides the file per-setting.
+#   - Secrets: reference by PATH (TLS keys, password_file, JWT keys via *_FILE,
+#              MQTTD_SWIM_KEY_FILE) mounted from a Secret — keep them out of the file.
+#   - Validate a config without starting the broker:  mqttd --check-config --config <path>
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/mqttd"]

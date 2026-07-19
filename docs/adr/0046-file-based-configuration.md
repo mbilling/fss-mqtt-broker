@@ -1,7 +1,7 @@
 # ADR 0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)
 
-- **Status:** Proposed
-- **Date:** 2026-07-17
+- **Status:** Accepted
+- **Date:** 2026-07-17 (accepted 2026-07-19)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0046-file-based-configuration.md](../delivery/0046-file-based-configuration.md) — plan, progress, and changelog
 - **Related:** [ADR 0032](0032-hot-reloadable-security-policy.md) (the validate-before-swap
