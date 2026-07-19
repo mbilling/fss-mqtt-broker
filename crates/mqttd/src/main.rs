@@ -15,6 +15,8 @@
 //! read directly here. The TOML file is named by `--config <path>` or `MQTTD_CONFIG`; with
 //! neither, config is defaults + the env overlay (fully backward compatible). Each
 //! `MQTTD_*` variable maps to exactly one config key (see `mqtt_config::ENV_VARS`).
+//! `mqttd --check-config` (ADR 0046 T3) validates the effective config and exits without
+//! binding any port — the GitOps/pre-rollout gate.
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
 //! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
 //! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
@@ -138,7 +140,7 @@ use mqtt_cluster::placement::{self, Placement};
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
-use mqtt_config::Config;
+use mqtt_config::{Config, ConfigError};
 use mqtt_net::tls;
 use mqtt_observability::{AuditLog, AuditSink};
 use mqtt_storage::logged::ReplicatedSessionStore;
@@ -167,6 +169,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // ADR 0046 T3: `--check-config` validates the config the broker would boot with and exits,
+    // without binding a port or starting the hub — the GitOps/pre-rollout gate. Handled here,
+    // before any resource is acquired.
+    if std::env::args().skip(1).any(|a| a == "--check-config") {
+        check_config();
+    }
 
     // ADR 0046 T2: assemble the effective configuration in precedence order —
     // defaults < TOML file < `MQTTD_*` env. The file path comes from `--config <path>` or
@@ -1889,6 +1898,58 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         info!(path = %p.display(), "loading configuration file (ADR 0046)");
     }
     Ok(Config::load(path.as_deref())?)
+}
+
+/// Validate the config the broker would boot with (file from `--config` / `MQTTD_CONFIG`,
+/// layered under the `MQTTD_*` env), then exit — **without binding any port or starting the
+/// hub** (ADR 0046 T3). For CI gates and pre-rollout operator checks: `mqttd --check-config`
+/// (optionally with `--config <path>`). Exit `0` + `config OK` on success; exit `1` + a clear,
+/// located error on failure; exit `2` if the invocation itself is malformed.
+fn check_config() -> ! {
+    match check_config_inner() {
+        Ok(Some(path)) => {
+            println!(
+                "config OK: {} + MQTTD_* env overlay validates",
+                path.display()
+            );
+            std::process::exit(0);
+        }
+        Ok(None) => {
+            println!("config OK: defaults + MQTTD_* env overlay validates (no config file set)");
+            std::process::exit(0);
+        }
+        Err(CheckError::Usage(e)) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        Err(CheckError::Invalid { path, error }) => {
+            match path {
+                Some(p) => eprintln!("config INVALID ({}): {error}", p.display()),
+                None => eprintln!("config INVALID: {error}"),
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Distinguishes a malformed *invocation* (exit 2) from a well-formed one that produced an
+/// *invalid config* (exit 1) — CI can tell "you called me wrong" from "the config is bad".
+enum CheckError {
+    Usage(Box<dyn std::error::Error>),
+    Invalid {
+        path: Option<std::path::PathBuf>,
+        error: ConfigError,
+    },
+}
+
+/// The testable core of [`check_config`]: resolve the path and load+validate, returning the
+/// resolved path on success (so the caller can report it) or a classified error.
+fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
+    let path = config_path().map_err(CheckError::Usage)?;
+    match Config::load(path.as_deref()) {
+        Ok(_) => Ok(path),
+        Err(error) => Err(CheckError::Invalid { path, error }),
+    }
 }
 
 /// The config-file path from `--config <path>` / `--config=<path>` (highest precedence) or the
