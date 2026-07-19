@@ -171,22 +171,7 @@ broker in another security/administrative zone). The bridge is a standalone MQTT
 unit whose failure domain is its own: a bridge fault cannot touch the cluster's consensus
 or membership.
 
-The demo runs the bridge **HA: two instances (`bridge-1`, `bridge-2`) in one shared group**
-(ADR 0025 §5 / T6). Both name `share_group = "boundary-ha"`, so their cluster-side
-subscriptions become `$share/boundary-ha/<filter>` — the cluster delivers each message to
-exactly **one** instance (no duplicates at the partner), and killing either instance
-mid-traffic leaves the partner feed unbroken:
-
-```sh
-# watch the partner feed, kill an instance, watch the feed continue without a gap
-mosquitto_sub -h localhost -p 1886 -t 'from-cluster/#' -v &
-docker compose kill bridge-1        # bridge-2 keeps forwarding
-docker compose start bridge-1       # instance rejoins the share group
-```
-
-Their configs — [`bridge/bridge-1.toml`](bridge/bridge-1.toml) /
-[`bridge/bridge-2.toml`](bridge/bridge-2.toml), identical rules, distinct client ids —
-declare two mappings:
+Its config — [`bridge/bridge.toml`](bridge/bridge.toml) — declares two mappings:
 
 - **`telemetry/#` — unidirectional (`out`):** cluster telemetry flows to the partner only,
   remapped under `from-cluster/telemetry/…`. The one-wayness is enforced *in code* — for an
@@ -209,17 +194,17 @@ mosquitto_sub -h localhost -p 1883 -t 'shared/#' -v &                   # cluste
 mosquitto_pub -h localhost -p 1886 -t 'shared/cmd' -m 'ping'            # partner -> cluster
 ```
 
-Each bridge instance exposes Prometheus metrics (`fss_bridge_forwarded_total`,
-`…_dropped_total`, `…_reconnects_total` — host ports `:8090`/`:8091`, both scraped by Alloy)
-and writes an **audit** log line (`bridge::audit`) for every message that crosses, recording
-the upstream, direction, and source/destination topics. During an HA failover the forwarded
-counter simply switches instances.
+The bridge exposes Prometheus metrics on `:8090` (`fss_bridge_forwarded_total`,
+`…_dropped_total`, `…_reconnects_total`, scraped by Alloy) and writes an **audit** log line
+(`bridge::audit`) for every message that crosses, recording the upstream, direction, and
+source/destination topics.
 
 **Production note (least privilege, ADR 0025 §8):** the demo uses plaintext and anonymous
 access for convenience. A real boundary uses a **distinct mTLS identity per upstream** and a
 **least-privilege account on each broker** — publish-only or subscribe-only on exactly the
 bridged topics (an ACL on the bridge's account, ADR 0004) — so even a bridge code fault
-cannot open a path the credentials forbid.
+cannot open a path the credentials forbid. Run ≥2 instances with a shared `share_group` for
+HA (the cluster load-balances and deduplicates across them).
 
 ## Files
 
@@ -228,7 +213,7 @@ cannot open a path the credentials forbid.
 | `docker-compose.yml` | the whole topology |
 | `Dockerfile` | builds the `mqttd` binary on a slim runtime |
 | `Dockerfile.bridge` | builds the `mqtt-bridge` binary (ADR 0025) |
-| `bridge/bridge-{1,2}.toml` | the HA boundary-bridge pair's configs (one-way + bidirectional mappings; shared group) |
+| `bridge/bridge.toml` | the boundary-bridge config (one-way + bidirectional mappings) |
 | `alloy/config.alloy` | Alloy: scrape `/metrics` (brokers + bridge) + receive OTLP → remote_write to Prometheus |
 | `prometheus/prometheus.yml` | Prometheus (remote-write receiver) |
 | `grafana/provisioning/*` | datasource + dashboard auto-provisioning |
