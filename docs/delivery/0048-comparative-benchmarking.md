@@ -78,3 +78,8 @@ the pinned, dedicated, disclosed environment of phases 3–4.
   Cost stays bounded: phases 1–2 (harness + dev-grade local numbers) are free and only guide;
   the sole cash outlay is the one publishable run (a rented box) plus a few VM-hours for the
   curve. Tasks remain **planned** — this is planning, not execution.
+- **2026-07-19** — The single-host lesson is now backed by its primary source: the
+  [7-node HA-bridge post-mortem](../postmortems/2026-07-14-ha-bridge-durable-refused.md) is
+  filed under `docs/postmortems/` and cited from the ADR's scaling-curve decision. (The
+  post-mortem also surfaces two real defects — learner-owner durable recovery, and a
+  readiness blind spot — tracked separately, not by this ADR.)
