@@ -1,0 +1,20 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# Prometheus Operator scrape of /metrics (ADR 0020). Requires the ServiceMonitor CRD.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mqttd.fullname" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mqttd.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: health
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

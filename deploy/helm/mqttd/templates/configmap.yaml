@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mqttd.fullname" . }}-config
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+data:
+  # The config TEMPLATE (ADR 0046). __NODE_ID__ and __SEEDS__ are filled per-pod by the render
+  # init container (see the StatefulSet): node id = the stable pod name; seeds = pod-0 for every
+  # non-founder, empty for pod-0 so it founds the lease group (ADR 0007/0016). The rendered file
+  # is what `--check-config` validates and the broker loads.
+  mqttd.toml.tmpl: |-
+    {{- .Values.config | nindent 4 }}

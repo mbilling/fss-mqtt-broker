@@ -139,6 +139,12 @@
 //! `decommission{pending,rounds,complete}`), and only then runs the graceful
 //! leave — so a planned removal loses nothing, unlike pulling the plug. A
 //! `SIGTERM` during the drain escalates to a plain shutdown (crash semantics).
+//!
+//! Subcommands (each validates + exits, binding nothing): `--check-config [--config <path>]`
+//! (ADR 0046 T3) validates the effective config; **`--decommission [--pid <n>] [--timeout <secs>]`**
+//! (ADR 0047 T4) sends `SIGUSR1` to the running broker (`--pid`, default 1 — the container
+//! entrypoint) to begin the decommission drain and **blocks until it exits**, so a Kubernetes
+//! `preStop` holds the pod open for the whole drain even though the distroless image has no shell.
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
@@ -181,6 +187,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before any resource is acquired.
     if std::env::args().skip(1).any(|a| a == "--check-config") {
         check_config();
+    }
+
+    // ADR 0047 T4: `--decommission` sends SIGUSR1 to the running broker (PID 1 in a distroless
+    // container, which has no shell/`kill`) and waits for the drain + graceful shutdown to
+    // complete — the Kubernetes `preStop` hook. Handled here so it never touches the network.
+    if std::env::args().skip(1).any(|a| a == "--decommission") {
+        run_decommission();
     }
 
     // ADR 0046 T2: assemble the effective configuration in precedence order —
@@ -2110,6 +2123,107 @@ fn check_config() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// `mqttd --decommission [--pid <n>] [--timeout <secs>]` (ADR 0047 T4): send `SIGUSR1` to the
+/// running broker to begin the ADR 0043 decommission drain (hand every held key to its
+/// post-departure replica set, verify, then leave gracefully), and **block until that process
+/// exits** so a Kubernetes `preStop` holds the pod open for the whole drain. The broker image is
+/// distroless (no shell, no `kill`), so this is how the `preStop` hook reaches it.
+///
+/// Target defaults to **PID 1** — the broker is the container entrypoint. Exit `0` when the
+/// broker exits (drain complete), `1` on timeout (`preStop` then yields to the grace period /
+/// `SIGTERM`), `2` on a usage or signal error.
+#[cfg(unix)]
+fn run_decommission() -> ! {
+    use rustix::process::{kill_process, Pid, Signal};
+
+    let (raw_pid, timeout) = match decommission_args() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let Some(pid) = Pid::from_raw(raw_pid) else {
+        eprintln!("error: --pid must be a positive pid, got {raw_pid}");
+        std::process::exit(2);
+    };
+    if let Err(e) = kill_process(pid, Signal::USR1) {
+        eprintln!("decommission: cannot signal pid {raw_pid}: {e}");
+        std::process::exit(2);
+    }
+    println!("decommission: sent SIGUSR1 to pid {raw_pid}; waiting for drain + graceful shutdown");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if broker_exited(raw_pid) {
+            println!("decommission: pid {raw_pid} exited — drain complete");
+            std::process::exit(0);
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "decommission: timed out after {}s waiting for pid {raw_pid} to exit",
+                timeout.as_secs()
+            );
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Has the broker process exited (drain complete)? On Linux we read `/proc/<pid>/stat` and treat
+/// a **zombie** (`Z`) or dead (`X`) state — or a missing entry — as exited; a bare `kill(pid, 0)`
+/// would call a not-yet-reaped zombie "alive" and never return. Off-Linux there is no `/proc`, so
+/// fall back to the signal-0 probe.
+#[cfg(target_os = "linux")]
+fn broker_exited(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true, // no /proc entry — reaped / gone
+        // `stat` is `pid (comm) state …`; comm may contain spaces/parens, so the state char is the
+        // first non-space after the LAST ')'.
+        Ok(s) => s
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_none_or(|st| st == 'Z' || st == 'X' || st == 'x'),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn broker_exited(pid: i32) -> bool {
+    use rustix::process::{test_kill_process, Pid};
+    Pid::from_raw(pid).is_none_or(|p| test_kill_process(p).is_err())
+}
+
+#[cfg(not(unix))]
+fn run_decommission() -> ! {
+    eprintln!("error: --decommission is only supported on Unix");
+    std::process::exit(2);
+}
+
+/// Parse `--pid <n>` (default 1, the container entrypoint) and `--timeout <secs>` (default 3600;
+/// the effective bound is the pod's `terminationGracePeriodSeconds`) from `--decommission`.
+#[cfg(unix)]
+fn decommission_args() -> Result<(i32, Duration), String> {
+    let mut pid: i32 = 1;
+    let mut timeout = Duration::from_secs(3600);
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--pid" => {
+                let v = args.next().ok_or("--pid requires a value")?;
+                pid = v.parse().map_err(|_| format!("--pid: not a pid: {v:?}"))?;
+            }
+            "--timeout" => {
+                let v = args.next().ok_or("--timeout requires a value")?;
+                let secs: u64 = v
+                    .parse()
+                    .map_err(|_| format!("--timeout: not seconds: {v:?}"))?;
+                timeout = Duration::from_secs(secs);
+            }
+            _ => {}
+        }
+    }
+    Ok((pid, timeout))
 }
 
 /// Distinguishes a malformed *invocation* (exit 2) from a well-formed one that produced an

@@ -520,6 +520,32 @@ under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
 [0027](docs/adr/0027-replica-group-commit.md) /
 [0028](docs/adr/0028-link-gated-voter-admission.md)).
 
+### On Kubernetes (Helm)
+
+A Helm chart under [`deploy/helm/mqttd`](deploy/helm/mqttd) runs the broker as a **StatefulSet**
+that encodes the operational contract (ADR 0047), so the safe path is the default:
+
+```sh
+helm install mqttd deploy/helm/mqttd \
+  --set replicaCount=3 \
+  --set secrets.tls.secretName=mqttd-server-tls   # a kubernetes.io/tls Secret
+```
+
+- **Per-pod PersistentVolume** (`volumeClaimTemplate`) for the redb data dir — a rescheduled pod
+  reattaches its volume and recovers durable state, never the ephemeral-storage data-loss trap.
+- **Self-forming mesh:** pod-0 founds the lease group; pods 1..N seed to it over the headless
+  Service. Node id = the stable pod name. (An init container renders the per-pod config, since the
+  image is distroless.)
+- **Config from a ConfigMap, secrets by path from Secrets** (ADR 0046); a `--check-config` init
+  container fails a bad config before the pod serves.
+- **Safe scale-down:** a `preStop` runs `mqttd --decommission`, which drains every held key to its
+  post-departure replica set (ADR 0043) and holds the pod open until the drain completes — a
+  planned removal loses nothing.
+- **Quorum-safe rollout:** one pod at a time (ADR 0039) + a `PodDisruptionBudget` (`maxUnavailable: 1`).
+
+Validate a rendered config without a cluster: `mqttd --check-config --config <file>`. See
+[`docs/mqttd.example.toml`](docs/mqttd.example.toml) for every setting.
+
 ## Resizing the cluster
 
 Grow, shrink, and replace are first-class, **data-safe** operations on a running

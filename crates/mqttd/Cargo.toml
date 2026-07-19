@@ -29,6 +29,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 tokio-rustls.workspace = true
+# `mqttd --decommission` (ADR 0047 T4) sends SIGUSR1 to the running broker (PID 1 in a
+# distroless container has no shell/`kill`) and waits for the drain. rustix's safe kill wrappers
+# (the crate forbids `unsafe` in first-party code); rustix is already in the tree — this only
+# enables its `process` feature. Unix-gated.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 # fault-injecting SessionStore double for the durable-attach readiness tests (ADR 0017)

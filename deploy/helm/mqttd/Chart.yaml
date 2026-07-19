@@ -1,0 +1,22 @@
+apiVersion: v2
+name: mqttd
+description: >-
+  A security-first, cluster-native MQTT 3.1.1 + 5.0 broker — deployed as a StatefulSet with
+  per-pod persistent storage, self-forming gossip mesh, safe (decommission-draining) scale-down,
+  and a quorum-safe one-at-a-time rollout (ADR 0047).
+type: application
+# Chart version — bumped on chart changes. appVersion tracks the broker image tag.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/mbilling/fss-mqtt-broker
+sources:
+  - https://github.com/mbilling/fss-mqtt-broker
+maintainers:
+  - name: project maintainers
+kubeVersion: ">=1.24.0-0"
+keywords:
+  - mqtt
+  - broker
+  - iot
+  - messaging
+  - cluster

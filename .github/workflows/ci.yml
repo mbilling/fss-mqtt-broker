@@ -93,3 +93,46 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: cargo-audit
         run: cargo audit
+
+  helm:
+    name: helm chart (lint + template + kubeconform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Install kubeconform
+        run: |
+          curl -fsSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar xzf kubeconform.tar.gz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+      # ADR 0047: the chart is our operator contract; lint it, render it (default + a bounded
+      # single-node override), and schema-validate every rendered manifest. Renders offline — no
+      # cluster needed. The kind/k3d runtime smoke (T5) lives in the nightly tier.
+      - name: helm lint
+        run: helm lint deploy/helm/mqttd
+      - name: helm template + kubeconform (defaults)
+        run: |
+          helm template mqttd deploy/helm/mqttd | tee /tmp/rendered.yaml | \
+            kubeconform -strict -summary -ignore-missing-schemas \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: helm template + kubeconform (single-node, PDB off)
+        run: |
+          helm template mqttd deploy/helm/mqttd \
+            --set replicaCount=1 --set podDisruptionBudget.enabled=false \
+            --set persistence.enabled=false | \
+            kubeconform -strict -summary -ignore-missing-schemas -schema-location default
+      # The rendered per-pod config template must itself be valid input to --check-config once its
+      # placeholders are filled — a quick shell-level render mirrors the init container.
+      - name: Rendered config is check-config-valid
+        run: |
+          helm template mqttd deploy/helm/mqttd \
+            | awk '/mqttd.toml.tmpl: \|-/{f=1;next} f&&/^    /{sub(/^    /,"");print;next} f{exit}' \
+            | sed -e 's/__NODE_ID__/mqttd-0/g' -e 's/__SEEDS__//g' > /tmp/rendered.toml
+          echo "--- rendered founder config ---"; cat /tmp/rendered.toml
+          cargo build --quiet -p mqttd
+          target/debug/mqttd --check-config --config /tmp/rendered.toml
