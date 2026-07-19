@@ -92,6 +92,8 @@ struct OtelInstruments {
     lease_epoch: OtelGauge<i64>,
     durable_append_latency: OtelHistogram<f64>,
     durable_append_failures: OtelCounter<u64>,
+    durable_recovery_failures: OtelCounter<u64>,
+    lease_quorum_ack_ms: OtelGauge<i64>,
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
     revocation_evictions: OtelCounter<u64>,
@@ -129,6 +131,8 @@ impl OtelInstruments {
                 .f64_histogram("durable_append_latency_seconds")
                 .build(),
             durable_append_failures: meter.u64_counter("durable_append_failures").build(),
+            durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
+            lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
@@ -177,6 +181,14 @@ pub struct Metrics {
     lease_epoch: Gauge,
     durable_append_latency_seconds: Histogram,
     durable_append_failures_total: Family<ReasonLabel, Counter>,
+    /// Durable session *recovery* refusals (ADR 0049): a persistent attach that stayed
+    /// unavailable past its deadline and got CONNACK 0x88. Distinct from an *append*
+    /// failure — the signal that was silent for 11 h in the 2026-07-14 incident.
+    durable_recovery_failures_total: Family<ReasonLabel, Counter>,
+    /// Milliseconds since the lease-group leader last had a quorum ack (ADR 0049),
+    /// mirrored from openraft. A growing value is the fsync-bound degradation that
+    /// preceded the incident — alertable before any session is refused.
+    lease_quorum_ack_ms: Gauge,
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
     revocation_evictions_total: Family<ReasonLabel, Counter>,
@@ -331,6 +343,16 @@ impl Metrics {
             "durable_append_failures",
             "Durable append failures, by reason (no-quorum, not-owner, backend)",
         );
+        let durable_recovery_failures_total = register_family(
+            &mut registry,
+            "durable_recovery_failures",
+            "Durable session recovery refusals (persistent attach rejected with 0x88), by reason",
+        );
+        let lease_quorum_ack_ms = register_gauge(
+            &mut registry,
+            "lease_quorum_ack_ms",
+            "Milliseconds since the lease-group leader last had a quorum ack (0 when not leader)",
+        );
         let gossip_rejected_total = register_family(
             &mut registry,
             "gossip_rejected",
@@ -417,6 +439,8 @@ impl Metrics {
             lease_epoch,
             durable_append_latency_seconds,
             durable_append_failures_total,
+            durable_recovery_failures_total,
+            lease_quorum_ack_ms,
             gossip_rejected_total,
             security_reloads_total,
             revocation_evictions_total,
@@ -603,6 +627,29 @@ impl Metrics {
         self.otel
             .durable_append_failures
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// A durable session recovery was refused (persistent attach rejected with 0x88,
+    /// ADR 0049); `reason` is a bounded class (e.g. `"deadline"`). Distinct from an
+    /// append failure — this is the signal that stayed silent through the 2026-07-14
+    /// incident while the durable plane refused every attach.
+    pub fn durable_recovery_failed(&self, reason: &str) {
+        self.durable_recovery_failures_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .durable_recovery_failures
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// Set the lease-group quorum-ack age gauge (ADR 0049): milliseconds since the
+    /// leader last had a quorum ack, mirrored from openraft each gauge refresh. A
+    /// growing value is the fsync-bound degradation that precedes durable refusals.
+    pub fn set_lease_quorum_ack_ms(&self, ms: i64) {
+        self.lease_quorum_ack_ms.set(ms);
+        self.otel.lease_quorum_ack_ms.record(ms, &[]);
     }
 
     /// A SWIM gossip datagram was dropped (ADR 0003); `reason` is a bounded class

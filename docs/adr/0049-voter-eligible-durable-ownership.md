@@ -94,16 +94,25 @@ The blind spot is closed with **metrics first, readiness second** — deliberate
 order, because flipping `/readyz` to NotReady under transient load would evict healthy nodes
 and cause orchestration churn (the cure worse than the disease):
 
-- New counters (ADR 0020 registry, `metrics.rs`, modelled on `durable_append_failed`):
-  **`durable_recovery_failures_total`** (incremented where the attach is refused —
-  `conn.rs:589` / `recover_until_ready`) and **`lease_rpc_timeouts_total`** (the follower
-  `AppendEntries`/replication timeouts that precede the degradation — the signal that was
-  screaming in the logs but exposed in no metric).
-- These make the *green-but-degraded* state alertable: recovery refusals climbing while
-  appends stay flat is exactly the incident's fingerprint.
-- Readiness is **augmented, not inverted**: `/readyz` keeps its current meaning (it must not
-  flap a healthy node), but `/readyz?verbose` (or the readiness report body) additionally
-  reports durable-serviceability signals so an operator probing a suspect node sees the truth.
+- **`durable_recovery_failures_total`** (ADR 0020 registry, `metrics.rs`, modelled on
+  `durable_append_failed`; incremented at the attach refusal in the hub's `Unavailable` arm)
+  — the *direct* fingerprint: a persistent attach refused with 0x88, distinct from an
+  *append* failure (which stayed at zero through the incident).
+- **`lease_quorum_ack_ms`** gauge — the *leading* indicator, mirrored from openraft's
+  `millis_since_quorum_ack` each gauge refresh. **Design note:** the draft proposed a
+  `lease_rpc_timeouts_total` counter, but the incident's degradation was follower *fsync*
+  slowness with a healthy network — openraft's RPC timeout fires while our `MeshConn` send
+  still eventually gets a late reply, so a network-level timeout counter cannot see this
+  failure mode. `millis_since_quorum_ack` (a growing "time since the leader last reached
+  quorum") measures the degradation *directly* and reads cleanly from raft metrics — the
+  accurate instrument. (`mqtt-cluster` has no `mqtt-observability` dependency, so the plane
+  exposes `quorum_ack_age_ms()` and the hub mirrors it into the gauge — no layering
+  inversion.)
+- Together they make the *green-but-degraded* state alertable: recovery refusals climbing (or
+  the quorum-ack age growing) while appends stay flat is exactly the incident's fingerprint.
+- Readiness is **augmented, not inverted**: `/readyz` keeps its status contract (it must not
+  flap a healthy node), but its JSON body additionally reports durable-serviceability signals
+  (voter count, quorum-ack age) so an operator probing a suspect node sees the truth.
 
 ### 4. Demo sizing is documented, and a stale log line fixed
 

@@ -172,6 +172,16 @@ impl DurablePlane {
             .count()
     }
 
+    /// Milliseconds since the lease-group **leader** last had a quorum ack, from the
+    /// raft metrics (`None` when this node is not the leader). A growing value is the
+    /// fsync-bound consensus degradation behind the 2026-07-14 incident (ADR 0049):
+    /// the leader is issuing `AppendEntries` but not getting timely quorum acks — the
+    /// leading indicator that durable recovery is about to start refusing attaches.
+    #[must_use]
+    pub fn quorum_ack_age_ms(&self) -> Option<u64> {
+        self.raft.metrics().borrow().millis_since_quorum_ack
+    }
+
     /// Whether the lease group can serve this node's durable sessions: it has a
     /// current leader (so consensus is making progress and leases can be assigned)
     /// **and** this node is a voter (so the leader can assign it ownership, and a
