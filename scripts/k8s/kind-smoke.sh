@@ -14,7 +14,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER="${CLUSTER:-mqttd-smoke}"
 NS="${NS:-mqttd-smoke}"
-RELEASE="${RELEASE:-mqttd}"
+# The release name must NOT contain the chart name "mqttd", or Helm's fullname collapses to just
+# the release name (mqttd.fullname), breaking the "<release>-mqttd" object names this script uses.
+RELEASE="${RELEASE:-smoke}"
 IMAGE="${IMAGE:-mqttd:smoke}"
 CHART="$REPO_ROOT/deploy/helm/mqttd"
 SMOKE_VALUES="$CHART/ci/values-smoke.yaml"
