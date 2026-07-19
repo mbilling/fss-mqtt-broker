@@ -53,7 +53,7 @@
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/7 done](0044-release-readiness-assurance.md) | — |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [3/5 done](0045-release-engineering-and-distribution.md) | 2 open |
-| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Proposed | [0/5 done](0046-file-based-configuration.md) | 5 open |
+| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Proposed | [1/5 done](0046-file-based-configuration.md) | 4 open |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Proposed | [0/5 done](0047-kubernetes-deployment.md) | 5 open |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Proposed | [0/4 done](0048-comparative-benchmarking.md) | 4 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
@@ -115,7 +115,6 @@
 
 **0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
 
-- `0046-T1` ⬜ planned: TOML config schema + parser — sections mirroring the MQTTD_* env groups; strict (unknown keys rejected, types/ranges checked); reuses the hardened ACL TOML parsing posture
 - `0046-T2` ⬜ planned: Layering + precedence — defaults < config file < env vars < flags; --config path and MQTTD_CONFIG; effective config logged at startup with secrets redacted; a test asserts every MQTTD_* var maps to exactly one config key and vice versa
 - `0046-T3` ⬜ planned: mqttd --check-config subcommand — validates a file and exits without binding ports; for GitOps CI and pre-rollout operator checks; clear located errors
 - `0046-T4` ⬜ planned: Whole-config hot reload — SIGHUP/watch reloads the full config through the ADR 0032 validate-before-swap path; live-swappable settings change without restart, non-live ones logged as requires-restart; audited + metered
