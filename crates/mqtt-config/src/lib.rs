@@ -142,9 +142,9 @@ impl Default for Security {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Jwt {
-    /// HS256 shared-secret file (`MQTTD_JWT_HS`).
+    /// HS256 shared-secret file (`MQTTD_JWT_HS256_SECRET`).
     pub hs256_secret_file: Option<String>,
-    /// RS256 public-key PEM (`MQTTD_JWT_RS`).
+    /// RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`).
     pub rs256_pem_file: Option<String>,
     /// Required `iss` claim (`MQTTD_JWT_ISSUER`).
     pub issuer: Option<String>,
@@ -258,7 +258,7 @@ pub struct Limits {
     pub receive_maximum: Option<u16>,
     /// MQTT 5 Topic Alias Maximum granted to clients (`MQTTD_TOPIC_ALIAS_MAX`).
     pub topic_alias_max: Option<u16>,
-    /// Offline-queue overflow policy (`MQTTD_QUEUE_OVERFLOW`): `drop-oldest` or `drop-new`.
+    /// Offline-queue overflow policy (`MQTTD_QUEUE_OVERFLOW`): `drop-oldest` or `reject-newest`.
     pub queue_overflow: Option<String>,
 }
 
@@ -328,6 +328,281 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Load the layered configuration in ADR 0046 precedence order:
+    /// **defaults → the TOML file at `path` (if any) → `MQTTD_*` environment overlay**,
+    /// then [`validate`](Self::validate). (CLI flags, the highest layer, are applied by the
+    /// caller after this returns.) Env wins over the file, which wins over defaults.
+    ///
+    /// # Errors
+    /// [`ConfigError::Parse`] if the file is unreadable or malformed; [`ConfigError::Invalid`]
+    /// if an env value is unparseable or the result fails validation.
+    pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
+        let mut cfg = match path {
+            Some(p) => {
+                let s = std::fs::read_to_string(p)
+                    .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", p.display())))?;
+                toml::from_str(&s).map_err(|e| ConfigError::Parse(e.to_string()))?
+            }
+            None => Config::default(),
+        };
+        cfg.overlay_env()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Overlay the process's `MQTTD_*` environment onto this config (env is the higher layer).
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] if a numeric env var holds an unparseable value.
+    pub fn overlay_env(&mut self) -> Result<(), ConfigError> {
+        self.overlay_from(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// Overlay from an arbitrary getter (each key → its non-empty value, or `None`). This is
+    /// the single place `MQTTD_*` ↔ typed-field conversions live — including the *per-var*
+    /// boolean conventions (`MQTTD_ALLOW_ANONYMOUS`: any value = on; `MQTTD_DURABLE_SESSIONS`:
+    /// `0/false/off/no` = off) that make a naive string flatten unsafe. Injectable so the
+    /// mapping is unit-testable without touching the process environment.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] if a numeric var holds an unparseable value.
+    // One linear field-by-field mapping (the single source of env↔typed truth); splitting it
+    // would only scatter the surface it enumerates.
+    #[allow(clippy::too_many_lines)]
+    pub fn overlay_from<F>(&mut self, get: F) -> Result<(), ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        /// Parse a numeric env var or fail with a located error.
+        fn num<T: std::str::FromStr>(key: &str, v: &str) -> Result<T, ConfigError>
+        where
+            T::Err: std::fmt::Display,
+        {
+            v.parse::<T>()
+                .map_err(|e| ConfigError::Invalid(format!("{key}: invalid value {v:?}: {e}")))
+        }
+        fn list(v: &str) -> Vec<String> {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        }
+        // Convenience: run `f` with the value if the key is set.
+        macro_rules! on {
+            ($key:literal, $v:ident, $body:block) => {
+                if let Some($v) = get($key) {
+                    $body
+                }
+            };
+        }
+
+        // -- node --
+        on!("MQTTD_NODE_ID", v, {
+            self.node.id = v;
+        });
+        on!("MQTTD_DATA_DIR", v, {
+            self.node.data_dir = Some(v);
+        });
+        on!("MQTTD_FAILURE_DOMAIN", v, {
+            self.node.failure_domain = Some(v);
+        });
+        on!("MQTTD_FAILURE_DOMAINS", v, {
+            let mut m = BTreeMap::new();
+            for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (k, d) = pair.split_once('=').ok_or_else(|| {
+                    ConfigError::Invalid(format!(
+                        "MQTTD_FAILURE_DOMAINS entry {pair:?} is not node-id=domain"
+                    ))
+                })?;
+                m.insert(k.trim().to_string(), d.trim().to_string());
+            }
+            self.node.failure_domains = m;
+        });
+
+        // -- listeners --
+        on!("MQTTD_TLS_BIND", v, {
+            self.listeners.tls_bind = Some(v);
+        });
+        on!("MQTTD_PLAINTEXT_BIND", v, {
+            self.listeners.plaintext_bind = Some(v);
+        });
+        on!("MQTTD_WS_BIND", v, {
+            self.listeners.ws_bind = Some(v);
+        });
+        on!("MQTTD_WSS_BIND", v, {
+            self.listeners.wss_bind = Some(v);
+        });
+        on!("MQTTD_QUIC_BIND", v, {
+            self.listeners.quic_bind = Some(v);
+        });
+        on!("MQTTD_HEALTH_BIND", v, {
+            self.listeners.health_bind = Some(v);
+        });
+        on!("MQTTD_METRICS_BIND", v, {
+            self.listeners.metrics_bind = Some(v);
+        });
+
+        // -- tls --
+        on!("MQTTD_TLS_CERT", v, {
+            self.tls.cert = Some(v);
+        });
+        on!("MQTTD_TLS_KEY", v, {
+            self.tls.key = Some(v);
+        });
+        on!("MQTTD_TLS_CLIENT_CA", v, {
+            self.tls.client_ca = Some(v);
+        });
+        on!("MQTTD_TLS_CRL", v, {
+            self.tls.crl = Some(v);
+        });
+
+        // -- security -- (MQTTD_ALLOW_ANONYMOUS: presence = on; require_client_cert is derived,
+        // has no env var by design)
+        if get("MQTTD_ALLOW_ANONYMOUS").is_some() {
+            self.security.allow_anonymous = true;
+        }
+        on!("MQTTD_PASSWORD_FILE", v, {
+            self.security.password_file = Some(v);
+        });
+        on!("MQTTD_ACL_FILE", v, {
+            self.security.acl_file = Some(v);
+        });
+        on!("MQTTD_JWT_HS256_SECRET", v, {
+            self.security.jwt.hs256_secret_file = Some(v);
+        });
+        on!("MQTTD_JWT_RS256_PEM", v, {
+            self.security.jwt.rs256_pem_file = Some(v);
+        });
+        on!("MQTTD_JWT_ISSUER", v, {
+            self.security.jwt.issuer = Some(v);
+        });
+        on!("MQTTD_JWT_AUDIENCE", v, {
+            self.security.jwt.audience = Some(v);
+        });
+        on!("MQTTD_AUTH_TIMEOUT", v, {
+            self.security.auth_timeout_secs = Some(num("MQTTD_AUTH_TIMEOUT", &v)?);
+        });
+        on!("MQTTD_AUTH_PENALTY_THRESHOLD", v, {
+            self.security.auth_penalty.threshold = Some(num("MQTTD_AUTH_PENALTY_THRESHOLD", &v)?);
+        });
+        on!("MQTTD_AUTH_PENALTY_DECAY_SECS", v, {
+            self.security.auth_penalty.decay_secs = Some(num("MQTTD_AUTH_PENALTY_DECAY_SECS", &v)?);
+        });
+
+        // -- cluster --
+        on!("MQTTD_PEER_BIND", v, {
+            self.cluster.peer_bind = Some(v);
+        });
+        on!("MQTTD_PEER_ADVERTISE", v, {
+            self.cluster.peer_advertise = Some(v);
+        });
+        on!("MQTTD_PEERS", v, {
+            self.cluster.peers = list(&v);
+        });
+        on!("MQTTD_PEER_TLS_CA", v, {
+            self.cluster.peer_tls.ca = Some(v);
+        });
+        on!("MQTTD_PEER_TLS_CERT", v, {
+            self.cluster.peer_tls.cert = Some(v);
+        });
+        on!("MQTTD_PEER_TLS_KEY", v, {
+            self.cluster.peer_tls.key = Some(v);
+        });
+        on!("MQTTD_PEER_TLS_CRL", v, {
+            self.cluster.peer_tls.crl = Some(v);
+        });
+        on!("MQTTD_SWIM_BIND", v, {
+            self.cluster.swim.bind = Some(v);
+        });
+        on!("MQTTD_SWIM_SEEDS", v, {
+            self.cluster.swim.seeds = list(&v);
+        });
+        on!("MQTTD_SWIM_KEY", v, {
+            self.cluster.swim.key = Some(v);
+        });
+        on!("MQTTD_SWIM_KEY_ACCEPT", v, {
+            self.cluster.swim.key_accept = list(&v);
+        });
+        on!("MQTTD_SWIM_SIGNED", v, {
+            self.cluster.swim.signed = Some(v);
+        });
+        on!("MQTTD_SWIM_REPLAY", v, {
+            self.cluster.swim.replay = Some(v);
+        });
+
+        // -- durable -- (MQTTD_DURABLE_SESSIONS: 0/false/off/no = off, else on)
+        on!("MQTTD_DURABLE_SESSIONS", v, {
+            self.durable.enabled = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        });
+        on!("MQTTD_LEASE_VOTERS", v, {
+            self.durable.lease_voters = num("MQTTD_LEASE_VOTERS", &v)?;
+        });
+        on!("MQTTD_STORE_MAX_BYTES", v, {
+            self.durable.store_max_bytes = Some(num("MQTTD_STORE_MAX_BYTES", &v)?);
+        });
+
+        // -- limits --
+        on!("MQTTD_MAX_CONNECTIONS", v, {
+            self.limits.max_connections = Some(num("MQTTD_MAX_CONNECTIONS", &v)?);
+        });
+        on!("MQTTD_MAX_CONNECTIONS_PER_IP", v, {
+            self.limits.max_connections_per_ip = Some(num("MQTTD_MAX_CONNECTIONS_PER_IP", &v)?);
+        });
+        on!("MQTTD_MAX_PACKET_SIZE", v, {
+            self.limits.max_packet_size = Some(num("MQTTD_MAX_PACKET_SIZE", &v)?);
+        });
+        on!("MQTTD_MAX_PUBLISH_RATE", v, {
+            self.limits.max_publish_rate = Some(num("MQTTD_MAX_PUBLISH_RATE", &v)?);
+        });
+        on!("MQTTD_MAX_QUEUED_MESSAGES", v, {
+            self.limits.max_queued_messages = Some(num("MQTTD_MAX_QUEUED_MESSAGES", &v)?);
+        });
+        on!("MQTTD_MAX_RETAINED_MESSAGES", v, {
+            self.limits.max_retained_messages = Some(num("MQTTD_MAX_RETAINED_MESSAGES", &v)?);
+        });
+        on!("MQTTD_MAX_SESSIONS", v, {
+            self.limits.max_sessions = Some(num("MQTTD_MAX_SESSIONS", &v)?);
+        });
+        on!("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT", v, {
+            self.limits.max_subscriptions_per_client =
+                Some(num("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT", &v)?);
+        });
+        on!("MQTTD_RECEIVE_MAXIMUM", v, {
+            self.limits.receive_maximum = Some(num("MQTTD_RECEIVE_MAXIMUM", &v)?);
+        });
+        on!("MQTTD_TOPIC_ALIAS_MAX", v, {
+            self.limits.topic_alias_max = Some(num("MQTTD_TOPIC_ALIAS_MAX", &v)?);
+        });
+        on!("MQTTD_QUEUE_OVERFLOW", v, {
+            self.limits.queue_overflow = Some(v);
+        });
+
+        // -- observability --
+        on!("MQTTD_OTLP_ENDPOINT", v, {
+            self.observability.otlp_endpoint = Some(v);
+        });
+        on!("MQTTD_OTLP_INTERVAL", v, {
+            self.observability.otlp_interval_secs = num("MQTTD_OTLP_INTERVAL", &v)?;
+        });
+
+        // -- runtime --
+        on!("MQTTD_SHUTDOWN_GRACE", v, {
+            self.runtime.shutdown_grace_secs = num("MQTTD_SHUTDOWN_GRACE", &v)?;
+        });
+        on!("MQTTD_READY_MIN_MEMBERS", v, {
+            self.runtime.ready_min_members = num("MQTTD_READY_MIN_MEMBERS", &v)?;
+        });
+        on!("MQTTD_CONFIG_WATCH", v, {
+            self.runtime.config_watch_secs = num("MQTTD_CONFIG_WATCH", &v)?;
+        });
+
+        Ok(())
+    }
+
     /// Validate that the configuration is internally consistent, in range, and that every
     /// insecure combination has been explicitly opted into.
     ///
@@ -385,9 +660,9 @@ impl Config {
             }
         }
         if let Some(p) = &self.limits.queue_overflow {
-            if p != "drop-oldest" && p != "drop-new" {
+            if p != "drop-oldest" && p != "reject-newest" {
                 return Err(ConfigError::Invalid(format!(
-                    "limits.queue_overflow must be \"drop-oldest\" or \"drop-new\", got {p:?}"
+                    "limits.queue_overflow must be \"drop-oldest\" or \"reject-newest\", got {p:?}"
                 )));
             }
         }
@@ -483,5 +758,100 @@ mod tests {
     fn a_bad_enum_value_is_rejected() {
         assert!(Config::from_toml("[cluster.swim]\nsigned = \"maybe\"\n").is_err());
         assert!(Config::from_toml("[limits]\nqueue_overflow = \"drop-middle\"\n").is_err());
+        assert!(Config::from_toml("[limits]\nqueue_overflow = \"reject-newest\"\n").is_ok());
+    }
+
+    // --- ADR 0046 T2: env overlay + precedence ---
+
+    /// Build a getter from key→value pairs, for injecting an environment without touching
+    /// the real process env.
+    fn getter<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(kk, _)| *kk == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn env_overlay_wins_over_the_file() {
+        // File sets node id + lease voters; env overrides both (env is the higher layer).
+        let mut c =
+            Config::from_toml("[node]\nid = \"from-file\"\n[durable]\nlease_voters = 3\n").unwrap();
+        c.overlay_from(getter(&[
+            ("MQTTD_NODE_ID", "from-env"),
+            ("MQTTD_LEASE_VOTERS", "5"),
+        ]))
+        .unwrap();
+        assert_eq!(c.node.id, "from-env");
+        assert_eq!(c.durable.lease_voters, 5);
+    }
+
+    #[test]
+    fn per_var_boolean_conventions_are_honoured() {
+        // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_ALLOW_ANONYMOUS", "0")]))
+            .unwrap();
+        assert!(c.security.allow_anonymous, "any value enables anonymous");
+
+        // MQTTD_DURABLE_SESSIONS: 0/false/off/no = off, anything else = on.
+        for (v, want) in [
+            ("0", false),
+            ("false", false),
+            ("OFF", false),
+            ("no", false),
+            ("1", true),
+            ("yes", true),
+        ] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_DURABLE_SESSIONS", v)]))
+                .unwrap();
+            assert_eq!(c.durable.enabled, want, "MQTTD_DURABLE_SESSIONS={v:?}");
+        }
+    }
+
+    #[test]
+    fn comma_lists_and_the_domain_map_parse() {
+        let mut c = Config::default();
+        c.overlay_from(getter(&[
+            ("MQTTD_PEERS", "a:1, b:2 ,c:3"),
+            ("MQTTD_SWIM_SEEDS", "s1:7946,s2:7946"),
+            ("MQTTD_FAILURE_DOMAINS", "n1=rack-a, n2=rack-b"),
+        ]))
+        .unwrap();
+        assert_eq!(c.cluster.peers, vec!["a:1", "b:2", "c:3"]);
+        assert_eq!(c.cluster.swim.seeds.len(), 2);
+        assert_eq!(
+            c.node.failure_domains.get("n1").map(String::as_str),
+            Some("rack-a")
+        );
+        assert_eq!(
+            c.node.failure_domains.get("n2").map(String::as_str),
+            Some("rack-b")
+        );
+    }
+
+    #[test]
+    fn a_bad_numeric_env_value_is_a_located_error() {
+        let mut c = Config::default();
+        let err = c
+            .overlay_from(getter(&[("MQTTD_LEASE_VOTERS", "five")]))
+            .expect_err("non-numeric must fail");
+        match err {
+            super::ConfigError::Invalid(m) => assert!(m.contains("MQTTD_LEASE_VOTERS")),
+            super::ConfigError::Parse(m) => panic!("wrong error kind: {m}"),
+        }
+    }
+
+    #[test]
+    fn an_unset_env_leaves_file_and_defaults_intact() {
+        // Overlaying an empty environment changes nothing.
+        let base =
+            Config::from_toml("[node]\nid = \"keep\"\n[limits]\nmax_connections = 42\n").unwrap();
+        let mut c = base.clone();
+        c.overlay_from(getter(&[])).unwrap();
+        assert_eq!(c, base);
     }
 }
