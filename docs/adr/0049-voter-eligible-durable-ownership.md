@@ -1,7 +1,7 @@
 # ADR 0049 — Durable ownership must be lease-eligible, and a degraded durable plane must be visible
 
-- **Status:** Proposed
-- **Date:** 2026-07-19
+- **Status:** Accepted
+- **Date:** 2026-07-19 (accepted 2026-07-19)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0049-voter-eligible-durable-ownership.md](../delivery/0049-voter-eligible-durable-ownership.md) — plan, progress, and changelog
 - **Related:** [ADR 0021](0021-bounded-lease-voters.md) (bounded lease voters — this ADR
