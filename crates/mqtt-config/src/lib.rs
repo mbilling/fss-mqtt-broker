@@ -142,9 +142,9 @@ impl Default for Security {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Jwt {
-    /// HS256 shared-secret file (`MQTTD_JWT_HS`).
+    /// HS256 shared-secret file (`MQTTD_JWT_HS256_SECRET`).
     pub hs256_secret_file: Option<String>,
-    /// RS256 public-key PEM (`MQTTD_JWT_RS`).
+    /// RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`).
     pub rs256_pem_file: Option<String>,
     /// Required `iss` claim (`MQTTD_JWT_ISSUER`).
     pub issuer: Option<String>,
@@ -258,7 +258,7 @@ pub struct Limits {
     pub receive_maximum: Option<u16>,
     /// MQTT 5 Topic Alias Maximum granted to clients (`MQTTD_TOPIC_ALIAS_MAX`).
     pub topic_alias_max: Option<u16>,
-    /// Offline-queue overflow policy (`MQTTD_QUEUE_OVERFLOW`): `drop-oldest` or `drop-new`.
+    /// Offline-queue overflow policy (`MQTTD_QUEUE_OVERFLOW`): `drop-oldest` or `reject-newest`.
     pub queue_overflow: Option<String>,
 }
 
@@ -285,7 +285,8 @@ impl Default for Observability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Runtime {
-    /// Graceful-shutdown drain window, seconds (`MQTTD_SHUTDOWN_GRACE`, ADR 0019). Default 30.
+    /// Graceful-shutdown drain window, seconds (`MQTTD_SHUTDOWN_GRACE`, ADR 0019). Default 30;
+    /// `0` drains immediately (no wait for in-flight connections).
     pub shutdown_grace_secs: u64,
     /// Smallest mesh size `/readyz` accepts (`MQTTD_READY_MIN_MEMBERS`). Default 1.
     pub ready_min_members: usize,
@@ -328,6 +329,281 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Load the layered configuration in ADR 0046 precedence order:
+    /// **defaults → the TOML file at `path` (if any) → `MQTTD_*` environment overlay**,
+    /// then [`validate`](Self::validate). (CLI flags, the highest layer, are applied by the
+    /// caller after this returns.) Env wins over the file, which wins over defaults.
+    ///
+    /// # Errors
+    /// [`ConfigError::Parse`] if the file is unreadable or malformed; [`ConfigError::Invalid`]
+    /// if an env value is unparseable or the result fails validation.
+    pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
+        let mut cfg = match path {
+            Some(p) => {
+                let s = std::fs::read_to_string(p)
+                    .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", p.display())))?;
+                toml::from_str(&s).map_err(|e| ConfigError::Parse(e.to_string()))?
+            }
+            None => Config::default(),
+        };
+        cfg.overlay_env()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Overlay the process's `MQTTD_*` environment onto this config (env is the higher layer).
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] if a numeric env var holds an unparseable value.
+    pub fn overlay_env(&mut self) -> Result<(), ConfigError> {
+        self.overlay_from(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// Overlay from an arbitrary getter (each key → its non-empty value, or `None`). This is
+    /// the single place `MQTTD_*` ↔ typed-field conversions live — including the *per-var*
+    /// boolean conventions (`MQTTD_ALLOW_ANONYMOUS`: any value = on; `MQTTD_DURABLE_SESSIONS`:
+    /// `0/false/off/no` = off) that make a naive string flatten unsafe. Injectable so the
+    /// mapping is unit-testable without touching the process environment.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] if a numeric var holds an unparseable value.
+    // One linear field-by-field mapping (the single source of env↔typed truth); splitting it
+    // would only scatter the surface it enumerates.
+    #[allow(clippy::too_many_lines)]
+    pub fn overlay_from<F>(&mut self, get: F) -> Result<(), ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        /// Parse a numeric env var or fail with a located error.
+        fn num<T: std::str::FromStr>(key: &str, v: &str) -> Result<T, ConfigError>
+        where
+            T::Err: std::fmt::Display,
+        {
+            v.parse::<T>()
+                .map_err(|e| ConfigError::Invalid(format!("{key}: invalid value {v:?}: {e}")))
+        }
+        fn list(v: &str) -> Vec<String> {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        }
+        // Convenience: run `f` with the value if the key is set.
+        macro_rules! on {
+            ($key:literal, $v:ident, $body:block) => {
+                if let Some($v) = get($key) {
+                    $body
+                }
+            };
+        }
+
+        // -- node --
+        on!("MQTTD_NODE_ID", v, {
+            self.node.id = v;
+        });
+        on!("MQTTD_DATA_DIR", v, {
+            self.node.data_dir = Some(v);
+        });
+        on!("MQTTD_FAILURE_DOMAIN", v, {
+            self.node.failure_domain = Some(v);
+        });
+        on!("MQTTD_FAILURE_DOMAINS", v, {
+            let mut m = BTreeMap::new();
+            for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (k, d) = pair.split_once('=').ok_or_else(|| {
+                    ConfigError::Invalid(format!(
+                        "MQTTD_FAILURE_DOMAINS entry {pair:?} is not node-id=domain"
+                    ))
+                })?;
+                m.insert(k.trim().to_string(), d.trim().to_string());
+            }
+            self.node.failure_domains = m;
+        });
+
+        // -- listeners --
+        on!("MQTTD_TLS_BIND", v, {
+            self.listeners.tls_bind = Some(v);
+        });
+        on!("MQTTD_PLAINTEXT_BIND", v, {
+            self.listeners.plaintext_bind = Some(v);
+        });
+        on!("MQTTD_WS_BIND", v, {
+            self.listeners.ws_bind = Some(v);
+        });
+        on!("MQTTD_WSS_BIND", v, {
+            self.listeners.wss_bind = Some(v);
+        });
+        on!("MQTTD_QUIC_BIND", v, {
+            self.listeners.quic_bind = Some(v);
+        });
+        on!("MQTTD_HEALTH_BIND", v, {
+            self.listeners.health_bind = Some(v);
+        });
+        on!("MQTTD_METRICS_BIND", v, {
+            self.listeners.metrics_bind = Some(v);
+        });
+
+        // -- tls --
+        on!("MQTTD_TLS_CERT", v, {
+            self.tls.cert = Some(v);
+        });
+        on!("MQTTD_TLS_KEY", v, {
+            self.tls.key = Some(v);
+        });
+        on!("MQTTD_TLS_CLIENT_CA", v, {
+            self.tls.client_ca = Some(v);
+        });
+        on!("MQTTD_TLS_CRL", v, {
+            self.tls.crl = Some(v);
+        });
+
+        // -- security -- (MQTTD_ALLOW_ANONYMOUS: presence = on; require_client_cert is derived,
+        // has no env var by design)
+        if get("MQTTD_ALLOW_ANONYMOUS").is_some() {
+            self.security.allow_anonymous = true;
+        }
+        on!("MQTTD_PASSWORD_FILE", v, {
+            self.security.password_file = Some(v);
+        });
+        on!("MQTTD_ACL_FILE", v, {
+            self.security.acl_file = Some(v);
+        });
+        on!("MQTTD_JWT_HS256_SECRET", v, {
+            self.security.jwt.hs256_secret_file = Some(v);
+        });
+        on!("MQTTD_JWT_RS256_PEM", v, {
+            self.security.jwt.rs256_pem_file = Some(v);
+        });
+        on!("MQTTD_JWT_ISSUER", v, {
+            self.security.jwt.issuer = Some(v);
+        });
+        on!("MQTTD_JWT_AUDIENCE", v, {
+            self.security.jwt.audience = Some(v);
+        });
+        on!("MQTTD_AUTH_TIMEOUT", v, {
+            self.security.auth_timeout_secs = Some(num("MQTTD_AUTH_TIMEOUT", &v)?);
+        });
+        on!("MQTTD_AUTH_PENALTY_THRESHOLD", v, {
+            self.security.auth_penalty.threshold = Some(num("MQTTD_AUTH_PENALTY_THRESHOLD", &v)?);
+        });
+        on!("MQTTD_AUTH_PENALTY_DECAY_SECS", v, {
+            self.security.auth_penalty.decay_secs = Some(num("MQTTD_AUTH_PENALTY_DECAY_SECS", &v)?);
+        });
+
+        // -- cluster --
+        on!("MQTTD_PEER_BIND", v, {
+            self.cluster.peer_bind = Some(v);
+        });
+        on!("MQTTD_PEER_ADVERTISE", v, {
+            self.cluster.peer_advertise = Some(v);
+        });
+        on!("MQTTD_PEERS", v, {
+            self.cluster.peers = list(&v);
+        });
+        on!("MQTTD_PEER_TLS_CA", v, {
+            self.cluster.peer_tls.ca = Some(v);
+        });
+        on!("MQTTD_PEER_TLS_CERT", v, {
+            self.cluster.peer_tls.cert = Some(v);
+        });
+        on!("MQTTD_PEER_TLS_KEY", v, {
+            self.cluster.peer_tls.key = Some(v);
+        });
+        on!("MQTTD_PEER_TLS_CRL", v, {
+            self.cluster.peer_tls.crl = Some(v);
+        });
+        on!("MQTTD_SWIM_BIND", v, {
+            self.cluster.swim.bind = Some(v);
+        });
+        on!("MQTTD_SWIM_SEEDS", v, {
+            self.cluster.swim.seeds = list(&v);
+        });
+        on!("MQTTD_SWIM_KEY", v, {
+            self.cluster.swim.key = Some(v);
+        });
+        on!("MQTTD_SWIM_KEY_ACCEPT", v, {
+            self.cluster.swim.key_accept = list(&v);
+        });
+        on!("MQTTD_SWIM_SIGNED", v, {
+            self.cluster.swim.signed = Some(v);
+        });
+        on!("MQTTD_SWIM_REPLAY", v, {
+            self.cluster.swim.replay = Some(v);
+        });
+
+        // -- durable -- (MQTTD_DURABLE_SESSIONS: 0/false/off/no = off, else on)
+        on!("MQTTD_DURABLE_SESSIONS", v, {
+            self.durable.enabled = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        });
+        on!("MQTTD_LEASE_VOTERS", v, {
+            self.durable.lease_voters = num("MQTTD_LEASE_VOTERS", &v)?;
+        });
+        on!("MQTTD_STORE_MAX_BYTES", v, {
+            self.durable.store_max_bytes = Some(num("MQTTD_STORE_MAX_BYTES", &v)?);
+        });
+
+        // -- limits --
+        on!("MQTTD_MAX_CONNECTIONS", v, {
+            self.limits.max_connections = Some(num("MQTTD_MAX_CONNECTIONS", &v)?);
+        });
+        on!("MQTTD_MAX_CONNECTIONS_PER_IP", v, {
+            self.limits.max_connections_per_ip = Some(num("MQTTD_MAX_CONNECTIONS_PER_IP", &v)?);
+        });
+        on!("MQTTD_MAX_PACKET_SIZE", v, {
+            self.limits.max_packet_size = Some(num("MQTTD_MAX_PACKET_SIZE", &v)?);
+        });
+        on!("MQTTD_MAX_PUBLISH_RATE", v, {
+            self.limits.max_publish_rate = Some(num("MQTTD_MAX_PUBLISH_RATE", &v)?);
+        });
+        on!("MQTTD_MAX_QUEUED_MESSAGES", v, {
+            self.limits.max_queued_messages = Some(num("MQTTD_MAX_QUEUED_MESSAGES", &v)?);
+        });
+        on!("MQTTD_MAX_RETAINED_MESSAGES", v, {
+            self.limits.max_retained_messages = Some(num("MQTTD_MAX_RETAINED_MESSAGES", &v)?);
+        });
+        on!("MQTTD_MAX_SESSIONS", v, {
+            self.limits.max_sessions = Some(num("MQTTD_MAX_SESSIONS", &v)?);
+        });
+        on!("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT", v, {
+            self.limits.max_subscriptions_per_client =
+                Some(num("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT", &v)?);
+        });
+        on!("MQTTD_RECEIVE_MAXIMUM", v, {
+            self.limits.receive_maximum = Some(num("MQTTD_RECEIVE_MAXIMUM", &v)?);
+        });
+        on!("MQTTD_TOPIC_ALIAS_MAX", v, {
+            self.limits.topic_alias_max = Some(num("MQTTD_TOPIC_ALIAS_MAX", &v)?);
+        });
+        on!("MQTTD_QUEUE_OVERFLOW", v, {
+            self.limits.queue_overflow = Some(v);
+        });
+
+        // -- observability --
+        on!("MQTTD_OTLP_ENDPOINT", v, {
+            self.observability.otlp_endpoint = Some(v);
+        });
+        on!("MQTTD_OTLP_INTERVAL", v, {
+            self.observability.otlp_interval_secs = num("MQTTD_OTLP_INTERVAL", &v)?;
+        });
+
+        // -- runtime --
+        on!("MQTTD_SHUTDOWN_GRACE", v, {
+            self.runtime.shutdown_grace_secs = num("MQTTD_SHUTDOWN_GRACE", &v)?;
+        });
+        on!("MQTTD_READY_MIN_MEMBERS", v, {
+            self.runtime.ready_min_members = num("MQTTD_READY_MIN_MEMBERS", &v)?;
+        });
+        on!("MQTTD_CONFIG_WATCH", v, {
+            self.runtime.config_watch_secs = num("MQTTD_CONFIG_WATCH", &v)?;
+        });
+
+        Ok(())
+    }
+
     /// Validate that the configuration is internally consistent, in range, and that every
     /// insecure combination has been explicitly opted into.
     ///
@@ -342,11 +618,8 @@ impl Config {
                 "durable.lease_voters must be >= 1".to_string(),
             ));
         }
-        if self.runtime.shutdown_grace_secs == 0 {
-            return Err(ConfigError::Invalid(
-                "runtime.shutdown_grace_secs must be >= 1".to_string(),
-            ));
-        }
+        // shutdown_grace_secs == 0 is valid and meaningful: drain immediately (no wait for
+        // in-flight connections), the ADR 0019 fast-teardown value the test harness relies on.
         if self.runtime.ready_min_members == 0 {
             return Err(ConfigError::Invalid(
                 "runtime.ready_min_members must be >= 1".to_string(),
@@ -385,9 +658,9 @@ impl Config {
             }
         }
         if let Some(p) = &self.limits.queue_overflow {
-            if p != "drop-oldest" && p != "drop-new" {
+            if p != "drop-oldest" && p != "reject-newest" {
                 return Err(ConfigError::Invalid(format!(
-                    "limits.queue_overflow must be \"drop-oldest\" or \"drop-new\", got {p:?}"
+                    "limits.queue_overflow must be \"drop-oldest\" or \"reject-newest\", got {p:?}"
                 )));
             }
         }
@@ -395,9 +668,87 @@ impl Config {
     }
 }
 
+/// The authoritative `MQTTD_*` environment surface — every variable
+/// [`Config::overlay_from`] consumes, in declaration order. This is the single list the
+/// binary's env↔config mapping is checked against (the bijection test below). Adding a config
+/// field that an env var should set means adding the var here *and* wiring it in `overlay_from`.
+///
+/// **Documented exceptions** (a config key with no env var, or an env var with no config key):
+/// - [`Security::require_client_cert`] is *derived*, not env-set — it has no variable by design.
+/// - `MQTTD_CONFIG` is the meta variable naming the config *file*; it is read by the binary to
+///   locate the file, not overlaid as a field, so it is deliberately absent here.
+pub const ENV_VARS: &[&str] = &[
+    // node
+    "MQTTD_NODE_ID",
+    "MQTTD_DATA_DIR",
+    "MQTTD_FAILURE_DOMAIN",
+    "MQTTD_FAILURE_DOMAINS",
+    // listeners
+    "MQTTD_TLS_BIND",
+    "MQTTD_PLAINTEXT_BIND",
+    "MQTTD_WS_BIND",
+    "MQTTD_WSS_BIND",
+    "MQTTD_QUIC_BIND",
+    "MQTTD_HEALTH_BIND",
+    "MQTTD_METRICS_BIND",
+    // tls
+    "MQTTD_TLS_CERT",
+    "MQTTD_TLS_KEY",
+    "MQTTD_TLS_CLIENT_CA",
+    "MQTTD_TLS_CRL",
+    // security
+    "MQTTD_ALLOW_ANONYMOUS",
+    "MQTTD_PASSWORD_FILE",
+    "MQTTD_ACL_FILE",
+    "MQTTD_JWT_HS256_SECRET",
+    "MQTTD_JWT_RS256_PEM",
+    "MQTTD_JWT_ISSUER",
+    "MQTTD_JWT_AUDIENCE",
+    "MQTTD_AUTH_TIMEOUT",
+    "MQTTD_AUTH_PENALTY_THRESHOLD",
+    "MQTTD_AUTH_PENALTY_DECAY_SECS",
+    // cluster
+    "MQTTD_PEER_BIND",
+    "MQTTD_PEER_ADVERTISE",
+    "MQTTD_PEERS",
+    "MQTTD_PEER_TLS_CA",
+    "MQTTD_PEER_TLS_CERT",
+    "MQTTD_PEER_TLS_KEY",
+    "MQTTD_PEER_TLS_CRL",
+    "MQTTD_SWIM_BIND",
+    "MQTTD_SWIM_SEEDS",
+    "MQTTD_SWIM_KEY",
+    "MQTTD_SWIM_KEY_ACCEPT",
+    "MQTTD_SWIM_SIGNED",
+    "MQTTD_SWIM_REPLAY",
+    // durable
+    "MQTTD_DURABLE_SESSIONS",
+    "MQTTD_LEASE_VOTERS",
+    "MQTTD_STORE_MAX_BYTES",
+    // limits
+    "MQTTD_MAX_CONNECTIONS",
+    "MQTTD_MAX_CONNECTIONS_PER_IP",
+    "MQTTD_MAX_PACKET_SIZE",
+    "MQTTD_MAX_PUBLISH_RATE",
+    "MQTTD_MAX_QUEUED_MESSAGES",
+    "MQTTD_MAX_RETAINED_MESSAGES",
+    "MQTTD_MAX_SESSIONS",
+    "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT",
+    "MQTTD_RECEIVE_MAXIMUM",
+    "MQTTD_TOPIC_ALIAS_MAX",
+    "MQTTD_QUEUE_OVERFLOW",
+    // observability
+    "MQTTD_OTLP_ENDPOINT",
+    "MQTTD_OTLP_INTERVAL",
+    // runtime
+    "MQTTD_SHUTDOWN_GRACE",
+    "MQTTD_READY_MIN_MEMBERS",
+    "MQTTD_CONFIG_WATCH",
+];
+
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ENV_VARS};
 
     #[test]
     fn defaults_are_secure() {
@@ -468,8 +819,9 @@ mod tests {
     #[test]
     fn out_of_range_values_are_rejected() {
         assert!(Config::from_toml("[durable]\nlease_voters = 0\n").is_err());
-        assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_err());
         assert!(Config::from_toml("[runtime]\nready_min_members = 0\n").is_err());
+        // shutdown_grace_secs = 0 is *valid* (drain immediately) — not out of range.
+        assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_ok());
     }
 
     #[test]
@@ -483,5 +835,194 @@ mod tests {
     fn a_bad_enum_value_is_rejected() {
         assert!(Config::from_toml("[cluster.swim]\nsigned = \"maybe\"\n").is_err());
         assert!(Config::from_toml("[limits]\nqueue_overflow = \"drop-middle\"\n").is_err());
+        assert!(Config::from_toml("[limits]\nqueue_overflow = \"reject-newest\"\n").is_ok());
+    }
+
+    // --- ADR 0046 T2: env overlay + precedence ---
+
+    /// Build a getter from key→value pairs, for injecting an environment without touching
+    /// the real process env.
+    fn getter<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(kk, _)| *kk == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn env_overlay_wins_over_the_file() {
+        // File sets node id + lease voters; env overrides both (env is the higher layer).
+        let mut c =
+            Config::from_toml("[node]\nid = \"from-file\"\n[durable]\nlease_voters = 3\n").unwrap();
+        c.overlay_from(getter(&[
+            ("MQTTD_NODE_ID", "from-env"),
+            ("MQTTD_LEASE_VOTERS", "5"),
+        ]))
+        .unwrap();
+        assert_eq!(c.node.id, "from-env");
+        assert_eq!(c.durable.lease_voters, 5);
+    }
+
+    #[test]
+    fn per_var_boolean_conventions_are_honoured() {
+        // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_ALLOW_ANONYMOUS", "0")]))
+            .unwrap();
+        assert!(c.security.allow_anonymous, "any value enables anonymous");
+
+        // MQTTD_DURABLE_SESSIONS: 0/false/off/no = off, anything else = on.
+        for (v, want) in [
+            ("0", false),
+            ("false", false),
+            ("OFF", false),
+            ("no", false),
+            ("1", true),
+            ("yes", true),
+        ] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_DURABLE_SESSIONS", v)]))
+                .unwrap();
+            assert_eq!(c.durable.enabled, want, "MQTTD_DURABLE_SESSIONS={v:?}");
+        }
+    }
+
+    #[test]
+    fn comma_lists_and_the_domain_map_parse() {
+        let mut c = Config::default();
+        c.overlay_from(getter(&[
+            ("MQTTD_PEERS", "a:1, b:2 ,c:3"),
+            ("MQTTD_SWIM_SEEDS", "s1:7946,s2:7946"),
+            ("MQTTD_FAILURE_DOMAINS", "n1=rack-a, n2=rack-b"),
+        ]))
+        .unwrap();
+        assert_eq!(c.cluster.peers, vec!["a:1", "b:2", "c:3"]);
+        assert_eq!(c.cluster.swim.seeds.len(), 2);
+        assert_eq!(
+            c.node.failure_domains.get("n1").map(String::as_str),
+            Some("rack-a")
+        );
+        assert_eq!(
+            c.node.failure_domains.get("n2").map(String::as_str),
+            Some("rack-b")
+        );
+    }
+
+    #[test]
+    fn a_bad_numeric_env_value_is_a_located_error() {
+        let mut c = Config::default();
+        let err = c
+            .overlay_from(getter(&[("MQTTD_LEASE_VOTERS", "five")]))
+            .expect_err("non-numeric must fail");
+        match err {
+            super::ConfigError::Invalid(m) => assert!(m.contains("MQTTD_LEASE_VOTERS")),
+            super::ConfigError::Parse(m) => panic!("wrong error kind: {m}"),
+        }
+    }
+
+    #[test]
+    fn an_unset_env_leaves_file_and_defaults_intact() {
+        // Overlaying an empty environment changes nothing.
+        let base =
+            Config::from_toml("[node]\nid = \"keep\"\n[limits]\nmax_connections = 42\n").unwrap();
+        let mut c = base.clone();
+        c.overlay_from(getter(&[])).unwrap();
+        assert_eq!(c, base);
+    }
+
+    /// A value guaranteed to *differ from the default* for `var`, so overlaying it alone must
+    /// mutate the config. Booleans/enums need a specific opposite-of-default value; numerics need
+    /// a parseable one; everything else takes an arbitrary non-empty string.
+    fn distinct_value(var: &str) -> &'static str {
+        match var {
+            // Durable is on by default — the only value that *changes* it is a falsey one.
+            "MQTTD_DURABLE_SESSIONS" => "off",
+            // Presence flips anonymous on (default off).
+            "MQTTD_ALLOW_ANONYMOUS" => "1",
+            // Enums: any valid, non-default (default None) member.
+            "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
+            "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
+            // The node=domain map needs a well-formed entry.
+            "MQTTD_FAILURE_DOMAINS" => "n1=rack-a",
+            // Numerics (all widths parse "7").
+            "MQTTD_AUTH_TIMEOUT"
+            | "MQTTD_AUTH_PENALTY_THRESHOLD"
+            | "MQTTD_AUTH_PENALTY_DECAY_SECS"
+            | "MQTTD_LEASE_VOTERS"
+            | "MQTTD_STORE_MAX_BYTES"
+            | "MQTTD_MAX_CONNECTIONS"
+            | "MQTTD_MAX_CONNECTIONS_PER_IP"
+            | "MQTTD_MAX_PACKET_SIZE"
+            | "MQTTD_MAX_PUBLISH_RATE"
+            | "MQTTD_MAX_QUEUED_MESSAGES"
+            | "MQTTD_MAX_RETAINED_MESSAGES"
+            | "MQTTD_MAX_SESSIONS"
+            | "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT"
+            | "MQTTD_RECEIVE_MAXIMUM"
+            | "MQTTD_TOPIC_ALIAS_MAX"
+            | "MQTTD_OTLP_INTERVAL"
+            | "MQTTD_SHUTDOWN_GRACE"
+            | "MQTTD_READY_MIN_MEMBERS"
+            | "MQTTD_CONFIG_WATCH" => "7",
+            // Paths / addresses / lists / keys.
+            _ => "x-sentinel",
+        }
+    }
+
+    #[test]
+    fn the_env_surface_is_a_deduplicated_curated_list() {
+        // Every var appears exactly once — a duplicate would be a copy/paste bug that hides a
+        // missing mapping.
+        let mut seen = std::collections::BTreeSet::new();
+        for v in ENV_VARS {
+            assert!(seen.insert(*v), "{v} is listed twice in ENV_VARS");
+            assert!(v.starts_with("MQTTD_"), "{v} is not an MQTTD_* var");
+        }
+        // Guards the count so adding/removing a field forces a deliberate list update.
+        assert_eq!(
+            seen.len(),
+            57,
+            "the MQTTD_* surface changed — update ENV_VARS"
+        );
+    }
+
+    #[test]
+    fn every_env_var_maps_to_a_config_key() {
+        // Totality (env → config): setting *one* listed var, alone, must move the config off its
+        // default. If overlay_from ever dropped a mapping, that var's overlay would be a no-op
+        // and this fails — the var would silently do nothing.
+        for var in ENV_VARS {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[(var, distinct_value(var))]))
+                .unwrap_or_else(|e| panic!("overlay of {var} errored: {e}"));
+            assert_ne!(
+                c,
+                Config::default(),
+                "{var} is in ENV_VARS but overlaying it changed nothing — the mapping is missing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_env_surface_overlays_without_collision() {
+        // Setting the entire surface at once produces a config that differs from default in every
+        // section and still round-trips through validate for the numeric/enistence-only fields
+        // (the relational checks that a full env would trip — crl-without-ca etc. — are exercised
+        // by the dedicated tests above; here every var carries a self-consistent value).
+        let pairs: Vec<(&str, &str)> = ENV_VARS.iter().map(|v| (*v, distinct_value(v))).collect();
+        let mut c = Config::default();
+        c.overlay_from(getter(&pairs)).unwrap();
+        // A representative field from each section moved.
+        assert_eq!(c.node.id, "x-sentinel");
+        assert!(c.listeners.tls_bind.is_some());
+        assert!(c.tls.cert.is_some());
+        assert!(c.security.allow_anonymous);
+        assert!(c.cluster.peer_bind.is_some());
+        assert!(!c.durable.enabled);
+        assert_eq!(c.limits.max_connections, Some(7));
+        assert!(c.observability.otlp_endpoint.is_some());
+        assert_eq!(c.runtime.ready_min_members, 7);
     }
 }

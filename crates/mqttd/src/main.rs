@@ -9,7 +9,12 @@
 //! Secure-by-default: no listener runs unless explicitly enabled, and every
 //! plaintext option is loudly logged as insecure.
 //!
-//! Dev environment shims (until config-file loading lands):
+//! Configuration (ADR 0046): every setting below is loaded in precedence order
+//! **defaults < TOML file < `MQTTD_*` env var** (CLI flags on top) into a typed
+//! `mqtt_config::Config` — the `MQTTD_*` variables are the env layer of that config, not
+//! read directly here. The TOML file is named by `--config <path>` or `MQTTD_CONFIG`; with
+//! neither, config is defaults + the env overlay (fully backward compatible). Each
+//! `MQTTD_*` variable maps to exactly one config key (see `mqtt_config::ENV_VARS`).
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
 //! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
 //! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
@@ -163,20 +168,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let node_id = NodeId(std::env::var("MQTTD_NODE_ID").unwrap_or_else(|_| "node-local".into()));
+    // ADR 0046 T2: assemble the effective configuration in precedence order —
+    // defaults < TOML file < `MQTTD_*` env. The file path comes from `--config <path>` or
+    // `MQTTD_CONFIG` (the flag wins); with neither, the config is defaults + the env overlay,
+    // fully backward-compatible with the env-only deployments that predate file config. CLI
+    // flags are ADR 0046's top layer; today `--config` is the only one, so env is the highest
+    // value layer. Every `MQTTD_*` setting below is now read from this typed `Config`, never
+    // from `std::env` directly — the env surface is mapped once, in `mqtt_config`.
+    let config = Arc::new(load_config()?);
+    let node_id = NodeId(config.node.id.clone());
     info!(version = env!("CARGO_PKG_VERSION"), node = %node_id.0, "starting mqttd");
-
-    let config = Config::default();
-    config.validate()?;
-    info!(
-        require_client_cert = config.security.require_client_cert,
-        allow_anonymous = config.security.allow_anonymous,
-        "configuration validated (secure defaults)"
-    );
+    log_effective_config(&config);
 
     // Server-wide MQTT 5 wire limits (ADR 0011/0012/0013), configurable via env, set once
     // before any connection is served.
-    let wire_limits = wire_limits_from_env()?;
+    let wire_limits = wire_limits_from_config(&config)?;
     // The same ceiling governs the transport frame reader (ADR 0041 T4): the
     // advertised Maximum Packet Size and the enforced cap cannot drift apart.
     mqtt_net::set_max_packet_bytes(wire_limits.max_packet_size as usize);
@@ -188,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Placement::new(node_id.clone(), placement::DEFAULT_REPLICAS)
             // This node's own failure-domain label (ADR 0016 T5), so placement reports it
             // in the topology map without waiting for gossip to round-trip.
-            .with_local_domain(this_node_failure_domain()),
+            .with_local_domain(config.node.failure_domain.clone()),
     ));
 
     // Graceful-shutdown plumbing (ADR 0019): a cancellation token that stops the accept
@@ -202,14 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pushed via OTLP/HTTP (ADR 0020 T9); otherwise it is the Prometheus endpoint only.
     let version = env!("CARGO_PKG_VERSION");
     let metrics = Arc::new(
-        if let Some(endpoint) = non_empty_env("MQTTD_OTLP_ENDPOINT") {
-            let interval = non_empty_env("MQTTD_OTLP_INTERVAL")
-                .and_then(|v| v.parse().ok())
-                .map_or(Duration::from_secs(10), Duration::from_secs);
+        if let Some(endpoint) = &config.observability.otlp_endpoint {
+            let interval = Duration::from_secs(config.observability.otlp_interval_secs);
             // node_id becomes service.instance.id so each cluster node's OTLP series are
             // distinct at the backend (otherwise all nodes collide into one series).
             let m = mqtt_observability::metrics::Metrics::with_otlp(
-                version, &endpoint, interval, &node_id.0,
+                version, endpoint, interval, &node_id.0,
             )?;
             info!(%endpoint, interval_s = interval.as_secs(), "OTLP/HTTP metric export enabled");
             m
@@ -222,18 +226,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the bounded in-memory default). The store is shared with connections for the
     // QoS-2 dedup window (ADR 0007 §5).
     let (hub_tx, store, durable_plane, lease_driver) =
-        start_hub(&node_id, &placement, &metrics).await?;
+        start_hub(&config, &node_id, &placement, &metrics).await?;
 
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
     // handle to stop openraft cleanly on shutdown.
     let plane_for_shutdown = durable_plane.clone();
-    let (draining, decommission_slot) =
-        start_health_from_env(&hub_tx, &placement, durable_plane.clone(), metrics.clone()).await?;
+    let (draining, decommission_slot) = start_health(
+        &config,
+        &hub_tx,
+        &placement,
+        durable_plane.clone(),
+        metrics.clone(),
+    )
+    .await?;
 
     // Cluster-bus mTLS context (ADR 0002): one CA + node cert pair secures both
     // the accepting and dialing side of every peer link.
-    let peer_tls_parts = peer_tls_from_env()?;
+    let peer_tls_parts = peer_tls_from_config(&config)?;
     let (peer_tls, peer_tls_reload) = match peer_tls_parts {
         Some((tls, reload_parts)) => (Some(tls), Some(reload_parts)),
         None => (None, None),
@@ -247,8 +257,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
-    let (policy, mut reloader) =
-        client_policy_from_env(Some(proxy), store, shutdown.clone(), metrics.clone())?;
+    let (policy, mut reloader) = client_policy(
+        &config,
+        Some(proxy),
+        store,
+        shutdown.clone(),
+        metrics.clone(),
+    )?;
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
     // reload as the client policy: a republished CRL revokes a node's gossip on the next
@@ -269,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Cluster peer mesh (opt-in).
-    let peer_bind = non_empty_env("MQTTD_PEER_BIND");
+    let peer_bind = config.cluster.peer_bind.clone();
     if let Some(bind) = &peer_bind {
         if peer_tls.is_none() {
             warn!(%bind, "INSECURE: starting PLAINTEXT peer listener (no mTLS) — testing use only");
@@ -285,22 +300,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             durable_plane.clone(),
         ));
     }
-    if let Some(peers) = non_empty_env("MQTTD_PEERS") {
-        for addr in peers.split(',').map(str::trim).filter(|a| !a.is_empty()) {
-            info!(%addr, "dialing cluster peer (static)");
-            tokio::spawn(peer::dial_forever(
-                addr.to_string(),
-                node_id.clone(),
-                hub_tx.clone(),
-                peer_tls.clone(),
-                durable_plane.clone(),
-            ));
-        }
+    for addr in &config.cluster.peers {
+        info!(%addr, "dialing cluster peer (static)");
+        tokio::spawn(peer::dial_forever(
+            addr.clone(),
+            node_id.clone(),
+            hub_tx.clone(),
+            peer_tls.clone(),
+            durable_plane.clone(),
+        ));
     }
 
     // SWIM gossip membership (opt-in): discovers peers and drives the peer mesh,
     // replacing the need for a static MQTTD_PEERS list.
-    start_swim_from_env(
+    start_swim(
+        &config,
         &node_id,
         peer_bind,
         &hub_tx,
@@ -320,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // removed password user, or a connect-ACL deny evicts the live session. The
     // client-CRL serials mirror the same MQTTD_TLS_CRL file the TLS verifier enforces
     // per handshake; parsing it is part of the same validate-before-swap reload.
-    let client_crl_build = non_empty_env("MQTTD_TLS_CRL").map(|path| {
+    let client_crl_build = config.tls.crl.clone().map(|path| {
         Box::new(move || {
             let bytes = std::fs::read(&path).map_err(|e| format!("read client crl {path}: {e}"))?;
             mqtt_auth::signed_gossip::RevocationList::from_bytes_unverified(&bytes)
@@ -331,18 +345,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Disk visibility + watermark brownout (ADR 0041 T5): stat the redb stores
     // periodically, export store_bytes{store}, and drive the hub's brownout flag
     // when MQTTD_STORE_MAX_BYTES is configured.
-    if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
-        let max_bytes = match non_empty_env("MQTTD_STORE_MAX_BYTES") {
-            None => None,
-            Some(v) => match v.parse::<u64>() {
-                Ok(n) if n >= 1 => Some(n),
-                _ => {
-                    return Err(format!(
-                        "MQTTD_STORE_MAX_BYTES must be a positive integer, got {v:?}"
-                    )
-                    .into())
-                }
-            },
+    if let Some(dir) = &config.node.data_dir {
+        // ADR 0041 T5: the disk high-water cap. A configured zero is meaningless (it would
+        // brown out immediately), so reject it as the env path did.
+        let max_bytes = match config.durable.store_max_bytes {
+            Some(0) => return Err("store_max_bytes must be a positive integer".into()),
+            other => other,
         };
         if let Some(max) = max_bytes {
             info!(max, "disk watermark active (ADR 0041): brownout above it");
@@ -359,19 +367,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-client and global state quotas (ADR 0041 T3/T4), configured once before
     // any listener accepts. Unset = uncapped; a non-positive or unparseable value
     // is a startup error.
-    let quota = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
-        match non_empty_env(var) {
-            None => Ok(None),
-            Some(v) => match v.parse::<usize>() {
-                Ok(n) if n >= 1 => Ok(Some(n)),
-                _ => Err(format!("{var} must be a positive integer, got {v:?}").into()),
-            },
-        }
-    };
     let quotas = mqttd::hub::Quotas {
-        max_subscriptions_per_client: quota("MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT")?,
-        max_retained_messages: quota("MQTTD_MAX_RETAINED_MESSAGES")?,
-        max_sessions: quota("MQTTD_MAX_SESSIONS")?,
+        max_subscriptions_per_client: positive_cap(
+            "limits.max_subscriptions_per_client",
+            config.limits.max_subscriptions_per_client,
+        )?,
+        max_retained_messages: positive_cap(
+            "limits.max_retained_messages",
+            config.limits.max_retained_messages,
+        )?,
+        max_sessions: positive_cap("limits.max_sessions", config.limits.max_sessions)?,
     };
     if quotas.max_subscriptions_per_client.is_some()
         || quotas.max_retained_messages.is_some()
@@ -388,7 +393,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mqttd::hub::AuthzWatch(policy.authz.clone()),
     ));
 
-    start_client_listeners(hub_tx, policy, &mut reloader, &shutdown, &connections).await?;
+    start_client_listeners(
+        &config,
+        hub_tx,
+        policy,
+        &mut reloader,
+        &shutdown,
+        &connections,
+    )
+    .await?;
 
     // Share the (now fully-configured) reloader between the SIGHUP handler and the optional
     // filesystem watcher; both drive the same validate-before-swap routine.
@@ -401,10 +414,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional filesystem watcher (ADR 0033): MQTTD_CONFIG_WATCH=<seconds> auto-reloads when a
     // configured policy file changes on disk (the Kubernetes ConfigMap case), through the same
     // fail-safe reload. Off by default — signal-driven reload stays the default.
-    spawn_config_watcher(reloader, &shutdown)?;
+    spawn_config_watcher(&config, reloader, &shutdown);
 
     // Run until a shutdown signal, then drain gracefully (ADR 0019).
     graceful_shutdown(
+        Duration::from_secs(config.runtime.shutdown_grace_secs),
         &shutdown,
         &connections,
         &draining,
@@ -430,31 +444,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `MQTTD_MAX_CONNECTIONS` / `MQTTD_MAX_CONNECTIONS_PER_IP`. Unset = uncapped
 /// (today's behavior); a value that does not parse as a positive integer is a
 /// startup error, not a silent misconfiguration.
-fn admission_gate_from_env(
+fn admission_gate(
+    config: &Config,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     audit: Option<Arc<dyn mqtt_observability::AuditSink>>,
 ) -> Result<admission::AdmissionGate, Box<dyn std::error::Error>> {
-    let cap = |var: &str| -> Result<Option<usize>, Box<dyn std::error::Error>> {
-        match non_empty_env(var) {
-            None => Ok(None),
-            Some(v) => match v.parse::<usize>() {
-                Ok(n) if n >= 1 => Ok(Some(n)),
-                _ => Err(format!("{var} must be a positive integer, got {v:?}").into()),
-            },
-        }
-    };
-    let max_connections = cap("MQTTD_MAX_CONNECTIONS")?;
-    let max_per_ip = cap("MQTTD_MAX_CONNECTIONS_PER_IP")?;
+    let max_connections = positive_cap("limits.max_connections", config.limits.max_connections)?;
+    let max_per_ip = positive_cap(
+        "limits.max_connections_per_ip",
+        config.limits.max_connections_per_ip,
+    )?;
     // Auth-failure penalty box (ADR 0041 T2): threshold enables it; the decay is
     // how long one strike takes to age away (default 60s).
-    let penalty = match cap("MQTTD_AUTH_PENALTY_THRESHOLD")? {
-        None => None,
+    let penalty = match config.security.auth_penalty.threshold {
+        None | Some(0) => None,
         Some(threshold) => {
-            let decay_secs = cap("MQTTD_AUTH_PENALTY_DECAY_SECS")?.unwrap_or(60);
+            let decay_secs = config.security.auth_penalty.decay_secs.unwrap_or(60);
             Some(admission::PenaltyConfig {
-                threshold: u32::try_from(threshold)
-                    .map_err(|_| "MQTTD_AUTH_PENALTY_THRESHOLD is too large")?,
-                decay: std::time::Duration::from_secs(decay_secs as u64),
+                threshold,
+                decay: std::time::Duration::from_secs(decay_secs),
             })
         }
     };
@@ -479,6 +487,7 @@ fn admission_gate_from_env(
 // One linear listener-wiring flow; splitting it would scatter the env-var reads.
 #[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
+    config: &Config,
     hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
     policy: Arc<conn::ConnPolicy>,
     reloader: &mut reload::Reloader,
@@ -487,26 +496,24 @@ async fn start_client_listeners(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut any = false;
     // Connection admission caps (ADR 0041 T1), shared by every client listener.
-    let gate = admission_gate_from_env(policy.metrics.clone(), Some(policy.audit.clone()))?;
-    let tls_bind = non_empty_env("MQTTD_TLS_BIND");
-    let wss_bind = non_empty_env("MQTTD_WSS_BIND");
+    let gate = admission_gate(config, policy.metrics.clone(), Some(policy.audit.clone()))?;
+    let tls_bind = config.listeners.tls_bind.clone();
+    let wss_bind = config.listeners.wss_bind.clone();
 
     // A single reloadable client-TLS acceptor, shared by the TLS and WSS listeners (ADR 0035
     // WSS reuses the ADR 0002 TLS stack + the ADR 0032 reloadable acceptor — one TLS path).
     let acceptor_rx = if tls_bind.is_some() || wss_bind.is_some() {
-        let (Some(cert), Some(key)) = (
-            non_empty_env("MQTTD_TLS_CERT"),
-            non_empty_env("MQTTD_TLS_KEY"),
-        ) else {
+        let (Some(cert), Some(key)) = (config.tls.cert.clone(), config.tls.key.clone()) else {
             return Err(
-                "MQTTD_TLS_BIND / MQTTD_WSS_BIND require MQTTD_TLS_CERT and MQTTD_TLS_KEY".into(),
+                "tls_bind / wss_bind require a TLS cert and key (MQTTD_TLS_CERT / MQTTD_TLS_KEY)"
+                    .into(),
             );
         };
-        let client_ca = non_empty_env("MQTTD_TLS_CLIENT_CA");
+        let client_ca = config.tls.client_ca.clone();
         // Optional certificate revocation list (ADR 0002 T8): a client whose cert is listed is
         // rejected at the TLS handshake. Reloadable on SIGHUP via the same closure below, so a
         // freshly-published CRL takes effect on the next handshake with no restart (ADR 0032 §5).
-        let crl = non_empty_env("MQTTD_TLS_CRL");
+        let crl = config.tls.crl.clone();
         let acceptor = tls::server_acceptor_with_crl(
             Path::new(&cert),
             Path::new(&key),
@@ -561,7 +568,7 @@ async fn start_client_listeners(
         ));
         any = true;
     }
-    if let Some(addr) = non_empty_env("MQTTD_PLAINTEXT_BIND") {
+    if let Some(addr) = config.listeners.plaintext_bind.clone() {
         warn!(%addr, "INSECURE: starting PLAINTEXT MQTT listener (no TLS) — testing use only");
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT 3.1.1 clients");
@@ -575,7 +582,7 @@ async fn start_client_listeners(
         ));
         any = true;
     }
-    if let Some(addr) = non_empty_env("MQTTD_WS_BIND") {
+    if let Some(addr) = config.listeners.ws_bind.clone() {
         warn!(%addr, "INSECURE: starting PLAINTEXT WebSocket listener (no TLS) — testing use only");
         let listener = TcpListener::bind(&addr).await?;
         info!(%addr, "accepting MQTT clients over WebSocket (ws, ADR 0035)");
@@ -589,16 +596,15 @@ async fn start_client_listeners(
         ));
         any = true;
     }
-    if let Some(bind) = non_empty_env("MQTTD_QUIC_BIND") {
+    if let Some(bind) = config.listeners.quic_bind.clone() {
         // QUIC mandates TLS 1.3 (no plaintext mode); it reuses the same cert material as the
         // TLS listener. The endpoint is built once (cert hot-reload is a follow-on, ADR 0036).
-        let (Some(cert), Some(key)) = (
-            non_empty_env("MQTTD_TLS_CERT"),
-            non_empty_env("MQTTD_TLS_KEY"),
-        ) else {
-            return Err("MQTTD_QUIC_BIND requires MQTTD_TLS_CERT and MQTTD_TLS_KEY".into());
+        let (Some(cert), Some(key)) = (config.tls.cert.clone(), config.tls.key.clone()) else {
+            return Err(
+                "quic_bind requires a TLS cert and key (MQTTD_TLS_CERT / MQTTD_TLS_KEY)".into(),
+            );
         };
-        let client_ca = non_empty_env("MQTTD_TLS_CLIENT_CA");
+        let client_ca = config.tls.client_ca.clone();
         let udp: std::net::SocketAddr = bind
             .parse()
             .map_err(|e| format!("MQTTD_QUIC_BIND is not a UDP socket address ({bind}): {e}"))?;
@@ -633,7 +639,8 @@ async fn start_client_listeners(
 /// Build the connection policy — authentication, topic authorization, and
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
-fn client_policy_from_env(
+fn client_policy(
+    config: &Arc<Config>,
     proxy: Option<conn::ProxyContext>,
     store: Arc<dyn SessionStore>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -643,12 +650,19 @@ fn client_policy_from_env(
     // Build the initial policy, and a closure that re-reads the configured files on reload
     // (ADR 0032). The closure returns the freshly-built (authorizer, authenticator) or an
     // error string that aborts the swap — validate-before-swap lives in `reload::Reloader`.
-    let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) =
-        (authorizer_from_env()?, authenticator_from_env()?);
-    let build = || -> reload::BuildResult {
-        let authz = authorizer_from_env().map_err(|e| e.to_string())?;
-        let auth = authenticator_from_env().map_err(|e| e.to_string())?;
-        Ok((authz, auth))
+    // The reload closure captures the config so the *paths* stay fixed while the *file
+    // contents* at those paths are re-read on each reload (ADR 0032/0033).
+    let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = (
+        authorizer_from_config(config)?,
+        authenticator_from_config(config)?,
+    );
+    let build = {
+        let config = config.clone();
+        move || -> reload::BuildResult {
+            let authz = authorizer_from_config(&config).map_err(|e| e.to_string())?;
+            let auth = authenticator_from_config(&config).map_err(|e| e.to_string())?;
+            Ok((authz, auth))
+        }
     };
     let (reloader, handles) =
         reload::Reloader::with_metrics(initial, audit.clone(), Some(metrics.clone()), build);
@@ -670,9 +684,11 @@ fn client_policy_from_env(
 /// Build the topic authorizer (ADR 0004 step 3): a TOML ACL file gives deny-by-default
 /// per-identity topic policy; without one, authorization is not enforced — loudly. Reads
 /// the file fresh each call, so it is reusable at startup *and* on a SIGHUP reload (ADR 0032).
-fn authorizer_from_env() -> Result<Arc<dyn Authorizer>, Box<dyn std::error::Error>> {
-    if let Some(path) = non_empty_env("MQTTD_ACL_FILE") {
-        let text = std::fs::read_to_string(&path)?;
+fn authorizer_from_config(
+    config: &Config,
+) -> Result<Arc<dyn Authorizer>, Box<dyn std::error::Error>> {
+    if let Some(path) = &config.security.acl_file {
+        let text = std::fs::read_to_string(path)?;
         let policy = mqtt_auth::acl::AclPolicy::from_toml_str(&text)?;
         info!(%path, "topic ACL policy loaded (deny by default)");
         Ok(Arc::new(policy))
@@ -714,48 +730,39 @@ fn spawn_reload_handler(_reloader: std::sync::Arc<reload::Reloader>) {
 /// The configured policy file paths the reload closures read — the set the filesystem watcher
 /// stats (ADR 0033 T1). Only file-backed material: the JWT HS256 secret is an inline env value,
 /// not a file, so it is not watchable. A path is included only when its env var is set.
-fn watched_policy_paths() -> Vec<std::path::PathBuf> {
+fn watched_policy_paths(config: &Config) -> Vec<std::path::PathBuf> {
     [
-        "MQTTD_ACL_FILE",
-        "MQTTD_PASSWORD_FILE",
-        "MQTTD_JWT_RS256_PEM",
-        "MQTTD_TLS_CERT",
-        "MQTTD_TLS_KEY",
-        "MQTTD_TLS_CLIENT_CA",
-        "MQTTD_TLS_CRL",
-        "MQTTD_PEER_TLS_CRL",
+        config.security.acl_file.as_ref(),
+        config.security.password_file.as_ref(),
+        config.security.jwt.rs256_pem_file.as_ref(),
+        config.tls.cert.as_ref(),
+        config.tls.key.as_ref(),
+        config.tls.client_ca.as_ref(),
+        config.tls.crl.as_ref(),
+        config.cluster.peer_tls.crl.as_ref(),
     ]
-    .iter()
-    .filter_map(|var| non_empty_env(var))
+    .into_iter()
+    .flatten()
     .map(std::path::PathBuf::from)
     .collect()
 }
 
-/// Spawn the opt-in filesystem watcher (ADR 0033) when `MQTTD_CONFIG_WATCH=<seconds>` is set
-/// (unset / `0` = disabled, the signal-only default). Polls the configured policy files and
-/// auto-reloads through the same fail-safe routine as `SIGHUP`.
-///
-/// # Errors
-/// Returns an error if `MQTTD_CONFIG_WATCH` is set but not a non-negative integer.
+/// Spawn the opt-in filesystem watcher (ADR 0033) when `runtime.config_watch_secs`
+/// (`MQTTD_CONFIG_WATCH`) is non-zero (0 = disabled, the signal-only default). Polls the
+/// configured policy files and auto-reloads through the same fail-safe routine as `SIGHUP`.
 fn spawn_config_watcher(
+    config: &Config,
     reloader: std::sync::Arc<reload::Reloader>,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(raw) = non_empty_env("MQTTD_CONFIG_WATCH") else {
-        return Ok(());
-    };
-    let secs: u64 = raw
-        .parse()
-        .map_err(|_| format!("MQTTD_CONFIG_WATCH must be a number of seconds (got {raw:?})"))?;
+) {
+    let secs = config.runtime.config_watch_secs;
     if secs == 0 {
-        return Ok(()); // explicitly disabled
+        return; // unset / explicitly disabled — signal-only default
     }
-    let paths = watched_policy_paths();
+    let paths = watched_policy_paths(config);
     if paths.is_empty() {
-        warn!(
-            "MQTTD_CONFIG_WATCH is set but no watchable policy files are configured — watcher idle"
-        );
-        return Ok(());
+        warn!("config_watch is set but no watchable policy files are configured — watcher idle");
+        return;
     }
     info!(
         interval_secs = secs,
@@ -768,7 +775,6 @@ fn spawn_config_watcher(
         std::time::Duration::from_secs(secs),
         shutdown.clone(),
     ));
-    Ok(())
 }
 
 /// Build the CONNECT authenticator (ADR 0004 steps 2 + 6): a certificate /
@@ -776,33 +782,38 @@ fn spawn_config_watcher(
 /// (`MQTTD_PASSWORD_FILE`) and a JWT verifier (`MQTTD_JWT_HS256_SECRET` or
 /// `MQTTD_JWT_RS256_PEM`, with optional `MQTTD_JWT_ISSUER`/`MQTTD_JWT_AUDIENCE`).
 /// Credentials are tried cert → password → token via a chain.
-fn authenticator_from_env() -> Result<Arc<dyn Authenticator>, Box<dyn std::error::Error>> {
-    let allow_anonymous = non_empty_env("MQTTD_ALLOW_ANONYMOUS").is_some();
+fn authenticator_from_config(
+    config: &Config,
+) -> Result<Arc<dyn Authenticator>, Box<dyn std::error::Error>> {
+    let allow_anonymous = config.security.allow_anonymous;
     if allow_anonymous {
         warn!(
-            "INSECURE: anonymous MQTT clients are PERMITTED (MQTTD_ALLOW_ANONYMOUS) — \
-             testing use only"
+            "INSECURE: anonymous MQTT clients are PERMITTED (allow_anonymous / \
+             MQTTD_ALLOW_ANONYMOUS) — testing use only"
         );
     }
     let mut members: Vec<Arc<dyn Authenticator>> =
         vec![Arc::new(BasicAuthenticator { allow_anonymous })];
 
-    if let Some(path) = non_empty_env("MQTTD_PASSWORD_FILE") {
-        let text = std::fs::read_to_string(&path)?;
+    if let Some(path) = &config.security.password_file {
+        let text = std::fs::read_to_string(path)?;
         let pw = mqtt_auth::password::PasswordAuthenticator::from_file_contents(&text)?;
         info!(%path, "Argon2id password file loaded");
         members.push(Arc::new(pw));
     }
 
-    if let Some(secret) = non_empty_env("MQTTD_JWT_HS256_SECRET") {
+    // NOTE (ADR 0046 T5): `hs256_secret_file` currently carries the HS256 secret *inline*
+    // (matching the historical `MQTTD_JWT_HS256_SECRET` value semantics); moving it to a true
+    // path reference is T5. `rs256_pem_file` is already a file path.
+    if let Some(secret) = &config.security.jwt.hs256_secret_file {
         info!("JWT HS256 verification enabled");
         members.push(Arc::new(mqtt_auth::token::TokenAuthenticator::hs256(
             secret.as_bytes(),
-            jwt_config_from_env(),
+            jwt_config(config),
         )));
-    } else if let Some(pem_path) = non_empty_env("MQTTD_JWT_RS256_PEM") {
-        let pem = std::fs::read(&pem_path)?;
-        let tok = mqtt_auth::token::TokenAuthenticator::rs256_pem(&pem, jwt_config_from_env())?;
+    } else if let Some(pem_path) = &config.security.jwt.rs256_pem_file {
+        let pem = std::fs::read(pem_path)?;
+        let tok = mqtt_auth::token::TokenAuthenticator::rs256_pem(&pem, jwt_config(config))?;
         info!(%pem_path, "JWT RS256 verification enabled");
         members.push(Arc::new(tok));
     }
@@ -810,11 +821,11 @@ fn authenticator_from_env() -> Result<Arc<dyn Authenticator>, Box<dyn std::error
     Ok(Arc::new(mqtt_auth::chain::ChainAuthenticator::new(members)))
 }
 
-/// Assemble JWT validation options from the optional issuer/audience shims.
-fn jwt_config_from_env() -> mqtt_auth::token::TokenConfig {
+/// Assemble JWT validation options from the optional issuer/audience config.
+fn jwt_config(config: &Config) -> mqtt_auth::token::TokenConfig {
     mqtt_auth::token::TokenConfig {
-        issuer: non_empty_env("MQTTD_JWT_ISSUER"),
-        audience: non_empty_env("MQTTD_JWT_AUDIENCE"),
+        issuer: config.security.jwt.issuer.clone(),
+        audience: config.security.jwt.audience.clone(),
         ..Default::default()
     }
 }
@@ -836,112 +847,48 @@ type HubHandle = (
     Option<tokio::task::JoinHandle<()>>,
 );
 
-/// Whether durable sessions are enabled given the `MQTTD_DURABLE_SESSIONS` value
-/// (ADR 0029). Durable is the **default**: unset → on; `0`/`false`/`off`/`no`
-/// (case-insensitive) opts out to the in-memory store; anything else → on.
-fn durable_enabled(val: Option<&str>) -> bool {
-    val.is_none_or(|v| {
-        !matches!(
-            v.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
-}
-
-/// The bounded lease-consensus voter-set size `N` from `MQTTD_LEASE_VOTERS` (ADR 0021).
-/// Default `5` (recommend odd). An unparseable or zero value is a startup error rather
-/// than a silent fallback — a zero-voter group would be un-electable.
-fn lease_voters() -> Result<usize, Box<dyn std::error::Error>> {
-    match non_empty_env("MQTTD_LEASE_VOTERS") {
-        None => Ok(5),
-        Some(raw) => {
-            let n: usize = raw
-                .parse()
-                .map_err(|_| format!("MQTTD_LEASE_VOTERS is not a number: {raw:?}"))?;
-            if n == 0 {
-                return Err("MQTTD_LEASE_VOTERS must be at least 1".into());
-            }
-            Ok(n)
-        }
-    }
-}
-
-/// The failure-domain topology from `MQTTD_FAILURE_DOMAINS` (ADR 0016 T4): a comma-separated
-/// list of `node-id=domain` pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`) mapping each cluster
-/// node to its rack/zone label, so the bounded lease-voter set is spread across domains and one
-/// domain's loss cannot take quorum. **Must be cluster-uniform** — every node needs the same map
-/// so each successive leader's reconciler computes the same voter target. Empty/unset disables
-/// the spread (every node is its own singleton domain — the prior id-ordered selection). A
-/// malformed entry is a startup error, not a silent skip — a deny-by-default broker does not
-/// quietly ignore a misconfigured security/availability control.
-fn failure_domains(
-) -> Result<std::collections::BTreeMap<NodeId, String>, Box<dyn std::error::Error>> {
-    let mut map = std::collections::BTreeMap::new();
-    let Some(raw) = non_empty_env("MQTTD_FAILURE_DOMAINS") else {
-        return Ok(map);
-    };
-    for entry in raw.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (node, domain) = entry.split_once('=').ok_or_else(|| {
-            format!("MQTTD_FAILURE_DOMAINS entry {entry:?} is not `node-id=domain`")
-        })?;
-        let (node, domain) = (node.trim(), domain.trim());
-        if node.is_empty() || domain.is_empty() {
-            return Err(format!("MQTTD_FAILURE_DOMAINS entry {entry:?} has an empty side").into());
-        }
-        map.insert(NodeId(node.to_string()), domain.to_string());
-    }
-    Ok(map)
-}
-
-/// This node's own failure-domain label from `MQTTD_FAILURE_DOMAIN` (singular, ADR 0016 T5):
-/// the node advertises it over the authenticated SWIM gossip payload so the cluster topology
-/// **self-assembles** — no static, cluster-uniform `MQTTD_FAILURE_DOMAINS` map required. Unset
-/// leaves this node unlabelled (its own singleton domain, unless a peer/static map supplies a
-/// label). When both are set, the self-advertised label wins for this node.
-fn this_node_failure_domain() -> Option<String> {
-    non_empty_env("MQTTD_FAILURE_DOMAIN")
-}
-
 async fn start_hub(
+    config: &Config,
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<HubHandle, Box<dyn std::error::Error>> {
     // Claim the data directory for this node (ADR 0018 phase 5): refuse to open another
     // node's persistent state, before any store touches disk.
-    if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
-        mqtt_storage::data_dir::guard_data_dir(&dir, &node_id.0)?;
+    if let Some(dir) = &config.node.data_dir {
+        mqtt_storage::data_dir::guard_data_dir(dir, &node_id.0)?;
     }
     // Durable is the **default** (ADR 0029): the consensus-backed replicated store is on
     // unless explicitly opted out. `0/false/off/no` selects the lightweight in-memory store.
-    let durable = durable_enabled(non_empty_env("MQTTD_DURABLE_SESSIONS").as_deref());
+    let durable = config.durable.enabled;
     // Cluster-configured = peer networking is set up. Told to the hub explicitly
     // (0043-P4 exhibit ②): a restarted cluster node sees a single-member ring for
     // its first moments, and judging "clustered" by live membership would switch
     // every cluster honesty gate off exactly while its view is most incomplete.
-    let cluster_configured = non_empty_env("MQTTD_PEER_BIND").is_some()
-        || non_empty_env("MQTTD_PEERS").is_some()
-        || non_empty_env("MQTTD_SWIM_BIND").is_some()
-        || non_empty_env("MQTTD_SWIM_SEEDS").is_some();
+    let cluster_configured = config.cluster.peer_bind.is_some()
+        || !config.cluster.peers.is_empty()
+        || config.cluster.swim.bind.is_some()
+        || !config.cluster.swim.seeds.is_empty();
     if durable {
         // A node started with no SWIM seeds is the cluster founder — only it
         // bootstraps the lease group (ADR 0007 §2). Exactly one founder per cluster.
-        let founder = non_empty_env("MQTTD_SWIM_SEEDS").is_none();
-        // Persist the lease store and follower replica copy on disk when MQTTD_DATA_DIR
+        let founder = config.cluster.swim.seeds.is_empty();
+        // Persist the lease store and follower replica copy on disk when a data dir
         // is set (ADR 0018 phases 2–3): the lease vote/assignments and the replicated
         // session log survive a restart (restoring Raft safety and full-cluster-restart
         // durability). Without it the durable plane is in-memory (rebuilds from peers).
-        let data_dir = non_empty_env("MQTTD_DATA_DIR");
+        let data_dir = config.node.data_dir.clone();
         // Bound the lease-consensus voter set (ADR 0021): at most `N` members vote, the
         // rest join as learners that still receive the lease log. Default 5 (recommend
-        // odd); decouples consensus cost from cluster size.
-        let voter_cap = lease_voters()?;
+        // odd); decouples consensus cost from cluster size. `validate()` guarantees ≥ 1.
+        let voter_cap = config.durable.lease_voters as usize;
         // Failure-domain topology (ADR 0016 T4): spread the bounded voter set across racks/zones.
-        let domains = failure_domains()?;
+        let domains: std::collections::BTreeMap<NodeId, String> = config
+            .node
+            .failure_domains
+            .iter()
+            .map(|(node, domain)| (NodeId(node.clone()), domain.clone()))
+            .collect();
         info!(
             founder,
             persistent = data_dir.is_some(),
@@ -980,11 +927,11 @@ async fn start_hub(
         hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(plane_for_health), Some(driver)))
-    } else if let Some(dir) = non_empty_env("MQTTD_DATA_DIR") {
+    } else if let Some(dir) = config.node.data_dir.clone() {
         // Single-node **persistent** sessions (ADR 0018 phase 1): the session log is
         // backed by an on-disk redb database, so sessions, subscriptions, the QoS-2
         // dedup window and offline queues survive a restart. Not replicated — use
-        // MQTTD_DURABLE_SESSIONS for cluster (quorum) durability.
+        // durable sessions for cluster (quorum) durability.
         let path = std::path::Path::new(&dir).join("sessions.redb");
         info!(
             path = %path.display(),
@@ -993,7 +940,7 @@ async fn start_hub(
         let log = PersistentLog::open(&path)?;
         let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::with_limits(
             log,
-            queue_limits_from_env()?,
+            queue_limits_from_config(config)?,
         ));
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
             node_id.clone(),
@@ -1008,8 +955,9 @@ async fn start_hub(
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     } else {
-        let store: Arc<dyn SessionStore> =
-            Arc::new(MemorySessionStore::with_limits(queue_limits_from_env()?));
+        let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::with_limits(
+            queue_limits_from_config(config)?,
+        ));
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
             node_id.clone(),
             store.clone(),
@@ -1035,7 +983,8 @@ fn persistent_retained(dir: &str) -> Result<Box<dyn RetainedStore>, Box<dyn std:
 /// `/livez` reports hub liveness; `/readyz` additionally requires the mesh to have
 /// at least `MQTTD_READY_MIN_MEMBERS` members (default 1) and, when durable sessions
 /// are on, the lease group to be ready (a leader exists and this node is a voter).
-async fn start_health_from_env(
+async fn start_health(
+    config: &Config,
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
     placement: &Arc<RwLock<Placement>>,
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
@@ -1047,8 +996,8 @@ async fn start_health_from_env(
     ),
     Box<dyn std::error::Error>,
 > {
-    let health_bind = non_empty_env("MQTTD_HEALTH_BIND");
-    let metrics_bind = non_empty_env("MQTTD_METRICS_BIND");
+    let health_bind = config.listeners.health_bind.clone();
+    let metrics_bind = config.listeners.metrics_bind.clone();
     if health_bind.is_none() && metrics_bind.is_none() {
         // Neither server: hand back standalone handles so the caller's shutdown
         // path is uniform (nothing reads them).
@@ -1057,12 +1006,8 @@ async fn start_health_from_env(
             Arc::new(std::sync::OnceLock::new()),
         ));
     }
-    let min_members = match non_empty_env("MQTTD_READY_MIN_MEMBERS") {
-        Some(raw) => raw
-            .parse()
-            .map_err(|_| format!("MQTTD_READY_MIN_MEMBERS is not a number: {raw:?}"))?,
-        None => 1,
-    };
+    // `validate()` guarantees ready_min_members ≥ 1.
+    let min_members = config.runtime.ready_min_members;
     // One state serves both binds: health endpoints plus `/metrics` (ADR 0020).
     let state = mqttd::health::HealthState::new(
         hub_tx.clone(),
@@ -1089,20 +1034,21 @@ async fn start_health_from_env(
     Ok((draining, decommission))
 }
 
-fn queue_limits_from_env() -> Result<QueueLimits, Box<dyn std::error::Error>> {
+fn queue_limits_from_config(config: &Config) -> Result<QueueLimits, Box<dyn std::error::Error>> {
     let mut limits = QueueLimits::default();
-    if let Some(raw) = non_empty_env("MQTTD_MAX_QUEUED_MESSAGES") {
-        limits.max_messages = raw
-            .parse()
-            .map_err(|_| format!("MQTTD_MAX_QUEUED_MESSAGES is not a number: {raw:?}"))?;
+    if let Some(max) = config.limits.max_queued_messages {
+        limits.max_messages = usize::try_from(max)
+            .map_err(|_| format!("limits.max_queued_messages is too large: {max}"))?;
     }
-    if let Some(raw) = non_empty_env("MQTTD_QUEUE_OVERFLOW") {
+    // `validate()` already constrains the enum to drop-oldest|reject-newest; the fallthrough
+    // stays as defence in depth.
+    if let Some(raw) = &config.limits.queue_overflow {
         limits.overflow = match raw.as_str() {
             "drop-oldest" => OverflowPolicy::DropOldest,
             "reject-newest" => OverflowPolicy::RejectNewest,
             other => {
                 return Err(format!(
-                    "MQTTD_QUEUE_OVERFLOW must be drop-oldest or reject-newest, got {other:?}"
+                    "limits.queue_overflow must be drop-oldest or reject-newest, got {other:?}"
                 )
                 .into())
             }
@@ -1130,13 +1076,14 @@ struct PeerTlsReload {
 /// All three must be set together; none means a (loudly logged) plaintext mesh.
 /// `MQTTD_PEER_TLS_CRL` (optional, requires the other three) loads a cluster-CA-signed
 /// CRL checked on every inbound signed-gossip datagram (ADR 0022 T7).
-fn peer_tls_from_env() -> Result<Option<(peer::PeerTls, PeerTlsReload)>, Box<dyn std::error::Error>>
-{
-    let crl_path = non_empty_env("MQTTD_PEER_TLS_CRL");
+fn peer_tls_from_config(
+    config: &Config,
+) -> Result<Option<(peer::PeerTls, PeerTlsReload)>, Box<dyn std::error::Error>> {
+    let crl_path = config.cluster.peer_tls.crl.clone();
     match (
-        non_empty_env("MQTTD_PEER_TLS_CA"),
-        non_empty_env("MQTTD_PEER_TLS_CERT"),
-        non_empty_env("MQTTD_PEER_TLS_KEY"),
+        config.cluster.peer_tls.ca.clone(),
+        config.cluster.peer_tls.cert.clone(),
+        config.cluster.peer_tls.key.clone(),
     ) {
         (Some(ca), Some(cert), Some(key)) => {
             let (ca, cert, key) = (Path::new(&ca), Path::new(&cert), Path::new(&key));
@@ -1290,16 +1237,17 @@ enum SignedGossip {
 
 /// Resolve the signed-gossip mode. Defaults to `Require` when both the shared key and the
 /// cluster-bus TLS material are present (the security win), else `Off`.
-fn signed_gossip_from_env(
+fn signed_gossip_from_config(
+    config: &Config,
     has_tls: bool,
     has_key: bool,
 ) -> Result<SignedGossip, Box<dyn std::error::Error>> {
-    Ok(match non_empty_env("MQTTD_SWIM_SIGNED").as_deref() {
+    Ok(match config.cluster.swim.signed.as_deref() {
         Some("require") => SignedGossip::Require,
         Some("off") => SignedGossip::Off,
         Some(other) => {
             return Err(
-                format!("MQTTD_SWIM_SIGNED must be one of require|off (got {other:?})").into(),
+                format!("cluster.swim.signed must be one of require|off (got {other:?})").into(),
             );
         }
         None if has_tls && has_key => SignedGossip::Require,
@@ -1406,15 +1354,16 @@ enum ReplayMode {
 /// sequence counter, so it requires a data dir. A requested mode without them is a startup
 /// error. Defaults to `off` (opt-in).
 fn apply_anti_replay(
+    config: &Config,
     auth: Option<SwimAuth>,
     signed: SignedGossip,
 ) -> Result<(Option<SwimAuth>, Option<swim_driver::SeqAlloc>), Box<dyn std::error::Error>> {
-    let mode = match non_empty_env("MQTTD_SWIM_REPLAY").as_deref() {
+    let mode = match config.cluster.swim.replay.as_deref() {
         Some("require") => ReplayMode::Require,
         Some("off") | None => ReplayMode::Off,
         Some(other) => {
             return Err(
-                format!("MQTTD_SWIM_REPLAY must be one of require|off (got {other:?})").into(),
+                format!("cluster.swim.replay must be one of require|off (got {other:?})").into(),
             );
         }
     };
@@ -1426,19 +1375,19 @@ fn apply_anti_replay(
     };
     if signed == SignedGossip::Off {
         return Err(
-            "MQTTD_SWIM_REPLAY requires MQTTD_SWIM_SIGNED=require: anti-replay binds the \
+            "cluster.swim.replay requires cluster.swim.signed=require: anti-replay binds the \
                     sequence to the per-node signature"
                 .into(),
         );
     }
-    let Some(dir) = non_empty_env("MQTTD_DATA_DIR") else {
+    let Some(dir) = &config.node.data_dir else {
         return Err(
-            "MQTTD_SWIM_REPLAY requires MQTTD_DATA_DIR for the persisted, restart-safe \
-                    sequence counter"
+            "cluster.swim.replay requires a data dir (node.data_dir) for the persisted, \
+                    restart-safe sequence counter"
                 .into(),
         );
     };
-    let store = FileSeqStore::open(Path::new(&dir).join("gossip-seq"))?;
+    let store = FileSeqStore::open(Path::new(dir).join("gossip-seq"))?;
     let alloc = mqtt_cluster::replay::SequenceAllocator::open(
         Box::new(store) as Box<dyn mqtt_cluster::replay::SeqStore>,
         SEQ_BLOCK,
@@ -1450,7 +1399,8 @@ fn apply_anti_replay(
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and
 /// hand its events to the peer-link manager.
 #[allow(clippy::too_many_arguments)]
-async fn start_swim_from_env(
+async fn start_swim(
+    config: &Config,
     node_id: &NodeId,
     peer_bind: Option<String>,
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
@@ -1460,38 +1410,37 @@ async fn start_swim_from_env(
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(bind) = non_empty_env("MQTTD_SWIM_BIND") else {
+    let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
     };
     let Some(peer_addr) = peer_bind else {
-        return Err("MQTTD_SWIM_BIND requires MQTTD_PEER_BIND: membership \
+        return Err(
+            "swim.bind requires peer_bind (MQTTD_PEER_BIND): membership \
                     gossips the peer-link address so other nodes can dial us"
-            .into());
+                .into(),
+        );
     };
     // The address gossip ADVERTISES for this node's peer links (ADR 0044 P1):
     // defaults to the bind, overridable where the dialable address differs from
     // the bound one — NAT, container port mapping, or a fronting relay (the
     // out-of-process harness fronts each peer listener with one).
-    let peer_addr = non_empty_env("MQTTD_PEER_ADVERTISE").unwrap_or(peer_addr);
+    let peer_addr = config.cluster.peer_advertise.clone().unwrap_or(peer_addr);
     // Gossip authentication (ADR 0003): keyed = membership claims require the
     // cluster key; unkeyed is possible but loudly insecure.
-    let auth = if let Some(hex) = non_empty_env("MQTTD_SWIM_KEY") {
-        let mut auth = SwimAuth::from_hex_key(&hex)?;
+    let auth = if let Some(hex) = &config.cluster.swim.key {
+        let mut auth = SwimAuth::from_hex_key(hex)?;
         // Additional keys accepted (but not used to seal) during a rotation window (ADR
         // 0003): an old key still opens peers' datagrams while the cluster migrates to the
         // new primary, so the gossip key rotates without downtime.
         let mut rotation = 0;
-        for k in non_empty_env("MQTTD_SWIM_KEY_ACCEPT")
+        for k in config
+            .cluster
+            .swim
+            .key_accept
             .iter()
-            .flat_map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
             .filter(|k| !k.is_empty())
         {
-            auth = auth.accept_also_hex(&k)?;
+            auth = auth.accept_also_hex(k)?;
             rotation += 1;
         }
         if rotation > 0 {
@@ -1502,9 +1451,9 @@ async fn start_swim_from_env(
         }
         Some(auth)
     } else {
-        if non_empty_env("MQTTD_SWIM_KEY_ACCEPT").is_some() {
+        if !config.cluster.swim.key_accept.is_empty() {
             return Err(
-                "MQTTD_SWIM_KEY_ACCEPT requires MQTTD_SWIM_KEY: rotation keys are \
+                "swim.key_accept requires swim.key (MQTTD_SWIM_KEY): rotation keys are \
                         accepted in addition to a primary key, not on their own"
                     .into(),
             );
@@ -1518,26 +1467,18 @@ async fn start_swim_from_env(
     };
     // Layer per-node signatures (ADR 0022) then anti-replay sequencing (ADR 0023) on top of
     // the shared-key MAC when configured.
-    let signed = signed_gossip_from_env(peer_tls.is_some(), auth.is_some())?;
+    let signed = signed_gossip_from_config(config, peer_tls.is_some(), auth.is_some())?;
     let auth = apply_signed_gossip(auth, peer_tls, signed)?;
-    let (auth, seq_alloc) = apply_anti_replay(auth, signed)?;
+    let (auth, seq_alloc) = apply_anti_replay(config, auth, signed)?;
     let socket = UdpSocket::bind(&bind).await?;
-    let seeds: Vec<String> = non_empty_env("MQTTD_SWIM_SEEDS")
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|a| !a.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let seeds: Vec<String> = config.cluster.swim.seeds.clone();
     info!(%bind, seeds = seeds.len(), authenticated = auth.is_some(), "starting SWIM gossip membership");
     let swim = Swim::new(
         node_id.clone(),
         bind,
         peer_addr,
         // Advertise this node's own failure-domain label over gossip (ADR 0016 T5).
-        this_node_failure_domain(),
+        config.node.failure_domain.clone(),
         mqtt_cluster::swim::Config::default(),
         seeds,
     );
@@ -1917,67 +1858,120 @@ fn spawn_quic_migration_watch(
     });
 }
 
-/// Read an environment variable, treating unset or empty as absent.
-fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+/// Convert a config `Option<u64>` cap into the `Option<usize>` the runtime uses, rejecting a
+/// configured `0` (a zero cap is meaningless — unset it to mean "unbounded"). `field` names the
+/// config key for the error message.
+fn positive_cap(
+    field: &str,
+    value: Option<u64>,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    match value {
+        None => Ok(None),
+        Some(0) => {
+            Err(format!("{field} must be a positive integer (unset it for unbounded)").into())
+        }
+        Some(v) => Ok(Some(
+            usize::try_from(v).map_err(|_| format!("{field} is too large: {v}"))?,
+        )),
+    }
 }
 
-/// Parse an env var as `T`, falling back to `default` when unset/empty. An unparseable
-/// value is a startup error rather than a silent fallback.
-fn parse_env<T>(key: &str, default: T) -> Result<T, Box<dyn std::error::Error>>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    match non_empty_env(key) {
-        None => Ok(default),
-        Some(v) => v
-            .parse::<T>()
-            .map_err(|e| format!("{key}: invalid value {v:?}: {e}").into()),
+/// Resolve the config-file path (`--config <path>` / `--config=<path>`, else `MQTTD_CONFIG`)
+/// and load the layered configuration — defaults < TOML file < `MQTTD_*` env — then validate it
+/// (ADR 0046 T2). The command-line flag wins over the env var.
+///
+/// # Errors
+/// A `--config` flag with no value, an unreadable/malformed file, an unparseable env value, or a
+/// config that fails validation.
+fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
+    let path = config_path()?;
+    if let Some(p) = &path {
+        info!(path = %p.display(), "loading configuration file (ADR 0046)");
     }
+    Ok(Config::load(path.as_deref())?)
+}
+
+/// The config-file path from `--config <path>` / `--config=<path>` (highest precedence) or the
+/// `MQTTD_CONFIG` env var, or `None`. A `--config` without a value is a startup error.
+fn config_path() -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(inline) = arg.strip_prefix("--config=") {
+            return Ok(Some(std::path::PathBuf::from(inline)));
+        }
+        if arg == "--config" {
+            let value = args
+                .next()
+                .ok_or("--config requires a file path argument")?;
+            return Ok(Some(std::path::PathBuf::from(value)));
+        }
+    }
+    Ok(std::env::var("MQTTD_CONFIG")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from))
+}
+
+/// Log the effective configuration at startup (ADR 0046 T2) with secret material redacted: the
+/// inline gossip keys (`swim.key`, `swim.key_accept`) and the inline JWT HS256 secret never
+/// reach the logs. File *paths* are safe to log and are retained for operability.
+fn log_effective_config(config: &Config) {
+    let mut redacted = config.clone();
+    if redacted.cluster.swim.key.is_some() {
+        redacted.cluster.swim.key = Some("<redacted>".to_string());
+    }
+    if !redacted.cluster.swim.key_accept.is_empty() {
+        let n = redacted.cluster.swim.key_accept.len();
+        redacted.cluster.swim.key_accept = vec![format!("<{n} key(s) redacted>")];
+    }
+    if redacted.security.jwt.hs256_secret_file.is_some() {
+        redacted.security.jwt.hs256_secret_file = Some("<redacted>".to_string());
+    }
+    info!(config = ?redacted, "effective configuration (ADR 0046; secrets redacted)");
 }
 
 /// Build the server-wide MQTT 5 wire limits from env (ADR 0011/0012/0013), each with a
 /// spec-sensible default. `MQTTD_TOPIC_ALIAS_MAX` (default 16; `0` disables inbound
 /// aliases), `MQTTD_RECEIVE_MAXIMUM` (default 256; floored at 1 — a Receive Maximum of 0
 /// is a Protocol Error), `MQTTD_AUTH_TIMEOUT` seconds (default 10; floored at 1).
-fn wire_limits_from_env() -> Result<conn::WireLimits, Box<dyn std::error::Error>> {
+fn wire_limits_from_config(
+    config: &Config,
+) -> Result<conn::WireLimits, Box<dyn std::error::Error>> {
     let d = conn::WireLimits::default();
-    Ok(conn::WireLimits {
-        topic_alias_max: parse_env("MQTTD_TOPIC_ALIAS_MAX", d.topic_alias_max)?,
-        receive_maximum: parse_env("MQTTD_RECEIVE_MAXIMUM", d.receive_maximum)?.max(1),
-        auth_round_timeout: Duration::from_secs(
-            parse_env("MQTTD_AUTH_TIMEOUT", d.auth_round_timeout.as_secs())?.max(1),
+    let l = &config.limits;
+    // The config carries these as serialization-friendly widths; convert to the transport's
+    // internal widths, preserving the historical floors (a Receive Maximum of 0 is a Protocol
+    // Error; a sub-1 KiB packet ceiling would refuse CONNECT itself).
+    let max_packet_size = match l.max_packet_size {
+        None => d.max_packet_size,
+        Some(v) => u32::try_from(v)
+            .map_err(|_| format!("limits.max_packet_size is too large for u32: {v}"))?,
+    }
+    .max(1024);
+    let publish_rate = match l.max_publish_rate {
+        None => None,
+        Some(0) => return Err("limits.max_publish_rate must be a positive integer".into()),
+        Some(v) => Some(
+            u32::try_from(v)
+                .map_err(|_| format!("limits.max_publish_rate is too large for u32: {v}"))?,
         ),
-        // The inbound packet ceiling (ADR 0041 T4), advertised as the MQTT 5
-        // Maximum Packet Size; installed into the transport below. Floor 1 KiB —
-        // smaller would refuse CONNECT packets themselves.
-        max_packet_size: parse_env("MQTTD_MAX_PACKET_SIZE", d.max_packet_size)?.max(1024),
+    };
+    Ok(conn::WireLimits {
+        topic_alias_max: l.topic_alias_max.unwrap_or(d.topic_alias_max),
+        receive_maximum: l.receive_maximum.unwrap_or(d.receive_maximum).max(1),
+        auth_round_timeout: Duration::from_secs(
+            config
+                .security
+                .auth_timeout_secs
+                .unwrap_or(d.auth_round_timeout.as_secs())
+                .max(1),
+        ),
+        // The inbound packet ceiling (ADR 0041 T4), advertised as the MQTT 5 Maximum Packet
+        // Size; installed into the transport below. Floor 1 KiB.
+        max_packet_size,
         // Per-connection publish-rate throttle (ADR 0041 T3); unset = unlimited.
-        publish_rate: match non_empty_env("MQTTD_MAX_PUBLISH_RATE") {
-            None => None,
-            Some(v) => match v.parse::<u32>() {
-                Ok(n) if n >= 1 => Some(n),
-                _ => {
-                    return Err(format!(
-                        "MQTTD_MAX_PUBLISH_RATE must be a positive integer, got {v:?}"
-                    )
-                    .into())
-                }
-            },
-        },
+        publish_rate,
     })
-}
-
-/// Default graceful-shutdown drain deadline (ADR 0019), aligned with a typical
-/// Kubernetes `terminationGracePeriodSeconds`.
-const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
-
-/// The graceful-shutdown drain deadline from `MQTTD_SHUTDOWN_GRACE` (seconds).
-fn shutdown_grace_from_env() -> Duration {
-    non_empty_env("MQTTD_SHUTDOWN_GRACE")
-        .and_then(|v| v.parse().ok())
-        .map_or(DEFAULT_SHUTDOWN_GRACE, Duration::from_secs)
 }
 
 /// Run until a shutdown signal, then drain gracefully (ADR 0019): fail readiness, stop
@@ -1992,6 +1986,7 @@ fn shutdown_grace_from_env() -> Duration {
 /// crash mid-decommission is just a crash, handled by the survivors.
 #[allow(clippy::too_many_arguments)]
 async fn graceful_shutdown(
+    grace: Duration,
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
     draining: &std::sync::atomic::AtomicBool,
@@ -2024,7 +2019,6 @@ async fn graceful_shutdown(
             }
         }
     }
-    let grace = shutdown_grace_from_env();
     warn!(
         grace_secs = grace.as_secs(),
         "shutdown signal received; draining"
@@ -2105,19 +2099,52 @@ async fn wait_for_shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::durable_enabled;
+    use super::{positive_cap, queue_limits_from_config, wire_limits_from_config};
+    use mqtt_config::Config;
+    use mqtt_storage::OverflowPolicy;
 
     #[test]
-    fn durable_is_the_default_and_opts_out_explicitly() {
-        // Default (unset) → durable on (ADR 0029).
-        assert!(durable_enabled(None));
-        // Explicit falsey values opt out, case-insensitively.
-        for v in ["0", "false", "False", "FALSE", "off", "OFF", "no", "No"] {
-            assert!(!durable_enabled(Some(v)), "{v} should opt out");
-        }
-        // Truthy / anything-else stays on.
-        for v in ["1", "true", "TRUE", "on", "yes", "anything"] {
-            assert!(durable_enabled(Some(v)), "{v} should stay durable");
-        }
+    fn positive_cap_rejects_zero_and_converts() {
+        assert_eq!(positive_cap("x", None).unwrap(), None);
+        assert_eq!(positive_cap("x", Some(7)).unwrap(), Some(7));
+        assert!(positive_cap("x", Some(0)).is_err());
+    }
+
+    #[test]
+    fn wire_limits_default_config_matches_the_spec_floors() {
+        // Durable is on by default, so validate() is satisfied by the default config.
+        let cfg = Config::default();
+        let d = super::conn::WireLimits::default();
+        let w = wire_limits_from_config(&cfg).unwrap();
+        // Unset limits fall back to the transport defaults (no drift from the env path).
+        assert_eq!(w.topic_alias_max, d.topic_alias_max);
+        assert_eq!(w.receive_maximum, d.receive_maximum);
+        assert_eq!(w.max_packet_size, d.max_packet_size.max(1024));
+        assert_eq!(w.publish_rate, None);
+    }
+
+    #[test]
+    fn wire_limits_apply_config_and_preserve_floors() {
+        let mut cfg = Config::default();
+        cfg.limits.receive_maximum = Some(0); // floored to 1 (0 is a Protocol Error)
+        cfg.limits.max_packet_size = Some(10); // floored to 1024
+        cfg.security.auth_timeout_secs = Some(0); // floored to 1
+        let w = wire_limits_from_config(&cfg).unwrap();
+        assert_eq!(w.receive_maximum, 1);
+        assert_eq!(w.max_packet_size, 1024);
+        assert_eq!(w.auth_round_timeout.as_secs(), 1);
+        // A zero publish rate is a hard error, not a silent unlimited.
+        cfg.limits.max_publish_rate = Some(0);
+        assert!(wire_limits_from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn queue_limits_read_overflow_policy_from_config() {
+        let mut cfg = Config::default();
+        cfg.limits.max_queued_messages = Some(42);
+        cfg.limits.queue_overflow = Some("reject-newest".to_string());
+        let q = queue_limits_from_config(&cfg).unwrap();
+        assert_eq!(q.max_messages, 42);
+        assert_eq!(q.overflow, OverflowPolicy::RejectNewest);
     }
 }
