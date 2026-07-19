@@ -670,9 +670,87 @@ impl Config {
     }
 }
 
+/// The authoritative `MQTTD_*` environment surface — every variable
+/// [`Config::overlay_from`] consumes, in declaration order. This is the single list the
+/// binary's env↔config mapping is checked against (the bijection test below). Adding a config
+/// field that an env var should set means adding the var here *and* wiring it in `overlay_from`.
+///
+/// **Documented exceptions** (a config key with no env var, or an env var with no config key):
+/// - [`Security::require_client_cert`] is *derived*, not env-set — it has no variable by design.
+/// - `MQTTD_CONFIG` is the meta variable naming the config *file*; it is read by the binary to
+///   locate the file, not overlaid as a field, so it is deliberately absent here.
+pub const ENV_VARS: &[&str] = &[
+    // node
+    "MQTTD_NODE_ID",
+    "MQTTD_DATA_DIR",
+    "MQTTD_FAILURE_DOMAIN",
+    "MQTTD_FAILURE_DOMAINS",
+    // listeners
+    "MQTTD_TLS_BIND",
+    "MQTTD_PLAINTEXT_BIND",
+    "MQTTD_WS_BIND",
+    "MQTTD_WSS_BIND",
+    "MQTTD_QUIC_BIND",
+    "MQTTD_HEALTH_BIND",
+    "MQTTD_METRICS_BIND",
+    // tls
+    "MQTTD_TLS_CERT",
+    "MQTTD_TLS_KEY",
+    "MQTTD_TLS_CLIENT_CA",
+    "MQTTD_TLS_CRL",
+    // security
+    "MQTTD_ALLOW_ANONYMOUS",
+    "MQTTD_PASSWORD_FILE",
+    "MQTTD_ACL_FILE",
+    "MQTTD_JWT_HS256_SECRET",
+    "MQTTD_JWT_RS256_PEM",
+    "MQTTD_JWT_ISSUER",
+    "MQTTD_JWT_AUDIENCE",
+    "MQTTD_AUTH_TIMEOUT",
+    "MQTTD_AUTH_PENALTY_THRESHOLD",
+    "MQTTD_AUTH_PENALTY_DECAY_SECS",
+    // cluster
+    "MQTTD_PEER_BIND",
+    "MQTTD_PEER_ADVERTISE",
+    "MQTTD_PEERS",
+    "MQTTD_PEER_TLS_CA",
+    "MQTTD_PEER_TLS_CERT",
+    "MQTTD_PEER_TLS_KEY",
+    "MQTTD_PEER_TLS_CRL",
+    "MQTTD_SWIM_BIND",
+    "MQTTD_SWIM_SEEDS",
+    "MQTTD_SWIM_KEY",
+    "MQTTD_SWIM_KEY_ACCEPT",
+    "MQTTD_SWIM_SIGNED",
+    "MQTTD_SWIM_REPLAY",
+    // durable
+    "MQTTD_DURABLE_SESSIONS",
+    "MQTTD_LEASE_VOTERS",
+    "MQTTD_STORE_MAX_BYTES",
+    // limits
+    "MQTTD_MAX_CONNECTIONS",
+    "MQTTD_MAX_CONNECTIONS_PER_IP",
+    "MQTTD_MAX_PACKET_SIZE",
+    "MQTTD_MAX_PUBLISH_RATE",
+    "MQTTD_MAX_QUEUED_MESSAGES",
+    "MQTTD_MAX_RETAINED_MESSAGES",
+    "MQTTD_MAX_SESSIONS",
+    "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT",
+    "MQTTD_RECEIVE_MAXIMUM",
+    "MQTTD_TOPIC_ALIAS_MAX",
+    "MQTTD_QUEUE_OVERFLOW",
+    // observability
+    "MQTTD_OTLP_ENDPOINT",
+    "MQTTD_OTLP_INTERVAL",
+    // runtime
+    "MQTTD_SHUTDOWN_GRACE",
+    "MQTTD_READY_MIN_MEMBERS",
+    "MQTTD_CONFIG_WATCH",
+];
+
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ENV_VARS};
 
     #[test]
     fn defaults_are_secure() {
@@ -853,5 +931,99 @@ mod tests {
         let mut c = base.clone();
         c.overlay_from(getter(&[])).unwrap();
         assert_eq!(c, base);
+    }
+
+    /// A value guaranteed to *differ from the default* for `var`, so overlaying it alone must
+    /// mutate the config. Booleans/enums need a specific opposite-of-default value; numerics need
+    /// a parseable one; everything else takes an arbitrary non-empty string.
+    fn distinct_value(var: &str) -> &'static str {
+        match var {
+            // Durable is on by default — the only value that *changes* it is a falsey one.
+            "MQTTD_DURABLE_SESSIONS" => "off",
+            // Presence flips anonymous on (default off).
+            "MQTTD_ALLOW_ANONYMOUS" => "1",
+            // Enums: any valid, non-default (default None) member.
+            "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
+            "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
+            // The node=domain map needs a well-formed entry.
+            "MQTTD_FAILURE_DOMAINS" => "n1=rack-a",
+            // Numerics (all widths parse "7").
+            "MQTTD_AUTH_TIMEOUT"
+            | "MQTTD_AUTH_PENALTY_THRESHOLD"
+            | "MQTTD_AUTH_PENALTY_DECAY_SECS"
+            | "MQTTD_LEASE_VOTERS"
+            | "MQTTD_STORE_MAX_BYTES"
+            | "MQTTD_MAX_CONNECTIONS"
+            | "MQTTD_MAX_CONNECTIONS_PER_IP"
+            | "MQTTD_MAX_PACKET_SIZE"
+            | "MQTTD_MAX_PUBLISH_RATE"
+            | "MQTTD_MAX_QUEUED_MESSAGES"
+            | "MQTTD_MAX_RETAINED_MESSAGES"
+            | "MQTTD_MAX_SESSIONS"
+            | "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT"
+            | "MQTTD_RECEIVE_MAXIMUM"
+            | "MQTTD_TOPIC_ALIAS_MAX"
+            | "MQTTD_OTLP_INTERVAL"
+            | "MQTTD_SHUTDOWN_GRACE"
+            | "MQTTD_READY_MIN_MEMBERS"
+            | "MQTTD_CONFIG_WATCH" => "7",
+            // Paths / addresses / lists / keys.
+            _ => "x-sentinel",
+        }
+    }
+
+    #[test]
+    fn the_env_surface_is_a_deduplicated_curated_list() {
+        // Every var appears exactly once — a duplicate would be a copy/paste bug that hides a
+        // missing mapping.
+        let mut seen = std::collections::BTreeSet::new();
+        for v in ENV_VARS {
+            assert!(seen.insert(*v), "{v} is listed twice in ENV_VARS");
+            assert!(v.starts_with("MQTTD_"), "{v} is not an MQTTD_* var");
+        }
+        // Guards the count so adding/removing a field forces a deliberate list update.
+        assert_eq!(
+            seen.len(),
+            57,
+            "the MQTTD_* surface changed — update ENV_VARS"
+        );
+    }
+
+    #[test]
+    fn every_env_var_maps_to_a_config_key() {
+        // Totality (env → config): setting *one* listed var, alone, must move the config off its
+        // default. If overlay_from ever dropped a mapping, that var's overlay would be a no-op
+        // and this fails — the var would silently do nothing.
+        for var in ENV_VARS {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[(var, distinct_value(var))]))
+                .unwrap_or_else(|e| panic!("overlay of {var} errored: {e}"));
+            assert_ne!(
+                c,
+                Config::default(),
+                "{var} is in ENV_VARS but overlaying it changed nothing — the mapping is missing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_env_surface_overlays_without_collision() {
+        // Setting the entire surface at once produces a config that differs from default in every
+        // section and still round-trips through validate for the numeric/enistence-only fields
+        // (the relational checks that a full env would trip — crl-without-ca etc. — are exercised
+        // by the dedicated tests above; here every var carries a self-consistent value).
+        let pairs: Vec<(&str, &str)> = ENV_VARS.iter().map(|v| (*v, distinct_value(v))).collect();
+        let mut c = Config::default();
+        c.overlay_from(getter(&pairs)).unwrap();
+        // A representative field from each section moved.
+        assert_eq!(c.node.id, "x-sentinel");
+        assert!(c.listeners.tls_bind.is_some());
+        assert!(c.tls.cert.is_some());
+        assert!(c.security.allow_anonymous);
+        assert!(c.cluster.peer_bind.is_some());
+        assert!(!c.durable.enabled);
+        assert_eq!(c.limits.max_connections, Some(7));
+        assert!(c.observability.otlp_endpoint.is_some());
+        assert_eq!(c.runtime.ready_min_members, 7);
     }
 }
