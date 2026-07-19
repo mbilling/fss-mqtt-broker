@@ -67,6 +67,13 @@ can hold a servable lease, so no session id is structurally unrecoverable. Concr
 - `group_owner`/`owner`/`owner_route` hash over `voters` (∩ eligible). **Bootstrap safety:**
   if the voter set is not yet known (empty), fall back to the eligible set exactly as today,
   so a fresh/single-node cluster is unaffected.
+- **Settle before restricting.** The restriction is applied only once the voter set has held
+  steady for a few reconcile ticks; while it is still growing (founder bootstraps as *sole
+  voter*, then grows to `voter_cap`), ownership falls back to the eligible set. Restricting
+  mid-growth would concentrate *every* group on the founder and then thrash it out via a
+  mass lease migration — pathological under load (a disk-stressed founder never converges).
+  By the time the set settles in a small all-voter cluster, `voters == eligible`, so the
+  restriction is a no-op there; a bounded cluster gets it once stable.
 
 ### 2. Session-data replication is unchanged — the owner just leads the set
 

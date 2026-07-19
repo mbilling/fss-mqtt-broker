@@ -53,6 +53,13 @@ use tracing::{debug, warn};
 /// membership/lease change before the previous one commits amplifies durable-store churn.
 const DRIVER_TICK: Duration = Duration::from_secs(1);
 
+/// Consecutive ticks the lease voter set must hold steady before durable ownership
+/// is restricted to it (ADR 0049). Bridges the founder-bootstrap growth window
+/// (sole voter → `voter_cap`) so ownership is never concentrated on the founder and
+/// then thrashed out by mass migration; until then, ownership falls back to the
+/// eligible members.
+const VOTER_STABLE_TICKS: u32 = 3;
+
 /// Driver ticks between catch-up sweeps while one is armed (ADR 0043 P1): brisk
 /// enough that a joiner back-fills within seconds of entering a replica set, slow
 /// enough that the owner is not asked to re-commit the same key more often than a
@@ -411,6 +418,16 @@ async fn run_driver(
     // Static-seed overrides already warned about, so the mismatch is loud once per
     // (node, label) rather than per tick (ADR 0016 T6 loudness rule).
     let mut warned_overrides: BTreeSet<(RaftNodeId, FailureDomain)> = BTreeSet::new();
+    // Voter-set stability tracking (ADR 0049): durable ownership is restricted to the
+    // voters, but ONLY once the set has settled. During founder bootstrap the voter set
+    // grows (sole voter → voter_cap); restricting mid-growth would concentrate every
+    // group's ownership on the founder and then thrash it back out via mass migration.
+    // While the set is still moving we push an empty set (Placement falls back to the
+    // eligible members — the pre-ADR-0049 behaviour), so no concentration ever happens.
+    // By the time it settles in a small all-voter cluster, voters == eligible, so the
+    // restriction is a no-op there; a bounded cluster gets the restriction once stable.
+    let mut prev_voter_rids: BTreeSet<RaftNodeId> = BTreeSet::new();
+    let mut voter_stable_ticks: u32 = 0;
     loop {
         tokio::time::sleep(DRIVER_TICK).await;
 
@@ -432,7 +449,15 @@ async fn run_driver(
                 .membership_config
                 .voter_ids()
                 .collect();
-            let voter_nodes: BTreeSet<NodeId> = {
+            if voter_rids == prev_voter_rids {
+                voter_stable_ticks = voter_stable_ticks.saturating_add(1);
+            } else {
+                voter_stable_ticks = 0;
+                prev_voter_rids.clone_from(&voter_rids);
+            }
+            // Restrict only once the voter set has held steady for a couple of ticks;
+            // otherwise fall back to eligible (empty set) to avoid bootstrap churn.
+            let voter_nodes: BTreeSet<NodeId> = if voter_stable_ticks >= VOTER_STABLE_TICKS {
                 let p = placement
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -440,6 +465,8 @@ async fn run_driver(
                     .into_iter()
                     .filter(|n| voter_rids.contains(&raft_id(n)))
                     .collect()
+            } else {
+                BTreeSet::new()
             };
             placement
                 .write()

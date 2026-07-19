@@ -70,3 +70,12 @@ P1 is the ship-blocker of the three; P2/P3 harden and close.
   `raft_view`'s `membership().voter_ids()`, which under a bounded set reported a base membership
   and left ownership split-brained. The bounded-voter integration test was rewritten to the
   amended invariant (no session owns on a learner; durable through failures). All green.
+- **2026-07-19** — **P1 hardening.** The out-of-process disk-fault test (`cluster_proc`
+  `a_disk_bound_crash_mid_write`) exposed a second issue the in-process tests missed: the
+  founder bootstraps as *sole voter*, so restricting ownership immediately concentrated all
+  256 groups on it and then thrashed them out via mass migration — which never converges on a
+  disk-stressed founder (persistent `not the owning node`, zero acks). Fix: **settle-gate** the
+  restriction — only restrict once the voter set has held steady for 3 ticks; while it grows,
+  fall back to eligible. In a small all-voter cluster the set settles at `voters == eligible`,
+  so the restriction is a no-op there; the bounded cluster still gets it. Full `cluster_proc`
+  (3), `durable_sessions` (10), `mqtt-cluster` (245) green; clippy + fmt clean.
