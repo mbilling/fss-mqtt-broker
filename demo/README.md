@@ -81,6 +81,18 @@ persists its lease group and replicated session log to its own `/data` volume. E
 > is what makes scaling this demo up viable. Set `MQTTD_DURABLE_SESSIONS=0` to fall back to the
 > bounded in-memory store (then those panels stay empty).
 
+> **Single-host sizing caveat (fsync-bound).** This demo runs every node on one machine
+> sharing one disk. A consensus-backed cluster is **fsync-bound**: each node persists to the
+> raft log + session log + retained store on commit, so packing ≥5 durable nodes onto a
+> single host makes them contend for the same disk queue, and under load the follower commit
+> path can miss its RPC deadline — degrading (or stalling) durable session recovery while
+> `/readyz` still reports a leader. This is a *laptop-demo* limit, not a property of the
+> broker: a real deployment gives each node its own host and disk (see
+> [ADR 0049](../docs/adr/0049-voter-eligible-durable-ownership.md) and the
+> [post-mortem](../docs/postmortems/2026-07-14-ha-bridge-durable-refused.md)). Watch
+> `lease_quorum_ack_ms` and `durable_recovery_failures_total` (ADR 0049) for the degradation;
+> if you see it, run fewer durable nodes or lower `MQTTD_LEASE_VOTERS`.
+
 The **loadgen** keeps a persistent QoS-1 subscriber on node-2 and publishes QoS-1 +
 retained messages on node-1, so publishes route **across nodes** — populating
 publish/deliver, sessions, subscriptions, retained, and inflight panels.

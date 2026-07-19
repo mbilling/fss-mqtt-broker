@@ -77,6 +77,15 @@ log replicates to all of them. A learner that HRW makes a placement owner reads 
 assigned lease epoch from that replicated log exactly as a voter would — it does not need
 to vote to own a group or run its `ClusterLog` at the granted epoch.
 
+> **Amended by [ADR 0049](0049-voter-eligible-durable-ownership.md) (2026-07-19).** The claim
+> above that a *learner* can own a group and serve it "exactly as a voter would" did **not**
+> hold in practice: the [2026-07-14 post-mortem](../postmortems/2026-07-14-ha-bridge-durable-refused.md)
+> proved a durable session whose id hashes to a permanent learner can never recover (CONNACK
+> 0x88 forever). ADR 0049 restricts durable **ownership** to lease voters (data *replication*
+> still spans all eligible members, so §1's decoupling of replication from the voter cap
+> stands). Read this section as: learners replicate the lease log and hold replica data, but
+> do not *own* durable groups.
+
 ### 3. Reconciler reshape
 
 `MembershipReconciler::decide` changes from "make every member a voter" to computing a

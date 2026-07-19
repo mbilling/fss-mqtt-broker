@@ -1874,7 +1874,7 @@ impl Hub {
                 client = %client.0,
                 owner = %p.owner(&client.0).0,
                 "persistent session served locally but owned by another node \
-                 (ephemeral mode; cross-node affinity is ADR 0005 step 2)"
+                 (session relocation / cross-node affinity is ADR 0005 step 2)"
             );
         }
     }
