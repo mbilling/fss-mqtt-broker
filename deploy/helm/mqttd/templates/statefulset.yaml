@@ -63,7 +63,12 @@ spec:
               else
                 SEEDS="\"${FOUNDER_FQDN}:7946\""
               fi
+              # Every pod must ADVERTISE a routable peer-bus address, not its 0.0.0.0 bind — peers
+              # dial the advertised address over the headless service, and 0.0.0.0 is unroutable
+              # (the mesh never links). Per-pod DNS is <pod>.<headless>.<ns>.svc.cluster.local.
+              PEER_ADVERTISE="${POD_NAME}.${HEADLESS_DOMAIN}:7001"
               sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
+                -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
                 /tmpl/mqttd.toml.tmpl > /config/mqttd.toml
               echo "rendered config for ${POD_NAME} (ordinal ${ORD}):"
               cat /config/mqttd.toml
@@ -74,6 +79,8 @@ spec:
                   fieldPath: metadata.name
             - name: FOUNDER_FQDN
               value: {{ printf "%s-0.%s.%s.svc.cluster.local" (include "mqttd.fullname" .) (include "mqttd.headlessName" .) .Release.Namespace | quote }}
+            - name: HEADLESS_DOMAIN
+              value: {{ printf "%s.%s.svc.cluster.local" (include "mqttd.headlessName" .) .Release.Namespace | quote }}
           volumeMounts:
             - name: config-tmpl
               mountPath: /tmpl

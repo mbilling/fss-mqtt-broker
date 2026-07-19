@@ -20,6 +20,7 @@ config: |
 
   [cluster]
   peer_bind = "0.0.0.0:7001"
+  peer_advertise = "__PEER_ADVERTISE__"
 
   [cluster.swim]
   bind = "0.0.0.0:7946"
