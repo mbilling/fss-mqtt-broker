@@ -5,7 +5,9 @@ adr_status: Proposed
 tasks:
   - id: 0049-P1
     title: Voter-eligible ownership — plumb the lease voter set into Placement (pushed each reconcile tick by run_driver); group_owner/owner/owner_route hash over voters ∩ eligible with an empty-voters bootstrap fallback; the voter owner leads its group's replica set while replicas still span the full eligible set (ADR 0021 replication-independence preserved); real-cluster test enforces the invariant that no session id maps to a learner owner and every persistent attach succeeds
-    status: planned
+    status: done
+    date: 2026-07-19
+    evidence: "placement.rs: voters field + set_voters (pushed each run_driver tick from membership_config.voter_ids(), the same source DurablePlane::voter_count trusts) + owner_over/owner_led_replica_set helpers; group_owner/group_replica_set/group_replica_set_without restricted to voters (owner leads), replicas still span eligible. Unit tests: owner is always a voter across all 256 groups, replicas still hit learners, empty-voters fallback == pre-0049. Rewrote the bounded-voter integration test (a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_failures, amends ADR 0021 §2): all 5 nodes converge on a 3-voter set, no session owns on a learner, and a voter-owned session survives a replica loss + another failure. Full durable_sessions (10) + mqtt-cluster (245) green; clippy -D warnings + fmt clean."
   - id: 0049-P2
     title: Durable-plane visibility — new counters durable_recovery_failures_total (at the attach refusal) and lease_rpc_timeouts_total (follower AppendEntries/replication timeouts); readiness augmented (not inverted) so a verbose /readyz probe reports durable-serviceability signals without flapping the k8s-facing ready gate
     status: planned
@@ -22,7 +24,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 <!-- status-table:0049 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0049-P1 | ⬜ planned | — |  |
+| 0049-P1 | ✅ done | 2026-07-19 | "placement.rs: voters field + set_voters (pushed each run_driver tick from membership_config.voter_ids(), the same source DurablePlane::voter_count trusts) + owner_over/owner_led_replica_set helpers; group_owner/group_replica_set/group_replica_set_without restricted to voters (owner leads), replicas still span eligible. Unit tests: owner is always a voter across all 256 groups, replicas still hit learners, empty-voters fallback == pre-0049. Rewrote the bounded-voter integration test (a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_failures, amends ADR 0021 §2): all 5 nodes converge on a 3-voter set, no session owns on a learner, and a voter-owned session survives a replica loss + another failure. Full durable_sessions (10) + mqtt-cluster (245) green; clippy -D warnings + fmt clean." |
 | 0049-P2 | ⬜ planned | — |  |
 | 0049-P3 | ⬜ planned | — |  |
 <!-- /status-table:0049 -->
@@ -61,3 +63,10 @@ P1 is the ship-blocker of the three; P2/P3 harden and close.
   (durable ownership can land on a learner that never serves it — amends ADR 0021 §2) and the
   readiness/metrics blind spot (a dead durable plane reported healthy for 11 h). Phased
   P1 (fix) → P2 (visibility) → P3 (docs/closure). Tasks **planned** — build begins at P1.
+- **2026-07-19** — **P1 done.** Durable ownership is now voter-restricted: `Placement` carries
+  the lease voter set (pushed each `run_driver` tick), and owner selection hashes over it
+  (owner-led replica set, replicas still span eligible). A debug find along the way: the voter
+  set must be read from `membership_config.voter_ids()` (what `voter_count` trusts), not
+  `raft_view`'s `membership().voter_ids()`, which under a bounded set reported a base membership
+  and left ownership split-brained. The bounded-voter integration test was rewritten to the
+  amended invariant (no session owns on a learner; durable through failures). All green.

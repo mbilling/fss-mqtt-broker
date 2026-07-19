@@ -416,6 +416,37 @@ async fn run_driver(
 
         let view = raft_view(&raft);
 
+        // Push the current lease voter set into Placement so durable ownership is
+        // restricted to lease-eligible nodes (ADR 0049 P1): a learner cannot serve
+        // a durable group, so it must never be selected as an owner. The voter set
+        // is committed raft membership (identical across nodes), keeping owner
+        // selection deterministic. Empty until the group forms → eligible fallback.
+        {
+            // Read the committed voter ids from the same accessor the readiness
+            // signal trusts (`DurablePlane::voter_count`), not `raft_view` — the
+            // latter reads a base membership that under a bounded voter set (ADR
+            // 0021) does not reflect the effective voters.
+            let voter_rids: BTreeSet<RaftNodeId> = raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .voter_ids()
+                .collect();
+            let voter_nodes: BTreeSet<NodeId> = {
+                let p = placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                p.members()
+                    .into_iter()
+                    .filter(|n| voter_rids.contains(&raft_id(n)))
+                    .collect()
+            };
+            placement
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_voters(voter_nodes);
+        }
+
         let (members, live_domains): (Vec<RaftNodeId>, BTreeMap<RaftNodeId, FailureDomain>) = {
             let p = placement
                 .read()

@@ -70,6 +70,15 @@ pub struct Placement {
     /// Nodes eligible to own sessions: this node plus non-`Dead` peers. A
     /// `BTreeSet` keeps the derived node list deterministic across calls.
     eligible: BTreeSet<NodeId>,
+    /// The current lease-consensus voter set (ADR 0049), pushed each reconcile
+    /// tick by the durable driver. Durable *ownership* is restricted to these
+    /// nodes — a learner cannot hold a servable lease, so a group owned by one
+    /// refuses every persistent attach forever (the 2026-07-14 post-mortem).
+    /// Empty means "not yet known" (bootstrap / non-durable), in which case
+    /// ownership falls back to the full eligible set exactly as before. Data
+    /// *replication* still spans the eligible set — only ownership is bounded
+    /// (ADR 0021 keeps replication independent of the voter cap).
+    voters: BTreeSet<NodeId>,
     /// Each peer's inter-node (peer-link) address, so the owner of a session can
     /// be reached for session relocation (ADR 0005).
     addrs: BTreeMap<NodeId, String>,
@@ -93,6 +102,7 @@ impl Placement {
             local,
             replicas: replicas.max(1),
             eligible,
+            voters: BTreeSet::new(),
             addrs: BTreeMap::new(),
             local_domain: None,
             domains: BTreeMap::new(),
@@ -155,20 +165,73 @@ impl Placement {
         self.eligible.iter().cloned().collect()
     }
 
-    /// The owner node of a placement `group`. There is always an owner (this node
-    /// is always eligible).
+    /// Replace the current lease voter set (ADR 0049). Called each reconcile tick
+    /// by the durable driver with the committed voters (mapped back to `NodeId`).
+    /// An empty set means "unknown" and ownership falls back to the eligible set.
+    pub fn set_voters(&mut self, voters: BTreeSet<NodeId>) {
+        self.voters = voters;
+    }
+
+    /// The current lease voter set as seen by this ring (ADR 0049) — empty until
+    /// the durable driver has pushed it. Exposed so ownership convergence can be
+    /// observed (tests, diagnostics).
     #[must_use]
-    pub fn group_owner(&self, group: GroupId) -> NodeId {
-        hrw::owner(group_key(group).as_bytes(), &self.nodes())
+    pub fn voter_ids(&self) -> Vec<NodeId> {
+        self.voters.iter().cloned().collect()
+    }
+
+    /// The owner of `group` over a given candidate node list, restricted to the
+    /// lease voter set (ADR 0049) when it is known. A learner cannot serve durable
+    /// ownership, so owners are drawn from the voters ∩ `nodes`; if that
+    /// intersection is empty (voters unknown, or momentarily none of them
+    /// eligible) it falls back to `nodes` so the ring never has no owner.
+    fn owner_over(&self, group: GroupId, nodes: &[NodeId]) -> NodeId {
+        let voter_pool: Vec<NodeId> = if self.voters.is_empty() {
+            Vec::new()
+        } else {
+            nodes
+                .iter()
+                .filter(|n| self.voters.contains(*n))
+                .cloned()
+                .collect()
+        };
+        let pool: &[NodeId] = if voter_pool.is_empty() {
+            nodes
+        } else {
+            &voter_pool
+        };
+        hrw::owner(group_key(group).as_bytes(), pool)
             .cloned()
             .unwrap_or_else(|| self.local.clone())
+    }
+
+    /// The ordered replica set of `group` over a candidate node list: the
+    /// voter-eligible owner (ADR 0049 §1) leads, followed by the HRW replica set
+    /// over the full `nodes` — so ownership is bounded to voters while data
+    /// replication still spans every eligible node (ADR 0021 §2). Owner-first,
+    /// deduplicated, capped at `R`. The owner is always present, preserving the
+    /// invariant that a group's owner holds its data.
+    fn owner_led_replica_set(&self, group: GroupId, nodes: &[NodeId]) -> Vec<NodeId> {
+        let owner = self.owner_over(group, nodes);
+        let mut set = hrw::replica_set(group_key(group).as_bytes(), nodes, self.replicas);
+        set.retain(|n| n != &owner);
+        set.insert(0, owner);
+        set.truncate(self.replicas.max(1));
+        set
+    }
+
+    /// The owner node of a placement `group`. There is always an owner (this node
+    /// is always eligible). Restricted to lease voters when known (ADR 0049).
+    #[must_use]
+    pub fn group_owner(&self, group: GroupId) -> NodeId {
+        self.owner_over(group, &self.nodes())
     }
 
     /// The ordered replica set of a placement `group` (owner first), capped at `R`
     /// and at the current member count.
     #[must_use]
     pub fn group_replica_set(&self, group: GroupId) -> Vec<NodeId> {
-        hrw::replica_set(group_key(group).as_bytes(), &self.nodes(), self.replicas)
+        self.owner_led_replica_set(group, &self.nodes())
     }
 
     /// Whether this node owns placement `group`.
@@ -191,7 +254,9 @@ impl Placement {
             .filter(|n| *n != leaving)
             .cloned()
             .collect();
-        hrw::replica_set(group_key(group).as_bytes(), &nodes, self.replicas)
+        // Owner-led (ADR 0049): the post-leave owner is a voter (when known), so the
+        // decommission drain hands each group to a node that can actually serve it.
+        self.owner_led_replica_set(group, &nodes)
     }
 
     /// The owner node for `client` — the owner of its placement group.
@@ -269,6 +334,68 @@ mod tests {
             );
         }
         p
+    }
+
+    // --- ADR 0049: durable ownership restricted to lease voters ---
+
+    /// Every group's owner is a voter, and no session id maps to a learner owner —
+    /// the invariant that closes the placement × voter-cap availability bug.
+    #[test]
+    fn voter_restricted_owner_is_always_a_voter() {
+        use super::NUM_GROUPS;
+        use std::collections::BTreeSet;
+        // 7-node cluster, voter_cap 5: b..f are voters, g/h are permanent learners.
+        let mut p = ring("a", &["b", "c", "d", "e", "f", "g"]);
+        p.observe(&node("h"), MemberState::Alive, "h:7000", None);
+        assert_eq!(p.member_count(), 8);
+        let voters: BTreeSet<NodeId> = ["a", "b", "c", "d", "e"].iter().map(|s| node(s)).collect();
+        p.set_voters(voters.clone());
+
+        for g in 0..NUM_GROUPS {
+            let owner = p.group_owner(g);
+            assert!(
+                voters.contains(&owner),
+                "group {g} owner {owner:?} is not a voter"
+            );
+            // The owner always holds the group's data (owner ∈ replica set).
+            assert!(
+                p.group_replica_set(g).contains(&owner),
+                "group {g} replica set missing its owner"
+            );
+        }
+    }
+
+    /// Ownership is voter-bounded, but data replication still spans learners —
+    /// ADR 0021 §2's decoupling of replication from the voter cap is preserved.
+    #[test]
+    fn replicas_still_span_learners() {
+        use super::NUM_GROUPS;
+        use std::collections::BTreeSet;
+        let mut p = ring("a", &["b", "c", "d", "e", "f", "g"]);
+        let voters: BTreeSet<NodeId> = ["a", "b", "c"].iter().map(|s| node(s)).collect();
+        p.set_voters(voters);
+        let learners = [node("d"), node("e"), node("f"), node("g")];
+        // At least one group replicates onto a learner (data domain > voter set).
+        let hits_learner =
+            (0..NUM_GROUPS).any(|g| p.group_replica_set(g).iter().any(|n| learners.contains(n)));
+        assert!(
+            hits_learner,
+            "no group replicates to a learner — spread collapsed to voters"
+        );
+    }
+
+    /// With no voter set known (bootstrap / non-durable), ownership falls back to
+    /// the full eligible set — identical to pre-ADR-0049 behaviour.
+    #[test]
+    fn empty_voters_falls_back_to_eligible() {
+        use super::NUM_GROUPS;
+        let p = ring("a", &["b", "c", "d"]);
+        // No set_voters call → voters empty → owner over all eligible.
+        for g in 0..NUM_GROUPS {
+            let owner = p.group_owner(g);
+            assert!(p.members().contains(&owner));
+            assert!(p.group_replica_set(g).contains(&owner));
+        }
     }
 
     #[test]
