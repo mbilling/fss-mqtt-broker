@@ -5,7 +5,9 @@ adr_status: Proposed
 tasks:
   - id: 0046-T1
     title: TOML config schema + parser — sections mirroring the MQTTD_* env groups; strict (unknown keys rejected, types/ranges checked); reuses the hardened ACL TOML parsing posture
-    status: planned
+    status: done
+    date: 2026-07-19
+    evidence: "mqtt-config: a typed Config grouped by concern (node/listeners/tls/security/cluster/durable/limits/observability/runtime) mirroring the full MQTTD_* surface; every table #[serde(deny_unknown_fields)] so a typo fails the load; secure defaults (durable on, anonymous off, mTLS required, TLS-only) match the env defaults; Config::from_toml parses strict + validates ranges/relations (lease_voters≥1, crl needs its ca, swim.signed/replay ∈ {require,off}, queue_overflow enum). 8 unit tests: defaults secure, full-TOML round-trip, unknown key/table rejected, type mismatch rejected, out-of-range rejected, crl-without-ca rejected, bad enum rejected. Additive — not yet wired into main.rs (T2). clippy -D warnings + fmt clean; mqttd still builds."
   - id: 0046-T2
     title: Layering + precedence — defaults < config file < env vars < flags; --config path and MQTTD_CONFIG; effective config logged at startup with secrets redacted; a test asserts every MQTTD_* var maps to exactly one config key and vice versa
     status: planned
@@ -28,7 +30,7 @@ above · this file is the plan, progress log, and changelog.
 <!-- status-table:0046 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0046-T1 | ⬜ planned | — |  |
+| 0046-T1 | ✅ done | 2026-07-19 | "mqtt-config: a typed Config grouped by concern (node/listeners/tls/security/cluster/durable/limits/observability/runtime) mirroring the full MQTTD_* surface; every table #[serde(deny_unknown_fields)] so a typo fails the load; secure defaults (durable on, anonymous off, mTLS required, TLS-only) match the env defaults; Config::from_toml parses strict + validates ranges/relations (lease_voters≥1, crl needs its ca, swim.signed/replay ∈ {require,off}, queue_overflow enum). 8 unit tests: defaults secure, full-TOML round-trip, unknown key/table rejected, type mismatch rejected, out-of-range rejected, crl-without-ca rejected, bad enum rejected. Additive — not yet wired into main.rs (T2). clippy -D warnings + fmt clean; mqttd still builds." |
 | 0046-T2 | ⬜ planned | — |  |
 | 0046-T3 | ⬜ planned | — |  |
 | 0046-T4 | ⬜ planned | — |  |
