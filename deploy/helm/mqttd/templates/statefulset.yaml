@@ -1,0 +1,218 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mqttd.fullname" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+spec:
+  # Headless service backs stable per-pod DNS and gossip discovery (ADR 0016).
+  serviceName: {{ include "mqttd.headlessName" . }}
+  replicas: {{ .Values.replicaCount }}
+  # One pod at a time, in order — ADR 0039's rolling-upgrade motion (a pod rejoins and reaches
+  # its caught-up watermark before the next rolls).
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "mqttd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mqttd.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Re-render + roll pods when the config template changes.
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- if .Values.metrics.podAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "mqttd.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Cover the ADR 0043 decommission drain + ADR 0019 graceful shutdown before a hard kill.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+        # 1) Render the per-pod config: node id = the stable pod name; seeds = pod-0 for every
+        #    non-founder, empty for pod-0 (which founds the lease group). The broker image is
+        #    distroless (no shell), so this tiny POSIX-shell step does the templating.
+        - name: render-config
+          image: "{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}"
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${POD_NAME##*-}"
+              if [ "$ORD" = "0" ]; then
+                SEEDS=""
+              else
+                SEEDS="\"${FOUNDER_FQDN}:7946\""
+              fi
+              sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
+                /tmpl/mqttd.toml.tmpl > /config/mqttd.toml
+              echo "rendered config for ${POD_NAME} (ordinal ${ORD}):"
+              cat /config/mqttd.toml
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FOUNDER_FQDN
+              value: {{ printf "%s-0.%s.%s.svc.cluster.local" (include "mqttd.fullname" .) (include "mqttd.headlessName" .) .Release.Namespace | quote }}
+          volumeMounts:
+            - name: config-tmpl
+              mountPath: /tmpl
+            - name: config
+              mountPath: /config
+        {{- if .Values.checkConfig.enabled }}
+        # 2) Fail the pod BEFORE it serves if the rendered config is invalid (ADR 0046 T3).
+        - name: check-config
+          image: {{ include "mqttd.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["--check-config", "--config", "/config/mqttd.toml"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+        {{- end }}
+      containers:
+        - name: mqttd
+          image: {{ include "mqttd.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["--config", "/config/mqttd.toml"]
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: mqtt-tls
+              containerPort: 8883
+            - name: health
+              containerPort: 8080
+            - name: peer
+              containerPort: 7001
+            - name: gossip
+              containerPort: 7946
+              protocol: UDP
+          # Scale-down is a decommission, not a crash (ADR 0043 / 0047 T4): `mqttd --decommission`
+          # sends SIGUSR1 to the broker (PID 1) to drain every held key to its post-departure
+          # replica set, then BLOCKS until the broker exits — so k8s holds the pod open for the
+          # whole drain before SIGTERM. A hard kill past terminationGracePeriodSeconds falls back
+          # to crash semantics the survivors handle.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /usr/local/bin/mqttd
+                  - --decommission
+                  - --timeout
+                  - {{ .Values.terminationGracePeriodSeconds | quote }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /var/lib/mqttd
+            {{- if .Values.secrets.tls.secretName }}
+            - name: tls
+              mountPath: {{ .Values.secrets.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.secrets.acl.configMapName }}
+            - name: acl
+              mountPath: {{ .Values.secrets.acl.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.secrets.peerTls.secretName }}
+            - name: peer-tls
+              mountPath: {{ .Values.secrets.peerTls.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.secrets.gossipKey.secretName }}
+            - name: gossip-key
+              mountPath: {{ .Values.secrets.gossipKey.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config-tmpl
+          configMap:
+            name: {{ include "mqttd.fullname" . }}-config
+        - name: config
+          emptyDir: {}
+        {{- if .Values.secrets.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.secrets.tls.secretName }}
+        {{- end }}
+        {{- if .Values.secrets.acl.configMapName }}
+        - name: acl
+          configMap:
+            name: {{ .Values.secrets.acl.configMapName }}
+        {{- end }}
+        {{- if .Values.secrets.peerTls.secretName }}
+        - name: peer-tls
+          secret:
+            secretName: {{ .Values.secrets.peerTls.secretName }}
+        {{- end }}
+        {{- if .Values.secrets.gossipKey.secretName }}
+        - name: gossip-key
+          secret:
+            secretName: {{ .Values.secrets.gossipKey.secretName }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "mqttd.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+  {{- end }}

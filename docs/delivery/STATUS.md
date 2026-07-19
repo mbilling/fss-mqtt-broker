@@ -54,7 +54,7 @@
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/7 done](0044-release-readiness-assurance.md) | — |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [3/5 done](0045-release-engineering-and-distribution.md) | 2 open |
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/5 done](0046-file-based-configuration.md) | — |
-| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Proposed | [0/5 done](0047-kubernetes-deployment.md) | 5 open |
+| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Proposed | [4/5 done](0047-kubernetes-deployment.md) | 1 open |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Proposed | [0/4 done](0048-comparative-benchmarking.md) | 4 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
 
@@ -115,11 +115,7 @@
 
 **0047 — Kubernetes deployment (Helm chart, StatefulSet, safe scale-down)**
 
-- `0047-T1` ⬜ planned: StatefulSet + per-pod PVC — volumeClaimTemplate for the redb data dir; node id from the stable pod name; headless service backs gossip discovery so the mesh self-forms
-- `0047-T2` ⬜ planned: ConfigMap-mounted config (ADR 0046) + Secret-mounted TLS/keys/gossip-key by path; --check-config as an init container so a bad config fails the rollout before serving
-- `0047-T3` ⬜ planned: Probes + services wired — readinessProbe /readyz, livenessProbe /livez, /metrics scrape annotation/ServiceMonitor; client Service + headless peer/gossip Service
-- `0047-T4` ⬜ planned: Safe scale-down — preStop hook sends SIGUSR1 (ADR 0043 decommission drain); terminationGracePeriodSeconds sized for drain + ADR 0019 graceful shutdown; hard-kill falls back to crash semantics survivors handle
-- `0047-T5` ⬜ planned: Quorum-safe rollout — StatefulSet one-at-a-time RollingUpdate (ADR 0039 motion) + PodDisruptionBudget maxUnavailable 1; a kind/k3d smoke test in CI stands up a cluster, scales, and rolls, asserting no acked loss
+- `0047-T5` 🚧 in-progress: Quorum-safe rollout — StatefulSet one-at-a-time RollingUpdate (ADR 0039 motion) + PodDisruptionBudget maxUnavailable 1; a kind/k3d smoke test in CI stands up a cluster, scales, and rolls, asserting no acked loss — "Rollout config authored in the chart: StatefulSet OrderedReady + RollingUpdate (one pod at a time, each rejoining before the next — ADR 0039), and a PodDisruptionBudget maxUnavailable 1 (a node drain can't take two brokers / quorum). A CI `helm` job lints + templates + kubeconform-validates the whole chart offline. Remaining: the live kind/k3d runtime smoke that stands up a cluster, scales down (asserting the decommission drain runs), and rolls (asserting no acked fact is lost) — it needs the image built + a kind cluster, so it lands in the nightly tier."
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 

@@ -1,0 +1,45 @@
+{{/* Headless service: stable per-pod DNS + gossip discovery / peer mesh (ADR 0016). */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mqttd.headlessName" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Return SRV/A records for pods before they are Ready, so gossip can reach a still-joining peer.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mqttd.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: peer
+      port: 7001
+      targetPort: peer
+      protocol: TCP
+    - name: gossip
+      port: 7946
+      targetPort: gossip
+      protocol: UDP
+---
+{{/* Client-facing service (load-balanced across ready pods). */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mqttd.fullname" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "mqttd.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- toYaml .Values.service.ports | nindent 4 }}
+    # Health + Prometheus /metrics port, so a ServiceMonitor (port: health) can scrape.
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP

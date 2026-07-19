@@ -1,0 +1,31 @@
+mqttd {{ .Chart.AppVersion }} deployed as a {{ .Values.replicaCount }}-node StatefulSet
+"{{ include "mqttd.fullname" . }}" in namespace "{{ .Release.Namespace }}".
+
+Cluster formation (ADR 0016):
+  - Pod {{ include "mqttd.fullname" . }}-0 is the gossip founder (no seeds); pods 1..N seed to it
+    over the headless service "{{ include "mqttd.headlessName" . }}", and the mesh self-forms.
+  - Each pod's node id is its stable pod name; each has its own PersistentVolume for the redb
+    data dir, so a rescheduled pod recovers its durable state.
+
+Check status:
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "mqttd.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Connect (from inside the cluster):
+  Client service:   {{ include "mqttd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ (index .Values.service.ports 0).port }}
+
+{{- if not .Values.secrets.tls.secretName }}
+
+WARNING: no TLS Secret is set (secrets.tls.secretName is empty). The config references
+{{ .Values.secrets.tls.mountPath }}/tls.crt — set secrets.tls.secretName to a
+kubernetes.io/tls Secret, or the TLS listener will fail to start. Provision TLS (e.g. with
+cert-manager) before serving clients.
+{{- end }}
+
+Safe operations:
+  - Scale down (a lossless decommission drain, ADR 0043):
+      kubectl -n {{ .Release.Namespace }} scale statefulset/{{ include "mqttd.fullname" . }} --replicas=<n>
+  - Upgrade (one pod at a time, quorum-safe, ADR 0039):
+      helm upgrade {{ .Release.Name }} <chart> ...
+  - Validate a config change before rolling it out:
+      mqttd --check-config --config <your file>   # or rely on the check-config init container

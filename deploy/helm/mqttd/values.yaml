@@ -1,0 +1,184 @@
+# Default values for the mqttd chart (ADR 0047). Every value is documented; the secure,
+# cluster-correct defaults are the ones that ship.
+
+image:
+  repository: ghcr.io/mbilling/fss-mqtt-broker
+  # Defaults to .Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# A small POSIX-shell image used only by the init container that renders the per-pod config
+# (the broker image itself is distroless and has no shell). Any busybox/alpine works.
+initImage:
+  repository: busybox
+  tag: "1.36"
+  pullPolicy: IfNotPresent
+
+# Cluster size. The StatefulSet's pod-0 is the gossip founder (no seeds); pods 1..N seed to it
+# and the mesh self-forms over the headless service (ADR 0016). For a durable quorum use an odd
+# number >= 3; 1 is single-node (no fault tolerance).
+replicaCount: 3
+
+# --- Broker configuration (ADR 0046) --------------------------------------------------------
+# This becomes the ConfigMap-mounted TOML. Two placeholders — __NODE_ID__ and __SEEDS__ — are
+# filled per-pod by the render init container (node id = pod name; seeds = pod-0 for non-founders,
+# empty for pod-0). Everything else is verbatim. Keep secrets OUT of here — reference them by the
+# mounted paths under `secrets` below.
+config: |
+  [node]
+  id = "__NODE_ID__"
+  data_dir = "/var/lib/mqttd"
+
+  [listeners]
+  tls_bind = "0.0.0.0:8883"
+  health_bind = "0.0.0.0:8080"
+
+  [tls]
+  cert = "/etc/mqttd/tls/tls.crt"
+  key = "/etc/mqttd/tls/tls.key"
+
+  [security]
+  acl_file = "/etc/mqttd/acl/acl.toml"
+
+  [cluster]
+  peer_bind = "0.0.0.0:7001"
+
+  [cluster.swim]
+  bind = "0.0.0.0:7946"
+  seeds = [__SEEDS__]
+
+  [durable]
+  enabled = true
+  lease_voters = 5
+
+# Secret material is referenced BY PATH (ADR 0046 T5) and mounted read-only from existing
+# Secrets/ConfigMaps you manage (e.g. cert-manager for TLS). Each entry, when its `secretName`
+# (or `configMapName`) is set, is mounted at `mountPath`; the paths above must match. Leave a
+# name empty to skip that mount.
+secrets:
+  # Server TLS keypair (kubernetes.io/tls Secret: keys tls.crt + tls.key).
+  tls:
+    secretName: ""
+    mountPath: /etc/mqttd/tls
+  # Topic ACL policy (a ConfigMap or Secret with key acl.toml).
+  acl:
+    configMapName: ""
+    mountPath: /etc/mqttd/acl
+  # Cluster-bus mTLS material (Secret with ca.crt/tls.crt/tls.key).
+  peerTls:
+    secretName: ""
+    mountPath: /etc/mqttd/cluster
+  # Gossip key file (Secret with key `swim-key`); set MQTTD_SWIM_KEY_FILE to <mountPath>/swim-key
+  # via extraEnv, or reference it in `config`.
+  gossipKey:
+    secretName: ""
+    mountPath: /etc/mqttd/gossip
+
+# Extra environment variables (the highest config layer — override any file setting per ADR 0046).
+extraEnv: []
+#  - name: MQTTD_SWIM_KEY_FILE
+#    value: /etc/mqttd/gossip/swim-key
+
+# --- Persistence (ADR 0018) -----------------------------------------------------------------
+# Each pod gets its OWN PersistentVolume (volumeClaimTemplate) for the redb data dir, so a
+# rescheduled pod reattaches its volume and recovers durable state — never the ephemeral trap.
+persistence:
+  enabled: true
+  size: 10Gi
+  # Empty = the cluster default StorageClass. ReadWriteOnce is required (per-pod volume).
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+
+# --- Scale-down / shutdown (ADR 0043 / 0019) ------------------------------------------------
+# preStop sends SIGUSR1 to begin a DECOMMISSION drain (hand every held key to its post-departure
+# replica set, verify, then leave gracefully). terminationGracePeriodSeconds must cover the drain
+# PLUS the graceful shutdown; a hard kill past it falls back to crash semantics survivors handle.
+terminationGracePeriodSeconds: 300
+
+# --- Rollout safety (ADR 0039) --------------------------------------------------------------
+# The StatefulSet rolls one pod at a time (OrderedReady + RollingUpdate). The PDB stops a node
+# drain / voluntary disruption from taking two brokers — and thus quorum — at once.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# --- Probes (ADR 0020) ----------------------------------------------------------------------
+# /readyz gates traffic on mesh + lease-group readiness; /livez reports hub liveness. Generous
+# startup allowance so a joining node that is catching up is not liveness-killed.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  periodSeconds: 5
+  failureThreshold: 3
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: health
+  periodSeconds: 10
+  failureThreshold: 6
+startupProbe:
+  httpGet:
+    path: /livez
+    port: health
+  periodSeconds: 5
+  failureThreshold: 60
+
+# Run `mqttd --check-config` as an init container so a bad config fails the pod before it serves.
+checkConfig:
+  enabled: true
+
+# --- Services ------------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Client-facing ports. mqtt = TLS listener (8883). Add plaintext/ws/quic here if enabled.
+  ports:
+    - name: mqtt-tls
+      port: 8883
+      targetPort: mqtt-tls
+  annotations: {}
+
+# Prometheus scrape. If you run the Prometheus Operator, enable serviceMonitor; otherwise the
+# pod carries prometheus.io/scrape annotations.
+metrics:
+  podAnnotations: true
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# --- Pod placement / resources -------------------------------------------------------------
+resources: {}
+#  requests:
+#    cpu: 500m
+#    memory: 512Mi
+#  limits:
+#    memory: 1Gi
+nodeSelector: {}
+tolerations: []
+# Spread brokers across nodes/zones so one node/zone loss can't take quorum.
+affinity: {}
+topologySpreadConstraints: []
+
+podAnnotations: {}
+podLabels: {}
+# Distroless runs as uid 65532 (nonroot); keep that and drop everything.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+nameOverride: ""
+fullnameOverride: ""
