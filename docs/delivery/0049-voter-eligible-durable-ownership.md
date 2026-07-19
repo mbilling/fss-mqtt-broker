@@ -36,7 +36,7 @@ frontmatter above · this file is the plan, progress log, and changelog.
 | Task | Done means |
 |---|---|
 | **0049-P1** Voter-eligible ownership | The lease voter set is plumbed into `Placement` and refreshed each tick; owner selection hashes over voters (∩ eligible, with an empty-voters fallback for bootstrap); the voter owner leads its replica set, which still spans all eligible nodes. A real-cluster test with `voter_cap < N` proves **every** group owner is a voter and a session whose id previously hashed to a learner now attaches. |
-| **0049-P2** Visibility | `durable_recovery_failures_total` and `lease_rpc_timeouts_total` exist, increment on the real paths, and render in `/metrics`; a verbose readiness probe surfaces durable-serviceability without changing the plain `/readyz` ready/NotReady contract. A test asserts a recovery refusal moves the counter (which an append failure would not). |
+| **0049-P2** Visibility | `durable_recovery_failures_total` (the direct refusal fingerprint) and a `lease_quorum_ack_ms` gauge (the leading indicator) exist, update on the real paths, and render in `/metrics`; the `/readyz` body surfaces durable-serviceability without changing the ready/NotReady status contract. A test asserts a recovery refusal moves the recovery counter (which an append failure would not). |
 | **0049-P3** Docs + closure | Demo docs state the single-host fsync limit; the misleading `(ephemeral mode)` log line is fixed; ADR 0021 §2 carries the amendment cross-reference; the leader `/readyz`-hang is recorded as an open investigation. ADR → Accepted. |
 
 Order: P1 (the availability fix) → P2 (make the failure visible) → P3 (docs + closure).
@@ -51,9 +51,9 @@ P1 is the ship-blocker of the three; P2/P3 harden and close.
   `RaftView.voters` via `run_driver`), owner-leads-replica-set, replicas unchanged. This is
   the standalone-valuable core: it closes the data-availability hole.
 - **P2 — make it impossible to hide again.** The incident was invisible: `/readyz` green for
-  11 h, no metric moved. Add the two counters that would have screamed, and a verbose
-  serviceability probe — deliberately *not* flipping the plain `/readyz` (which would flap
-  healthy nodes under transient fsync load).
+  11 h, no metric moved. Add the refusal counter + the quorum-ack-age gauge that would have
+  screamed, and enrich the `/readyz` body — deliberately *not* flipping the plain `/readyz`
+  status (which would flap healthy nodes under transient fsync load).
 - **P3 — the honest tail.** Document the single-host fsync limit as a demo/operator note, fix
   the `(ephemeral mode)` log line that misleads during exactly this incident, amend ADR 0021
   §2, and file the one unexplained observation (leader `/readyz` hang) as open.
