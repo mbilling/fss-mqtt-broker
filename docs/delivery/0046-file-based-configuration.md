@@ -80,3 +80,9 @@ Order: T1 → T2 → T3/T4 (parallel) → T5.
   fails CI. Documented exceptions: `require_client_cert` is derived (no var); `MQTTD_CONFIG` names
   the file. Chosen over the env-bridge (`set_var`) approach, which round-trips secrets through the
   process environment. Backward compatible: an env-only deployment behaves exactly as before.
+- **2026-07-19** — **T2 backward-compat fix.** `MQTTD_SHUTDOWN_GRACE=0` (drain immediately — the
+  ADR 0019 fast-teardown value the `cluster_proc` harness spawns with) was a *valid* env value the
+  old code accepted; the T1 `validate()` over-restricted `shutdown_grace_secs` to `≥ 1`, so the
+  rewired binary refused to start under it and every spawned node failed readiness (caught by
+  `cluster_proc` on the first CI run of the rewire). Fixed by allowing `0` (0 = immediate); the
+  out-of-range test now asserts `0` is accepted. `cluster_proc` (3) green locally after the fix.

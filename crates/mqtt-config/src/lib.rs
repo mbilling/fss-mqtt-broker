@@ -285,7 +285,8 @@ impl Default for Observability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Runtime {
-    /// Graceful-shutdown drain window, seconds (`MQTTD_SHUTDOWN_GRACE`, ADR 0019). Default 30.
+    /// Graceful-shutdown drain window, seconds (`MQTTD_SHUTDOWN_GRACE`, ADR 0019). Default 30;
+    /// `0` drains immediately (no wait for in-flight connections).
     pub shutdown_grace_secs: u64,
     /// Smallest mesh size `/readyz` accepts (`MQTTD_READY_MIN_MEMBERS`). Default 1.
     pub ready_min_members: usize,
@@ -617,11 +618,8 @@ impl Config {
                 "durable.lease_voters must be >= 1".to_string(),
             ));
         }
-        if self.runtime.shutdown_grace_secs == 0 {
-            return Err(ConfigError::Invalid(
-                "runtime.shutdown_grace_secs must be >= 1".to_string(),
-            ));
-        }
+        // shutdown_grace_secs == 0 is valid and meaningful: drain immediately (no wait for
+        // in-flight connections), the ADR 0019 fast-teardown value the test harness relies on.
         if self.runtime.ready_min_members == 0 {
             return Err(ConfigError::Invalid(
                 "runtime.ready_min_members must be >= 1".to_string(),
@@ -821,8 +819,9 @@ mod tests {
     #[test]
     fn out_of_range_values_are_rejected() {
         assert!(Config::from_toml("[durable]\nlease_voters = 0\n").is_err());
-        assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_err());
         assert!(Config::from_toml("[runtime]\nready_min_members = 0\n").is_err());
+        // shutdown_grace_secs = 0 is *valid* (drain immediately) — not out of range.
+        assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_ok());
     }
 
     #[test]
