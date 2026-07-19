@@ -142,7 +142,8 @@ impl Default for Security {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Jwt {
-    /// HS256 shared-secret file (`MQTTD_JWT_HS256_SECRET`).
+    /// Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046
+    /// T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined.
     pub hs256_secret_file: Option<String>,
     /// RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`).
     pub rs256_pem_file: Option<String>,
@@ -200,8 +201,14 @@ pub struct Swim {
     pub bind: Option<String>,
     /// Seed member gossip addresses (`MQTTD_SWIM_SEEDS`).
     pub seeds: Vec<String>,
-    /// 64-hex cluster gossip key file/value (`MQTTD_SWIM_KEY`).
+    /// 64-hex cluster gossip key, **inline** (`MQTTD_SWIM_KEY`). A raw secret; prefer
+    /// [`Swim::key_file`] to keep it out of the config file (ADR 0046 T5). Mutually exclusive
+    /// with `key_file`.
     pub key: Option<String>,
+    /// Path to a file holding the 64-hex cluster gossip key (`MQTTD_SWIM_KEY_FILE`, ADR 0046 T5):
+    /// the secret-by-reference form, mountable from a Kubernetes Secret so it never sits in the
+    /// committed config file. Mutually exclusive with the inline `key`.
+    pub key_file: Option<String>,
     /// Extra accepted gossip keys for zero-downtime rotation (`MQTTD_SWIM_KEY_ACCEPT`).
     pub key_accept: Vec<String>,
     /// Per-node gossip signature posture (`MQTTD_SWIM_SIGNED`): `require` or `off`.
@@ -469,7 +476,7 @@ impl Config {
         on!("MQTTD_ACL_FILE", v, {
             self.security.acl_file = Some(v);
         });
-        on!("MQTTD_JWT_HS256_SECRET", v, {
+        on!("MQTTD_JWT_HS256_SECRET_FILE", v, {
             self.security.jwt.hs256_secret_file = Some(v);
         });
         on!("MQTTD_JWT_RS256_PEM", v, {
@@ -521,6 +528,9 @@ impl Config {
         });
         on!("MQTTD_SWIM_KEY", v, {
             self.cluster.swim.key = Some(v);
+        });
+        on!("MQTTD_SWIM_KEY_FILE", v, {
+            self.cluster.swim.key_file = Some(v);
         });
         on!("MQTTD_SWIM_KEY_ACCEPT", v, {
             self.cluster.swim.key_accept = list(&v);
@@ -664,6 +674,14 @@ impl Config {
                 )));
             }
         }
+        // The gossip key is inline XOR by-reference — not both (ADR 0046 T5).
+        if self.cluster.swim.key.is_some() && self.cluster.swim.key_file.is_some() {
+            return Err(ConfigError::Invalid(
+                "cluster.swim.key and cluster.swim.key_file are mutually exclusive \
+                 (inline secret vs secret-by-reference)"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -700,7 +718,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_ALLOW_ANONYMOUS",
     "MQTTD_PASSWORD_FILE",
     "MQTTD_ACL_FILE",
-    "MQTTD_JWT_HS256_SECRET",
+    "MQTTD_JWT_HS256_SECRET_FILE",
     "MQTTD_JWT_RS256_PEM",
     "MQTTD_JWT_ISSUER",
     "MQTTD_JWT_AUDIENCE",
@@ -718,6 +736,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_SWIM_BIND",
     "MQTTD_SWIM_SEEDS",
     "MQTTD_SWIM_KEY",
+    "MQTTD_SWIM_KEY_FILE",
     "MQTTD_SWIM_KEY_ACCEPT",
     "MQTTD_SWIM_SIGNED",
     "MQTTD_SWIM_REPLAY",
@@ -972,6 +991,21 @@ mod tests {
     }
 
     #[test]
+    fn the_gossip_key_is_inline_xor_by_reference() {
+        // Either form alone validates; both together is rejected (ADR 0046 T5).
+        assert!(Config::from_toml("[cluster.swim]\nkey = \"deadbeef\"\n").is_ok());
+        assert!(Config::from_toml("[cluster.swim]\nkey_file = \"/run/secrets/swim\"\n").is_ok());
+        let err = Config::from_toml(
+            "[cluster.swim]\nkey = \"deadbeef\"\nkey_file = \"/run/secrets/swim\"\n",
+        )
+        .unwrap_err();
+        match err {
+            super::ConfigError::Invalid(m) => assert!(m.contains("mutually exclusive")),
+            super::ConfigError::Parse(m) => panic!("wrong error kind: {m}"),
+        }
+    }
+
+    #[test]
     fn the_env_surface_is_a_deduplicated_curated_list() {
         // Every var appears exactly once — a duplicate would be a copy/paste bug that hides a
         // missing mapping.
@@ -983,7 +1017,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            57,
+            58,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
     }
