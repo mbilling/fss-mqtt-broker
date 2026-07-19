@@ -16,7 +16,11 @@
 //! neither, config is defaults + the env overlay (fully backward compatible). Each
 //! `MQTTD_*` variable maps to exactly one config key (see `mqtt_config::ENV_VARS`).
 //! `mqttd --check-config` (ADR 0046 T3) validates the effective config and exits without
-//! binding any port — the GitOps/pre-rollout gate.
+//! binding any port — the GitOps/pre-rollout gate. `SIGHUP` (and the `MQTTD_CONFIG_WATCH`
+//! filesystem watcher) reload the whole config file through the ADR 0032 validate-before-swap
+//! path (ADR 0046 T4): a bad edit is rejected and the running config kept; live-swappable
+//! settings (policy files, `allow_anonymous`, quotas) change without a restart; every other
+//! change is logged + audited as requires-restart.
 //! - `MQTTD_NODE_ID`        — this node's id (default `node-local`)
 //! - `MQTTD_MAX_QUEUED_MESSAGES` — per-session offline-queue cap (default 100000)
 //! - `MQTTD_QUEUE_OVERFLOW` — `drop-oldest` (default) or `reject-newest`
@@ -140,7 +144,7 @@ use mqtt_cluster::placement::{self, Placement};
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
-use mqtt_config::{Config, ConfigError};
+use mqtt_config::{Config, ConfigError, Jwt};
 use mqtt_net::tls;
 use mqtt_observability::{AuditLog, AuditSink};
 use mqtt_storage::logged::ReplicatedSessionStore;
@@ -188,6 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_id = NodeId(config.node.id.clone());
     info!(version = env!("CARGO_PKG_VERSION"), node = %node_id.0, "starting mqttd");
     log_effective_config(&config);
+
+    // ADR 0046 T4: the running config, shared with the policy reload closures so a `SIGHUP` /
+    // watch re-load of the file reaches them (a changed ACL path, a changed quota) through the
+    // ADR 0032 validate-before-swap path. The one-time startup wiring below reads the immutable
+    // `config` snapshot (those settings are requires-restart); only the reload path reads `live`.
+    let live_config = Arc::new(RwLock::new((*config).clone()));
 
     // Server-wide MQTT 5 wire limits (ADR 0011/0012/0013), configurable via env, set once
     // before any connection is served.
@@ -267,7 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
     };
     let (policy, mut reloader) = client_policy(
-        &config,
+        &live_config,
         Some(proxy),
         store,
         shutdown.clone(),
@@ -351,6 +361,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) as Box<dyn Fn() -> reload::ClientCrlBuildResult + Send + Sync>
     });
     reloader.attach_identity_sweep(hub_tx.clone(), client_crl_build);
+    // ADR 0046 T4: whole-config hot reload. On SIGHUP / watch the reloader now re-loads the
+    // config file, validates it (validate-before-swap), swaps `live_config`, rebuilds the policy
+    // from it, pushes the live-swappable settings (quotas) to the hub, and logs every changed
+    // non-live section as requires-restart. A bad edit is rejected and the running config kept.
+    {
+        let hub_for_apply = hub_tx.clone();
+        let audit_for_apply = policy.audit.clone();
+        reloader.attach_config_source(reload::ConfigSource {
+            live: live_config.clone(),
+            path: config_path()?,
+            precheck: Box::new(runtime_precheck),
+            apply: Box::new(move |old, new| {
+                apply_live_config(old, new, &hub_for_apply, &audit_for_apply);
+            }),
+        });
+    }
     // Disk visibility + watermark brownout (ADR 0041 T5): stat the redb stores
     // periodically, export store_bytes{store}, and drive the hub's brownout flag
     // when MQTTD_STORE_MAX_BYTES is configured.
@@ -375,18 +401,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Per-client and global state quotas (ADR 0041 T3/T4), configured once before
     // any listener accepts. Unset = uncapped; a non-positive or unparseable value
-    // is a startup error.
-    let quotas = mqttd::hub::Quotas {
-        max_subscriptions_per_client: positive_cap(
-            "limits.max_subscriptions_per_client",
-            config.limits.max_subscriptions_per_client,
-        )?,
-        max_retained_messages: positive_cap(
-            "limits.max_retained_messages",
-            config.limits.max_retained_messages,
-        )?,
-        max_sessions: positive_cap("limits.max_sessions", config.limits.max_sessions)?,
-    };
+    // is a startup error. Live-swappable on config reload (ADR 0046 T4).
+    let quotas = quotas_from_config(&config)?;
     if quotas.max_subscriptions_per_client.is_some()
         || quotas.max_retained_messages.is_some()
         || quotas.max_sessions.is_some()
@@ -649,7 +665,7 @@ async fn start_client_listeners(
 /// auditing — from the `MQTTD_*` shims (ADR 0004). Everything is deny-by-default;
 /// the insecure fallbacks are explicit and loudly logged.
 fn client_policy(
-    config: &Arc<Config>,
+    live: &Arc<RwLock<Config>>,
     proxy: Option<conn::ProxyContext>,
     store: Arc<dyn SessionStore>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -659,17 +675,26 @@ fn client_policy(
     // Build the initial policy, and a closure that re-reads the configured files on reload
     // (ADR 0032). The closure returns the freshly-built (authorizer, authenticator) or an
     // error string that aborts the swap — validate-before-swap lives in `reload::Reloader`.
-    // The reload closure captures the config so the *paths* stay fixed while the *file
-    // contents* at those paths are re-read on each reload (ADR 0032/0033).
-    let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = (
-        authorizer_from_config(config)?,
-        authenticator_from_config(config)?,
-    );
+    // The closure reads the *current* config snapshot from `live` each call (ADR 0046 T4): a
+    // config-file reload swaps `live` first, so a changed ACL/password/JWT path — not just the
+    // file contents at a fixed path — is picked up here.
+    let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = {
+        let snap = live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            authorizer_from_config(&snap)?,
+            authenticator_from_config(&snap)?,
+        )
+    };
     let build = {
-        let config = config.clone();
+        let live = live.clone();
         move || -> reload::BuildResult {
-            let authz = authorizer_from_config(&config).map_err(|e| e.to_string())?;
-            let auth = authenticator_from_config(&config).map_err(|e| e.to_string())?;
+            let snap = live
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let authz = authorizer_from_config(&snap).map_err(|e| e.to_string())?;
+            let auth = authenticator_from_config(&snap).map_err(|e| e.to_string())?;
             Ok((authz, auth))
         }
     };
@@ -725,7 +750,7 @@ fn spawn_reload_handler(reloader: std::sync::Arc<reload::Reloader>) {
             }
         };
         while hup.recv().await.is_some() {
-            info!("SIGHUP received — reloading security policy");
+            info!("SIGHUP received — reloading configuration (ADR 0046 T4) + security policy");
             reloader.reload("signal");
         }
     });
@@ -768,9 +793,14 @@ fn spawn_config_watcher(
     if secs == 0 {
         return; // unset / explicitly disabled — signal-only default
     }
-    let paths = watched_policy_paths(config);
+    let mut paths = watched_policy_paths(config);
+    // ADR 0046 T4: also watch the config file itself, so editing it (a Kubernetes ConfigMap
+    // update) auto-reloads the whole config through the same fail-safe path as SIGHUP.
+    if let Ok(Some(p)) = config_path() {
+        paths.push(p);
+    }
     if paths.is_empty() {
-        warn!("config_watch is set but no watchable policy files are configured — watcher idle");
+        warn!("config_watch is set but no watchable files are configured — watcher idle");
         return;
     }
     info!(
@@ -1885,6 +1915,130 @@ fn positive_cap(
     }
 }
 
+/// The per-client / global state quotas (ADR 0041 T3/T4) from the config. Shared by startup and
+/// the config-reload apply path (ADR 0046 T4), so both derive the same live-swappable quotas.
+fn quotas_from_config(config: &Config) -> Result<hub::Quotas, Box<dyn std::error::Error>> {
+    Ok(hub::Quotas {
+        max_subscriptions_per_client: positive_cap(
+            "limits.max_subscriptions_per_client",
+            config.limits.max_subscriptions_per_client,
+        )?,
+        max_retained_messages: positive_cap(
+            "limits.max_retained_messages",
+            config.limits.max_retained_messages,
+        )?,
+        max_sessions: positive_cap("limits.max_sessions", config.limits.max_sessions)?,
+    })
+}
+
+/// The runtime acceptance gate (ADR 0046 T4): can this config be built into every derived
+/// runtime value the broker boots with? Runs the same fallible conversions startup does — wire
+/// limits (packet-size fits u32, publish-rate positive), queue limits (queued-messages fits
+/// usize, valid overflow enum), the state quotas, the admission caps, and the disk watermark —
+/// so a config that could not start is rejected *before* it is swapped in live. Returns a
+/// human-readable reason on the first failure.
+fn runtime_precheck(config: &Config) -> Result<(), String> {
+    fn ok<T>(r: Result<T, Box<dyn std::error::Error>>) -> Result<(), String> {
+        r.map(|_| ()).map_err(|e| e.to_string())
+    }
+    ok(wire_limits_from_config(config))?;
+    ok(queue_limits_from_config(config))?;
+    ok(quotas_from_config(config))?;
+    ok(positive_cap(
+        "limits.max_connections",
+        config.limits.max_connections,
+    ))?;
+    ok(positive_cap(
+        "limits.max_connections_per_ip",
+        config.limits.max_connections_per_ip,
+    ))?;
+    if config.durable.store_max_bytes == Some(0) {
+        return Err("durable.store_max_bytes must be a positive integer".to_string());
+    }
+    Ok(())
+}
+
+/// The config sections that changed between `old` and `new` **and are not live-swappable** — i.e.
+/// changes that only take effect after a restart (ADR 0046 T4). The live-swappable fields are
+/// masked out before comparing: the policy paths + `allow_anonymous` (rebuilt by the reloader)
+/// and the state quotas (pushed to the hub). Everything else — listeners, cluster/SWIM, durable,
+/// wire limits, observability, runtime, node identity, and the TLS *paths* — requires a restart.
+fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
+    // Blank the live-swappable fields so only restart-relevant differences remain.
+    let mask = |c: &Config| {
+        let mut c = c.clone();
+        c.security.allow_anonymous = false;
+        c.security.password_file = None;
+        c.security.acl_file = None;
+        c.security.jwt = Jwt::default();
+        c.limits.max_subscriptions_per_client = None;
+        c.limits.max_retained_messages = None;
+        c.limits.max_sessions = None;
+        c
+    };
+    let (o, n) = (mask(old), mask(new));
+    let mut changed = Vec::new();
+    if o.node != n.node {
+        changed.push("node");
+    }
+    if o.listeners != n.listeners {
+        changed.push("listeners");
+    }
+    if o.tls != n.tls {
+        changed.push("tls");
+    }
+    if o.security != n.security {
+        changed.push("security");
+    }
+    if o.cluster != n.cluster {
+        changed.push("cluster");
+    }
+    if o.durable != n.durable {
+        changed.push("durable");
+    }
+    if o.limits != n.limits {
+        changed.push("limits");
+    }
+    if o.observability != n.observability {
+        changed.push("observability");
+    }
+    if o.runtime != n.runtime {
+        changed.push("runtime");
+    }
+    changed
+}
+
+/// Apply the live-swappable half of a committed config reload (ADR 0046 T4): push the (possibly
+/// changed) state quotas to the hub, and log + audit every changed non-live section as
+/// requires-restart so an operator knows those edits are staged but not yet in effect. The policy
+/// half (ACL/auth/TLS/CRL) is applied by the reloader itself, before this runs.
+fn apply_live_config(
+    old: &Config,
+    new: &Config,
+    hub: &mpsc::UnboundedSender<hub::HubCommand>,
+    audit: &Arc<dyn AuditSink>,
+) {
+    // Quotas are live: push the new set (idempotent when unchanged). precheck guaranteed they
+    // build, so this does not error.
+    if let Ok(quotas) = quotas_from_config(new) {
+        let _ = hub.send(hub::HubCommand::SetQuotas(quotas));
+    }
+    let restart = requires_restart(old, new);
+    if !restart.is_empty() {
+        let sections = restart.join(", ");
+        warn!(
+            sections = %sections,
+            "config reload: settings changed that require a RESTART to take effect — the running \
+             values are kept for now"
+        );
+        audit.record(
+            "config.reload",
+            None,
+            &format!("requires-restart sections: {sections}"),
+        );
+    }
+}
+
 /// Resolve the config-file path (`--config <path>` / `--config=<path>`, else `MQTTD_CONFIG`)
 /// and load the layered configuration — defaults < TOML file < `MQTTD_*` env — then validate it
 /// (ADR 0046 T2). The command-line flag wins over the env var.
@@ -2160,7 +2314,10 @@ async fn wait_for_shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{positive_cap, queue_limits_from_config, wire_limits_from_config};
+    use super::{
+        positive_cap, queue_limits_from_config, requires_restart, runtime_precheck,
+        wire_limits_from_config,
+    };
     use mqtt_config::Config;
     use mqtt_storage::OverflowPolicy;
 
@@ -2207,5 +2364,49 @@ mod tests {
         let q = queue_limits_from_config(&cfg).unwrap();
         assert_eq!(q.max_messages, 42);
         assert_eq!(q.overflow, OverflowPolicy::RejectNewest);
+    }
+
+    #[test]
+    fn requires_restart_masks_the_live_swappable_fields() {
+        let base = Config::default();
+        // No change → nothing requires a restart.
+        assert!(requires_restart(&base, &base).is_empty());
+
+        // Live-swappable edits (ADR 0046 T4) report NO restart: quotas, allow_anonymous, and the
+        // policy file paths are applied in place by the reloader.
+        let mut live = base.clone();
+        live.security.allow_anonymous = true;
+        live.security.acl_file = Some("/etc/acl.toml".into());
+        live.limits.max_sessions = Some(1000);
+        assert!(
+            requires_restart(&base, &live).is_empty(),
+            "quotas / allow_anonymous / ACL path are live"
+        );
+
+        // Non-live edits DO require a restart, reported by section.
+        let mut restart = base.clone();
+        restart.listeners.tls_bind = Some("0.0.0.0:8883".into());
+        restart.cluster.peer_bind = Some("127.0.0.1:7001".into());
+        restart.durable.lease_voters = 7;
+        let sections = requires_restart(&base, &restart);
+        assert!(sections.contains(&"listeners"));
+        assert!(sections.contains(&"cluster"));
+        assert!(sections.contains(&"durable"));
+        assert!(!sections.contains(&"security"));
+    }
+
+    #[test]
+    fn runtime_precheck_rejects_what_startup_would_reject() {
+        assert!(runtime_precheck(&Config::default()).is_ok());
+        // A zero publish rate / zero quota / zero watermark are all rejected before a live swap.
+        let mut c = Config::default();
+        c.limits.max_publish_rate = Some(0);
+        assert!(runtime_precheck(&c).is_err());
+        let mut c = Config::default();
+        c.limits.max_sessions = Some(0);
+        assert!(runtime_precheck(&c).is_err());
+        let mut c = Config::default();
+        c.durable.store_max_bytes = Some(0);
+        assert!(runtime_precheck(&c).is_err());
     }
 }
