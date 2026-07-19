@@ -21,9 +21,25 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
+/// Poison-tolerant read of a shared `RwLock` (a panic mid-write must not brick reloads).
+fn read_lock<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// Poison-tolerant write of a shared `RwLock`.
+fn write_lock<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// What a `build` closure returns: the freshly-read `(authorizer, authenticator)`, or an
 /// error string (a missing/unparseable file) that **aborts** the swap.
 pub type BuildResult = Result<(Arc<dyn Authorizer>, Arc<dyn Authenticator>), String>;
+
+/// A [`ConfigSource`] runtime-acceptance gate: `Err` if the freshly-loaded config cannot be
+/// built into the broker's derived runtime values (ADR 0046 T4).
+pub type ConfigPrecheck = Box<dyn Fn(&mqtt_config::Config) -> Result<(), String> + Send + Sync>;
+
+/// A [`ConfigSource`] live-apply hook, called `(old, new)` on a committed reload (ADR 0046 T4).
+pub type ConfigApply = Box<dyn Fn(&mqtt_config::Config, &mqtt_config::Config) + Send + Sync>;
 
 /// What a TLS `build` closure returns: a freshly-built acceptor from the renewed
 /// cert/key/client-CA, or an error string (a missing/unparseable file) that aborts the swap.
@@ -47,6 +63,36 @@ pub type ClientCrlBuildResult = Result<RevocationList, String>;
 /// acceptor + connector from the re-read cluster CA / node cert / key, or an error
 /// string that aborts the swap.
 pub type PeerTlsBuildResult = Result<(TlsAcceptor, tokio_rustls::TlsConnector), String>;
+
+/// Whole-config hot reload (ADR 0046 T4). When a [`ConfigSource`] is attached, every
+/// [`Reloader::reload`] first re-loads the config file (defaults < file < `MQTTD_*` env),
+/// validates it, and swaps it into the shared `live` cell **before** the policy is rebuilt —
+/// so the policy build (which reads paths from `live`) sees the new config. Validate-before-swap
+/// is preserved end to end: if the new config is invalid, or the policy build against it fails,
+/// the live config is rolled back and nothing changes.
+pub struct ConfigSource {
+    /// The running config, shared with the binary's policy `build` closures (they read the
+    /// current snapshot each reload). Swapped on a committed reload, rolled back on rejection.
+    pub live: Arc<RwLock<mqtt_config::Config>>,
+    /// The config-file path (`--config` / `MQTTD_CONFIG`), or `None` for defaults + env only.
+    pub path: Option<std::path::PathBuf>,
+    /// Runtime acceptance gate: returns `Err` if the freshly-loaded config could not be built
+    /// into the derived runtime values the broker boots with (wire/queue limits, quotas) — so a
+    /// config that would not start is never swapped in live. Supplied by the binary.
+    pub precheck: ConfigPrecheck,
+    /// Applied on a committed reload `(old, new)`: pushes the live-swappable settings (quotas)
+    /// to the hub and logs every changed non-live section as requires-restart. Supplied by the
+    /// binary (it owns the runtime the settings feed).
+    pub apply: ConfigApply,
+}
+
+impl std::fmt::Debug for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigSource")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The `watch` receivers to wire into [`crate::conn::ConnPolicy`].
 pub struct Handles {
@@ -94,6 +140,9 @@ pub struct Reloader {
         watch::Sender<tokio_rustls::TlsConnector>,
     )>,
     peer_tls_build: Option<Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>>,
+    /// Set by [`attach_config_source`](Self::attach_config_source) (ADR 0046 T4): the whole
+    /// config is re-loaded, validated, and swapped ahead of the policy rebuild.
+    config_source: Option<ConfigSource>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -139,6 +188,7 @@ impl Reloader {
                 client_crl_build: None,
                 peer_tls: None,
                 peer_tls_build: None,
+                config_source: None,
             },
             Handles {
                 authz,
@@ -211,6 +261,14 @@ impl Reloader {
         self.peer_tls_build = Some(build);
     }
 
+    /// Register the whole-config source for reload (ADR 0046 T4): each [`reload`](Self::reload)
+    /// re-loads the config file, validates it, and swaps it into the shared `live` cell before
+    /// the policy is rebuilt — so a config-file edit (a new ACL path, a changed quota) takes
+    /// effect on `SIGHUP`/watch, folded into the same atomic validate-before-swap.
+    pub fn attach_config_source(&mut self, source: ConfigSource) {
+        self.config_source = Some(source);
+    }
+
     /// Re-read the sources and swap the policy in place — **validate-before-swap**: build the
     /// new authorizer, authenticator, *and* (if a TLS listener is attached) the TLS acceptor
     /// first; publish them only if **every** build succeeded. On any failure nothing is
@@ -220,7 +278,34 @@ impl Reloader {
     /// `trigger` records *why* the reload fired — `"signal"` for `SIGHUP`, `"watch"` for the
     /// filesystem watcher (ADR 0033) — carried into the audit event and the metric label so an
     /// operator can tell a manual reload from an auto-applied one.
+    #[allow(clippy::too_many_lines)]
     pub fn reload(&self, trigger: &str) -> bool {
+        // ADR 0046 T4: when a config source is attached, re-load + validate the whole config and
+        // swap it into `live` *before* rebuilding the policy (which reads paths from `live`).
+        // `committed` carries the (old, new) pair so any downstream build failure can roll back —
+        // validate-before-swap holds for the config too.
+        let committed = match &self.config_source {
+            None => None,
+            Some(cs) => {
+                let new = match mqtt_config::Config::load(cs.path.as_deref()) {
+                    Ok(c) => c,
+                    Err(e) => return self.reject(trigger, &format!("config: {e}")),
+                };
+                if let Err(e) = (cs.precheck)(&new) {
+                    return self.reject(trigger, &format!("config: {e}"));
+                }
+                let old = read_lock(&cs.live).clone();
+                *write_lock(&cs.live) = new.clone();
+                Some((old, new))
+            }
+        };
+        // Roll the live config back to `old` (used before every post-swap rejection).
+        let rollback = || {
+            if let (Some(cs), Some((old, _))) = (&self.config_source, &committed) {
+                *write_lock(&cs.live) = old.clone();
+            }
+        };
+
         // Build everything up front; only an all-clean build is allowed to publish.
         let policy = (self.build)();
         let tls = self.tls_build.as_ref().map(|b| b());
@@ -229,20 +314,27 @@ impl Reloader {
         let peer_tls = self.peer_tls_build.as_ref().map(|b| b());
         // A configured TLS or CRL build failed: reject the whole reload, swap nothing.
         if let Some(Err(e)) = &tls {
+            rollback();
             return self.reject(trigger, &format!("tls: {e}"));
         }
         if let Some(Err(e)) = &crl {
+            rollback();
             return self.reject(trigger, &format!("gossip crl: {e}"));
         }
         if let Some(Err(e)) = &client_crl {
+            rollback();
             return self.reject(trigger, &format!("client crl: {e}"));
         }
         if let Some(Err(e)) = &peer_tls {
+            rollback();
             return self.reject(trigger, &format!("peer tls: {e}"));
         }
         match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
-            Err(e) => self.reject(trigger, &e),
+            Err(e) => {
+                rollback();
+                self.reject(trigger, &e)
+            }
             // Everything built cleanly: publish atomically. The connection/accept loop reads
             // whichever it reaches first on its next check; all are mutually consistent.
             Ok((authz, auth)) => {
@@ -297,6 +389,11 @@ impl Reloader {
                     .record("security.reload", None, &format!("ok (trigger={trigger})"));
                 if let Some(m) = &self.metrics {
                     m.security_reload("ok", trigger);
+                }
+                // ADR 0046 T4: the config swap is committed — push the live-swappable settings
+                // (quotas) to the hub and log every changed non-live section as requires-restart.
+                if let (Some(cs), Some((old, new))) = (&self.config_source, &committed) {
+                    (cs.apply)(old, new);
                 }
                 true
             }
@@ -623,5 +720,93 @@ mod tests {
             subject: "u".to_string(),
             groups: Vec::new(),
         }
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // must match the `build: Fn() -> BuildResult` signature
+    fn ok_auth_pair() -> BuildResult {
+        Ok((
+            Arc::new(AllowAll) as Arc<dyn Authorizer>,
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }) as Arc<dyn Authenticator>,
+        ))
+    }
+
+    /// ADR 0046 T4: a reload re-loads the whole config file and swaps it into the shared `live`
+    /// cell (validate-before-swap), running the injected precheck + apply. An invalid config, a
+    /// precheck failure, or a failed policy build all keep the running config unchanged.
+    #[test]
+    fn a_config_reload_swaps_live_and_keeps_it_on_any_failure() {
+        let dir = std::env::temp_dir().join(format!("mqttd-cfgreload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        std::fs::write(&path, "[node]\nid = \"first\"\n").unwrap();
+
+        let live = Arc::new(RwLock::new(mqtt_config::Config::default()));
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Valid reload: live swaps to the file's contents and apply runs.
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
+        let applied_c = applied.clone();
+        reloader.attach_config_source(ConfigSource {
+            live: live.clone(),
+            path: Some(path.clone()),
+            precheck: Box::new(|_| Ok(())),
+            apply: Box::new(move |_, _| applied_c.store(true, Ordering::SeqCst)),
+        });
+        assert!(reloader.reload("signal"));
+        assert_eq!(read_lock(&live).node.id, "first");
+        assert!(
+            applied.load(Ordering::SeqCst),
+            "apply runs on a committed reload"
+        );
+
+        // Invalid config (unknown key): rejected, running config kept, apply not run.
+        applied.store(false, Ordering::SeqCst);
+        std::fs::write(&path, "[node]\nid = \"second\"\nbogus = 1\n").unwrap();
+        assert!(!reloader.reload("signal"));
+        assert_eq!(
+            read_lock(&live).node.id,
+            "first",
+            "an invalid edit is kept out"
+        );
+        assert!(
+            !applied.load(Ordering::SeqCst),
+            "apply is skipped on rejection"
+        );
+
+        // Precheck failure: rejected, running config kept.
+        std::fs::write(&path, "[node]\nid = \"third\"\n").unwrap();
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
+        reloader.attach_config_source(ConfigSource {
+            live: live.clone(),
+            path: Some(path.clone()),
+            precheck: Box::new(|_| Err("precheck says no".into())),
+            apply: Box::new(|_, _| {}),
+        });
+        assert!(!reloader.reload("signal"));
+        assert_eq!(
+            read_lock(&live).node.id,
+            "first",
+            "a precheck failure keeps it"
+        );
+
+        // Config valid but the POLICY build fails: the swapped-in config is rolled back.
+        let (mut reloader, _h) =
+            Reloader::new(ok_auth_pair().unwrap(), audit(), || Err("acl: bad".into()));
+        reloader.attach_config_source(ConfigSource {
+            live: live.clone(),
+            path: Some(path.clone()),
+            precheck: Box::new(|_| Ok(())),
+            apply: Box::new(|_, _| {}),
+        });
+        assert!(!reloader.reload("signal"));
+        assert_eq!(
+            read_lock(&live).node.id,
+            "first",
+            "a failed policy build rolls the config back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
