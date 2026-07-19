@@ -117,3 +117,25 @@ jobs:
           cargo +nightly fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=720
+
+  kube-smoke:
+    name: kubernetes runtime smoke (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+      # ADR 0047 T5: stand up the chart as a real 3-node cluster in kind, prove it forms, drains
+      # on scale-down (preStop --decommission), and survives a quorum-safe rolling restart with no
+      # durable (retained) state loss. Self-diagnosing on failure (dumps pods + logs).
+      - name: kind runtime smoke
+        run: ./scripts/k8s/kind-smoke.sh
