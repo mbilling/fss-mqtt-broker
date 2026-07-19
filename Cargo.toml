@@ -20,7 +20,7 @@ edition = "2021"
 # SDK + reqwest stack requires Rust 1.85.
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/TODO/mqtt-broker"
+repository = "https://github.com/mbilling/fss-mqtt-broker"
 authors = ["mqtt-broker contributors"]
 
 [workspace.lints.rust]
