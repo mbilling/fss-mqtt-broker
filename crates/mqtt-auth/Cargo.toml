@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
+mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
 thiserror.workspace = true
 # `verify` enables x509 signature verification (the chain-check for signed gossip,
 # ADR 0022); it uses `ring`, already in the tree — no new dependency.

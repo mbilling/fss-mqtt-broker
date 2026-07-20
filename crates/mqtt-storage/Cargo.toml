@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
+mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
 thiserror.workspace = true
 async-trait = "0.1"
 bytes = { workspace = true }

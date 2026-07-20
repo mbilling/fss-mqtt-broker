@@ -6,8 +6,8 @@ description: >-
   and a quorum-safe one-at-a-time rollout (ADR 0047).
 type: application
 # Chart version — bumped on chart changes. appVersion tracks the broker image tag.
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.9.0
+appVersion: "0.9.0"
 home: https://github.com/mbilling/fss-mqtt-broker
 sources:
   - https://github.com/mbilling/fss-mqtt-broker
