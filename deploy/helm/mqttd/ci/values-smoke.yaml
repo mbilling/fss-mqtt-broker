@@ -30,12 +30,6 @@ config: |
   enabled = true
   lease_voters = 3
 
-# Turn up gossip/membership logging so a failed run captures WHY a node's SWIM view
-# might isolate (2026-07-20 post-mortem: a joiner's placement collapsed to [self]).
-extraEnv:
-  - name: RUST_LOG
-    value: "info,mqtt_cluster::swim_driver=debug,mqtt_cluster::swim=debug,mqtt_cluster::durable_node=debug,mqttd::cluster=debug"
-
 # No secret mounts in the smoke.
 secrets:
   tls:

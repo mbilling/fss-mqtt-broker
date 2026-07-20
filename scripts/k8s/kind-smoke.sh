@@ -51,7 +51,16 @@ trap 'rc=$?; if [ $rc -ne 0 ]; then dump; fi; cleanup; exit $rc' EXIT
 mqtt() { # mqtt <pub|sub> <args...>
   local verb="$1"; shift
   kubectl -n "$NS" run "mqtt-$verb-$RANDOM" --rm -i --restart=Never \
-    --image=eclipse-mosquitto:2 --command -- "mosquitto_$verb" "$@"
+    --image=eclipse-mosquitto:2 --command -- "mosquitto_$verb" "$@" 2>/dev/null
+}
+
+# Read one retained message from a topic and return ONLY the payload. `kubectl run
+# --rm` prints a `pod "…" deleted …` cleanup notice to stdout after the pod's own
+# output, so strip that line (by line, not `head -1`, to avoid a SIGPIPE that could
+# abort the --rm cleanup and leak the throwaway pod), then drop line endings.
+mqtt_read() { # mqtt_read <topic>
+  mqtt sub -h "$RELEASE-mqttd.$NS.svc" -t "$1" -C 1 -W 15 \
+    | sed -E '/^pod "[^"]*" deleted/d' | tr -d '\r\n'
 }
 
 log "Build broker + test image ($IMAGE)"
@@ -83,7 +92,7 @@ kubectl -n "$NS" get pods -o wide
 log "Connectivity + durable retained publish"
 # Publish a RETAINED message; a fresh subscriber must receive it (retained state is durable).
 mqtt pub -h "$RELEASE-mqttd.$NS.svc" -t smoke/state -m "hello-v1" -q 1 -r
-got="$(mqtt sub -h "$RELEASE-mqttd.$NS.svc" -t smoke/state -C 1 -W 15 | tr -d '\r\n')"
+got="$(mqtt_read smoke/state)"
 echo "retained read back: '$got'"
 [ "$got" = "hello-v1" ] || { echo "FAIL: retained message not delivered"; exit 1; }
 
@@ -93,14 +102,14 @@ kubectl -n "$NS" scale "statefulset/$STS" --replicas=2
 kubectl -n "$NS" wait --for=delete "pod/$STS-2" --timeout=120s
 # The remaining pods stay Ready (quorum held); the retained state survives the shrink.
 kubectl -n "$NS" rollout status "statefulset/$STS" --timeout=120s
-got2="$(mqtt sub -h "$RELEASE-mqttd.$NS.svc" -t smoke/state -C 1 -W 15 | tr -d '\r\n')"
+got2="$(mqtt_read smoke/state)"
 [ "$got2" = "hello-v1" ] || { echo "FAIL: retained state lost across scale-down"; exit 1; }
 echo "retained state survived scale-down: '$got2'"
 
 log "Rolling restart (quorum-safe, one at a time) — durable state must survive"
 kubectl -n "$NS" rollout restart "statefulset/$STS"
 kubectl -n "$NS" rollout status "statefulset/$STS" --timeout="$READY_TIMEOUT"
-got3="$(mqtt sub -h "$RELEASE-mqttd.$NS.svc" -t smoke/state -C 1 -W 15 | tr -d '\r\n')"
+got3="$(mqtt_read smoke/state)"
 [ "$got3" = "hello-v1" ] || { echo "FAIL: retained state lost across rolling restart"; exit 1; }
 echo "retained state survived rolling restart: '$got3'"
 
