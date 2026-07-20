@@ -31,8 +31,15 @@ dump() {
   kubectl -n "$NS" get pvc,statefulset,svc || true
   kubectl -n "$NS" describe pods || true
   for p in $(kubectl -n "$NS" get pods -o name 2>/dev/null); do
-    echo "---- logs $p (all containers) ----"
+    echo "---- logs $p (all containers, tail) ----"
     kubectl -n "$NS" logs "$p" --all-containers --tail=120 || true
+    # The membership/gossip timeline lives at FORMATION (log start), which the tail
+    # above misses under retained-commit spam. Capture it compactly so a failed run
+    # explains any SWIM isolation (2026-07-20 post-mortem, follow-up 2).
+    echo "---- $p membership/gossip timeline ----"
+    kubectl -n "$NS" logs "$p" -c mqttd 2>/dev/null \
+      | grep -Ei 'membership|swim|gossip|peer link|establishing|alive|suspect|dead|drop|isolat|voter|lease assign|DIAG' \
+      | head -250 || true
   done
   echo "::endgroup::"
 }
