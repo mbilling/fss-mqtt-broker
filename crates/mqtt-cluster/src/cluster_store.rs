@@ -77,11 +77,25 @@ impl LocalLeaseSource {
 #[async_trait]
 impl LeaseSource for LocalLeaseSource {
     async fn epoch_for(&self, group: GroupId) -> Result<Epoch, ReplError> {
-        match self.store.current_lease(group) {
+        let current = self.store.current_lease(group);
+        match &current {
             // The lease is assigned to us — return the epoch we hold it at.
             Some(rec) if rec.holder == self.local => Ok(rec.epoch),
             // Assigned to another node, or not yet assigned: we cannot write durably.
-            _ => Err(ReplError::NotOwner),
+            // DIAG 0047-T5: this path is only reached AFTER `owns_group` passed (the
+            // placement ring says this node owns the group), so a refusal here is
+            // always the ring/lease split — log who actually holds it (or that it is
+            // unassigned) so the kind smoke's persistent retained NotOwner is pinned.
+            _ => {
+                tracing::warn!(
+                    group,
+                    local = self.local,
+                    lease_holder = ?current.as_ref().map(|r| r.holder),
+                    lease_epoch = ?current.as_ref().map(|r| r.epoch),
+                    "DIAG lease store refuses group epoch to its placement-ring owner (ADR 0047-T5)"
+                );
+                Err(ReplError::NotOwner)
+            }
         }
     }
 }
@@ -167,7 +181,10 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         let group = group_of_key(key);
 
         // Resolve ownership + replica set without holding a lock across an await.
-        let replica_set = {
+        // Capture an ownership snapshot for diagnostics (DIAG 0047-T5): the ring owner,
+        // the voter set, and the eligible members this node sees — so a split between
+        // the placement ring (routing) and the lease store (commit) is visible.
+        let (replica_set, diag_owner, diag_voters, diag_members) = {
             let placement = self
                 .placement
                 .read()
@@ -175,14 +192,38 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             if !placement.owns_group(group) {
                 return Err(ReplError::NotOwner);
             }
-            placement.group_replica_set(group)
+            (
+                placement.group_replica_set(group),
+                placement.group_owner(group),
+                placement.voter_ids(),
+                placement.members(),
+            )
         };
 
         // Read the group's current lease epoch on every call. A higher epoch than the
         // cached log's means ownership was lost and regained: the cached log writes at
         // the old epoch and would be fenced by followers forever, so it must be rebuilt
         // (and the group's keys re-recovered) against the new lease.
-        let epoch = self.leases.epoch_for(group).await?;
+        let epoch = match self.leases.epoch_for(group).await {
+            Ok(epoch) => epoch,
+            // DIAG 0047-T5: this node OWNS the group by the placement ring (it passed
+            // `owns_group` above) yet the lease store refuses the epoch — the ring and
+            // the lease-assigner disagree about who holds `group`. Log the split so the
+            // kind smoke's persistent retained `NotOwner` is attributable, then bubble.
+            Err(e) => {
+                tracing::warn!(
+                    key,
+                    group,
+                    local = %self.local.0,
+                    ring_owner = %diag_owner.0,
+                    voters = ?diag_voters.iter().map(|n| &n.0).collect::<Vec<_>>(),
+                    members = ?diag_members.iter().map(|n| &n.0).collect::<Vec<_>>(),
+                    error = ?e,
+                    "DIAG durable split: placement ring owns this group but the lease store refuses its epoch (ADR 0047-T5)"
+                );
+                return Err(e);
+            }
+        };
 
         // Get-or-(re)build the group entry at the current epoch **and replica set**.
         // A replica-set change rebuilds (and re-recovers, which re-commits to the
