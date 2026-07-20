@@ -162,6 +162,20 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Learn the direct sender's gossip address from where the datagram
+                // ACTUALLY came from, not from its self-claimed `from_addr` (2026-07-20
+                // post-mortem). A node that binds/advertises `0.0.0.0:<port>` (the k8s
+                // default) would otherwise be recorded at an unroutable address, so every
+                // gossip reply and dissemination about it is black-holed — the founder
+                // learns joiners from their greets but no one can gossip back, and joiners
+                // stay isolated (`members=[self]`). The UDP source is authoritative for
+                // the peer we are talking to directly; gossip *about* third parties keeps
+                // its relayed address until we hear from them first-hand. `from_peer_addr`
+                // (the TCP peer-link address) is NOT derivable from a UDP source and stays
+                // as advertised. Applies in every posture: even signed datagrams bind only
+                // `from` (the id) to the certificate, never the address.
+                let mut msg = msg;
+                msg.from_addr = src.to_string();
                 let now = elapsed_ms(start);
                 for action in swim.handle(msg, now) {
                     apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;

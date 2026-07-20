@@ -82,17 +82,17 @@ impl LeaseSource for LocalLeaseSource {
             // The lease is assigned to us — return the epoch we hold it at.
             Some(rec) if rec.holder == self.local => Ok(rec.epoch),
             // Assigned to another node, or not yet assigned: we cannot write durably.
-            // DIAG 0047-T5: this path is only reached AFTER `owns_group` passed (the
-            // placement ring says this node owns the group), so a refusal here is
-            // always the ring/lease split — log who actually holds it (or that it is
-            // unassigned) so the kind smoke's persistent retained NotOwner is pinned.
+            // This path is only reached AFTER `owns_group` passed (the placement ring
+            // says this node owns the group), so a refusal here is the ring/lease split
+            // (2026-07-20 post-mortem). Expected only transiently during convergence;
+            // debug-logs who actually holds it (or that it is unassigned).
             _ => {
-                tracing::warn!(
+                tracing::debug!(
                     group,
                     local = self.local,
                     lease_holder = ?current.as_ref().map(|r| r.holder),
                     lease_epoch = ?current.as_ref().map(|r| r.epoch),
-                    "DIAG lease store refuses group epoch to its placement-ring owner (ADR 0047-T5)"
+                    "lease store refuses group epoch to its placement-ring owner"
                 );
                 Err(ReplError::NotOwner)
             }
@@ -206,12 +206,14 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // (and the group's keys re-recovered) against the new lease.
         let epoch = match self.leases.epoch_for(group).await {
             Ok(epoch) => epoch,
-            // DIAG 0047-T5: this node OWNS the group by the placement ring (it passed
-            // `owns_group` above) yet the lease store refuses the epoch — the ring and
-            // the lease-assigner disagree about who holds `group`. Log the split so the
-            // kind smoke's persistent retained `NotOwner` is attributable, then bubble.
+            // This node OWNS the group by the placement ring (it passed `owns_group`
+            // above) yet the lease store refuses the epoch — the ring and the
+            // lease-assigner disagree about who holds `group`. Steady-state this must not
+            // happen; it is expected only transiently while a fresh node's gossip/lease
+            // views converge. A persistent occurrence is the 2026-07-20 durable-ownership
+            // split — kept as a debug signal for that class.
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     key,
                     group,
                     local = %self.local.0,
@@ -219,7 +221,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                     voters = ?diag_voters.iter().map(|n| &n.0).collect::<Vec<_>>(),
                     members = ?diag_members.iter().map(|n| &n.0).collect::<Vec<_>>(),
                     error = ?e,
-                    "DIAG durable split: placement ring owns this group but the lease store refuses its epoch (ADR 0047-T5)"
+                    "durable ownership split: placement ring owns this group but the lease store refuses its epoch"
                 );
                 return Err(e);
             }

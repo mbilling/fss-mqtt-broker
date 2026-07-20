@@ -1,6 +1,6 @@
 # Post-mortem: kind runtime smoke — durable retained write refused forever (ring/lease ownership split)
 
-**Date:** 2026-07-20 · **Environment:** ADR 0047 `kube-smoke` (kind, 3-node StatefulSet, `lease_voters=3`, `cpu request 50m`) · **Status:** root cause confirmed by in-cluster diagnostics; fix in progress
+**Date:** 2026-07-20 · **Environment:** ADR 0047 `kube-smoke` (kind, 3-node StatefulSet, `lease_voters=3`, `cpu request 50m`) · **Status:** root cause confirmed and FIXED (SWIM driver learns the datagram source address); regression test added
 
 > Related decisions: [ADR 0037](../adr/0037-durable-retained-messages.md) (durable retained keyspace),
 > [ADR 0049](../adr/0049-voter-eligible-durable-ownership.md) (voter-eligible ownership — the `voters`
@@ -60,14 +60,23 @@ DIAG lease store refuses group epoch to its placement-ring owner
 
 **Two independent defects; the second turns the first from a transient into permanent data loss.**
 
-**Primary — gossip/placement isolation.** A non-founder's `Placement.eligible` is fed *only* from SWIM
-gossip events (`Placement::observe`, driven by `maintain_peer_links`). `smoke-mqttd-1`'s gossip view
-collapsed to `[self]` — either never converged or converged then evicted its peers under
-suspicion. The broker learns peer **NodeId identities only from gossip**; the raft mesh works in opaque
-`raft_id` hashes with no gossip-independent `raft_id → NodeId` registry wired into the durable driver.
-So once gossip isolates a node, it cannot name, route to, or replicate to its peers at all. (Suspected
-contributing factor: UDP gossip under the smoke's very tight `cpu request 50m` — SWIM heartbeat
-starvation → false-suspicion. Not yet confirmed; a follow-up diagnostic run captures the gossip log.)
+**Primary — SWIM advertises an unroutable gossip address, and the driver trusts it (CONFIRMED).** The
+instrumented run (`mqtt_cluster::swim_driver=debug`) showed `smoke-mqttd-1` *sending* gossip (the
+founder learned it and added it as a voter) but receiving **nothing** back — no membership events, no
+`swim_driver` drops. The cause: `swim_driver::run` reads `(n, src)` from `recv_from` but **never used
+`src`** — it learned a peer's gossip address purely from the peer's *self-claimed* `msg.from_addr`.
+Under the chart's `[cluster.swim] bind = "0.0.0.0:7946"`, every node advertises `from_addr =
+0.0.0.0:7946`. So joiners greet the founder at its routable **seed** address (the founder learns them,
+and the raft/peer mesh forms over the separately-advertised routable `peer_advertise` FQDN), but every
+gossip **reply and dissemination** targets `0.0.0.0:7946` and is black-holed. Only the founder — which
+everyone greets directly — ends up with the full view; joiners stay isolated (`members=[self]`). This
+is the **same bug class as the `peer_advertise` fix earlier in ADR 0047-T5, but for the SWIM gossip
+address** — and unlike the TCP peer address (which genuinely cannot be derived from an inbound UDP
+datagram), the gossip address *can*: it is where the datagram came from. **Fix:** the driver now sets
+`msg.from_addr = src` before feeding the state machine, so a peer is always learned at its real
+datagram source regardless of what it binds/advertises (standard SWIM practice). The lease-epoch
+flapping (`epoch=427`) was a downstream symptom of the resulting membership churn and stops once gossip
+converges. (The `cpu request 50m` was *not* implicated — gossip convergence is not fsync/CPU-bound.)
 
 **Secondary — durable ownership follows gossip, not consensus.** Durable group ownership is computed
 *twice from two independently-evolving snapshots*: the **desired** owner (placement HRW ring, a hash of
@@ -83,7 +92,26 @@ than being ignored by it.
 
 ## Detection — and could a unit test have found this?
 
-**Partly — and the split is unit-testable; the trigger is not.**
+**Yes — the confirmed root cause is an integration test we simply never wrote; the design fragility it
+exposed is separately unit-testable.** (Added now: `swim_cluster.rs::
+nodes_that_advertise_an_unroutable_gossip_address_still_converge` — it fails on the pre-fix driver and
+passes on the fixed one.)
+
+- The **root cause is a driver-level integration property** exercisable with real UDP loopback (no
+  cluster, no kind): spin up nodes that *advertise* an unroutable `0.0.0.0` gossip address but bind
+  real sockets, and assert they still converge. The existing `three_nodes_converge_then_detect_failure`
+  test came within one line of catching it but always advertised each node's **real** bound address —
+  the single case the bug does not hit. The gap was a missing *adversarial address* in the harness, not
+  a missing capability. This is the general lesson: convergence tests must advertise addresses that
+  differ from the bind (NAT, `0.0.0.0`, containers), because that is what real deployments do.
+- The **secondary design fragility** (durable ownership follows the gossip HRW ring instead of the
+  committed lease) remains separately unit-testable and is tracked as follow-up #1 — it is what turned
+  this gossip bug into *permanent* data loss rather than a transient, and would harden the plane against
+  any future membership skew.
+
+**Historical note (superseded).** The originally-suspected trigger — SWIM heartbeat starvation under the
+`50m` CPU cap — was wrong; the instrumented run disproved it (the joiner sent fine and received nothing,
+a routing problem, not a timing one).
 
 - The **secondary defect is unit-testable and should have been caught there.** The invariant "a node
   whose gossip view is isolated must not compute itself the durable owner of a group the committed voter
@@ -112,11 +140,10 @@ skew* window, which neither harness perturbs.
    path (routing, `owns_group`) must derive from the committed lease / raft voter set, not the gossip
    HRW ring; and the driver must not filter the committed voter set through gossip `members()`. Add the
    in-process regression test described above as the guard. *(Owns the secondary defect.)*
-2. **Gossip convergence robustness (bug, primary trigger).** Determine why a seeded joiner's SWIM
-   collapses to `[self]` under the smoke (diagnostic run with `mqtt_cluster::swim_driver=debug` +
-   full pod logs queued). Likely fixes: gossip-independent NodeId learning at the peer-link/raft-mesh
-   handshake so an isolated-gossip voter can still name and reach peers; and/or SWIM failure-detector
-   tolerance sized for constrained CPU. Raise the smoke's CPU request meanwhile.
+2. **Gossip convergence robustness (bug, primary trigger) — DONE.** Root cause found: `swim_driver`
+   ignored the datagram source and trusted the peer's self-claimed `from_addr`, so a `0.0.0.0`-bind
+   advertise black-holed all return gossip. Fixed by learning the source address; regression test added
+   (`nodes_that_advertise_an_unroutable_gossip_address_still_converge`).
 3. **Client-facing durability honesty (bug).** A QoS-1 retained publish that cannot durably commit must
    not have already returned `PUBACK`. Either withhold the ack until the durable commit (or a bounded
    queue-until-heal) succeeds, or the readiness gate must pull a node whose durable routing is
