@@ -174,11 +174,7 @@ async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (St
 
 /// Spawn a node that binds a real socket but ADVERTISES `advertise` as its own SWIM
 /// datagram address — used to reproduce the k8s `0.0.0.0`-advertise isolation.
-async fn spawn_node_advertising(
-    id: &str,
-    seeds: Vec<String>,
-    advertise: &str,
-) -> (String, Node) {
+async fn spawn_node_advertising(id: &str, seeds: Vec<String>, advertise: &str) -> (String, Node) {
     spawn_node_inner(
         id,
         seeds,
@@ -193,7 +189,16 @@ async fn spawn_node_advertising(
 
 /// Spawn a node that advertises its own failure-domain label over gossip (ADR 0016 T5).
 async fn spawn_node_in_domain(id: &str, seeds: Vec<String>, domain: &str) -> (String, Node) {
-    spawn_node_inner(id, seeds, None, None, Some(domain), None, std::future::pending()).await
+    spawn_node_inner(
+        id,
+        seeds,
+        None,
+        None,
+        Some(domain),
+        None,
+        std::future::pending(),
+    )
+    .await
 }
 
 /// Spawn a node that signs its gossip as itself (ADR 0022, require mode).
