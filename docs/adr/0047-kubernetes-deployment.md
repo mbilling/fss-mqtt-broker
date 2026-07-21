@@ -1,6 +1,6 @@
 # ADR 0047 — Kubernetes deployment (Helm chart, StatefulSet, safe scale-down)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0047-kubernetes-deployment.md](../delivery/0047-kubernetes-deployment.md) — plan, progress, and changelog

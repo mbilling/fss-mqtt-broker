@@ -1,0 +1,79 @@
+# Test-only values for the kind/k3d runtime smoke (ADR 0047 T5). Not packaged (see .helmignore
+# `ci/`). Runs the broker WITHOUT TLS/secret provisioning: a plaintext listener + anonymous auth,
+# durable sessions on, tiny grace so the smoke is fast. The image + tag are injected by the CI job
+# (`--set image.repository=... --set image.tag=...`).
+
+replicaCount: 3
+
+# Plaintext + anonymous so the smoke needs no certs; durable on to exercise the lease group.
+config: |
+  [node]
+  id = "__NODE_ID__"
+  data_dir = "/var/lib/mqttd"
+
+  [listeners]
+  plaintext_bind = "0.0.0.0:1883"
+  health_bind = "0.0.0.0:8080"
+
+  [security]
+  allow_anonymous = true
+
+  [cluster]
+  peer_bind = "0.0.0.0:7001"
+  peer_advertise = "__PEER_ADVERTISE__"
+
+  [cluster.swim]
+  bind = "0.0.0.0:7946"
+  seeds = [__SEEDS__]
+
+  [durable]
+  enabled = true
+  lease_voters = 3
+
+# No secret mounts in the smoke.
+secrets:
+  tls:
+    secretName: ""
+  acl:
+    configMapName: ""
+  peerTls:
+    secretName: ""
+  gossipKey:
+    secretName: ""
+
+# The client Service exposes the plaintext listener for the smoke. targetPort is numeric (the
+# container declares only the TLS/health/peer/gossip named ports; kube-proxy routes to a numeric
+# pod port regardless).
+service:
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: 1883
+
+persistence:
+  enabled: true
+  size: 1Gi
+  # kind ships the rancher local-path provisioner as the default StorageClass.
+  storageClassName: standard
+
+# Small grace so scale-down/roll finish quickly in the smoke.
+terminationGracePeriodSeconds: 60
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+
+# Faster readiness for a quick smoke (the cluster still needs ~tens of seconds to form the lease group).
+startupProbe:
+  httpGet:
+    path: /livez
+    port: health
+  periodSeconds: 3
+  failureThreshold: 80
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  periodSeconds: 3
+  failureThreshold: 3

@@ -132,7 +132,8 @@ jobs:
         run: |
           helm template mqttd deploy/helm/mqttd \
             | awk '/mqttd.toml.tmpl: \|-/{f=1;next} f&&/^    /{sub(/^    /,"");print;next} f{exit}' \
-            | sed -e 's/__NODE_ID__/mqttd-0/g' -e 's/__SEEDS__//g' > /tmp/rendered.toml
+            | sed -e 's/__NODE_ID__/mqttd-0/g' -e 's/__SEEDS__//g' \
+                  -e 's|__PEER_ADVERTISE__|mqttd-0.mqttd-headless.default.svc.cluster.local:7001|g' > /tmp/rendered.toml
           echo "--- rendered founder config ---"; cat /tmp/rendered.toml
           cargo build --quiet -p mqttd
           target/debug/mqttd --check-config --config /tmp/rendered.toml

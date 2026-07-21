@@ -161,7 +161,7 @@ async fn spawn_leavable_node(
     seeds: Vec<String>,
 ) -> (String, Node, tokio::sync::oneshot::Sender<()>) {
     let (leave_tx, leave_rx) = tokio::sync::oneshot::channel::<()>();
-    let (addr, node) = spawn_node_inner(id, seeds, None, None, None, async move {
+    let (addr, node) = spawn_node_inner(id, seeds, None, None, None, None, async move {
         let _ = leave_rx.await;
     })
     .await;
@@ -169,12 +169,36 @@ async fn spawn_leavable_node(
 }
 
 async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (String, Node) {
-    spawn_node_inner(id, seeds, auth, None, None, std::future::pending()).await
+    spawn_node_inner(id, seeds, auth, None, None, None, std::future::pending()).await
+}
+
+/// Spawn a node that binds a real socket but ADVERTISES `advertise` as its own SWIM
+/// datagram address — used to reproduce the k8s `0.0.0.0`-advertise isolation.
+async fn spawn_node_advertising(id: &str, seeds: Vec<String>, advertise: &str) -> (String, Node) {
+    spawn_node_inner(
+        id,
+        seeds,
+        None,
+        None,
+        None,
+        Some(advertise.to_string()),
+        std::future::pending(),
+    )
+    .await
 }
 
 /// Spawn a node that advertises its own failure-domain label over gossip (ADR 0016 T5).
 async fn spawn_node_in_domain(id: &str, seeds: Vec<String>, domain: &str) -> (String, Node) {
-    spawn_node_inner(id, seeds, None, None, Some(domain), std::future::pending()).await
+    spawn_node_inner(
+        id,
+        seeds,
+        None,
+        None,
+        Some(domain),
+        None,
+        std::future::pending(),
+    )
+    .await
 }
 
 /// Spawn a node that signs its gossip as itself (ADR 0022, require mode).
@@ -183,6 +207,7 @@ async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, No
         id,
         seeds,
         Some(signed_auth(key, id)),
+        None,
         None,
         None,
         std::future::pending(),
@@ -201,6 +226,7 @@ async fn spawn_sequenced_node(id: &str, seeds: Vec<String>, key: u8) -> (String,
         Some(auth),
         Some(alloc),
         None,
+        None,
         std::future::pending(),
     )
     .await
@@ -212,15 +238,22 @@ async fn spawn_node_inner(
     auth: Option<SwimAuth>,
     seq_alloc: Option<SeqAlloc>,
     domain: Option<&str>,
+    // The address this node ADVERTISES as its own SWIM datagram address (`from_addr`).
+    // `None` advertises its real bound address (the honest case). A test passes an
+    // unroutable value (e.g. a `0.0.0.0` bind) to prove peers still reach it via the
+    // datagram source (2026-07-20 post-mortem). The real bound address is always
+    // returned for seeding.
+    advertise: Option<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (String, Node) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap().to_string();
+    let advertised = advertise.unwrap_or_else(|| addr.clone());
     // No peer-link transport in this test; the routing address is a placeholder.
-    let peer_addr = format!("{addr}-peer");
+    let peer_addr = format!("{advertised}-peer");
     let swim = Swim::new(
         NodeId(id.to_string()),
-        addr.clone(),
+        advertised,
         peer_addr,
         domain.map(str::to_string),
         cfg(),
@@ -333,6 +366,52 @@ async fn three_nodes_converge_then_detect_failure() {
     n2.handle.abort();
 }
 
+/// Regression for the 2026-07-20 kube-smoke isolation: a node that advertises an
+/// **unroutable** SWIM datagram address (the kubernetes `0.0.0.0:<port>` bind default)
+/// must still converge, because peers learn its real address from the datagram source
+/// rather than trusting its self-claim.
+///
+/// Before the driver learned the source address, the founder learned joiners from
+/// their greets (sent to its routable seed address) but every gossip *reply* went to
+/// `0.0.0.0` and was black-holed — so joiners stayed isolated (`members=[self]`), their
+/// placement HRW ring believed they owned every group, and durable ownership split from
+/// the committed lease (permanent retained `NotOwner`). This is why the existing
+/// convergence test above did not catch it: it advertises each node's *real* bound
+/// address, the one case the bug does not hit.
+#[tokio::test]
+async fn nodes_that_advertise_an_unroutable_gossip_address_still_converge() {
+    // Advertise 0.0.0.0:7946 (as under a k8s 0.0.0.0 bind) while listening on a real
+    // ephemeral socket. Joiners are seeded with the founder's REAL address — that is
+    // where the initial greet goes (the routable seed, ADR 0016) — but from then on
+    // reachability depends entirely on peers learning the source address.
+    let bogus = "0.0.0.0:7946";
+    let (seed_addr, n1) = spawn_node_advertising("n1", vec![], bogus).await;
+    let (_a2, n2) = spawn_node_advertising("n2", vec![seed_addr.clone()], bogus).await;
+    let (_a3, n3) = spawn_node_advertising("n3", vec![seed_addr.clone()], bogus).await;
+
+    // FULL convergence — including the joiners seeing each other and the founder. The
+    // joiner-side assertions (n2/n3 see their peers) are the ones that regress without
+    // the source-address fix; the founder-side ones passed even with the bug.
+    let converged = wait_for(Duration::from_secs(8), || {
+        sees(&n1, "n2", MemberState::Alive)
+            && sees(&n1, "n3", MemberState::Alive)
+            && sees(&n2, "n1", MemberState::Alive)
+            && sees(&n2, "n3", MemberState::Alive)
+            && sees(&n3, "n1", MemberState::Alive)
+            && sees(&n3, "n2", MemberState::Alive)
+    })
+    .await;
+    assert!(
+        converged,
+        "nodes advertising an unroutable gossip address failed to converge — a joiner \
+         isolated to [self] (2026-07-20 post-mortem)"
+    );
+
+    n1.handle.abort();
+    n2.handle.abort();
+    n3.handle.abort();
+}
+
 /// ADR 0019 §2: a node that leaves **gracefully** is seen `Dead` by its peer almost
 /// immediately — well before failure detection (one probe period + ack timeout +
 /// suspicion window) could even begin to conclude it dead. This is the latency a
@@ -417,6 +496,7 @@ async fn a_cert_attested_domain_propagates_without_any_self_claim() {
         Some(attested_auth(key, "c1", "rack-a")),
         None,
         None, // no MQTTD_FAILURE_DOMAIN-style self claim — the cert alone labels the node
+        None,
         std::future::pending(),
     )
     .await;
@@ -424,6 +504,7 @@ async fn a_cert_attested_domain_propagates_without_any_self_claim() {
         "c2",
         vec![addr1],
         Some(attested_auth(key, "c2", "rack-b")),
+        None,
         None,
         None,
         std::future::pending(),
@@ -458,6 +539,7 @@ async fn a_domain_claim_contradicting_the_certificate_is_rejected() {
         Some(attested_auth(key, "h1", "rack-a")),
         None,
         None,
+        None,
         std::future::pending(),
     )
     .await;
@@ -468,6 +550,7 @@ async fn a_domain_claim_contradicting_the_certificate_is_rejected() {
         Some(attested_auth(key, "liar", "rack-a")),
         None,
         Some("rack-z"),
+        None,
         std::future::pending(),
     )
     .await;

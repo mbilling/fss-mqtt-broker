@@ -21,10 +21,11 @@ initImage:
 replicaCount: 3
 
 # --- Broker configuration (ADR 0046) --------------------------------------------------------
-# This becomes the ConfigMap-mounted TOML. Two placeholders — __NODE_ID__ and __SEEDS__ — are
-# filled per-pod by the render init container (node id = pod name; seeds = pod-0 for non-founders,
-# empty for pod-0). Everything else is verbatim. Keep secrets OUT of here — reference them by the
-# mounted paths under `secrets` below.
+# This becomes the ConfigMap-mounted TOML. Three placeholders — __NODE_ID__, __SEEDS__, and
+# __PEER_ADVERTISE__ — are filled per-pod by the render init container (node id = pod name; seeds
+# = pod-0 for non-founders, empty for pod-0; peer_advertise = this pod's routable per-pod FQDN so
+# the mesh links over the headless service rather than an unroutable 0.0.0.0). Everything else is
+# verbatim. Keep secrets OUT of here — reference them by the mounted paths under `secrets` below.
 config: |
   [node]
   id = "__NODE_ID__"
@@ -43,6 +44,7 @@ config: |
 
   [cluster]
   peer_bind = "0.0.0.0:7001"
+  peer_advertise = "__PEER_ADVERTISE__"
 
   [cluster.swim]
   bind = "0.0.0.0:7946"

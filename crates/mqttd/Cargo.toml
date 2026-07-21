@@ -11,14 +11,14 @@ name = "mqttd"
 path = "src/main.rs"
 
 [dependencies]
-mqtt-codec = { path = "../mqtt-codec", version = "0.1.0" }
-mqtt-core = { path = "../mqtt-core", version = "0.1.0" }
-mqtt-net = { path = "../mqtt-net", version = "0.1.0" }
-mqtt-auth = { path = "../mqtt-auth", version = "0.1.0" }
-mqtt-storage = { path = "../mqtt-storage", version = "0.1.0" }
-mqtt-cluster = { path = "../mqtt-cluster", version = "0.1.0" }
-mqtt-observability = { path = "../mqtt-observability", version = "0.1.0" }
-mqtt-config = { path = "../mqtt-config", version = "0.1.0" }
+mqtt-codec = { path = "../mqtt-codec", version = "0.9.0" }
+mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
+mqtt-net = { path = "../mqtt-net", version = "0.9.0" }
+mqtt-auth = { path = "../mqtt-auth", version = "0.9.0" }
+mqtt-storage = { path = "../mqtt-storage", version = "0.9.0" }
+mqtt-cluster = { path = "../mqtt-cluster", version = "0.9.0" }
+mqtt-observability = { path = "../mqtt-observability", version = "0.9.0" }
+mqtt-config = { path = "../mqtt-config", version = "0.9.0" }
 
 tokio.workspace = true
 # CancellationToken + TaskTracker for graceful shutdown (ADR 0019)
