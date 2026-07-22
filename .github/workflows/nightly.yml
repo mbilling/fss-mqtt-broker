@@ -114,6 +114,10 @@ jobs:
       - name: fuzz ${{ matrix.target }}
         working-directory: ${{ matrix.crate }}
         run: |
+          # The working corpus dir is gitignored (ephemeral), so it does not
+          # exist in a fresh checkout — and libFuzzer hard-errors on a missing
+          # explicit corpus dir ("The required directory ... does not exist").
+          mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo +nightly fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=720
