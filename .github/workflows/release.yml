@@ -218,7 +218,13 @@ jobs:
           # Emit per-crate SBOMs (each the crate's transitive graph, as pinned by
           # Cargo.lock). cargo-cyclonedx writes <package>.cdx.json next to each
           # crate manifest; we ship the mqttd binary's as the headline SBOM.
-          cargo cyclonedx --locked --format json
+          # NOTE: `cargo cyclonedx` rejects cargo's `--locked` flag (v0.5.9:
+          # "unexpected argument") — lockfile discipline is asserted by the
+          # diff guard below instead.
+          cargo cyclonedx --format json
+          git diff --exit-code Cargo.lock || {
+            echo "::error title=SBOM::SBOM generation mutated Cargo.lock (resolution drifted from the tagged lockfile)"; exit 1;
+          }
           SBOM="$(find . -name 'mqttd.cdx.json' -print -quit)"
           if [ -z "$SBOM" ]; then
             echo "::error title=SBOM::cargo-cyclonedx produced no mqttd.cdx.json"; exit 1
