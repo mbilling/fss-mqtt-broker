@@ -5,7 +5,9 @@ adr_status: Accepted
 tasks:
   - id: 0048-T1
     title: Containerized load harness — emqtt-bench + docker-compose that stands up each broker (ours, Mosquitto, EMQX) from its published image with documented reasonable config; same hardware, pinned versions, security posture held constant and disclosed
-    status: in-progress
+    status: done
+    date: 2026-07-23
+    evidence: "bench/: compose profiles run ONE broker at a time (mqttd built from source; Mosquitto 2.0.20; EMQX 5.8.6 — pinned), driven by emqtt-bench 0.6.3 (EMQX's own tool, ADR §3). run.sh executes identical scenarios per broker — connection-rate (timed window; emqtt_bench conn holds connections and never exits, learned in smoke), sustained pub/sub at QoS 0/1/2 (N pubs → N subs, 256 B), RSS snapshot — capturing raw logs + env.txt (versions/params/host, dev-grade label) per run; results/ is gitignored. Posture held constant and disclosed: plaintext/anonymous/in-memory on all three (mqttd explicitly opts out of durable-by-default; TLS posture is T2). Smoke-verified end-to-end on all three brokers: 100/100 connects, publishes complete at every QoS, exit 0."
   - id: 0048-T2
     title: The selection metrics — sustained throughput (QoS 0/1/2), end-to-end latency p50/p99/p999, memory per idle connection at scale, connection-establishment rate (mTLS included); full distributions, never a single number
     status: planned
@@ -25,7 +27,7 @@ above · this file is the plan, progress log, and changelog.
 <!-- status-table:0048 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0048-T1 | 🚧 in-progress | — |  |
+| 0048-T1 | ✅ done | 2026-07-23 | "bench/: compose profiles run ONE broker at a time (mqttd built from source; Mosquitto 2.0.20; EMQX 5.8.6 — pinned), driven by emqtt-bench 0.6.3 (EMQX's own tool, ADR §3). run.sh executes identical scenarios per broker — connection-rate (timed window; emqtt_bench conn holds connections and never exits, learned in smoke), sustained pub/sub at QoS 0/1/2 (N pubs → N subs, 256 B), RSS snapshot — capturing raw logs + env.txt (versions/params/host, dev-grade label) per run; results/ is gitignored. Posture held constant and disclosed: plaintext/anonymous/in-memory on all three (mqttd explicitly opts out of durable-by-default; TLS posture is T2). Smoke-verified end-to-end on all three brokers: 100/100 connects, publishes complete at every QoS, exit 0." |
 | 0048-T2 | ⬜ planned | — |  |
 | 0048-T3 | ⬜ planned | — |  |
 | 0048-T4 | ⬜ planned | — |  |

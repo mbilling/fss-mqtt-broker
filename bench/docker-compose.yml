@@ -1,0 +1,45 @@
+name: mqttd-bench
+
+# Comparative benchmark harness (ADR 0048 T1). ONE broker runs at a time — selected by
+# compose profile — so brokers never contend for the host while being measured:
+#
+#   docker compose --profile mqttd     up -d --build
+#   docker compose --profile mosquitto up -d
+#   docker compose --profile emqx      up -d
+#
+# The load driver (emqtt-bench, EMQX's own tool — see ADR 0048 §3) is run against the
+# broker by ../bench/run.sh on this compose network. Versions are PINNED; configuration
+# is each broker's documented, reasonable setup — not ours tuned and theirs default.
+#
+# Posture (T1): plaintext + anonymous + in-memory sessions on every broker, matching the
+# competitors' out-of-the-box behaviour and DISCLOSED (mqttd's durable-by-default is
+# explicitly opted out here; the TLS/mTLS posture lands with T2). See bench/README.md.
+
+services:
+  mqttd:
+    profiles: [mqttd]
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    image: mqttd-bench
+    hostname: broker
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883
+      MQTTD_ALLOW_ANONYMOUS: "1"  # like-for-like: competitors run anonymous here too
+      MQTTD_DURABLE_SESSIONS: "0" # like-for-like: competitors default to in-memory sessions (disclosed)
+      MQTTD_HEALTH_BIND: 0.0.0.0:8080
+      RUST_LOG: warn # measure the broker, not its logger
+
+  mosquitto:
+    profiles: [mosquitto]
+    image: eclipse-mosquitto:2.0.20
+    hostname: broker
+    volumes:
+      - ./configs/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  emqx:
+    profiles: [emqx]
+    image: emqx/emqx:5.8.6
+    hostname: broker
+    environment:
+      EMQX_LOG__CONSOLE__LEVEL: warning
