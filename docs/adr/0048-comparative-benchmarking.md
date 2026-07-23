@@ -1,7 +1,7 @@
 # ADR 0048 — Comparative performance benchmarking (published, reproducible, honest)
 
-- **Status:** Proposed
-- **Date:** 2026-07-17
+- **Status:** Accepted
+- **Date:** 2026-07-17 (accepted 2026-07-23)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0048-comparative-benchmarking.md](../delivery/0048-comparative-benchmarking.md) — plan, progress, and changelog
 - **Related:** [ADR 0044](0044-release-readiness-assurance.md) (P6's internal micro/hot-path
@@ -86,6 +86,13 @@ does mTLS on every connection will pay a connection-setup cost — say so); and 
 our clustered throughput to a competitor's single node without labeling it. The security
 posture is held **constant and disclosed** (e.g. TLS on where the comparison is like-for-like)
 so "fast" is never bought by quietly turning security off.
+
+Our **known architectural weak spots are named in the results up front**, not left for a
+reader to discover: durable-session ownership is bounded by the lease voter set
+(`MQTTD_LEASE_VOTERS`, ADR 0021/0049) — durable-session capacity scales with the voter cap,
+not the node count — and the memory footprint is that of a Rust broker with an embedded
+observability stack, not a few-MB single-threaded C daemon (Mosquitto wins footprint;
+the table says so).
 
 ### 5. Published, versioned, and re-run
 

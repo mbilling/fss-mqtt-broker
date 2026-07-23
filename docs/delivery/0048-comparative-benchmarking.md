@@ -1,11 +1,11 @@
 ---
 adr: "0048"
 title: "Comparative performance benchmarking (published, reproducible, honest)"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0048-T1
-    title: Containerized load harness — an established MQTT benchmark client + docker-compose that stands up each broker (ours, Mosquitto, EMQX) from its published image with documented reasonable config; same hardware, pinned versions, security posture held constant and disclosed
-    status: planned
+    title: Containerized load harness — emqtt-bench + docker-compose that stands up each broker (ours, Mosquitto, EMQX) from its published image with documented reasonable config; same hardware, pinned versions, security posture held constant and disclosed
+    status: in-progress
   - id: 0048-T2
     title: The selection metrics — sustained throughput (QoS 0/1/2), end-to-end latency p50/p99/p999, memory per idle connection at scale, connection-establishment rate (mTLS included); full distributions, never a single number
     status: planned
@@ -25,7 +25,7 @@ above · this file is the plan, progress log, and changelog.
 <!-- status-table:0048 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0048-T1 | ⬜ planned | — |  |
+| 0048-T1 | 🚧 in-progress | — |  |
 | 0048-T2 | ⬜ planned | — |  |
 | 0048-T3 | ⬜ planned | — |  |
 | 0048-T4 | ⬜ planned | — |  |
