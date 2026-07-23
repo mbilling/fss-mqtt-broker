@@ -143,7 +143,7 @@ mod tests {
         let store = LeaseStore::new();
         let assigner = LeaseAssigner::new(placement.clone());
         let pending = assigner.pending(&store);
-        assert_eq!(pending.len(), NUM_GROUPS as usize);
+        assert_eq!(pending.len(), usize::try_from(NUM_GROUPS).unwrap());
         let p = placement.read().unwrap();
         for (g, desired) in &pending {
             assert_eq!(*desired, raft_id(&p.hrw_owner(*g)));
