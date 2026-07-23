@@ -1,6 +1,6 @@
 name: mqttd-bench
 
-# Comparative benchmark harness (ADR 0048 T1). ONE broker runs at a time — selected by
+# Comparative benchmark harness (ADR 0048 T1/T2). ONE broker runs at a time — selected by
 # compose profile — so brokers never contend for the host while being measured:
 #
 #   docker compose --profile mqttd     up -d --build
@@ -11,9 +11,11 @@ name: mqttd-bench
 # broker by ../bench/run.sh on this compose network. Versions are PINNED; configuration
 # is each broker's documented, reasonable setup — not ours tuned and theirs default.
 #
-# Posture (T1): plaintext + anonymous + in-memory sessions on every broker, matching the
-# competitors' out-of-the-box behaviour and DISCLOSED (mqttd's durable-by-default is
-# explicitly opted out here; the TLS/mTLS posture lands with T2). See bench/README.md.
+# Two DISCLOSED postures per broker (ADR 0048 §4 — the security cost is shown, never
+# hidden): plaintext/anonymous on 1883 (competitors' out-of-the-box behaviour; mqttd's
+# durable-by-default explicitly opted out for like-for-like) and TLS with REQUIRED
+# client certificates (mTLS) on 8883, from the throwaway PKI in tls/certs
+# (tls/gen-certs.sh). See bench/README.md.
 
 services:
   mqttd:
@@ -27,8 +29,14 @@ services:
       MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883
       MQTTD_ALLOW_ANONYMOUS: "1"  # like-for-like: competitors run anonymous here too
       MQTTD_DURABLE_SESSIONS: "0" # like-for-like: competitors default to in-memory sessions (disclosed)
+      MQTTD_TLS_BIND: 0.0.0.0:8883
+      MQTTD_TLS_CERT: /certs/server.pem
+      MQTTD_TLS_KEY: /certs/server.key
+      MQTTD_TLS_CLIENT_CA: /certs/ca.pem # mTLS: client certificates required
       MQTTD_HEALTH_BIND: 0.0.0.0:8080
       RUST_LOG: warn # measure the broker, not its logger
+    volumes:
+      - ./tls/certs:/certs:ro
 
   mosquitto:
     profiles: [mosquitto]
@@ -36,6 +44,7 @@ services:
     hostname: broker
     volumes:
       - ./configs/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./tls/certs:/certs:ro
 
   emqx:
     profiles: [emqx]
@@ -43,3 +52,11 @@ services:
     hostname: broker
     environment:
       EMQX_LOG__CONSOLE__LEVEL: warning
+      # mTLS on the default SSL listener (8883): require and verify client certs.
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CACERTFILE: /certs/ca.pem
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: /certs/server.pem
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE: /certs/server.key
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__VERIFY: verify_peer
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__FAIL_IF_NO_PEER_CERT: "true"
+    volumes:
+      - ./tls/certs:/certs:ro
