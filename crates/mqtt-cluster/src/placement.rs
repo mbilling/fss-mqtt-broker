@@ -267,10 +267,24 @@ impl Placement {
     /// non-durable). The data path routes and gates durable ownership here, so it always
     /// agrees with the lease the commit is fenced against. There is always an owner (this
     /// node is always eligible; the HRW fallback never has an empty ring).
+    ///
+    /// **Liveness rule:** the committed lease is honored only while its holder is still
+    /// an eligible (non-`Dead`) member. A lease held by a corpse falls back to HRW at the
+    /// same tick SWIM declares the death — the data path never routes to a dead node,
+    /// and (crucially) the group's replica set settles together with membership,
+    /// preserving the catch-up sweep's arming invariant (ADR 0043 P1: the sweep arms on
+    /// membership change; without this filter the dead node's groups change replica set
+    /// *again* when their leases migrate ticks later — after the sweep already ran —
+    /// leaving them unstamped and their takeover recovery permanently `NoQuorum`). A
+    /// holder *falsely* declared dead degrades to the transient fail-closed ring/lease
+    /// split (`NotOwner`, retried) until the assigner reconciles; the permanent-split
+    /// hazard this overlay fixes needs a *live* skewed holder, which the filter
+    /// deliberately leaves lease-first.
     #[must_use]
     pub fn group_owner(&self, group: GroupId) -> NodeId {
         self.lease_owners
             .get(&group)
+            .filter(|holder| self.eligible.contains(*holder))
             .cloned()
             .unwrap_or_else(|| self.hrw_owner(group))
     }
@@ -440,6 +454,54 @@ mod tests {
             .unwrap();
         assert_eq!(p.group_owner(g_unassigned), p.hrw_owner(g_unassigned));
         assert_eq!(p.committed_owner(g_unassigned), None);
+    }
+
+    /// The liveness rule: a committed lease held by a node SWIM has declared **Dead** is
+    /// not honored — the group falls back to HRW (over the survivors) at the same tick
+    /// the death lands in placement, so the data path never routes to a corpse and the
+    /// replica set settles together with membership (the catch-up sweep's arming
+    /// invariant, ADR 0043 P1 — without this, a dead owner's groups change replica set
+    /// again when their leases migrate ticks later, after the sweep already ran, leaving
+    /// takeover recovery permanently `NoQuorum`). A merely-Suspect holder stays
+    /// lease-first: the overlay's whole point is a *live* holder the gossip view has
+    /// momentarily skewed away from.
+    #[test]
+    fn a_dead_holders_lease_falls_back_to_hrw_a_suspect_holders_does_not() {
+        use super::NUM_GROUPS;
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b", "c"]);
+        // A group HRW-owned by us, lease-held by b.
+        let g = (0..NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("a"))
+            .unwrap();
+        let mut leases = BTreeMap::new();
+        leases.insert(g, node("b"));
+        p.set_lease_owners(leases);
+        assert_eq!(p.group_owner(g), node("b"), "live holder: lease-first");
+
+        // Suspect is NOT dead — the lease still rules.
+        p.observe(&node("b"), MemberState::Suspect, "b:7000", None);
+        assert_eq!(p.group_owner(g), node("b"), "suspect holder: lease-first");
+
+        // Dead: the lease is a corpse's — fall back to HRW over the survivors, and the
+        // replica set is led by the fallback owner (no dead node in it).
+        p.observe(&node("b"), MemberState::Dead, "", None);
+        assert_eq!(
+            p.group_owner(g),
+            p.hrw_owner(g),
+            "dead holder: HRW fallback"
+        );
+        assert_ne!(p.group_owner(g), node("b"));
+        assert!(
+            !p.group_replica_set(g).contains(&node("b")),
+            "a dead holder must not appear in the replica set"
+        );
+        // The raw committed record is still observable (diagnostics), just not honored.
+        assert_eq!(p.committed_owner(g), Some(node("b")));
+
+        // The holder rejoining (Alive) restores lease-first ownership.
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert_eq!(p.group_owner(g), node("b"), "rejoined holder: lease-first");
     }
 
     /// Until the durable driver reports a committed lease, the data path is exactly the
