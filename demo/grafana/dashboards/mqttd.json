@@ -7,6 +7,20 @@
   "version": 1,
   "refresh": "5s",
   "time": { "from": "now-15m", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "name": "cluster reformation",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "hide": false,
+        "iconColor": "orange",
+        "expr": "max(changes(mqttd_lease_epoch[1m])) > 0",
+        "titleFormat": "cluster re-formed",
+        "textFormat": "lease re-election (epoch changed) — on this single-host demo usually a host stall breaking the 3s leader lease; see the README's fsync-bound caveat"
+      }
+    ]
+  },
   "templating": {
     "list": [
       {
@@ -204,6 +218,18 @@
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 40 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (instance) (increase(mqttd_quic_path_migrations_total{instance=~\"$instance\"}[1m]))", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "Cluster reformations (leader re-elections)",
+      "description": "Each bar = the lease group re-elected in that window; peer links dip while the mesh re-forms and recover in seconds — the flap-and-heal cycle. On this single-host demo the usual trigger is a host stall (fsync/CPU contention) breaking the 3s leader lease, not a broker fault: see the README's fsync-bound caveat and the 2026-07-14 post-mortem. The orange dashed annotations mark each event on every panel.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [ { "matcher": { "id": "byFrameRefID", "options": "B" }, "properties": [ { "id": "custom.drawStyle", "value": "line" }, { "id": "custom.fillOpacity", "value": 0 }, { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max(changes(mqttd_lease_epoch[5m]))", "legendFormat": "re-elections (5m window)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "min(mqttd_peer_links)", "legendFormat": "min peer links (dips during a flap)" }
+      ]
     }
   ]
 }

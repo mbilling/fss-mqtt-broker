@@ -118,7 +118,11 @@ filter by broker and panels grouped roughly as:
   reason (auth / acl / keepalive / tls / accept).
 - **State** — sessions / subscriptions / inflight per node.
 - **Cluster** — members & peer links, members by SWIM state, lease leader/epoch, durable
-  append p95 + failures by reason (no-quorum / not-owner / …).
+  append p95 + failures by reason (no-quorum / not-owner / …), and **cluster reformations**
+  (leader re-elections + the peer-link dip while the mesh re-forms). Each reformation is
+  also marked as an **orange dashed annotation across every panel**, so a flap-and-heal
+  cycle reads as the recovery event it is (on this single-host demo the usual trigger is a
+  host stall — see the fsync-bound caveat above) rather than a mystery gap in the graphs.
 - **Security** — gossip datagrams rejected by reason; build info.
 
 ## MQTT playground (browser)
