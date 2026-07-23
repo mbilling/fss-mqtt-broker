@@ -79,6 +79,16 @@ pub struct Placement {
     /// *replication* still spans the eligible set — only ownership is bounded
     /// (ADR 0021 keeps replication independent of the voter cap).
     voters: BTreeSet<NodeId>,
+    /// The **committed** durable owner of each group — `group -> holder`, read from
+    /// the replicated lease map and pushed each reconcile tick by the durable driver
+    /// (2026-07-20 post-mortem). This is the *actual* ownership the data path must
+    /// follow: the HRW ring below is only the *desired* topology the lease assigner
+    /// drives toward. Routing durable writes by HRW instead of the committed lease is
+    /// what let a transient membership skew split ownership from the lease into a
+    /// permanent `NotOwner`. A group absent here (no lease assigned yet, or non-durable
+    /// bootstrap) falls back to the HRW owner, so behaviour is unchanged until the
+    /// driver has a committed lease to report.
+    lease_owners: BTreeMap<GroupId, NodeId>,
     /// Each peer's inter-node (peer-link) address, so the owner of a session can
     /// be reached for session relocation (ADR 0005).
     addrs: BTreeMap<NodeId, String>,
@@ -103,6 +113,7 @@ impl Placement {
             replicas: replicas.max(1),
             eligible,
             voters: BTreeSet::new(),
+            lease_owners: BTreeMap::new(),
             addrs: BTreeMap::new(),
             local_domain: None,
             domains: BTreeMap::new(),
@@ -172,6 +183,22 @@ impl Placement {
         self.voters = voters;
     }
 
+    /// Replace the committed durable owner map — `group -> holder` from the replicated
+    /// lease store, pushed each reconcile tick by the durable driver (2026-07-20
+    /// post-mortem). This is the ACTUAL ownership the data path follows; a group absent
+    /// from the map falls back to the desired HRW owner. Passing an empty map (e.g. a
+    /// non-durable node) restores pure-HRW routing.
+    pub fn set_lease_owners(&mut self, owners: BTreeMap<GroupId, NodeId>) {
+        self.lease_owners = owners;
+    }
+
+    /// The committed durable owner of `group`, if a lease has been reported for it —
+    /// exposed so ownership convergence can be observed (tests, diagnostics).
+    #[must_use]
+    pub fn committed_owner(&self, group: GroupId) -> Option<NodeId> {
+        self.lease_owners.get(&group).cloned()
+    }
+
     /// The current lease voter set as seen by this ring (ADR 0049) — empty until
     /// the durable driver has pushed it. Exposed so ownership convergence can be
     /// observed (tests, diagnostics).
@@ -211,8 +238,12 @@ impl Placement {
     /// replication still spans every eligible node (ADR 0021 §2). Owner-first,
     /// deduplicated, capped at `R`. The owner is always present, preserving the
     /// invariant that a group's owner holds its data.
-    fn owner_led_replica_set(&self, group: GroupId, nodes: &[NodeId]) -> Vec<NodeId> {
-        let owner = self.owner_over(group, nodes);
+    fn owner_led_replica_set(
+        &self,
+        group: GroupId,
+        nodes: &[NodeId],
+        owner: NodeId,
+    ) -> Vec<NodeId> {
         let mut set = hrw::replica_set(group_key(group).as_bytes(), nodes, self.replicas);
         set.retain(|n| n != &owner);
         set.insert(0, owner);
@@ -220,21 +251,53 @@ impl Placement {
         set
     }
 
-    /// The owner node of a placement `group`. There is always an owner (this node
-    /// is always eligible). Restricted to lease voters when known (ADR 0049).
+    /// The **desired** HRW owner of a placement `group` (voter-restricted, ADR 0049) —
+    /// the topology the lease assigner drives ownership toward. This is the assigner's
+    /// input ONLY: the data path must resolve ownership through the committed lease
+    /// ([`group_owner`](Self::group_owner)), or a transient HRW/lease disagreement
+    /// splits routing from the commit gate into a permanent `NotOwner` (2026-07-20
+    /// post-mortem).
     #[must_use]
-    pub fn group_owner(&self, group: GroupId) -> NodeId {
+    pub fn hrw_owner(&self, group: GroupId) -> NodeId {
         self.owner_over(group, &self.nodes())
     }
 
-    /// The ordered replica set of a placement `group` (owner first), capped at `R`
-    /// and at the current member count.
+    /// The **actual** owner of a placement `group`: the holder of its committed lease,
+    /// falling back to the desired HRW owner when no lease is assigned yet (bootstrap /
+    /// non-durable). The data path routes and gates durable ownership here, so it always
+    /// agrees with the lease the commit is fenced against. There is always an owner (this
+    /// node is always eligible; the HRW fallback never has an empty ring).
+    ///
+    /// **Liveness rule:** the committed lease is honored only while its holder is still
+    /// an eligible (non-`Dead`) member. A lease held by a corpse falls back to HRW at the
+    /// same tick SWIM declares the death — the data path never routes to a dead node,
+    /// and (crucially) the group's replica set settles together with membership,
+    /// preserving the catch-up sweep's arming invariant (ADR 0043 P1: the sweep arms on
+    /// membership change; without this filter the dead node's groups change replica set
+    /// *again* when their leases migrate ticks later — after the sweep already ran —
+    /// leaving them unstamped and their takeover recovery permanently `NoQuorum`). A
+    /// holder *falsely* declared dead degrades to the transient fail-closed ring/lease
+    /// split (`NotOwner`, retried) until the assigner reconciles; the permanent-split
+    /// hazard this overlay fixes needs a *live* skewed holder, which the filter
+    /// deliberately leaves lease-first.
     #[must_use]
-    pub fn group_replica_set(&self, group: GroupId) -> Vec<NodeId> {
-        self.owner_led_replica_set(group, &self.nodes())
+    pub fn group_owner(&self, group: GroupId) -> NodeId {
+        self.lease_owners
+            .get(&group)
+            .filter(|holder| self.eligible.contains(*holder))
+            .cloned()
+            .unwrap_or_else(|| self.hrw_owner(group))
     }
 
-    /// Whether this node owns placement `group`.
+    /// The ordered replica set of a placement `group` — the **committed** owner leads
+    /// (so the lease holder always holds the group's data), followed by the HRW replica
+    /// set, capped at `R` and at the current member count.
+    #[must_use]
+    pub fn group_replica_set(&self, group: GroupId) -> Vec<NodeId> {
+        self.owner_led_replica_set(group, &self.nodes(), self.group_owner(group))
+    }
+
+    /// Whether this node holds placement `group`'s committed lease (its actual owner).
     #[must_use]
     pub fn owns_group(&self, group: GroupId) -> bool {
         self.group_owner(group) == self.local
@@ -254,9 +317,12 @@ impl Placement {
             .filter(|n| *n != leaving)
             .cloned()
             .collect();
-        // Owner-led (ADR 0049): the post-leave owner is a voter (when known), so the
-        // decommission drain hands each group to a node that can actually serve it.
-        self.owner_led_replica_set(group, &nodes)
+        // Owner-led by the DESIRED (HRW) post-leave owner (ADR 0049): the drain computes
+        // where each group's data WILL go once `leaving` departs — the topology the
+        // assigner then makes the committed lease — so it leads with the HRW owner over
+        // the post-leave members, not a lease that still names the departing node.
+        let owner = self.owner_over(group, &nodes);
+        self.owner_led_replica_set(group, &nodes, owner)
     }
 
     /// The owner node for `client` — the owner of its placement group.
@@ -334,6 +400,121 @@ mod tests {
             );
         }
         p
+    }
+
+    // --- 2026-07-20 post-mortem: the data path follows the committed lease ---
+
+    /// The committed lease (pushed via `set_lease_owners`) is the ACTUAL owner the data
+    /// path resolves — it overrides the desired HRW ring in both directions (granting and
+    /// revoking local ownership), and the committed owner leads its replica set so the
+    /// lease holder always holds the group's data. The assigner's `hrw_owner` view is
+    /// untouched, so reconcile keeps driving the lease toward HRW instead of freezing on
+    /// the value it just read back.
+    #[test]
+    fn the_committed_lease_overrides_the_hrw_ring_on_the_data_path() {
+        use super::NUM_GROUPS;
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b", "c"]);
+        // A group the HRW ring assigns to a PEER, and one it assigns to us.
+        let g_peer = (0..NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("b"))
+            .unwrap();
+        let g_self = (0..NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("a"))
+            .unwrap();
+
+        // The committed lease says the OPPOSITE of HRW for each.
+        let mut leases = BTreeMap::new();
+        leases.insert(g_peer, node("a"));
+        leases.insert(g_self, node("c"));
+        p.set_lease_owners(leases);
+
+        // Data path follows the committed lease — grant and revoke.
+        assert_eq!(p.group_owner(g_peer), node("a"));
+        assert!(
+            p.owns_group(g_peer),
+            "the committed lease grants us the group"
+        );
+        assert_eq!(p.group_owner(g_self), node("c"));
+        assert!(
+            !p.owns_group(g_self),
+            "the committed lease moved our HRW group to c"
+        );
+        // The committed owner leads its replica set (holder holds the data).
+        assert_eq!(p.group_replica_set(g_peer)[0], node("a"));
+        assert_eq!(p.group_replica_set(g_self)[0], node("c"));
+
+        // The assigner's desired-state view is unchanged (still HRW).
+        assert_eq!(p.hrw_owner(g_peer), node("b"));
+        assert_eq!(p.hrw_owner(g_self), node("a"));
+
+        // A group with no committed lease still falls back to HRW.
+        let g_unassigned = (0..NUM_GROUPS)
+            .find(|g| *g != g_peer && *g != g_self)
+            .unwrap();
+        assert_eq!(p.group_owner(g_unassigned), p.hrw_owner(g_unassigned));
+        assert_eq!(p.committed_owner(g_unassigned), None);
+    }
+
+    /// The liveness rule: a committed lease held by a node SWIM has declared **Dead** is
+    /// not honored — the group falls back to HRW (over the survivors) at the same tick
+    /// the death lands in placement, so the data path never routes to a corpse and the
+    /// replica set settles together with membership (the catch-up sweep's arming
+    /// invariant, ADR 0043 P1 — without this, a dead owner's groups change replica set
+    /// again when their leases migrate ticks later, after the sweep already ran, leaving
+    /// takeover recovery permanently `NoQuorum`). A merely-Suspect holder stays
+    /// lease-first: the overlay's whole point is a *live* holder the gossip view has
+    /// momentarily skewed away from.
+    #[test]
+    fn a_dead_holders_lease_falls_back_to_hrw_a_suspect_holders_does_not() {
+        use super::NUM_GROUPS;
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b", "c"]);
+        // A group HRW-owned by us, lease-held by b.
+        let g = (0..NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("a"))
+            .unwrap();
+        let mut leases = BTreeMap::new();
+        leases.insert(g, node("b"));
+        p.set_lease_owners(leases);
+        assert_eq!(p.group_owner(g), node("b"), "live holder: lease-first");
+
+        // Suspect is NOT dead — the lease still rules.
+        p.observe(&node("b"), MemberState::Suspect, "b:7000", None);
+        assert_eq!(p.group_owner(g), node("b"), "suspect holder: lease-first");
+
+        // Dead: the lease is a corpse's — fall back to HRW over the survivors, and the
+        // replica set is led by the fallback owner (no dead node in it).
+        p.observe(&node("b"), MemberState::Dead, "", None);
+        assert_eq!(
+            p.group_owner(g),
+            p.hrw_owner(g),
+            "dead holder: HRW fallback"
+        );
+        assert_ne!(p.group_owner(g), node("b"));
+        assert!(
+            !p.group_replica_set(g).contains(&node("b")),
+            "a dead holder must not appear in the replica set"
+        );
+        // The raw committed record is still observable (diagnostics), just not honored.
+        assert_eq!(p.committed_owner(g), Some(node("b")));
+
+        // The holder rejoining (Alive) restores lease-first ownership.
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert_eq!(p.group_owner(g), node("b"), "rejoined holder: lease-first");
+    }
+
+    /// Until the durable driver reports a committed lease, the data path is exactly the
+    /// HRW ring — so every existing (non-durable / pre-lease) behaviour is preserved.
+    #[test]
+    fn an_empty_lease_map_leaves_the_hrw_ring_unchanged() {
+        use super::NUM_GROUPS;
+        let p = ring("a", &["b", "c"]);
+        for g in 0..NUM_GROUPS {
+            assert_eq!(p.group_owner(g), p.hrw_owner(g));
+            assert_eq!(p.owns_group(g), p.hrw_owner(g) == node("a"));
+            assert_eq!(p.committed_owner(g), None);
+        }
     }
 
     // --- ADR 0049: durable ownership restricted to lease voters ---
