@@ -59,7 +59,10 @@ impl LeaseAssigner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (0..NUM_GROUPS)
             .filter_map(|group| {
-                let desired = raft_id(&placement.group_owner(group));
+                // Drive the lease toward the DESIRED HRW owner — never the committed
+                // lease the data path now reads back via `group_owner`, or reconcile
+                // would see desired == current forever and freeze (2026-07-20 post-mortem).
+                let desired = raft_id(&placement.hrw_owner(group));
                 let current = store.current_lease(group).map(|rec| rec.holder);
                 (current != Some(desired)).then_some((group, desired))
             })
@@ -114,6 +117,43 @@ mod tests {
 
     fn nid(s: &str) -> NodeId {
         NodeId(s.to_string())
+    }
+
+    /// `pending` targets the DESIRED HRW owner, never the committed lease the data path
+    /// now reads back via `group_owner` — otherwise, once the data path follows the
+    /// committed lease, the assigner would see desired == current for every group and
+    /// freeze, never reconciling a membership change (2026-07-20 post-mortem).
+    #[test]
+    fn pending_targets_the_hrw_owner_not_the_committed_lease() {
+        use crate::swim::MemberState;
+        let local = nid("assign-node");
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        {
+            let mut p = placement.write().unwrap();
+            p.observe(&nid("peer"), MemberState::Alive, "peer:7000", None);
+            // Force EVERY group's committed owner to "peer" via the data-path overlay.
+            let mut leases = BTreeMap::new();
+            for g in 0..NUM_GROUPS {
+                leases.insert(g, nid("peer"));
+            }
+            p.set_lease_owners(leases);
+        }
+        // An empty store → every group is pending; the desired holder must be the HRW
+        // owner, not the overlaid "peer".
+        let store = LeaseStore::new();
+        let assigner = LeaseAssigner::new(placement.clone());
+        let pending = assigner.pending(&store);
+        assert_eq!(pending.len(), NUM_GROUPS as usize);
+        let p = placement.read().unwrap();
+        for (g, desired) in &pending {
+            assert_eq!(*desired, raft_id(&p.hrw_owner(*g)));
+        }
+        // Some groups HRW-hash to us, which the "everything is peer" overlay could never
+        // produce — proof `pending` ignored the committed lease.
+        assert!(
+            pending.iter().any(|(_, d)| *d == raft_id(&local)),
+            "the assigner must still target our HRW-owned groups, not the committed lease"
+        );
     }
 
     /// On a single-node cluster the leader assigns every group's lease to itself

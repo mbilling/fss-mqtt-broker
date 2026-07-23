@@ -428,6 +428,12 @@ async fn run_driver(
     // restriction is a no-op there; a bounded cluster gets the restriction once stable.
     let mut prev_voter_rids: BTreeSet<RaftNodeId> = BTreeSet::new();
     let mut voter_stable_ticks: u32 = 0;
+    // A raft-id → NodeId map, accumulated across ticks and NEVER forgotten, used to
+    // resolve committed lease holders back to node ids for the data-path owner map
+    // (2026-07-20 post-mortem). Keeping departed nodes mapped means a lease still held
+    // by a momentarily-ungossiped voter — the exact skew that split ownership — remains
+    // resolvable until the assigner moves it.
+    let mut id_map: BTreeMap<RaftNodeId, NodeId> = BTreeMap::new();
     loop {
         tokio::time::sleep(DRIVER_TICK).await;
 
@@ -472,6 +478,36 @@ async fn run_driver(
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_voters(voter_nodes);
+        }
+
+        // Push the COMMITTED durable owner map (group → holder) so the data path routes
+        // and gates durable ownership by the replicated lease — the single agreed truth —
+        // rather than recomputing it from the gossip-derived HRW ring, which a transient
+        // membership skew can split from the lease into a permanent NotOwner (2026-07-20
+        // post-mortem). Unlike `set_voters` this is NOT gated on stability: the committed
+        // lease is authoritative whenever it exists; a group with no lease yet simply
+        // falls back to the HRW owner in Placement. The lease map is identical on every
+        // node (replicated), so ownership stays deterministic across the cluster.
+        {
+            let members = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .members();
+            for n in &members {
+                id_map.entry(raft_id(n)).or_insert_with(|| n.clone());
+            }
+            let mut owners: BTreeMap<GroupId, NodeId> = BTreeMap::new();
+            for group in 0..NUM_GROUPS {
+                if let Some(holder) = lease_store.current_lease(group).map(|rec| rec.holder) {
+                    if let Some(nid) = id_map.get(&holder) {
+                        owners.insert(group, nid.clone());
+                    }
+                }
+            }
+            placement
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_lease_owners(owners);
         }
 
         let (members, live_domains): (Vec<RaftNodeId>, BTreeMap<RaftNodeId, FailureDomain>) = {

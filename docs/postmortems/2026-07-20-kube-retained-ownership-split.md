@@ -136,10 +136,21 @@ skew* window, which neither harness perturbs.
 
 ## Follow-ups (proposed)
 
-1. **Durable ownership must follow consensus, not gossip (bug, primary design fix).** The durable data
-   path (routing, `owns_group`) must derive from the committed lease / raft voter set, not the gossip
-   HRW ring; and the driver must not filter the committed voter set through gossip `members()`. Add the
-   in-process regression test described above as the guard. *(Owns the secondary defect.)*
+1. **Durable ownership must follow consensus, not gossip (bug, primary design fix) — DONE.** The durable
+   data path (routing + `owns_group` + the replica-set lead, used by the hub and `cluster_store`) now
+   resolves ownership from the **committed lease map** — `Placement::lease_owners`, pushed each reconcile
+   tick by the durable driver from the replicated lease store (`durable_node::run_driver`). The HRW ring
+   became the *desired-state* input the lease assigner alone reads (`Placement::hrw_owner`, used by
+   `LeaseAssigner::pending`), so it still drives the lease toward HRW instead of freezing on what the
+   data path reads back. Safe by construction: an empty lease map falls back to HRW, so every existing
+   test and steady state is unchanged; the new behaviour only bites in the transient HRW/lease
+   disagreement window — where lease-first is correct — and the committed owner leads its replica set so
+   the lease holder is always in its own write quorum. The driver keeps a persistent `raft_id → NodeId`
+   map so a lease held by a momentarily-ungossiped voter stays resolvable (the exact skew that split
+   ownership). Guards: `placement::the_committed_lease_overrides_the_hrw_ring_on_the_data_path`,
+   `placement::an_empty_lease_map_leaves_the_hrw_ring_unchanged`,
+   `lease_assign::pending_targets_the_hrw_owner_not_the_committed_lease`. Whole durable suite (228 lib +
+   durable_sim + stress + decommission + swim) stays green.
 2. **Gossip convergence robustness (bug, primary trigger) — DONE.** Root cause found: `swim_driver`
    ignored the datagram source and trusted the peer's self-claimed `from_addr`, so a `0.0.0.0`-bind
    advertise black-holed all return gossip. Fixed by learning the source address; regression test added
