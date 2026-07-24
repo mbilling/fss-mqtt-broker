@@ -8,33 +8,42 @@ load tool**, so no home-field driver flatters us
 
 ```sh
 cd bench
-./run.sh smoke      # seconds-long harness check, all three brokers
-./run.sh            # full pass (60 s per scenario)
-./run.sh full emqx  # one broker
+./run.sh smoke                  # seconds-long harness check, all three brokers
+./run.sh                        # full pass (60 s per scenario, 5k connections)
+./run.sh full emqx              # one broker
+./summarize.py results/<stamp>  # markdown table from the raw logs
 ```
 
-Raw output lands in `results/<stamp>/<broker>/<scenario>.log` plus `env.txt` (versions,
-parameters, host). Raw logs are the record — any summary table links back to them.
+Raw output lands in `results/<stamp>/<broker>/` plus `env.txt` (versions, parameters,
+host). Raw logs are the record — `summarize.py` only extracts and links back to them.
 
-## Scenarios
+## Scenarios (ADR 0048 T2 — the selection metrics)
 
 | Scenario | What it measures |
 |---|---|
-| `conn` | connection-establishment rate (`-c` conns at `-R`/s) |
-| `pubsub-qos0/1/2` | sustained pub/sub throughput, N publishers → N subscribers, 256-byte payloads |
-| `mem` | broker RSS after load (dev-grade proxy; per-connection memory is T2) |
+| `conn` | connection-establishment rate, and **memory per idle connection** (broker RSS snapshotted before/after the ramp) |
+| `pubsub-qos0/1/2` | sustained pub/sub throughput, N publishers → N subscribers, 256-byte payloads, and the **end-to-end latency distribution** |
+| `tls-conn` | connection establishment under **mTLS** (client certificates required) |
+| `tls-pubsub-qos1` | throughput + latency under mTLS — the security cost, shown |
 
-## Posture (T1) — held constant and disclosed
+**Latency method:** publishers stamp payloads (`--payload-hdrs ts`); each subscriber
+exposes emqtt-bench's `e2e_latency` Prometheus **histogram**, scraped to
+`<scenario>.prom`. `summarize.py` reports p50/p99/p999 as **bucket upper bounds**
+(1/5/10/25/50/100/500/1000 ms resolution) — coarse, but it cannot flatter: the true
+percentile is at most the reported bound.
 
-All brokers: **plaintext, anonymous, in-memory sessions** — the competitors'
-out-of-the-box behaviour. For mqttd that means `MQTTD_DURABLE_SESSIONS=0`
-(**explicitly opting out of our durable-by-default**, ADR 0029) and
-`MQTTD_ALLOW_ANONYMOUS=1`; both are disclosed here because ADR 0048 §4 forbids buying
-"fast" by quietly turning security off. The **TLS/mTLS posture** (security cost shown,
-like-for-like) is T2.
+## Postures — held constant and disclosed
 
-Configs are each broker's documented reasonable minimum, committed in this directory
-(`configs/`) — not ours tuned and theirs default.
+- **Plaintext (1883):** anonymous, in-memory sessions — the competitors' out-of-the-box
+  behaviour. For mqttd that means `MQTTD_DURABLE_SESSIONS=0` (**explicitly opting out of
+  our durable-by-default**, ADR 0029) and `MQTTD_ALLOW_ANONYMOUS=1`; both are disclosed
+  because ADR 0048 §4 forbids buying "fast" by quietly turning security off.
+- **mTLS (8883):** TLS with **required client certificates** on every broker, from the
+  throwaway PKI in `tls/` (`tls/gen-certs.sh`; client cert carries `clientAuth` EKU —
+  rustls enforces it).
+
+Configs are each broker's documented reasonable minimum, committed here (`configs/`,
+`docker-compose.yml`) — not ours tuned and theirs default.
 
 ## Honesty rules that bind this harness
 
@@ -49,3 +58,10 @@ Configs are each broker's documented reasonable minimum, committed in this direc
 - **Losing dimensions get printed** (ADR 0048 §4): Mosquitto wins footprint; mTLS costs
   connection setup; mqttd's durable-session capacity is bounded by the lease voter cap
   (ADR 0021/0049). The results table says all of this next to whatever we win.
+
+## Harness lessons encoded
+
+- `emqtt_bench conn` **holds its connections and never exits** — it is run detached in a
+  timed window and must not be used as a readiness probe (a plain TCP probe is).
+- One broker at a time (compose profiles) — brokers must not contend for the host while
+  being measured.
