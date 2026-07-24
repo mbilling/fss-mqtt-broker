@@ -1,7 +1,7 @@
 ---
 adr: "0050"
 title: "OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP)"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0050-T1
     title: Discovery + JWKS fetch — issuer URL -> .well-known/openid-configuration -> jwks_uri -> key set, over the in-tree rustls HTTP client; https-only (loud MQTTD_OIDC_ALLOW_HTTP override); no new OIDC/HTTP dependency

@@ -1,7 +1,7 @@
 # ADR 0050 — OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP)
 
-- **Status:** Proposed
-- **Date:** 2026-07-24
+- **Status:** Accepted
+- **Date:** 2026-07-24 (accepted 2026-07-24)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0050-oidc-token-authentication.md](../delivery/0050-oidc-token-authentication.md) — plan, progress, and changelog
 - **Related:** [ADR 0004](0004-identity-and-authentication.md) (whose deferred T9 this
