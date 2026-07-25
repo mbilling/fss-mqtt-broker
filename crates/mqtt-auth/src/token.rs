@@ -131,6 +131,10 @@ impl Authenticator for TokenAuthenticator {
             groups,
         })
     }
+
+    fn handles_token(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

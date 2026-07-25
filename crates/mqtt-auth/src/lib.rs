@@ -81,6 +81,15 @@ pub trait Authenticator: Send + Sync {
         creds: &Credentials<'_>,
     ) -> Result<Identity, AuthError>;
 
+    /// Whether this authenticator verifies bearer tokens ([`Credentials::Token`]). The
+    /// CONNECT path consults this to decide whether a JWT-shaped password should be
+    /// carried as a token rather than a password — a static/OIDC token verifier is
+    /// otherwise unreachable from a real client (there is no other `Token` construction
+    /// site). Default `false`.
+    fn handles_token(&self) -> bool {
+        false
+    }
+
     /// Whether `subject`, previously admitted with **password** credentials, still
     /// exists in this authenticator's credential store (ADR 0040 T2). The identity
     /// sweep evicts a live password session whose user was removed by a reload.

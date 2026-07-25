@@ -1055,7 +1055,10 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        assert_eq!(c.security.oidc.issuer.as_deref(), Some("https://idp.test/realms/iot"));
+        assert_eq!(
+            c.security.oidc.issuer.as_deref(),
+            Some("https://idp.test/realms/iot")
+        );
         assert_eq!(c.security.oidc.audience.as_deref(), Some("mqttd"));
         assert_eq!(c.security.oidc.jwks_refresh_secs, Some(120));
         assert_eq!(c.security.oidc.max_stale_secs, Some(3600));

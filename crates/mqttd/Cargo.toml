@@ -40,6 +40,7 @@ tokio-rustls.workspace = true
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+jsonwebtoken.workspace = true
 # fault-injecting SessionStore double for the durable-attach readiness tests (ADR 0017)
 async-trait = "0.1"
 # Argon2id PHC hashing to forge rotated password files in the auth hot-reload test

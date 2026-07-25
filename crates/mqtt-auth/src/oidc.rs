@@ -290,6 +290,10 @@ impl Authenticator for OidcAuthenticator {
         }
         Err(AuthError::Rejected)
     }
+
+    fn handles_token(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
