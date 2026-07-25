@@ -69,6 +69,11 @@
 //! - `MQTTD_PASSWORD_FILE`  — Argon2id `username:phc-hash` file (ADR 0004 step 6)
 //! - `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` — JWT verification key, read from a
 //!   file (ADR 0046 T5 secret-by-reference); optional `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE`
+//! - `MQTTD_OIDC_ISSUER` — OIDC-mode token auth (ADR 0050): discovery + JWKS rotation from the
+//!   issuer; requires `MQTTD_OIDC_AUDIENCE`; optional `MQTTD_OIDC_JWKS_REFRESH` (secs, 300),
+//!   `MQTTD_OIDC_MAX_STALE` (secs, 86400 — fail-closed beyond), `MQTTD_OIDC_GROUPS_CLAIM`
+//!   (`groups`), `MQTTD_OIDC_ALLOW_HTTP` (INSECURE, tests only). Mutually exclusive with the
+//!   static `MQTTD_JWT_*` verifier; OIDC settings are read at startup (not hot-reloaded)
 //! - `MQTTD_CONFIG_WATCH`   — opt-in filesystem auto-reload (ADR 0033): poll interval in
 //!   seconds; when a configured policy file (ACL, password, JWT PEM, TLS cert/key/CA/CRL)
 //!   changes on disk, reload through the same fail-safe routine as `SIGHUP` (no restart).
@@ -176,6 +181,10 @@ const SWIM_TICK: Duration = Duration::from_millis(100);
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Process-default crypto provider (ring): reqwest's rustls-no-provider build (the OIDC
+    // JWKS fetcher, ADR 0050) resolves its TLS provider from here. Everything else in the
+    // tree configures ring explicitly; this keeps the one implicit consumer on ring too.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -693,23 +702,34 @@ fn client_policy(
     // The closure reads the *current* config snapshot from `live` each call (ADR 0046 T4): a
     // config-file reload swaps `live` first, so a changed ACL/password/JWT path — not just the
     // file contents at a fixed path — is picked up here.
+    // OIDC-mode token auth (ADR 0050) is built ONCE, outside the reload closure: its JWKS
+    // cache (last-known-good keys) and single fetch loop must survive policy hot-reloads —
+    // a reload rebuilds the chain around the same Arc. OIDC settings are start-time.
+    let oidc_auth = {
+        let snap = live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        oidc_from_config(&snap, shutdown.clone())?
+    };
     let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = {
         let snap = live
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             authorizer_from_config(&snap)?,
-            authenticator_from_config(&snap)?,
+            authenticator_from_config(&snap, oidc_auth.clone())?,
         )
     };
     let build = {
         let live = live.clone();
+        let oidc_auth = oidc_auth.clone();
         move || -> reload::BuildResult {
             let snap = live
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let authz = authorizer_from_config(&snap).map_err(|e| e.to_string())?;
-            let auth = authenticator_from_config(&snap).map_err(|e| e.to_string())?;
+            let auth =
+                authenticator_from_config(&snap, oidc_auth.clone()).map_err(|e| e.to_string())?;
             Ok((authz, auth))
         }
     };
@@ -839,6 +859,7 @@ fn spawn_config_watcher(
 /// Credentials are tried cert → password → token via a chain.
 fn authenticator_from_config(
     config: &Config,
+    oidc: Option<Arc<mqtt_auth::oidc::OidcAuthenticator>>,
 ) -> Result<Arc<dyn Authenticator>, Box<dyn std::error::Error>> {
     let allow_anonymous = config.security.allow_anonymous;
     if allow_anonymous {
@@ -876,7 +897,66 @@ fn authenticator_from_config(
         members.push(Arc::new(tok));
     }
 
+    if let Some(oidc) = oidc {
+        // The chain stops at the first real verdict on a credential kind, so a static JWT
+        // verifier ahead of OIDC would shadow it: the two are mutually exclusive (ADR 0050
+        // §1 — no silent fallback between key sources).
+        if config.security.jwt.hs256_secret_file.is_some()
+            || config.security.jwt.rs256_pem_file.is_some()
+        {
+            return Err(
+                "MQTTD_OIDC_ISSUER and MQTTD_JWT_* are mutually exclusive: configure one                  token verifier"
+                    .into(),
+            );
+        }
+        members.push(oidc);
+    }
     Ok(Arc::new(mqtt_auth::chain::ChainAuthenticator::new(members)))
+}
+
+/// Build the OIDC-mode authenticator (ADR 0050) and spawn its JWKS fetch loop, once per
+/// process. `None` when OIDC is not configured. Startup errors on a non-https issuer
+/// (without the loud test override) or a missing audience — fail closed at config time.
+fn oidc_from_config(
+    config: &Config,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<Option<Arc<mqtt_auth::oidc::OidcAuthenticator>>, Box<dyn std::error::Error>> {
+    let Some(issuer) = config.security.oidc.issuer.clone() else {
+        return Ok(None);
+    };
+    let allow_http = config.security.oidc.allow_http;
+    if !issuer.starts_with("https://") {
+        if !allow_http {
+            return Err(format!(
+                "MQTTD_OIDC_ISSUER must be https ({issuer}); MQTTD_OIDC_ALLOW_HTTP overrides                  for tests only"
+            )
+            .into());
+        }
+        warn!(%issuer, "INSECURE: OIDC issuer over plaintext http (MQTTD_OIDC_ALLOW_HTTP) — testing use only");
+    }
+    let Some(audience) = config.security.oidc.audience.clone() else {
+        return Err("MQTTD_OIDC_AUDIENCE is required with MQTTD_OIDC_ISSUER (ADR 0050:                     audience validation is not optional in OIDC mode)"
+            .into());
+    };
+    let mut cfg = mqtt_auth::oidc::OidcConfig::new(issuer.clone(), audience);
+    if let Some(s) = config.security.oidc.max_stale_secs {
+        cfg.max_stale = Duration::from_secs(s);
+    }
+    if let Some(c) = config.security.oidc.groups_claim.clone() {
+        cfg.groups_claim = c;
+    }
+    let refresh = Duration::from_secs(config.security.oidc.jwks_refresh_secs.unwrap_or(300).max(5));
+    let (auth, hints) = mqtt_auth::oidc::OidcAuthenticator::new(cfg);
+    info!(%issuer, refresh_s = refresh.as_secs(), "OIDC token authentication enabled (ADR 0050); fail-closed until the first JWKS load");
+    tokio::spawn(mqttd::oidc::run_fetch_loop(
+        auth.clone(),
+        issuer,
+        allow_http,
+        refresh,
+        hints,
+        shutdown,
+    ));
+    Ok(Some(auth))
 }
 
 /// Assemble JWT validation options from the optional issuer/audience config.

@@ -9,6 +9,7 @@ pub mod basic;
 pub mod chain;
 pub mod enhanced;
 pub mod mtls;
+pub mod oidc;
 pub mod password;
 pub mod signed_gossip;
 pub mod token;

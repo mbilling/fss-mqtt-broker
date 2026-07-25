@@ -117,6 +117,8 @@ pub struct Security {
     pub acl_file: Option<String>,
     /// JWT verification (ADR 0013).
     pub jwt: Jwt,
+    /// OIDC-mode token verification (ADR 0050).
+    pub oidc: Oidc,
     /// Seconds a client may take to authenticate before the connection is dropped
     /// (`MQTTD_AUTH_TIMEOUT`).
     pub auth_timeout_secs: Option<u64>,
@@ -132,6 +134,7 @@ impl Default for Security {
             password_file: None,
             acl_file: None,
             jwt: Jwt::default(),
+            oidc: Oidc::default(),
             auth_timeout_secs: None,
             auth_penalty: AuthPenalty::default(),
         }
@@ -151,6 +154,27 @@ pub struct Jwt {
     pub issuer: Option<String>,
     /// Required `aud` claim (`MQTTD_JWT_AUDIENCE`).
     pub audience: Option<String>,
+}
+
+/// OIDC-mode token verification (`MQTTD_OIDC_*`, ADR 0050): issuer-URL discovery,
+/// JWKS rotation followed live. Distinct from the static-key `Jwt` section — the two
+/// are separate authenticators and are not mixed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Oidc {
+    /// Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless
+    /// `allow_http` (testing) is set. Also the required `iss` claim value.
+    pub issuer: Option<String>,
+    /// Required `aud` claim (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC mode.
+    pub audience: Option<String>,
+    /// JWKS background-refresh interval in seconds (`MQTTD_OIDC_JWKS_REFRESH`, default 300).
+    pub jwks_refresh_secs: Option<u64>,
+    /// Staleness window in seconds before fail-closed (`MQTTD_OIDC_MAX_STALE`, default 86400).
+    pub max_stale_secs: Option<u64>,
+    /// Permit an http:// issuer (`MQTTD_OIDC_ALLOW_HTTP` — INSECURE, loudly logged; tests).
+    pub allow_http: bool,
+    /// Claim to read group memberships from (`MQTTD_OIDC_GROUPS_CLAIM`, default `groups`).
+    pub groups_claim: Option<String>,
 }
 
 /// Auth-failure penalty box (`MQTTD_AUTH_PENALTY_*`, ADR 0041 T2).
@@ -488,6 +512,26 @@ impl Config {
         on!("MQTTD_JWT_AUDIENCE", v, {
             self.security.jwt.audience = Some(v);
         });
+        on!("MQTTD_OIDC_ISSUER", v, {
+            self.security.oidc.issuer = Some(v);
+        });
+        on!("MQTTD_OIDC_AUDIENCE", v, {
+            self.security.oidc.audience = Some(v);
+        });
+        on!("MQTTD_OIDC_JWKS_REFRESH", v, {
+            self.security.oidc.jwks_refresh_secs = Some(num("MQTTD_OIDC_JWKS_REFRESH", &v)?);
+        });
+        on!("MQTTD_OIDC_MAX_STALE", v, {
+            self.security.oidc.max_stale_secs = Some(num("MQTTD_OIDC_MAX_STALE", &v)?);
+        });
+        on!("MQTTD_OIDC_ALLOW_HTTP", _v, {
+            // Presence = on, matching MQTTD_ALLOW_ANONYMOUS's convention for
+            // loudly-insecure toggles.
+            self.security.oidc.allow_http = true;
+        });
+        on!("MQTTD_OIDC_GROUPS_CLAIM", v, {
+            self.security.oidc.groups_claim = Some(v);
+        });
         on!("MQTTD_AUTH_TIMEOUT", v, {
             self.security.auth_timeout_secs = Some(num("MQTTD_AUTH_TIMEOUT", &v)?);
         });
@@ -722,6 +766,12 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_JWT_RS256_PEM",
     "MQTTD_JWT_ISSUER",
     "MQTTD_JWT_AUDIENCE",
+    "MQTTD_OIDC_ISSUER",
+    "MQTTD_OIDC_AUDIENCE",
+    "MQTTD_OIDC_JWKS_REFRESH",
+    "MQTTD_OIDC_MAX_STALE",
+    "MQTTD_OIDC_ALLOW_HTTP",
+    "MQTTD_OIDC_GROUPS_CLAIM",
     "MQTTD_AUTH_TIMEOUT",
     "MQTTD_AUTH_PENALTY_THRESHOLD",
     "MQTTD_AUTH_PENALTY_DECAY_SECS",
@@ -959,7 +1009,7 @@ mod tests {
             // Durable is on by default — the only value that *changes* it is a falsey one.
             "MQTTD_DURABLE_SESSIONS" => "off",
             // Presence flips anonymous on (default off).
-            "MQTTD_ALLOW_ANONYMOUS" => "1",
+            "MQTTD_ALLOW_ANONYMOUS" | "MQTTD_OIDC_ALLOW_HTTP" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
@@ -984,10 +1034,33 @@ mod tests {
             | "MQTTD_OTLP_INTERVAL"
             | "MQTTD_SHUTDOWN_GRACE"
             | "MQTTD_READY_MIN_MEMBERS"
-            | "MQTTD_CONFIG_WATCH" => "7",
+            | "MQTTD_CONFIG_WATCH"
+            | "MQTTD_OIDC_JWKS_REFRESH"
+            | "MQTTD_OIDC_MAX_STALE" => "7",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
+    }
+
+    #[test]
+    fn oidc_env_maps_and_is_https_gated_at_use_not_parse() {
+        let mut c = Config::default();
+        c.overlay_from(|k| match k {
+            "MQTTD_OIDC_ISSUER" => Some("https://idp.test/realms/iot".to_string()),
+            "MQTTD_OIDC_AUDIENCE" => Some("mqttd".to_string()),
+            "MQTTD_OIDC_JWKS_REFRESH" => Some("120".to_string()),
+            "MQTTD_OIDC_MAX_STALE" => Some("3600".to_string()),
+            "MQTTD_OIDC_GROUPS_CLAIM" => Some("roles".to_string()),
+            "MQTTD_OIDC_ALLOW_HTTP" => Some("1".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.security.oidc.issuer.as_deref(), Some("https://idp.test/realms/iot"));
+        assert_eq!(c.security.oidc.audience.as_deref(), Some("mqttd"));
+        assert_eq!(c.security.oidc.jwks_refresh_secs, Some(120));
+        assert_eq!(c.security.oidc.max_stale_secs, Some(3600));
+        assert_eq!(c.security.oidc.groups_claim.as_deref(), Some("roles"));
+        assert!(c.security.oidc.allow_http, "presence sets the flag");
     }
 
     #[test]
@@ -1017,7 +1090,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            58,
+            64,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
     }

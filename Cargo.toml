@@ -35,6 +35,9 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
 [workspace.dependencies]
+# OIDC JWKS fetching (ADR 0050): already in-tree transitively via opentelemetry-otlp —
+# a direct dep adds no new crates. rustls + webpki roots only (no system TLS).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # async runtime
 tokio = { version = "1", features = ["full"] }
 # error handling

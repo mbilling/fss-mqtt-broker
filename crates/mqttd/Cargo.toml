@@ -11,6 +11,9 @@ name = "mqttd"
 path = "src/main.rs"
 
 [dependencies]
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 mqtt-codec = { path = "../mqtt-codec", version = "0.9.0" }
 mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
 mqtt-net = { path = "../mqtt-net", version = "0.9.0" }
