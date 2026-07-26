@@ -101,16 +101,21 @@ jobs:
             target: crl_parse # CRL DER (operator file, hot-reloaded)
           - crate: crates/mqtt-auth
             target: acl_parse # ACL TOML (operator file, hot-reloaded)
+    # libFuzzer needs nightly rustc. PINNED (not floating @nightly): the 2026-07-24+
+    # nightlies ICE in codegen ("not immediate: OperandRef(Uninit ...)", a
+    # rustc_codegen_ssa bug) while compiling the tokio-runtime types the mqtt-cluster
+    # fuzz targets pull in — it broke the nightly tier for 4 nights running. The date
+    # lives HERE, once: both the install and the `cargo +<tc>` invocation read it, so
+    # they can never drift (a `cargo +nightly` that ignores the dated install is exactly
+    # the bug that made the first pin a no-op). Revisit toward floating once upstream
+    # fixes the ICE.
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-07-22
     steps:
       - uses: actions/checkout@v5
-      # libFuzzer needs nightly rustc. PINNED (not floating @nightly): the 2026-07-24+
-      # nightlies ICE in codegen ("not immediate: OperandRef(Uninit ...)", a
-      # rustc_codegen_ssa bug) while compiling the tokio-runtime types the mqtt-cluster
-      # fuzz targets pull in — it broke the nightly tier for 4 nights running. Pinned to
-      # the last known-good nightly; revisit (bump toward floating) once upstream fixes it.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-22
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -125,7 +130,10 @@ jobs:
           # exist in a fresh checkout — and libFuzzer hard-errors on a missing
           # explicit corpus dir ("The required directory ... does not exist").
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo +nightly fuzz run ${{ matrix.target }} \
+          # cargo +$FUZZ_TOOLCHAIN (not +nightly): rustup sets RUSTUP_TOOLCHAIN for the
+          # inner `cargo build` cargo-fuzz spawns, so the DATED toolchain compiles the
+          # target — bypassing the broken floating nightly.
+          cargo "+${FUZZ_TOOLCHAIN}" fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=720
 
