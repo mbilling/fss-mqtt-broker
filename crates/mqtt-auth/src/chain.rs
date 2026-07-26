@@ -61,6 +61,12 @@ impl Authenticator for ChainAuthenticator {
             .iter()
             .all(|m| m.password_subject_exists(subject))
     }
+
+    /// The chain verifies tokens if any member does — the signal the CONNECT path uses
+    /// to carry a JWT-shaped password as a bearer token (ADR 0050 §0).
+    fn handles_token(&self) -> bool {
+        self.members.iter().any(|m| m.handles_token())
+    }
 }
 
 #[cfg(test)]

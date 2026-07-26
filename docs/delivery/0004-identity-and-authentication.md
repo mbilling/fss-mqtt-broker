@@ -43,6 +43,7 @@ tasks:
     status: done
     date: 2026-06-12
     evidence: password::correct_password_authenticates_with_username_as_subject / unknown_username_is_rejected_indistinguishably_from_wrong_password; token::tampered_or_wrong_secret_signature_is_rejected; chain::first_abstains_second_accepts_yields_ok
+    notes: "CORRECTION (2026-07-25): the TokenAuthenticator was verified only at the authenticator boundary — no CONNECT path constructed Credentials::Token, so JWT auth was unreachable from a real client (the unit tests hand-built the credential). The wire→Token bridge (JWT-in-password) that makes it actually reachable landed with ADR 0050; password auth was and is reachable."
   - id: 0004-T9
     title: Full OIDC discovery / JWKS rotation; MQTT5 enhanced auth after v5 codec
     status: deferred

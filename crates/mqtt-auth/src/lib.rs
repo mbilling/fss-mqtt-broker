@@ -9,6 +9,7 @@ pub mod basic;
 pub mod chain;
 pub mod enhanced;
 pub mod mtls;
+pub mod oidc;
 pub mod password;
 pub mod signed_gossip;
 pub mod token;
@@ -79,6 +80,15 @@ pub trait Authenticator: Send + Sync {
         client: &ClientId,
         creds: &Credentials<'_>,
     ) -> Result<Identity, AuthError>;
+
+    /// Whether this authenticator verifies bearer tokens ([`Credentials::Token`]). The
+    /// CONNECT path consults this to decide whether a JWT-shaped password should be
+    /// carried as a token rather than a password — a static/OIDC token verifier is
+    /// otherwise unreachable from a real client (there is no other `Token` construction
+    /// site). Default `false`.
+    fn handles_token(&self) -> bool {
+        false
+    }
 
     /// Whether `subject`, previously admitted with **password** credentials, still
     /// exists in this authenticator's credential store (ADR 0040 T2). The identity

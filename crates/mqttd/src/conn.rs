@@ -897,12 +897,34 @@ where
     }
 }
 
+/// If `password` is a compact-JWS-shaped bearer token — three non-empty
+/// base64url segments separated by two dots, valid UTF-8 — return it as `&str`.
+/// This is the shape a JWT has on the wire (`header.payload.signature`); it is the
+/// trigger for carrying a password as [`Credentials::Token`] (ADR 0050). Deliberately
+/// structural, not a decode: the authenticator does the real verification, and a
+/// non-token password can never accidentally match (a bcrypt/plain password has no
+/// two-dot base64url structure).
+fn jwt_password_str(password: &[u8]) -> Option<&str> {
+    let s = std::str::from_utf8(password).ok()?;
+    let mut parts = s.split('.');
+    let (a, b, c, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next());
+    if rest.is_some() || a.is_empty() || b.is_empty() || c.is_empty() {
+        return None;
+    }
+    let base64url = |seg: &str| {
+        seg.bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_')
+    };
+    (base64url(a) && base64url(b) && base64url(c)).then_some(s)
+}
+
 /// Authenticate the CONNECT against the listener policy. Credentials priority:
-/// a TLS-verified certificate identity wins; otherwise CONNECT
-/// username/password; otherwise anonymous (only honored when the policy opts
-/// in). On failure this sends the rejecting CONNACK — 0x04 (bad user name or
-/// password) for password credentials, 0x05 (not authorized) otherwise — and
-/// returns `Ok(None)`: the caller must close without attaching to the hub.
+/// a TLS-verified certificate identity wins; otherwise a JWT-shaped password when a
+/// token verifier is configured (ADR 0050); otherwise CONNECT username/password;
+/// otherwise anonymous (only honored when the policy opts in). On failure this sends
+/// the rejecting CONNACK — 0x04 (bad user name or password) for password credentials,
+/// 0x05 (not authorized) otherwise — and returns `Ok(None)`: the caller must close
+/// without attaching to the hub.
 async fn authenticate_connect<W>(
     writer: &mut FrameWriter<W>,
     client: &ClientId,
@@ -914,15 +936,28 @@ async fn authenticate_connect<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let creds = match (identity, &connect.username) {
-        (Some(id), _) => Credentials::ClientCert {
+    // mTLS identity outranks any wire credential (ADR 0004). Otherwise, when a token
+    // verifier is configured, a JWT-shaped password is carried as a bearer token — the
+    // ecosystem convention (EMQX/HiveMQ: the JWT rides in the password field), and the
+    // only path by which a real client can reach the token/OIDC authenticators
+    // (ADR 0050): there is no other `Credentials::Token` construction site. The shape
+    // check gates on a token authenticator being present, so password-auth deployments
+    // are untouched; a misroute only ever fails auth (fail-closed), never escalates.
+    let token = connect
+        .password
+        .as_deref()
+        .filter(|_| policy.authenticator().handles_token())
+        .and_then(jwt_password_str);
+    let creds = match (identity, token, &connect.username) {
+        (Some(id), _, _) => Credentials::ClientCert {
             subject: &id.subject,
         },
-        (None, Some(username)) => Credentials::Password {
+        (None, Some(jwt), _) => Credentials::Token(jwt),
+        (None, None, Some(username)) => Credentials::Password {
             username,
             password: connect.password.as_deref().unwrap_or(&[]),
         },
-        (None, None) => Credentials::Anonymous,
+        (None, None, None) => Credentials::Anonymous,
     };
     let auth_method = match creds {
         Credentials::ClientCert { .. } => AuthMethod::Certificate,
@@ -1805,10 +1840,26 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::{
-        auth_handle, authz_handle, handle_stream, wire_limits, ConnPolicy, DEFAULT_CONNECT_TIMEOUT,
+        auth_handle, authz_handle, handle_stream, jwt_password_str, wire_limits, ConnPolicy,
+        DEFAULT_CONNECT_TIMEOUT,
     };
     use crate::hub::{AttachOutcome, HubCommand, Outbound};
     use bytes::Bytes;
+
+    #[test]
+    fn jwt_password_shape_detection() {
+        // Compact JWS: three non-empty base64url segments.
+        assert!(jwt_password_str(b"aGVhZGVy.cGF5bG9hZA.c2ln").is_some());
+        assert!(jwt_password_str(b"eyJ0-_9.eyJ0-_9.c2ln").is_some()); // - and _ are base64url
+                                                                      // Not tokens: wrong segment count, empty segments, non-base64url bytes, non-UTF8.
+        assert!(jwt_password_str(b"only.two").is_none());
+        assert!(jwt_password_str(b"a.b.c.d").is_none());
+        assert!(jwt_password_str(b"a..c").is_none());
+        assert!(jwt_password_str(b"plain-password").is_none());
+        assert!(jwt_password_str(b"has+slash/.b.c").is_none()); // + and / are base64, not base64url
+        assert!(jwt_password_str(b"a.b.c\xff").is_none()); // invalid UTF-8
+        assert!(jwt_password_str(b"").is_none());
+    }
     use mqtt_auth::basic::BasicAuthenticator;
     use mqtt_codec::{
         packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},

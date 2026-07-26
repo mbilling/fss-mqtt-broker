@@ -12,6 +12,7 @@ pub mod config_watch;
 pub mod conn;
 pub mod health;
 pub mod hub;
+pub mod oidc;
 pub mod peer;
 pub mod reload;
 pub mod store_watch;

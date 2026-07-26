@@ -143,3 +143,21 @@ jobs:
       # durable (retained) state loss. Self-diagnosing on failure (dumps pods + logs).
       - name: kind runtime smoke
         run: ./scripts/k8s/kind-smoke.sh
+
+  oidc:
+    name: OIDC integration (real Keycloak, forced rotation) (ADR 0050 T4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mosquitto clients
+        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
+      # ADR 0050 T4 — the acceptance bar: drive the real mqttd binary against a pinned
+      # Keycloak, prove an IdP-minted token authenticates (JWT-in-password bridge), a
+      # wrong-audience token is refused, keys ROTATED mid-run are followed WITHOUT a
+      # broker restart (unknown-kid refetch), and cached keys survive an IdP outage.
+      # docker is preinstalled on ubuntu-latest runners.
+      - name: OIDC lifecycle against Keycloak
+        run: ./scripts/oidc/run.sh

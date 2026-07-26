@@ -11,6 +11,9 @@ name = "mqttd"
 path = "src/main.rs"
 
 [dependencies]
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 mqtt-codec = { path = "../mqtt-codec", version = "0.9.0" }
 mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
 mqtt-net = { path = "../mqtt-net", version = "0.9.0" }
@@ -37,6 +40,7 @@ tokio-rustls.workspace = true
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+jsonwebtoken.workspace = true
 # fault-injecting SessionStore double for the durable-attach readiness tests (ADR 0017)
 async-trait = "0.1"
 # Argon2id PHC hashing to forge rotated password files in the auth hot-reload test

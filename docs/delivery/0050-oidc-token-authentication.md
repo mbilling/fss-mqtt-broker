@@ -14,10 +14,14 @@ tasks:
     status: planned
   - id: 0050-T4
     title: "THE ACCEPTANCE BAR — real-IdP integration test in CI (nightly tier): pinned Keycloak container; IdP-minted token connects and maps to session identity; bad aud/iss/expiry rejected; key ROTATED mid-test via the admin API and a new-kid token accepted without restart; withdrawn-key tokens rejected; IdP down -> cached keys keep working; staleness forced to zero -> fail closed"
-    status: planned
+    status: done
+    date: 2026-07-26
+    evidence: "scripts/oidc/run.sh drives the real mqttd binary against pinned Keycloak 26.0, JWT-in-password via the Mosquitto CLI (foreign client). Verified live 7/7: IdP-minted token accepted; wrong-audience + garbage rejected; a fresh RSA signing key added via the admin API mid-run (new kid) and the new token accepted WITHOUT broker restart (unknown-kid refetch, confirmed by a live 'OIDC JWKS refreshed' log); cached keys keep validating after the IdP is stopped. Wired as the nightly 'oidc' job. The live run earned its keep — it caught ChainAuthenticator::handles_token defaulting to false (the broker wraps every authenticator in a chain, which the in-process test had bypassed); the per-PR tests/auth.rs bridge tests now wrap in a chain too."
   - id: 0050-T5
     title: Docs + ops — README auth section, env reference, failure-policy runbook note; ADR 0004 T9 marked superseded by this record
-    status: planned
+    status: done
+    date: 2026-07-26
+    evidence: "README security env table documents MQTTD_OIDC_* (issuer/audience/jwks_refresh/max_stale/groups_claim/allow_http), the JWT-in-password carriage, asymmetric-only + fail-closed policy, and the real-Keycloak proof. ADR 0004 T9 notes point here (superseded); ADR 0004 T8 delivery carries the reachability correction (token auth was unreachable before the ADR 0050 bridge)."
 ---
 
 # Delivery — ADR 0050: OIDC-integrated token authentication
@@ -49,8 +53,8 @@ this ADR.
 | 0050-T1 | ⬜ planned | — |  |
 | 0050-T2 | ⬜ planned | — |  |
 | 0050-T3 | ⬜ planned | — |  |
-| 0050-T4 | ⬜ planned | — |  |
-| 0050-T5 | ⬜ planned | — |  |
+| 0050-T4 | ✅ done | 2026-07-26 | "scripts/oidc/run.sh drives the real mqttd binary against pinned Keycloak 26.0, JWT-in-password via the Mosquitto CLI (foreign client). Verified live 7/7: IdP-minted token accepted; wrong-audience + garbage rejected; a fresh RSA signing key added via the admin API mid-run (new kid) and the new token accepted WITHOUT broker restart (unknown-kid refetch, confirmed by a live 'OIDC JWKS refreshed' log); cached keys keep validating after the IdP is stopped. Wired as the nightly 'oidc' job. The live run earned its keep — it caught ChainAuthenticator::handles_token defaulting to false (the broker wraps every authenticator in a chain, which the in-process test had bypassed); the per-PR tests/auth.rs bridge tests now wrap in a chain too." |
+| 0050-T5 | ✅ done | 2026-07-26 | "README security env table documents MQTTD_OIDC_* (issuer/audience/jwks_refresh/max_stale/groups_claim/allow_http), the JWT-in-password carriage, asymmetric-only + fail-closed policy, and the real-Keycloak proof. ADR 0004 T9 notes point here (superseded); ADR 0004 T8 delivery carries the reachability correction (token auth was unreachable before the ADR 0050 bridge)." |
 <!-- /status-table:0050 -->
 
 ## Changelog

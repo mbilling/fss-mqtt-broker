@@ -263,3 +263,95 @@ async fn legacy_handle_path_still_accepts_anonymous_clients() {
     client.send(&Packet::PingReq).await;
     assert_eq!(client.recv().await, Some(Packet::PingResp));
 }
+
+// --- Token-as-password bridge (ADR 0050) -------------------------------------
+//
+// A JWT never became `Credentials::Token` from a real client until this bridge:
+// the token/OIDC authenticators were reachable only from unit tests. These prove
+// the wire → Token path end to end through the real broker CONNECT handler.
+
+/// The RSA test key shared with mqtt-auth's OIDC fixture, and its JWKS.
+const OIDC_PRIVATE_PEM: &[u8] = include_bytes!("../../mqtt-auth/src/testdata/rs256_private.pem");
+const OIDC_JWKS: &[u8] = include_bytes!("../../mqtt-auth/src/testdata/oidc_jwks.json");
+
+fn oidc_broker_auth() -> Arc<dyn Authenticator> {
+    let (oidc, _hints) = mqtt_auth::oidc::OidcAuthenticator::new(mqtt_auth::oidc::OidcConfig::new(
+        "https://idp.test/realms/bench".to_string(),
+        "mqttd".to_string(),
+    ));
+    oidc.install_jwks(OIDC_JWKS).expect("install test JWKS");
+    // Wrap in a ChainAuthenticator exactly as the broker does — the live Keycloak run
+    // proved an unwrapped authenticator hides a chain-level handles_token() bug.
+    Arc::new(mqtt_auth::chain::ChainAuthenticator::new(vec![
+        Arc::new(BasicAuthenticator {
+            allow_anonymous: false,
+        }),
+        oidc,
+    ]))
+}
+
+fn mint_oidc_token(sub: &str, aud: &str, exp_offset: u64) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = serde_json::json!({
+        "sub": sub, "iss": "https://idp.test/realms/bench", "aud": aud,
+        "exp": now + exp_offset, "groups": ["fleet"],
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("t1".to_string());
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(OIDC_PRIVATE_PEM).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_valid_jwt_in_the_password_field_authenticates_via_the_token_bridge() {
+    let addr = start_broker(None, oidc_broker_auth()).await;
+    // A real client puts the IdP-minted JWT in the password field (EMQX convention).
+    let token: &'static [u8] = Box::leak(
+        mint_oidc_token("device-9", "mqttd", 600)
+            .into_bytes()
+            .into_boxed_slice(),
+    );
+    let (mut client, ack) = Client::connect(addr, "tok-ok", Some("_token_"), Some(token)).await;
+    assert_eq!(ack.code, 0x00, "a valid IdP token must be accepted");
+    client.send(&Packet::PingReq).await;
+    assert_eq!(client.recv().await, Some(Packet::PingResp));
+}
+
+#[tokio::test]
+async fn a_wrong_audience_jwt_in_the_password_field_is_rejected() {
+    let addr = start_broker(None, oidc_broker_auth()).await;
+    let token: &'static [u8] = Box::leak(
+        mint_oidc_token("device-9", "someone-else", 600)
+            .into_bytes()
+            .into_boxed_slice(),
+    );
+    let (mut client, ack) = Client::connect(addr, "tok-bad", Some("_token_"), Some(token)).await;
+    assert_ne!(
+        ack.code, 0x00,
+        "a token minted for another audience must be refused"
+    );
+    assert_eq!(
+        client.recv().await,
+        None,
+        "the connection must close after rejection"
+    );
+}
+
+#[tokio::test]
+async fn a_non_jwt_password_is_not_hijacked_by_the_token_bridge() {
+    // With a token authenticator active, an ordinary (non-JWT-shaped) password must NOT
+    // be misrouted to the token verifier — it stays a password credential, which this
+    // OIDC-only chain does not handle, so it is cleanly refused (never silently accepted).
+    let addr = start_broker(None, oidc_broker_auth()).await;
+    let (mut client, ack) = Client::connect(addr, "pw", Some("alice"), Some(b"not-a-jwt")).await;
+    assert_ne!(ack.code, 0x00);
+    assert_eq!(client.recv().await, None);
+}

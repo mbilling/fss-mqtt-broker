@@ -36,6 +36,27 @@ Extend token authentication with an **OIDC mode**: configured with an **issuer U
 the broker discovers the JWKS endpoint, fetches and caches the key set, selects keys by
 `kid`, and follows rotation — no restart, no reconfiguration.
 
+### 0. How the token reaches the broker (the wire → `Credentials::Token` bridge)
+
+Building this surfaced a latent gap: **nothing constructed `Credentials::Token` from a real
+client.** The CONNECT path only ever built `ClientCert`/`Password`/`Anonymous`, so the static
+`TokenAuthenticator` (ADR 0004 T8, marked done) was reachable *only from its own unit tests* —
+JWT auth had never worked end to end, and the unit tests masked it by hand-building the
+credential. OIDC would have inherited the same dead end.
+
+The bridge, following the ecosystem convention (EMQX/HiveMQ): **the JWT rides in the CONNECT
+password field.** When a token verifier is configured (`Authenticator::handles_token()`), a
+password with the compact-JWS shape — three non-empty base64url segments, two dots, valid
+UTF-8 — is carried as `Credentials::Token` instead of `Credentials::Password`. The check is
+purely *structural*; the authenticator does the real verification. It is gated on a token
+authenticator being present, so password-auth deployments are untouched, and a misroute can
+only ever **fail closed** (a mis-shaped or wrong password fails auth, never escalates). mTLS
+identity still outranks it. The username is ignored for the token case (clients typically send
+a sentinel like `_token_`, since MQTT 3.1.1 requires a username flag whenever a password is
+present). This bridge is a prerequisite for OIDC and simultaneously repairs the shipped static
+JWT verifier; it is proven by an integration test through the real broker CONNECT handler, not
+just at the authenticator boundary.
+
 ### 1. Discovery and key sourcing
 
 `MQTTD_OIDC_ISSUER=https://idp.example/realms/iot` enables the mode. The broker fetches
