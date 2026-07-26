@@ -103,7 +103,14 @@ jobs:
             target: acl_parse # ACL TOML (operator file, hot-reloaded)
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly # libFuzzer needs nightly rustc
+      # libFuzzer needs nightly rustc. PINNED (not floating @nightly): the 2026-07-24+
+      # nightlies ICE in codegen ("not immediate: OperandRef(Uninit ...)", a
+      # rustc_codegen_ssa bug) while compiling the tokio-runtime types the mqtt-cluster
+      # fuzz targets pull in — it broke the nightly tier for 4 nights running. Pinned to
+      # the last known-good nightly; revisit (bump toward floating) once upstream fixes it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-22
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
