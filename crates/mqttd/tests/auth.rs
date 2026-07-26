@@ -280,7 +280,14 @@ fn oidc_broker_auth() -> Arc<dyn Authenticator> {
         "mqttd".to_string(),
     ));
     oidc.install_jwks(OIDC_JWKS).expect("install test JWKS");
-    oidc
+    // Wrap in a ChainAuthenticator exactly as the broker does — the live Keycloak run
+    // proved an unwrapped authenticator hides a chain-level handles_token() bug.
+    Arc::new(mqtt_auth::chain::ChainAuthenticator::new(vec![
+        Arc::new(BasicAuthenticator {
+            allow_anonymous: false,
+        }),
+        oidc,
+    ]))
 }
 
 fn mint_oidc_token(sub: &str, aud: &str, exp_offset: u64) -> String {

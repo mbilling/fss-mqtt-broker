@@ -57,7 +57,7 @@
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [5/5 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [2/4 done](0048-comparative-benchmarking.md) | 2 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
-| [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [0/5 done](0050-oidc-token-authentication.md) | 5 open |
+| [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [1/5 done](0050-oidc-token-authentication.md) | 4 open |
 
 ## Open and deferred work
 
@@ -124,5 +124,4 @@
 - `0050-T1` ⬜ planned: Discovery + JWKS fetch — issuer URL -> .well-known/openid-configuration -> jwks_uri -> key set, over the in-tree rustls HTTP client; https-only (loud MQTTD_OIDC_ALLOW_HTTP override); no new OIDC/HTTP dependency
 - `0050-T2` ⬜ planned: Rotation machinery — kid-selected keys, TTL background refresh (MQTTD_OIDC_JWKS_REFRESH), debounced unknown-kid immediate refetch, last-known-good cache with bounded staleness (MQTTD_OIDC_MAX_STALE) then fail-closed; deterministic per-PR unit tests for cache/refresh/debounce/staleness
 - `0050-T3` ⬜ planned: Validation hardening + wiring — OIDC mode on TokenAuthenticator with required iss/aud, asymmetric-only algorithm allow-list (RS256/ES256, no HS* against a public JWKS, no none), bounded clock skew; composes with CONNECT-password and MQTT5 AUTH (ADR 0013) token transport
-- `0050-T4` ⬜ planned: "THE ACCEPTANCE BAR — real-IdP integration test in CI (nightly tier): pinned Keycloak container; IdP-minted token connects and maps to session identity; bad aud/iss/expiry rejected; key ROTATED mid-test via the admin API and a new-kid token accepted without restart; withdrawn-key tokens rejected; IdP down -> cached keys keep working; staleness forced to zero -> fail closed"
 - `0050-T5` ⬜ planned: Docs + ops — README auth section, env reference, failure-policy runbook note; ADR 0004 T9 marked superseded by this record
