@@ -46,7 +46,7 @@ tasks:
   - id: 0004-T9
     title: Full OIDC discovery / JWKS rotation; MQTT5 enhanced auth after v5 codec
     status: deferred
-    notes: step 6 takes a single static key; enhanced auth waits on the v5 codec milestone
+    notes: superseded by ADR 0050 (OIDC discovery + JWKS rotation, with a real-IdP integration test as the acceptance bar); the enhanced-auth half was delivered under ADR 0013
   - id: 0004-T10
     title: Delivery-time ACL re-check in the hub (enforcement is subscription-time only)
     status: deferred
@@ -93,7 +93,7 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | 0004-T6 | ✅ done | 2026-06-12 | AuditLog::audit_log_hash_chains_recorded_events; audit::successful_connect_is_audited / rejected_connect_is_audited / denied_publish_and_subscribe_are_audited |
 | 0004-T7 | ✅ done | 2026-06-12 | peer_identity::cert_cn_mismatch_with_hello_node_id_is_rejected / honest_nodes_with_matching_cert_cn_link_and_route |
 | 0004-T8 | ✅ done | 2026-06-12 | password::correct_password_authenticates_with_username_as_subject / unknown_username_is_rejected_indistinguishably_from_wrong_password; token::tampered_or_wrong_secret_signature_is_rejected; chain::first_abstains_second_accepts_yields_ok |
-| 0004-T9 | 💤 deferred | — | step 6 takes a single static key; enhanced auth waits on the v5 codec milestone |
+| 0004-T9 | 💤 deferred | — | superseded by ADR 0050 (OIDC discovery + JWKS rotation, with a real-IdP integration test as the acceptance bar); the enhanced-auth half was delivered under ADR 0013 |
 | 0004-T10 | 💤 deferred | — | documented known limitation; needed only if policies change under live subscriptions; tracked with hot ACL reload |
 | 0004-T11 | 💤 deferred | — | %c deferred until the Authorizer trait carries the client id; the rest are future config options |
 <!-- /status-table:0004 -->
