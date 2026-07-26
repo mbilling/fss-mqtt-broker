@@ -383,8 +383,12 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 |---|---|
 | `MQTTD_ALLOW_ANONYMOUS` | **Insecure**: permit clients with no credentials |
 | `MQTTD_PASSWORD_FILE` | Argon2id `username:phc-hash` password file |
-| `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` | JWT verification key, **by file** (ADR 0046 T5): the HS256 shared secret and the RS256 public key are both read from a path, so the key is mounted from a Secret, never inlined. A trailing newline in the HS256 file is trimmed |
-| `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` | Optional JWT `iss`/`aud` constraints |
+| `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` | Static JWT verification key, **by file** (ADR 0046 T5): the HS256 shared secret and the RS256 public key are both read from a path, so the key is mounted from a Secret, never inlined. A trailing newline in the HS256 file is trimmed |
+| `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` | Optional JWT `iss`/`aud` constraints (static-key mode) |
+| `MQTTD_OIDC_ISSUER` | **OIDC-mode token auth** (ADR 0050): the broker discovers the issuer's JWKS and follows key rotation live (no restart). Requires `MQTTD_OIDC_AUDIENCE`. Mutually exclusive with `MQTTD_JWT_*`. Asymmetric-only (RS256/ES256; a public JWKS never feeds an HMAC verify). Tokens ride in the CONNECT **password** field (EMQX convention). Proven against a real Keycloak, forced key rotation included (nightly `oidc` job) |
+| `MQTTD_OIDC_AUDIENCE` | Required `aud` in OIDC mode (not optional — a token minted for another audience must be refused) |
+| `MQTTD_OIDC_JWKS_REFRESH` / `MQTTD_OIDC_MAX_STALE` | JWKS background-refresh interval (s, default 300) and the last-known-good staleness window (s, default 86400) after which token auth **fails closed** on a persistent IdP outage |
+| `MQTTD_OIDC_GROUPS_CLAIM` / `MQTTD_OIDC_ALLOW_HTTP` | Claim to read groups from (default `groups`); and a loud INSECURE override permitting an `http://` issuer (tests only) |
 | `MQTTD_ACL_FILE` | TOML topic-ACL policy (deny by default) |
 | `MQTTD_CONFIG` | Path to the TOML config file (ADR 0046); `--config <path>` overrides it. Unset = defaults + this env overlay |
 | `MQTTD_CONFIG_WATCH` | Opt-in filesystem auto-reload (ADR 0033): poll interval in **seconds**. When the config file **or** a referenced policy file changes on disk, reload the whole config via the same validate-before-swap routine as `SIGHUP` (no restart) — the Kubernetes ConfigMap case. Unset/`0` = disabled (signal-only default) |
