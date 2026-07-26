@@ -103,7 +103,13 @@ jobs:
             target: acl_parse # ACL TOML (operator file, hot-reloaded)
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly # libFuzzer needs nightly rustc
+      # libFuzzer needs nightly rustc — but PINNED: the floating `nightly` channel
+      # took down the tokio-dependent fuzz targets with an upstream rustc ICE
+      # (1.99.0-nightly 008fa22ce 2026-07-25, "could not compile `tokio`" under the
+      # sanitizer flags; nightly run #16). Bump the date deliberately, on green.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-24
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
