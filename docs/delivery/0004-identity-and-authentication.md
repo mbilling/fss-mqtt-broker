@@ -54,7 +54,9 @@ tasks:
     notes: "SUPERSEDED by ADR 0040. The goal — a tightened ACL reaching already-established subscriptions — ships as the reload-triggered grant sweep (hub::sweep_grants: revoked filters leave live routing and the durable subscription set; offline sessions are re-checked at resume). The mechanism named here, a per-delivery re-check, was weighed in ADR 0040's alternatives and rejected: it closes only the subscription gap, at an O(messages) hot-path cost that grows with fan-out, where the sweep is O(state) once per policy change and also reaches revoked certs, removed users, and peer links."
   - id: 0004-T11
     title: "SAN-based identity selection (MQTTD_MTLS_IDENTITY_SOURCE = cn | san-dns | san-uri | san-email), fail-closed on an absent or ambiguous SAN"
-    status: planned
+    status: done
+    date: 2026-07-27
+    evidence: mtls::each_san_source_selects_its_own_field_of_one_certificate / the_default_source_is_the_common_name / a_missing_selected_source_yields_no_identity_and_never_falls_back / an_ambiguous_source_yields_no_identity / a_multi_common_name_subject_yields_no_identity / san_subjects_with_topic_wildcards_are_rejected / only_a_uri_san_may_carry_a_level_separator / a_uri_subject_can_never_be_substituted_into_a_topic_pattern; tls::a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn / a_san_configured_listener_refuses_a_cn_only_certificate; config::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted; mqttd::the_config_and_the_authenticator_agree_on_identity_source_spellings / changing_the_identity_source_requires_a_restart
   - id: 0004-T12
     title: "%c (client-id) substitution in ACL topic patterns — carry the ClientId through the Authorizer trait, failing closed on unsafe ids"
     status: planned
@@ -104,13 +106,25 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | 0004-T8 | ✅ done | 2026-06-12 | password::correct_password_authenticates_with_username_as_subject / unknown_username_is_rejected_indistinguishably_from_wrong_password; token::tampered_or_wrong_secret_signature_is_rejected; chain::first_abstains_second_accepts_yields_ok |
 | 0004-T9 | ✂️ cut | — | "SUPERSEDED — both halves shipped under their own records: OIDC discovery + JWKS rotation as ADR 0050 (proven against a live Keycloak, forced mid-run key rotation included), MQTT 5 enhanced auth as ADR 0013. Cut, not done: the capability is in the broker, but the work is counted once, where it was built." |
 | 0004-T10 | ✂️ cut | — | "SUPERSEDED by ADR 0040. The goal — a tightened ACL reaching already-established subscriptions — ships as the reload-triggered grant sweep (hub::sweep_grants: revoked filters leave live routing and the durable subscription set; offline sessions are re-checked at resume). The mechanism named here, a per-delivery re-check, was weighed in ADR 0040's alternatives and rejected: it closes only the subscription gap, at an O(messages) hot-path cost that grows with fan-out, where the sweep is O(state) once per policy change and also reaches revoked certs, removed users, and peer links." |
-| 0004-T11 | ⬜ planned | — |  |
+| 0004-T11 | ✅ done | 2026-07-27 | mtls::each_san_source_selects_its_own_field_of_one_certificate / the_default_source_is_the_common_name / a_missing_selected_source_yields_no_identity_and_never_falls_back / an_ambiguous_source_yields_no_identity / a_multi_common_name_subject_yields_no_identity / san_subjects_with_topic_wildcards_are_rejected / only_a_uri_san_may_carry_a_level_separator / a_uri_subject_can_never_be_substituted_into_a_topic_pattern; tls::a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn / a_san_configured_listener_refuses_a_cn_only_certificate; config::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted; mqttd::the_config_and_the_authenticator_agree_on_identity_source_spellings / changing_the_identity_source_requires_a_restart |
 | 0004-T12 | ⬜ planned | — |  |
 | 0004-T13 | 💤 deferred | — | "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040." |
 <!-- /status-table:0004 -->
 
 ## Changelog
 
+- **2026-07-27** — **T11 done**: `MQTTD_MTLS_IDENTITY_SOURCE` selects which verified-leaf
+  field is the subject — `cn` (default, byte-for-byte the old path), `san-dns`, `san-uri`,
+  `san-email`. Extraction is fail-closed on *both* sides of ambiguity: the selected source
+  being absent yields no identity and never falls back to another field, and the source
+  appearing **twice** — two DNS SANs, or a multi-CN subject — is treated as fatally as none,
+  so certificate field ordering can never choose the principal. The CN path's safety rules
+  travel with it: `+`/`#` are refused everywhere and `/` everywhere but `san-uri`, where a
+  test pins the interlock that the ACL engine refuses to substitute a `/`-bearing subject
+  into `%i`. An unknown spelling is a config-validation error, not a silent default, and a
+  cross-crate test pins `mqtt-config`'s list against the authenticator's. The setting is
+  deliberately *not* live-reloadable — re-keying every ACL under established sessions is a
+  restart-level change, and a reload reports an edit to it as requires-restart (ADR 0046 T4).
 - **2026-07-27** — Re-triaged the three open tasks; two of them had been quietly
   delivered elsewhere and one was a grab-bag hiding the fact.
   **T9 cut** (OIDC/JWKS is ADR 0050, enhanced auth is ADR 0013 — both shipped).

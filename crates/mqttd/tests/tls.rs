@@ -127,6 +127,7 @@ async fn start_tls_node(acceptor: TlsAcceptor) -> SocketAddr {
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth: mqttd::conn::auth_handle(auth),
                         authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
+                        identity_source: mqtt_auth::mtls::IdentitySource::default(),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
@@ -489,9 +490,17 @@ async fn plaintext_peer_is_rejected_by_mtls_listener() {
 // --- mTLS identity (ADR 0004) ---------------------------------------------------
 
 /// Start a node whose TLS listener enforces the production auth path: client
-/// certificates are required (`client_ca`), the verified leaf's CN becomes the
-/// broker identity via `conn::tls_identity`, and anonymous access is denied.
-async fn start_identity_node(pki: &Pki) -> SocketAddr {
+/// certificates are required (`client_ca`), the verified leaf's `source` field becomes the
+/// broker identity via `conn::tls_admission`, and anonymous access is denied.
+///
+/// `authz` is the topic policy that identity is then judged by — `AllowAll` when a test
+/// only cares about admission, a real ACL when it cares that the *right* identity arrived
+/// (ADR 0004 T11).
+async fn start_identity_node(
+    pki: &Pki,
+    source: mqtt_auth::mtls::IdentitySource,
+    authz: Arc<dyn mqtt_auth::Authorizer>,
+) -> SocketAddr {
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, Some(&pki.ca)).unwrap();
     let (hub, hub_tx) = Hub::with_config(
         NodeId("id-node".into()),
@@ -506,15 +515,17 @@ async fn start_identity_node(pki: &Pki) -> SocketAddr {
             let (stream, peer) = listener.accept().await.unwrap();
             let acceptor = acceptor.clone();
             let hub = hub_tx.clone();
+            let authz = authz.clone();
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
-                    let identity = mqttd::conn::tls_admission(&tls);
+                    let identity = mqttd::conn::tls_admission(&tls, source);
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth: mqttd::conn::auth_handle(auth),
-                        authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
+                        authz: mqttd::conn::authz_handle(authz),
+                        identity_source: source,
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
@@ -562,7 +573,12 @@ fn mint_client_cert(
 async fn mtls_common_name_identity_is_admitted_under_deny_anonymous() {
     let (pki, ca_cert, ca_key) = mint_pki("cn-identity");
     let (client_cert, client_key) = mint_client_cert(&ca_cert, &ca_key, "device-7", "admit");
-    let addr = start_identity_node(&pki).await;
+    let addr = start_identity_node(
+        &pki,
+        mqtt_auth::mtls::IdentitySource::default(),
+        Arc::new(mqtt_auth::AllowAll),
+    )
+    .await;
     let connector = test_connector(&pki.ca, Some((&client_cert, &client_key)));
 
     let mut sub = Client::connect(tls_connect(addr, &connector).await.unwrap(), "sub").await;
@@ -573,6 +589,138 @@ async fn mtls_common_name_identity_is_admitted_under_deny_anonymous() {
     match sub.recv().await {
         Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"authenticated"),
         other => panic!("expected publish over authenticated session, got {other:?}"),
+    }
+}
+
+/// Mint a client leaf whose CN and dNSName SAN deliberately **disagree**, so a test can
+/// tell which field the broker actually read (ADR 0004 T11).
+fn mint_client_cert_with_san(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+    cn: &str,
+    san: Option<&str>,
+    dir_tag: &str,
+) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("mqttd-san-{}-{dir_tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    if let Some(san) = san {
+        params.subject_alt_names =
+            vec![rcgen::SanType::DnsName(san.to_string().try_into().unwrap())];
+    }
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert_path = dir.join("client-cert.pem");
+    let key_path = dir.join("client-key.pem");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    (cert_path, key_path)
+}
+
+/// A deny-by-default ACL that grants exactly one subject its own topic namespace, so an
+/// admitted session proves *which* identity the broker derived, not merely that it derived
+/// one.
+fn acl_scoped_to(subject: &str) -> Arc<dyn mqtt_auth::Authorizer> {
+    Arc::new(
+        mqtt_auth::acl::AclPolicy::from_toml_str(&format!(
+            r#"
+            [[rules]]
+            effect = "allow"
+            identities = ["{subject}"]
+            actions = ["publish", "subscribe"]
+            topics = ["san/#"]
+            "#
+        ))
+        .unwrap(),
+    )
+}
+
+/// End to end (ADR 0004 T11): with the listener configured to read a dNSName SAN, a client
+/// is admitted **as its SAN** — the ACL that grants only the SAN-named subject lets it
+/// through, which it could not do if the broker had read the (deliberately different) CN.
+#[tokio::test]
+async fn a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn() {
+    let (pki, ca_cert, ca_key) = mint_pki("san-identity");
+    let (client_cert, client_key) = mint_client_cert_with_san(
+        &ca_cert,
+        &ca_key,
+        "cn-that-must-not-be-used",
+        Some("device-7.fleet.example"),
+        "admit",
+    );
+    let addr = start_identity_node(
+        &pki,
+        mqtt_auth::mtls::IdentitySource::SanDns,
+        acl_scoped_to("device-7.fleet.example"),
+    )
+    .await;
+    let connector = test_connector(&pki.ca, Some((&client_cert, &client_key)));
+
+    let mut sub = Client::connect(tls_connect(addr, &connector).await.unwrap(), "sub").await;
+    sub.subscribe("san/+/data").await;
+    let mut publ = Client::connect(tls_connect(addr, &connector).await.unwrap(), "pub").await;
+    publ.publish("san/zone/data", b"by-san").await;
+
+    match sub.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"by-san"),
+        other => panic!("expected publish over the SAN-identified session, got {other:?}"),
+    }
+}
+
+/// End to end (ADR 0004 T11), the fail-closed half: the same listener refuses a client whose
+/// certificate carries **no** dNSName — no silent fall back to the CN, which a CA that can
+/// mint any Common Name would otherwise be able to use to impersonate a SAN-named workload.
+/// The CONNECT is refused with 0x05, exactly as for a client presenting no certificate.
+#[tokio::test]
+async fn a_san_configured_listener_refuses_a_cn_only_certificate() {
+    let (pki, ca_cert, ca_key) = mint_pki("san-no-fallback");
+    let (client_cert, client_key) = mint_client_cert_with_san(
+        &ca_cert,
+        &ca_key,
+        "device-7.fleet.example", // the very name the ACL grants — but in the wrong field
+        None,
+        "refuse",
+    );
+    let addr = start_identity_node(
+        &pki,
+        mqtt_auth::mtls::IdentitySource::SanDns,
+        acl_scoped_to("device-7.fleet.example"),
+    )
+    .await;
+    let connector = test_connector(&pki.ca, Some((&client_cert, &client_key)));
+
+    // The TLS handshake still succeeds — the certificate is CA-issued and valid; it simply
+    // yields no identity, so the deny-anonymous policy refuses the session.
+    let stream = tls_connect(addr, &connector).await.unwrap();
+    let (rh, wh) = tokio::io::split(stream);
+    let mut writer = mqtt_net::FrameWriter::new(wh, V4);
+    writer
+        .send(&Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
+            protocol: V4,
+            clean_session: true,
+            keep_alive: 30,
+            client_id: "cn-only".into(),
+            last_will: None,
+            username: None,
+            password: None,
+        }))
+        .await
+        .unwrap();
+    let mut reader = mqtt_net::FrameReader::new(rh, V4);
+    match timeout(Duration::from_millis(500), reader.next_packet()).await {
+        Ok(Ok(Some(Packet::ConnAck(ack)))) => {
+            assert_eq!(
+                ack.code, 0x05,
+                "a CN-only cert must not satisfy a SAN source"
+            );
+        }
+        other => panic!("expected CONNACK 0x05, got {other:?}"),
     }
 }
 
@@ -597,13 +745,17 @@ async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
             let hub = hub_tx.clone();
             tokio::spawn(async move {
                 if let Ok(tls) = acceptor.accept(stream).await {
-                    let identity = mqttd::conn::tls_admission(&tls);
+                    let identity = mqttd::conn::tls_admission(
+                        &tls,
+                        mqtt_auth::mtls::IdentitySource::default(),
+                    );
                     let auth = Arc::new(mqtt_auth::basic::BasicAuthenticator {
                         allow_anonymous: false,
                     });
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth: mqttd::conn::auth_handle(auth),
                         authz: mqttd::conn::authz_handle(Arc::new(mqtt_auth::AllowAll)),
+                        identity_source: mqtt_auth::mtls::IdentitySource::default(),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
@@ -893,6 +1045,7 @@ async fn start_reloadable_mtls_node(
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth,
                         authz,
+                        identity_source: mqtt_auth::mtls::IdentitySource::default(),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,
@@ -901,7 +1054,10 @@ async fn start_reloadable_mtls_node(
                         metrics: None,
                         enhanced: None,
                     });
-                    let cert = mqttd::conn::tls_admission(&tls);
+                    let cert = mqttd::conn::tls_admission(
+                        &tls,
+                        mqtt_auth::mtls::IdentitySource::default(),
+                    );
                     mqttd::conn::handle_stream(tls, Some(peer), cert, policy, hub).await;
                 }
             });

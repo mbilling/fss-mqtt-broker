@@ -146,6 +146,7 @@ async fn start_reloadable_node(
             let conn_policy = Arc::new(mqttd::conn::ConnPolicy {
                 auth: handles.auth.clone(),
                 authz: handles.authz.clone(),
+                identity_source: mqtt_auth::mtls::IdentitySource::default(),
                 audit: Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
                 store: None,

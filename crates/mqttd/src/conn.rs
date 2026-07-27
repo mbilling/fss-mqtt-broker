@@ -12,8 +12,8 @@ use crate::aliases::{InboundAliases, OutboundAliases};
 use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound};
 use bytes::Bytes;
 use mqtt_auth::{
-    basic::BasicAuthenticator, AllowAll, AuthSession, AuthStep, Authenticator, Authorizer,
-    Credentials, EnhancedAuthenticator, Identity,
+    basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthSession, AuthStep,
+    Authenticator, Authorizer, Credentials, EnhancedAuthenticator, Identity,
 };
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
@@ -142,7 +142,8 @@ static AUTO_ID: AtomicU64 = AtomicU64::new(1);
 /// re-checks against a reloaded policy (ADR 0040 T1).
 #[derive(Debug, Clone)]
 pub struct CertAdmission {
-    /// The broker identity (Subject CN) of the verified leaf.
+    /// The broker identity of the verified leaf — its Subject CN, or the SAN the
+    /// operator selected (ADR 0004 T11).
     pub identity: Identity,
     /// The leaf's serial number (big-endian bytes as encoded in the certificate);
     /// `None` when no live TLS leaf exists at this hop (a vouched proxied session,
@@ -151,26 +152,36 @@ pub struct CertAdmission {
 }
 
 /// Extract the mTLS admission (ADR 0004/0040) from an accepted server-side TLS
-/// stream: the chain-verified leaf certificate's Subject Common Name and serial.
+/// stream: the chain-verified leaf certificate's identity field and serial.
 ///
 /// Returns `None` when no client certificate was presented, or when a verified
-/// certificate carries no usable CN (logged — such a client can only proceed
-/// as anonymous, which the default policy denies).
-pub fn tls_admission<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<CertAdmission> {
+/// certificate carries no usable identity in the configured `source` (logged — such a
+/// client can only proceed as anonymous, which the default policy denies).
+pub fn tls_admission<S>(
+    tls: &tokio_rustls::server::TlsStream<S>,
+    source: IdentitySource,
+) -> Option<CertAdmission> {
     let leaf = tls.get_ref().1.peer_certificates()?.first()?;
-    cert_admission(leaf)
+    cert_admission(leaf, source)
 }
 
 /// Build a [`CertAdmission`] from a chain-verified DER leaf certificate (shared by
-/// the TLS/WSS listeners and the QUIC handshake).
-pub fn cert_admission(leaf: &[u8]) -> Option<CertAdmission> {
-    match mqtt_auth::mtls::identity_from_cert(leaf) {
+/// the TLS/WSS listeners and the QUIC handshake), reading the identity from the field
+/// `source` selects (ADR 0004 T11; [`IdentitySource::CommonName`] is the default).
+pub fn cert_admission(leaf: &[u8], source: IdentitySource) -> Option<CertAdmission> {
+    match mqtt_auth::mtls::identity_from_cert_with(leaf, source) {
         Ok(identity) => Some(CertAdmission {
             identity,
             serial: mqtt_auth::mtls::serial_from_cert(leaf),
         }),
         Err(e) => {
-            warn!(error = %e, "client certificate verified but has no usable Common Name");
+            // No fallback to another field: a certificate that does not carry the
+            // configured identity is not identified, full stop (ADR 0004 T11).
+            warn!(
+                error = %e,
+                %source,
+                "client certificate verified but carries no usable identity for the configured source"
+            );
             None
         }
     }
@@ -219,6 +230,11 @@ pub struct ConnPolicy {
     /// ([`ConnPolicy::authorizer`]), so a tightened ACL denies an already-subscribed
     /// client's next operation (ADR 0032).
     pub authz: watch::Receiver<Arc<dyn Authorizer>>,
+    /// Which field of a verified client certificate is the identity (ADR 0004 T11).
+    /// Deliberately **not** behind a `watch`: re-keying every ACL under live sessions is
+    /// a restart-level change, and the config reload path reports an edit to it as
+    /// requires-restart (ADR 0046 T4) rather than applying half of it.
+    pub identity_source: IdentitySource,
     /// Records auth and authorization decisions.
     pub audit: Arc<dyn AuditSink>,
     /// Session relocation context; `None` outside a cluster (serve locally).
@@ -294,6 +310,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
             allow_anonymous: true,
         })),
         authz: authz_handle(Arc::new(AllowAll)),
+        identity_source: IdentitySource::default(),
         audit: Arc::new(AuditLog::new()),
         proxy: None,
         store: None,
@@ -1887,6 +1904,7 @@ mod tests {
                 allow_anonymous: true,
             })),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -1920,6 +1938,7 @@ mod tests {
                 allow_anonymous: true,
             })),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -2032,6 +2051,7 @@ mod tests {
                 allow_anonymous: true,
             })),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -2083,6 +2103,7 @@ mod tests {
                 allow_anonymous: false,
             })),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -2183,6 +2204,7 @@ mod tests {
                 secrets,
             ))),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: None,
@@ -2426,6 +2448,7 @@ mod tests {
                 allow_anonymous: true,
             })),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: audit.clone(),
             proxy: None,
             store: None,
@@ -3077,6 +3100,7 @@ mod tests {
                 allow_anonymous: true,
             })),
             authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
             store: Some(store),

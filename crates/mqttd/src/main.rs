@@ -171,7 +171,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// SWIM driver tick; must stay below the ack timeout (250ms default config).
 const SWIM_TICK: Duration = Duration::from_millis(100);
@@ -739,6 +739,14 @@ fn client_policy(
     let policy = Arc::new(conn::ConnPolicy {
         auth: handles.auth,
         authz: handles.authz,
+        // Start-time, like the OIDC settings above: re-keying every ACL under live
+        // sessions is a restart-level change, and `requires_restart` reports an edit as
+        // such (ADR 0046 T4). Validated at config load, so `parse` cannot fail here.
+        identity_source: identity_source_from_config(
+            &live
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ),
         audit,
         proxy,
         store: Some(store),
@@ -748,6 +756,35 @@ fn client_policy(
         metrics: Some(metrics),
     });
     Ok((policy, reloader))
+}
+
+/// Which field of a verified client certificate is the identity (ADR 0004 T11).
+///
+/// `Config::validate` has already rejected an unrecognised spelling at load, so an
+/// unparseable value here cannot come from a validated config; it is treated as the
+/// secure-by-default CN and logged rather than panicking in the connection path.
+fn identity_source_from_config(config: &Config) -> mqtt_auth::mtls::IdentitySource {
+    let Some(raw) = config.security.mtls_identity_source.as_deref() else {
+        return mqtt_auth::mtls::IdentitySource::default();
+    };
+    match mqtt_auth::mtls::IdentitySource::parse(raw) {
+        Ok(source) => {
+            if source != mqtt_auth::mtls::IdentitySource::default() {
+                info!(
+                    source = %source,
+                    "mTLS identity is read from a Subject Alternative Name, not the Common Name (ADR 0004 T11)"
+                );
+            }
+            source
+        }
+        Err(bad) => {
+            error!(
+                value = %bad,
+                "unrecognised security.mtls_identity_source; falling back to the Common Name"
+            );
+            mqtt_auth::mtls::IdentitySource::default()
+        }
+    }
 }
 
 /// Build the topic authorizer (ADR 0004 step 3): a TOML ACL file gives deny-by-default
@@ -1717,7 +1754,7 @@ async fn serve_tls_clients(
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
-                    let cert = conn::tls_admission(&tls_stream);
+                    let cert = conn::tls_admission(&tls_stream, policy.identity_source);
                     let outcome =
                         conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await;
                     if outcome.auth_failed {
@@ -1878,7 +1915,7 @@ async fn serve_wss_clients(
                 Ok(tls) => {
                     // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
                     // read before the TLS stream is consumed by the WebSocket adapter.
-                    let cert = conn::tls_admission(&tls);
+                    let cert = conn::tls_admission(&tls, policy.identity_source);
                     match mqtt_net::ws::accept(tls).await {
                         Ok(ws) => {
                             let outcome =
@@ -1957,7 +1994,8 @@ async fn serve_quic_clients(
             }
             // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial, from
             // the QUIC handshake.
-            let cert = mqtt_net::quic::peer_leaf_cert(&conn).and_then(|c| conn::cert_admission(&c));
+            let cert = mqtt_net::quic::peer_leaf_cert(&conn)
+                .and_then(|c| conn::cert_admission(&c, policy.identity_source));
             let identity = cert.as_ref().map(|c| c.identity.clone());
             // Connection-migration observation (ADR 0036 §3b): QUIC keeps a connection alive
             // across a client path change (Wi-Fi↔cellular, NAT rebind). Watch the remote address
@@ -2534,8 +2572,8 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        positive_cap, queue_limits_from_config, requires_restart, runtime_precheck,
-        wire_limits_from_config,
+        identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
+        runtime_precheck, wire_limits_from_config,
     };
     use mqtt_config::Config;
     use mqtt_storage::OverflowPolicy;
@@ -2612,6 +2650,57 @@ mod tests {
         assert!(sections.contains(&"cluster"));
         assert!(sections.contains(&"durable"));
         assert!(!sections.contains(&"security"));
+    }
+
+    /// The config crate validates the spelling; `mqtt_auth` decides what it means. The two
+    /// lists live in different crates on purpose (mqtt-config has no broker dependencies),
+    /// so this is where they are pinned together: a value the config accepts must parse,
+    /// and one it rejects must not.
+    #[test]
+    fn the_config_and_the_authenticator_agree_on_identity_source_spellings() {
+        use mqtt_auth::mtls::IdentitySource;
+        for good in ["cn", "san-dns", "san-uri", "san-email"] {
+            let toml = format!("[security]\nmtls_identity_source = \"{good}\"\n");
+            let cfg = Config::from_toml(&toml).expect("config accepts it");
+            assert_eq!(
+                IdentitySource::parse(good)
+                    .expect("mqtt-auth accepts it")
+                    .as_str(),
+                good,
+                "spelling must round-trip"
+            );
+            // ...and the broker reads back exactly that source, never the default.
+            assert_eq!(
+                identity_source_from_config(&cfg),
+                IdentitySource::parse(good).unwrap()
+            );
+        }
+        for bad in ["san", "dns", "common-name", "san_dns", ""] {
+            assert!(
+                Config::from_toml(&format!("[security]\nmtls_identity_source = \"{bad}\"\n"))
+                    .is_err(),
+                "config must reject {bad:?}"
+            );
+            assert!(
+                IdentitySource::parse(bad).is_err(),
+                "mqtt-auth must reject {bad:?}"
+            );
+        }
+        // Unset means the historical Common Name, with no logging noise.
+        assert_eq!(
+            identity_source_from_config(&Config::default()),
+            IdentitySource::CommonName
+        );
+    }
+
+    /// Re-keying every ACL under live sessions is not a hot-swap: an edit to the identity
+    /// source must be reported as requires-restart, not half-applied (ADR 0046 T4).
+    #[test]
+    fn changing_the_identity_source_requires_a_restart() {
+        let base = Config::default();
+        let mut changed = base.clone();
+        changed.security.mtls_identity_source = Some("san-dns".into());
+        assert!(requires_restart(&base, &changed).contains(&"security"));
     }
 
     #[test]

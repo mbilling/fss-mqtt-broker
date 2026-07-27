@@ -38,6 +38,7 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
             let policy = std::sync::Arc::new(mqttd::conn::ConnPolicy {
                 auth: mqttd::conn::auth_handle(auth.clone()),
                 authz: mqttd::conn::authz_handle(std::sync::Arc::new(mqtt_auth::AllowAll)),
+                identity_source: mqtt_auth::mtls::IdentitySource::default(),
                 audit: std::sync::Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
                 store: None,

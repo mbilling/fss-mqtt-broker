@@ -11,7 +11,7 @@
 | [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [10/11 done](0001-session-durability.md) | 1 deferred |
 | [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [10/10 done](0002-transport-security.md) | — |
 | [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
-| [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [8/13 done](0004-identity-and-authentication.md) | 2 open, 1 deferred |
+| [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [9/13 done](0004-identity-and-authentication.md) | 1 open, 1 deferred |
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [4/6 done](0005-session-affinity.md) | 2 deferred |
 | [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [11/11 done](0006-consensus-and-replication.md) | — |
 | [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [9/9 done](0007-durable-store-integration.md) | — |
@@ -67,7 +67,6 @@
 
 **0004 — Identity model: mTLS Common Name first, deny by default**
 
-- `0004-T11` ⬜ planned: "SAN-based identity selection (MQTTD_MTLS_IDENTITY_SOURCE = cn | san-dns | san-uri | san-email), fail-closed on an absent or ambiguous SAN"
 - `0004-T12` ⬜ planned: "%c (client-id) substitution in ACL topic patterns — carry the ClientId through the Authorizer trait, failing closed on unsafe ids"
 - `0004-T13` 💤 deferred: Per-listener auth policies (each listener carrying its own authenticator/ACL) — "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040."
 
