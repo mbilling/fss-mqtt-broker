@@ -36,6 +36,7 @@ fn permissive_policy() -> Arc<ConnPolicy> {
             allow_anonymous: true,
         })),
         authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+        identity_source: mqtt_auth::mtls::IdentitySource::default(),
         audit: Arc::new(mqtt_observability::AuditLog::new()),
         proxy: None,
         store: None,
@@ -65,8 +66,9 @@ fn start_quic_node(cert: &Path, key: &Path, ca: &Path) -> SocketAddr {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_address();
-                let identity = mqtt_net::quic::peer_leaf_cert(&conn)
-                    .and_then(|c| mqttd::conn::cert_admission(&c));
+                let identity = mqtt_net::quic::peer_leaf_cert(&conn).and_then(|c| {
+                    mqttd::conn::cert_admission(&c, mqtt_auth::mtls::IdentitySource::default())
+                });
                 // The multi-stream mux: control stream + any data streams feed one session.
                 if let Ok(mux) = mqtt_net::quic::accept_mux(conn).await {
                     mqttd::conn::handle_stream(mux, Some(peer), identity, permissive_policy(), hub)

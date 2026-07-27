@@ -110,6 +110,12 @@ pub struct Security {
     pub allow_anonymous: bool,
     /// Require a client certificate (mTLS) on TLS listeners. Default `true`.
     pub require_client_cert: bool,
+    /// Which field of a verified client certificate is the identity
+    /// (`MQTTD_MTLS_IDENTITY_SOURCE`, ADR 0004 T11): `"cn"` (default), `"san-dns"`,
+    /// `"san-uri"`, or `"san-email"`. `None` means `"cn"`. Applies to client listeners
+    /// only — the cluster bus binds peer node ids to the Common Name by definition
+    /// (ADR 0004 T7).
+    pub mtls_identity_source: Option<String>,
     /// Argon2id `username:phc-hash` password file (`MQTTD_PASSWORD_FILE`).
     pub password_file: Option<String>,
     /// Topic-ACL TOML policy file (`MQTTD_ACL_FILE`); without it authorization is not
@@ -131,6 +137,7 @@ impl Default for Security {
         Self {
             allow_anonymous: false,
             require_client_cert: true,
+            mtls_identity_source: None,
             password_file: None,
             acl_file: None,
             jwt: Jwt::default(),
@@ -494,6 +501,9 @@ impl Config {
         if get("MQTTD_ALLOW_ANONYMOUS").is_some() {
             self.security.allow_anonymous = true;
         }
+        on!("MQTTD_MTLS_IDENTITY_SOURCE", v, {
+            self.security.mtls_identity_source = Some(v);
+        });
         on!("MQTTD_PASSWORD_FILE", v, {
             self.security.password_file = Some(v);
         });
@@ -711,6 +721,22 @@ impl Config {
                 }
             }
         }
+        // Which certificate field is the principal is not a setting to get wrong quietly:
+        // an unrecognised value must not degrade to the CN default, or a SAN-keyed ACL
+        // would silently start matching against a CA-chosen Common Name (ADR 0004 T11).
+        // The spellings are duplicated here rather than depending on mqtt-auth — this crate
+        // deliberately has no broker dependencies; mtls::IdentitySource::parse is the one
+        // that decides at use, and a test in mqtt-auth pins the two lists together.
+        if let Some(s) = &self.security.mtls_identity_source {
+            if !["cn", "san-dns", "san-uri", "san-email"]
+                .contains(&s.trim().to_lowercase().as_str())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "security.mtls_identity_source must be one of \"cn\", \"san-dns\", \
+                     \"san-uri\", \"san-email\", got {s:?}"
+                )));
+            }
+        }
         if let Some(p) = &self.limits.queue_overflow {
             if p != "drop-oldest" && p != "reject-newest" {
                 return Err(ConfigError::Invalid(format!(
@@ -760,6 +786,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TLS_CRL",
     // security
     "MQTTD_ALLOW_ANONYMOUS",
+    "MQTTD_MTLS_IDENTITY_SOURCE",
     "MQTTD_PASSWORD_FILE",
     "MQTTD_ACL_FILE",
     "MQTTD_JWT_HS256_SECRET_FILE",
@@ -1013,6 +1040,7 @@ mod tests {
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
+            "MQTTD_MTLS_IDENTITY_SOURCE" => "san-dns",
             // The node=domain map needs a well-formed entry.
             "MQTTD_FAILURE_DOMAINS" => "n1=rack-a",
             // Numerics (all widths parse "7").
@@ -1066,6 +1094,31 @@ mod tests {
         assert!(c.security.oidc.allow_http, "presence sets the flag");
     }
 
+    /// A typo in the identity source must be a startup error, never a silent fall back to
+    /// the CN default — a SAN-keyed ACL evaluated against a CA-chosen Common Name is a
+    /// privilege change, not a cosmetic one (ADR 0004 T11).
+    #[test]
+    fn an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted() {
+        for good in ["cn", "san-dns", "san-uri", "san-email", " SAN-DNS "] {
+            let toml = format!("[security]\nmtls_identity_source = \"{good}\"\n");
+            assert!(Config::from_toml(&toml).is_ok(), "{good:?} should be valid");
+        }
+        for bad in ["", "san", "dns", "common-name", "san_dns"] {
+            let toml = format!("[security]\nmtls_identity_source = \"{bad}\"\n");
+            let err = Config::from_toml(&toml).expect_err("must be rejected");
+            assert!(
+                err.to_string().contains("mtls_identity_source"),
+                "error should name the field: {err}"
+            );
+        }
+        // Unset is the CN default, and stays representable as "absent" rather than a string.
+        assert!(Config::default().security.mtls_identity_source.is_none());
+        let mut c = Config::default();
+        c.overlay_from(|k| (k == "MQTTD_MTLS_IDENTITY_SOURCE").then(|| "san-uri".to_string()))
+            .unwrap();
+        assert_eq!(c.security.mtls_identity_source.as_deref(), Some("san-uri"));
+    }
+
     #[test]
     fn the_gossip_key_is_inline_xor_by_reference() {
         // Either form alone validates; both together is rejected (ADR 0046 T5).
@@ -1093,7 +1146,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            64,
+            65,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
     }

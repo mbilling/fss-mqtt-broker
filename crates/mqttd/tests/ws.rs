@@ -39,6 +39,7 @@ fn permissive_policy() -> Arc<ConnPolicy> {
             allow_anonymous: true,
         })),
         authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+        identity_source: mqtt_auth::mtls::IdentitySource::default(),
         audit: Arc::new(mqtt_observability::AuditLog::new()),
         proxy: None,
         store: None,
@@ -92,7 +93,8 @@ async fn start_wss_node(acceptor: tokio_rustls::TlsAcceptor) -> SocketAddr {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
-                let identity = mqttd::conn::tls_admission(&tls);
+                let identity =
+                    mqttd::conn::tls_admission(&tls, mqtt_auth::mtls::IdentitySource::default());
                 if let Ok(ws) = mqtt_net::ws::accept(tls).await {
                     mqttd::conn::handle_stream(ws, Some(peer), identity, permissive_policy(), hub)
                         .await;

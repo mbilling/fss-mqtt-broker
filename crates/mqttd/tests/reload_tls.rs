@@ -150,6 +150,7 @@ async fn start_reloadable_tls_node(cert: PathBuf, key: PathBuf) -> (SocketAddr, 
                     let policy = Arc::new(mqttd::conn::ConnPolicy {
                         auth,
                         authz,
+                        identity_source: mqtt_auth::mtls::IdentitySource::default(),
                         audit: Arc::new(mqtt_observability::AuditLog::new()),
                         proxy: None,
                         store: None,

@@ -289,6 +289,7 @@ async fn start_proxy_node(
             allow_anonymous: true,
         })),
         authz: mqttd::conn::authz_handle(Arc::new(AllowAll)),
+        identity_source: mqtt_auth::mtls::IdentitySource::default(),
         audit: Arc::new(AuditLog::new()),
         proxy: Some(ProxyContext {
             node: node_id.clone(),

@@ -39,6 +39,7 @@ async fn start_node(
     let policy = Arc::new(ConnPolicy {
         auth: mqttd::conn::auth_handle(Arc::new(BasicAuthenticator { allow_anonymous })),
         authz: mqttd::conn::authz_handle(authz),
+        identity_source: mqtt_auth::mtls::IdentitySource::default(),
         audit: audit.clone(),
         proxy: None,
         store: None,
