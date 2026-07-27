@@ -4,7 +4,13 @@
 - **Date:** 2026-06-12
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0004-identity-and-authentication.md](../delivery/0004-identity-and-authentication.md) — plan, progress, and changelog
-- **Related:** ADR 0002 (transport security), Capability Plan §3, `mqtt-auth`
+- **Related:** ADR 0002 (transport security), Capability Plan §3, `mqtt-auth`;
+  later records that took over parts of this one's deferred list —
+  [ADR 0013](0013-enhanced-authentication.md) (MQTT 5 enhanced auth),
+  [ADR 0032](0032-hot-reloadable-security-policy.md) / [ADR 0033](0033-config-file-watch-reload.md)
+  (hot policy reload), [ADR 0040](0040-revocation-reaches-live-state.md) (reload sweeps live
+  subscriptions, in place of a delivery-time re-check),
+  [ADR 0050](0050-oidc-token-authentication.md) (OIDC discovery + JWKS rotation)
 
 > This record states the decision only. How it is being built and how far along it is
 > live in the [delivery doc](../delivery/0004-identity-and-authentication.md).
@@ -107,10 +113,34 @@ docs; the load-bearing decisions:
   step.
 - `conn::handle` remains a permissive anonymous shim for the integration test
   suites; production listeners do not use it.
-- **Known limitation:** ACL enforcement is subscription-time only; a *delivery-
-  time* check in the hub (needed if policies ever change under live
-  subscriptions) is deferred along with hot reload. `%c` (client-id)
+- **Known limitation (as of 2026-06-12, superseded — see below):** ACL enforcement is
+  subscription-time only; a *delivery-time* check in the hub (needed if policies ever
+  change under live subscriptions) is deferred along with hot reload. `%c` (client-id)
   substitution in ACL patterns is deferred until the `Authorizer` trait carries
   the client id. Full OIDC discovery / JWKS rotation, SAN-based identity
   selection, per-listener auth policies, and MQTT 5 enhanced auth are likewise
   deferred.
+
+### Amendment (2026-07-27): what the deferred list became
+
+The paragraph above is kept for the record and is no longer accurate. Later records
+took over most of it, and the two items that remain in this ADR's scope are being
+built rather than deferred:
+
+- **Hot ACL reload** — delivered by [ADR 0032](0032-hot-reloadable-security-policy.md)
+  (validate-before-swap behind `watch` handles) and [ADR 0033](0033-config-file-watch-reload.md)
+  (the file-watch trigger).
+- **Delivery-time ACL re-check** — *not* built, on purpose. The requirement behind it (a
+  tightened ACL must reach already-established subscriptions) is met by
+  [ADR 0040](0040-revocation-reaches-live-state.md)'s reload-triggered grant sweep, which
+  is O(live state) once per policy change instead of O(messages) forever, and which also
+  reaches revoked certificates, removed users, and peer links. ADR 0040 records the
+  trade-off in its alternatives.
+- **OIDC discovery / JWKS rotation** — [ADR 0050](0050-oidc-token-authentication.md),
+  proven against a live IdP. **MQTT 5 enhanced auth** —
+  [ADR 0013](0013-enhanced-authentication.md).
+- **SAN-based identity selection** and **`%c` substitution** stay here, as T11/T12 of this
+  ADR's delivery: neither is a new decision space, they are the config option and the
+  trait plumbing this record already anticipated in points 1 and 2.
+- **Per-listener auth policies** remain deferred, and will need their own record: they
+  are a change to the shape of the listener configuration (ADR 0046), not a flag.
