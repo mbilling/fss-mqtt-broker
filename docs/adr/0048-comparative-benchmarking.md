@@ -134,3 +134,15 @@ re-run and re-published per release (competitor versions move too).
 - **Benchmark against every broker (HiveMQ, NanoMQ, VerneMQ, …):** more coverage, more
   maintenance, diminishing returns. Start with the two the market actually compares us to
   (Mosquitto = ubiquity, EMQX = the clustered incumbent); widen if there is demand.
+
+### Amendment (2026-07-27): NanoMQ joins the comparison set (ADR 0051)
+
+The "widen if there is demand" clause above has been exercised: the maintainer named
+**NanoMQ** as a comparison target during the release-readiness review
+([ADR 0051](0051-evaluation-readiness.md)). NanoMQ covers the quadrant the original pair
+does not — the lightweight, edge-native broker (and EMQX's own edge sibling), the natural
+alternative wherever footprint drives the choice. It joins the containerized harness under
+the same rules: pinned published image, reasonable disclosed config, both postures
+(plaintext and TLS/mTLS), driven by `emqtt-bench`. The set is now Mosquitto, EMQX, NanoMQ;
+it widens further only on further demand. Delivery of the NanoMQ lane is tracked as
+0051-T9, feeding the same publication gate as 0048-T4.
