@@ -57,7 +57,7 @@
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [5/5 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [2/4 done](0048-comparative-benchmarking.md) | 2 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
-| [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [2/5 done](0050-oidc-token-authentication.md) | 3 open |
+| [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |
 
 ## Open and deferred work
 
@@ -118,9 +118,3 @@
 
 - `0048-T3` ⬜ planned: The scaling curve — the same workload against 1/3/5 nodes, throughput and p99 vs node count; tests capability claim 1 and the ADR 0015 shared-subscription mechanism end to end; a flat curve is a finding to fix
 - `0048-T4` ⬜ planned: Honesty rules + publication — versions/hardware/config/date stated; losing dimensions reported as prominently as winning ones; results in docs/benchmarks/ linked from the README; self-benchmark runs nightly (ADR 0044 P4), cross-broker re-run per release
-
-**0050 — OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP)**
-
-- `0050-T1` ⬜ planned: Discovery + JWKS fetch — issuer URL -> .well-known/openid-configuration -> jwks_uri -> key set, over the in-tree rustls HTTP client; https-only (loud MQTTD_OIDC_ALLOW_HTTP override); no new OIDC/HTTP dependency
-- `0050-T2` ⬜ planned: Rotation machinery — kid-selected keys, TTL background refresh (MQTTD_OIDC_JWKS_REFRESH), debounced unknown-kid immediate refetch, last-known-good cache with bounded staleness (MQTTD_OIDC_MAX_STALE) then fail-closed; deterministic per-PR unit tests for cache/refresh/debounce/staleness
-- `0050-T3` ⬜ planned: Validation hardening + wiring — OIDC mode on TokenAuthenticator with required iss/aud, asymmetric-only algorithm allow-list (RS256/ES256, no HS* against a public JWKS, no none), bounded clock skew; composes with CONNECT-password and MQTT5 AUTH (ADR 0013) token transport

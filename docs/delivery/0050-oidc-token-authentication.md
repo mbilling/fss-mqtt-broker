@@ -5,13 +5,19 @@ adr_status: Accepted
 tasks:
   - id: 0050-T1
     title: Discovery + JWKS fetch — issuer URL -> .well-known/openid-configuration -> jwks_uri -> key set, over the in-tree rustls HTTP client; https-only (loud MQTTD_OIDC_ALLOW_HTTP override); no new OIDC/HTTP dependency
-    status: planned
+    status: done
+    date: 2026-07-26
+    evidence: "mqttd::oidc::run_fetch_loop: discovery (<issuer>/.well-known/openid-configuration -> jwks_uri) then JWKS GET over the in-tree reqwest (rustls-no-provider on the process ring provider — reuses the OTLP stack, no new crate, no aws-lc beyond what OTLP already pulls). https enforced with the loud MQTTD_OIDC_ALLOW_HTTP test override; backoff discovery so the IdP may boot after the broker. Proven live end to end in T4 (broker logs 'OIDC discovery complete' + 'OIDC JWKS refreshed keys=1' against real Keycloak)."
   - id: 0050-T2
     title: Rotation machinery — kid-selected keys, TTL background refresh (MQTTD_OIDC_JWKS_REFRESH), debounced unknown-kid immediate refetch, last-known-good cache with bounded staleness (MQTTD_OIDC_MAX_STALE) then fail-closed; deterministic per-PR unit tests for cache/refresh/debounce/staleness
-    status: planned
+    status: done
+    date: 2026-07-26
+    evidence: "mqtt-auth::oidc::OidcAuthenticator: kid-selected keys, install_jwks validate-before-swap (a garbled/empty fetch never evicts last-known-good), bounded(1) refresh-hint channel (capacity IS the debounce), staleness beyond max_stale fails closed. Fetch loop does TTL refresh + hint-driven refetch floored by a 5s anti-stampede gap. 8 deterministic unit tests (cache/refresh/debounce/staleness/validate-before-swap/unknown-kid). Rotation proven live in T4: a mid-run new-kid token accepted WITHOUT restart."
   - id: 0050-T3
     title: Validation hardening + wiring — OIDC mode on TokenAuthenticator with required iss/aud, asymmetric-only algorithm allow-list (RS256/ES256, no HS* against a public JWKS, no none), bounded clock skew; composes with CONNECT-password and MQTT5 AUTH (ADR 0013) token transport
-    status: planned
+    status: done
+    date: 2026-07-26
+    evidence: "OIDC authenticate: required iss+aud, asymmetric-only allow-list enforced on the token HEADER before any key is consulted (alg=none and HS* die before key selection — the key-confusion guard), bounded clock skew. MQTTD_OIDC_* config wired via mqtt-config; built ONCE outside the reload closure so its key cache survives hot-reloads; mutually exclusive with the static MQTTD_JWT_* verifier. §0 wire->Credentials::Token bridge (JWT-in-password) makes it reachable from a real client — the piece that was silently missing (static TokenAuthenticator was unreachable, ADR 0004 T8 corrected). Proven through the real broker CONNECT handler (tests/auth.rs, chain-wrapped) and live in T4."
   - id: 0050-T4
     title: "THE ACCEPTANCE BAR — real-IdP integration test in CI (nightly tier): pinned Keycloak container; IdP-minted token connects and maps to session identity; bad aud/iss/expiry rejected; key ROTATED mid-test via the admin API and a new-kid token accepted without restart; withdrawn-key tokens rejected; IdP down -> cached keys keep working; staleness forced to zero -> fail closed"
     status: done
@@ -50,9 +56,9 @@ this ADR.
 <!-- status-table:0050 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0050-T1 | ⬜ planned | — |  |
-| 0050-T2 | ⬜ planned | — |  |
-| 0050-T3 | ⬜ planned | — |  |
+| 0050-T1 | ✅ done | 2026-07-26 | "mqttd::oidc::run_fetch_loop: discovery (<issuer>/.well-known/openid-configuration -> jwks_uri) then JWKS GET over the in-tree reqwest (rustls-no-provider on the process ring provider — reuses the OTLP stack, no new crate, no aws-lc beyond what OTLP already pulls). https enforced with the loud MQTTD_OIDC_ALLOW_HTTP test override; backoff discovery so the IdP may boot after the broker. Proven live end to end in T4 (broker logs 'OIDC discovery complete' + 'OIDC JWKS refreshed keys=1' against real Keycloak)." |
+| 0050-T2 | ✅ done | 2026-07-26 | "mqtt-auth::oidc::OidcAuthenticator: kid-selected keys, install_jwks validate-before-swap (a garbled/empty fetch never evicts last-known-good), bounded(1) refresh-hint channel (capacity IS the debounce), staleness beyond max_stale fails closed. Fetch loop does TTL refresh + hint-driven refetch floored by a 5s anti-stampede gap. 8 deterministic unit tests (cache/refresh/debounce/staleness/validate-before-swap/unknown-kid). Rotation proven live in T4: a mid-run new-kid token accepted WITHOUT restart." |
+| 0050-T3 | ✅ done | 2026-07-26 | "OIDC authenticate: required iss+aud, asymmetric-only allow-list enforced on the token HEADER before any key is consulted (alg=none and HS* die before key selection — the key-confusion guard), bounded clock skew. MQTTD_OIDC_* config wired via mqtt-config; built ONCE outside the reload closure so its key cache survives hot-reloads; mutually exclusive with the static MQTTD_JWT_* verifier. §0 wire->Credentials::Token bridge (JWT-in-password) makes it reachable from a real client — the piece that was silently missing (static TokenAuthenticator was unreachable, ADR 0004 T8 corrected). Proven through the real broker CONNECT handler (tests/auth.rs, chain-wrapped) and live in T4." |
 | 0050-T4 | ✅ done | 2026-07-26 | "scripts/oidc/run.sh drives the real mqttd binary against pinned Keycloak 26.0, JWT-in-password via the Mosquitto CLI (foreign client). Verified live 7/7: IdP-minted token accepted; wrong-audience + garbage rejected; a fresh RSA signing key added via the admin API mid-run (new kid) and the new token accepted WITHOUT broker restart (unknown-kid refetch, confirmed by a live 'OIDC JWKS refreshed' log); cached keys keep validating after the IdP is stopped. Wired as the nightly 'oidc' job. The live run earned its keep — it caught ChainAuthenticator::handles_token defaulting to false (the broker wraps every authenticator in a chain, which the in-process test had bypassed); the per-PR tests/auth.rs bridge tests now wrap in a chain too." |
 | 0050-T5 | ✅ done | 2026-07-26 | "README security env table documents MQTTD_OIDC_* (issuer/audience/jwks_refresh/max_stale/groups_claim/allow_http), the JWT-in-password carriage, asymmetric-only + fail-closed policy, and the real-Keycloak proof. ADR 0004 T9 notes point here (superseded); ADR 0004 T8 delivery carries the reachability correction (token auth was unreachable before the ADR 0050 bridge)." |
 <!-- /status-table:0050 -->
