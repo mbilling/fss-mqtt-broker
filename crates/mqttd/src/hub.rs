@@ -2043,7 +2043,9 @@ impl Hub {
                 Some(rx) => {
                     let authorizer = rx.0.borrow().clone();
                     subscriptions.into_iter().partition(|s| {
-                        authorizer.authorize_subscribe(&admission.identity, &s.filter)
+                        // Under the resuming session's own client id, so a `%c` grant
+                        // is re-checked against the handle it was written for.
+                        authorizer.authorize_subscribe(&admission.identity, &client, &s.filter)
                     })
                 }
                 None => (subscriptions, Vec::new()),
@@ -2926,7 +2928,7 @@ impl Hub {
                     .subs_by_client
                     .get(client)?
                     .keys()
-                    .filter(|f| !policy.authorizer.authorize_subscribe(identity, f))
+                    .filter(|f| !policy.authorizer.authorize_subscribe(identity, client, f))
                     .cloned()
                     .collect();
                 (!revoked.is_empty()).then(|| (client.clone(), revoked))
@@ -5634,10 +5636,10 @@ mod tests {
         /// Denies connect for one subject; permits everything else.
         struct DenyConnectFor(&'static str);
         impl Authorizer for DenyConnectFor {
-            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+            fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, _: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
             fn authorize_connect(&self, identity: &Identity, _: &ClientId) -> bool {
@@ -5757,10 +5759,10 @@ mod tests {
         /// Denies subscriptions to `secret/#`; permits everything else.
         struct DenySecret;
         impl mqtt_auth::Authorizer for DenySecret {
-            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+            fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, filter: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &String) -> bool {
                 !filter.starts_with("secret/")
             }
         }
@@ -5814,10 +5816,10 @@ mod tests {
 
         struct DenySecret;
         impl mqtt_auth::Authorizer for DenySecret {
-            fn authorize_publish(&self, _: &Identity, _: &String) -> bool {
+            fn authorize_publish(&self, _: &Identity, _: &ClientId, _: &String) -> bool {
                 true
             }
-            fn authorize_subscribe(&self, _: &Identity, filter: &String) -> bool {
+            fn authorize_subscribe(&self, _: &Identity, _: &ClientId, filter: &String) -> bool {
                 !filter.starts_with("secret/")
             }
         }

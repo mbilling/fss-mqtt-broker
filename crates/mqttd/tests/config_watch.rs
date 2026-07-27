@@ -73,9 +73,11 @@ fn alice() -> Identity {
 }
 
 fn may_publish(authz: &tokio::sync::watch::Receiver<Arc<dyn Authorizer>>) -> bool {
-    authz
-        .borrow()
-        .authorize_publish(&alice(), &"room/x".to_string())
+    authz.borrow().authorize_publish(
+        &alice(),
+        &mqtt_core::ClientId("c".into()),
+        &"room/x".to_string(),
+    )
 }
 
 #[test]

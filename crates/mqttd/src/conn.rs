@@ -433,7 +433,10 @@ async fn will_rejected<W: AsyncWrite + Unpin>(
     let Some(w) = &connect.last_will else {
         return Ok(false);
     };
-    if policy.authorizer().authorize_publish(principal, &w.topic) {
+    if policy
+        .authorizer()
+        .authorize_publish(principal, client, &w.topic)
+    {
         return Ok(false);
     }
     warn!(client = %client.0, topic = %w.topic, "CONNECT rejected: will topic not authorized");
@@ -1547,7 +1550,9 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped but still
     // acknowledged — 3.1.1 has no negative PUBACK, and not acking would leave
     // conforming publishers retrying forever.
-    let authorized = policy.authorizer().authorize_publish(principal, &topic);
+    let authorized = policy
+        .authorizer()
+        .authorize_publish(principal, client, &topic);
     if !authorized {
         debug!(client = %client.0, identity = %principal.subject, topic = %topic,
                "publish denied by ACL; dropping");
@@ -1792,7 +1797,10 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 if is_shared_filter(&f.path) && parse_shared(&f.path).is_none() {
                     debug!(client = %client.0, filter = %f.path, "malformed shared subscription");
                     return_codes.push(SUBACK_FAILURE);
-                } else if policy.authorizer().authorize_subscribe(principal, &f.path) {
+                } else if policy
+                    .authorizer()
+                    .authorize_subscribe(principal, client, &f.path)
+                {
                     granted.push((f.path.clone(), f.qos));
                     return_codes.push(f.qos as u8);
                 } else {

@@ -421,6 +421,71 @@ async fn a_subscribe_acl_tightening_stops_delivery_to_a_live_subscription() {
     );
 }
 
+/// ADR 0040 T3 × ADR 0004 T12 — the grant sweep re-checks `%c` under **each session's
+/// own** client id, not some single ambient one.
+///
+/// The discriminator is that both sessions carry the *same identity* and the *same
+/// filter string* `room/c-two` is at stake for both: after tightening to `room/%c`, it
+/// must be revoked for `c-one` (not its handle) and kept for `c-two` (its own). A sweep
+/// keying on anything but the per-session client id gets one of those two wrong.
+#[tokio::test]
+async fn the_grant_sweep_re_checks_percent_c_under_each_sessions_own_client_id() {
+    let acl = AclFile::new(PERMISSIVE);
+    let (addr, ids, reloader) = start_reloadable_node(acl.path.clone()).await;
+
+    // Same identity on both handles — only the client id distinguishes them.
+    ids.send(identity("fleet")).unwrap();
+    let mut one = Client::connect(addr, "c-one").await;
+    assert_eq!(one.subscribe("room/c-one", QoS::AtMostOnce).await, vec![0]);
+    assert_eq!(one.subscribe("room/c-two", QoS::AtMostOnce).await, vec![0]);
+
+    ids.send(identity("fleet")).unwrap();
+    let mut two = Client::connect(addr, "c-two").await;
+    assert_eq!(two.subscribe("room/c-two", QoS::AtMostOnce).await, vec![0]);
+
+    ids.send(identity("fleet")).unwrap();
+    let mut writer = Client::connect(addr, "c-writer").await;
+
+    // Tighten: a session may only *subscribe* under its own client id. Publishing stays
+    // broad so the writer below is unaffected — the sweep is what this test is about.
+    acl.write(
+        r#"
+[[rules]]
+actions = ["publish"]
+topics = ["room/#"]
+
+[[rules]]
+actions = ["subscribe"]
+topics = ["room/%c"]
+"#,
+    );
+    assert!(reloader.reload("signal"), "the tightened ACL should reload");
+
+    // `room/c-two` survives for c-two...
+    writer.publish_qos1("room/c-two", 1, b"to-two").await;
+    match two.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"to-two"),
+        other => panic!("c-two must keep its own-handle grant, got {other:?}"),
+    }
+    // ...and is revoked for c-one, which held the identical filter.
+    assert!(
+        one.recv().await.is_none(),
+        "the sweep must revoke room/c-two for c-one — the filter is not under its handle"
+    );
+    // c-one's own-handle grant is untouched: the sweep revoked the right one only.
+    writer.publish_qos1("room/c-one", 2, b"to-one").await;
+    match one.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(&p.payload[..], b"to-one"),
+        other => panic!("c-one must keep room/c-one, got {other:?}"),
+    }
+    // And re-subscribing to the sibling's namespace is denied at admission.
+    assert_eq!(
+        one.subscribe("room/c-two", QoS::AtMostOnce).await,
+        vec![0x80],
+        "re-subscribing under another session's handle must be denied"
+    );
+}
+
 /// ADR 0040 T3 — the grant sweep, offline: a persistent session that slept through
 /// a tightening reload loses the revoked grant at resume — the queued message only
 /// that grant admits is NOT replayed, and re-subscribing is denied.

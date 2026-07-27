@@ -320,6 +320,84 @@ async fn identity_substitution_scopes_topics() {
     assert_eq!(sub_silence(&mut alpha).await, None);
 }
 
+/// `%c` substitution scopes rules to the connecting client id (ADR 0004 T12). The
+/// discriminator here is that BOTH clients carry the *same* identity — so anything
+/// separating them can only have come from the client id reaching the authorizer.
+#[tokio::test]
+async fn client_id_substitution_scopes_topics_within_one_identity() {
+    let (addr, ids) = start_acl_node(
+        r#"
+        [[rules]]
+        actions = ["publish", "subscribe"]
+        topics = ["dev/%i/%c/#"]
+        "#,
+    )
+    .await;
+
+    ids.send(identity("fleet")).unwrap();
+    let mut one = Client::connect(addr, "sensor-1").await;
+    assert_eq!(
+        one.subscribe(&[
+            ("dev/fleet/sensor-1/#", QoS::AtMostOnce),
+            ("dev/fleet/sensor-2/#", QoS::AtMostOnce),
+        ])
+        .await,
+        vec![0x00, 0x80],
+        "a session may subscribe under its own client id only"
+    );
+
+    // Same identity, different client id: the grant moves with the session handle.
+    ids.send(identity("fleet")).unwrap();
+    let mut two = Client::connect(addr, "sensor-2").await;
+    assert_eq!(
+        two.subscribe(&[
+            ("dev/fleet/sensor-2/#", QoS::AtMostOnce),
+            ("dev/fleet/sensor-1/#", QoS::AtMostOnce),
+        ])
+        .await,
+        vec![0x00, 0x80],
+        "the same identity on another handle gets the other namespace, not both"
+    );
+
+    one.publish_qos1("dev/fleet/sensor-1/state", 1, b"mine")
+        .await;
+    match one.recv().await {
+        Some(Packet::Publish(p)) => assert_eq!(p.topic, "dev/fleet/sensor-1/state"),
+        other => panic!("expected own-handle delivery, got {other:?}"),
+    }
+    // Publishing into the sibling session's namespace is dropped (but acked).
+    one.publish_qos1("dev/fleet/sensor-2/state", 2, b"theirs")
+        .await;
+    assert_eq!(sub_silence(&mut two).await, None);
+}
+
+/// A client id carrying topic metacharacters must not broaden a `%c` grant. The id is
+/// chosen outright by the client, so this is the hostile-input case for T12.
+#[tokio::test]
+async fn a_wildcard_client_id_cannot_broaden_a_percent_c_grant() {
+    let (addr, ids) = start_acl_node(
+        r#"
+        [[rules]]
+        actions = ["publish", "subscribe"]
+        topics = ["dev/%c/#"]
+        "#,
+    )
+    .await;
+
+    ids.send(identity("fleet")).unwrap();
+    let mut evil = Client::connect(addr, "+").await;
+    assert_eq!(
+        evil.subscribe(&[
+            ("dev/+/#", QoS::AtMostOnce),
+            ("dev/victim/#", QoS::AtMostOnce),
+            ("dev/+", QoS::AtMostOnce),
+        ])
+        .await,
+        vec![0x80, 0x80, 0x80],
+        "a `+` client id must not expand dev/%c/# into a cross-session grant"
+    );
+}
+
 /// Deny rules use overlap semantics: denying `secret/#` blocks a broad `#`
 /// subscription outright, so wide filters cannot tunnel past denials.
 #[tokio::test]
