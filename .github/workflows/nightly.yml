@@ -124,7 +124,10 @@ jobs:
           # exist in a fresh checkout — and libFuzzer hard-errors on a missing
           # explicit corpus dir ("The required directory ... does not exist").
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo +nightly fuzz run ${{ matrix.target }} \
+          # No `+nightly` override: it would bypass the PINNED nightly installed
+          # above (the pin is the default toolchain; `+nightly` re-selects the
+          # floating channel and its ICE).
+          cargo fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=720
 
