@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-BROKERS = ["mqttd", "mosquitto", "emqx"]
+BROKERS = ["mqttd", "mosquitto", "emqx", "vernemq", "nanomq"]
 PCTS = [("p50", 0.50), ("p99", 0.99), ("p999", 0.999)]
 
 
@@ -111,6 +111,8 @@ def main() -> None:
     print(env.strip())
     print("```\n")
 
+    present = [b for b in BROKERS if (run / b).is_dir()]
+
     rows = [
         ("connects (plaintext)", lambda d: last_rate(d / "conn.log", "connect_succ")),
         ("connects (mTLS)", lambda d: last_rate(d / "tls-conn.log", "connect_succ")),
@@ -122,11 +124,28 @@ def main() -> None:
         ("mTLS qos1 recv", lambda d: recv_throughput(d / "tls-pubsub-qos1.sub.log")),
         ("mTLS qos1 e2e latency", lambda d: latency_percentiles(d / "tls-pubsub-qos1.prom")),
     ]
-    present = [b for b in BROKERS if (run / b).is_dir()]
+
+    # Saturate-mode ladder steps (sat-qos1-<label>.*), ordered by offered rate. The
+    # "sent" row is the driver's achieved publish rate — a step where it undershoots
+    # the offered rate is driver-limited and says nothing about the broker.
+    labels = sorted(
+        {p.name[len("sat-qos1-") : -len(".sub.log")] for b in present for p in (run / b).glob("sat-qos1-*.sub.log")},
+        key=lambda s: float(re.sub(r"[^\d.]", "", s) or 0),
+    )
+    for lab in labels:
+        rows += [
+            (f"sat @{lab} sent", lambda d, l=lab: last_rate(d / f"sat-qos1-{l}.log", "pub")),
+            (f"sat @{lab} recv", lambda d, l=lab: recv_throughput(d / f"sat-qos1-{l}.sub.log")),
+            (f"sat @{lab} latency", lambda d, l=lab: latency_percentiles(d / f"sat-qos1-{l}.prom")),
+        ]
+
     print("| metric | " + " | ".join(present) + " |")
     print("|---|" + "---|" * len(present))
     for name, fn in rows:
-        print(f"| {name} | " + " | ".join(fn(run / b) for b in present) + " |")
+        cells = [fn(run / b) for b in present]
+        if all(c == "—" for c in cells):  # scenario absent from this run mode
+            continue
+        print(f"| {name} | " + " | ".join(cells) + " |")
 
 
 if __name__ == "__main__":
