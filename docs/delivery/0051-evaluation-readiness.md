@@ -69,9 +69,9 @@ above · this file is the plan, progress log, and changelog.
 | **0051-T2** Secured quickstart | Copy-paste from a clean checkout to a TLS+mTLS+ACL node with a foreign client connected — and CI runs those exact commands. |
 | **0051-T3** Community surface | A first-time contributor and a first-time issue reporter each have a path; the changelog policy is written down. |
 | **0051-T4** v0.9.0 | ADR 0045 Accepted; the signed tag exists; every published artifact verifies per RELEASING.md (cosign, provenance, SBOM, reproduce). |
-| **0051-T5** Comparison | An expert from any of the three brokers can see in one read what they gain, what they lose, and which losses are on purpose. |
+| **0051-T5** Comparison | An expert from any of the four brokers can see in one read what they gain, what they lose, and which losses are on purpose. |
 | **0051-T6..T8** Migration | A working competitor config converts to a validating mqttd TOML, with every unconverted directive explained — proven by fixture tests per product. |
-| **0051-T9** NanoMQ benched | NanoMQ runs in the same harness under the same postures; the first honest numbers are in `docs/benchmarks/` linked from the README. |
+| **0051-T9** New brokers benched | NanoMQ and VerneMQ run in the same harness under disclosed postures (VerneMQ per the 0048 fairness terms); the first honest numbers are in `docs/benchmarks/` linked from the README. |
 | **0051-T10** Bridge assessable | Ten minutes with `demo/` shows a message crossing a security boundary under a deny-by-default rule — and the README shows the dashboard. |
 | **0051-T11** 1.0.0 | The freeze is a reviewed act on evidence: bake survived, skew smoke green, ADR 0038 checklist walked. |
 
