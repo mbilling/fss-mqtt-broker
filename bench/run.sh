@@ -2,7 +2,7 @@
 # ADR 0048 T1/T2 — comparative benchmark runner. Runs the SAME emqtt-bench scenarios
 # against one broker at a time (compose profile), capturing raw output per scenario:
 #
-#   ./run.sh                 # all brokers (mqttd, mosquitto, emqx), standard durations
+#   ./run.sh                 # all brokers (mqttd, mosquitto, emqx, vernemq, nanomq)
 #   ./run.sh smoke           # all brokers, seconds-long smoke pass (harness check)
 #   ./run.sh smoke mqttd     # one broker
 #
@@ -30,7 +30,7 @@ MODE="${1:-full}"
 ONLY="${2:-}"
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
 NET="mqttd-bench_default"
-BROKERS="${ONLY:-mqttd mosquitto emqx}"
+BROKERS="${ONLY:-mqttd mosquitto emqx vernemq nanomq}"
 CERTS="$PWD/tls/certs"
 
 # Scenario parameters (small enough for a laptop driver; a publishable run scales these
@@ -134,7 +134,7 @@ done
 	echo "date: $STAMP"
 	echo "mode: $MODE  duration=${DURATION}s conns=$CONNS conn_rate=$CONN_RATE pubs=$PUBS subs=$SUBS interval_ms=$INTERVAL_MS size=$SIZE"
 	echo "bench tool: $BENCH_IMG"
-	echo "brokers: mqttd=$(git -C .. rev-parse --short HEAD 2>/dev/null || echo '?') mosquitto=2.0.20 emqx=5.8.6"
+	echo "brokers: mqttd=$(git -C .. rev-parse --short HEAD 2>/dev/null || echo '?') mosquitto=2.0.20 emqx=5.8.6 vernemq=2.1.1 nanomq=0.25.5-slim"
 	echo "postures: plaintext/anonymous (1883) and TLS+required-client-certs (8883)"
 	echo "host: $(uname -sm) (DEV-GRADE unless a dedicated, documented bench host)"
 } >"$OUT/env.txt"

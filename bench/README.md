@@ -1,7 +1,8 @@
 # Comparative benchmark harness (ADR 0048)
 
 Reproducible, one-broker-at-a-time load harness comparing **mqttd** against
-**Mosquitto 2.0.20** and **EMQX 5.8.6**, driven by
+**Mosquitto 2.0.20**, **EMQX 5.8.6**, **VerneMQ 2.1.1**, and **NanoMQ 0.25.5**
+(the set widened per ADR 0048's amendments, 2026-07-27 and 2026-08-03), driven by
 [`emqtt-bench` 0.6.3](https://github.com/emqx/emqtt-bench) — deliberately **EMQX's own
 load tool**, so no home-field driver flatters us
 ([ADR 0048](../docs/adr/0048-comparative-benchmarking.md) §3).
@@ -55,9 +56,32 @@ Configs are each broker's documented reasonable minimum, committed here (`config
   manufacture false evidence (see the
   [2026-07-14 post-mortem](../docs/postmortems/2026-07-14-ha-bridge-durable-refused.md)).
   One small host per node, or the curve is not published.
-- **Losing dimensions get printed** (ADR 0048 §4): Mosquitto wins footprint; mTLS costs
-  connection setup; mqttd's durable-session capacity is bounded by the lease voter cap
-  (ADR 0021/0049). The results table says all of this next to whatever we win.
+- **Losing dimensions get printed** (ADR 0048 §4): Mosquitto and NanoMQ win footprint;
+  mTLS costs connection setup; mqttd's durable-session capacity is bounded by the lease
+  voter cap (ADR 0021/0049). The results table says all of this next to whatever we win.
+
+## Per-broker fairness notes (ADR 0048 amendment, 2026-08-03)
+
+- **VerneMQ 2.1.1** — the official image is EULA-licensed, free for testing; running it
+  here is testing. Its default persists queues to node-local LevelDB (single-node
+  durability; documented: offline messages on a dead node are lost) while mqttd's default
+  is quorum-replicated — the harness runs mqttd with `MQTTD_DURABLE_SESSIONS=0` for
+  like-for-like, and any durable-posture run is labeled as carrying a guarantee VerneMQ
+  does not offer. Fault scenarios (none in the current set) must state the partition
+  regime: VerneMQ's default fails closed cluster-wide on a detected netsplit. Pinning:
+  `latest` on Docker Hub is stale (digest-identical to 2.0.1) and 2.1.2+ are flagged
+  pre-release — 2.1.1 is the current stable.
+- **NanoMQ 0.25.5** — the `-slim` image variant is used for *both* postures: the default
+  variant is built without TLS, and switching variants between postures would compare two
+  different builds. NanoMQ's shipped config marks the inflight window
+  (`max_inflight_window`/`max_awaiting_rel`) "unsupported now", so its QoS 1/2 numbers are
+  not shaped by broker-side flow control the way every other broker's are — footnoted in
+  any table that prints them.
+- **EMQX pin is due for review at publication**: 5.8.6 is the last Apache-2.0 line,
+  EOL'd 2026-02-28; current EMQX is the BSL 1.1 single-distribution line (6.x — single
+  node free, no license key needed for this harness). Publishing numbers against an EOL'd
+  version would be its own honesty problem; the 0048-T4 publishable run re-pins by
+  maintainer decision.
 
 ## Harness lessons encoded
 

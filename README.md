@@ -211,6 +211,20 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
   in place; pushing the first `v0.x` tag cuts the first release — see
   [Install](#install) and [RELEASING.md](RELEASING.md).
 
+## How it compares
+
+The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
+and **VerneMQ** — including every cell we lose — is
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-03). The one-paragraph
+version:
+
+|  | mqttd's answer |
+|---|---|
+| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses). Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
+| Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
+| Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
+| Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery yet — and **no production track record**: the matrix says so in as many words. |
+
 ## Workspace layout
 
 | Crate | Responsibility |

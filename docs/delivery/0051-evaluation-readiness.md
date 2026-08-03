@@ -17,7 +17,9 @@ tasks:
     status: planned
   - id: 0051-T5
     title: docs/COMPARISON.md + condensed README matrix — Mosquitto / EMQX / NanoMQ / VerneMQ; every cell matched / exceeded / missing-by-design (with the deciding ADR) / missing-for-now (with the tracking task); versions pinned, claims dated, losses as prominent as wins
-    status: planned
+    status: done
+    date: 2026-08-03
+    evidence: "docs/COMPARISON.md (dated 2026-08-03; pinned: mosquitto 2.0.22/2.1.2, EMQX 6.2.2, NanoMQ 0.25.5, VerneMQ 2.1.1, mqttd 0.9.0-rc) + README 'How it compares' condensed table. Competitor cells from docs/changelogs/source researched 2026-07-29→08-03; mqttd cells verified against source (conn.rs: ResponseTopic/CorrelationData forwarded, Receive Maximum 0x93 enforced; codec-only: subscription identifiers NOT delivered, no ServerKeepAlive, no AssignedClientIdentifier — all printed as losses). Unverifiable competitor cells marked n/v, never guessed; by-design absences cite their ADRs (dashboard/HTTP-API per signal-driven-ops posture). Losses printed: footprint, maturity (no released version, no users — stated verbatim), subscription ids, assigned client id, voter-set-bounded durable capacity."
   - id: 0051-T6
     title: Migration from Mosquitto — scripts/migrate/from-mosquitto.py (mosquitto.conf → ADR 0046 TOML, acl_file → ACL TOML, bridge blocks → mqtt-bridge rules) + guide + fixture tests; loud unmapped report, secrets never transformed, output must pass --check-config
     status: planned
@@ -29,8 +31,8 @@ tasks:
     status: planned
   - id: 0051-T9
     title: NanoMQ and VerneMQ join the bench harness (amends ADR 0048's competitor set; VerneMQ under the disclosed-posture fairness terms in 0048's 2026-08-03 amendment) and the first comparative results are published to docs/benchmarks/ under 0048-T4's honesty rules
-    notes: "VerneMQ fairness: pair MQTTD_DURABLE_SESSIONS=0 against their unreplicated-queue default; label our durable-default posture as carrying a guarantee they do not offer; state the partition regime per scenario; pin their EULA'd (free-for-testing) image."
-    status: planned
+    status: in-progress
+    notes: "Harness wired 2026-08-03: compose profiles vernemq (vernemq/vernemq:2.1.1 — 'latest' is stale=2.0.1, 2.1.2+ are pre-releases; EULA accepted = testing use; env-mapped mTLS listener, require_certificate on) and nanomq (emqx/nanomq:0.25.5-slim — the smallest variant WITH TLS, same variant both postures; configs/nanomq.conf with verify_peer+fail_if_no_peer_cert), run.sh broker list + env.txt versions, bench/README fairness notes (VerneMQ node-local durable queues; NanoMQ inflight window unenforced; EMQX 5.8.6 pin flagged for re-review — last Apache line, EOL'd; current is BSL 6.x). NOT yet smoke-run: no docker daemon on the wiring machine — smoke is the next action on a docker host. Publication (the 0048-T4 gate) additionally needs the dedicated-host run and the maintainer's EMQX re-pin decision."
   - id: 0051-T10
     title: The bridge made assessable — a demo/ second security zone (Mosquitto upstream + mqtt-bridge with directional rules), a walkthrough doc, and the Grafana screenshot into the README
     status: planned
@@ -52,11 +54,11 @@ above · this file is the plan, progress log, and changelog.
 | 0051-T2 | ⬜ planned | — |  |
 | 0051-T3 | ⬜ planned | — |  |
 | 0051-T4 | ⬜ planned | — |  |
-| 0051-T5 | ⬜ planned | — |  |
+| 0051-T5 | ✅ done | 2026-08-03 | "docs/COMPARISON.md (dated 2026-08-03; pinned: mosquitto 2.0.22/2.1.2, EMQX 6.2.2, NanoMQ 0.25.5, VerneMQ 2.1.1, mqttd 0.9.0-rc) + README 'How it compares' condensed table. Competitor cells from docs/changelogs/source researched 2026-07-29→08-03; mqttd cells verified against source (conn.rs: ResponseTopic/CorrelationData forwarded, Receive Maximum 0x93 enforced; codec-only: subscription identifiers NOT delivered, no ServerKeepAlive, no AssignedClientIdentifier — all printed as losses). Unverifiable competitor cells marked n/v, never guessed; by-design absences cite their ADRs (dashboard/HTTP-API per signal-driven-ops posture). Losses printed: footprint, maturity (no released version, no users — stated verbatim), subscription ids, assigned client id, voter-set-bounded durable capacity." |
 | 0051-T6 | ⬜ planned | — |  |
 | 0051-T7 | ⬜ planned | — |  |
 | 0051-T8 | ⬜ planned | — |  |
-| 0051-T9 | ⬜ planned | — | "VerneMQ fairness: pair MQTTD_DURABLE_SESSIONS=0 against their unreplicated-queue default; label our durable-default posture as carrying a guarantee they do not offer; state the partition regime per scenario; pin their EULA'd (free-for-testing) image." |
+| 0051-T9 | 🚧 in-progress | — | "Harness wired 2026-08-03: compose profiles vernemq (vernemq/vernemq:2.1.1 — 'latest' is stale=2.0.1, 2.1.2+ are pre-releases; EULA accepted = testing use; env-mapped mTLS listener, require_certificate on) and nanomq (emqx/nanomq:0.25.5-slim — the smallest variant WITH TLS, same variant both postures; configs/nanomq.conf with verify_peer+fail_if_no_peer_cert), run.sh broker list + env.txt versions, bench/README fairness notes (VerneMQ node-local durable queues; NanoMQ inflight window unenforced; EMQX 5.8.6 pin flagged for re-review — last Apache line, EOL'd; current is BSL 6.x). NOT yet smoke-run: no docker daemon on the wiring machine — smoke is the next action on a docker host. Publication (the 0048-T4 gate) additionally needs the dedicated-host run and the maintainer's EMQX re-pin decision." |
 | 0051-T10 | ⬜ planned | — |  |
 | 0051-T11 | ⛔ blocked | — | "Needs v0.9.0 shipped (T4), a bake window survived, and a second tag (0.9.x/0.10) to make the 0039-T3 adjacent-skew smoke real — impossible before two releases exist by definition." |
 <!-- /status-table:0051 -->
@@ -110,3 +112,15 @@ maintainer's act, gated on the ADR 0044 checklist which is already green).
   Migration tooling (a from-vernemq converter) deliberately **not** added yet — pending a
   maintainer call on whether VerneMQ operators are a migration audience or a comparison
   audience only.
+- **2026-08-03** — T5 delivered and T9's harness half wired (maintainer: "implement the
+  amendment and add the comparison data"). `docs/COMPARISON.md` + README condensed matrix
+  land with pinned versions and printed losses; competitor research 2026-07-29→08-03
+  (VerneMQ arch + MQTT 5; NanoMQ; Mosquitto/EMQX/pinning verification), mqttd cells
+  verified in source — which surfaced three of our own gaps now printed as ✖ and worth
+  backlog consideration: **subscription-identifier delivery** (codec-only today),
+  **assigned client ids** (empty v5 id refused, not assigned), **Server Keep Alive**
+  (never sent). Licensing landscape shifted under the matrix: **EMQX is BSL 1.1 since
+  5.9** (single node free, clustering commercial, last Apache line 5.8 EOL'd 2026-02-28)
+  — bench's EMQX 5.8.6 pin flagged for re-review at publication. VerneMQ + NanoMQ compose
+  profiles, nanomq.conf, run.sh wiring, and bench/README fairness notes committed;
+  smoke pending a docker host (none on the wiring machine — honestly recorded in T9).
