@@ -27,8 +27,8 @@ the workspace sits at `0.9.0` with a `v0.9.0-rc` tag already cut.
 
 A release-readiness review (2026-07-27) therefore assessed the repository the way its first
 users will: as an **evaluator** — a newcomer deciding whether to look closer, and an expert
-Mosquitto/EMQX/NanoMQ operator deciding whether to switch. That lens found the gap is not
-the engineering but the **evaluation experience**:
+Mosquitto/EMQX/NanoMQ/VerneMQ operator deciding whether to switch. That lens found the gap
+is not the engineering but the **evaluation experience**:
 
 - **The finished bridge is invisible.** `mqtt-bridge` (ADR 0025, 11/11 tasks, standalone
   binary, deny-by-default directional rules, loop prevention, spool, HA) appears **zero
@@ -73,13 +73,18 @@ facts, the missing MSRV/platform/stability statements) plus the minimal communit
 The rest of the evaluation package lands during the 0.9.x bake. Releases are cheap now;
 every week at "no releases" costs more credibility than any missing polish.
 
-### 2. The named comparison set: Mosquitto, EMQX, NanoMQ
+### 2. The named comparison set: Mosquitto, EMQX, NanoMQ, VerneMQ
 
 One honest comparison (`docs/COMPARISON.md`, condensed into a README matrix) against the
-three brokers evaluators actually arrive from: **Mosquitto** (ubiquity), **EMQX** (the
-clustered incumbent), **NanoMQ** (the lightweight edge sibling). This widens ADR 0048's
-set — its alternatives said "widen if there is demand", and maintainer demand has arrived —
-so NanoMQ joins the **benchmark harness too**, not just the prose (amended in ADR 0048).
+brokers evaluators actually arrive from: **Mosquitto** (ubiquity), **EMQX** (the
+clustered incumbent), **NanoMQ** (the lightweight edge sibling), **VerneMQ** (the
+architectural cousin — the only other masterless-clustered open-source broker, and
+therefore the most informative head-to-head for the clustering and durability claims).
+This widens ADR 0048's set — its alternatives said "widen if there is demand", and
+maintainer demand has arrived, twice — so both join the **benchmark harness too**, not
+just the prose (amended in ADR 0048, which also records the VerneMQ fairness terms:
+non-comparable durability defaults disclosed, partition regimes stated, EULA'd test
+images pinned).
 
 Every cell is classified honestly: **matched**, **exceeded**, **missing by design** (with
 the ADR that decided it), or **missing for now** (with the tracking task). ADR 0048's
@@ -165,6 +170,8 @@ semantics (ADR 0039 applies from 1.0.0; ADR 0038's freeze regime until then).
   evaluator, precisely where switching friction decides the outcome. The scripts are small,
   testable against fixtures, and honest about their limits. Rejected as the default (guides
   alone remain the fallback for corners the scripts decline).
-- **A broader comparison set (HiveMQ, VerneMQ, rumqttd, …):** more maintenance for brokers
+- **A broader comparison set (HiveMQ, rumqttd, …):** more maintenance for brokers
   evaluators arrive from less often; ADR 0048's diminishing-returns argument stands. The
-  set widens to exactly NanoMQ, where demand exists; further only on further demand.
+  set has widened exactly where demand existed — NanoMQ (2026-07-27), then VerneMQ
+  (2026-08-03, after the architecture analysis made its head-to-head value concrete);
+  further only on further demand.

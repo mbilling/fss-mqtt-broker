@@ -16,7 +16,7 @@ tasks:
     title: Cut v0.9.0 — flip ADR 0045 to Accepted, maintainer pushes the signed tag per RELEASING.md, verify the pipeline's artifacts end to end (first real signatures + SBOM complete 0045-T3/T5)
     status: planned
   - id: 0051-T5
-    title: docs/COMPARISON.md + condensed README matrix — Mosquitto / EMQX / NanoMQ; every cell matched / exceeded / missing-by-design (with the deciding ADR) / missing-for-now (with the tracking task); versions pinned, claims dated, losses as prominent as wins
+    title: docs/COMPARISON.md + condensed README matrix — Mosquitto / EMQX / NanoMQ / VerneMQ; every cell matched / exceeded / missing-by-design (with the deciding ADR) / missing-for-now (with the tracking task); versions pinned, claims dated, losses as prominent as wins
     status: planned
   - id: 0051-T6
     title: Migration from Mosquitto — scripts/migrate/from-mosquitto.py (mosquitto.conf → ADR 0046 TOML, acl_file → ACL TOML, bridge blocks → mqtt-bridge rules) + guide + fixture tests; loud unmapped report, secrets never transformed, output must pass --check-config
@@ -28,7 +28,8 @@ tasks:
     title: Migration from NanoMQ — scripts/migrate/from-nanomq.py (listeners, TLS, auth, bridge config → common-subset TOML) + guide + fixture tests; same three converter rules
     status: planned
   - id: 0051-T9
-    title: NanoMQ joins the bench harness (amends ADR 0048's competitor set) and the first comparative results are published to docs/benchmarks/ under 0048-T4's honesty rules
+    title: NanoMQ and VerneMQ join the bench harness (amends ADR 0048's competitor set; VerneMQ under the disclosed-posture fairness terms in 0048's 2026-08-03 amendment) and the first comparative results are published to docs/benchmarks/ under 0048-T4's honesty rules
+    notes: "VerneMQ fairness: pair MQTTD_DURABLE_SESSIONS=0 against their unreplicated-queue default; label our durable-default posture as carrying a guarantee they do not offer; state the partition regime per scenario; pin their EULA'd (free-for-testing) image."
     status: planned
   - id: 0051-T10
     title: The bridge made assessable — a demo/ second security zone (Mosquitto upstream + mqtt-bridge with directional rules), a walkthrough doc, and the Grafana screenshot into the README
@@ -55,7 +56,7 @@ above · this file is the plan, progress log, and changelog.
 | 0051-T6 | ⬜ planned | — |  |
 | 0051-T7 | ⬜ planned | — |  |
 | 0051-T8 | ⬜ planned | — |  |
-| 0051-T9 | ⬜ planned | — |  |
+| 0051-T9 | ⬜ planned | — | "VerneMQ fairness: pair MQTTD_DURABLE_SESSIONS=0 against their unreplicated-queue default; label our durable-default posture as carrying a guarantee they do not offer; state the partition regime per scenario; pin their EULA'd (free-for-testing) image." |
 | 0051-T10 | ⬜ planned | — |  |
 | 0051-T11 | ⛔ blocked | — | "Needs v0.9.0 shipped (T4), a bake window survived, and a second tag (0.9.x/0.10) to make the 0039-T3 adjacent-skew smoke real — impossible before two releases exist by definition." |
 <!-- /status-table:0051 -->
@@ -95,3 +96,17 @@ maintainer's act, gated on the ADR 0044 checklist which is already green).
   during the bake, keep `1.0.0` as the conscious ADR 0038 freeze. Maintainer widened the
   comparison set to include **NanoMQ** (benchmark + matrix + migration), triggering ADR
   0048's "widen if there is demand" clause — recorded there as an amendment.
+- **2026-08-03** — Second widening: **VerneMQ** joins the benchmark and comparison set
+  (maintainer decision, informed by the 2026-07-29 VerneMQ architecture + MQTT 5 analysis:
+  masterless clustering makes it the closest structural neighbor and the most informative
+  head-to-head for the clustering/durability claims). Fairness terms recorded in ADR
+  0048's 2026-08-03 amendment: durability postures disclosed (their queues are node-local
+  and unreplicated — like-for-like pairs our in-memory opt-out against their default),
+  partition regime stated per scenario (their default fails closed on netsplit), pinned
+  EULA'd image (free for testing). T5/T9 widened accordingly. Comparison-matrix rows
+  already drafted from the analysis: durable sessions across node loss, cross-node
+  backpressure vs bounded-buffer drop, partition behavior, built-in vs plugin enhanced
+  auth, binary licensing (their packages are paywalled since 1.10; ours signed and free).
+  Migration tooling (a from-vernemq converter) deliberately **not** added yet — pending a
+  maintainer call on whether VerneMQ operators are a migration audience or a comparison
+  audience only.
