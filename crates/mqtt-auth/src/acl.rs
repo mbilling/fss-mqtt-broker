@@ -14,8 +14,7 @@
 //!                               # (client-id rule); the two kinds don't mix
 //! effect = "allow"              # optional; "allow" (default) or "deny"
 //! topics = ["devices/%i/#"]     # MQTT filter patterns; %i substitutes the
-//!                               # identity subject (%c is deferred until the
-//!                               # Authorizer trait carries the client id)
+//!                               # identity subject, %c the client id
 //!
 //! [[rules]]                     # a connect rule (ADR 0031): which client ids
 //! identities = ["tenant-a-*"]   # an identity may claim
@@ -31,6 +30,40 @@
 //! client ids per tenant. This is layered on top of the secure-by-default session-owner guard
 //! (which binds a session to its creator with no configuration).
 //!
+//! ## Substitution: `%i` and `%c` (ADR 0004 T12)
+//! In `topics` patterns, `%i` expands to the identity subject and `%c` to the connecting
+//! client id. Both fail closed: an empty value, or one containing `/`, `+` or `#`, makes
+//! the pattern unusable — an **allow** then grants nothing and a **deny** refuses the
+//! action outright. A rule is only exposed to a placeholder it actually names, so a
+//! hostile client id cannot spoil a rule that never says `%c`.
+//!
+//! **`%i` and `%c` are not interchangeable, and `%c` is the weaker of the two.** The
+//! subject is established by the server (a verified certificate field, a password
+//! record, a token claim); the client id is chosen outright by the client. The
+//! session-owner guard (ADR 0031) stops a client from *taking over another identity's*
+//! session, but nothing stops it from picking any unused id it likes. So
+//! `topics = ["dev/%c/#"]` scopes a grant to the **session handle**, not to a principal:
+//! absent other constraints it grants the union over every id that client could choose.
+//!
+//! Use `%c` to separate a principal's own sessions (per-device telemetry under one fleet
+//! identity, say), not as a tenant boundary. To make it an isolation boundary, pair it
+//! with a `connect` rule that constrains which ids the identity may claim — then the
+//! reachable set of `%c` values is exactly what the policy admits:
+//! ```toml
+//! [[rules]]                          # only these ids are claimable...
+//! identities = ["fleet-a"]
+//! actions = ["connect"]
+//! clients = ["fleet-a-*"]
+//!
+//! [[rules]]                          # ...so %c can only expand within them
+//! identities = ["fleet-a"]
+//! actions = ["publish"]
+//! topics = ["telemetry/%c/#"]
+//! ```
+//! `%c` is rejected in a `connect` rule's `clients` globs: there it would match the
+//! client id against itself and allow every id, which is the opposite of what such a
+//! rule is for.
+//!
 //! ## Decision semantics
 //! Among the rules matching the principal and action: any matching **deny**
 //! rule wins; otherwise any matching **allow** rule permits; otherwise the
@@ -45,7 +78,7 @@
 //! Publish targets are concrete topics and use plain MQTT filter matching.
 
 use crate::{Action, Authorizer, Identity};
-use mqtt_core::{TopicFilter, TopicName};
+use mqtt_core::{ClientId, TopicFilter, TopicName};
 use serde::Deserialize;
 
 /// Errors from parsing or validating an ACL policy.
@@ -199,28 +232,24 @@ impl AclPolicy {
     /// Applies the documented decision order: among rules matching the
     /// principal and action, any deny hit refuses, else any allow hit
     /// permits, else the policy default applies.
-    fn evaluate(&self, identity: &Identity, action: Action, target: &str) -> bool {
+    fn evaluate(&self, identity: &Identity, client_id: &str, action: Action, target: &str) -> bool {
         let mut allow_hit = false;
         for rule in &self.rules {
             if !rule.applies_to(action) || !rule.matches_principal(identity) {
                 continue;
             }
             for pattern in &rule.topics {
-                // `%i` substitution fails closed (ADR 0004): the subject is an
-                // untrusted certificate CN, and substituting one that carries
-                // topic metacharacters could broaden the pattern across
-                // namespaces. When it cannot be substituted safely, an allow
-                // grants nothing and a deny denies the action outright.
-                let pattern = if pattern.contains("%i") {
-                    if subject_safe_for_substitution(&identity.subject) {
-                        pattern.replace("%i", &identity.subject)
-                    } else if rule.effect == Effect::Deny {
+                // `%i`/`%c` substitution fails closed (ADR 0004): both values are
+                // untrusted — the subject is a certificate CN or SAN, the client id is
+                // chosen outright by the client — and substituting one that carries
+                // topic metacharacters could broaden the pattern across namespaces.
+                // When a pattern cannot be substituted safely, an allow grants nothing
+                // and a deny denies the action outright.
+                let Some(pattern) = substitute(pattern, &identity.subject, client_id) else {
+                    if rule.effect == Effect::Deny {
                         return false;
-                    } else {
-                        continue;
                     }
-                } else {
-                    pattern.clone()
+                    continue;
                 };
                 let hit = match (action, rule.effect) {
                     // Publish targets are concrete topics: plain matching.
@@ -262,9 +291,11 @@ impl AclPolicy {
             }
             for pattern in &rule.clients {
                 // `%i` substitution fails closed, as for topics: an unsubstitutable subject
-                // grants nothing on an allow and refuses outright on a deny.
+                // grants nothing on an allow and refuses outright on a deny. `%c` is not
+                // substituted here — matching the client id against itself always succeeds,
+                // so it is rejected at validation rather than silently allowing everything.
                 let pattern = if pattern.contains("%i") {
-                    if subject_safe_for_substitution(&identity.subject) {
+                    if safe_for_substitution(&identity.subject) {
                         pattern.replace("%i", &identity.subject)
                     } else if rule.effect == Effect::Deny {
                         return false;
@@ -287,11 +318,57 @@ impl AclPolicy {
     }
 }
 
-/// Whether `subject` is a single, wildcard-free topic level safe to substitute
-/// for `%i`. An empty subject, or one containing a level separator or a topic
-/// wildcard, is not — substituting it could broaden a rule across namespaces.
-fn subject_safe_for_substitution(subject: &str) -> bool {
-    !subject.is_empty() && !subject.contains(['/', '+', '#'])
+/// Expand `%i` (identity subject) and `%c` (client id) in a pattern, or `None` if the
+/// pattern names a placeholder whose value is unsafe to substitute.
+///
+/// A pattern mentioning neither placeholder is returned unchanged. A pattern is only
+/// rejected for the placeholders it actually uses: a hostile client id cannot poison a
+/// rule that never says `%c`.
+/// Substitution is a **single left-to-right pass**: substituted text is never rescanned
+/// for further placeholders. Doing it as two `replace` passes would let a subject of
+/// literally `%c` expand into the client id — letting the client, not the policy, choose
+/// the namespace — and the flaw would be silently one-directional (whichever placeholder
+/// is expanded first). Here a `%` in a value is inert.
+fn substitute(pattern: &str, subject: &str, client_id: &str) -> Option<String> {
+    if !pattern.contains('%') {
+        return Some(pattern.to_string());
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let at = &rest[i..];
+        let value = if at.starts_with("%i") {
+            Some(subject)
+        } else if at.starts_with("%c") {
+            Some(client_id)
+        } else {
+            None
+        };
+        match value {
+            // A pattern is only exposed to the placeholders it actually names, so a
+            // hostile client id cannot poison a rule that never says `%c`.
+            Some(v) if !safe_for_substitution(v) => return None,
+            Some(v) => {
+                out.push_str(v);
+                rest = &at[2..];
+            }
+            // Not a placeholder: `%` is an ordinary character in a topic.
+            None => {
+                out.push('%');
+                rest = &at[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Whether `value` is a single, wildcard-free topic level safe to substitute for `%i`
+/// or `%c`. An empty value, or one containing a level separator or a topic wildcard, is
+/// not — substituting it could broaden a rule across namespaces.
+fn safe_for_substitution(value: &str) -> bool {
+    !value.is_empty() && !value.contains(['/', '+', '#'])
 }
 
 fn validate_rule(index: usize, raw: RawRule) -> Result<Rule, AclError> {
@@ -343,6 +420,15 @@ fn validate_rule(index: usize, raw: RawRule) -> Result<Rule, AclError> {
                 "rule {index}: a `connect` rule must list `clients`"
             )));
         }
+        // `%c` here would match the client id against itself and always succeed, so a
+        // rule meant to *constrain* which ids an identity may claim would silently
+        // permit every id. Refuse the policy rather than accept a tautology (ADR 0004 T12).
+        if raw.clients.iter().any(|c| c.contains("%c")) {
+            return Err(AclError::Invalid(format!(
+                "rule {index}: `%c` is meaningless in `clients` (it matches the client id \
+                 against itself and would allow every id); use a literal glob or `%i`"
+            )));
+        }
     } else {
         if !raw.clients.is_empty() {
             return Err(AclError::Invalid(format!(
@@ -369,13 +455,23 @@ fn validate_rule(index: usize, raw: RawRule) -> Result<Rule, AclError> {
 }
 
 impl Authorizer for AclPolicy {
-    fn authorize_publish(&self, identity: &Identity, topic: &TopicName) -> bool {
-        self.evaluate(identity, Action::Publish, topic)
+    fn authorize_publish(
+        &self,
+        identity: &Identity,
+        client_id: &ClientId,
+        topic: &TopicName,
+    ) -> bool {
+        self.evaluate(identity, &client_id.0, Action::Publish, topic)
     }
-    fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool {
-        self.evaluate(identity, Action::Subscribe, filter)
+    fn authorize_subscribe(
+        &self,
+        identity: &Identity,
+        client_id: &ClientId,
+        filter: &TopicFilter,
+    ) -> bool {
+        self.evaluate(identity, &client_id.0, Action::Subscribe, filter)
     }
-    fn authorize_connect(&self, identity: &Identity, client_id: &mqtt_core::ClientId) -> bool {
+    fn authorize_connect(&self, identity: &Identity, client_id: &ClientId) -> bool {
         self.evaluate_connect(identity, &client_id.0)
     }
 }
@@ -384,6 +480,7 @@ impl Authorizer for AclPolicy {
 mod tests {
     use super::{AclError, AclPolicy};
     use crate::{Authorizer, Identity};
+    use mqtt_core::ClientId;
 
     fn ident(subject: &str, groups: &[&str]) -> Identity {
         Identity {
@@ -399,12 +496,24 @@ mod tests {
         }
     }
 
+    /// The client id used by tests that are not about `%c`. Deliberately a value that
+    /// would be *visible* if it ever leaked into a pattern that never named `%c`.
+    const ANY_CLIENT: &str = "some-client";
+
     fn can_pub(p: &AclPolicy, id: &Identity, topic: &str) -> bool {
-        p.authorize_publish(id, &topic.to_string())
+        can_pub_as(p, id, ANY_CLIENT, topic)
     }
 
     fn can_sub(p: &AclPolicy, id: &Identity, filter: &str) -> bool {
-        p.authorize_subscribe(id, &filter.to_string())
+        can_sub_as(p, id, ANY_CLIENT, filter)
+    }
+
+    fn can_pub_as(p: &AclPolicy, id: &Identity, client: &str, topic: &str) -> bool {
+        p.authorize_publish(id, &ClientId(client.to_string()), &topic.to_string())
+    }
+
+    fn can_sub_as(p: &AclPolicy, id: &Identity, client: &str, filter: &str) -> bool {
+        p.authorize_subscribe(id, &ClientId(client.to_string()), &filter.to_string())
     }
 
     // ----- parse / validation failures -----
@@ -680,6 +789,223 @@ mod tests {
         assert!(!can_sub(&p, &alpha, "dev/beta/#"));
         // Coverage, not overlap: a broader filter is refused outright.
         assert!(!can_sub(&p, &alpha, "dev/#"));
+    }
+
+    // ----- %c substitution (ADR 0004 T12) -----
+
+    #[test]
+    fn percent_c_scopes_topics_to_the_client_id() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["publish", "subscribe"]
+            topics = ["dev/%c/#"]
+            "#,
+        )
+        .unwrap();
+        let id = ident("alpha", &[]);
+        assert!(can_pub_as(&p, &id, "probe-1", "dev/probe-1/x"));
+        assert!(!can_pub_as(&p, &id, "probe-1", "dev/probe-2/x"));
+        assert!(can_sub_as(&p, &id, "probe-1", "dev/probe-1/#"));
+        assert!(!can_sub_as(&p, &id, "probe-1", "dev/probe-2/#"));
+        // Coverage, not overlap, exactly as for `%i`.
+        assert!(!can_sub_as(&p, &id, "probe-1", "dev/#"));
+    }
+
+    /// The whole point of T12: one identity, two sessions, disjoint grants. Without
+    /// `%c` a per-session split is inexpressible — `%i` is the same for both.
+    #[test]
+    fn one_identity_two_client_ids_get_disjoint_grants() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["publish"]
+            topics = ["telemetry/%i/%c"]
+            "#,
+        )
+        .unwrap();
+        let fleet = ident("fleet-a", &[]);
+        assert!(can_pub_as(
+            &p,
+            &fleet,
+            "sensor-1",
+            "telemetry/fleet-a/sensor-1"
+        ));
+        assert!(!can_pub_as(
+            &p,
+            &fleet,
+            "sensor-1",
+            "telemetry/fleet-a/sensor-2"
+        ));
+        assert!(can_pub_as(
+            &p,
+            &fleet,
+            "sensor-2",
+            "telemetry/fleet-a/sensor-2"
+        ));
+        // The identity half still binds: another subject cannot reach this namespace.
+        assert!(!can_pub_as(
+            &p,
+            &ident("fleet-b", &[]),
+            "sensor-1",
+            "telemetry/fleet-a/sensor-1"
+        ));
+    }
+
+    /// Client ids are chosen outright by the client — the most attacker-controlled
+    /// value the engine substitutes. A metacharacter must not broaden the grant.
+    #[test]
+    fn a_hostile_client_id_cannot_broaden_a_grant() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["publish", "subscribe"]
+            topics = ["dev/%c/#"]
+            "#,
+        )
+        .unwrap();
+        let id = ident("alpha", &[]);
+        for hostile in ["+", "#", "a/b", ""] {
+            assert!(
+                !can_sub_as(&p, &id, hostile, "dev/+/#"),
+                "client id {hostile:?} must not turn dev/%c/# into a wildcard grant"
+            );
+            assert!(
+                !can_sub_as(&p, &id, hostile, "dev/other/#"),
+                "client id {hostile:?} must not reach another client's namespace"
+            );
+            assert!(
+                !can_pub_as(&p, &id, hostile, "dev/other/x"),
+                "client id {hostile:?} must not publish into another namespace"
+            );
+        }
+    }
+
+    /// Failing closed cuts both ways: on a **deny** rule an unsubstitutable client id
+    /// refuses the action outright rather than letting the deny evaporate.
+    #[test]
+    fn an_unsubstitutable_client_id_makes_a_deny_refuse_outright() {
+        let p = AclPolicy::from_toml_str(
+            r##"
+            [[rules]]
+            actions = ["publish"]
+            topics = ["#"]
+
+            [[rules]]
+            actions = ["publish"]
+            effect = "deny"
+            topics = ["dev/%c/secret"]
+            "##,
+        )
+        .unwrap();
+        let id = ident("alpha", &[]);
+        // A well-formed id: the deny applies to its own namespace only.
+        assert!(!can_pub_as(&p, &id, "probe-1", "dev/probe-1/secret"));
+        assert!(can_pub_as(&p, &id, "probe-1", "dev/probe-1/public"));
+        // A hostile id cannot dodge the deny by making it unsubstitutable.
+        assert!(!can_pub_as(&p, &id, "a/b", "dev/probe-1/public"));
+    }
+
+    /// A rule that never names `%c` is untouched by an unsubstitutable client id —
+    /// failing closed is scoped to the placeholder actually used, so one bad session
+    /// handle cannot take down unrelated grants.
+    #[test]
+    fn a_bad_client_id_does_not_disturb_rules_that_never_use_it() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["publish", "subscribe"]
+            topics = ["shared/#", "dev/%i/#"]
+            "#,
+        )
+        .unwrap();
+        let id = ident("alpha", &[]);
+        assert!(can_pub_as(&p, &id, "+", "shared/x"));
+        assert!(can_pub_as(&p, &id, "a/b", "dev/alpha/x"));
+    }
+
+    /// Substitution does not rescan its own output. A subject of literally `%c` must
+    /// stay the literal text `%c`, not expand into the client id — otherwise the client
+    /// would pick the namespace a `%i` rule resolves to.
+    #[test]
+    fn a_substituted_value_is_never_rescanned_for_placeholders() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["publish"]
+            topics = ["dev/%i/#"]
+            "#,
+        )
+        .unwrap();
+        // Subject is the literal "%c" — legal (no `/`, `+`, `#`), so the rule expands
+        // to `dev/%c/#` and stops there.
+        let tricky = ident("%c", &[]);
+        assert!(
+            can_pub_as(&p, &tricky, "chosen", "dev/%c/x"),
+            "the pattern must resolve to the literal namespace dev/%c"
+        );
+        assert!(
+            !can_pub_as(&p, &tricky, "chosen", "dev/chosen/x"),
+            "a %c in the SUBJECT must not expand into the client id"
+        );
+    }
+
+    /// A `%` that starts no placeholder is an ordinary topic character, and an unknown
+    /// `%x` is left alone rather than silently swallowed.
+    #[test]
+    fn a_bare_percent_is_literal() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            actions = ["publish"]
+            topics = ["odd/100%/%x/%i"]
+            "#,
+        )
+        .unwrap();
+        assert!(can_pub(&p, &ident("alpha", &[]), "odd/100%/%x/alpha"));
+    }
+
+    /// `%c` in a `connect` rule's `clients` glob would match the client id against
+    /// itself and allow every id — the opposite of what the rule is for.
+    #[test]
+    fn percent_c_is_rejected_in_connect_client_globs() {
+        let msg = err_msg(
+            r#"
+            [[rules]]
+            actions = ["connect"]
+            clients = ["tenant-a/%c"]
+            "#,
+        );
+        assert!(
+            msg.contains("%c"),
+            "message should name the offending placeholder: {msg}"
+        );
+    }
+
+    /// The documented way to make `%c` an isolation boundary: a connect rule fixes the
+    /// set of claimable ids, so the reachable `%c` values are exactly what it admits.
+    #[test]
+    fn a_connect_rule_bounds_the_client_ids_percent_c_can_expand_to() {
+        let p = AclPolicy::from_toml_str(
+            r#"
+            [[rules]]
+            identities = ["fleet-a"]
+            actions = ["connect"]
+            clients = ["fleet-a-*"]
+
+            [[rules]]
+            identities = ["fleet-a"]
+            actions = ["publish"]
+            topics = ["telemetry/%c/#"]
+            "#,
+        )
+        .unwrap();
+        let fleet = ident("fleet-a", &[]);
+        assert!(p.authorize_connect(&fleet, &ClientId("fleet-a-1".into())));
+        // An id outside the connect glob never gets a session, so `telemetry/evil/#`
+        // is unreachable even though the topic rule alone would have expanded to it.
+        assert!(!p.authorize_connect(&fleet, &ClientId("evil".into())));
+        assert!(can_pub_as(&p, &fleet, "fleet-a-1", "telemetry/fleet-a-1/x"));
     }
 
     // ----- deny precedence and asymmetric topic tests -----

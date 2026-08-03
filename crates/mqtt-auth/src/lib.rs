@@ -105,11 +105,28 @@ pub trait Authenticator: Send + Sync {
 }
 
 /// Decides whether an authenticated [`Identity`] may perform an [`Action`] on a topic.
+///
+/// Every decision carries both halves of the principal: *who* the client is
+/// ([`Identity`], server-established) and *which session handle* it is using
+/// ([`ClientId`], client-chosen). Policies substitute the first as `%i` and the second
+/// as `%c` (ADR 0004 T12). The two are not interchangeable — see
+/// [`acl`](crate::acl) for why `%c` alone is a namespacing convenience rather than an
+/// isolation boundary.
 pub trait Authorizer: Send + Sync {
     /// Returns `true` if the action is permitted. Default policy should be deny.
-    fn authorize_publish(&self, identity: &Identity, topic: &TopicName) -> bool;
+    fn authorize_publish(
+        &self,
+        identity: &Identity,
+        client_id: &ClientId,
+        topic: &TopicName,
+    ) -> bool;
     /// Returns `true` if subscribing to `filter` is permitted.
-    fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool;
+    fn authorize_subscribe(
+        &self,
+        identity: &Identity,
+        client_id: &ClientId,
+        filter: &TopicFilter,
+    ) -> bool;
 
     /// Returns `true` if `identity` may connect with `client_id` (ADR 0031 option B — the
     /// optional connect ACL that constrains *which* client ids an identity may claim, e.g. a
@@ -130,10 +147,10 @@ pub trait Authorizer: Send + Sync {
 pub struct AllowAll;
 
 impl Authorizer for AllowAll {
-    fn authorize_publish(&self, _identity: &Identity, _topic: &TopicName) -> bool {
+    fn authorize_publish(&self, _id: &Identity, _client: &ClientId, _topic: &TopicName) -> bool {
         true
     }
-    fn authorize_subscribe(&self, _identity: &Identity, _filter: &TopicFilter) -> bool {
+    fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &TopicFilter) -> bool {
         true
     }
 }
@@ -143,10 +160,10 @@ impl Authorizer for AllowAll {
 pub struct DenyAll;
 
 impl Authorizer for DenyAll {
-    fn authorize_publish(&self, _identity: &Identity, _topic: &TopicName) -> bool {
+    fn authorize_publish(&self, _id: &Identity, _client: &ClientId, _topic: &TopicName) -> bool {
         false
     }
-    fn authorize_subscribe(&self, _identity: &Identity, _filter: &TopicFilter) -> bool {
+    fn authorize_subscribe(&self, _id: &Identity, _client: &ClientId, _f: &TopicFilter) -> bool {
         false
     }
 }
@@ -162,8 +179,9 @@ mod tests {
             groups: vec![],
         };
         let z = DenyAll;
-        assert!(!z.authorize_publish(&id, &"a/b".to_string()));
-        assert!(!z.authorize_subscribe(&id, &"a/#".to_string()));
+        let c = ClientId("c".into());
+        assert!(!z.authorize_publish(&id, &c, &"a/b".to_string()));
+        assert!(!z.authorize_subscribe(&id, &c, &"a/#".to_string()));
     }
 
     /// The allow path through the trait object: a custom policy can grant
@@ -173,12 +191,11 @@ mod tests {
     fn custom_authorizer_allow_path_works_through_the_trait() {
         struct PrefixPolicy;
         impl Authorizer for PrefixPolicy {
-            fn authorize_publish(&self, identity: &Identity, topic: &TopicName) -> bool {
-                topic.starts_with(&format!("users/{}/", identity.subject))
+            fn authorize_publish(&self, id: &Identity, c: &ClientId, topic: &TopicName) -> bool {
+                topic.starts_with(&format!("users/{}/{}/", id.subject, c.0))
             }
-            fn authorize_subscribe(&self, identity: &Identity, filter: &TopicFilter) -> bool {
-                identity.groups.iter().any(|g| g == "readers")
-                    || self.authorize_publish(identity, filter)
+            fn authorize_subscribe(&self, id: &Identity, c: &ClientId, f: &TopicFilter) -> bool {
+                id.groups.iter().any(|g| g == "readers") || self.authorize_publish(id, c, f)
             }
         }
 
@@ -191,10 +208,15 @@ mod tests {
             groups: vec!["readers".into()],
         };
         let z: &dyn Authorizer = &PrefixPolicy;
+        let laptop = ClientId("laptop".into());
+        let phone = ClientId("phone".into());
 
-        assert!(z.authorize_publish(&alice, &"users/alice/state".to_string()));
-        assert!(!z.authorize_publish(&alice, &"users/eve/state".to_string()));
-        assert!(z.authorize_subscribe(&reader, &"anything/#".to_string()));
-        assert!(!z.authorize_subscribe(&alice, &"anything/#".to_string()));
+        assert!(z.authorize_publish(&alice, &laptop, &"users/alice/laptop/state".to_string()));
+        assert!(!z.authorize_publish(&alice, &laptop, &"users/eve/laptop/state".to_string()));
+        // Both halves of the principal bind independently: the right identity on the
+        // wrong session handle is refused just as the wrong identity is.
+        assert!(!z.authorize_publish(&alice, &phone, &"users/alice/laptop/state".to_string()));
+        assert!(z.authorize_subscribe(&reader, &laptop, &"anything/#".to_string()));
+        assert!(!z.authorize_subscribe(&alice, &laptop, &"anything/#".to_string()));
     }
 }

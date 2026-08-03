@@ -78,7 +78,10 @@ docs; the load-bearing decisions:
   neither cover nor overlap `$`-rooted filters.
 - **Principals:** any-of `identities` globs (`*` only, byte-wise, literal
   otherwise) or any-of `groups`; both empty = everyone.
-- **`%i`** substitutes the identity subject in rule topics at evaluation time.
+- **`%i`** substitutes the identity subject and **`%c`** the client id in rule topics at
+  evaluation time. Both fail closed on an empty value or one carrying `/`, `+` or `#`:
+  an allow then grants nothing, a deny refuses outright. See the T12 amendment below for
+  why the two are not interchangeable.
 - **Enforcement:** SUBSCRIBE → per-filter 0x80, denied filters never reach the
   hub (so retained replay is implicitly gated); PUBLISH → dropped but still
   acknowledged per `QoS` (3.1.1 has no negative PUBACK; not acking strands
@@ -144,3 +147,47 @@ built rather than deferred:
   trait plumbing this record already anticipated in points 1 and 2.
 - **Per-listener auth policies** remain deferred, and will need their own record: they
   are a change to the shape of the listener configuration (ADR 0046), not a flag.
+
+### Amendment (2026-07-27): `%c` is a namespacing tool, not an isolation boundary (T12)
+
+`%c` substitution now ships, and the `Authorizer` trait carries the `ClientId` at every
+decision point — SUBSCRIBE, PUBLISH, the will check at CONNECT, and ADR 0040's grant
+sweep, where each session's grants are re-checked under *its own* handle.
+
+The thing worth recording is what `%c` is **not**. `%i` and `%c` look symmetric in a
+policy file and are not:
+
+| | `%i` | `%c` |
+|---|---|---|
+| Value | identity subject | client id |
+| Chosen by | the **server** (verified cert field, password record, token claim) | the **client**, freely |
+| Bounded by | authentication | nothing, by default |
+
+ADR 0031's session-owner guard stops a client from taking over *another identity's*
+session, but nothing stops it from claiming any unused id it likes. So a rule granting
+`dev/%c/#` does not confine a principal to one namespace — it grants the union over
+every id that principal could choose. `%c` separates a principal's *own* sessions (per
+device under one fleet identity); it is not a tenant boundary.
+
+It becomes one only in combination: a `connect` rule (ADR 0031 option B) fixes the set of
+claimable ids, and the reachable `%c` values are then exactly what that rule admits. The
+`acl` module documents the pairing, and a test pins it.
+
+Two consequences follow, both implemented:
+
+- **Substitution fails closed per placeholder.** An empty value, or one carrying `/`,
+  `+` or `#`, makes a pattern unusable: an allow grants nothing, a deny refuses outright.
+  This matters more for `%c` than `%i` — the client id is fully attacker-chosen, and the
+  broker accepts any non-empty UTF-8 id. A rule is only exposed to the placeholders it
+  actually names, so a hostile id cannot spoil rules that never say `%c`.
+- **`%c` is rejected in a `connect` rule's `clients` globs.** There it would match the
+  client id against itself and allow every id — a rule written to constrain would
+  silently permit. That is a policy-validation error, not a runtime surprise.
+- **Substitution is a single left-to-right pass; substituted text is never rescanned.**
+  Implementing it as two `replace` passes (`%i`, then `%c`) is the obvious approach and
+  is wrong: a subject of literally `%c` — legal, since it carries no `/`, `+` or `#` —
+  makes `dev/%i/#` expand to `dev/%c/#` and then to `dev/<client-id>/#`, so the *client*
+  chooses the namespace of a rule that never mentioned `%c`. The flaw is also
+  one-directional in whichever order the passes run, which is exactly the kind of
+  asymmetry that survives review. In the single pass a `%` inside a substituted value is
+  an ordinary character.

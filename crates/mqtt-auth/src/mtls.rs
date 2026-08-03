@@ -479,14 +479,17 @@ mod tests {
         let id = identity_from_cert_with(&der, IdentitySource::SanUri).expect("URI SAN");
         // The pattern is unusable for this subject, so the rule grants nothing at all —
         // it must never expand into extra topic levels.
+        let client = mqtt_core::ClientId("device-1".into());
         assert!(!crate::Authorizer::authorize_subscribe(
             &policy,
             &id,
+            &client,
             &"dev/spiffe:/trust.example/ns/prod/sa/device/#".to_string()
         ));
         assert!(!crate::Authorizer::authorize_subscribe(
             &policy,
             &id,
+            &client,
             &"dev/+/#".to_string()
         ));
     }

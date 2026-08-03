@@ -59,7 +59,10 @@ tasks:
     evidence: mtls::each_san_source_selects_its_own_field_of_one_certificate / the_default_source_is_the_common_name / a_missing_selected_source_yields_no_identity_and_never_falls_back / an_ambiguous_source_yields_no_identity / a_multi_common_name_subject_yields_no_identity / san_subjects_with_topic_wildcards_are_rejected / only_a_uri_san_may_carry_a_level_separator / a_uri_subject_can_never_be_substituted_into_a_topic_pattern; tls::a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn / a_san_configured_listener_refuses_a_cn_only_certificate; config::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted; mqttd::the_config_and_the_authenticator_agree_on_identity_source_spellings / changing_the_identity_source_requires_a_restart
   - id: 0004-T12
     title: "%c (client-id) substitution in ACL topic patterns — carry the ClientId through the Authorizer trait, failing closed on unsafe ids"
-    status: planned
+    status: done
+    date: 2026-07-27
+    evidence: acl::percent_c_scopes_topics_to_the_client_id / one_identity_two_client_ids_get_disjoint_grants / a_hostile_client_id_cannot_broaden_a_grant / an_unsubstitutable_client_id_makes_a_deny_refuse_outright / a_bad_client_id_does_not_disturb_rules_that_never_use_it / a_substituted_value_is_never_rescanned_for_placeholders / a_bare_percent_is_literal / percent_c_is_rejected_in_connect_client_globs / a_connect_rule_bounds_the_client_ids_percent_c_can_expand_to; acl(integration)::client_id_substitution_scopes_topics_within_one_identity / a_wildcard_client_id_cannot_broaden_a_percent_c_grant; reload_acl::the_grant_sweep_re_checks_percent_c_under_each_sessions_own_client_id
+    notes: "The sweep test is mutation-verified: hard-coding a single client id in hub::sweep_grants makes it fail. %c is documented as a namespacing tool, not an isolation boundary — the client id is client-chosen, so %c bounds a grant only when paired with a connect rule constraining claimable ids (ADR 0004 amendment)."
   - id: 0004-T13
     title: Per-listener auth policies (each listener carrying its own authenticator/ACL)
     status: deferred
@@ -88,7 +91,7 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | **0004-T9** OIDC / enhanced auth | ~~Full OIDC discovery / JWKS rotation; MQTT 5 enhanced auth.~~ Cut — delivered as ADR 0050 and ADR 0013. |
 | **0004-T10** Delivery-time ACL | ~~A delivery-time ACL re-check in the hub so live subscriptions honor policy changes.~~ Cut — the goal is met by the ADR 0040 reload-triggered grant sweep; the per-delivery mechanism was rejected there on merit. |
 | **0004-T11** SAN identity | An operator selects which verified-leaf field is the subject: `cn` (default, unchanged) or a SAN of a chosen kind. Fail closed — the selected source absent, empty, or present more than once yields *no* identity, never a guess. The safety rules the CN path already enforces travel with it. |
-| **0004-T12** `%c` substitution | ACL topic patterns substitute the connecting client id, so a policy can scope topics per session handle. The `Authorizer` trait carries the `ClientId` at every decision point (SUBSCRIBE, PUBLISH, will, and the ADR 0040 grant sweep). Client ids are client-chosen, so substitution fails closed on the same metacharacters as `%i`. |
+| **0004-T12** `%c` substitution | ACL topic patterns substitute the connecting client id, so a policy can scope topics per session handle. The `Authorizer` trait carries the `ClientId` at every decision point (SUBSCRIBE, PUBLISH, will, and the ADR 0040 grant sweep — each session re-checked under its own handle). Client ids are client-chosen, so substitution fails closed on the same metacharacters as `%i`, per placeholder; and `%c` is refused in a `connect` rule's `clients` globs, where it would match the id against itself. Documented as a namespacing tool, not an isolation boundary. |
 | **0004-T13** Per-listener policies | Deferred — each listener carrying its own authenticator/ACL needs the listener config to become a list of named definitions (own record). |
 
 ## Progress
@@ -107,12 +110,27 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | 0004-T9 | ✂️ cut | — | "SUPERSEDED — both halves shipped under their own records: OIDC discovery + JWKS rotation as ADR 0050 (proven against a live Keycloak, forced mid-run key rotation included), MQTT 5 enhanced auth as ADR 0013. Cut, not done: the capability is in the broker, but the work is counted once, where it was built." |
 | 0004-T10 | ✂️ cut | — | "SUPERSEDED by ADR 0040. The goal — a tightened ACL reaching already-established subscriptions — ships as the reload-triggered grant sweep (hub::sweep_grants: revoked filters leave live routing and the durable subscription set; offline sessions are re-checked at resume). The mechanism named here, a per-delivery re-check, was weighed in ADR 0040's alternatives and rejected: it closes only the subscription gap, at an O(messages) hot-path cost that grows with fan-out, where the sweep is O(state) once per policy change and also reaches revoked certs, removed users, and peer links." |
 | 0004-T11 | ✅ done | 2026-07-27 | mtls::each_san_source_selects_its_own_field_of_one_certificate / the_default_source_is_the_common_name / a_missing_selected_source_yields_no_identity_and_never_falls_back / an_ambiguous_source_yields_no_identity / a_multi_common_name_subject_yields_no_identity / san_subjects_with_topic_wildcards_are_rejected / only_a_uri_san_may_carry_a_level_separator / a_uri_subject_can_never_be_substituted_into_a_topic_pattern; tls::a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn / a_san_configured_listener_refuses_a_cn_only_certificate; config::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted; mqttd::the_config_and_the_authenticator_agree_on_identity_source_spellings / changing_the_identity_source_requires_a_restart |
-| 0004-T12 | ⬜ planned | — |  |
+| 0004-T12 | ✅ done | 2026-07-27 | acl::percent_c_scopes_topics_to_the_client_id / one_identity_two_client_ids_get_disjoint_grants / a_hostile_client_id_cannot_broaden_a_grant / an_unsubstitutable_client_id_makes_a_deny_refuse_outright / a_bad_client_id_does_not_disturb_rules_that_never_use_it / a_substituted_value_is_never_rescanned_for_placeholders / a_bare_percent_is_literal / percent_c_is_rejected_in_connect_client_globs / a_connect_rule_bounds_the_client_ids_percent_c_can_expand_to; acl(integration)::client_id_substitution_scopes_topics_within_one_identity / a_wildcard_client_id_cannot_broaden_a_percent_c_grant; reload_acl::the_grant_sweep_re_checks_percent_c_under_each_sessions_own_client_id |
 | 0004-T13 | 💤 deferred | — | "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040." |
 <!-- /status-table:0004 -->
 
 ## Changelog
 
+- **2026-07-27** — **T12 done**: ACL topic patterns substitute `%c` (the client id)
+  alongside `%i`, and the `Authorizer` trait carries the `ClientId` at every decision
+  point — SUBSCRIBE, PUBLISH, the will check at CONNECT, and ADR 0040's grant sweep,
+  where each session's grants are re-checked under *its own* handle (mutation-verified:
+  hard-coding one client id in `sweep_grants` fails the test). Substitution fails closed
+  per placeholder — an empty value or one carrying `/`, `+`, `#` makes the pattern
+  unusable, so an allow grants nothing and a deny refuses outright, while rules that
+  never name `%c` are untouched by a hostile id. `%c` is refused in a `connect` rule's
+  `clients` globs, where it would match the client id against itself and permit every id.
+  Documented honestly, and recorded as an ADR amendment: **`%c` is a namespacing tool,
+  not an isolation boundary** — the client id is client-chosen, so `dev/%c/#` grants the
+  union over every id a principal could claim unless a `connect` rule bounds that set.
+  Substitution is a single left-to-right pass — the two-`replace` version would let a
+  subject of literally `%c` expand into the client id, handing the client the namespace
+  of a rule that never named `%c`; caught in review and pinned by a test.
 - **2026-07-27** — **T11 done**: `MQTTD_MTLS_IDENTITY_SOURCE` selects which verified-leaf
   field is the subject — `cn` (default, byte-for-byte the old path), `san-dns`, `san-uri`,
   `san-email`. Extraction is fail-closed on *both* sides of ambiguity: the selected source

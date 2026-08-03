@@ -574,18 +574,20 @@ mod tests {
         });
 
         // Before reload: the initial (AllowAll) authorizer permits.
-        assert!(handles
-            .authz
-            .borrow()
-            .authorize_publish(&id(), &"t".to_string()));
+        assert!(handles.authz.borrow().authorize_publish(
+            &id(),
+            &mqtt_core::ClientId("c".into()),
+            &"t".to_string()
+        ));
 
         assert!(reloader.reload("signal"), "the reload should apply");
 
         // After reload: the live receiver now sees DenyAll.
-        assert!(!handles
-            .authz
-            .borrow()
-            .authorize_publish(&id(), &"t".to_string()));
+        assert!(!handles.authz.borrow().authorize_publish(
+            &id(),
+            &mqtt_core::ClientId("c".into()),
+            &"t".to_string()
+        ));
     }
 
     /// A failed build (a bad file) leaves the running policy unchanged — never fail open.
@@ -607,10 +609,11 @@ mod tests {
         assert!(!reloader.reload("signal"), "a failed build must not apply");
         assert!(attempted.load(Ordering::SeqCst), "the build was attempted");
         // The running policy is still the permissive initial one — not swapped, not emptied.
-        assert!(handles
-            .authz
-            .borrow()
-            .authorize_publish(&id(), &"t".to_string()));
+        assert!(handles.authz.borrow().authorize_publish(
+            &id(),
+            &mqtt_core::ClientId("c".into()),
+            &"t".to_string()
+        ));
     }
 
     /// Each reload increments `security_reloads_total`, labelled by outcome.
@@ -709,10 +712,11 @@ mod tests {
         );
         assert!(slot.read().unwrap().is_none(), "the slot is untouched");
         // The authorizer was not swapped either — all-or-nothing held.
-        assert!(handles
-            .authz
-            .borrow()
-            .authorize_publish(&id(), &"t".to_string()));
+        assert!(handles.authz.borrow().authorize_publish(
+            &id(),
+            &mqtt_core::ClientId("c".into()),
+            &"t".to_string()
+        ));
     }
 
     fn id() -> mqtt_auth::Identity {

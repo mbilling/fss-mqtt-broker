@@ -90,9 +90,11 @@ Both protocol versions round-trip against two independent foreign clients
 - **Identity & authentication**: identity from the mTLS certificate CN; a
   deny-by-default CONNECT gate; pluggable Argon2id password and JWT (HS256/RS256)
   authenticators composed in a chain (cert → password → token).
-- **Authorization**: deny-by-default TOML topic ACLs with `%i` identity
-  substitution and asymmetric allow-covers / deny-overlaps semantics so a narrow
-  grant can't widen and a broad subscription can't tunnel past a deny.
+- **Authorization**: deny-by-default TOML topic ACLs with `%i` (identity) and `%c`
+  (client id) substitution and asymmetric allow-covers / deny-overlaps semantics so a
+  narrow grant can't widen and a broad subscription can't tunnel past a deny. Both
+  substitutions fail closed on a value carrying `/`, `+` or `#`, so neither an identity
+  nor a client-chosen session handle can smuggle topic structure into a pattern.
 - **Session-identity binding** (ADR 0031): a persistent session is bound to the
   authenticated identity that created it — a different principal cannot resume or
   take it over (CONNACK Not-authorized + audit). Secure by default; an optional
@@ -208,6 +210,20 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
   pipeline ([ADR 0045](docs/adr/0045-release-engineering-and-distribution.md)) is
   in place; pushing the first `v0.x` tag cuts the first release — see
   [Install](#install) and [RELEASING.md](RELEASING.md).
+
+## How it compares
+
+The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
+and **VerneMQ** — including every cell we lose — is
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-03). The one-paragraph
+version:
+
+|  | mqttd's answer |
+|---|---|
+| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses). Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
+| Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
+| Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
+| Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery yet — and **no production track record**: the matrix says so in as many words. |
 
 ## Workspace layout
 

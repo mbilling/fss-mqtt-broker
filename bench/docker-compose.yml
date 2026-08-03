@@ -1,11 +1,14 @@
 name: mqttd-bench
 
-# Comparative benchmark harness (ADR 0048 T1/T2). ONE broker runs at a time — selected by
-# compose profile — so brokers never contend for the host while being measured:
+# Comparative benchmark harness (ADR 0048 T1/T2 + the 2026-07/08 amendments). ONE broker
+# runs at a time — selected by compose profile — so brokers never contend for the host
+# while being measured:
 #
 #   docker compose --profile mqttd     up -d --build
 #   docker compose --profile mosquitto up -d
 #   docker compose --profile emqx      up -d
+#   docker compose --profile vernemq   up -d
+#   docker compose --profile nanomq    up -d
 #
 # The load driver (emqtt-bench, EMQX's own tool — see ADR 0048 §3) is run against the
 # broker by ../bench/run.sh on this compose network. Versions are PINNED; configuration
@@ -15,7 +18,8 @@ name: mqttd-bench
 # hidden): plaintext/anonymous on 1883 (competitors' out-of-the-box behaviour; mqttd's
 # durable-by-default explicitly opted out for like-for-like) and TLS with REQUIRED
 # client certificates (mTLS) on 8883, from the throwaway PKI in tls/certs
-# (tls/gen-certs.sh). See bench/README.md.
+# (tls/gen-certs.sh). See bench/README.md — including the per-broker fairness notes
+# (VerneMQ's node-local durable queues, NanoMQ's unenforced inflight window).
 
 services:
   mqttd:
@@ -48,6 +52,11 @@ services:
 
   emqx:
     profiles: [emqx]
+    # PIN NOTE (2026-08-03): 5.8.6 is the last Apache-2.0 EMQX line, EOL'd 2026-02-28.
+    # Current is the BSL 1.1 single-distribution line (6.x; single-node use is free, so a
+    # single-node benchmark needs no license key). Re-pin is a maintainer decision at the
+    # 0048-T4 publishable run — comparing against an EOL'd version in *published* numbers
+    # would be its own honesty problem, and the ADR requires competitor versions to move.
     image: emqx/emqx:5.8.6
     hostname: broker
     environment:
@@ -59,4 +68,39 @@ services:
       EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__VERIFY: verify_peer
       EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__FAIL_IF_NO_PEER_CERT: "true"
     volumes:
+      - ./tls/certs:/certs:ro
+
+  vernemq:
+    profiles: [vernemq]
+    # Pinned to the latest stable (2.1.2+ are flagged pre-release; `latest` on Docker Hub
+    # is STALE — digest-identical to 2.0.1 — never use it). The official image is under
+    # the VerneMQ EULA, free for testing; benchmarking is testing (ADR 0048 amendment
+    # 2026-08-03), and accepting it below is that use, nothing more.
+    image: vernemq/vernemq:2.1.1
+    hostname: broker
+    environment:
+      DOCKER_VERNEMQ_ACCEPT_EULA: "yes"
+      DOCKER_VERNEMQ_ALLOW_ANONYMOUS: "on" # like-for-like plaintext posture (their default is off)
+      # FAIRNESS (disclosed): VerneMQ's default persists queues to node-local LevelDB —
+      # kept as-is because the harness runs each broker's documented default posture; the
+      # results table says so (their durability is single-node; ours is quorum-replicated
+      # when not opted out — see bench/README.md).
+      DOCKER_VERNEMQ_LISTENER__SSL__DEFAULT: 0.0.0.0:8883
+      DOCKER_VERNEMQ_LISTENER__SSL__CAFILE: /certs/ca.pem
+      DOCKER_VERNEMQ_LISTENER__SSL__CERTFILE: /certs/server.pem
+      DOCKER_VERNEMQ_LISTENER__SSL__KEYFILE: /certs/server.key
+      DOCKER_VERNEMQ_LISTENER__SSL__REQUIRE_CERTIFICATE: "on" # mTLS: client certs required
+      DOCKER_VERNEMQ_LOG__CONSOLE__LEVEL: warning
+    volumes:
+      - ./tls/certs:/certs:ro
+
+  nanomq:
+    profiles: [nanomq]
+    # -slim is the smallest variant that includes TLS (the default image is built without
+    # it); using the SAME variant for both postures keeps plaintext and mTLS numbers from
+    # coming out of two different builds.
+    image: emqx/nanomq:0.25.5-slim
+    hostname: broker
+    volumes:
+      - ./configs/nanomq.conf:/etc/nanomq.conf:ro
       - ./tls/certs:/certs:ro
