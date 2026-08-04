@@ -29,3 +29,6 @@ Safe operations:
       helm upgrade {{ .Release.Name }} <chart> ...
   - Validate a config change before rolling it out:
       mqttd --check-config --config <your file>   # or rely on the check-config init container
+
+Day-2 runbook (rotation, scaling, PVC lifecycle, founder recovery, backup):
+  https://github.com/mbilling/fss-mqtt-broker/blob/main/docs/OPERATIONS.md

@@ -547,7 +547,9 @@ under load (ADR [0026](docs/adr/0026-lease-timing-durable-storage.md) /
 ### On Kubernetes (Helm)
 
 A Helm chart under [`deploy/helm/mqttd`](deploy/helm/mqttd) runs the broker as a **StatefulSet**
-that encodes the operational contract (ADR 0047), so the safe path is the default:
+that encodes the operational contract (ADR 0047), so the safe path is the default.
+Day-2 procedures — cert/key rotation, scaling, PVC lifecycle, founder recovery, backup —
+are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md):
 
 ```sh
 helm install mqttd deploy/helm/mqttd \
