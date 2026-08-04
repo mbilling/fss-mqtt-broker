@@ -3104,6 +3104,9 @@ impl Hub {
 
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
     /// (ADR 0009). Runs on the hub's periodic sweep tick.
+    // `%`-and-compare, not `is_multiple_of` (stable 1.87; MSRV 1.85) — drop the
+    // allow when the floor rises.
+    #[allow(clippy::manual_is_multiple_of)]
     async fn sweep_expired_sessions(&mut self) {
         // Ring-change watch (ADR 0043 P2): any placement member-set change moves
         // group ownership (growth moves ~1/N of the groups onto the joiner), so it
