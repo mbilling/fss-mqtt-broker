@@ -185,7 +185,10 @@ Both protocol versions round-trip against two independent foreign clients
   enforced at accept before any TLS work), an **auth-failure penalty box**,
   per-client **subscription/session quotas**, **publish-rate limiting** by TCP
   backpressure (nothing dropped, nothing disconnected), a **retained-topic cap**,
-  and a **disk watermark** that sheds load before the store fills.
+  and a **disk watermark** that sheds load before the store fills. Sizing a node
+  with a fixed RAM/disk budget — which limits to set and the arithmetic — is
+  [docs/SIZING.md](docs/SIZING.md), with a ready preset in
+  [docs/examples/bounded-node.toml](docs/examples/bounded-node.toml).
 - **Operator control is signal-driven, not an admin API** (deliberate: the
   health listener stays read-only and unauthenticated): `SIGHUP` reloads the
   security policy on live connections, `SIGUSR1` begins a decommission drain,

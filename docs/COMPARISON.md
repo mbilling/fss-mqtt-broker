@@ -115,6 +115,26 @@ logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
 | Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down (ADR 0047) | — | Operator + Helm | container | k8s discovery in image |
 | Config | TOML + env, strict schema, `--check-config`, whole-config hot reload | conf file, SIGHUP | HOCON + dashboard/API | HOCON + env, hot reload | conf file + env mapping, live reconfig |
 
+## Operational limits & resource governance
+
+What an operator can *bound*. mqttd's quota layer is ADR 0041
+(refuse-at-the-edge: reason codes and backpressure, never silent drops); every knob
+below ships **unset = unbounded** except where a default is printed — the sizing
+consequences and a bounded-node recipe live in [SIZING.md](SIZING.md).
+Packet-size enforcement is compared in the Protocol table above.
+
+| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
+|---|---|---|---|---|---|
+| Max connections | ✅ global + per-IP (`MQTTD_MAX_CONNECTIONS`, `_PER_IP`), refused at accept before TLS work | ✅ `max_connections` | ✅ per-listener | n/v | ✅ `listener.max_connections` (default 10 000) |
+| Queued/offline messages per session | ✅ count, default 100 000, overflow `drop-oldest` or `disconnect` (`MQTTD_MAX_QUEUED_MESSAGES`, `MQTTD_QUEUE_OVERFLOW`); ✖ **no byte-based cap** — accepted, tracked (ADR 0041 amendment T6) | ✅ count (`max_queued_messages`, default 1000) **and bytes** (`max_queued_bytes`) | ✅ `max_mqueue_len` (default 1000); byte variant n/v | ⚠️ `msq_len`; our 0.25.5 bench observed QoS 1 acks stalling at 1024 msgs/connection (see [bench/](../bench/)) | ✅ `max_online_messages` / `max_offline_messages` (1000/1000) |
+| Subscriptions per client | ✅ `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` (per-slot `0x97`) | n/v | ✅ | n/v | n/v |
+| Publish rate limiting | ✅ token bucket + TCP backpressure — pause, not drop (`MQTTD_MAX_PUBLISH_RATE`) | ✖ | ✅ rate limiters | n/v | n/v |
+| Retained-store bound | ✅ topic count (`MQTTD_MAX_RETAINED_MESSAGES`); overwrite/clear always allowed | ✖ | ✅ retainer limits | n/v | n/v |
+| Sessions cap | ✅ `MQTTD_MAX_SESSIONS` (new refused; resume never refused) | ✖ | ✅ | n/v | n/v |
+| Disk bound / full-disk behavior | ⚠️ one aggregate high-water mark (`MQTTD_STORE_MAX_BYTES`) → **brownout**: growth writes refused, acks/reads/expiry continue; disk-full itself fails closed, crash-tested mid-write (ADR 0044 P2). ✖ no per-store quota (ADR 0041 amendment T7) | ⚠️ persistence file + autosave, no quota | n/v | n/v | n/v (node-local LevelDB) |
+| Total-memory limit | ✖ **none — a real loss.** Bound by arithmetic + container limits ([SIZING.md](SIZING.md)); an RSS watermark is accepted, tracked (ADR 0041 amendment T8) | ✅ `memory_limit` (hard heap cap) | ⚠️ per-connection `force_shutdown` (heap default 32 MiB + mailbox 1000) — kills the connection, not a broker-wide cap | n/v | n/v |
+| Auth-failure penalty | ✅ per-source threshold + decay, bounded table (`MQTTD_AUTH_PENALTY_*`; default off) | ✖ | ✅ flapping detect / banning | n/v | n/v |
+
 ## Licensing & distribution
 
 | | mqttd | Mosquitto | EMQX | NanoMQ | VerneMQ |
@@ -149,3 +169,11 @@ its documented netsplit semantics and public issue tracker). mqttd facts: this
 repository at `0.9.0-rc`. Cells marked n/v were not verified and are treated as unknown,
 not as absent. This file is re-checked at every cross-broker benchmark re-run
 (per release, ADR 0048 §5); staleness beyond one release cycle is a defect.
+
+## Changelog
+
+- 2026-08-04 — Added "Operational limits & resource governance" (the ADR 0041 surface
+  was implemented but absent here). Competitor limit cells verified against mosquitto
+  man pages, EMQX 5.x/latest MQTT config docs, and VerneMQ options/listeners docs this
+  date; unverified cells print n/v. mqttd's missing byte-based queue cap and
+  total-memory limit are printed as losses with their tracking tasks.

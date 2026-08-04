@@ -115,6 +115,8 @@ lease_voters = 5
 [limits]
 # Resource governance (ADR 0041). Unset generally = uncapped. A configured 0 where a positive
 # value is required is a startup error.
+# Sizing a machine with a fixed RAM/disk budget: docs/SIZING.md has the arithmetic and
+# docs/examples/bounded-node.toml is a fully-set preset for a 4 GiB / 20 GiB node.
 # max_connections = 100000
 # max_connections_per_ip = 1000
 # max_sessions = 500000
