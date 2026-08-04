@@ -121,6 +121,27 @@ beyond quorum loss, snapshot the PVs of a **stopped** node (redb files are only
 crash-consistent under snapshot while running) or use storage-class volume snapshots;
 restore = recreate the StatefulSet over restored PVs with the same pod names.
 
+## Monitoring for the operator (and humans)
+
+The signals the future controller will reconcile on — equally useful today as alert
+rules ([ADR 0054](adr/0054-operator-facing-state-surface.md); Grafana panels ship in
+the demo dashboard's "Operator signals" row):
+
+| Condition | Rule | Action |
+|---|---|---|
+| **Split brain** | `count(count by (cluster_id) (mqttd_cluster_info == 1)) > 1` across the fleet | Fence the new founder (see split-brain detection above) |
+| **Unexpected founding** | `increase(mqttd_foundings_total[1h]) > 0` after day one | Same — a node founded a second cluster |
+| **Foreign gossip arriving** | `rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0` | Contained, but find and fix the re-founded node |
+| **Brownout** | `mqttd_brownout == 1` (page); `sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8` (warn) | Expand the PVC / raise the watermark / prune retained |
+| **Stuck drain** | `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m | Inspect the drain logs; the grace deadline will fall back to crash semantics |
+| **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | Node not catch-up-current; takeover from it would be degraded |
+| **Quorum thinning** | `mqttd_voters < 3` (with `lease_voters = 5`) | One more loss risks durable writes; restore nodes |
+| **Prolonged rotation window** | `mqttd_swim_keys_accepted > 1` for > 1h | A rotation phase was never closed (see key rotation above) |
+| **Config divergence** | `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m | A config roll did not converge; check the stuck pod |
+| **Degraded durable plane** | `mqttd_lease_quorum_ack_ms` growing (ADR 0049) | fsync-bound consensus; check disks before sessions are refused |
+
+`curl <pod>:8080/statusz` is the human-readable superset of all of it.
+
 ## Bare-metal equivalents
 
 Same procedures, different transport: rotation = replace the files (the watcher path

@@ -61,7 +61,7 @@
 | [0051](../adr/0051-evaluation-readiness.md) | Evaluation readiness: an assessable, comparable, migratable first release | Proposed | [1/11 done](0051-evaluation-readiness.md) | 10 open |
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
-| [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [3/4 done](0054-operator-facing-state-surface.md) | 1 open |
+| [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [4/4 done](0054-operator-facing-state-surface.md) | — |
 
 ## Open and deferred work
 
@@ -147,7 +147,3 @@
 **0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
 
 - `0053-T5` ⬜ planned: FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration
-
-**0054 — Operator-facing state surface: `/statusz` + state gauges**
-
-- `0054-T4` ⬜ planned: Monitoring docs + dashboard — Grafana rows for the new signals (brownout, store utilization, decommission, cluster identity, mismatch rate) and the OPERATIONS.md alert-rule catalogue the operator will encode
