@@ -16,9 +16,10 @@ members = [
 [workspace.package]
 version = "0.9.0"
 edition = "2021"
-# Raised from 1.75 by the OTLP/HTTP metric exporter (ADR 0020 T9): the OpenTelemetry
-# SDK + reqwest stack requires Rust 1.85.
-rust-version = "1.85"
+# Raised from 1.75 by the OTLP/HTTP metric exporter (ADR 0020 T9: the OpenTelemetry
+# SDK + reqwest stack requires Rust 1.85), then from 1.85 by jsonwebtoken 11
+# (rust-version 1.88; taken for its aws_lc_rs backend — ADR 0053 staged prep).
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/mbilling/fss-mqtt-broker"
 authors = ["mqtt-broker contributors"]
@@ -61,8 +62,10 @@ toml = "0.8"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 # password hashing (ADR 0004 step 6): Argon2id, no fast hashes
 argon2 = "0.5"
-# JWT bearer-token verification (ADR 0004 step 6)
-jsonwebtoken = "9"
+# JWT bearer-token verification (ADR 0004 step 6). v11 with the aws_lc_rs backend:
+# staged prep for the single-crypto-provider consolidation (ADR 0053) — v9 carried a
+# hard dependency on maintenance-mode ring.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 serde_json = "1"
 # TLS (ADR 0002): pure-Rust rustls, ring provider, TLS 1.3 only (no tls12 feature)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
