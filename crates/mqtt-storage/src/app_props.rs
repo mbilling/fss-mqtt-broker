@@ -37,21 +37,27 @@ impl AppProps {
     }
 
     /// The canonical byte encoding, embedded (length-prefixed) in store record
-    /// codecs and folded into retained value digests.
+    /// codecs and folded into retained value digests. postcard's encoding is
+    /// canonical (no configuration knobs), which is what makes the digest fold
+    /// stable (ADR 0052).
     ///
     /// # Panics
     /// Never in practice: this shape (options, strings, byte vectors) is always
-    /// bincode-serializable.
+    /// postcard-serializable.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("AppProps serialization is infallible")
+        postcard::to_allocvec(self).expect("AppProps serialization is infallible")
     }
 
     /// Fail-closed decode of [`encode`](Self::encode)'s output: `None` on malformed
-    /// bytes, never garbage properties.
+    /// bytes, never garbage properties. Strict: trailing bytes after a valid
+    /// encoding are malformed too.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        bincode::deserialize(bytes).ok()
+        match postcard::take_from_bytes(bytes) {
+            Ok((props, [])) => Some(props),
+            _ => None,
+        }
     }
 
     /// A cheap size estimate for frame-chunking budgets: the variable-length parts

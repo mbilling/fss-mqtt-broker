@@ -59,6 +59,10 @@ aws-lc-rs = "1"
 x509-parser = "0.16"
 # ACL policy files (ADR 0004 step 3)
 toml = "0.8"
+# Cluster wire + store codec (ADR 0052): succeeded bincode 1.x (RUSTSEC-2025-0141,
+# archived upstream). Canonical, deterministic encoding; decode allocations are
+# bounded by the input slice, so the frame/datagram caps bound the decoder.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 # password hashing (ADR 0004 step 6): Argon2id, no fast hashes
 argon2 = "0.5"
 # JWT bearer-token verification (ADR 0004 step 6). v11 with the aws_lc_rs backend:

@@ -1030,7 +1030,7 @@ fn qos_num(qos: QoS) -> u8 {
 }
 
 /// Per-chunk byte budget for a retained-snapshot frame (0014-T8): well under the peer
-/// frame limit (16 MiB, `mqtt_cluster::peer`), with headroom for bincode framing — a
+/// frame limit (16 MiB, `mqtt_cluster::peer`), with headroom for codec framing — a
 /// frame at the limit would be rejected by the receiver and tear down the link.
 const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1159,9 +1159,11 @@ fn retained_value_id(topic: &str, payload: &[u8], qos: u8, props: &[u8]) -> u64 
 /// skipped with a warning — it could never fit a frame, and sending it would sever the
 /// link instead of just missing one back-fill.
 fn chunk_retained(entries: impl Iterator<Item = RetainedWireEntry>) -> Vec<Vec<RetainedWireEntry>> {
-    // Fixed per-entry overhead estimate for bincode length prefixes, the QoS byte,
-    // and the two u64 token halves (ADR 0037 P5); the variable-length application
-    // properties (ADR 0038 T3) are sized per entry.
+    // Fixed per-entry overhead estimate for codec framing, the QoS byte, and the
+    // two u64 token halves (ADR 0037 P5); the variable-length application
+    // properties (ADR 0038 T3) are sized per entry. Calibrated to the old
+    // fixed-width codec; postcard's varints are never wider (ADR 0052), so the
+    // estimate is conservative — the safe direction for a chunk budget.
     const ENTRY_OVERHEAD: usize = 48;
     let mut chunks = Vec::new();
     let mut current = Vec::new();

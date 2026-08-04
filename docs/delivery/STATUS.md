@@ -59,6 +59,7 @@
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
 | [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |
 | [0051](../adr/0051-evaluation-readiness.md) | Evaluation readiness: an assessable, comparable, migratable first release | Proposed | [1/11 done](0051-evaluation-readiness.md) | 10 open |
+| [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 
 ## Open and deferred work
@@ -131,6 +132,10 @@
 - `0051-T9` 🚧 in-progress: NanoMQ and VerneMQ join the bench harness (amends ADR 0048's competitor set; VerneMQ under the disclosed-posture fairness terms in 0048's 2026-08-03 amendment) and the first comparative results are published to docs/benchmarks/ under 0048-T4's honesty rules — "Harness wired 2026-08-03: compose profiles vernemq (vernemq/vernemq:2.1.1 — 'latest' is stale=2.0.1, 2.1.2+ are pre-releases; EULA accepted = testing use; env-mapped mTLS listener, require_certificate on) and nanomq (emqx/nanomq:0.25.5-slim — the smallest variant WITH TLS, same variant both postures; configs/nanomq.conf with verify_peer+fail_if_no_peer_cert), run.sh broker list + env.txt versions, bench/README fairness notes (VerneMQ node-local durable queues; NanoMQ inflight window unenforced; EMQX 5.8.6 pin flagged for re-review — last Apache line, EOL'd; current is BSL 6.x). NOT yet smoke-run: no docker daemon on the wiring machine — smoke is the next action on a docker host. Publication (the 0048-T4 gate) additionally needs the dedicated-host run and the maintainer's EMQX re-pin decision."
 - `0051-T10` ⬜ planned: The bridge made assessable — a demo/ second security zone (Mosquitto upstream + mqtt-bridge with directional rules), a walkthrough doc, and the Grafana screenshot into the README
 - `0051-T11` ⛔ blocked: The 1.0.0 freeze — after the bake window, run the ADR 0038 wire/schema review consciously, run the 0039-T3 skew smoke against two real tags, then the maintainer cuts the freeze tag — "Needs v0.9.0 shipped (T4), a bake window survived, and a second tag (0.9.x/0.10) to make the 0039-T3 adjacent-skew smoke real — impossible before two releases exist by definition."
+
+**0052 — Codec succession: postcard replaces bincode on every cluster surface**
+
+- `0052-T4` ⬜ planned: BASELINE_REF bump (follow-up PR, post-merge by necessity) — cluster_upgrade.rs pinned baseline moves to this change's merge commit; nightly red window disclosed in both PR bodies
 
 **0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
 

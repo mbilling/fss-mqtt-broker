@@ -201,7 +201,7 @@ async fn apply(
             // First-contact / full-state kinds carry the full certificate (0022-T6
             // priming); routine probe traffic rides on the fingerprint.
             let prime = matches!(msg.kind, Kind::Join | Kind::Sync);
-            if let Ok(bytes) = bincode::serialize(&msg) {
+            if let Ok(bytes) = postcard::to_allocvec(&msg) {
                 // With a sequence allocator configured, seal a signed+sequenced v3 datagram
                 // (ADR 0023); otherwise the signed/plain seal (ADR 0022/0003).
                 let datagram = match (auth, seq_alloc.as_mut()) {

@@ -213,12 +213,18 @@ pub struct Message {
 
 impl Message {
     /// Decode a SWIM datagram payload exactly as the driver does after it
-    /// clears authentication (`bincode::deserialize`). Returns `None` on any
-    /// malformed input — never panics. Public so the ADR 0044 P5 fuzz target
-    /// exercises the real gossip parser rather than a reimplementation.
+    /// clears authentication. Returns `None` on any malformed input — never
+    /// panics. Strict (ADR 0052): trailing bytes after a valid message are
+    /// malformed. Input size is bounded ahead of this call by the driver's
+    /// 64 KiB receive buffer, and postcard cannot allocate beyond its input.
+    /// Public so the ADR 0044 P5 fuzz target exercises the real gossip parser
+    /// rather than a reimplementation.
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        bincode::deserialize(payload).ok()
+        match postcard::take_from_bytes(payload) {
+            Ok((msg, [])) => Some(msg),
+            _ => None,
+        }
     }
 }
 
