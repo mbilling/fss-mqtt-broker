@@ -128,3 +128,37 @@ voluntary disruption from taking two nodes — and thus quorum — at once.
 - **No `PodDisruptionBudget`:** simpler, but a routine node drain could evict two brokers at
   once and lose quorum — precisely the failure the broker's durability model assumes cannot
   happen silently. A PDB is not optional for a quorum system. Rejected.
+
+## Amendment (2026-08-04): the operator question, revisited — still no, with named triggers
+
+A pre-release review asked whether the chart should grow a companion operator
+(CRD + controller). The review inventoried every day-2 sequence the chart could not
+carry and found four: policy/cert rotation reaching running pods, SWIM key rotation
+(the `key_accept` dual-key window), PVC lifecycle after scale-down (stale-data
+reattach), and founder-PVC-loss (a fresh, seedless pod-0 founding a second cluster).
+
+**Decision: still no operator — because three of the four dissolved at chart level**
+(the 2026-08-04 chart hardening: `config_watch_secs` makes rotation automatic per
+ADR 0033; `persistentVolumeClaimRetentionPolicy` closes the PVC trap; a per-pod
+readiness floor plus the [OPERATIONS.md](../OPERATIONS.md) founder rule fences the
+split-brain vector), and the fourth (key-rotation orchestration) is a rare,
+operator-initiated act a runbook carries honestly. What remains genuinely
+operator-shaped is small: orchestrating the three-phase key rotation unattended, and
+distinguishing a shrink from a roll so upgrades skip the full drain. Neither justifies
+a controller today, and a CRD is a far stickier public API than values.yaml — the
+worst possible thing to iterate on pre-1.0.
+
+**Named triggers that reopen this decision** (any one suffices; replacing the
+original's bare "post-1.0 if demand appears"):
+
+1. A real deployment needs **unattended SWIM key rotation** at fleet scale (the
+   runbook's three `helm upgrade` rolls become an operational burden, not an event).
+2. **Fleet/multi-cluster management** demand — many mqttd clusters under one control
+   plane.
+3. The **drain-on-every-roll cost is measured as pain** (upgrade windows dominated by
+   drains that a shrink/roll-aware controller would skip).
+4. Post-1.0 **user demand** for CRD-native management, as originally recorded.
+
+If reopened, the operator wraps the existing contracts (drain via SIGUSR1, readiness
+via `/readyz`, config via the same TOML) rather than inventing new control surfaces —
+the no-code-coupling property this ADR's consequences noted is what keeps that cheap.
