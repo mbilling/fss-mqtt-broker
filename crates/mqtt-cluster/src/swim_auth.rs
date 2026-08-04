@@ -331,6 +331,9 @@ impl SwimAuth {
     /// The cert-ref field for an outgoing signed datagram (0022-T6): the full leaf
     /// certificate when `prime` is set or on every [`FULL_CERT_EVERY`]th send, else the
     /// 32-byte SHA-256 fingerprint.
+    // `%`-and-compare, not `is_multiple_of`: that method is stable only since
+    // Rust 1.87 and the MSRV floor is 1.85 — drop the allow when the floor rises.
+    #[allow(clippy::manual_is_multiple_of)]
     fn cert_ref(&self, signer: &dyn GossipSign, prime: bool) -> Vec<u8> {
         let nth = self.sends.fetch_add(1, Ordering::Relaxed);
         if prime || nth % FULL_CERT_EVERY == 0 {
@@ -512,6 +515,8 @@ fn parse_v3(body: &[u8]) -> Option<(u64, CertRef<'_>, &[u8], &[u8])> {
 }
 
 /// Minimal hex decoder (avoids a dependency for one call site).
+// `%`-and-compare, not `is_multiple_of` (stable 1.87; MSRV 1.85) — see cert_ref.
+#[allow(clippy::manual_is_multiple_of)]
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
