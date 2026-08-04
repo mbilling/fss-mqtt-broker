@@ -54,7 +54,7 @@
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/7 done](0044-release-readiness-assurance.md) | — |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [3/5 done](0045-release-engineering-and-distribution.md) | 2 open |
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/5 done](0046-file-based-configuration.md) | — |
-| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [5/7 done](0047-kubernetes-deployment.md) | 2 open |
+| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [7/7 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [2/4 done](0048-comparative-benchmarking.md) | 2 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
 | [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |
@@ -120,11 +120,6 @@
 
 - `0045-T3` 🚧 in-progress: Keyless signing + provenance — cosign/sigstore signatures on every artifact and image, build-provenance attestation, transparency-log entry; a one-command documented verify path — "cosign keyless sign-blob (binaries/checksums/SBOM) + sign image + attest-build-provenance + attest-sbom all wired; RELEASING.md + README document the one-command verify; first real signatures/Rekor entries are produced by the first tag run (OIDC exists only in Actions)"
 - `0045-T5` 🚧 in-progress: SBOM per release (CycloneDX or SPDX) attached to the release and image; cargo-deny/cargo-audit run on the release commit; RELEASING.md + README verify docs; cut the first 0.x release — "CycloneDX SBOM (cargo-cyclonedx) + cargo-deny/cargo-audit gate on the release commit + RELEASING.md + README Install/verify — all in place; remaining: cut the first 0.x release (a maintainer signed-tag push, gated on the ADR 0044 readiness checklist)"
-
-**0047 — Kubernetes deployment (Helm chart, StatefulSet, safe scale-down)**
-
-- `0047-T6` 🚧 in-progress: Chart hardening (2026-08-04 amendment) — config_watch_secs wired (automatic cert/ACL/CRL rotation per ADR 0033), per-pod readiness floor (founder 1, joiners majority), persistentVolumeClaimRetentionPolicy (Retain on delete / Delete on scale-down, post-drain-safe), dual seed ordinals, docs/OPERATIONS.md day-2 runbook
-- `0047-T7` 🚧 in-progress: Operator decision recorded (2026-08-04 amendment) — no operator pre-1.0; three of four day-2 gaps closed at chart level, key rotation runbook'd; four named reopen triggers replace the bare "post-1.0 if demand appears"
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 
