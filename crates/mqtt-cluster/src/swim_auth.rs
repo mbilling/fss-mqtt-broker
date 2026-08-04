@@ -9,7 +9,7 @@
 //! The pure [`crate::swim`] module stays crypto-free; this seals/opens at the
 //! I/O boundary only ([`crate::swim_driver`]).
 
-use ring::{digest, hmac};
+use aws_lc_rs::{digest, hmac};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};

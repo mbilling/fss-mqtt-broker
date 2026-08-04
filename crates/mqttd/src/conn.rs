@@ -2238,8 +2238,8 @@ mod tests {
 
     /// HMAC-SHA256 proof over `nonce` with alice's secret.
     fn alice_proof(nonce: &[u8]) -> Vec<u8> {
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"alice-secret");
-        ring::hmac::sign(&key, nonce).as_ref().to_vec()
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, b"alice-secret");
+        aws_lc_rs::hmac::sign(&key, nonce).as_ref().to_vec()
     }
 
     /// Drive a full connect-time HMAC enhanced-auth handshake to a successful CONNACK.
@@ -2863,8 +2863,8 @@ mod tests {
             other => panic!("expected AUTH challenge, got {other:?}"),
         };
 
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"alice-secret");
-        let proof = ring::hmac::sign(&key, &nonce);
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, b"alice-secret");
+        let proof = aws_lc_rs::hmac::sign(&key, &nonce);
         writer
             .send(&Packet::Auth(Auth {
                 reason: 0x18,
@@ -2899,8 +2899,8 @@ mod tests {
         assert!(matches!(recv(&mut reader).await, Some(Packet::Auth(_))));
 
         // A proof under the wrong key.
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"guessed");
-        let proof = ring::hmac::sign(&key, b"any-nonce");
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, b"guessed");
+        let proof = aws_lc_rs::hmac::sign(&key, b"any-nonce");
         writer
             .send(&Packet::Auth(Auth {
                 reason: 0x18,
@@ -2972,8 +2972,8 @@ mod tests {
         writer.send(&hmac_auth(0x19, b"alice")).await.unwrap();
         assert!(matches!(recv(&mut reader).await, Some(Packet::Auth(_))));
         // Proof under the wrong key.
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"wrong");
-        let proof = ring::hmac::sign(&key, b"x");
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, b"wrong");
+        let proof = aws_lc_rs::hmac::sign(&key, b"x");
         writer.send(&hmac_auth(0x18, proof.as_ref())).await.unwrap();
         match recv(&mut reader).await {
             Some(Packet::Disconnect(d)) => {

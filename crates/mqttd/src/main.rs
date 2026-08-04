@@ -181,10 +181,11 @@ const SWIM_TICK: Duration = Duration::from_millis(100);
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Process-default crypto provider (ring): reqwest's rustls-no-provider build (the OIDC
-    // JWKS fetcher, ADR 0050) resolves its TLS provider from here. Everything else in the
-    // tree configures ring explicitly; this keeps the one implicit consumer on ring too.
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    // Process-default crypto provider (aws-lc-rs, ADR 0053): reqwest's rustls-no-provider
+    // build (the OIDC JWKS fetcher, ADR 0050) resolves its TLS provider from here. With a
+    // single provider compiled into the build this is belt-and-braces determinism — no
+    // binary or test can silently resolve a different stack.
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

@@ -36,8 +36,8 @@ const OUTBOUND_POOL: usize = 4;
 const ALPN_MQTT: &[u8] = b"mqtt";
 
 /// Build a QUIC server [`Endpoint`] bound to `addr`, using the same audited rustls server
-/// config as the TLS listener (TLS 1.3, `ring`, optional mTLS client-cert verification) with
-/// ALPN `mqtt`. 0-RTT early data is left disabled (replay safety for the CONNECT exchange).
+/// config as the TLS listener (TLS 1.3, `aws-lc-rs`, optional mTLS client-cert verification)
+/// with ALPN `mqtt`. 0-RTT early data is left disabled (replay safety for the CONNECT exchange).
 ///
 /// # Errors
 /// [`NetError`] if the TLS material is unreadable/invalid, the QUIC crypto cannot be built, or

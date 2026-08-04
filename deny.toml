@@ -11,6 +11,15 @@ ignore = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+deny = [
+    # ADR 0053: the workspace crypto provider is aws-lc-rs; ring (maintenance-mode
+    # upstream) must not re-enter the build. Nothing COMPILES ring
+    # (`cargo tree -i ring` prints nothing), but Cargo.lock records optional
+    # dependencies regardless of features, so the two crates whose *disabled*
+    # ring features leave a phantom lock entry are wrapped; any other consumer
+    # trips the ban.
+    { name = "ring", wrappers = ["quinn-proto", "rustls-webpki"] },
+]
 # Internal workspace crates are version-less `path` dependencies, which cargo-deny
 # counts as wildcards. Allow only those; registry wildcards remain denied.
 allow-wildcard-paths = true

@@ -167,8 +167,8 @@ async fn enhanced_auth_wrong_proof_is_rejected() {
     assert_eq!(c.expect_auth().await.reason, 0x18, "challenge");
 
     // A proof under the wrong key.
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"not-the-secret");
-    let bad = ring::hmac::sign(&key, b"nonce");
+    let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, b"not-the-secret");
+    let bad = aws_lc_rs::hmac::sign(&key, b"nonce");
     c.send(&enhanced::auth(0x18, bad.as_ref())).await;
     match c.recv().await {
         Packet::ConnAck(a) => assert_eq!(a.code, 0x87, "not authorized"),

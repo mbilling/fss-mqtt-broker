@@ -20,12 +20,13 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// non-feature until a deployment demands it (ADR 0002).
 static TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
-/// This broker's rustls crypto provider — `ring`, selected **explicitly** rather than
-/// via rustls' process-default auto-detection. The OTLP exporter (ADR 0020 T9) pulls
-/// reqwest's rustls, which adds a second provider (`aws-lc-rs`) to the build; naming
-/// `ring` here keeps every broker-built TLS config unambiguous and provider-stable.
+/// This broker's rustls crypto provider — `aws-lc-rs`, selected **explicitly** rather
+/// than via rustls' process-default auto-detection (ADR 0053). It is the same provider
+/// the OTLP exporter's reqwest/rustls chain compiles in, so the whole build carries
+/// exactly one crypto stack; naming it here keeps every broker-built TLS config
+/// unambiguous and provider-stable regardless of process-default installation order.
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
 /// Build a server-side acceptor from PEM files.

@@ -60,6 +60,7 @@
 | [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |
 | [0051](../adr/0051-evaluation-readiness.md) | Evaluation readiness: an assessable, comparable, migratable first release | Proposed | [1/11 done](0051-evaluation-readiness.md) | 10 open |
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
+| [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 
 ## Open and deferred work
 
@@ -135,3 +136,7 @@
 **0052 — Codec succession: postcard replaces bincode on every cluster surface**
 
 - `0052-T4` ⬜ planned: BASELINE_REF bump (follow-up PR, post-merge by necessity) — cluster_upgrade.rs pinned baseline moves to this change's merge commit; nightly red window disclosed in both PR bodies
+
+**0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
+
+- `0053-T5` ⬜ planned: FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration

@@ -76,8 +76,10 @@ replies with a random 32-byte nonce (`ring::rand`); the client returns
 (`ring::hmac::verify`) against the subject's configured shared secret. The secret
 never crosses the wire. An unknown subject is still issued a challenge before the
 inevitable failure, to blunt user enumeration (the verify-time difference remains
-a known minor side channel). This reuses the `ring` primitive already vetted for
-the gossip MAC (ADR 0003).
+a known minor side channel). This reuses the crypto primitive already vetted for
+the gossip MAC (ADR 0003; `ring::hmac` then, `aws_lc_rs::hmac` since
+[ADR 0053](0053-single-crypto-provider-aws-lc-rs.md) — same algorithm and
+constant-time verify).
 
 ### 4. Re-authentication reuses the same exchange in the serve loop
 

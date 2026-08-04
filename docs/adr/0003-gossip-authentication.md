@@ -34,6 +34,11 @@ own integrity/authenticity mechanism.
    would be faster but adds a crate; gossip volume (a few datagrams per second
    per node) makes MAC speed irrelevant.
 
+   > **Amended by [ADR 0053](0053-single-crypto-provider-aws-lc-rs.md)
+   > (2026-08-04):** the primitive is now `aws_lc_rs::hmac` — same algorithm,
+   > same no-new-dependency argument, same wire bytes (pinned by the golden
+   > HMAC vector).
+
 3. **Key provisioning:** a 64-hex-char (32-byte) key via `MQTTD_SWIM_KEY`
    (interim env shim, like all current config). Short or malformed keys are
    startup errors — there is no weak-key mode. Generate with

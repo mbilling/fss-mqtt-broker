@@ -758,8 +758,8 @@ pub mod enhanced {
     /// The correct HMAC-SHA256 proof over `nonce` for `SUBJECT`.
     #[must_use]
     pub fn proof(nonce: &[u8]) -> Vec<u8> {
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, SECRET);
-        ring::hmac::sign(&key, nonce).as_ref().to_vec()
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, SECRET);
+        aws_lc_rs::hmac::sign(&key, nonce).as_ref().to_vec()
     }
 
     /// An AUTH packet for `METHOD` with the given reason and data.

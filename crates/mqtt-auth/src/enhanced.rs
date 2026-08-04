@@ -8,8 +8,8 @@
 //! mechanism-agnostic abstraction plus one reference mechanism (HMAC-SHA256).
 
 use crate::Identity;
+use aws_lc_rs::{hmac, rand::SecureRandom};
 use mqtt_core::ClientId;
-use ring::{hmac, rand::SecureRandom};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -83,7 +83,7 @@ impl EnhancedAuthenticator for HmacChallengeAuthenticator {
     fn start(&self) -> Box<dyn AuthSession> {
         Box::new(HmacSession {
             secrets: Arc::clone(&self.secrets),
-            rng: ring::rand::SystemRandom::new(),
+            rng: aws_lc_rs::rand::SystemRandom::new(),
             pending: None,
         })
     }
@@ -92,7 +92,7 @@ impl EnhancedAuthenticator for HmacChallengeAuthenticator {
 /// One HMAC challenge/response exchange.
 struct HmacSession {
     secrets: Arc<HashMap<String, Vec<u8>>>,
-    rng: ring::rand::SystemRandom,
+    rng: aws_lc_rs::rand::SystemRandom,
     /// `(subject, nonce)` once a challenge has been issued and we await the proof.
     pending: Option<(String, [u8; NONCE_LEN])>,
 }
@@ -137,8 +137,8 @@ impl AuthSession for HmacSession {
 #[cfg(test)]
 mod tests {
     use super::{AuthStep, EnhancedAuthenticator, HmacChallengeAuthenticator};
+    use aws_lc_rs::hmac;
     use mqtt_core::ClientId;
-    use ring::hmac;
     use std::collections::HashMap;
 
     fn cid() -> ClientId {
