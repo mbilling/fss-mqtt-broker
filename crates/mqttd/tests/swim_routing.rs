@@ -104,6 +104,7 @@ async fn start_node(
         Some(auth),
         None, // no anti-replay sequencing in this test
         None, // no reject sink in this test
+        None, // no cluster identity in this harness
         std::future::pending(),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(
@@ -356,6 +357,7 @@ async fn start_proxy_node(
         Some(auth),
         None, // no anti-replay sequencing in this test
         None, // no reject sink in this test
+        None, // no cluster identity in this harness
         std::future::pending(),
     ));
     tokio::spawn(mqttd::cluster::maintain_peer_links(

@@ -400,6 +400,7 @@ async fn start_stress_node_in_zone(
             Some(auth),
             None,
             None,
+            None, // no cluster identity in this harness
             std::future::pending(),
         ))
         .abort_handle(),

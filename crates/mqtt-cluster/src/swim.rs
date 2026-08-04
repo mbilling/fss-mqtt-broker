@@ -209,6 +209,15 @@ pub struct Message {
     pub kind: Kind,
     /// Piggybacked membership updates.
     pub gossip: Vec<Update>,
+    /// The sender's cluster identity (ADR 0054 T2), stamped by the DRIVER at
+    /// send time — the pure state machine never learns it. `None` from a joiner
+    /// that has not adopted one yet, or from a pre-0054 build. The driver drops
+    /// (and counts `cluster-mismatch`) any datagram carrying a *different*
+    /// identity than ours: gossip from a separately-founded cluster is contained,
+    /// not merged. Appended field: a pre-1.0 wire reshape (ADR 0039), same
+    /// clean-break rules as ADR 0052.
+    #[serde(default)]
+    pub cluster_id: Option<String>,
 }
 
 impl Message {
@@ -453,6 +462,7 @@ impl Swim {
             from_addr: self.local_addr.clone(),
             from_peer_addr: self.local_peer_addr.clone(),
             from_domain: self.local_domain.clone(),
+            cluster_id: None, // stamped by the driver at send time (ADR 0054)
             kind,
             gossip: self.take_gossip(),
         }
@@ -657,6 +667,7 @@ impl Swim {
                     from_addr: self.local_addr.clone(),
                     from_peer_addr: self.local_peer_addr.clone(),
                     from_domain: self.local_domain.clone(),
+                    cluster_id: None, // stamped by the driver at send time (ADR 0054)
                     kind: Kind::Sync,
                     gossip: vec![departure.clone()],
                 },
@@ -1050,6 +1061,7 @@ mod tests {
             from_addr: from_addr.to_string(),
             from_peer_addr: peer_addr_of(from_addr),
             from_domain: None,
+            cluster_id: None,
             kind,
             gossip,
         }
@@ -1804,6 +1816,7 @@ mod tests {
             from_addr: "a:1".into(),
             from_peer_addr: peer_addr_of("a:1"),
             from_domain: Some("rack-a".into()),
+            cluster_id: None,
             kind: Kind::Ping { seq: 7 },
             gossip: vec![],
         };

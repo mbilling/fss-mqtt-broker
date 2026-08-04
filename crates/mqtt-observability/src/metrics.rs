@@ -76,6 +76,14 @@ struct AxisLabel {
     axis: String,
 }
 
+/// `{cluster_id}` label for `mqttd_cluster_info` (ADR 0054 T2): exactly one live
+/// series per node (the `build_info` pattern) — the value every node in a healthy
+/// cluster must agree on. Two values across a fleet = split brain.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ClusterIdLabel {
+    cluster_id: String,
+}
+
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
 /// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
 /// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
@@ -117,6 +125,9 @@ struct OtelInstruments {
     voters: OtelGauge<i64>,
     replica_groups_current: OtelGauge<i64>,
     replica_groups_tracked: OtelGauge<i64>,
+    cluster_info: OtelGauge<i64>,
+    founder: OtelGauge<i64>,
+    foundings: OtelCounter<u64>,
 }
 
 impl OtelInstruments {
@@ -163,6 +174,9 @@ impl OtelInstruments {
             voters: meter.i64_gauge("voters").build(),
             replica_groups_current: meter.i64_gauge("replica_groups_current").build(),
             replica_groups_tracked: meter.i64_gauge("replica_groups_tracked").build(),
+            cluster_info: meter.i64_gauge("cluster_info").build(),
+            founder: meter.i64_gauge("founder").build(),
+            foundings: meter.u64_counter("foundings").build(),
         }
     }
 }
@@ -237,6 +251,15 @@ pub struct Metrics {
     /// replication lag in groups — the takeover-safety signal.
     replica_groups_current: Gauge,
     replica_groups_tracked: Gauge,
+    /// The cluster identity (ADR 0054 T2), `build_info`-style: one series with the
+    /// id as its label, value 1. Every node in a healthy cluster agrees on it.
+    cluster_info: Family<ClusterIdLabel, Gauge>,
+    /// 1 when this node is the cluster founder (started seedless), else 0.
+    founder: Gauge,
+    /// Founding events: this process minted a NEW cluster identity. Exactly one,
+    /// ever, on a healthy cluster's first boot — any increment after day one is
+    /// the split-brain alarm.
+    foundings_total: Counter,
 }
 
 impl Metrics {
@@ -486,6 +509,24 @@ impl Metrics {
             "Replicated groups this node tracks a caught-up set for (ADR 0054)",
         );
 
+        let cluster_info = register_gauge_family(
+            &mut registry,
+            "cluster_info",
+            "The cluster identity this node belongs to (ADR 0054 T2), as a \
+             build_info-style label; two distinct values across a fleet = split brain",
+        );
+        let founder = register_gauge(
+            &mut registry,
+            "founder",
+            "1 if this node founded the cluster (started seedless), else 0",
+        );
+        let foundings_total = register_counter(
+            &mut registry,
+            "foundings",
+            "Cluster-identity foundings by this process; anything beyond the very \
+             first boot of a brand-new cluster indicates a split-brain founding",
+        );
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         build_info
@@ -535,6 +576,9 @@ impl Metrics {
             voters,
             replica_groups_current,
             replica_groups_tracked,
+            cluster_info,
+            founder,
+            foundings_total,
         }
     }
 
@@ -845,6 +889,30 @@ impl Metrics {
         self.otel
             .replica_groups_tracked
             .record(clamp_gauge(tracked), &[]);
+    }
+
+    /// Record the cluster identity (ADR 0054 T2) — one series, value 1.
+    pub fn set_cluster_info(&self, cluster_id: &str) {
+        self.cluster_info
+            .get_or_create(&ClusterIdLabel {
+                cluster_id: cluster_id.to_string(),
+            })
+            .set(1);
+        self.otel
+            .cluster_info
+            .record(1, &[KeyValue::new("cluster_id", cluster_id.to_string())]);
+    }
+
+    /// Record whether this node founded the cluster.
+    pub fn set_founder(&self, founder: bool) {
+        self.founder.set(i64::from(founder));
+        self.otel.founder.record(i64::from(founder), &[]);
+    }
+
+    /// A founding event: this process minted a new cluster identity.
+    pub fn founding(&self) {
+        self.foundings_total.inc();
+        self.otel.foundings.add(1, &[]);
     }
 
     /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only

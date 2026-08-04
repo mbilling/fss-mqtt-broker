@@ -98,9 +98,10 @@ pub struct HealthState {
     decommission: Arc<OnceLock<Arc<DrainStatus>>>,
     /// When set, `GET /metrics` serves Prometheus exposition (ADR 0020); otherwise it 404s.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
-    /// Identity block for `/statusz` (ADR 0054): `(node id, founder flag)`.
-    /// `None` = `/statusz` 404s (the route is opt-in via [`with_status`]).
-    identity: Option<(String, bool)>,
+    /// Identity block for `/statusz` (ADR 0054): the node id plus the shared
+    /// cluster identity (founder flag + cluster id, filled at founding or on
+    /// gossip adoption). `None` = `/statusz` 404s (opt-in via [`with_status`]).
+    identity: Option<(String, Arc<mqtt_cluster::cluster_identity::ClusterIdentity>)>,
     /// Brownout state for `/statusz` (ADR 0054).
     brownout: Option<Arc<BrownoutStatus>>,
     /// Store-size snapshot for `/statusz` (ADR 0054).
@@ -193,17 +194,17 @@ impl HealthState {
     }
 
     /// Enable `GET /statusz` (ADR 0054): the structured operator-facing state body.
-    /// `node_id`/`founder` form the identity block; `brownout` and `stores` are the
-    /// shared snapshots the hub and store watcher keep current.
+    /// `node_id` + the shared `cluster` identity form the identity block; `brownout`
+    /// and `stores` are the shared snapshots the hub and store watcher keep current.
     #[must_use]
     pub fn with_status(
         mut self,
         node_id: String,
-        founder: bool,
+        cluster: Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
         brownout: Arc<BrownoutStatus>,
         stores: Option<Arc<crate::store_watch::StoreSnapshot>>,
     ) -> Self {
-        self.identity = Some((node_id, founder));
+        self.identity = Some((node_id, cluster));
         self.brownout = Some(brownout);
         self.stores = stores;
         self
@@ -311,17 +312,26 @@ impl HealthState {
     /// ids) lives HERE, never in metric labels — the ADR 0020 cardinality rule.
     /// Every value is broker state an ops-network reader may see; no secret
     /// material is ever included.
+    // A flat, section-by-section JSON assembly — long by field count, not complexity.
+    #[allow(clippy::too_many_lines)]
     async fn statusz(&self) -> Option<String> {
         use std::fmt::Write;
-        let (node_id, founder) = self.identity.as_ref()?;
+        let (node_id, cluster) = self.identity.as_ref()?;
         let report = self.readiness().await;
         let mut s = format!(
-            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"founder\":{founder},\"ready\":{},\"live\":{}",
+            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"founder\":{},\"ready\":{},\"live\":{}",
             json_escape(node_id),
             env!("CARGO_PKG_VERSION"),
+            cluster.founder(),
             report.ready,
             report.live,
         );
+        // The cluster identity (ADR 0054 T2): absent until known (a joiner before
+        // its first authenticated contact). The operator's split-brain check is
+        // "every pod reports the SAME cluster_id".
+        if let Some(id) = cluster.get() {
+            let _ = write!(s, ",\"cluster_id\":\"{}\"", json_escape(&id));
+        }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
             let members = p
@@ -647,9 +657,14 @@ mod tests {
     #[tokio::test]
     async fn statusz_reports_identity_members_brownout_and_proto() {
         let brownout = Arc::new(super::BrownoutStatus::default());
+        // A founder identity (no persistence): mints an id at construction.
+        let cluster = Arc::new(
+            mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+        );
+        let cluster_id = cluster.get().expect("founder mints");
         let state = HealthState::new(spawn_live_hub(), Some(placement(2)), None, 1).with_status(
             "node-a".into(),
-            true,
+            cluster,
             brownout.clone(),
             None,
         );
@@ -658,6 +673,10 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"node_id\":\"node-a\""), "{body}");
         assert!(body.contains("\"founder\":true"), "{body}");
+        assert!(
+            body.contains(&format!("\"cluster_id\":\"{cluster_id}\"")),
+            "{body}"
+        );
         assert!(body.contains("\"members\":["), "{body}");
         assert!(body.contains("\"id\":\"peer-1\""), "{body}");
         assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");
