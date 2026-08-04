@@ -187,3 +187,39 @@ ADR 0032 — adding limits to it later is mechanical).
   from security policy: they change rarely and a restart is acceptable; keeping them
   startup-only avoids sweep semantics for capacity (what would "sweep" a lowered
   connection cap mean — mass disconnect?). Deferred with a recorded path back.
+
+## Amendment (2026-08-04): byte-based bounds and a memory watermark
+
+The 2026-08-04 pre-release sizing review (docs/SIZING.md, and the operational-limits
+section it added to docs/COMPARISON.md) produced the evidence this ADR's deferrals
+asked for. Three additions are **accepted**; implementation is tracked as 0041-T6..T8
+in the delivery doc and ships as its own reviewed feature work.
+
+1. **Per-session byte bound on the offline queue** (`max_queued_bytes`, env
+   `MQTTD_MAX_QUEUED_BYTES`; unset = unbounded, both bounds enforced when both set —
+   first reached wins, mirroring mosquitto's pairing). The count cap alone bounds
+   memory/disk only when multiplied by `max_packet_size`: 100 000 messages × 1 MiB
+   default packets is ~100 GiB *per session*. A count is not a budget; a byte bound
+   is. Same overflow semantics as the count bound (`queue_overflow`).
+
+2. **Bridge-spool byte bound.** The mqtt-bridge spool bounds messages (default
+   10 000) but not bytes; the same count-is-not-a-budget argument applies to a
+   boundary link buffering large payloads. A `max_bytes` joins `max_messages`,
+   drop-oldest, counted.
+
+3. **Process-memory watermark → brownout** (`memory_max_bytes`, env
+   `MQTTD_MEMORY_MAX_BYTES`; unset = off). The RSS analogue of the T5 disk
+   watermark, reusing its shape: a poller samples process RSS, an edge-triggered
+   brownout refuses growth (new sessions, new retained topics, offline enqueues —
+   all already-built refusal paths) while acks, reads, deletes, expiry, and resumes
+   continue, and dropping below the mark restores growth. This is deliberately NOT
+   mosquitto's allocation-failure model (deny malloc at a heap cap) nor EMQX's
+   `force_shutdown` (kill the connection process over a per-connection heap/mailbox
+   bound): both destroy standing state or sessions; brownout refuses new growth,
+   consistent with this ADR's founding principle. Operators who prefer a hard
+   ceiling keep the container limit — the watermark's job is to make the limit
+   unnecessary in the common case.
+
+Reaffirmed as deferred: per-tenant/weighted quota classes, byte-*rate* bandwidth
+quotas (`rate × size` still bounds bandwidth; the additions above bound *state*, a
+distinct axis), and hot-reloadable limits (unchanged reasoning).
