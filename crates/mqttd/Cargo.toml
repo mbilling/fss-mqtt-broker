@@ -50,7 +50,7 @@ argon2.workspace = true
 # uses for the server side — no new supply-chain surface.
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
-ring = { workspace = true }
+aws-lc-rs = { workspace = true }
 rustls.workspace = true
 rustls-pki-types.workspace = true
 # `test-util` enables tokio's paused-clock test helpers (start_paused) for the

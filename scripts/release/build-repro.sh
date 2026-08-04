@@ -45,7 +45,7 @@ export SOURCE_DATE_EPOCH
 # in the remap list: longer prefixes first.
 export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo --remap-path-prefix=${REPO_ROOT}=/build -C strip=symbols -C target-feature=+crt-static"
 
-# The C dependencies (aws-lc-rs, ring) need a musl C compiler. `musl-tools`
+# The C dependency (aws-lc-rs) needs a musl C compiler. `musl-tools`
 # provides `musl-gcc` for the *native* arch, so each arch builds on its own
 # native runner (no cross-toolchain). Point the target's CC at it, e.g.
 # CC_x86_64_unknown_linux_musl=musl-gcc.

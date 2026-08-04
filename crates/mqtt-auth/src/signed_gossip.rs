@@ -5,24 +5,84 @@
 //! the signature is valid, then reads the certificate's Common Name. The driver binds that
 //! authenticated CN to the SWIM `from` id, so a datagram cannot impersonate another node.
 //!
-//! This reuses the cluster PKI (ADR 0002/0004) and the crypto already in the tree: `ring`
-//! for signing/verification and `x509-parser` (with its `verify` feature) for the chain
-//! check and Common-Name extraction — no new dependency. Supported leaf key types are
-//! **ECDSA P-256, ECDSA P-384, and Ed25519**; anything else fails closed.
+//! This reuses the cluster PKI (ADR 0002/0004) and the crypto already in the tree:
+//! `aws-lc-rs` (the workspace's single crypto provider, ADR 0053) for
+//! signing/verification and `x509-parser` for **parsing only** — its ring-backed
+//! `verify` feature is replaced by the first-party [`verify_x509_signature`] below, an
+//! OID→algorithm dispatch onto the same provider. No new dependency. Supported leaf key
+//! types are **ECDSA P-256, ECDSA P-384, and Ed25519**; anything else fails closed.
 //!
 //! Inputs are DER (the PEM I/O lives in the broker, which already loads these files for
 //! mTLS), so this module stays free of file/PEM handling.
 
 use std::collections::BTreeSet;
 
-use ring::rand::SystemRandom;
-use ring::signature::{
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{
     self, EcdsaKeyPair, Ed25519KeyPair, UnparsedPublicKey, VerificationAlgorithm,
 };
-use x509_parser::oid_registry::{OID_KEY_TYPE_EC_PUBLIC_KEY, OID_SIG_ED25519};
+use x509_parser::oid_registry::{
+    OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384, OID_PKCS1_SHA256WITHRSA,
+    OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA, OID_SIG_ECDSA_WITH_SHA256,
+    OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ED25519,
+};
 use x509_parser::prelude::{
     ASN1Time, CertificateRevocationList, FromDer, GeneralName, X509Certificate,
 };
+use x509_parser::x509::{AlgorithmIdentifier, SubjectPublicKeyInfo};
+
+/// Verify a DER-signed X.509 structure (a certificate or a CRL) under the issuer's
+/// `SubjectPublicKeyInfo` — the first-party successor to x509-parser's ring-backed
+/// `verify` feature (ADR 0053): the same OID→algorithm dispatch, onto the
+/// workspace's single crypto provider.
+///
+/// Deliberate narrowing versus the library version: the SHA-1 RSA legacy arm is
+/// **dropped** — a SHA-1-signed cluster CA artifact is rejected, not grandfathered.
+/// Any unknown algorithm fails closed.
+fn verify_x509_signature(
+    issuer_spki: &SubjectPublicKeyInfo<'_>,
+    sig_alg: &AlgorithmIdentifier<'_>,
+    sig: &[u8],
+    tbs: &[u8],
+) -> Result<(), ()> {
+    // For ECDSA the hash comes from the signature algorithm and the curve from the
+    // ISSUER key's SPKI parameters (that is the key doing the verifying).
+    let issuer_curve = || -> Result<&'static str, ()> {
+        let params = issuer_spki.algorithm.parameters.as_ref().ok_or(())?;
+        let oid = params.as_oid().map_err(|_| ())?;
+        if oid == OID_EC_P256 {
+            Ok("p256")
+        } else if oid == OID_NIST_EC_P384 {
+            Ok("p384")
+        } else {
+            Err(())
+        }
+    };
+    let alg: &'static dyn VerificationAlgorithm = if sig_alg.algorithm == OID_PKCS1_SHA256WITHRSA {
+        &signature::RSA_PKCS1_2048_8192_SHA256
+    } else if sig_alg.algorithm == OID_PKCS1_SHA384WITHRSA {
+        &signature::RSA_PKCS1_2048_8192_SHA384
+    } else if sig_alg.algorithm == OID_PKCS1_SHA512WITHRSA {
+        &signature::RSA_PKCS1_2048_8192_SHA512
+    } else if sig_alg.algorithm == OID_SIG_ECDSA_WITH_SHA256 {
+        match issuer_curve()? {
+            "p256" => &signature::ECDSA_P256_SHA256_ASN1,
+            _ => &signature::ECDSA_P384_SHA256_ASN1,
+        }
+    } else if sig_alg.algorithm == OID_SIG_ECDSA_WITH_SHA384 {
+        match issuer_curve()? {
+            "p256" => &signature::ECDSA_P256_SHA384_ASN1,
+            _ => &signature::ECDSA_P384_SHA384_ASN1,
+        }
+    } else if sig_alg.algorithm == OID_SIG_ED25519 {
+        &signature::ED25519
+    } else {
+        return Err(()); // unknown signature algorithm: fail closed
+    };
+    UnparsedPublicKey::new(alg, &issuer_spki.subject_public_key.data)
+        .verify(tbs, sig)
+        .map_err(|_| ())
+}
 
 /// The SAN URI prefix that carries a CA-attested failure-domain label (ADR 0016 T6):
 /// a leaf certificate with `URI:urn:fss:failure-domain:<label>` among its Subject
@@ -95,8 +155,13 @@ impl RevocationList {
     pub fn from_der(crl_der: &[u8], ca_der: &[u8]) -> Result<Self, CrlError> {
         let (_, crl) = CertificateRevocationList::from_der(crl_der).map_err(|_| CrlError::Parse)?;
         let (_, ca) = X509Certificate::from_der(ca_der).map_err(|_| CrlError::Parse)?;
-        crl.verify_signature(ca.public_key())
-            .map_err(|_| CrlError::Chain)?;
+        verify_x509_signature(
+            ca.public_key(),
+            &crl.signature_algorithm,
+            &crl.signature_value.data,
+            crl.tbs_cert_list.as_ref(),
+        )
+        .map_err(|()| CrlError::Chain)?;
         let serials = crl
             .iter_revoked_certificates()
             .map(|r| r.user_certificate.to_bytes_be())
@@ -192,17 +257,13 @@ impl GossipSigner {
     /// [`SignerError`] if the bytes are not a supported PKCS#8 key.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, SignerError> {
         let rng = SystemRandom::new();
-        if let Ok(k) =
-            EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, der, &rng)
-        {
+        if let Ok(k) = EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, der) {
             return Ok(Self {
                 key: Key::Ecdsa(k),
                 rng,
             });
         }
-        if let Ok(k) =
-            EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, der, &rng)
-        {
+        if let Ok(k) = EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, der) {
             return Ok(Self {
                 key: Key::Ecdsa(k),
                 rng,
@@ -220,7 +281,8 @@ impl GossipSigner {
     /// Sign `msg`, returning the signature bytes (ASN.1 DER for ECDSA, raw for Ed25519).
     ///
     /// # Panics
-    /// Panics only if the system RNG fails, which `ring` treats as unrecoverable.
+    /// Panics only if the system RNG fails, which the crypto provider treats as
+    /// unrecoverable.
     #[must_use]
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
         match &self.key {
@@ -258,8 +320,13 @@ pub fn verify(
     let (_, ca) = X509Certificate::from_der(ca_der).map_err(|_| VerifyError::Parse)?;
 
     // 1. The leaf is signed by the cluster CA (chain of one — peer certs are CA-issued).
-    leaf.verify_signature(Some(ca.public_key()))
-        .map_err(|_| VerifyError::Chain)?;
+    verify_x509_signature(
+        ca.public_key(),
+        &leaf.signature_algorithm,
+        &leaf.signature_value.data,
+        leaf.tbs_certificate.as_ref(),
+    )
+    .map_err(|()| VerifyError::Chain)?;
 
     // 2. The leaf is inside its validity window (ADR 0022 T7). An unrepresentable clock
     //    fails closed as Expired rather than skipping the check.
@@ -275,8 +342,9 @@ pub fn verify(
         }
     }
 
-    // 4. The gossip signature verifies under the leaf's public key. The ring algorithm is
-    //    chosen from the SPKI: EC by point length (P-256 = 65 B, P-384 = 97 B), or Ed25519.
+    // 4. The gossip signature verifies under the leaf's public key. The verification
+    //    algorithm is chosen from the SPKI: EC by point length (P-256 = 65 B,
+    //    P-384 = 97 B), or Ed25519.
     let spki = leaf.public_key();
     let key_bytes: &[u8] = &spki.subject_public_key.data;
     let alg: &dyn VerificationAlgorithm = if spki.algorithm.algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY

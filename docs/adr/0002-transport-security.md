@@ -30,6 +30,13 @@ deliberately deferred.
    our `cargo-deny` allow-list unmodified. Switching providers later is a
    one-line change confined to `mqtt-net`.
 
+   > **Amended by [ADR 0053](0053-single-crypto-provider-aws-lc-rs.md)
+   > (2026-08-04):** the provider is now `aws-lc-rs`. ring went into upstream
+   > maintenance mode, and the OTLP exporter's reqwest chain had already pulled
+   > aws-lc-rs into every build — the swap *removed* the second provider. (The
+   > "one-line change" held for TLS; the direct `ring::` call sites in
+   > mqtt-auth/mqtt-cluster took import renames.)
+
 2. **TLS 1.3 only.** The plan says "TLS 1.2 opt-in only"; we go further and do
    not implement the 1.2 opt-in until a concrete deployment needs it. No
    protocol-version configuration surface exists until then — what isn't
@@ -64,7 +71,8 @@ deliberately deferred.
   mesh or read traffic.
 - `ring`'s build simplicity costs FIPS availability (`aws-lc-rs` has a FIPS
   mode). Certified builds are a stated business line; revisit the provider when
-  that work starts.
+  that work starts. *(Taken early — [ADR 0053](0053-single-crypto-provider-aws-lc-rs.md)
+  moved to aws-lc-rs for maintenance reasons; FIPS is now a feature flag away.)*
 - Tests minting real CAs keep the no-insecure-verifier invariant but make test
   setup slightly heavier (an in-test PKI helper).
 

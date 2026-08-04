@@ -50,8 +50,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # config
 serde = { version = "1", features = ["derive"] }
-# gossip-datagram HMAC (ADR 0003); already in-tree as the rustls crypto provider
-ring = "0.17"
+# The workspace's single crypto provider (ADR 0053): backs rustls/quinn TLS, the
+# gossip-datagram HMAC (ADR 0003), gossip signatures (ADR 0022), and — via their own
+# features — jsonwebtoken and rcgen. Succeeded maintenance-mode ring, which had
+# become the SECOND provider after the OTLP/reqwest chain pulled aws-lc-rs in anyway.
+aws-lc-rs = "1"
 # X.509 parsing for mTLS identity extraction (ADR 0004)
 x509-parser = "0.16"
 # ACL policy files (ADR 0004 step 3)
@@ -63,20 +66,21 @@ argon2 = "0.5"
 # hard dependency on maintenance-mode ring.
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 serde_json = "1"
-# TLS (ADR 0002): pure-Rust rustls, ring provider, TLS 1.3 only (no tls12 feature)
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# TLS (ADR 0002, provider per ADR 0053): rustls on aws-lc-rs, TLS 1.3 only (no tls12)
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging"] }
 rustls-pki-types = "1"
 # test-only PKI: integration tests mint throwaway CAs instead of skipping verification
-rcgen = "0.13"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 # WebSocket transport (ADR 0035): the HTTP Upgrade handshake + WS frame codec only — TLS is
 # done by our own rustls (no tungstenite TLS feature), so there is one TLS stack in the broker.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 # Stream/Sink adapters for the WebSocket byte-stream shim (already in-tree transitively).
 futures-util = "0.3"
-# QUIC transport (ADR 0036): MQTT-over-QUIC. Pinned to the `ring` rustls provider (no aws-lc),
-# matching the rest of the broker; already in-tree transitively on our rustls 0.23.
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# QUIC transport (ADR 0036): MQTT-over-QUIC on the same aws-lc-rs provider as the rest
+# of the broker (ADR 0053 — one provider; previously quinn-proto linked BOTH ring and
+# aws-lc-rs through feature unification).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 # Micro-benchmarks (ADR 0044 P6): dev-only, statistical timing of the hot paths.
 criterion = "0.5"
 

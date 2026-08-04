@@ -166,4 +166,7 @@ keeps flowing — turning T10 from "deferred, unproven" into "demonstrated".
   replayable, unacceptable for session establishment on a security broker. 1-RTT resumption is
   kept (replay-safe).
 - **aws-lc-rs crypto for quinn.** A second crypto provider alongside ring. Rejected: use ring,
-  matching the rest of the broker (one provider).
+  matching the rest of the broker (one provider). *(Inverted by
+  [ADR 0053](0053-single-crypto-provider-aws-lc-rs.md): the OTLP chain had made aws-lc-rs the
+  de-facto second provider — quinn-proto linked both — so the same one-provider argument now
+  lands on aws-lc-rs, and quinn runs `rustls-aws-lc-rs`.)*

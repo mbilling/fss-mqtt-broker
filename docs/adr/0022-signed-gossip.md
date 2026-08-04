@@ -71,7 +71,12 @@ material; a `require` node, however, accepts only v2 (each posture is strict —
 
 Signing/verification reuse the existing crypto surface — `ring` (HMAC, ECDSA/Ed25519) and
 `x509-parser` (already used by [ADR 0004](0004-identity-and-authentication.md)'s mTLS
-identity extraction) for chain verification and SPKI extraction. No new dependency. The
+identity extraction) for chain verification and SPKI extraction. No new dependency.
+
+> **Amended by [ADR 0053](0053-single-crypto-provider-aws-lc-rs.md) (2026-08-04):**
+> signatures now run on `aws_lc_rs`, and x509-parser is parsing-only — its ring-backed
+> `verify` feature is replaced by the first-party `verify_x509_signature` (which also
+> drops the SHA-1 RSA legacy arm: fail closed). The
 broker's own certificates are ECDSA P-256 (the `rcgen` default); the implementation supports
 **ECDSA P-256/P-384 and Ed25519**, selected from the certificate's SPKI algorithm, and
 fails closed with a clear error on an unsupported key type. The pure `swim` state machine
