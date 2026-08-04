@@ -1004,6 +1004,9 @@ pub struct Hub {
     connecting: HashMap<ClientId, u64>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    /// Shared brownout state for the `/statusz` body (ADR 0054), flipped alongside
+    /// the internal flag on [`HubCommand::SetBrownout`] transitions.
+    brownout_status: Option<Arc<crate::health::BrownoutStatus>>,
     /// Wall-clock source for absolute message-expiry deadlines (ADR 0009 §3).
     /// Injectable so expiry can be tested without real time passing.
     clock: Arc<dyn crate::clock::Clock>,
@@ -1246,6 +1249,7 @@ impl Hub {
                 durable_retained: None,
                 authz: None,
                 brownout: false,
+                brownout_status: None,
                 quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
                 retained_queue: VecDeque::new(),
@@ -1317,6 +1321,11 @@ impl Hub {
     /// publish/deliver/drop counts (ADR 0020).
     pub fn attach_metrics(&mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Attach the shared brownout status the `/statusz` body reads (ADR 0054).
+    pub fn attach_brownout_status(&mut self, status: Arc<crate::health::BrownoutStatus>) {
+        self.brownout_status = Some(status);
     }
 
     /// Replace the wall-clock source before [`run`](Self::run). Production uses the
@@ -1409,6 +1418,14 @@ impl Hub {
                         );
                     } else {
                         info!("disk usage back under the watermark: brownout lifted (ADR 0041)");
+                    }
+                    // ADR 0054: brownout is a STATE, not just symptoms — export the
+                    // gauge and the shared /statusz flag on every transition.
+                    if let Some(m) = &self.metrics {
+                        m.set_brownout("disk", on);
+                    }
+                    if let Some(s) = &self.brownout_status {
+                        s.set(on);
                     }
                 }
                 self.brownout = on;
@@ -3554,6 +3571,12 @@ impl Hub {
                 .and_then(|v| i64::try_from(v).ok())
                 .unwrap_or(0);
             m.set_lease_quorum_ack_ms(ack_ms);
+            // ADR 0054: voter count (previously only in the /readyz body) and the
+            // replica catch-up summary — tracked minus current is this node's
+            // replication lag in groups, the takeover-safety signal.
+            m.set_voters(plane.voter_count());
+            let (current, tracked) = plane.caught_up_summary();
+            m.set_replica_groups(current, tracked);
         }
     }
 

@@ -220,6 +220,30 @@ impl DurablePlane {
         )
     }
 
+    /// The replica catch-up summary for the observability gauges (ADR 0054):
+    /// `(current, tracked)` groups, where a group is current when this node's
+    /// durable caught-up stamp matches the group's present replica set.
+    #[must_use]
+    pub fn caught_up_summary(&self) -> (usize, usize) {
+        let placement = self
+            .placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let r = self.lock_replicas();
+        r.caught_up_summary(|g| placement.group_replica_set(g))
+    }
+
+    /// The current lease-group voter identities, as pushed to placement each
+    /// reconcile tick (ADR 0049) — for the `/statusz` body (ADR 0054).
+    #[must_use]
+    pub fn voter_ids(&self) -> Vec<NodeId> {
+        self.placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .voter_ids()
+    }
+
     /// Whether this node's replica copy of `key` is **caught up** (ADR 0043 P1):
     /// non-empty, gap-free, and stamped current for the key's group replica set —
     /// exactly the verdict its recovery reads answer with. Observability for the

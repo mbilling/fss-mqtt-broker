@@ -61,6 +61,7 @@
 | [0051](../adr/0051-evaluation-readiness.md) | Evaluation readiness: an assessable, comparable, migratable first release | Proposed | [1/11 done](0051-evaluation-readiness.md) | 10 open |
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
+| [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [0/4 done](0054-operator-facing-state-surface.md) | 4 open |
 
 ## Open and deferred work
 
@@ -146,3 +147,10 @@
 **0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
 
 - `0053-T5` ⬜ planned: FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration
+
+**0054 — Operator-facing state surface: `/statusz` + state gauges**
+
+- `0054-T1` 🚧 in-progress: /statusz route + state gauges — identity/members/lease/decommission/brownout/store/proto body on the health listener; brownout{axis}, store_max_bytes, decommission_state/pending, voters, replica_groups_current/tracked gauges wired on existing refresh paths
+- `0054-T2` ⬜ planned: Cluster identity — minted at founding, persisted in the lease store, gossip-propagated, adopted by joiners; cluster-mismatch gossip guard (containment, not just detection); cluster_info/founder/foundings_total metrics; statusz cluster block; OPERATIONS.md split-brain detection rule
+- `0054-T3` ⬜ planned: Rotation + convergence visibility — SWIM key count/fingerprints (never material), config checksum + reload generation, peer proto gauge; statusz keys/config blocks; OPERATIONS.md rotation verification
+- `0054-T4` ⬜ planned: Monitoring docs + dashboard — Grafana rows for the new signals (brownout, store utilization, decommission, cluster identity, mismatch rate) and the OPERATIONS.md alert-rule catalogue the operator will encode

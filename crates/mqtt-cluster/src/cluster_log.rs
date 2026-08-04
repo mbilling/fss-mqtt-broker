@@ -583,6 +583,21 @@ impl ReplicaState {
         self.caught_up.get(&group)
     }
 
+    /// The caught-up watermark summarized for the observability gauges (ADR 0054):
+    /// `(current, tracked)` — of every group this node holds a stamp for, how many
+    /// stamps match that group's current replica set per `set_of`. `tracked -
+    /// current` is this node's replication lag in groups.
+    #[must_use]
+    pub fn caught_up_summary(&self, set_of: impl Fn(GroupId) -> Vec<NodeId>) -> (usize, usize) {
+        let tracked = self.caught_up.len();
+        let current = self
+            .caught_up
+            .keys()
+            .filter(|g| self.group_current(**g, &set_of(**g)))
+            .count();
+        (current, tracked)
+    }
+
     /// Durably stamp each `(group, set)` as caught up, in **one** fsync'd
     /// transaction (a boot sweep stamps every owned group at once). On a persist
     /// failure nothing is stamped in memory either — the watermark never claims

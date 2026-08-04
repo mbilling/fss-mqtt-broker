@@ -69,6 +69,13 @@ struct OutcomeLabel {
     trigger: String,
 }
 
+/// `{axis}` label for resource-watermark state gauges (ADR 0054): a bounded set —
+/// `disk` today, `memory` when the ADR 0041 amendment's RSS watermark lands.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AxisLabel {
+    axis: String,
+}
+
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
 /// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
 /// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
@@ -103,6 +110,13 @@ struct OtelInstruments {
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
+    brownout: OtelGauge<i64>,
+    store_max_bytes: OtelGauge<i64>,
+    decommission_state: OtelGauge<i64>,
+    decommission_pending: OtelGauge<i64>,
+    voters: OtelGauge<i64>,
+    replica_groups_current: OtelGauge<i64>,
+    replica_groups_tracked: OtelGauge<i64>,
 }
 
 impl OtelInstruments {
@@ -142,6 +156,13 @@ impl OtelInstruments {
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
+            brownout: meter.i64_gauge("brownout").build(),
+            store_max_bytes: meter.i64_gauge("store_max_bytes").build(),
+            decommission_state: meter.i64_gauge("decommission_state").build(),
+            decommission_pending: meter.i64_gauge("decommission_pending").build(),
+            voters: meter.i64_gauge("voters").build(),
+            replica_groups_current: meter.i64_gauge("replica_groups_current").build(),
+            replica_groups_tracked: meter.i64_gauge("replica_groups_tracked").build(),
         }
     }
 }
@@ -198,6 +219,24 @@ pub struct Metrics {
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
     retained_queue_dropped_total: Counter,
+    /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
+    /// (`disk` today), 0 otherwise. The rejection counters record symptoms; this
+    /// gauge is the condition itself — an idle browned-out broker is visible.
+    brownout: Family<AxisLabel, Gauge>,
+    /// The configured disk high-water mark in bytes (0 = no watermark), so
+    /// utilization is computable from `store_bytes / store_max_bytes` in `PromQL`.
+    store_max_bytes: Gauge,
+    /// Decommission drain state (ADR 0054): 0 = none, 1 = draining, 2 = complete.
+    decommission_state: Gauge,
+    /// Hand-offs still pending in an active decommission drain.
+    decommission_pending: Gauge,
+    /// Current lease-group voter count (previously only in the `/readyz` body).
+    voters: Gauge,
+    /// Replica catch-up summary (ADR 0054): of the replicated groups this node
+    /// tracks, how many list it as caught up. `tracked - current` is this node's
+    /// replication lag in groups — the takeover-safety signal.
+    replica_groups_current: Gauge,
+    replica_groups_tracked: Gauge,
 }
 
 impl Metrics {
@@ -408,6 +447,45 @@ impl Metrics {
              means a partition outlasted the queue's capacity",
         );
 
+        let brownout = register_gauge_family(
+            &mut registry,
+            "brownout",
+            "1 while growth writes are refused on this axis (ADR 0041 §5 / ADR 0054), \
+             by axis (disk); 0 otherwise — the state, not the rejection symptoms",
+        );
+        let store_max_bytes = register_gauge(
+            &mut registry,
+            "store_max_bytes",
+            "The configured disk high-water mark in bytes (MQTTD_STORE_MAX_BYTES); \
+             0 = no watermark configured",
+        );
+        let decommission_state = register_gauge(
+            &mut registry,
+            "decommission_state",
+            "Decommission drain state (ADR 0043/0054): 0 = none, 1 = draining, 2 = complete",
+        );
+        let decommission_pending = register_gauge(
+            &mut registry,
+            "decommission_pending",
+            "Hand-offs still pending in an active decommission drain",
+        );
+        let voters = register_gauge(
+            &mut registry,
+            "voters",
+            "Current lease-group voter count (ADR 0049/0054)",
+        );
+        let replica_groups_current = register_gauge(
+            &mut registry,
+            "replica_groups_current",
+            "Replicated groups this node tracks that list it as caught up (ADR 0054); \
+             tracked minus current is this node's replication lag in groups",
+        );
+        let replica_groups_tracked = register_gauge(
+            &mut registry,
+            "replica_groups_tracked",
+            "Replicated groups this node tracks a caught-up set for (ADR 0054)",
+        );
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         build_info
@@ -450,6 +528,13 @@ impl Metrics {
             quic_path_migrations_total,
             retained_divergence_total,
             retained_queue_dropped_total,
+            brownout,
+            store_max_bytes,
+            decommission_state,
+            decommission_pending,
+            voters,
+            replica_groups_current,
+            replica_groups_tracked,
         }
     }
 
@@ -710,6 +795,56 @@ impl Metrics {
             i64::try_from(bytes).unwrap_or(i64::MAX),
             &[KeyValue::new("store", store.to_string())],
         );
+    }
+
+    /// Set the brownout STATE for `axis` (ADR 0054). Bounded axes only (`disk`,
+    /// later `memory`).
+    pub fn set_brownout(&self, axis: &str, on: bool) {
+        self.brownout
+            .get_or_create(&AxisLabel {
+                axis: axis.to_string(),
+            })
+            .set(i64::from(on));
+        self.otel
+            .brownout
+            .record(i64::from(on), &[KeyValue::new("axis", axis.to_string())]);
+    }
+
+    /// Record the configured disk high-water mark (0 = unset).
+    pub fn set_store_max_bytes(&self, bytes: u64) {
+        let v = i64::try_from(bytes).unwrap_or(i64::MAX);
+        self.store_max_bytes.set(v);
+        self.otel.store_max_bytes.record(v, &[]);
+    }
+
+    /// Record decommission drain progress: `state` 0 = none, 1 = draining,
+    /// 2 = complete; `pending` = hand-offs outstanding.
+    pub fn set_decommission(&self, state: i64, pending: usize) {
+        self.decommission_state.set(state);
+        self.decommission_pending.set(clamp_gauge(pending));
+        self.otel.decommission_state.record(state, &[]);
+        self.otel
+            .decommission_pending
+            .record(clamp_gauge(pending), &[]);
+    }
+
+    /// Record the current lease-group voter count.
+    pub fn set_voters(&self, n: usize) {
+        self.voters.set(clamp_gauge(n));
+        self.otel.voters.record(clamp_gauge(n), &[]);
+    }
+
+    /// Record the replica catch-up summary: of `tracked` groups, `current` list
+    /// this node as caught up.
+    pub fn set_replica_groups(&self, current: usize, tracked: usize) {
+        self.replica_groups_current.set(clamp_gauge(current));
+        self.replica_groups_tracked.set(clamp_gauge(tracked));
+        self.otel
+            .replica_groups_current
+            .record(clamp_gauge(current), &[]);
+        self.otel
+            .replica_groups_tracked
+            .record(clamp_gauge(tracked), &[]);
     }
 
     /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only
