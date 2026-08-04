@@ -21,11 +21,13 @@ initImage:
 replicaCount: 3
 
 # --- Broker configuration (ADR 0046) --------------------------------------------------------
-# This becomes the ConfigMap-mounted TOML. Three placeholders — __NODE_ID__, __SEEDS__, and
-# __PEER_ADVERTISE__ — are filled per-pod by the render init container (node id = pod name; seeds
-# = pod-0 for non-founders, empty for pod-0; peer_advertise = this pod's routable per-pod FQDN so
-# the mesh links over the headless service rather than an unroutable 0.0.0.0). Everything else is
-# verbatim. Keep secrets OUT of here — reference them by the mounted paths under `secrets` below.
+# This becomes the ConfigMap-mounted TOML. Four placeholders — __NODE_ID__, __SEEDS__,
+# __PEER_ADVERTISE__, and __READY_MIN__ — are filled per-pod by the render init container
+# (node id = pod name; seeds = the first two stable ordinals for joiners, empty for pod-0;
+# peer_advertise = this pod's routable per-pod FQDN so the mesh links over the headless service
+# rather than an unroutable 0.0.0.0; ready_min = 1 for the founder, a majority of replicaCount
+# for joiners — see [runtime] below). Everything else is verbatim. Keep secrets OUT of here —
+# reference them by the mounted paths under `secrets` below.
 config: |
   [node]
   id = "__NODE_ID__"
@@ -53,6 +55,18 @@ config: |
   [durable]
   enabled = true
   lease_voters = 5
+
+  [runtime]
+  # Watch the mounted policy files (TLS cert/key/CA, ACL, CRLs — ADR 0033) and hot-reload
+  # through the validate-before-swap path when they change on disk. This is what makes a
+  # cert-manager renewal or an ACL ConfigMap edit reach RUNNING pods with no restart (the
+  # distroless image has no shell to signal by hand). 0 = signal-only.
+  config_watch_secs = 30
+  # Readiness floor, rendered per-pod: the founder (ordinal 0) keeps 1 so ordered bring-up
+  # can start, every joiner requires a MAJORITY of replicaCount live members before
+  # reporting ready — a minority pod stays out of Service rotation instead of serving a
+  # split view.
+  ready_min_members = __READY_MIN__
 
 # Secret material is referenced BY PATH (ADR 0046 T5) and mounted read-only from existing
 # Secrets/ConfigMaps you manage (e.g. cert-manager for TLS). Each entry, when its `secretName`
@@ -92,6 +106,15 @@ persistence:
   storageClassName: ""
   accessModes:
     - ReadWriteOnce
+  # PVC lifecycle (StatefulSetAutoDeletePVC; honored on Kubernetes >= 1.27, inert before).
+  # whenScaled: Delete is CORRECT here, not data loss: scale-down runs the ADR 0043
+  # decommission drain first — the departing node hands every held key to the surviving
+  # replica set before exiting — so its PVC afterwards holds only stale, superseded state,
+  # and deleting it prevents the stale-data trap when a later scale-up reuses the ordinal.
+  # whenDeleted: Retain keeps data across a full release delete/reinstall.
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
 
 # --- Scale-down / shutdown (ADR 0043 / 0019) ------------------------------------------------
 # preStop sends SIGUSR1 to begin a DECOMMISSION drain (hand every held key to its post-departure

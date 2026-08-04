@@ -30,6 +30,11 @@ config: |
   enabled = true
   lease_voters = 3
 
+  [runtime]
+  # Exercise the file-watcher and the per-pod readiness floor in the nightly smoke.
+  config_watch_secs = 5
+  ready_min_members = __READY_MIN__
+
 # No secret mounts in the smoke.
 secrets:
   tls:
