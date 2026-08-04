@@ -286,6 +286,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|d| std::path::Path::new(d).join("cluster-id")),
         )?,
     );
+    // Config stamp (ADR 0054 T3): checksum + generation of the applied config,
+    // recorded at startup and on every successful reload.
+    let config_stamp = Arc::new(mqttd::reload::ConfigStamp::default());
+    {
+        let bytes = config_path()
+            .ok()
+            .flatten()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        config_stamp.record(&bytes);
+        let (sum, _) = config_stamp.read();
+        metrics.set_config_info(&sum);
+    }
+    // SWIM key-rotation posture (ADR 0054 T3): filled by start_swim once auth is built.
+    let swim_key_fps = Arc::new(std::sync::OnceLock::new());
+    metrics.set_peer_proto(mqtt_cluster::peer::PROTO_MIN, mqtt_cluster::peer::PROTO_MAX);
     metrics.set_founder(cluster_identity.founder());
     if cluster_identity.minted() {
         // A founding event. Expected exactly once, on a brand-new cluster's first
@@ -328,6 +344,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cluster_identity,
         &brownout_status,
         &store_snapshot,
+        &config_stamp,
+        &swim_key_fps,
     )
     .await?;
 
@@ -354,6 +372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
         metrics.clone(),
     )?;
+    reloader.attach_config_stamp(config_stamp.clone());
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
     // reload as the client policy: a republished CRL revokes a node's gossip on the next
@@ -414,6 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
         durable_plane.clone(),
         cluster_identity.clone(),
+        swim_key_fps.clone(),
     )
     .await?;
 
@@ -1231,6 +1251,8 @@ async fn start_health(
     cluster_identity: &Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
     store_snapshot: &Arc<mqttd::store_watch::StoreSnapshot>,
+    config_stamp: &Arc<mqttd::reload::ConfigStamp>,
+    swim_key_fps: &Arc<std::sync::OnceLock<Vec<String>>>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -1264,6 +1286,8 @@ async fn start_health(
         node_id.0.clone(),
         cluster_identity.clone(),
         brownout_status.clone(),
+        config_stamp.clone(),
+        swim_key_fps.clone(),
         config
             .node
             .data_dir
@@ -1652,7 +1676,7 @@ fn apply_anti_replay(
 
 /// Start SWIM membership from `MQTTD_SWIM_{BIND,SEEDS}` (no-op when unset) and
 /// hand its events to the peer-link manager.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one wiring seam
 async fn start_swim(
     config: &Config,
     node_id: &NodeId,
@@ -1664,6 +1688,7 @@ async fn start_swim(
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     cluster_identity: Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
+    swim_key_fps: Arc<std::sync::OnceLock<Vec<String>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
@@ -1755,6 +1780,14 @@ async fn start_swim(
         let m = metrics.clone();
         Arc::new(move |reason: &'static str| m.gossip_rejected(reason))
     };
+    // Rotation posture (ADR 0054 T3): the accepted-key fingerprints, for /statusz
+    // and the swim_keys_accepted gauge (1 steady; 2 = a rotation window is open).
+    let fps = auth
+        .as_ref()
+        .map(|a| a.key_fingerprints().to_vec())
+        .unwrap_or_default();
+    metrics.set_swim_keys_accepted(fps.len());
+    let _ = swim_key_fps.set(fps);
     // On graceful shutdown (ADR 0019) the driver announces a SWIM leave so peers drop
     // this node from the ring immediately, instead of waiting out failure detection.
     tokio::spawn(swim_driver::run(

@@ -41,6 +41,14 @@ drain-safe):
 Never skip phase 2: jumping old→new directly partitions the gossip plane mid-roll
 (half the fleet rejects the other half's datagrams).
 
+**Verify each phase** (ADR 0054 T3): `mqttd_swim_keys_accepted` reads 2 on every node
+while the window is open and must return to 1 after phase 3 — alert if it stays at 2
+longer than a rotation should take. `curl <pod>:8080/statusz | jq .keys` shows the
+accepted-key *fingerprints* (never material), so you can confirm every node staged the
+same new key before flipping the sealer. Config convergence after each roll:
+`jq .config.checksum` identical across pods (`mqttd_config_info{checksum}` is the
+alertable equivalent).
+
 ## Scaling
 
 - **Up:** `kubectl scale sts <name> --replicas=N` or `helm upgrade --set replicaCount=N`.

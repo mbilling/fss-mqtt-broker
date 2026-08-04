@@ -84,6 +84,14 @@ struct ClusterIdLabel {
     cluster_id: String,
 }
 
+/// `{checksum}` label for `mqttd_config_info` (ADR 0054 T3): the sha-256 of the
+/// loaded config file. One live series; the previous series is zeroed on change
+/// so a scrape shows exactly one checksum at 1 per node.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ChecksumLabel {
+    checksum: String,
+}
+
 /// The OpenTelemetry mirror of every metric, recorded alongside the Prometheus handles
 /// so the same measurement is exported via OTLP (ADR 0020). Built from a real SDK meter
 /// when OTLP is enabled, or a no-op meter otherwise (then every record is a no-op).
@@ -128,6 +136,10 @@ struct OtelInstruments {
     cluster_info: OtelGauge<i64>,
     founder: OtelGauge<i64>,
     foundings: OtelCounter<u64>,
+    config_info: OtelGauge<i64>,
+    swim_keys_accepted: OtelGauge<i64>,
+    peer_proto_min: OtelGauge<i64>,
+    peer_proto_max: OtelGauge<i64>,
 }
 
 impl OtelInstruments {
@@ -177,6 +189,10 @@ impl OtelInstruments {
             cluster_info: meter.i64_gauge("cluster_info").build(),
             founder: meter.i64_gauge("founder").build(),
             foundings: meter.u64_counter("foundings").build(),
+            config_info: meter.i64_gauge("config_info").build(),
+            swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
+            peer_proto_min: meter.i64_gauge("peer_proto_min").build(),
+            peer_proto_max: meter.i64_gauge("peer_proto_max").build(),
         }
     }
 }
@@ -260,6 +276,20 @@ pub struct Metrics {
     /// ever, on a healthy cluster's first boot — any increment after day one is
     /// the split-brain alarm.
     foundings_total: Counter,
+    /// The loaded config's checksum (ADR 0054 T3), `build_info`-style. The
+    /// convergence check: after a config roll, every node reports the same value.
+    config_info: Family<ChecksumLabel, Gauge>,
+    /// The previously exported checksum label, zeroed when a reload changes it
+    /// (so exactly one series is ever at 1).
+    config_info_prev: std::sync::Mutex<Option<String>>,
+    /// How many SWIM gossip keys this node currently accepts (ADR 0054 T3):
+    /// 1 = steady state, 2 = a rotation window is open. Alert when it stays > 1
+    /// longer than a rotation should take.
+    swim_keys_accepted: Gauge,
+    /// The peer-bus protocol range this build speaks (ADR 0038/0054) — a mixed-
+    /// version fleet is visible per node.
+    peer_proto_min: Gauge,
+    peer_proto_max: Gauge,
 }
 
 impl Metrics {
@@ -527,6 +557,29 @@ impl Metrics {
              first boot of a brand-new cluster indicates a split-brain founding",
         );
 
+        let config_info = register_gauge_family(
+            &mut registry,
+            "config_info",
+            "Checksum of the loaded config file (ADR 0054 T3), build_info-style; \
+             after a config roll every node must report the same value",
+        );
+        let swim_keys_accepted = register_gauge(
+            &mut registry,
+            "swim_keys_accepted",
+            "SWIM gossip keys currently accepted (ADR 0054 T3): 1 steady, 2 = a \
+             rotation window is open",
+        );
+        let peer_proto_min = register_gauge(
+            &mut registry,
+            "peer_proto_min",
+            "Oldest peer-bus protocol version this build speaks (ADR 0038)",
+        );
+        let peer_proto_max = register_gauge(
+            &mut registry,
+            "peer_proto_max",
+            "Newest peer-bus protocol version this build speaks (ADR 0038)",
+        );
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         build_info
@@ -579,6 +632,11 @@ impl Metrics {
             cluster_info,
             founder,
             foundings_total,
+            config_info,
+            config_info_prev: std::sync::Mutex::new(None),
+            swim_keys_accepted,
+            peer_proto_min,
+            peer_proto_max,
         }
     }
 
@@ -913,6 +971,49 @@ impl Metrics {
     pub fn founding(&self) {
         self.foundings_total.inc();
         self.otel.foundings.add(1, &[]);
+    }
+
+    /// Record the loaded config's checksum (ADR 0054 T3). Zeroes the previously
+    /// exported series so exactly one checksum reads 1 per node.
+    ///
+    /// # Panics
+    /// Never in practice: the internal mutex is only held for these few lines.
+    pub fn set_config_info(&self, checksum: &str) {
+        let mut prev = self
+            .config_info_prev
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if prev.as_deref() == Some(checksum) {
+            return;
+        }
+        if let Some(old) = prev.replace(checksum.to_string()) {
+            self.config_info
+                .get_or_create(&ChecksumLabel { checksum: old })
+                .set(0);
+        }
+        drop(prev);
+        self.config_info
+            .get_or_create(&ChecksumLabel {
+                checksum: checksum.to_string(),
+            })
+            .set(1);
+        self.otel
+            .config_info
+            .record(1, &[KeyValue::new("checksum", checksum.to_string())]);
+    }
+
+    /// Record how many SWIM gossip keys this node accepts (rotation posture).
+    pub fn set_swim_keys_accepted(&self, n: usize) {
+        self.swim_keys_accepted.set(clamp_gauge(n));
+        self.otel.swim_keys_accepted.record(clamp_gauge(n), &[]);
+    }
+
+    /// Record the peer-bus protocol range this build speaks.
+    pub fn set_peer_proto(&self, min: u32, max: u32) {
+        self.peer_proto_min.set(i64::from(min));
+        self.peer_proto_max.set(i64::from(max));
+        self.otel.peer_proto_min.record(i64::from(min), &[]);
+        self.otel.peer_proto_max.record(i64::from(max), &[]);
     }
 
     /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only

@@ -11,6 +11,9 @@ name = "mqttd"
 path = "src/main.rs"
 
 [dependencies]
+# Config-checksum hashing for the /statusz convergence stamp (ADR 0054 T3); the
+# workspace crypto provider, already compiled in via rustls (ADR 0053).
+aws-lc-rs = { workspace = true }
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -50,7 +53,6 @@ argon2.workspace = true
 # uses for the server side — no new supply-chain surface.
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
-aws-lc-rs = { workspace = true }
 rustls.workspace = true
 rustls-pki-types.workspace = true
 # `test-util` enables tokio's paused-clock test helpers (start_paused) for the
