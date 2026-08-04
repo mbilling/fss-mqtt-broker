@@ -1,0 +1,63 @@
+# A BOUNDED node — every resource limit set (docs/SIZING.md's worked example).
+#
+# Target hardware: 4 GiB RAM / 20 GiB disk. The arithmetic behind each number is in
+# docs/SIZING.md; the full commented reference for every key is docs/mqttd.example.toml.
+# Validate:  mqttd --check-config --config bounded-node.toml
+#
+# The shipped defaults are safe against attackers but UNCAPPED against success:
+# without this file's [limits] block, connections, sessions, retained topics, and
+# disk all grow without bound. On a machine with a budget, set them.
+
+[node]
+id = "node-1"
+# Without data_dir, ALL state is in memory and the disk section below is moot.
+data_dir = "/var/lib/mqttd"
+
+[listeners]
+# TLS-only posture; see mqttd.example.toml for the other listeners and cert keys.
+tls_bind = "0.0.0.0:8883"
+
+[tls]
+cert = "/etc/mqttd/tls/server.pem"
+key = "/etc/mqttd/tls/server.key"
+client_ca = "/etc/mqttd/tls/ca.pem"
+
+[security.auth_penalty]
+# Unset = unlimited auth attempts. On any internet-reachable listener, set it.
+threshold = 10
+decay_secs = 60
+
+[durable]
+# Disk high-water mark, ONE aggregate bound over all four stores. Above it: brownout —
+# growth writes refused (counted in quota_rejections_total{kind="brownout"}), acks/
+# reads/expiry continue, recovery below the mark restores writes. It is a high-water
+# mark, not a hard wall: leave headroom (here 4 GB of the 20 GB disk).
+store_max_bytes = 16000000000
+
+[limits]
+# RAM driver #1: connections × max_packet_size bounds worst-case read buffering.
+# 2000 × 256 KiB ≈ 0.5 GiB.
+max_connections = 2000
+max_connections_per_ip = 500
+max_packet_size = 262144
+
+# RAM/disk driver #2 — THE dominant term: sessions × queued × message size.
+# The default (100 000/session) is sized for one important session, not thousands.
+# 5000 sessions × 500 msgs × 4 KiB avg ≈ 9.8 GiB durable worst case, inside the
+# store mark above. NOTE these are COUNT caps: they bound bytes only together with
+# max_packet_size (a byte-based cap is tracked as ADR 0041 amendment work).
+max_sessions = 5000
+max_queued_messages = 500
+queue_overflow = "drop-oldest"   # or "reject-newest" if senders must see the refusal
+
+# Retained: 50 000 × 4 KiB avg ≈ 0.2 GiB. New topics beyond the cap are refused
+# (0x97); overwriting or clearing an existing topic is always allowed.
+max_retained_messages = 50000
+
+max_subscriptions_per_client = 1000
+# Per-connection publish rate; enforcement is TCP backpressure (pause), never a drop.
+max_publish_rate = 500
+
+# There is NO total-memory knob (see SIZING.md "What cannot be bounded today"):
+# run under a container memory limit sized by the SIZING.md formula — for these
+# numbers ~3 GiB RSS budget on the 4 GiB machine.
