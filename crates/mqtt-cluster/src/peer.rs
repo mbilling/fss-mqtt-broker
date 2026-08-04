@@ -547,11 +547,14 @@ mod frozen {
         }
 
         fn u32_le(&mut self) -> Option<u32> {
-            self.take(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            self.take(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         }
 
         fn string(&mut self) -> Option<String> {
-            let len = self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))?;
+            let len = self
+                .take(8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))?;
             let len = usize::try_from(len).ok()?;
             let bytes = self.take(len)?;
             String::from_utf8(bytes.to_vec()).ok()
@@ -946,10 +949,7 @@ mod tests {
             0, 0, 0, 0,                               // variant tag: Hello
             255, 0, 0, 0, 0, 0, 0, 0, b'n', b'1',     // node_id CLAIMS 255 bytes
         ][..]);
-        assert!(matches!(
-            decode(&mut lying),
-            Err(PeerCodecError::Serde(_))
-        ));
+        assert!(matches!(decode(&mut lying), Err(PeerCodecError::Serde(_))));
 
         // A frozen body with valid fields but trailing garbage is also malformed.
         let mut trailing = Vec::new();

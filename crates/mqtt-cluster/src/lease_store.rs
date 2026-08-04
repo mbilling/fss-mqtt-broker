@@ -500,8 +500,8 @@ impl RaftStorage<LeaseConfig> for LeaseStore {
             )
             .into());
         }
-        let sm: LeaseMap = de(&data)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let sm: LeaseMap =
+            de(&data).map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
         let mut ops = vec![
             WriteOp::PutMeta(K_SM, ser(&sm)?),
