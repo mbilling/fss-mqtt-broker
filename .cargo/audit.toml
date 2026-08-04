@@ -1,0 +1,12 @@
+# cargo-audit configuration (the CI supply-chain job runs `cargo audit`).
+[advisories]
+ignore = [
+    # rkyv 0.7.46 (out-of-bounds reads validating Rc/Arc archives). NOT COMPILED:
+    # it is a phantom Cargo.lock entry from rust_decimal's *disabled* optional
+    # `rkyv` feature (rust_decimal rides in via openraft -> byte-unit; Cargo.lock
+    # records optional dependencies regardless of features). Verify with
+    # `cargo tree --target all -e all -i rkyv` -> "nothing to print". No fixed
+    # rust_decimal exists (1.42.1 is latest; the fix needs its rkyv optional to
+    # move to >=0.8.17 upstream). Re-check on rust_decimal / openraft bumps.
+    "RUSTSEC-2026-0235",
+]
