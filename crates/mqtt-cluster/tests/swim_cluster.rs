@@ -161,7 +161,7 @@ async fn spawn_leavable_node(
     seeds: Vec<String>,
 ) -> (String, Node, tokio::sync::oneshot::Sender<()>) {
     let (leave_tx, leave_rx) = tokio::sync::oneshot::channel::<()>();
-    let (addr, node) = spawn_node_inner(id, seeds, None, None, None, None, async move {
+    let (addr, node) = spawn_node_inner(id, seeds, None, None, None, None, None, async move {
         let _ = leave_rx.await;
     })
     .await;
@@ -169,7 +169,17 @@ async fn spawn_leavable_node(
 }
 
 async fn spawn_node(id: &str, seeds: Vec<String>, auth: Option<SwimAuth>) -> (String, Node) {
-    spawn_node_inner(id, seeds, auth, None, None, None, std::future::pending()).await
+    spawn_node_inner(
+        id,
+        seeds,
+        auth,
+        None,
+        None,
+        None,
+        None,
+        std::future::pending(),
+    )
+    .await
 }
 
 /// Spawn a node that binds a real socket but ADVERTISES `advertise` as its own SWIM
@@ -182,6 +192,7 @@ async fn spawn_node_advertising(id: &str, seeds: Vec<String>, advertise: &str) -
         None,
         None,
         Some(advertise.to_string()),
+        None,
         std::future::pending(),
     )
     .await
@@ -196,6 +207,7 @@ async fn spawn_node_in_domain(id: &str, seeds: Vec<String>, domain: &str) -> (St
         None,
         Some(domain),
         None,
+        None,
         std::future::pending(),
     )
     .await
@@ -207,6 +219,7 @@ async fn spawn_signed_node(id: &str, seeds: Vec<String>, key: u8) -> (String, No
         id,
         seeds,
         Some(signed_auth(key, id)),
+        None,
         None,
         None,
         None,
@@ -227,11 +240,13 @@ async fn spawn_sequenced_node(id: &str, seeds: Vec<String>, key: u8) -> (String,
         Some(alloc),
         None,
         None,
+        None,
         std::future::pending(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // one shared spawn seam for every posture
 async fn spawn_node_inner(
     id: &str,
     seeds: Vec<String>,
@@ -244,6 +259,7 @@ async fn spawn_node_inner(
     // datagram source (2026-07-20 post-mortem). The real bound address is always
     // returned for seeding.
     advertise: Option<String>,
+    identity: Option<Arc<mqtt_cluster::cluster_identity::ClusterIdentity>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (String, Node) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -294,6 +310,7 @@ async fn spawn_node_inner(
         auth,
         seq_alloc,
         Some(reject),
+        identity,
         shutdown,
     ));
     (
@@ -497,6 +514,7 @@ async fn a_cert_attested_domain_propagates_without_any_self_claim() {
         None,
         None, // no MQTTD_FAILURE_DOMAIN-style self claim — the cert alone labels the node
         None,
+        None,
         std::future::pending(),
     )
     .await;
@@ -504,6 +522,7 @@ async fn a_cert_attested_domain_propagates_without_any_self_claim() {
         "c2",
         vec![addr1],
         Some(attested_auth(key, "c2", "rack-b")),
+        None,
         None,
         None,
         None,
@@ -540,6 +559,7 @@ async fn a_domain_claim_contradicting_the_certificate_is_rejected() {
         None,
         None,
         None,
+        None,
         std::future::pending(),
     )
     .await;
@@ -550,6 +570,7 @@ async fn a_domain_claim_contradicting_the_certificate_is_rejected() {
         Some(attested_auth(key, "liar", "rack-a")),
         None,
         Some("rack-z"),
+        None,
         None,
         std::future::pending(),
     )
@@ -648,6 +669,7 @@ async fn a_forged_sender_identity_is_rejected() {
         from_addr: sock.local_addr().unwrap().to_string(),
         from_peer_addr: String::new(),
         from_domain: None,
+        cluster_id: None,
         kind: Kind::Join,
         gossip: vec![],
     };
@@ -663,6 +685,7 @@ async fn a_forged_sender_identity_is_rejected() {
         from_addr: "10.0.0.9:1".into(),
         from_peer_addr: String::new(),
         from_domain: None,
+        cluster_id: None,
         kind: Kind::Join,
         gossip: vec![],
     };
@@ -747,6 +770,7 @@ async fn a_replayed_v3_datagram_is_dropped() {
         from_addr: sock.local_addr().unwrap().to_string(),
         from_peer_addr: String::new(),
         from_domain: None,
+        cluster_id: None,
         kind: Kind::Ping { seq: 1 },
         gossip: vec![],
     };
@@ -805,4 +829,68 @@ async fn recv_ack(sock: &UdpSocket, opener: &SwimAuth, buf: &mut [u8], within: D
             }
         }
     }
+}
+
+/// Spawn a node carrying a cluster identity (ADR 0054 T2).
+async fn spawn_node_with_identity(
+    id: &str,
+    seeds: Vec<String>,
+    identity: Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
+) -> (String, Node) {
+    spawn_node_inner(
+        id,
+        seeds,
+        None,
+        None,
+        None,
+        None,
+        Some(identity),
+        std::future::pending(),
+    )
+    .await
+}
+
+/// ADR 0054 T2 — the split-brain guard, end to end over real sockets:
+/// a joiner ADOPTS the founder's cluster identity on first contact, and a
+/// SEPARATELY-FOUNDED cluster's gossip is dropped (counted `cluster-mismatch`)
+/// and never admits the foreign node into the membership view.
+#[tokio::test]
+async fn a_foreign_clusters_gossip_is_contained_and_a_joiner_adopts() {
+    use mqtt_cluster::cluster_identity::ClusterIdentity;
+
+    // Cluster ONE: founder a (mints an identity) + joiner b (starts unknown).
+    let id_a = Arc::new(ClusterIdentity::load_or_mint(true, None).unwrap());
+    let (addr_a, node_a) = spawn_node_with_identity("a", vec![], id_a.clone()).await;
+    let id_b = Arc::new(ClusterIdentity::load_or_mint(false, None).unwrap());
+    let (_addr_b, node_b) = spawn_node_with_identity("b", vec![addr_a.clone()], id_b.clone()).await;
+
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            sees(&node_a, "b", MemberState::Alive) && sees(&node_b, "a", MemberState::Alive)
+        })
+        .await,
+        "cluster one forms"
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || id_b.get() == id_a.get()).await,
+        "the joiner adopts the founder's identity over gossip"
+    );
+
+    // Cluster TWO: an independent founder c, seeded (misconfigured or malicious)
+    // at cluster one's founder. Its datagrams carry a FOREIGN identity.
+    let id_c = Arc::new(ClusterIdentity::load_or_mint(true, None).unwrap());
+    assert_ne!(id_c.get(), id_a.get(), "two foundings mint distinct ids");
+    let (_addr_c, _node_c) = spawn_node_with_identity("c", vec![addr_a], id_c).await;
+
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            node_a.reject_count("cluster-mismatch") > 0
+        })
+        .await,
+        "cluster one counts the foreign gossip"
+    );
+    assert!(
+        !knows(&node_a, "c"),
+        "the foreign founder never enters cluster one's membership view"
+    );
 }

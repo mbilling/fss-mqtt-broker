@@ -273,6 +273,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // watcher fills sizes, /statusz reads both.
     let brownout_status = Arc::new(mqttd::health::BrownoutStatus::default());
     let store_snapshot = Arc::new(mqttd::store_watch::StoreSnapshot::default());
+    // Cluster identity (ADR 0054 T2): the founder (seedless) mints it, joiners adopt
+    // it over gossip, and gossip from a separately-founded cluster is dropped —
+    // split-brain becomes detectable (compare /statusz across nodes) AND contained.
+    let cluster_identity = Arc::new(
+        mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(
+            config.cluster.swim.seeds.is_empty(),
+            config
+                .node
+                .data_dir
+                .as_ref()
+                .map(|d| std::path::Path::new(d).join("cluster-id")),
+        )?,
+    );
+    metrics.set_founder(cluster_identity.founder());
+    if cluster_identity.minted() {
+        // A founding event. Expected exactly once, on a brand-new cluster's first
+        // boot; any later founding (a founder restarted over a lost data dir) is
+        // the split-brain alarm the foundings counter exists for.
+        metrics.founding();
+        info!(
+            cluster_id = cluster_identity.get().as_deref().unwrap_or(""),
+            "founded a NEW cluster identity (ADR 0054)"
+        );
+    }
+    // Export cluster_info{cluster_id} once the identity is known (immediately for
+    // the founder; after gossip adoption for a joiner).
+    {
+        let (m, id) = (metrics.clone(), cluster_identity.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Some(v) = id.get() {
+                    m.set_cluster_info(&v);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
     let (hub_tx, store, durable_plane, lease_driver) =
         start_hub(&config, &node_id, &placement, &metrics, &brownout_status).await?;
 
@@ -287,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         durable_plane.clone(),
         metrics.clone(),
         &node_id,
+        &cluster_identity,
         &brownout_status,
         &store_snapshot,
     )
@@ -374,6 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &shutdown,
         metrics.clone(),
         durable_plane.clone(),
+        cluster_identity.clone(),
     )
     .await?;
 
@@ -1188,6 +1228,7 @@ async fn start_health(
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     node_id: &NodeId,
+    cluster_identity: &Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
     store_snapshot: &Arc<mqttd::store_watch::StoreSnapshot>,
 ) -> Result<
@@ -1217,11 +1258,11 @@ async fn start_health(
         min_members,
     )
     .with_metrics(metrics)
-    // /statusz (ADR 0054): the structured operator-facing state body. Founder =
-    // started with no SWIM seeds (the node that bootstraps the lease group).
+    // /statusz (ADR 0054): the structured operator-facing state body; the cluster
+    // identity fills its founder flag and (once known) cluster_id.
     .with_status(
         node_id.0.clone(),
-        config.cluster.swim.seeds.is_empty(),
+        cluster_identity.clone(),
         brownout_status.clone(),
         config
             .node
@@ -1622,6 +1663,7 @@ async fn start_swim(
     shutdown: &tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    cluster_identity: Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
@@ -1723,6 +1765,7 @@ async fn start_swim(
         auth,
         seq_alloc,
         Some(reject),
+        Some(cluster_identity),
         shutdown.clone().cancelled_owned(),
     ));
     tokio::spawn(cluster::maintain_peer_links(

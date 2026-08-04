@@ -60,6 +60,25 @@ Never skip phase 2: jumping old→new directly partitions the gossip plane mid-r
   same node id. On older clusters delete the orphaned PVC by hand after the drain
   completes. Deleting the whole release keeps PVCs (`whenDeleted: Retain`).
 
+## Split-brain detection (ADR 0054 T2)
+
+Every node carries a **cluster identity**: the founder mints it at first bootstrap
+(persisted as `cluster-id` in the data dir), joiners adopt it over gossip, and gossip
+from a *different* identity is dropped and counted — a second, separately-founded
+cluster is **contained**, not merged.
+
+**The check:** `curl <pod>:8080/statusz | jq .cluster_id` across all pods — a healthy
+cluster reports exactly one value. Alertable equivalents:
+`mqttd_cluster_info{cluster_id}` (two distinct label values across the fleet =
+split brain), `mqttd_foundings_total` (any increment after a brand-new cluster's
+first boot = something founded again), and
+`mqttd_gossip_rejected_total{reason="cluster-mismatch"}` (> 0 = a foreign cluster's
+gossip is arriving — find the re-founded node and fence it).
+
+**Recovery:** the node holding the *minority/new* identity is the wrong one. Stop it,
+wipe its data dir (including `cluster-id`), and rejoin it with seeds — it adopts the
+surviving cluster's identity and back-fills per ADR 0043.
+
 ## The founder rule (read before touching pod-0's storage)
 
 Pod-0 renders with **no seeds**: a pod-0 that starts with an *empty data dir and no

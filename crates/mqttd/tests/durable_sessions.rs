@@ -209,6 +209,7 @@ async fn start_durable_node_capped(
             Some(auth),
             None, // no anti-replay sequencing in this test
             None, // no reject sink in this test
+            None, // no cluster identity in this harness
             std::future::pending(),
         ))
         .abort_handle(),

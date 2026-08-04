@@ -25,7 +25,7 @@ pub type SeqAlloc = SequenceAllocator<Box<dyn SeqStore>>;
 
 /// A sink for **dropped-gossip** events, called with a bounded reason class (`"auth"`,
 /// `"decode"`, `"identity"`, `"replay"`, `"expired"`, `"revoked"`, `"domain"`,
-/// `"cert-miss"`) each time an inbound datagram is rejected (ADR 0003). A callback rather
+/// `"cert-miss"`, `"cluster-mismatch"`) each time an inbound datagram is rejected (ADR 0003). A callback rather
 /// than a metrics handle keeps this crate free of any observability backend — the broker
 /// passes a closure that bumps its counter.
 pub type RejectCounter = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
@@ -65,7 +65,9 @@ pub struct MembershipEvent {
 // The driver's full I/O context: socket, state machine, timer, event sink, auth, the
 // sequence allocator, the reject sink, and the shutdown signal — distinct collaborators,
 // not a refactor smell.
-#[allow(clippy::too_many_arguments)]
+// One select loop over the driver's whole inbound pipeline (auth → decode → bind →
+// domain → replay → cluster guard): sequential gates, not extractable complexity.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run(
     socket: UdpSocket,
     mut swim: Swim,
@@ -74,6 +76,7 @@ pub async fn run(
     auth: Option<SwimAuth>,
     mut seq_alloc: Option<SeqAlloc>,
     reject: Option<RejectCounter>,
+    identity: Option<std::sync::Arc<crate::cluster_identity::ClusterIdentity>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     let start = Instant::now();
@@ -94,7 +97,7 @@ pub async fn run(
             () = &mut shutdown => {
                 // Graceful leave: announce our departure, flush it, and stop driving.
                 for action in swim.leave() {
-                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;
+                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc, identity.as_deref()).await;
                 }
                 debug!("SWIM graceful leave announced; stopping driver");
                 return;
@@ -102,7 +105,7 @@ pub async fn run(
             _ = ticker.tick() => {
                 let now = elapsed_ms(start);
                 for action in swim.tick(now) {
-                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;
+                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc, identity.as_deref()).await;
                 }
             }
             recv = socket.recv_from(&mut buf) => {
@@ -162,6 +165,32 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Cluster identity (ADR 0054 T2): gossip from a separately-founded
+                // cluster is CONTAINED, not merged — a datagram carrying a different
+                // identity than ours is dropped and counted. A joiner that knows no
+                // identity yet ADOPTS the first authenticated one it hears (and
+                // persists it); a sender that carries none (another pre-adoption
+                // joiner, or a pre-0054 build) falls through — authentication
+                // already gated it into the cluster.
+                if let Some(identity) = &identity {
+                    if let Some(theirs) = &msg.cluster_id {
+                        match identity.get() {
+                            Some(ours) if *theirs != ours => {
+                                debug!(%src, from = %msg.from, theirs = %theirs, ours = %ours,
+                                    "dropping SWIM datagram from a FOREIGN cluster (split-brain contained)");
+                                count_reject("cluster-mismatch");
+                                continue;
+                            }
+                            None => {
+                                if identity.adopt(theirs) {
+                                    tracing::info!(cluster_id = %theirs, learned_from = %msg.from,
+                                        "adopted the cluster identity from first authenticated contact (ADR 0054)");
+                                }
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
                 // Learn the direct sender's gossip address from where the datagram
                 // ACTUALLY came from, not from its self-claimed `from_addr` (2026-07-20
                 // post-mortem). A node that binds/advertises `0.0.0.0:<port>` (the k8s
@@ -178,7 +207,7 @@ pub async fn run(
                 msg.from_addr = src.to_string();
                 let now = elapsed_ms(start);
                 for action in swim.handle(msg, now) {
-                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc).await;
+                    apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc, identity.as_deref()).await;
                 }
             }
         }
@@ -195,9 +224,16 @@ async fn apply(
     events: &mpsc::UnboundedSender<MembershipEvent>,
     auth: Option<&SwimAuth>,
     seq_alloc: &mut Option<SeqAlloc>,
+    identity: Option<&crate::cluster_identity::ClusterIdentity>,
 ) {
     match action {
-        Action::Send { to, msg } => {
+        Action::Send { to, mut msg } => {
+            // Stamp the cluster identity at send time (ADR 0054 T2): the pure
+            // state machine never learns it; every outgoing datagram carries it
+            // once this node knows one.
+            if let Some(identity) = identity {
+                msg.cluster_id = identity.get();
+            }
             // First-contact / full-state kinds carry the full certificate (0022-T6
             // priming); routine probe traffic rides on the fingerprint.
             let prime = matches!(msg.kind, Kind::Join | Kind::Sync);
@@ -296,6 +332,7 @@ mod tests {
             from_addr: format!("{from}:1"),
             from_peer_addr: String::new(),
             from_domain: from_domain.map(str::to_string),
+            cluster_id: None,
             kind: Kind::Sync,
             gossip,
         }

@@ -151,6 +151,6 @@
 **0054 — Operator-facing state surface: `/statusz` + state gauges**
 
 - `0054-T1` 🚧 in-progress: /statusz route + state gauges — identity/members/lease/decommission/brownout/store/proto body on the health listener; brownout{axis}, store_max_bytes, decommission_state/pending, voters, replica_groups_current/tracked gauges wired on existing refresh paths
-- `0054-T2` ⬜ planned: Cluster identity — minted at founding, persisted in the lease store, gossip-propagated, adopted by joiners; cluster-mismatch gossip guard (containment, not just detection); cluster_info/founder/foundings_total metrics; statusz cluster block; OPERATIONS.md split-brain detection rule
+- `0054-T2` 🚧 in-progress: Cluster identity — minted at founding, persisted (cluster-id file in the data dir), gossip-propagated, adopted by joiners; cluster-mismatch gossip guard (containment, not just detection); cluster_info/founder/foundings_total metrics; statusz cluster block; OPERATIONS.md split-brain detection rule
 - `0054-T3` ⬜ planned: Rotation + convergence visibility — SWIM key count/fingerprints (never material), config checksum + reload generation, peer proto gauge; statusz keys/config blocks; OPERATIONS.md rotation verification
 - `0054-T4` ⬜ planned: Monitoring docs + dashboard — Grafana rows for the new signals (brownout, store utilization, decommission, cluster identity, mismatch rate) and the OPERATIONS.md alert-rule catalogue the operator will encode
