@@ -111,12 +111,62 @@ impl std::fmt::Debug for Handles {
     }
 }
 
+/// The loaded config's identity (ADR 0054 T3): sha-256 of the config file's bytes
+/// plus a per-process load generation. Shared with `/statusz`; the convergence
+/// check across a fleet is "same checksum everywhere". Without a config file
+/// (env-only), the checksum is of the empty input — still stable per build of
+/// the env, and the generation still counts applied reloads.
+#[derive(Debug, Default)]
+pub struct ConfigStamp {
+    checksum: std::sync::RwLock<String>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl ConfigStamp {
+    /// Record a successful load of `file_bytes` (empty when no config file).
+    pub fn record(&self, file_bytes: &[u8]) {
+        let sum = sha256_hex(file_bytes);
+        *self
+            .checksum
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sum;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// `(checksum, generation)`; empty checksum = nothing recorded yet.
+    #[must_use]
+    pub fn read(&self) -> (String, u64) {
+        (
+            self.checksum
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            self.generation.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+}
+
+/// Hex sha-256 of `bytes` (the config-checksum hash, ADR 0054 T3).
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+    digest.as_ref().iter().fold(String::new(), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Holds the swap channels + the file-rereading `build` closure for SIGHUP reload.
 pub struct Reloader {
     authz_tx: watch::Sender<Arc<dyn Authorizer>>,
     auth_tx: watch::Sender<Arc<dyn Authenticator>>,
     audit: Arc<dyn AuditSink>,
     metrics: Option<Arc<Metrics>>,
+    /// Set by [`attach_config_stamp`](Self::attach_config_stamp): updated (and
+    /// mirrored to `config_info`) on every successful reload (ADR 0054 T3).
+    config_stamp: Option<Arc<ConfigStamp>>,
     build: Box<dyn Fn() -> BuildResult + Send + Sync>,
     /// Set by [`attach_tls`](Self::attach_tls) when a TLS listener is active; the acceptor
     /// is rebuilt and swapped as part of the same atomic, validate-before-swap reload.
@@ -175,6 +225,7 @@ impl Reloader {
         let (auth_tx, auth) = watch::channel(initial.1);
         (
             Reloader {
+                config_stamp: None,
                 authz_tx,
                 auth_tx,
                 audit,
@@ -206,6 +257,12 @@ impl Reloader {
     ///
     /// The acceptor reload is folded into the *same* atomic, validate-before-swap reload as
     /// the ACL/authenticator: if any of the three fails to build, none is swapped.
+    /// Attach the shared config stamp (ADR 0054 T3), updated on every successful
+    /// reload and mirrored to `config_info{checksum}`.
+    pub fn attach_config_stamp(&mut self, stamp: Arc<ConfigStamp>) {
+        self.config_stamp = Some(stamp);
+    }
+
     pub fn attach_tls(
         &mut self,
         initial: TlsAcceptor,
@@ -389,6 +446,21 @@ impl Reloader {
                     .record("security.reload", None, &format!("ok (trigger={trigger})"));
                 if let Some(m) = &self.metrics {
                     m.security_reload("ok", trigger);
+                }
+                // ADR 0054 T3: stamp the applied config (checksum + generation) so
+                // /statusz and config_info{checksum} reflect what is actually live.
+                if let Some(stamp) = &self.config_stamp {
+                    let bytes = self
+                        .config_source
+                        .as_ref()
+                        .and_then(|cs| cs.path.as_deref())
+                        .and_then(|p| std::fs::read(p).ok())
+                        .unwrap_or_default();
+                    stamp.record(&bytes);
+                    if let Some(m) = &self.metrics {
+                        let (sum, _) = stamp.read();
+                        m.set_config_info(&sum);
+                    }
                 }
                 // ADR 0046 T4: the config swap is committed — push the live-swappable settings
                 // (quotas) to the hub and log every changed non-live section as requires-restart.

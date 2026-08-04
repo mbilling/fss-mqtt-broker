@@ -106,6 +106,11 @@ pub struct HealthState {
     brownout: Option<Arc<BrownoutStatus>>,
     /// Store-size snapshot for `/statusz` (ADR 0054).
     stores: Option<Arc<crate::store_watch::StoreSnapshot>>,
+    /// Applied-config checksum + generation for `/statusz` (ADR 0054 T3).
+    config: Option<Arc<crate::reload::ConfigStamp>>,
+    /// Accepted SWIM key fingerprints (rotation posture, ADR 0054 T3); filled
+    /// once the gossip plane starts. Fingerprints only — never material.
+    keys: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -190,6 +195,8 @@ impl HealthState {
             identity: None,
             brownout: None,
             stores: None,
+            config: None,
+            keys: None,
         }
     }
 
@@ -202,10 +209,14 @@ impl HealthState {
         node_id: String,
         cluster: Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
         brownout: Arc<BrownoutStatus>,
+        config: Arc<crate::reload::ConfigStamp>,
+        keys: Arc<std::sync::OnceLock<Vec<String>>>,
         stores: Option<Arc<crate::store_watch::StoreSnapshot>>,
     ) -> Self {
         self.identity = Some((node_id, cluster));
         self.brownout = Some(brownout);
+        self.config = Some(config);
+        self.keys = Some(keys);
         self.stores = stores;
         self
     }
@@ -414,6 +425,29 @@ impl HealthState {
                 let _ = write!(s, ",\"max_bytes\":{max}");
             }
             s.push('}');
+        }
+        // Rotation posture (ADR 0054 T3): accepted-key FINGERPRINTS (never
+        // material) — 1 steady state, 2 = a rotation window is open.
+        if let Some(fps) = self.keys.as_ref().and_then(|k| k.get()) {
+            let _ = write!(s, ",\"keys\":{{\"count\":{},\"fingerprints\":[", fps.len());
+            for (i, fp) in fps.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "\"{}\"", json_escape(fp));
+            }
+            s.push_str("]}");
+        }
+        // Applied-config identity (ADR 0054 T3): the fleet convergence check is
+        // "same checksum on every node".
+        if let Some(stamp) = &self.config {
+            let (sum, generation) = stamp.read();
+            if !sum.is_empty() {
+                let _ = write!(
+                    s,
+                    ",\"config\":{{\"checksum\":\"{sum}\",\"generation\":{generation}}}"
+                );
+            }
         }
         // Peer-bus protocol range: a mixed-version fleet is visible per node.
         let _ = write!(
@@ -662,10 +696,16 @@ mod tests {
             mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
         );
         let cluster_id = cluster.get().expect("founder mints");
+        let stamp = Arc::new(crate::reload::ConfigStamp::default());
+        stamp.record(b"[node]\nid = \"node-a\"\n");
+        let keys = Arc::new(std::sync::OnceLock::new());
+        keys.set(vec!["aabbccddeeff0011".to_string()]).unwrap();
         let state = HealthState::new(spawn_live_hub(), Some(placement(2)), None, 1).with_status(
             "node-a".into(),
             cluster,
             brownout.clone(),
+            stamp.clone(),
+            keys,
             None,
         );
 
@@ -680,6 +720,19 @@ mod tests {
         assert!(body.contains("\"members\":["), "{body}");
         assert!(body.contains("\"id\":\"peer-1\""), "{body}");
         assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");
+        // Rotation + convergence blocks (ADR 0054 T3).
+        assert!(
+            body.contains("\"keys\":{\"count\":1,\"fingerprints\":[\"aabbccddeeff0011\"]}"),
+            "{body}"
+        );
+        let (sum, generation) = stamp.read();
+        assert_eq!(generation, 1);
+        assert!(
+            body.contains(&format!(
+                "\"config\":{{\"checksum\":\"{sum}\",\"generation\":1}}"
+            )),
+            "{body}"
+        );
         assert!(
             body.contains(&format!(
                 "\"proto\":{{\"min\":{},\"max\":{}}}",

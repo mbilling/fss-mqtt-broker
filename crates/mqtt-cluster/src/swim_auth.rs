@@ -44,6 +44,16 @@ const FULL_CERT_EVERY: u64 = 16;
 /// cleared and re-primes from the periodic full-cert datagrams.
 const CERT_CACHE_CAP: usize = 128;
 
+/// Short SHA-256 fingerprint (first 8 bytes, hex) of a gossip key (ADR 0054 T3).
+fn key_fingerprint(key: &[u8]) -> String {
+    let digest = digest::digest(&digest::SHA256, key);
+    digest.as_ref()[..8].iter().fold(String::new(), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// SHA-256 fingerprint of a certificate's DER bytes (0022-T6).
 fn fingerprint(cert_der: &[u8]) -> [u8; FP_LEN] {
     digest::digest(&digest::SHA256, cert_der)
@@ -160,6 +170,10 @@ pub struct SwimAuth {
     /// additional keys an incoming datagram may have been sealed with — the dual-key window
     /// that rotates the gossip key without downtime (ADR 0003).
     keys: Vec<hmac::Key>,
+    /// SHA-256 fingerprints (first 8 bytes, hex) of every accepted key, in
+    /// `keys` order — the rotation-posture signal (ADR 0054 T3). Never the key
+    /// material: safe on the unauthenticated ops surface.
+    key_fps: Vec<String>,
     /// When set, this node signs outgoing datagrams (v2/v3) and **requires** a verified
     /// signature on every incoming one — an unsigned (v1) datagram is rejected.
     signer: Option<Arc<dyn GossipSign>>,
@@ -197,6 +211,7 @@ impl SwimAuth {
     pub fn new(key: &[u8; KEY_LEN]) -> Self {
         Self {
             keys: vec![hmac::Key::new(hmac::HMAC_SHA256, key)],
+            key_fps: vec![key_fingerprint(key)],
             signer: None,
             verifier: None,
             sequenced: false,
@@ -213,7 +228,16 @@ impl SwimAuth {
     #[must_use]
     pub fn accept_also(mut self, key: &[u8; KEY_LEN]) -> Self {
         self.keys.push(hmac::Key::new(hmac::HMAC_SHA256, key));
+        self.key_fps.push(key_fingerprint(key));
         self
+    }
+
+    /// SHA-256 fingerprints (first 8 bytes, hex) of every accepted key — primary
+    /// first (ADR 0054 T3). Count 1 = steady state; 2 = a rotation window is
+    /// open. Fingerprints only, never material.
+    #[must_use]
+    pub fn key_fingerprints(&self) -> &[String] {
+        &self.key_fps
     }
 
     /// Like [`accept_also`](Self::accept_also), from a 64-hex-character key string.
@@ -1014,5 +1038,37 @@ mod tests {
             t[i] ^= 0x01;
             assert!(receiver.open(&t).is_err(), "fp bit flip at {i} accepted");
         }
+    }
+}
+
+#[cfg(test)]
+mod key_fingerprint_tests {
+    use super::{SwimAuth, KEY_LEN};
+
+    /// ADR 0054 T3: fingerprints are stable, distinct per key, never the key
+    /// material, and track the accept-set (1 steady, 2 in a rotation window).
+    #[test]
+    fn key_fingerprints_track_the_accept_set_without_leaking_material() {
+        let primary = [0x11u8; KEY_LEN];
+        let staged = [0x22u8; KEY_LEN];
+        let steady = SwimAuth::new(&primary);
+        assert_eq!(steady.key_fingerprints().len(), 1);
+        let fp = steady.key_fingerprints()[0].clone();
+        assert_eq!(fp.len(), 16, "8 bytes hex");
+        let key_hex = primary.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        assert!(!key_hex.contains(&fp), "a fingerprint is not key material");
+
+        let window = SwimAuth::new(&primary).accept_also(&staged);
+        assert_eq!(window.key_fingerprints().len(), 2, "rotation window open");
+        assert_eq!(window.key_fingerprints()[0], fp, "stable per key");
+        assert_ne!(
+            window.key_fingerprints()[0],
+            window.key_fingerprints()[1],
+            "distinct keys, distinct fingerprints"
+        );
     }
 }
