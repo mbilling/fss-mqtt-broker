@@ -2,7 +2,8 @@
 //! Fuzz target: the peer-bus frame decoder must never panic on arbitrary bytes.
 //!
 //! `peer::decode` runs on every inbound peer link — a length prefix followed by
-//! a `bincode` body an authenticated-but-possibly-buggy-or-hostile peer sent.
+//! a `postcard` body (or a hand-parsed frozen bootstrap frame, ADR 0052) an
+//! authenticated-but-possibly-buggy-or-hostile peer sent.
 //! The only safety invariant here: no input, however malformed, may panic, hang,
 //! or read out of bounds. A correct `Err`/`Ok(None)` is success; a panic is a
 //! finding. Anything decoded must re-encode without panicking.
