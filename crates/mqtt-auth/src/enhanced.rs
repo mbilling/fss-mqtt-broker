@@ -8,8 +8,8 @@
 //! mechanism-agnostic abstraction plus one reference mechanism (HMAC-SHA256).
 
 use crate::Identity;
-use mqtt_core::ClientId;
 use aws_lc_rs::{hmac, rand::SecureRandom};
+use mqtt_core::ClientId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -137,8 +137,8 @@ impl AuthSession for HmacSession {
 #[cfg(test)]
 mod tests {
     use super::{AuthStep, EnhancedAuthenticator, HmacChallengeAuthenticator};
-    use mqtt_core::ClientId;
     use aws_lc_rs::hmac;
+    use mqtt_core::ClientId;
     use std::collections::HashMap;
 
     fn cid() -> ClientId {
