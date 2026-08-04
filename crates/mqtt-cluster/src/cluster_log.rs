@@ -78,12 +78,13 @@ pub enum ReplOp {
 
 /// The replica store's on-disk layout version (ADR 0038 T2). v1 includes the
 /// per-group fence rows (ADR 0037 P4).
-/// v2: retained rows (`r/` keys) carry application properties (ADR 0038 T3) —
-/// the row bytes' meaning changed, so a v1 file fails closed at the gate.
-/// v3: every entry row is prefixed with its writing `(epoch, seq)` (ADR 0042 T7)
-/// — the tags the recovery merge resolves offset conflicts and stale tails with;
-/// a v2 file fails closed at the gate.
-const R_SCHEMA_VERSION: u32 = 3;
+/// Reset to 1 with the postcard codec succession (ADR 0052): nothing is released,
+/// so the pre-release version history (v2 app-props rows, v3 `(epoch, seq)` entry
+/// prefixes) was retired rather than extended — v1 now means "all of the above,
+/// with postcard-encoded property blobs", and the incremental bump history starts
+/// at 1.0.0. A file stamped with a retired pre-release version fails closed at
+/// the gate (wipe-and-rejoin).
+const R_SCHEMA_VERSION: u32 = 1;
 
 const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
 const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");

@@ -3,7 +3,11 @@
 //! This is deliberately **separate** from the MQTT client protocol: it carries
 //! node-to-node control and data — a `Hello` handshake, subscription interest
 //! announcements, and forwarded publishes. Messages are length-prefixed
-//! (`u32` big-endian) `bincode` frames.
+//! (`u32` big-endian) `postcard` frames (ADR 0052) — except the two ADR 0038
+//! **frozen** bootstrap frames ([`PeerMessage::Hello`] and
+//! [`PeerMessage::ProxyHello`]), which keep their original pinned byte layout
+//! via the hand-rolled [`frozen`] codec: they are read before any protocol
+//! version is negotiated, so their bytes can never change.
 //!
 //! Loop prevention is a protocol invariant enforced by the hub, not the codec: a
 //! [`PeerMessage::Publish`] received from a peer is delivered to *local*
@@ -29,12 +33,16 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// reshaped [`ReplicaReadReply`](PeerMessage::ReplicaReadReply) with the
 /// replica's completeness verdict and added the catch-up frames — incompatible
 /// reshapes of the replication frames, so the floor rose with the ceiling both
-/// times. Legal exactly because no release exists yet: until 1.0.0 there is no
-/// version compatibility to keep, so frames are reshaped in place rather than
-/// versioned side-by-side. After the first release this kind of raise is the
-/// MAJOR-release act described above, and additive changes ship as new frames
-/// under a raised [`PROTO_MAX`] with per-link gating.
-pub const PROTO_MIN: u32 = 5;
+/// times; proto 6 (ADR 0052) moved the frame body codec from bincode to
+/// postcard — every frame's bytes changed except the frozen `Hello` /
+/// `ProxyHello`, which keep their ADR 0038 T4 pinned layout so any two builds
+/// still discover disagreement politely. Legal exactly because no release
+/// exists yet: until 1.0.0 there is no version compatibility to keep, so
+/// frames are reshaped in place rather than versioned side-by-side. After the
+/// first release this kind of raise is the MAJOR-release act described above,
+/// and additive changes ship as new frames under a raised [`PROTO_MAX`] with
+/// per-link gating.
+pub const PROTO_MIN: u32 = 6;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
 /// negotiated version is `min(proto_max_a, proto_max_b)`.
 ///
@@ -42,7 +50,7 @@ pub const PROTO_MIN: u32 = 5;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 5;
+pub const PROTO_MAX: u32 = 6;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -470,6 +478,125 @@ pub enum PeerMessage {
     },
 }
 
+/// The hand-rolled codec for the two ADR 0038 **frozen** bootstrap frames.
+///
+/// [`PeerMessage::Hello`] and [`PeerMessage::ProxyHello`] are decoded *before*
+/// any protocol version is negotiated, and their encodings are pinned byte for
+/// byte (the `the_frozen_frames_encode_byte_for_byte_stably` test) — so when
+/// the body codec moved to postcard (ADR 0052), these two frames could not
+/// move with it. Their pinned layout — a `u32`-LE variant tag, `u64`-LE
+/// length-prefixed strings, one-byte `Option` tags — is reproduced here by
+/// hand; it happens to be the layout the original codec produced, but the
+/// bytes are the contract, not any library.
+///
+/// The decoders are strict: every inner length is checked against the
+/// remaining body, strings must be valid UTF-8, and the body must be consumed
+/// exactly — a frame that lies about a length is malformed, never a panic or
+/// an over-read.
+mod frozen {
+    use super::PeerMessage;
+
+    /// First byte of a frozen frame body (the low byte of the `u32`-LE variant
+    /// tag). The other three tag bytes are zero.
+    pub(super) const HELLO_TAG: u8 = 0;
+    /// See [`HELLO_TAG`].
+    pub(super) const PROXY_HELLO_TAG: u8 = 8;
+
+    fn put_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+        match s {
+            None => out.push(0),
+            Some(s) => {
+                out.push(1);
+                put_str(out, s);
+            }
+        }
+    }
+
+    pub(super) fn encode_hello(node_id: &str, proto_min: u32, proto_max: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 8 + node_id.len() + 8);
+        out.extend_from_slice(&u32::from(HELLO_TAG).to_le_bytes());
+        put_str(&mut out, node_id);
+        out.extend_from_slice(&proto_min.to_le_bytes());
+        out.extend_from_slice(&proto_max.to_le_bytes());
+        out
+    }
+
+    pub(super) fn encode_proxy_hello(identity: Option<&str>, via: Option<&str>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&u32::from(PROXY_HELLO_TAG).to_le_bytes());
+        put_opt_str(&mut out, identity);
+        put_opt_str(&mut out, via);
+        out
+    }
+
+    /// A bounds-checked cursor over a frozen frame body.
+    struct Reader<'a>(&'a [u8]);
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            (n <= self.0.len()).then(|| {
+                let (head, rest) = self.0.split_at(n);
+                self.0 = rest;
+                head
+            })
+        }
+
+        fn u32_le(&mut self) -> Option<u32> {
+            self.take(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        }
+
+        fn string(&mut self) -> Option<String> {
+            let len = self
+                .take(8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))?;
+            let len = usize::try_from(len).ok()?;
+            let bytes = self.take(len)?;
+            String::from_utf8(bytes.to_vec()).ok()
+        }
+
+        // The nesting is the point: outer `None` = malformed frame, inner
+        // `Option` = the wire field's own optionality.
+        #[allow(clippy::option_option)]
+        fn opt_string(&mut self) -> Option<Option<String>> {
+            match self.take(1)? {
+                [0] => Some(None),
+                [1] => self.string().map(Some),
+                _ => None,
+            }
+        }
+
+        fn finish(self) -> Option<()> {
+            self.0.is_empty().then_some(())
+        }
+    }
+
+    /// Decode a frozen frame body (including its 4-byte variant tag).
+    /// `None` = malformed (fail closed).
+    pub(super) fn decode(body: &[u8]) -> Option<PeerMessage> {
+        let mut r = Reader(body);
+        let msg = match r.u32_le()? {
+            tag if tag == u32::from(HELLO_TAG) => PeerMessage::Hello {
+                node_id: r.string()?,
+                proto_min: r.u32_le()?,
+                proto_max: r.u32_le()?,
+            },
+            tag if tag == u32::from(PROXY_HELLO_TAG) => PeerMessage::ProxyHello {
+                identity: r.opt_string()?,
+                via: r.opt_string()?,
+            },
+            _ => return None,
+        };
+        r.finish()?;
+        Some(msg)
+    }
+}
+
 /// Errors from peer-frame coding.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerCodecError {
@@ -486,7 +613,19 @@ pub enum PeerCodecError {
 /// # Errors
 /// Returns [`PeerCodecError::Serde`] if serialization fails.
 pub fn encode(msg: &PeerMessage, out: &mut Vec<u8>) -> Result<(), PeerCodecError> {
-    let body = bincode::serialize(msg).map_err(|e| PeerCodecError::Serde(e.to_string()))?;
+    let body = match msg {
+        // The two frozen bootstrap frames keep their pinned pre-negotiation
+        // bytes (ADR 0038 T4) — see [`frozen`].
+        PeerMessage::Hello {
+            node_id,
+            proto_min,
+            proto_max,
+        } => frozen::encode_hello(node_id, *proto_min, *proto_max),
+        PeerMessage::ProxyHello { identity, via } => {
+            frozen::encode_proxy_hello(identity.as_deref(), via.as_deref())
+        }
+        msg => postcard::to_allocvec(msg).map_err(|e| PeerCodecError::Serde(e.to_string()))?,
+    };
     // Enforce the frame bound on the SENDING side too: an oversized frame would not
     // fail here but on the receiver, which tears down the link — and a sender that
     // retries on reconnect (e.g. a link-up back-fill) would then kill the link in a
@@ -519,7 +658,25 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
     }
     buf.advance(4);
     let body = buf.split_to(len);
-    let msg = bincode::deserialize(&body).map_err(|e| PeerCodecError::Serde(e.to_string()))?;
+    // Dispatch on the first byte: the frozen bootstrap frames carry a u32-LE
+    // variant tag whose low byte is 0 (Hello) or 8 (ProxyHello); postcard
+    // bodies start with the variant index as a varint, and the encoder never
+    // emits variants 0 or 8 through postcard, so the spaces are disjoint.
+    let msg = match body.first() {
+        Some(&frozen::HELLO_TAG | &frozen::PROXY_HELLO_TAG) => frozen::decode(&body)
+            .ok_or_else(|| PeerCodecError::Serde("malformed frozen bootstrap frame".into()))?,
+        _ => match postcard::take_from_bytes(&body) {
+            // Strict: a valid message followed by trailing bytes is a
+            // malformed frame, not a message plus slack.
+            Ok((msg, [])) => msg,
+            Ok(_) => {
+                return Err(PeerCodecError::Serde(
+                    "trailing bytes after peer frame body".into(),
+                ))
+            }
+            Err(e) => return Err(PeerCodecError::Serde(e.to_string())),
+        },
+    };
     Ok(Some(msg))
 }
 
@@ -779,6 +936,50 @@ mod tests {
             b'n', b'o', b'd', b'e', b'-', b'b',
         ];
         assert_eq!(proxy, expected_proxy);
+    }
+
+    /// A frozen-layout frame that lies about an inner length (a `node_id`
+    /// length larger than the remaining body) is rejected as malformed —
+    /// never an over-read or a panic (ADR 0052 strict decoders).
+    #[test]
+    fn a_frozen_frame_with_a_lying_inner_length_is_rejected() {
+        #[rustfmt::skip]
+        let mut lying = BytesMut::from(&[
+            0, 0, 0, 14,                              // frame length (u32 BE)
+            0, 0, 0, 0,                               // variant tag: Hello
+            255, 0, 0, 0, 0, 0, 0, 0, b'n', b'1',     // node_id CLAIMS 255 bytes
+        ][..]);
+        assert!(matches!(decode(&mut lying), Err(PeerCodecError::Serde(_))));
+
+        // A frozen body with valid fields but trailing garbage is also malformed.
+        let mut trailing = Vec::new();
+        encode(
+            &PeerMessage::Hello {
+                node_id: "n1".into(),
+                proto_min: 1,
+                proto_max: 1,
+            },
+            &mut trailing,
+        )
+        .unwrap();
+        let body_len = trailing.len() - 4;
+        trailing.push(0xAA); // one byte past the pinned layout
+        trailing[..4].copy_from_slice(&u32::try_from(body_len + 1).unwrap().to_be_bytes());
+        let mut buf = BytesMut::from(&trailing[..]);
+        assert!(matches!(decode(&mut buf), Err(PeerCodecError::Serde(_))));
+    }
+
+    /// Trailing bytes after a valid postcard body are a malformed frame
+    /// (ADR 0052): the decoder consumes the body exactly or rejects it.
+    #[test]
+    fn trailing_bytes_after_a_postcard_body_are_rejected() {
+        let mut out = Vec::new();
+        encode(&PeerMessage::RetainedRequest, &mut out).unwrap();
+        let body_len = out.len() - 4;
+        out.push(0x00);
+        out[..4].copy_from_slice(&u32::try_from(body_len + 1).unwrap().to_be_bytes());
+        let mut buf = BytesMut::from(&out[..]);
+        assert!(matches!(decode(&mut buf), Err(PeerCodecError::Serde(_))));
     }
 
     /// ADR 0038: version negotiation picks the newest version both sides speak,

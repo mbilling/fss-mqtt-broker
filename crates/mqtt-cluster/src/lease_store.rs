@@ -40,7 +40,11 @@ use std::sync::{Arc, Mutex};
 
 type NodeId = u64;
 
-/// The lease store's on-disk layout version (ADR 0038 T2).
+/// The lease store's on-disk layout version (ADR 0038 T2). Still 1 across the
+/// postcard codec succession (ADR 0052, pre-release baseline reset): v1 now means
+/// postcard-encoded values. A pre-ADR-0052 dev store carries bincode bytes under
+/// the same stamp and fails at value decode (not at the gate) — wipe dev data
+/// dirs; nothing is released, so no upgrade path is owed.
 const LEASE_SCHEMA_VERSION: u32 = 1;
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
@@ -227,6 +231,16 @@ fn apply_ops(db: &Database, ops: &[WriteOp]) -> Result<(), PersistError> {
     Ok(())
 }
 
+/// Strict postcard decode for stored values (ADR 0052): exactly one `T`, no
+/// trailing bytes — a corrupt or foreign-format value fails closed.
+fn de<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, PersistError> {
+    match postcard::take_from_bytes(bytes) {
+        Ok((v, [])) => Ok(v),
+        Ok(_) => Err(PersistError("trailing bytes in stored value".into())),
+        Err(e) => Err(pe(e)),
+    }
+}
+
 /// Load the full store state from disk into an in-memory [`Inner`] cache.
 fn load(db: &Database) -> Result<Inner, PersistError> {
     let txn = db.begin_read().map_err(pe)?;
@@ -235,7 +249,7 @@ fn load(db: &Database) -> Result<Inner, PersistError> {
         let log = txn.open_table(LOG).map_err(pe)?;
         for item in log.range::<u64>(..).map_err(pe)? {
             let (k, v) = item.map_err(pe)?;
-            let entry: Entry<LeaseConfig> = bincode::deserialize(v.value()).map_err(pe)?;
+            let entry: Entry<LeaseConfig> = de(v.value())?;
             inner.log.insert(k.value(), entry);
         }
     }
@@ -245,26 +259,26 @@ fn load(db: &Database) -> Result<Inner, PersistError> {
             Ok(meta.get(k).map_err(pe)?.map(|g| g.value().to_vec()))
         };
         if let Some(v) = get(K_VOTE)? {
-            inner.vote = Some(bincode::deserialize(&v).map_err(pe)?);
+            inner.vote = Some(de(&v)?);
         }
         if let Some(v) = get(K_LAST_PURGED)? {
-            inner.last_purged = Some(bincode::deserialize(&v).map_err(pe)?);
+            inner.last_purged = Some(de(&v)?);
         }
         if let Some(v) = get(K_LAST_APPLIED)? {
-            inner.last_applied = Some(bincode::deserialize(&v).map_err(pe)?);
+            inner.last_applied = Some(de(&v)?);
         }
         if let Some(v) = get(K_LAST_MEMBERSHIP)? {
-            inner.last_membership = bincode::deserialize(&v).map_err(pe)?;
+            inner.last_membership = de(&v)?;
         }
         if let Some(v) = get(K_SM)? {
-            inner.sm = bincode::deserialize(&v).map_err(pe)?;
+            inner.sm = de(&v)?;
         }
         if let Some(v) = get(K_SNAP_IDX)? {
-            inner.snapshot_idx = bincode::deserialize(&v).map_err(pe)?;
+            inner.snapshot_idx = de(&v)?;
         }
         if let (Some(m), Some(d)) = (get(K_SNAP_META)?, get(K_SNAP_DATA)?) {
             inner.current_snapshot = Some(StoredSnapshot {
-                meta: bincode::deserialize(&m).map_err(pe)?,
+                meta: de(&m)?,
                 data: d,
             });
         }
@@ -273,7 +287,7 @@ fn load(db: &Database) -> Result<Inner, PersistError> {
 }
 
 fn ser<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StorageError<NodeId>> {
-    bincode::serialize(v).map_err(|e| io(pe(e)))
+    postcard::to_allocvec(v).map_err(|e| io(pe(e)))
 }
 
 impl RaftLogReader<LeaseConfig> for LeaseStore {
@@ -295,7 +309,7 @@ impl RaftSnapshotBuilder<LeaseConfig> for LeaseStore {
         // Prepare under the lock, persist, then commit the snapshot to the cache.
         let (data, meta, new_idx) = {
             let inner = self.lock();
-            let data = bincode::serialize(&inner.sm)
+            let data = postcard::to_allocvec(&inner.sm)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
             let new_idx = inner.snapshot_idx + 1;
             let snapshot_id = format!("{}-{}", inner.last_applied.map_or(0, |l| l.index), new_idx);
@@ -477,8 +491,17 @@ impl RaftStorage<LeaseConfig> for LeaseStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = (*snapshot).into_inner();
-        let sm: LeaseMap = bincode::deserialize(&data)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        // These bytes arrived from a peer over InstallSnapshot — bound them like
+        // any other raft RPC payload (ADR 0052) before decoding.
+        if data.len() > crate::raft_mesh::MAX_RAFT_RPC {
+            return Err(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &PersistError("snapshot exceeds raft rpc size bound".into()),
+            )
+            .into());
+        }
+        let sm: LeaseMap =
+            de(&data).map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
         let mut ops = vec![
             WriteOp::PutMeta(K_SM, ser(&sm)?),

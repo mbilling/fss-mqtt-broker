@@ -28,10 +28,13 @@ use std::fmt::Display;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// The retained store's on-disk layout version (ADR 0038 T2). v2: application
-/// properties in the value (ADR 0038 T3) — pre-1.0, a v1 file fails closed at the
-/// gate (wipe-and-rejoin) rather than silently decoding payload bytes as properties.
-const SCHEMA_VERSION: u32 = 2;
+/// The retained store's on-disk layout version (ADR 0038 T2). Reset to 1 with the
+/// postcard codec succession (ADR 0052): nothing is released, so the pre-release
+/// version history (v1 no props, v2 bincode props) was retired rather than extended
+/// — v1 now means "postcard-encoded properties in the value" and the incremental
+/// bump history starts at 1.0.0. A file stamped with a retired pre-release version
+/// fails closed at the gate (wipe-and-rejoin).
+const SCHEMA_VERSION: u32 = 1;
 
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 
@@ -185,7 +188,7 @@ mod tests {
     fn a_foreign_schema_version_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retained.redb");
-        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped v2
+        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped v1
         {
             let db = redb::Database::create(&path).unwrap();
             crate::schema::force_version(&db, 999).unwrap();
@@ -193,7 +196,7 @@ mod tests {
         let err = super::PersistentRetainedStore::open(&path)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("v999") && err.contains("expects v2"), "{err}");
+        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
     }
 
     use super::PersistentRetainedStore;

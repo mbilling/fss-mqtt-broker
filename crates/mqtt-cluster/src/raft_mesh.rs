@@ -36,6 +36,28 @@ use tokio::sync::{mpsc, oneshot};
 
 type RaftNodeId = u64;
 
+/// Maximum serialized size of one Raft RPC payload (request or reply), enforced
+/// on **both** sides (ADR 0052): a receiver rejects an oversized inbound payload
+/// before decoding, and a sender fails the send rather than shipping a payload
+/// the receiver would reject. The enclosing peer frame allows 16 MiB; this
+/// tighter bound reflects the actual content — `LeaseMap` snapshots and
+/// append-entries batches are KiB-scale, so 4 MiB is generous headroom, not a
+/// ceiling anyone should meet.
+pub(crate) const MAX_RAFT_RPC: usize = 4 * 1024 * 1024;
+
+/// Strict decode: the payload must be exactly one `T` (ADR 0052) and within
+/// [`MAX_RAFT_RPC`].
+fn strict_decode<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, String> {
+    if payload.len() > MAX_RAFT_RPC {
+        return Err(format!("raft rpc payload exceeds {MAX_RAFT_RPC} bytes"));
+    }
+    match postcard::take_from_bytes(payload) {
+        Ok((msg, [])) => Ok(msg),
+        Ok(_) => Err("trailing bytes after raft rpc payload".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// A Raft RPC request, serialized into a [`PeerMessage::RaftRpc`] payload.
 #[derive(Serialize, Deserialize)]
 enum RpcRequest {
@@ -62,7 +84,7 @@ enum RpcReply {
 /// the mirror of [`MeshRaftNetwork`]'s send side.
 #[must_use]
 pub async fn dispatch(raft: &LeaseRaft, payload: &[u8]) -> Vec<u8> {
-    let reply = match bincode::deserialize::<RpcRequest>(payload) {
+    let reply = match strict_decode::<RpcRequest>(payload) {
         Ok(RpcRequest::AppendEntries(rpc)) => match raft.append_entries(rpc).await {
             Ok(r) => RpcReply::AppendEntries(r),
             Err(e) => RpcReply::Err(e.to_string()),
@@ -77,7 +99,7 @@ pub async fn dispatch(raft: &LeaseRaft, payload: &[u8]) -> Vec<u8> {
         },
         Err(e) => RpcReply::Err(format!("undecodable raft rpc: {e}")),
     };
-    bincode::serialize(&reply).unwrap_or_default()
+    postcard::to_allocvec(&reply).unwrap_or_default()
 }
 
 struct Pending {
@@ -163,7 +185,14 @@ impl MeshRaftNetwork {
 
     /// Send an RPC to `target` and await its reply payload.
     async fn send(&self, target: RaftNodeId, req: &RpcRequest) -> Result<RpcReply, SendFail> {
-        let payload = bincode::serialize(req).map_err(|e| SendFail::Codec(e.to_string()))?;
+        let payload = postcard::to_allocvec(req).map_err(|e| SendFail::Codec(e.to_string()))?;
+        // Sender-side bound (mirrors peer::encode's rationale): an oversized
+        // payload fails here instead of being rejected by the receiver.
+        if payload.len() > MAX_RAFT_RPC {
+            return Err(SendFail::Codec(format!(
+                "raft rpc payload exceeds {MAX_RAFT_RPC} bytes"
+            )));
+        }
         let req_id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
@@ -187,7 +216,7 @@ impl MeshRaftNetwork {
             }
         }
         let bytes = reply_rx.await.map_err(|_| SendFail::Unreachable)?;
-        bincode::deserialize(&bytes).map_err(|e| SendFail::Codec(e.to_string()))
+        strict_decode(&bytes).map_err(SendFail::Codec)
     }
 }
 

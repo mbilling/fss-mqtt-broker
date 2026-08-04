@@ -288,10 +288,38 @@ mod tests {
         let mut m = LeaseMap::new();
         m.apply(&assign(1, 10));
         m.apply(&assign(2, 20));
-        let bytes = bincode::serialize(&m).unwrap();
-        let back: LeaseMap = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        let back: LeaseMap = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.get(1), m.get(1));
         assert_eq!(back.get(2), m.get(2));
         assert_eq!(back.high_epoch(), m.high_epoch());
+    }
+
+    /// The openraft types the store persists and the mesh ships round-trip
+    /// under postcard (ADR 0052) — pinned here so a codec or openraft upgrade
+    /// that changes a serde shape fails at `cargo test`, not in a cluster.
+    #[test]
+    fn openraft_wire_types_roundtrip_under_postcard() {
+        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, StoredMembership, Vote};
+
+        let log_id = LogId::new(CommittedLeaderId::new(3, 1), 7);
+        let entry = Entry::<LeaseConfig> {
+            log_id,
+            payload: EntryPayload::Normal(assign(1, 10)),
+        };
+        let bytes = postcard::to_allocvec(&entry).unwrap();
+        let back: Entry<LeaseConfig> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.log_id, entry.log_id);
+
+        let vote = Vote::<u64>::new(3, 1);
+        let bytes = postcard::to_allocvec(&vote).unwrap();
+        assert_eq!(postcard::from_bytes::<Vote<u64>>(&bytes).unwrap(), vote);
+
+        let membership = StoredMembership::<u64, openraft::BasicNode>::default();
+        let bytes = postcard::to_allocvec(&membership).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<StoredMembership<u64, openraft::BasicNode>>(&bytes).unwrap(),
+            membership
+        );
     }
 }

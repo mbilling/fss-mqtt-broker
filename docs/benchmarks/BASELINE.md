@@ -46,8 +46,12 @@ this isolates the CPU cost a code change can regress).
 |---|---|---|---|
 | replica apply | 64 B record | ~290 ns | ~3.4 Melem/s |
 | replica apply | 1 KiB record | ~367 ns | ~2.7 Melem/s |
-| peer frame encode | Replicate/256 B | ~284 ns | ~1.1 GiB/s |
-| peer frame decode | Replicate/256 B | ~418 ns | ~768 MiB/s |
+| peer frame encode | Replicate/256 B | ~439 ns | ~630 MiB/s |
+| peer frame decode | Replicate/256 B | ~357 ns | ~772 MiB/s |
+
+Re-baselined 2026-08-04 under the postcard codec (ADR 0052; previously bincode:
+encode ~284 ns / decode ~418 ns). Encode pays ~150 ns for varint packing; decode
+got faster. Both remain far below the per-message budget of the delivery path.
 
 ## The regression gate
 

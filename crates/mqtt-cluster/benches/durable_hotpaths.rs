@@ -6,7 +6,8 @@
 //!   follower ([`ReplicaState::apply`]); the in-memory apply is the CPU cost
 //!   before the fsync batch (ADR 0027 amortizes the disk).
 //! - **peer frame codec** — every cross-node frame (replication, recovery,
-//!   forwarded publish) is `bincode`-encoded on send and decoded on receive.
+//!   forwarded publish) is `postcard`-encoded on send and decoded on receive
+//!   (ADR 0052).
 //!
 //! In-memory only (no redb, no fsync): these isolate the CPU cost, which is
 //! what a code change can regress; the disk cost is the hardware's.
