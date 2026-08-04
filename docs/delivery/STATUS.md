@@ -48,7 +48,7 @@
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
-| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/5 done](0041-resource-governance.md) | — |
+| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/8 done](0041-resource-governance.md) | 3 open |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/7 done](0044-release-readiness-assurance.md) | — |
@@ -109,6 +109,12 @@
 **0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
 
 - `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. THE MACHINERY NOW EXISTS (ADR 0044 P3, 2026-07-17): cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact rolls a live cluster between a pinned baseline binary and HEAD one node at a time in both directions under the acked-facts oracle; at 1.0 this task is that test pointed at two release tags plus a scheduled CI job. Until then the pinned baseline doubles as the pre-release compatibility tripwire."
+
+**0041 — Resource governance (admission caps, per-client quotas, bounded state)**
+
+- `0041-T6` ⬜ planned: Per-session byte bound on the offline queue — MQTTD_MAX_QUEUED_BYTES beside the count bound, first-reached wins, same queue_overflow semantics, counted; SIZING.md updated (2026-08-04 amendment)
+- `0041-T7` ⬜ planned: Bridge-spool byte bound — max_bytes joins max_messages in the mqtt-bridge spool, drop-oldest, counted (2026-08-04 amendment)
+- `0041-T8` ⬜ planned: Process-memory watermark — MQTTD_MEMORY_MAX_BYTES, RSS poller + edge-triggered brownout reusing the T5 refusal paths; growth refused, maintenance continues, recovery restores; explicitly not allocation-denial or per-connection force-shutdown (2026-08-04 amendment)
 
 **0045 — Release engineering and distribution (signed, reproducible, SBOM-attested)**
 
