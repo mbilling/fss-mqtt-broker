@@ -1223,7 +1223,11 @@ async fn start_health(
         node_id.0.clone(),
         config.cluster.swim.seeds.is_empty(),
         brownout_status.clone(),
-        config.node.data_dir.as_ref().map(|_| store_snapshot.clone()),
+        config
+            .node
+            .data_dir
+            .as_ref()
+            .map(|_| store_snapshot.clone()),
     );
     let draining = state.draining_handle();
     let decommission = state.decommission_slot();

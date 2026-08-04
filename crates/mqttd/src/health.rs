@@ -674,7 +674,10 @@ mod tests {
         brownout.set(true);
         let (status, body, _) = super::route(&state, "/statusz").await;
         assert_eq!(status, 200, "statusz reports state; it never turns 503");
-        assert!(body.contains("\"brownout\":{\"disk\":true,\"since_unix\":"), "{body}");
+        assert!(
+            body.contains("\"brownout\":{\"disk\":true,\"since_unix\":"),
+            "{body}"
+        );
         brownout.set(false);
         let (_, body, _) = super::route(&state, "/statusz").await;
         assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");

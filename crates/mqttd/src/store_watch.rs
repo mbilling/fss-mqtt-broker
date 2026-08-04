@@ -88,10 +88,8 @@ pub async fn watch(
         m.set_store_max_bytes(max); // constant per process; exported once (ADR 0054)
     }
     if let Some(s) = &snapshot {
-        s.max_bytes.store(
-            max_bytes.unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        s.max_bytes
+            .store(max_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
     loop {
         let (sizes, total) = scan(&dir);
