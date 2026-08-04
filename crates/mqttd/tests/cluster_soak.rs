@@ -92,6 +92,9 @@ fn p99(mut samples: Vec<Duration>) -> Duration {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "long-running by design; the nightly tier (0044-P4) runs it with MQTTD_SOAK_SECS=3600"]
+// `%`-and-compare, not `is_multiple_of` (stable 1.87; MSRV 1.85) — drop the
+// allow when the floor rises.
+#[allow(clippy::manual_is_multiple_of)]
 async fn a_soak_under_sustained_load_shows_no_drift() {
     let seed = 8888;
     let secs = soak_secs();
