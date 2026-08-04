@@ -159,6 +159,27 @@ impl Placement {
         }
     }
 
+    /// A snapshot of the placement-eligible membership for the `/statusz` body
+    /// (ADR 0054): `(node id, peer-link addr if known, failure domain if known)`,
+    /// deterministic order. This is the *placement view* (self plus non-dead
+    /// peers) — per-member SWIM suspicion detail stays in the aggregate
+    /// `members{state}` gauges.
+    #[must_use]
+    pub fn members_snapshot(&self) -> Vec<(NodeId, Option<String>, Option<String>)> {
+        self.eligible
+            .iter()
+            .map(|id| {
+                let addr = self.addrs.get(id).cloned();
+                let domain = if *id == self.local {
+                    self.local_domain.clone()
+                } else {
+                    self.domains.get(id).cloned()
+                };
+                (id.clone(), addr, domain)
+            })
+            .collect()
+    }
+
     /// The current failure-domain topology (ADR 0016 T5): this node's own label plus
     /// every peer label learned from gossip. Feeds the lease-voter domain-balancing
     /// (ADR 0016 T4) with a *live*, self-assembling map — a node with no known label is

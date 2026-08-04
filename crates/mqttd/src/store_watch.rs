@@ -28,6 +28,33 @@ const STORE_FILES: [(&str, &str); 4] = [
 /// How often the watcher re-stats the store files.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// A shared snapshot of the last store scan, read by the `/statusz` body
+/// (ADR 0054). Updated every poll; all zeros until the first scan (or forever,
+/// without a data dir). Order matches [`STORE_FILES`].
+#[derive(Debug, Default)]
+pub struct StoreSnapshot {
+    /// Per-store bytes, in [`STORE_FILES`] order.
+    sizes: [std::sync::atomic::AtomicU64; 4],
+    /// The configured watermark (0 = none).
+    max_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl StoreSnapshot {
+    /// `(store name, bytes)` for every store, plus the configured watermark
+    /// (`None` when no watermark is set).
+    #[must_use]
+    pub fn read(&self) -> (Vec<(&'static str, u64)>, Option<u64>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sizes = STORE_FILES
+            .iter()
+            .zip(&self.sizes)
+            .map(|((name, _), v)| (*name, v.load(Relaxed)))
+            .collect();
+        let max = self.max_bytes.load(Relaxed);
+        (sizes, (max > 0).then_some(max))
+    }
+}
+
 /// Stat every store file under `dir`; absent files count as zero bytes.
 /// Returns `(store name, bytes)` pairs plus the total.
 #[must_use]
@@ -53,14 +80,29 @@ pub async fn watch(
     hub: mpsc::UnboundedSender<HubCommand>,
     metrics: Option<Arc<Metrics>>,
     poll: Option<Duration>,
+    snapshot: Option<Arc<StoreSnapshot>>,
 ) {
     let poll = poll.unwrap_or(POLL_INTERVAL);
     let mut brownout = false;
+    if let (Some(m), Some(max)) = (&metrics, max_bytes) {
+        m.set_store_max_bytes(max); // constant per process; exported once (ADR 0054)
+    }
+    if let Some(s) = &snapshot {
+        s.max_bytes.store(
+            max_bytes.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     loop {
         let (sizes, total) = scan(&dir);
         if let Some(m) = &metrics {
             for (store, bytes) in &sizes {
                 m.set_store_bytes(store, *bytes);
+            }
+        }
+        if let Some(s) = &snapshot {
+            for ((_, bytes), slot) in sizes.iter().zip(&s.sizes) {
+                slot.store(*bytes, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if let Some(max) = max_bytes {
@@ -108,12 +150,15 @@ mod tests {
         let dir = temp_dir("edge");
         std::fs::write(dir.join("sessions.redb"), vec![0u8; 10]).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        // The shared snapshot (ADR 0054) fills alongside the metrics/brownout path.
+        let snapshot = Arc::new(StoreSnapshot::default());
         let _watch = tokio::spawn(watch(
             dir.clone(),
             Some(100),
             tx,
             None,
             Some(Duration::from_millis(20)),
+            Some(snapshot.clone()),
         ));
 
         // Under the watermark: no command arrives.
@@ -133,6 +178,12 @@ mod tests {
             Ok(Some(HubCommand::SetBrownout(false))) => {}
             other => panic!("expected SetBrownout(false), got {other:?}"),
         }
+        // The /statusz snapshot tracked the scans: watermark recorded, sessions
+        // sized, the removed store back at zero (ADR 0054).
+        let (sizes, max) = snapshot.read();
+        assert_eq!(max, Some(100));
+        assert!(sizes.contains(&("sessions", 10)), "{sizes:?}");
+        assert!(sizes.contains(&("retained", 0)), "{sizes:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

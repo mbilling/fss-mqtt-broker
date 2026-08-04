@@ -17,11 +17,15 @@
 //!
 //! No HTTP framework is pulled in: the server parses the request line, routes on the
 //! path, and writes a small JSON body with `Connection: close`. It is deliberately
-//! minimal — it serves only these probes and exposes no broker state beyond the
-//! liveness/readiness booleans, the member count, the lease-group-ready flag, and
-//! (ADR 0049) durable-serviceability detail — the voter count and the leader's
-//! quorum-ack age — so a *green-but-degraded* durable plane is visible in the body
-//! without changing the ready/NotReady status the probe returns.
+//! minimal and strictly **read-only** (`GET`/`HEAD` only). `/readyz` carries the
+//! liveness/readiness booleans, member count, lease-group-ready flag, and (ADR 0049)
+//! durable-serviceability detail — voter count and quorum-ack age — without those
+//! details ever changing the ready/NotReady status code. **`GET /statusz`**
+//! (ADR 0054) is the wider, structured operator-facing state body: identity,
+//! membership view, lease detail, decommission, brownout, store sizes, and protocol
+//! range — everything a controller (or a human with `curl`) needs to act, none of it
+//! secret material, all of it on the same unauthenticated ops-network trust model as
+//! the probes (ADR 0020 §2).
 
 use crate::hub::HubCommand;
 use mqtt_cluster::decommission::DrainStatus;
@@ -37,6 +41,40 @@ use tracing::{debug, warn};
 /// How long the liveness probe waits for the hub to answer its ping before
 /// reporting the broker wedged.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Shared brownout state (ADR 0054): flipped by the hub on
+/// [`HubCommand::SetBrownout`] transitions, read by the `/statusz` body. The
+/// rejection counters record symptoms; this is the condition itself.
+#[derive(Debug, Default)]
+pub struct BrownoutStatus {
+    on: std::sync::atomic::AtomicBool,
+    since_unix: std::sync::atomic::AtomicU64,
+}
+
+impl BrownoutStatus {
+    /// Record a brownout transition (`on` = entered, `!on` = lifted).
+    pub fn set(&self, on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.on.store(on, Relaxed);
+        let since = if on {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        } else {
+            0
+        };
+        self.since_unix.store(since, Relaxed);
+    }
+
+    /// `(active, since-unix-seconds)`; `since` is `None` when not browned out.
+    #[must_use]
+    pub fn read(&self) -> (bool, Option<u64>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let on = self.on.load(Relaxed);
+        let since = self.since_unix.load(Relaxed);
+        (on, (on && since > 0).then_some(since))
+    }
+}
 
 /// Cap on the bytes read while looking for the request line — a crude guard against
 /// a client that streams forever without sending `\r\n`.
@@ -60,6 +98,13 @@ pub struct HealthState {
     decommission: Arc<OnceLock<Arc<DrainStatus>>>,
     /// When set, `GET /metrics` serves Prometheus exposition (ADR 0020); otherwise it 404s.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    /// Identity block for `/statusz` (ADR 0054): `(node id, founder flag)`.
+    /// `None` = `/statusz` 404s (the route is opt-in via [`with_status`]).
+    identity: Option<(String, bool)>,
+    /// Brownout state for `/statusz` (ADR 0054).
+    brownout: Option<Arc<BrownoutStatus>>,
+    /// Store-size snapshot for `/statusz` (ADR 0054).
+    stores: Option<Arc<crate::store_watch::StoreSnapshot>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -141,7 +186,27 @@ impl HealthState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             decommission: Arc::new(OnceLock::new()),
             metrics: None,
+            identity: None,
+            brownout: None,
+            stores: None,
         }
+    }
+
+    /// Enable `GET /statusz` (ADR 0054): the structured operator-facing state body.
+    /// `node_id`/`founder` form the identity block; `brownout` and `stores` are the
+    /// shared snapshots the hub and store watcher keep current.
+    #[must_use]
+    pub fn with_status(
+        mut self,
+        node_id: String,
+        founder: bool,
+        brownout: Arc<BrownoutStatus>,
+        stores: Option<Arc<crate::store_watch::StoreSnapshot>>,
+    ) -> Self {
+        self.identity = Some((node_id, founder));
+        self.brownout = Some(brownout);
+        self.stores = stores;
+        self
     }
 
     /// Serve Prometheus metrics on `GET /metrics` from this health server (ADR 0020).
@@ -222,6 +287,136 @@ impl HealthState {
     }
 }
 
+/// Minimal JSON string escaping for operator-supplied values (node ids,
+/// addresses, domains): quotes, backslashes, and control bytes.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+impl HealthState {
+    /// Build the `/statusz` body (ADR 0054): the structured, read-only,
+    /// operator-facing state of this node. Unbounded detail (member lists, voter
+    /// ids) lives HERE, never in metric labels — the ADR 0020 cardinality rule.
+    /// Every value is broker state an ops-network reader may see; no secret
+    /// material is ever included.
+    async fn statusz(&self) -> Option<String> {
+        use std::fmt::Write;
+        let (node_id, founder) = self.identity.as_ref()?;
+        let report = self.readiness().await;
+        let mut s = format!(
+            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"founder\":{founder},\"ready\":{},\"live\":{}",
+            json_escape(node_id),
+            env!("CARGO_PKG_VERSION"),
+            report.ready,
+            report.live,
+        );
+        // Membership: the placement view (self + non-dead peers). Deterministic order.
+        if let Some(p) = &self.placement {
+            let members = p
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .members_snapshot();
+            s.push_str(",\"members\":[");
+            for (i, (id, addr, domain)) in members.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "{{\"id\":\"{}\"", json_escape(&id.0));
+                if let Some(a) = addr {
+                    let _ = write!(s, ",\"addr\":\"{}\"", json_escape(a));
+                }
+                if let Some(d) = domain {
+                    let _ = write!(s, ",\"failure_domain\":\"{}\"", json_escape(d));
+                }
+                s.push('}');
+            }
+            s.push(']');
+        }
+        // Lease group (durable mode): role, epoch, voter identities, readiness.
+        if let Some(plane) = &self.durable {
+            let (is_leader, epoch) = plane.lease_role();
+            let _ = write!(
+                s,
+                ",\"lease\":{{\"leader\":{is_leader},\"epoch\":{epoch},\"group_ready\":{},\"voters\":[",
+                plane.lease_group_ready()
+            );
+            for (i, v) in plane.voter_ids().iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "\"{}\"", json_escape(&v.0));
+            }
+            s.push(']');
+            if let Some(ms) = plane.quorum_ack_age_ms() {
+                let _ = write!(s, ",\"quorum_ack_age_ms\":{ms}");
+            }
+            let (current, tracked) = plane.caught_up_summary();
+            let _ = write!(
+                s,
+                ",\"replica_groups\":{{\"current\":{current},\"tracked\":{tracked}}}}}"
+            );
+        }
+        // Decommission drain (ADR 0043), including the previously unsurfaced
+        // `active` flag — an operator distinguishes a draining shrink from a roll.
+        if let Some(d) = self.decommission.get() {
+            use std::sync::atomic::Ordering::Acquire;
+            let _ = write!(
+                s,
+                ",\"decommission\":{{\"active\":{},\"pending\":{},\"rounds\":{},\"complete\":{}}}",
+                d.active.load(Acquire),
+                d.pending.load(Acquire),
+                d.rounds.load(Acquire),
+                d.complete.load(Acquire)
+            );
+        }
+        // Brownout state (ADR 0041 §5): the condition, not the symptoms.
+        if let Some(b) = &self.brownout {
+            let (on, since) = b.read();
+            let _ = write!(s, ",\"brownout\":{{\"disk\":{on}");
+            if let Some(t) = since {
+                let _ = write!(s, ",\"since_unix\":{t}");
+            }
+            s.push('}');
+        }
+        // Store sizes + watermark, from the store watcher's shared snapshot.
+        if let Some(stores) = &self.stores {
+            let (sizes, max) = stores.read();
+            s.push_str(",\"store\":{");
+            for (i, (name, bytes)) in sizes.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "\"{name}\":{bytes}");
+            }
+            if let Some(max) = max {
+                let _ = write!(s, ",\"max_bytes\":{max}");
+            }
+            s.push('}');
+        }
+        // Peer-bus protocol range: a mixed-version fleet is visible per node.
+        let _ = write!(
+            s,
+            ",\"proto\":{{\"min\":{},\"max\":{}}}",
+            mqtt_cluster::peer::PROTO_MIN,
+            mqtt_cluster::peer::PROTO_MAX
+        );
+        s.push('}');
+        Some(s)
+    }
+}
+
 /// Serve health endpoints on `listener` until it errors. Each connection is handled
 /// off the accept loop so a slow client cannot stall probes.
 pub async fn serve(listener: TcpListener, state: HealthState) {
@@ -279,6 +474,13 @@ async fn route(state: &HealthState, path: &str) -> (u16, String, &'static str) {
         // Metrics exposition (ADR 0020); 404 when metrics are not enabled.
         "/metrics" => match &state.metrics {
             Some(m) => (200, m.render(), OPENMETRICS),
+            None => (404, "{\"error\":\"not found\"}".to_string(), JSON),
+        },
+        // Structured operator-facing state (ADR 0054); 404 until wired via
+        // `with_status`. Always 200 when wired — /statusz reports state, only
+        // /readyz carries the ready/NotReady contract in its status code.
+        "/statusz" => match state.statusz().await {
+            Some(body) => (200, body, JSON),
             None => (404, "{\"error\":\"not found\"}".to_string(), JSON),
         },
         _ => (404, "{\"error\":\"not found\"}".to_string(), JSON),
@@ -434,6 +636,56 @@ mod tests {
         assert_eq!(super::route(&state, "/").await.0, 404);
         // /metrics 404s when metrics are not enabled (no `with_metrics`).
         assert_eq!(super::route(&state, "/metrics").await.0, 404);
+        // /statusz 404s until wired via with_status (ADR 0054).
+        assert_eq!(super::route(&state, "/statusz").await.0, 404);
+    }
+
+    /// ADR 0054: `/statusz` reports the structured operator-facing state —
+    /// identity, membership view, brownout state (with a since-timestamp while
+    /// active), and the peer protocol range — and always answers 200 (only
+    /// `/readyz` carries readiness in its status code).
+    #[tokio::test]
+    async fn statusz_reports_identity_members_brownout_and_proto() {
+        let brownout = Arc::new(super::BrownoutStatus::default());
+        let state = HealthState::new(spawn_live_hub(), Some(placement(2)), None, 1).with_status(
+            "node-a".into(),
+            true,
+            brownout.clone(),
+            None,
+        );
+
+        let (status, body, _) = super::route(&state, "/statusz").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"node_id\":\"node-a\""), "{body}");
+        assert!(body.contains("\"founder\":true"), "{body}");
+        assert!(body.contains("\"members\":["), "{body}");
+        assert!(body.contains("\"id\":\"peer-1\""), "{body}");
+        assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "\"proto\":{{\"min\":{},\"max\":{}}}",
+                mqtt_cluster::peer::PROTO_MIN,
+                mqtt_cluster::peer::PROTO_MAX
+            )),
+            "{body}"
+        );
+
+        // A brownout transition is visible as STATE, with its onset timestamp.
+        brownout.set(true);
+        let (status, body, _) = super::route(&state, "/statusz").await;
+        assert_eq!(status, 200, "statusz reports state; it never turns 503");
+        assert!(body.contains("\"brownout\":{\"disk\":true,\"since_unix\":"), "{body}");
+        brownout.set(false);
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");
+    }
+
+    /// Operator-supplied strings (node ids) are JSON-escaped in the body.
+    #[test]
+    fn json_escape_handles_quotes_backslashes_and_control_bytes() {
+        assert_eq!(super::json_escape("plain-id"), "plain-id");
+        assert_eq!(super::json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(super::json_escape("nl\n"), "nl\\u000a");
     }
 
     #[tokio::test]

@@ -269,8 +269,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the
     // QoS-2 dedup window (ADR 0007 §5).
+    // Shared operator-state snapshots (ADR 0054): the hub flips brownout, the store
+    // watcher fills sizes, /statusz reads both.
+    let brownout_status = Arc::new(mqttd::health::BrownoutStatus::default());
+    let store_snapshot = Arc::new(mqttd::store_watch::StoreSnapshot::default());
     let (hub_tx, store, durable_plane, lease_driver) =
-        start_hub(&config, &node_id, &placement, &metrics).await?;
+        start_hub(&config, &node_id, &placement, &metrics, &brownout_status).await?;
 
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
@@ -282,6 +286,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &placement,
         durable_plane.clone(),
         metrics.clone(),
+        &node_id,
+        &brownout_status,
+        &store_snapshot,
     )
     .await?;
 
@@ -421,6 +428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hub_tx.clone(),
             Some(metrics.clone()),
             None,
+            Some(store_snapshot.clone()),
         ));
     }
 
@@ -476,6 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lease_driver,
         node_id,
         decommission_slot,
+        Some(metrics.clone()),
     )
     .await;
     // Push a final OTLP batch so the last counters are not lost on exit (no-op without
@@ -1036,6 +1045,7 @@ async fn start_hub(
     node_id: &NodeId,
     placement: &Arc<RwLock<Placement>>,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
+    brownout_status: &Arc<mqttd::health::BrownoutStatus>,
 ) -> Result<HubHandle, Box<dyn std::error::Error>> {
     // Claim the data directory for this node (ADR 0018 phase 5): refuse to open another
     // node's persistent state, before any store touches disk.
@@ -1109,6 +1119,7 @@ async fn start_hub(
             hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
         }
         hub.attach_metrics(metrics.clone());
+        hub.attach_brownout_status(brownout_status.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(plane_for_health), Some(driver)))
     } else if let Some(dir) = config.node.data_dir.clone() {
@@ -1136,6 +1147,7 @@ async fn start_hub(
         }
         hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
         hub.attach_metrics(metrics.clone());
+        hub.attach_brownout_status(brownout_status.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     } else {
@@ -1151,6 +1163,7 @@ async fn start_hub(
             hub.set_cluster_configured();
         }
         hub.attach_metrics(metrics.clone());
+        hub.attach_brownout_status(brownout_status.clone());
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     }
@@ -1167,12 +1180,16 @@ fn persistent_retained(dir: &str) -> Result<Box<dyn RetainedStore>, Box<dyn std:
 /// `/livez` reports hub liveness; `/readyz` additionally requires the mesh to have
 /// at least `MQTTD_READY_MIN_MEMBERS` members (default 1) and, when durable sessions
 /// are on, the lease group to be ready (a leader exists and this node is a voter).
+#[allow(clippy::too_many_arguments)] // a wiring seam: one call site, named handles
 async fn start_health(
     config: &Config,
     hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
     placement: &Arc<RwLock<Placement>>,
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
+    node_id: &NodeId,
+    brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    store_snapshot: &Arc<mqttd::store_watch::StoreSnapshot>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -1199,7 +1216,15 @@ async fn start_health(
         durable_plane,
         min_members,
     )
-    .with_metrics(metrics);
+    .with_metrics(metrics)
+    // /statusz (ADR 0054): the structured operator-facing state body. Founder =
+    // started with no SWIM seeds (the node that bootstraps the lease group).
+    .with_status(
+        node_id.0.clone(),
+        config.cluster.swim.seeds.is_empty(),
+        brownout_status.clone(),
+        config.node.data_dir.as_ref().map(|_| store_snapshot.clone()),
+    );
     let draining = state.draining_handle();
     let decommission = state.decommission_slot();
     if let Some(bind) = &health_bind {
@@ -2467,6 +2492,7 @@ async fn graceful_shutdown(
     lease_driver: Option<tokio::task::JoinHandle<()>>,
     node_id: NodeId,
     decommission_slot: Arc<std::sync::OnceLock<Arc<mqtt_cluster::decommission::DrainStatus>>>,
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
 ) {
     connections.close(); // no more spawns once the accept loops stop
     tokio::select! {
@@ -2479,6 +2505,24 @@ async fn graceful_shutdown(
                 warn!("SIGUSR1: decommission requested; draining data to the post-departure replica sets (ADR 0043 P3)");
                 let drain = plane.decommission_drain(node_id);
                 let _ = decommission_slot.set(drain.status());
+                // ADR 0054: mirror the drain into the decommission gauges so a
+                // scrape-only observer (operator, alert rule) sees it too — the
+                // /readyz|/statusz bodies alone require a direct probe.
+                if let (Some(m), Some(status)) = (&metrics, decommission_slot.get()) {
+                    let (m, status) = (m.clone(), status.clone());
+                    tokio::spawn(async move {
+                        use std::sync::atomic::Ordering::Acquire;
+                        loop {
+                            let complete = status.complete.load(Acquire);
+                            let state = if complete { 2 } else { 1 };
+                            m.set_decommission(state, status.pending.load(Acquire));
+                            if complete {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    });
+                }
                 tokio::select! {
                     () = drain.run() => {
                         warn!("decommission drain complete; proceeding with the graceful leave");
