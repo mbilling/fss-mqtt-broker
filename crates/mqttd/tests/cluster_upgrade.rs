@@ -35,10 +35,12 @@ use proc_common::{
     build_topology, establish_subscribers, oracle_acked_facts, proc_over, wait_all_ready,
 };
 
-/// The pinned baseline: the 0044-P2 merge — the newest ref carrying everything
-/// the harness itself needs (`MQTTD_PEER_ADVERTISE`, the SWIM seed re-greeting
-/// fix). Bump DELIBERATELY, together with any pre-1.0 wire/schema reshape.
-const BASELINE_REF: &str = "20cae2c7aa6f31f8cb14fee1065affe375a14268";
+/// The pinned baseline: the ADR 0052 codec-succession merge (postcard wire +
+/// stores, peer proto 6, schema stamps reset to 1) — the oldest ref a HEAD
+/// build can interoperate with, since 0052 was a deliberate clean break from
+/// everything before it. Bump DELIBERATELY, together with any pre-1.0
+/// wire/schema reshape.
+const BASELINE_REF: &str = "049d16b9228b5ee415293e3848b603d1c9c87e6e";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
