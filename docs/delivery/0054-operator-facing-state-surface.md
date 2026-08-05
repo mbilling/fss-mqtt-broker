@@ -20,7 +20,9 @@ tasks:
     evidence: "SwimAuth::key_fingerprints (sha256/8B hex per accepted key, primary first) + swim_keys_accepted gauge; reload::ConfigStamp (checksum of the config file bytes + applied-generation counter) recorded at startup and on every successful reload, mirrored to config_info{checksum} with previous-series zeroing; peer_proto_min/max gauges; statusz keys/config blocks with tests (fingerprint-not-material unit test; statusz shape); OPERATIONS.md rotation-verification steps" 
   - id: 0054-T4
     title: Monitoring docs + dashboard — Grafana rows for the new signals (brownout, store utilization, decommission, cluster identity, mismatch rate) and the OPERATIONS.md alert-rule catalogue the operator will encode
-    status: planned
+    status: done
+    date: 2026-08-05
+    evidence: "Demo dashboard gains an 'Operator signals (ADR 0054)' row: cluster-identity table (two values = split brain), foundings + cluster-mismatch rates, brownout state, store utilization vs watermark, decommission state/pending, replication lag + voters, rotation windows + config convergence, and the previously never-dashboarded ADR 0041 rejection families. OPERATIONS.md 'Monitoring for the operator' catalogues ten alert rules with actions; ADR 0047 amendment notes the operator path engaged with signals-first sequencing" 
 ---
 
 # 0054 — Operator-facing state surface: delivery
@@ -37,7 +39,7 @@ gauges, useful to humans and alert rules before any controller exists.
 | 0054-T1 | ✅ done | 2026-08-05 | "PR #79. /statusz always-200 on the health listener; unbounded detail body-only (member lists, voter ids), bounded gauges Prometheus+OTLP; statusz shape/brownout-transition/JSON-escape tests, store-watch snapshot test; mqttd lib 150 green, cardinality guard green" |
 | 0054-T2 | ✅ done | 2026-08-05 | "PR #80. End-to-end over real sockets: joiner adopts the founder's id; a separately-founded cluster's gossip counted cluster-mismatch and its node never enters the membership view; identity unit tests (mint-once/reload-stable, adopt-once/persist, distinct foundings); swim wire field appended (pre-1.0 reshape, disclosed), fuzz seed regenerated" |
 | 0054-T3 | ✅ done | 2026-08-05 | "SwimAuth::key_fingerprints (sha256/8B hex per accepted key, primary first) + swim_keys_accepted gauge; reload::ConfigStamp (checksum of the config file bytes + applied-generation counter) recorded at startup and on every successful reload, mirrored to config_info{checksum} with previous-series zeroing; peer_proto_min/max gauges; statusz keys/config blocks with tests (fingerprint-not-material unit test; statusz shape); OPERATIONS.md rotation-verification steps" |
-| 0054-T4 | ⬜ planned | — |  |
+| 0054-T4 | ✅ done | 2026-08-05 | "Demo dashboard gains an 'Operator signals (ADR 0054)' row: cluster-identity table (two values = split brain), foundings + cluster-mismatch rates, brownout state, store utilization vs watermark, decommission state/pending, replication lag + voters, rotation windows + config convergence, and the previously never-dashboarded ADR 0041 rejection families. OPERATIONS.md 'Monitoring for the operator' catalogues ten alert rules with actions; ADR 0047 amendment notes the operator path engaged with signals-first sequencing" |
 <!-- /status-table:0054 -->
 
 ## Notes

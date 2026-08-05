@@ -159,6 +159,11 @@ original's bare "post-1.0 if demand appears"):
    drains that a shrink/roll-aware controller would skip).
 4. Post-1.0 **user demand** for CRD-native management, as originally recorded.
 
+**2026-08-05 update:** the maintainer engaged this path — an operator handling
+split-brain and brownouts is now planned. The acting-signals land first
+([ADR 0054](0054-operator-facing-state-surface.md): cluster identity + containment,
+brownout/drain gauges, `/statusz`); the controller follows against proven signals.
+
 If reopened, the operator wraps the existing contracts (drain via SIGUSR1, readiness
 via `/readyz`, config via the same TOML) rather than inventing new control surfaces —
 the no-code-coupling property this ADR's consequences noted is what keeps that cheap.
