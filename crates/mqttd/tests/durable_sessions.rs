@@ -195,6 +195,7 @@ async fn start_durable_node_capped(
         swim_addr.clone(),
         peer_addr,
         None,
+        1,
         swim_cfg(),
         swim_seeds,
     );

@@ -2,7 +2,7 @@
 # Operator end-to-end (ADR 0055 T7) — the runtime proof that the reconciler does
 # what its unit tests claim, against a real API server.
 #
-# Three things are asserted, in order of how much they matter:
+# Four things are asserted, in order of how much they matter:
 #
 #   1. The operator CREATES a working cluster from a CR (apply → StatefulSet →
 #      3/3 Ready → status.phase=Ready with one clusterId).
@@ -10,7 +10,10 @@
 #      unreachable pods must read as absent evidence, never as a split brain.
 #      A controller that fails this would attack healthy nodes during ordinary
 #      operations, so it is asserted BEFORE the fence is proven to work at all.
-#   3. An INDUCED SPLIT BRAIN (wipe the founder's volume so it re-founds) is
+#   3. A SCALE cycle (3->4->3) resizes the set, keeps the cluster identity, raises
+#      no fence, and leaves every SURVIVING claim intact. (The departed pod's claim
+#      is reclaimed on purpose — see the note at that step.)
+#   4. An INDUCED SPLIT BRAIN (wipe the founder's volume so it re-founds) is
 #      detected and, with remediation opt-in, fenced — PVC labelled, pod deleted,
 #      DATA NEVER DELETED — and the verdict HOLDS: the fence fires once, so the
 #      incident stays visible instead of flickering behind a restart loop.
@@ -114,7 +117,7 @@ kubectl apply -f "$REPO_ROOT/deploy/crds/mqttd.io_mqttdclusters.json"
 kubectl -n "$NS" apply -f "$REPO_ROOT/deploy/operator/operator.yaml"
 kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=120s
 
-log "1/3 — apply a CR; the operator must CREATE a working cluster"
+log "1/4 — apply a CR; the operator must CREATE a working cluster"
 # Fence is enabled from the start: assertion 2 proves it does NOT fire on a
 # routine roll, which is only meaningful if it was armed the whole time.
 kubectl -n "$NS" apply -f - <<EOF
@@ -149,7 +152,11 @@ spec:
 
     [durable]
     enabled = true
-    lease_voters = 3
+    # 5, matching the chart default — NOT the replica count. Readiness requires that
+    # this node be a lease VOTER, so a node beyond the voter cap can never become
+    # Ready; with `lease_voters = 3` the scale-up below produced a 4th pod that was
+    # correctly, permanently NotReady, and OrderedReady then stalled forever.
+    lease_voters = 5
 
     [runtime]
     ready_min_members = __READY_MIN__
@@ -170,7 +177,7 @@ kubectl -n "$NS" get statefulset e2e -o jsonpath='{.metadata.ownerReferences[0].
   | grep -q MqttdCluster || fail "StatefulSet is not owned by the CR"
 echo "cluster created by the operator; clusterId=$CLUSTER_ID, ownership confirmed"
 
-log "2/3 — a rolling restart must provoke NO fence (the safety property)"
+log "2/4 — a rolling restart must provoke NO fence (the safety property)"
 BEFORE_PVCS="$(kubectl -n "$NS" get pvc -l "$(printf 'mqttd.io/quarantined=true')" -o name | wc -l | tr -d ' ')"
 kubectl -n "$NS" rollout restart statefulset/e2e
 kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
@@ -183,19 +190,40 @@ AFTER_PVCS="$(kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | wc
 [ "$(cr_status clusterId)" = "$CLUSTER_ID" ] || fail "cluster identity changed across a roll"
 echo "rolling restart completed with no fence and a stable identity"
 
-# SCALE up/down: NOT asserted yet, deliberately.
-#
-# ADR 0055 §5 lists a scale cycle here and this run implemented it, which is how
-# the broker-side membership flap below was found: a scale is also a config change
-# (REPLICAS feeds the readiness-floor math), so it rolls the set — and after any
-# roll a pod can flap dead<->alive in its peers' membership views every ~30s. Each
-# "dead" drops the peer link and routing state, the durable lease group never
-# elects, and that pod stays NotReady forever, so OrderedReady never reaches the
-# new ordinal. Asserting it now would only add a permanently red nightly job that
-# says nothing about the operator. Restore this step with the fix; the evidence and
-# the removed assertions are recorded in issue #92.
+log "3/4 — scale up then down; the operator must resize the set and keep data"
+# The rendered config carries REPLICAS (the readiness-floor math), so a scale is also
+# a config change: the operator must roll the set to the new shape, not just edit
+# .spec.replicas. Withheld until issue #92 was fixed — the roll a scale implies left
+# a pod NotReady forever, so OrderedReady never reached the new ordinal.
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge -p '{"spec":{"replicas":4}}'
+wait_for 240 "the operator to scale the StatefulSet to 4" \
+  bash -c "[ \"\$(kubectl -n $NS get statefulset e2e -o jsonpath='{.spec.replicas}')\" = 4 ]"
+kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
+wait_for 240 "status.readyReplicas=4" \
+  bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath='{.status.readyReplicas}')\" = 4 ]"
 
-log "3/3 — induce a split brain; it must be detected and fenced"
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge -p '{"spec":{"replicas":3}}'
+wait_for 240 "the departing pod to be gone" \
+  bash -c "! kubectl -n $NS get pod e2e-3 >/dev/null 2>&1"
+# The DEPARTED pod's claim is expected to be gone: the StatefulSet is rendered with
+# `persistentVolumeClaimRetentionPolicy.whenScaled: Delete`, deliberately, because a
+# scale-down runs the ADR 0043 decommission drain first — the data moves to the
+# post-departure replica set and the emptied volume is then reclaimed rather than
+# left to accrue cost. (Do not "fix" this into asserting data-e2e-3 survives; an
+# earlier draft did, and it contradicted a unit-tested design decision. Asserting
+# the DRAIN itself — that the data really did move before the volume went — is T6's
+# job, and is the assertion that makes this reclaim safe.)
+#
+# What must hold here is that the SURVIVORS were untouched.
+for ord in 0 1 2; do
+  kubectl -n "$NS" get "pvc/data-e2e-$ord" >/dev/null \
+    || fail "a surviving pod's PVC (data-e2e-$ord) was destroyed by a scale cycle"
+done
+[ "$(cr_status clusterId)" = "$CLUSTER_ID" ] || fail "cluster identity changed across a scale cycle"
+[ "$(cr_condition SplitBrain)" = "False" ] || fail "a scale cycle was mistaken for a split brain"
+echo "scaled 3->4->3; identity stable, no fence, every surviving PVC intact"
+
+log "4/4 — induce a split brain; it must be detected and fenced"
 # Wipe the founder's volume: pod-0 renders with no seeds, so an empty data dir
 # makes it found a NEW cluster beside the survivors — the exact scenario
 # OPERATIONS.md warns about.
@@ -230,4 +258,4 @@ done
 kubectl -n "$NS" get pvc data-e2e-0 >/dev/null || fail "the PVC was DELETED — data must never be destroyed"
 echo "split brain verdict STABLE ($held/20 samples) with the PVC intact"
 
-log "OPERATOR E2E PASSED: created a cluster, ignored a routine roll, detected and fenced a real split brain exactly once"
+log "OPERATOR E2E PASSED: created a cluster, ignored a routine roll, scaled up and down without data loss, detected and fenced a real split brain exactly once"

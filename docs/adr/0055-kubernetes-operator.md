@@ -113,13 +113,11 @@ Reconcile logic unit-tested against a mocked API server; the **render-parity** g
 per PR; a nightly **kind e2e**: install operator → apply `MqttdCluster` → cluster
 forms → scale up/down (drain asserted) → roll (no drain) → induced split-brain
 (founder PVC wipe) detected, and fenced when `Fence` is set — the ADR 0054 signals
-asserted end to end. *T7 status:* create, roll-without-fence, and split-brain
-detect-and-fence are asserted; the **scale cycle is written but withheld** — it
-reproduced a broker-side membership flap after any roll (issue #92) that leaves a
-pod NotReady forever, so asserting it now would only pin a red nightly job to a
-defect outside the operator. It is restored with that fix. The acked-facts oracle
-remains the broker suites' job; the operator e2e asserts orchestration, not message
-durability.
+asserted end to end. *T7 note:* the scale cycle was briefly withheld — it reproduced
+a broker-side membership flap after any roll (issue #92) that left a pod NotReady
+forever — and is asserted again now that ADR 0016's generation amendment fixed it.
+The drain assertion on the scale remains T6's. The acked-facts oracle remains the
+broker suites' job; the operator e2e asserts orchestration, not message durability.
 
 ## Alternatives considered
 

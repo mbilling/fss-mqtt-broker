@@ -1765,12 +1765,25 @@ async fn start_swim(
     let socket = UdpSocket::bind(&bind).await?;
     let seeds: Vec<String> = config.cluster.swim.seeds.clone();
     info!(%bind, seeds = seeds.len(), authenticated = auth.is_some(), "starting SWIM gossip membership");
+    // This process's gossip GENERATION (issue #92). A node id outlives the process
+    // that holds it — a Kubernetes pod keeps its name across every restart — while
+    // incarnation numbers do not survive a restart, so peers could not tell a
+    // returning node from the one they had just buried: a `Dead` claim about the
+    // previous life outranked the new process's `Alive` and killed it on a loop.
+    // Wall-clock milliseconds at start orders the lives without any persisted state.
+    // A clock that steps BACKWARDS across a restart would let the old life's claims
+    // win again — no worse than the behaviour this replaces, and NTP-stepped hosts
+    // do not do it between two pod starts.
+    let generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let swim = Swim::new(
         node_id.clone(),
         bind,
         peer_addr,
         // Advertise this node's own failure-domain label over gossip (ADR 0016 T5).
         config.node.failure_domain.clone(),
+        generation,
         mqtt_cluster::swim::Config::default(),
         seeds,
     );

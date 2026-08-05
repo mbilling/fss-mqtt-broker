@@ -50,10 +50,14 @@ pub async fn maintain_peer_links(
     // harness's in-process "crash") keeps redialing forever and pins every
     // resource its links capture (observed: a killed stress node's lease store
     // held open by a zombie dialer's durable-plane handle, ADR 0042 T4).
-    struct DialerBook(HashMap<NodeId, JoinHandle<()>>);
+    // The address a dialer was spawned with is remembered alongside its handle: a
+    // peer that returns at a NEW routing address is `Alive -> Alive`, so without
+    // this the live dialer would keep redialing the address it started with for
+    // the rest of the process's life (issue #92).
+    struct DialerBook(HashMap<NodeId, (String, JoinHandle<()>)>);
     impl Drop for DialerBook {
         fn drop(&mut self) {
-            for (_, h) in self.0.drain() {
+            for (_, (_, h)) in self.0.drain() {
                 h.abort();
             }
         }
@@ -82,12 +86,25 @@ pub async fn maintain_peer_links(
                     continue;
                 }
                 if ev.peer_addr.is_empty() {
-                    warn!(peer = %ev.id.0, "peer is alive but gossiped no routing address; cannot dial");
+                    // Not fatal and not final: a peer first seen through relayed
+                    // gossip may not carry its routing address yet. The address
+                    // arriving later now raises its own event (issue #92), so this
+                    // peer is picked up then rather than dropped for good.
+                    warn!(peer = %ev.id.0, "peer is alive but gossiped no routing address yet; waiting for one");
                     continue;
                 }
-                if let Some(h) = dialers.0.get(&ev.id) {
+                if let Some((addr, h)) = dialers.0.get(&ev.id) {
                     if !h.is_finished() {
-                        continue; // already dialing / linked
+                        if addr == &ev.peer_addr {
+                            continue; // already dialing / linked at this address
+                        }
+                        // The peer moved: the running dialer is aiming at an address
+                        // that no longer exists, so replace it.
+                        info!(
+                            peer = %ev.id.0, from = %addr, to = %ev.peer_addr,
+                            "membership: peer routing address changed; redialing"
+                        );
+                        h.abort();
                     }
                 }
                 info!(peer = %ev.id.0, addr = %ev.peer_addr, "membership: peer alive; establishing link");
@@ -98,11 +115,13 @@ pub async fn maintain_peer_links(
                     tls.clone(),
                     plane.clone(),
                 ));
-                dialers.0.insert(ev.id.clone(), handle);
+                dialers
+                    .0
+                    .insert(ev.id.clone(), (ev.peer_addr.clone(), handle));
             }
             MemberState::Suspect => {}
             MemberState::Dead => {
-                if let Some(h) = dialers.0.remove(&ev.id) {
+                if let Some((_, h)) = dialers.0.remove(&ev.id) {
                     h.abort();
                 }
                 info!(peer = %ev.id.0, "membership: peer dead; dropping link");

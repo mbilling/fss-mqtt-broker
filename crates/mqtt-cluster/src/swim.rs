@@ -119,6 +119,9 @@ pub struct Member {
     pub peer_addr: String,
     /// The latest incarnation we have observed for it.
     pub incarnation: Incarnation,
+    /// The process generation (issue #92) those observations belong to. Claims
+    /// carrying an older generation are about a previous life and are discarded.
+    pub generation: u64,
     /// Its current state in our view.
     pub state: MemberState,
     /// Its self-advertised failure-domain label (rack/zone), learned from gossip
@@ -147,6 +150,18 @@ pub struct Update {
     pub peer_addr: String,
     /// Subject incarnation the claim is about.
     pub incarnation: Incarnation,
+    /// The subject's process GENERATION this claim is about (issue #92).
+    ///
+    /// Incarnation numbers live inside one process life: a restarted node has no
+    /// memory of them and re-enters at the bottom of the range, so a `Dead` claim
+    /// about its previous life outranks the new process's `Alive` and kills it —
+    /// forever, since every node that applies a claim re-gossips it. The
+    /// generation is a monotonic per-start token that says *which life* a claim is
+    /// about, so a newer life supersedes any claim about an older one and a claim
+    /// about an older life is discarded outright. Appended field: a pre-1.0 wire
+    /// reshape (ADR 0039), same clean-break rules as ADR 0052.
+    #[serde(default)]
+    pub generation: u64,
     /// Claimed state.
     pub state: MemberState,
     /// For a `Suspect` claim, the id of the node asserting it (ADR 0016 §3), preserved
@@ -205,6 +220,12 @@ pub struct Message {
     /// teaches it directly — the same reason `from_peer_addr` rides here.
     #[serde(default)]
     pub from_domain: Option<String>,
+    /// The sender's own process generation (issue #92), so first contact learns
+    /// which life it is talking to — otherwise a member learned from a datagram
+    /// would start at generation 0 and a stale `Dead` claim about a real earlier
+    /// life would outrank it.
+    #[serde(default)]
+    pub from_generation: u64,
     /// The message kind.
     pub kind: Kind,
     /// Piggybacked membership updates.
@@ -286,6 +307,10 @@ pub struct Swim {
     /// self-update it emits so peers learn the cluster topology from gossip.
     local_domain: Option<String>,
     incarnation: Incarnation,
+    /// This process's generation (issue #92) — supplied by the caller so the state
+    /// machine stays clock-free. Must be strictly greater on each restart of the
+    /// same node id; the broker uses the wall clock at start.
+    generation: u64,
     cfg: Config,
     members: BTreeMap<NodeId, Member>,
     seeds: Vec<String>,
@@ -320,6 +345,7 @@ impl Swim {
         local_addr: String,
         local_peer_addr: String,
         local_domain: Option<String>,
+        generation: u64,
         cfg: Config,
         seeds: Vec<String>,
     ) -> Self {
@@ -336,6 +362,7 @@ impl Swim {
             local_peer_addr,
             local_domain,
             incarnation: 1,
+            generation,
             cfg,
             members: BTreeMap::new(),
             seeds,
@@ -462,6 +489,7 @@ impl Swim {
             from_addr: self.local_addr.clone(),
             from_peer_addr: self.local_peer_addr.clone(),
             from_domain: self.local_domain.clone(),
+            from_generation: self.generation,
             cluster_id: None, // stamped by the driver at send time (ADR 0054)
             kind,
             gossip: self.take_gossip(),
@@ -475,6 +503,15 @@ impl Swim {
     #[allow(clippy::too_many_lines)]
     fn apply_update(&mut self, u: &Update, now: u64, out: &mut Vec<Action>) {
         if u.id == self.local.0 {
+            // A claim about an EARLIER life of this id is not about this process
+            // (issue #92): incarnations are only comparable within one life, so
+            // refuting it would bump our counter for nothing. Drop it.
+            // (A claim at a HIGHER generation means another process is running with
+            // our id — a duplicate-id misconfiguration. We do not try to win that
+            // fight: our refutation would carry the lower generation and lose.)
+            if u.generation < self.generation {
+                return;
+            }
             // Once we have announced a graceful leave we do not refute `Dead` about
             // ourselves — including our own departure gossip echoed back (ADR 0019 §2).
             if u.state != MemberState::Alive && u.incarnation >= self.incarnation && !self.leaving {
@@ -484,6 +521,7 @@ impl Swim {
                     addr: self.local_addr.clone(),
                     peer_addr: self.local_peer_addr.clone(),
                     incarnation: self.incarnation,
+                    generation: self.generation,
                     state: MemberState::Alive,
                     suspecter: None,
                     failure_domain: self.local_domain.clone(),
@@ -497,17 +535,28 @@ impl Swim {
 
         let id = NodeId(u.id.clone());
         if let Some(m) = self.members.get_mut(&id) {
+            // Generation orders process LIVES of the same id (issue #92), and it is
+            // checked FIRST because it decides what the other rules even apply to.
+            if u.generation < m.generation {
+                return; // about a previous life; says nothing about this one
+            }
+            // A newer life supersedes everything we hold about the older one —
+            // including its tombstone, which was about a process that really did die.
+            let new_life = u.generation > m.generation;
             // Tombstone fence (ADR 0016 phase 1): while a `Dead` member is tombstoned,
             // no non-`Dead` gossip can revive it — not even a higher incarnation (e.g.
             // the node's own last refutation still in flight when it died). Only the
             // prune in `tick` clears the tombstone, after which the id may rejoin.
-            if m.tombstone_deadline.is_some() && u.state != MemberState::Dead {
+            // The fence is scoped to the life it was raised for: a *restart* is not a
+            // resurrection, and blocking it is what left a rolled pod dead forever.
+            if !new_life && m.tombstone_deadline.is_some() && u.state != MemberState::Dead {
                 return;
             }
             // Record an independent suspecter of the *current* incarnation even when the
             // update does not supersede (a second node suspecting an already-`Suspect`
             // peer) — this is how confirmations accumulate (ADR 0016 §3).
-            if u.state == MemberState::Suspect
+            if !new_life
+                && u.state == MemberState::Suspect
                 && m.state == MemberState::Suspect
                 && u.incarnation == m.incarnation
             {
@@ -515,17 +564,22 @@ impl Swim {
                     m.suspecters.insert(NodeId(sus.clone()));
                 }
             }
-            let supersedes = u.incarnation > m.incarnation
+            let supersedes = new_life
+                || u.incarnation > m.incarnation
                 || (u.incarnation == m.incarnation && u.state.precedence() > m.state.precedence());
             if !supersedes {
                 return;
             }
             let changed = m.state != u.state;
-            let inc_advanced = u.incarnation > m.incarnation;
+            // A new life resets the incarnation space, so treat it as an advance: the
+            // suspecter set below belongs to the old process and must not carry over.
+            let inc_advanced = new_life || u.incarnation > m.incarnation;
+            m.generation = u.generation;
             m.incarnation = u.incarnation;
             m.addr.clone_from(&u.addr);
             // Never let a claimant that hasn't learned the routing address yet
             // erase one we already know.
+            let prev_peer_addr = m.peer_addr.clone();
             if !u.peer_addr.is_empty() {
                 m.peer_addr.clone_from(&u.peer_addr);
             }
@@ -535,6 +589,11 @@ impl Swim {
             if domain_changed {
                 m.failure_domain.clone_from(&u.failure_domain);
             }
+            // A ROUTING ADDRESS that moved is news for the dial layer even when the
+            // state did not change (issue #92): a node that comes back at a new
+            // address is `Alive -> Alive`, and without an event the dialer keeps the
+            // address it was spawned with forever.
+            let addr_changed = !u.peer_addr.is_empty() && u.peer_addr != prev_peer_addr;
             // The `(incarnation, state)` identity changed: reset the suspecter set,
             // seeding it from this update if it is a fresh `Suspect` (ADR 0016 §3).
             if changed || inc_advanced {
@@ -545,7 +604,7 @@ impl Swim {
                     }
                 }
             }
-            if changed {
+            if changed || new_life {
                 m.state = u.state;
                 m.state_since = now;
                 m.tombstone_deadline = if u.state == MemberState::Dead {
@@ -557,7 +616,7 @@ impl Swim {
             // Surface the change to the routing/placement layer when the state changed
             // *or* only the failure-domain label did (ADR 0016 T5) — otherwise a label
             // learned after the member is already known would never reach placement.
-            if changed || domain_changed {
+            if changed || domain_changed || addr_changed {
                 out.push(Action::StateChange {
                     id: id.clone(),
                     addr: u.addr.clone(),
@@ -574,6 +633,7 @@ impl Swim {
                     addr: u.addr.clone(),
                     peer_addr: u.peer_addr.clone(),
                     incarnation: u.incarnation,
+                    generation: u.generation,
                     state: u.state,
                     failure_domain: u.failure_domain.clone(),
                     state_since: now,
@@ -613,6 +673,8 @@ impl Swim {
             addr: m.addr.clone(),
             peer_addr: m.peer_addr.clone(),
             incarnation: m.incarnation,
+            // The claim names the life we observed, so it can never kill a later one.
+            generation: m.generation,
             state,
             // Stamp ourselves as the suspecter so independent suspicions are countable
             // through re-broadcast (ADR 0016 §3).
@@ -648,6 +710,7 @@ impl Swim {
             addr: self.local_addr.clone(),
             peer_addr: self.local_peer_addr.clone(),
             incarnation: self.incarnation,
+            generation: self.generation,
             state: MemberState::Dead,
             suspecter: None,
             failure_domain: self.local_domain.clone(),
@@ -667,6 +730,7 @@ impl Swim {
                     from_addr: self.local_addr.clone(),
                     from_peer_addr: self.local_peer_addr.clone(),
                     from_domain: self.local_domain.clone(),
+                    from_generation: self.generation,
                     cluster_id: None, // stamped by the driver at send time (ADR 0054)
                     kind: Kind::Sync,
                     gossip: vec![departure.clone()],
@@ -863,6 +927,7 @@ impl Swim {
                 addr: msg.from_addr.clone(),
                 peer_addr: msg.from_peer_addr.clone(),
                 incarnation: 0,
+                generation: msg.from_generation,
                 state: MemberState::Alive,
                 suspecter: None,
                 // First contact teaches the sender's label directly (ADR 0016 T5).
@@ -950,6 +1015,7 @@ impl Swim {
             addr: self.local_addr.clone(),
             peer_addr: self.local_peer_addr.clone(),
             incarnation: self.incarnation,
+            generation: self.generation,
             state: MemberState::Alive,
             suspecter: None,
             failure_domain: self.local_domain.clone(),
@@ -960,6 +1026,7 @@ impl Swim {
                 addr: m.addr.clone(),
                 peer_addr: m.peer_addr.clone(),
                 incarnation: m.incarnation,
+                generation: m.generation,
                 state: m.state,
                 // A full-state relay does not assert independent suspicion (ADR 0016 §3);
                 // real suspecters propagate via the normal gossip re-broadcast path.
@@ -1004,6 +1071,7 @@ mod tests {
             addr.to_string(),
             peer_addr_of(addr),
             None,
+            1,
             fast_cfg(),
             seeds.iter().map(|s| (*s).to_string()).collect(),
         )
@@ -1016,6 +1084,7 @@ mod tests {
             addr.to_string(),
             peer_addr_of(addr),
             Some(domain.to_string()),
+            1,
             fast_cfg(),
             seeds.iter().map(|s| (*s).to_string()).collect(),
         )
@@ -1027,6 +1096,7 @@ mod tests {
             addr: addr.to_string(),
             peer_addr: peer_addr_of(addr),
             incarnation: inc,
+            generation: 1,
             state: MemberState::Alive,
             suspecter: None,
             failure_domain: None,
@@ -1061,6 +1131,7 @@ mod tests {
             from_addr: from_addr.to_string(),
             from_peer_addr: peer_addr_of(from_addr),
             from_domain: None,
+            from_generation: 1,
             cluster_id: None,
             kind,
             gossip,
@@ -1108,6 +1179,7 @@ mod tests {
                 addr: "b:1".into(),
                 peer_addr: String::new(),
                 incarnation: 5,
+                generation: 1,
                 state: MemberState::Alive,
                 suspecter: None,
                 failure_domain: None,
@@ -1135,6 +1207,7 @@ mod tests {
                 addr: "b:1".into(),
                 peer_addr: peer_addr_of("b:1"),
                 incarnation: 0,
+                generation: 1,
                 state: MemberState::Suspect,
                 suspecter: None,
                 failure_domain: None,
@@ -1160,6 +1233,7 @@ mod tests {
                 addr: "a:1".into(),
                 peer_addr: peer_addr_of("a:1"),
                 incarnation: start_inc,
+                generation: 1,
                 state: MemberState::Suspect,
                 suspecter: None,
                 failure_domain: None,
@@ -1326,6 +1400,157 @@ mod tests {
         assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
     }
 
+    /// A RESTARTED node must not be killed by its previous life's `Dead` claim.
+    ///
+    /// This is issue #92, found by the ADR 0055 T7 operator e2e on a Kubernetes
+    /// rolling restart. The pod keeps its node id across a restart, and a fresh
+    /// process has no memory of its incarnation, so its `Alive` re-enters at the
+    /// same low incarnation the `Dead` claim about its *previous* life carries —
+    /// and `Dead` outranks `Alive` at equal incarnation. Every node that applies
+    /// that claim re-gossips it, so the claim never drains: the member is revived
+    /// when its tombstone is pruned and re-killed seconds later, forever, at
+    /// exactly the `dead_ttl_ms` period. Downstream, each `Dead` drops the peer
+    /// link and its routing state, so the durable lease group never elects and the
+    /// pod stays `NotReady` for good.
+    #[test]
+    fn a_restarted_node_is_not_re_killed_by_its_previous_lifes_dead_claim() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+
+        // b lives, then genuinely dies; the Dead claim starts circulating.
+        s.apply_update(&alive_update("b", "b:1", 1), 0, &mut out);
+        let stale_dead = dead_update("b", "b:1", 1);
+        s.apply_update(&stale_dead, 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        // The tombstone drains and b's pod restarts: same id, new address, and a
+        // fresh process — so incarnation is back to where a new node starts.
+        let ttl = fast_cfg().dead_ttl_ms;
+        s.tick(ttl + 1);
+        out.clear();
+        s.apply_update(
+            &Update {
+                generation: 2,
+                ..alive_update("b", "b:2", 1)
+            },
+            ttl + 2,
+            &mut out,
+        );
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Alive),
+            "the restarted node rejoins once the tombstone is pruned"
+        );
+
+        // The previous life's claim is still in flight somewhere in the cluster.
+        out.clear();
+        s.apply_update(&stale_dead, ttl + 3, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Alive),
+            "a Dead claim about a node's PREVIOUS life must not kill the new one"
+        );
+        assert!(
+            !out.iter().any(|a| matches!(
+                a, Action::StateChange { id, state: MemberState::Dead, .. } if id.0 == "b"
+            )),
+            "and it must not tear down the peer link either"
+        );
+    }
+
+    /// A node that comes back at a NEW routing address must reach the dial layer,
+    /// even though its state never left `Alive` (issue #92). Without this event the
+    /// dialer keeps redialing the address it was spawned with, forever.
+    #[test]
+    fn a_changed_routing_address_is_surfaced_even_when_the_state_is_unchanged() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 1), 0, &mut out);
+
+        out.clear();
+        let moved = Update {
+            peer_addr: "b:2-peer".to_string(),
+            ..alive_update("b", "b:1", 2)
+        };
+        s.apply_update(&moved, 1, &mut out);
+        let surfaced = out.iter().find_map(|a| match a {
+            Action::StateChange { id, peer_addr, .. } if id.0 == "b" => Some(peer_addr.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            surfaced.as_deref(),
+            Some("b:2-peer"),
+            "an address move must raise a membership event carrying the NEW address"
+        );
+    }
+
+    /// The tombstone fence is scoped to the life it was raised for: a claim from a
+    /// NEWER life clears it (a restart is not a resurrection), while the dead
+    /// process's own in-flight refutation — same life — is still fenced out. This is
+    /// the guarantee ADR 0016 phase 1 bought, kept intact while fixing issue #92.
+    #[test]
+    fn a_tombstone_fences_the_dead_life_but_not_a_new_one() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 1), 0, &mut out);
+        s.apply_update(&dead_update("b", "b:1", 1), 0, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+
+        // Same life, higher incarnation: still fenced (the original guarantee).
+        s.apply_update(&alive_update("b", "b:1", 99), 1, &mut out);
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Dead),
+            "the dead process's own last refutation must not revive it"
+        );
+
+        // A NEW life clears the tombstone immediately — no waiting out dead_ttl_ms.
+        s.apply_update(
+            &Update {
+                generation: 2,
+                ..alive_update("b", "b:2", 1)
+            },
+            2,
+            &mut out,
+        );
+        assert_eq!(
+            member_state(&s, "b"),
+            Some(MemberState::Alive),
+            "a restarted node rejoins at once; it is not the corpse the fence is for"
+        );
+    }
+
+    /// Claims about an older life are inert in every direction: they must not
+    /// resurrect, re-kill, or even downgrade the current life.
+    #[test]
+    fn claims_about_a_previous_life_are_ignored_whatever_they_say() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(
+            &Update {
+                generation: 7,
+                ..alive_update("b", "b:1", 1)
+            },
+            0,
+            &mut out,
+        );
+
+        for stale in [
+            dead_update("b", "b:1", 99),
+            suspect_update("b", "b:1", 99),
+            alive_update("b", "b:1", 99),
+        ] {
+            out.clear();
+            s.apply_update(&stale, 1, &mut out); // generation 1 < 7
+            assert_eq!(
+                member_state(&s, "b"),
+                Some(MemberState::Alive),
+                "a claim about generation 1 says nothing about generation 7"
+            );
+            assert!(out.is_empty(), "and it raises no membership event");
+        }
+    }
+
     /// ADR 0016 phase 1: a tombstone is pruned after `dead_ttl_ms` (by when stale
     /// gossip has drained), after which the id may rejoin fresh.
     #[test]
@@ -1444,6 +1669,7 @@ mod tests {
             addr: "b:1".into(),
             peer_addr: peer_addr_of("b:1"),
             incarnation: 5,
+            generation: 1,
             state,
             suspecter: None,
             failure_domain: None,
@@ -1489,6 +1715,7 @@ mod tests {
                 addr: "b:1".into(),
                 peer_addr: peer_addr_of("b:1"),
                 incarnation: 0,
+                generation: 1,
                 state: MemberState::Dead,
                 suspecter: None,
                 failure_domain: None,
@@ -1816,6 +2043,7 @@ mod tests {
             from_addr: "a:1".into(),
             from_peer_addr: peer_addr_of("a:1"),
             from_domain: Some("rack-a".into()),
+            from_generation: 1,
             cluster_id: None,
             kind: Kind::Ping { seq: 7 },
             gossip: vec![],
