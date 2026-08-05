@@ -64,8 +64,24 @@ mqtt_read() { # mqtt_read <topic>
 }
 
 log "Build broker + test image ($IMAGE)"
-cargo build --release -p mqttd --manifest-path "$REPO_ROOT/Cargo.toml"
-cp "$REPO_ROOT/target/release/mqttd" "$REPO_ROOT/dist-smoke-mqttd"
+if [ "$(uname -s)" = "Darwin" ]; then
+  # macOS host: the kind node runs Linux, so a host build would produce a Mach-O
+  # binary the pod cannot exec. Build inside a Linux container instead (native
+  # arch under Docker Desktop; rustup picks up the repo's pinned toolchain).
+  # A named volume caches the cargo registry, and the target dir lives under the
+  # repo's gitignored target/ so re-runs are incremental.
+  docker volume create mqttd-smoke-cargo >/dev/null
+  docker run --rm -v "$REPO_ROOT":/src -w /src \
+    -v mqttd-smoke-cargo:/usr/local/cargo/registry \
+    -e CARGO_TARGET_DIR=/src/target/smoke-linux \
+    rust:slim sh -ec 'apt-get update -qq >/dev/null && \
+      apt-get install -y -qq cmake gcc g++ make perl pkg-config >/dev/null && \
+      cargo build --release -p mqttd' 
+  cp "$REPO_ROOT/target/smoke-linux/release/mqttd" "$REPO_ROOT/dist-smoke-mqttd"
+else
+  cargo build --release -p mqttd --manifest-path "$REPO_ROOT/Cargo.toml"
+  cp "$REPO_ROOT/target/release/mqttd" "$REPO_ROOT/dist-smoke-mqttd"
+fi
 docker build -t "$IMAGE" -f - "$REPO_ROOT" <<'DOCKERFILE'
 FROM debian:stable-slim
 COPY dist-smoke-mqttd /usr/local/bin/mqttd
