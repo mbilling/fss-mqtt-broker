@@ -74,7 +74,13 @@ first page of any incident.
    `minted` + minority id), quarantine its PVC by label (never auto-delete data),
    and re-render its seeds for the ADR 0043 replace motion — the automated form of
    OPERATIONS.md's manual recovery. Gossip-level containment (ADR 0054 T2) means the
-   fence is cleanup, not the safety mechanism.
+   fence is cleanup, not the safety mechanism. **The fence fires at most once per
+   node** (T7 amendment): the fenced pod returns with the same volume, still holding
+   the divergent state, so it re-founds and reads as split-brained again. Re-killing
+   it fixes nothing — only the documented manual wipe does — and it *hides* the
+   incident, because each delete removes the divergent pod from the observation and
+   drops `SplitBrain` back to False within milliseconds. An already-quarantined PVC
+   therefore suppresses further fencing and the condition stays raised.
 2. **Brownout**: `mqttd_brownout == 1` or utilization past a threshold sets the
    condition + Event; with `ExpandPVC` and an expansion-capable StorageClass, patch
    PVC sizes (bounded by `expansion.maxSize`) and raise `store_max_bytes`
@@ -107,8 +113,13 @@ Reconcile logic unit-tested against a mocked API server; the **render-parity** g
 per PR; a nightly **kind e2e**: install operator → apply `MqttdCluster` → cluster
 forms → scale up/down (drain asserted) → roll (no drain) → induced split-brain
 (founder PVC wipe) detected, and fenced when `Fence` is set — the ADR 0054 signals
-asserted end to end. The acked-facts oracle remains the broker suites' job; the
-operator e2e asserts orchestration, not message durability.
+asserted end to end. *T7 status:* create, roll-without-fence, and split-brain
+detect-and-fence are asserted; the **scale cycle is written but withheld** — it
+reproduced a broker-side membership flap after any roll (issue #92) that leaves a
+pod NotReady forever, so asserting it now would only pin a red nightly job to a
+defect outside the operator. It is restored with that fix. The acked-facts oracle
+remains the broker suites' job; the operator e2e asserts orchestration, not message
+durability.
 
 ## Alternatives considered
 

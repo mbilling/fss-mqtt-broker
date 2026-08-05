@@ -79,6 +79,15 @@ spec:
                 -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
                 -e "s/__READY_MIN__/${READY_MIN}/g" \
                 /tmpl/mqttd.toml.tmpl > /config/mqttd.toml
+              # A short write — e.g. a full ephemeral-storage volume — leaves sed exit 0 with a
+              # 0-byte file, and the broker then boots on pure DEFAULTS (no listeners, node id
+              # "node-local"): alive as a process, bound to nothing. An empty render is never a
+              # valid config, so fail the init container loudly instead of starting a broker
+              # that can only fail its probes.
+              if [ ! -s /config/mqttd.toml ]; then
+                echo "FATAL: rendered config is empty — is /config out of space?" >&2
+                exit 1
+              fi
               echo "rendered config for ${POD_NAME} (ordinal ${ORD}):"
               cat /config/mqttd.toml
           env:
