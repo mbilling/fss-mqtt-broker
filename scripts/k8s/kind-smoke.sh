@@ -48,19 +48,32 @@ cleanup() { kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
 trap 'rc=$?; if [ $rc -ne 0 ]; then dump; fi; cleanup; exit $rc' EXIT
 
 # A throwaway mosquitto client pod runs pub/sub against the client Service.
-mqtt() { # mqtt <pub|sub> <args...>
+#
+# NEVER use `kubectl run -i` here. `-i` attaches to the container, and a client
+# that finishes BEFORE the attach completes has its output dropped on the floor
+# ("couldn't attach …: container not found in pod", then a fallback log stream
+# that has already missed the write). A fast retained replay loses that race
+# routinely — observed 3/6 on an arm64 Docker Desktop VM against a cluster that
+# was demonstrably serving the value every time (issue #86). Instead: run the pod
+# to completion, then read its logs. Deterministic, attach-free, same cost.
+mqtt() { # mqtt <pub|sub> <args...> — returns the client's stdout
   local verb="$1"; shift
-  kubectl -n "$NS" run "mqtt-$verb-$RANDOM" --rm -i --restart=Never \
-    --image=eclipse-mosquitto:2 --command -- "mosquitto_$verb" "$@" 2>/dev/null
+  local pod="mqtt-$verb-$RANDOM"
+  kubectl -n "$NS" run "$pod" --restart=Never --image=eclipse-mosquitto:2 \
+    --command -- "mosquitto_$verb" "$@" >/dev/null 2>&1
+  # Wait for the client to finish (either outcome is fine — a `sub` that times
+  # out without a message exits non-zero and its logs are simply empty).
+  kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$pod" \
+    --timeout=60s >/dev/null 2>&1 ||
+    kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Failed "pod/$pod" \
+      --timeout=5s >/dev/null 2>&1 || true
+  kubectl -n "$NS" logs "$pod" 2>/dev/null || true
+  kubectl -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
 }
 
-# Read one retained message from a topic and return ONLY the payload. `kubectl run
-# --rm` prints a `pod "…" deleted …` cleanup notice to stdout after the pod's own
-# output, so strip that line (by line, not `head -1`, to avoid a SIGPIPE that could
-# abort the --rm cleanup and leak the throwaway pod), then drop line endings.
+# Read one retained message from a topic and return ONLY the payload.
 mqtt_read() { # mqtt_read <topic>
-  mqtt sub -h "$RELEASE-mqttd.$NS.svc" -t "$1" -C 1 -W 15 \
-    | sed -E '/^pod "[^"]*" deleted/d' | tr -d '\r\n'
+  mqtt sub -h "$RELEASE-mqttd.$NS.svc" -t "$1" -C 1 -W 15 | tr -d '\r\n'
 }
 
 log "Build broker + test image ($IMAGE)"
