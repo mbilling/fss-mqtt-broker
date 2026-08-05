@@ -9,11 +9,15 @@
 //!
 //! Landed so far: the CRD types (schema golden-tested against the committed
 //! manifest), the reconcile skeleton (observe + status stamp), a Lease-based
-//! leader gate (T1), and [`render`] — the chart's object set produced from a CR,
-//! held identical to `helm template` by the CI render-parity gate (T2).
-//! Observed-state aggregation and the remediations land as 0055-T3..T6.
+//! leader gate (T1), [`render`] — the chart's object set produced from a CR, held
+//! identical to `helm template` by the CI render-parity gate (T2) — and
+//! [`probe`]/[`observe`], which read every broker's `/statusz` and aggregate it
+//! into the CR's status, conditions, and Events (T3, alert-only). The opt-in
+//! remediations land as 0055-T4..T6.
 
 pub mod controller;
 pub mod crd;
 pub mod leader;
+pub mod observe;
+pub mod probe;
 pub mod render;

@@ -2042,6 +2042,7 @@ dependencies = [
  "futures-util",
  "k8s-openapi",
  "kube",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
