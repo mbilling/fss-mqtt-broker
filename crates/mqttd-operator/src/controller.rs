@@ -1,22 +1,28 @@
-//! The reconcile loop (0055-T1 skeleton: observe + status stamp).
+//! The reconcile loop (ADR 0055 T3: observe → status/conditions/Events).
 //!
-//! T1 deliberately performs **no mutations beyond the CR's own status**: it
-//! watches `MqttdCluster` resources, stamps `observedGeneration`, and sets a
-//! `Reconciled` condition — proving the watch → reconcile → status machinery
-//! end to end before any resource rendering (T2) or remediation (T4) exists.
+//! T3 is deliberately **alert-only**: the reconciler reads every broker's
+//! `/statusz`, aggregates it ([`crate::observe`]), writes the verdict to the CR's
+//! status, and raises Events — but changes nothing in the cluster. Rendering the
+//! owned objects (T2's [`crate::render`]) is applied in T4 alongside the opt-in
+//! remediations, so an operator installed today is a *reporter*: exactly as
+//! conservative as having no operator, which is the ADR 0055 default posture.
 
-use crate::crd::{MqttdCluster, MqttdClusterStatus, StatusCondition};
+use crate::crd::MqttdCluster;
+use crate::observe::observe;
+use crate::probe::probe_all;
 use futures_util::StreamExt;
-use kube::api::{Api, Patch, PatchParams};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::runtime::watcher;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// How long to wait before re-reconciling a healthy resource.
-const REQUEUE: Duration = Duration::from_secs(60);
+/// How long to wait before re-observing a healthy resource.
+const REQUEUE: Duration = Duration::from_secs(30);
 /// Backoff after a reconcile error.
 const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 /// The field-manager name for server-side apply patches.
@@ -35,6 +41,10 @@ pub enum Error {
 pub struct Context {
     /// The Kubernetes client.
     pub client: Client,
+    /// HTTP client for `/statusz` probes.
+    pub http: reqwest::Client,
+    /// Event reporter identity.
+    pub reporter: Reporter,
 }
 
 impl std::fmt::Debug for Context {
@@ -43,38 +53,69 @@ impl std::fmt::Debug for Context {
     }
 }
 
-/// One reconciliation: stamp `observedGeneration` + the `Reconciled` condition.
+/// The pods belonging to `cr`, as `(name, ip)` — pods without an IP yet are
+/// skipped here and surface as absent evidence in the aggregate.
+async fn cluster_pods(client: &Client, cr: &MqttdCluster) -> Result<Vec<(String, String)>, Error> {
+    let ns = cr.namespace().unwrap_or_else(|| "default".into());
+    let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let selector = format!(
+        "app.kubernetes.io/name=mqttd,app.kubernetes.io/instance={}",
+        cr.name_any()
+    );
+    let pods = api.list(&ListParams::default().labels(&selector)).await?;
+    Ok(pods
+        .into_iter()
+        .filter_map(|p| {
+            let name = p.name_any();
+            p.status.and_then(|s| s.pod_ip).map(|ip| (name, ip))
+        })
+        .collect())
+}
+
+/// One reconciliation: observe every pod, patch the verdict, raise Events.
 ///
 /// # Errors
-/// [`Error::Kube`] if the status patch is rejected.
+/// [`Error::Kube`] if listing pods or patching the status is rejected.
 pub async fn reconcile(obj: Arc<MqttdCluster>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = obj.namespace().unwrap_or_else(|| "default".into());
     let name = obj.name_any();
     let api: Api<MqttdCluster> = Api::namespaced(ctx.client.clone(), &ns);
 
-    let status = MqttdClusterStatus {
-        phase: Some("Pending".into()),
-        observed_generation: obj.metadata.generation,
-        conditions: vec![StatusCondition {
-            r#type: "Reconciled".into(),
-            status: "True".into(),
-            reason: Some("Scaffold".into()),
-            message: Some(
-                "observed by the 0055-T1 scaffold; resource rendering lands in 0055-T2".into(),
-            ),
-            last_transition_time: None,
-        }],
-        ..MqttdClusterStatus::default()
-    };
+    let pods = cluster_pods(&ctx.client, &obj).await?;
+    let probes = probe_all(&ctx.http, &pods).await;
+    let observation = observe(&probes, obj.spec.replicas, obj.metadata.generation);
+
     let patch = serde_json::json!({
         "apiVersion": "mqttd.io/v1alpha1",
         "kind": "MqttdCluster",
-        "status": status,
+        "status": observation.status,
     });
     api.patch_status(&name, &PatchParams::apply(MANAGER), &Patch::Merge(&patch))
         .await?;
-    info!(namespace = %ns, resource = %name, generation = ?obj.metadata.generation,
-        "reconciled (scaffold: status stamped)");
+
+    // Events make an incident visible in `kubectl describe` without diffing status.
+    if !observation.events.is_empty() {
+        let recorder = Recorder::new(ctx.client.clone(), ctx.reporter.clone());
+        for (reason, note) in &observation.events {
+            let ev = Event {
+                type_: EventType::Warning,
+                reason: reason.clone(),
+                note: Some(note.clone()),
+                action: "Observed".into(),
+                secondary: None,
+            };
+            if let Err(e) = recorder.publish(&ev, &obj.object_ref(&())).await {
+                warn!(error = %e, "failed to publish event");
+            }
+        }
+    }
+
+    info!(
+        namespace = %ns, resource = %name,
+        phase = observation.status.phase.as_deref().unwrap_or("?"),
+        pods = pods.len(),
+        "observed"
+    );
     Ok(Action::requeue(REQUEUE))
 }
 
@@ -88,7 +129,11 @@ pub fn error_policy(obj: Arc<MqttdCluster>, err: &Error, _ctx: Arc<Context>) -> 
 /// Run the controller until the watch stream ends.
 pub async fn run(client: Client) {
     let api: Api<MqttdCluster> = Api::all(client.clone());
-    let ctx = Arc::new(Context { client });
+    let ctx = Arc::new(Context {
+        client,
+        http: reqwest::Client::new(),
+        reporter: Reporter::from(MANAGER),
+    });
     Controller::new(api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
