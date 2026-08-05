@@ -99,6 +99,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # This job compiles two crates (mqttd for --check-config, mqttd-operator for
+      # the ADR 0055 T2 render-parity gate) — cache them like the other Rust jobs.
+      - uses: Swatinem/rust-cache@v2
       - name: Install helm
         uses: azure/setup-helm@v4
         with:
@@ -126,6 +129,11 @@ jobs:
             --set replicaCount=1 --set podDisruptionBudget.enabled=false \
             --set persistence.enabled=false | \
             kubeconform -strict -summary -ignore-missing-schemas -schema-location default
+      # ADR 0055 T2: the operator and the chart must render the SAME objects. Two
+      # supported deployment paths that disagree are worse than one, so this diffs
+      # them for equivalent inputs and fails on any load-bearing divergence.
+      - name: Render parity (operator vs chart)
+        run: ./scripts/k8s/render-parity.sh
       # The rendered per-pod config template must itself be valid input to --check-config once its
       # placeholders are filled — a quick shell-level render mirrors the init container.
       - name: Rendered config is check-config-valid

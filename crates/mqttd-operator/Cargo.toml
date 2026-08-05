@@ -13,6 +13,9 @@ kube = { version = "4", default-features = false, features = ["client", "runtime
 k8s-openapi = { version = "0.28", features = ["latest"] }
 # JSON Schema derivation for the CRD's openAPIV3Schema (kube derive requirement).
 schemars = "1"
+# The config checksum behind the pod roll-on-change annotation; the workspace
+# crypto provider (ADR 0053), already in the tree.
+aws-lc-rs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
