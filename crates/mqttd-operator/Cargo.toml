@@ -3,7 +3,12 @@ name = "mqttd-operator"
 description = "Kubernetes operator for mqttd clusters (ADR 0055): MqttdCluster CRD + reconciler"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# HIGHER than the workspace floor on purpose: kube 4.2 requires 1.89. The
+# BROKER's MSRV is a user-facing promise (people compile mqttd); the operator is
+# a separate deliverable shipped as an image, so it carries its own floor rather
+# than dragging the broker's up. `cargo +<workspace-msrv> check --workspace
+# --exclude mqttd-operator` keeps the broker's promise honest.
+rust-version = "1.89"
 license.workspace = true
 
 [dependencies]

@@ -62,7 +62,7 @@
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [4/4 done](0054-operator-facing-state-surface.md) | — |
-| [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [3/8 done](0055-kubernetes-operator.md) | 5 open |
+| [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [4/8 done](0055-kubernetes-operator.md) | 4 open |
 
 ## Open and deferred work
 
@@ -151,7 +151,6 @@
 
 **0055 — The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller)**
 
-- `0055-T4` ⬜ planned: Opt-in remediations — splitBrain Fence (delete new-founder pod, quarantine PVC by label, seeds-override recovery), brownout ExpandPVC (bounded by expansion.maxSize, watermark raised via config roll), founder-PVC-loss guard before pod-0 recreation
 - `0055-T5` ⬜ planned: Unattended gossip key rotation — three key_accept phases as Secret/config rolls, each gated on swim_keys_accepted returning to 1 and config checksum convergence
 - `0055-T6` ⬜ planned: Drain-aware rolls — operator-set annotation via Downward API consulted by preStop (hook shipped identically in chart and operator paths); shrink = full drain, roll = rejoin-and-catch-up
 - `0055-T7` ⬜ planned: Nightly kind e2e — install operator, apply CR, cluster forms, scale up/down with drain assertion, roll without drain, induced split-brain (founder PVC wipe) detected and fenced under Fence
