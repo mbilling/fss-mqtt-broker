@@ -179,3 +179,47 @@ delivered):
 - **Make recovery tolerate a bad replica set (retry / shrink quorum).** Retrying against a
   set with no live quorum cannot succeed, and shrinking the quorum breaks the safety
   (intersection) property. Membership must be correct; recovery must not paper over it.
+
+## Amendment (2026-08-05): claims are scoped to a process GENERATION (issue #92)
+
+§1 assumed one sentence too many: *"A node that genuinely restarts rejoins after the
+tombstone is pruned … it does not need to out-race stale gossip."* It does, and on
+Kubernetes it loses that race every time.
+
+A `Dead` claim never drains, because **applying one re-gossips it** — each node that
+accepts the claim re-arms its own dissemination of it. Meanwhile a restarted process
+has no memory of its incarnation, so it re-enters at the bottom of the range, where
+`Dead` outranks `Alive` at equal incarnation. The tombstone is pruned after
+`DEAD_TTL`, the node rejoins, the still-circulating claim kills it again, and the
+cycle repeats at exactly the `DEAD_TTL` period — indefinitely. Downstream, every
+`Dead` transition drops the peer link and its routing state, so the durable lease
+group never elects a leader and the affected pod stays NotReady for good. A rolling
+restart, the most routine operation there is, silently left a three-node cluster
+running on two. Found by the ADR 0055 T7 operator e2e; the existing kind smoke
+missed it because it asserts immediately after the roll and the flap needs ~30 s.
+
+**Membership claims now carry the subject's process `generation`** — a monotonic
+per-start token (the broker uses wall-clock ms at start; the state machine takes it
+as a parameter and stays clock-free). Ordering is `generation`, then incarnation,
+then state precedence:
+
+- a claim at a **lower** generation is about a previous life and is discarded
+  outright — it can no longer resurrect, re-kill, or downgrade the current process;
+- a claim at a **higher** generation supersedes everything held about the older
+  life, **including its tombstone** — a restart is not a resurrection, and fencing
+  one out is precisely what left a rolled pod dead;
+- at the **same** generation, every rule in §1 applies unchanged.
+
+So the anti-resurrection guarantee is kept exactly where it was aimed: a dead
+process's own in-flight refutation carries that same generation and is still fenced.
+What it no longer does is fence out the node's *next life*.
+
+Two adjacent defects, found in the same investigation and fixed with it: an address
+change that did not alter state raised no membership event (so a dialer kept the
+address it was spawned with for the life of the process), and a peer first seen
+through relayed gossip without a routing address was dropped permanently rather than
+picked up when the address arrived.
+
+Wire: `Update.generation` and `Message.from_generation` are appended fields — a
+pre-1.0 reshape under ADR 0039, same clean-break rules as ADR 0052 and the
+`cluster_id` field before them, so `BASELINE_REF` moves with it.

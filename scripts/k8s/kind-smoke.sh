@@ -142,4 +142,22 @@ got3="$(mqtt_read smoke/state)"
 [ "$got3" = "hello-v1" ] || { echo "FAIL: retained state lost across rolling restart"; exit 1; }
 echo "retained state survived rolling restart: '$got3'"
 
-log "SMOKE PASSED: cluster formed, drained on scale-down, and survived a quorum-safe roll"
+# The roll must still hold a minute LATER (issue #92). `rollout status` returns the
+# instant every pod is Ready, and this smoke used to read its value and tear the
+# cluster down right then — which is why it stayed green through a bug that left a
+# rolled pod NotReady forever: a stale Dead claim about the pod's previous life
+# re-killed it ~30s after the roll (dead_ttl_ms), every time.
+log "Post-roll stability — every pod must STILL be Ready after the membership settles"
+sleep 90
+not_ready="$(kubectl -n "$NS" get pods -l "app.kubernetes.io/name=mqttd" \
+  -o 'jsonpath={range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}')"
+case "$not_ready" in
+  *=False*|*=Unknown*)
+    kubectl -n "$NS" get pods
+    echo "FAIL: a pod fell out of Ready after the roll settled: $not_ready"
+    exit 1
+    ;;
+esac
+echo "all pods still Ready 90s after the roll: $not_ready"
+
+log "SMOKE PASSED: cluster formed, drained on scale-down, and survived a quorum-safe roll that STAYED healthy"

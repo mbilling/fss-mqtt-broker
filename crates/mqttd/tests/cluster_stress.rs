@@ -386,6 +386,7 @@ async fn start_stress_node_in_zone(
         swim_addr.clone(),
         relay_addr,
         zone.map(str::to_string),
+        1,
         swim_cfg(),
         swim_seeds,
     );

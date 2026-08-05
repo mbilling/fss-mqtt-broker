@@ -117,6 +117,7 @@ impl Sim {
                 a.clone(),
                 format!("{a}-peer"),
                 None,
+                1,
                 cfg.clone(),
                 seeds,
             ));
@@ -219,6 +220,28 @@ impl Sim {
         self.up[i] = false;
     }
 
+    /// Restart a killed node's PROCESS under the SAME id and address — what a
+    /// Kubernetes pod restart is (issue #92). A fresh `Swim` means a fresh
+    /// incarnation counter, and a strictly greater generation is what tells peers
+    /// this is a new life rather than the corpse they just buried.
+    fn restart(&mut self, i: usize, generation: u64) {
+        let a = format!("n{i}:7946");
+        let seeds: Vec<String> = (0..self.n())
+            .filter(|&j| j != i)
+            .map(|j| format!("n{j}:7946"))
+            .collect();
+        self.nodes[i] = Swim::new(
+            NodeId(format!("n{i}")),
+            a.clone(),
+            format!("{a}-peer"),
+            None,
+            generation,
+            sim_cfg(),
+            seeds,
+        );
+        self.up[i] = true;
+    }
+
     /// Every up node sees every *other* up node as `Alive`.
     fn fully_converged(&self) -> bool {
         for i in 0..self.n() {
@@ -319,6 +342,56 @@ fn a_stopped_node_is_detected_as_dead_by_every_survivor() {
             "seed {seed}: a crashed node was not detected dead by all survivors \
              (re-run with REPRO_SEED = Some({seed}))"
         );
+    }
+}
+
+/// A node that is killed, detected `Dead`, and then RESTARTED under the same id
+/// must rejoin and STAY joined — asserted well past `dead_ttl_ms`, so a tombstone
+/// prune that lets it back in only to have it evicted again would fail here.
+///
+/// Scope, honestly: this closes the harness's standing gap — no scenario ever
+/// restarted a node under an id it had already used — but it is NOT the reproducer
+/// for issue #92 and does not fail against the pre-fix build. That loop needed a
+/// `Dead` claim still circulating at the moment the tombstone pruned, which in
+/// production is fed by `Join` -> `gossip_full_state` re-broadcasting a `Dead` the
+/// responder still holds; five sim nodes on a reliable network drain their gossip
+/// before the prune and rejoin cleanly. The deterministic reproduction lives in
+/// `swim::tests::a_restarted_node_is_not_re_killed_by_its_previous_lifes_dead_claim`,
+/// and the end-to-end guard is the kind smoke's post-roll stability gate.
+#[test]
+fn a_restarted_node_rejoins_and_stays_alive() {
+    for seed in seeds() {
+        let mut sim = Sim::new(5, RELIABLE, seed);
+        assert!(
+            sim.run_until(20, 800, Sim::fully_converged),
+            "seed {seed}: precondition (converge) failed"
+        );
+        sim.kill(3);
+        assert!(
+            sim.run_until(20, 1500, |s| s.all_see_dead(3)),
+            "seed {seed}: precondition (detect the crash) failed"
+        );
+
+        // The pod comes back: same id, same address, new process.
+        sim.restart(3, 2);
+        assert!(
+            sim.run_until(20, 4000, Sim::fully_converged),
+            "seed {seed}: a restarted node never rejoined \
+             (re-run with REPRO_SEED = Some({seed}))"
+        );
+
+        // And it must STILL be joined well past the tombstone TTL, by when any
+        // stale claim about its previous life has had every chance to come back
+        // around. This is the assertion the old CI never made.
+        for _ in 0..600 {
+            sim.step(20);
+            assert!(
+                sim.fully_converged(),
+                "seed {seed}: the restarted node was evicted again after rejoining — \
+                 a claim about its previous life is still killing it \
+                 (re-run with REPRO_SEED = Some({seed}))"
+            );
+        }
     }
 }
 
