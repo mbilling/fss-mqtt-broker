@@ -17,7 +17,9 @@ deny = [
     # (`cargo tree -i ring` prints nothing), but Cargo.lock records optional
     # dependencies regardless of features, so the two crates whose *disabled*
     # ring features leave a phantom lock entry are wrapped; any other consumer
-    # trips the ban.
+    # trips the ban. A wrapper may report "unmatched" when feature resolution
+    # prunes that edge from cargo-deny's graph — a tolerated warning, kept so a
+    # future resolution shift cannot flap the ban.
     { name = "ring", wrappers = ["quinn-proto", "rustls-webpki"] },
 ]
 # Internal workspace crates are version-less `path` dependencies, which cargo-deny
