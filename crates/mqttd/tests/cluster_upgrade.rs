@@ -35,13 +35,13 @@ use proc_common::{
     build_topology, establish_subscribers, oracle_acked_facts, proc_over, wait_all_ready,
 };
 
-/// The pinned baseline: the ADR 0054-T2 cluster-identity merge — the oldest
-/// ref a HEAD build can interoperate with: T2 appended the `cluster_id` field
-/// to the SWIM datagram (a disclosed pre-1.0 wire reshape under ADR 0039, like
-/// ADR 0052's before it), so pre-T2 builds cannot decode HEAD gossip. Bump
-/// DELIBERATELY, together with any pre-1.0 wire/schema reshape — and bump this
-/// comment's story with it.
-const BASELINE_REF: &str = "f75683a0f28e69d34b1ebeb2b214cb9312349f9f";
+/// The pinned baseline: the issue #92 generation merge — the oldest ref a HEAD
+/// build can interoperate with. #92 appended `generation` to every membership
+/// `Update` and `from_generation` to the SWIM datagram (a disclosed pre-1.0 wire
+/// reshape under ADR 0039, like ADR 0054-T2's `cluster_id` and ADR 0052's before
+/// it), so pre-#92 builds cannot decode HEAD gossip. Bump DELIBERATELY, together
+/// with any pre-1.0 wire/schema reshape — and bump this comment's story with it.
+const BASELINE_REF: &str = "e39b6e139578c9605d39cea9f406b3b7e182a53c";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
