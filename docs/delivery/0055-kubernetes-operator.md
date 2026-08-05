@@ -1,11 +1,14 @@
 ---
 adr: "0055"
 title: "The mqttd Kubernetes operator (MqttdCluster CRD, kube-rs controller)"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0055-T1
     title: Scaffold — crates/mqttd-operator (kube-rs, leader election, reconcile loop skeleton), MqttdCluster v1alpha1 spec/status schema (CRD YAML generated from Rust types), CI wiring (build/test/clippy/deny + CRD schema validated in the helm job)
-    status: planned
+    status: done
+    date: 2026-08-05
+    evidence: "crates/mqttd-operator: kube 4 / k8s-openapi 0.28 (jiff time), rustls-tls (single stack, ring ban still holds — cargo tree -i ring empty, deny all four gates ok with the kube tree); MqttdCluster v1alpha1 spec/status with alert-only remediation defaults (unit-tested), printcolumns, shortname mqc; CRD manifest generated as JSON (deploy/crds/, kubectl-appliable, avoids the unmaintained serde_yaml) and golden-tested against the Rust types (regenerate: cargo run -p mqttd-operator --bin gen_crd); reconcile skeleton stamps observedGeneration + Reconciled condition via patch_status; Lease-based leader gate (coordination.k8s.io, no third-party election crate). CI = workspace membership (fmt/clippy/deny/test) + the golden test; kubeconform lacks a CRD meta-schema, so live validation is the T7 kind e2e's kubectl apply. NOTE deviation from the T1 title: CRD committed as JSON not YAML, and the helm-job kubeconform idea replaced by the golden test — both recorded here"
+
   - id: 0055-T2
     title: Resource rendering with render-parity — operator renders StatefulSet/Services/ConfigMap/PDB from the CR; CI diffs against helm template for equivalent inputs so chart and operator cannot drift
     status: planned
@@ -40,7 +43,7 @@ fully-supported no-operator path, pinned to the operator by a render-parity test
 <!-- status-table:0055 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0055-T1 | ⬜ planned | — |  |
+| 0055-T1 | ✅ done | 2026-08-05 | "crates/mqttd-operator: kube 4 / k8s-openapi 0.28 (jiff time), rustls-tls (single stack, ring ban still holds — cargo tree -i ring empty, deny all four gates ok with the kube tree); MqttdCluster v1alpha1 spec/status with alert-only remediation defaults (unit-tested), printcolumns, shortname mqc; CRD manifest generated as JSON (deploy/crds/, kubectl-appliable, avoids the unmaintained serde_yaml) and golden-tested against the Rust types (regenerate: cargo run -p mqttd-operator --bin gen_crd); reconcile skeleton stamps observedGeneration + Reconciled condition via patch_status; Lease-based leader gate (coordination.k8s.io, no third-party election crate). CI = workspace membership (fmt/clippy/deny/test) + the golden test; kubeconform lacks a CRD meta-schema, so live validation is the T7 kind e2e's kubectl apply. NOTE deviation from the T1 title: CRD committed as JSON not YAML, and the helm-job kubeconform idea replaced by the golden test — both recorded here" |
 | 0055-T2 | ⬜ planned | — |  |
 | 0055-T3 | ⬜ planned | — |  |
 | 0055-T4 | ⬜ planned | — |  |

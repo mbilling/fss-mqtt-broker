@@ -1,7 +1,7 @@
 # ADR 0055 — The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller)
 
-- **Status:** Proposed
-- **Date:** 2026-08-05
+- **Status:** Accepted
+- **Date:** 2026-08-05 (accepted 2026-08-05 — the maintainer started implementation)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0055-kubernetes-operator.md](../delivery/0055-kubernetes-operator.md) — plan, progress, and changelog
 - **Related:** [ADR 0047](0047-kubernetes-deployment.md) (the chart whose contracts this
