@@ -62,6 +62,7 @@
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [4/4 done](0054-operator-facing-state-surface.md) | — |
+| [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Proposed | [0/8 done](0055-kubernetes-operator.md) | 8 open |
 
 ## Open and deferred work
 
@@ -147,3 +148,14 @@
 **0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
 
 - `0053-T5` ⬜ planned: FIPS-mode evaluation (aws-lc-rs fips feature — the ADR 0002 certified-builds line) and rcgen 0.13→0.14 Issuer migration
+
+**0055 — The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller)**
+
+- `0055-T1` ⬜ planned: Scaffold — crates/mqttd-operator (kube-rs, leader election, reconcile loop skeleton), MqttdCluster v1alpha1 spec/status schema (CRD YAML generated from Rust types), CI wiring (build/test/clippy/deny + CRD schema validated in the helm job)
+- `0055-T2` ⬜ planned: Resource rendering with render-parity — operator renders StatefulSet/Services/ConfigMap/PDB from the CR; CI diffs against helm template for equivalent inputs so chart and operator cannot drift
+- `0055-T3` ⬜ planned: Observed state — /statusz + metrics polling into CR status (phase, members, clusterId, brownout, decommission) and conditions (SplitBrain, Converged, RotationInProgress) + Events; alert-only detection for split-brain and brownout
+- `0055-T4` ⬜ planned: Opt-in remediations — splitBrain Fence (delete new-founder pod, quarantine PVC by label, seeds-override recovery), brownout ExpandPVC (bounded by expansion.maxSize, watermark raised via config roll), founder-PVC-loss guard before pod-0 recreation
+- `0055-T5` ⬜ planned: Unattended gossip key rotation — three key_accept phases as Secret/config rolls, each gated on swim_keys_accepted returning to 1 and config checksum convergence
+- `0055-T6` ⬜ planned: Drain-aware rolls — operator-set annotation via Downward API consulted by preStop (hook shipped identically in chart and operator paths); shrink = full drain, roll = rejoin-and-catch-up
+- `0055-T7` ⬜ planned: Nightly kind e2e — install operator, apply CR, cluster forms, scale up/down with drain assertion, roll without drain, induced split-brain (founder PVC wipe) detected and fenced under Fence
+- `0055-T8` ⬜ planned: Packaging + docs — deploy/helm/mqttd-operator chart (Deployment + CRD + namespaced RBAC), operator image in the ADR 0045 release pipeline (signed/reproducible/SBOM), OPERATIONS.md operator mode, COMPARISON.md Kubernetes cell update
