@@ -62,7 +62,7 @@
 | [0052](../adr/0052-codec-succession.md) | Codec succession: postcard replaces bincode on every cluster surface | Accepted | [3/4 done](0052-codec-succession.md) | 1 open |
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [4/4 done](0054-operator-facing-state-surface.md) | — |
-| [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [1/8 done](0055-kubernetes-operator.md) | 7 open |
+| [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [2/8 done](0055-kubernetes-operator.md) | 6 open |
 
 ## Open and deferred work
 
@@ -151,7 +151,6 @@
 
 **0055 — The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller)**
 
-- `0055-T2` ⬜ planned: Resource rendering with render-parity — operator renders StatefulSet/Services/ConfigMap/PDB from the CR; CI diffs against helm template for equivalent inputs so chart and operator cannot drift
 - `0055-T3` ⬜ planned: Observed state — /statusz + metrics polling into CR status (phase, members, clusterId, brownout, decommission) and conditions (SplitBrain, Converged, RotationInProgress) + Events; alert-only detection for split-brain and brownout
 - `0055-T4` ⬜ planned: Opt-in remediations — splitBrain Fence (delete new-founder pod, quarantine PVC by label, seeds-override recovery), brownout ExpandPVC (bounded by expansion.maxSize, watermark raised via config roll), founder-PVC-loss guard before pod-0 recreation
 - `0055-T5` ⬜ planned: Unattended gossip key rotation — three key_accept phases as Secret/config rolls, each gated on swim_keys_accepted returning to 1 and config checksum convergence

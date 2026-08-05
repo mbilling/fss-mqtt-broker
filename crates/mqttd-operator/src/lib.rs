@@ -7,11 +7,13 @@
 //! surface on the broker, never reads secret material, and every destructive
 //! remediation is opt-in with Alert-only defaults.
 //!
-//! This crate is the 0055-T1 scaffold: the CRD types (schema golden-tested
-//! against the committed manifest), the reconcile skeleton (observe + status
-//! stamp), and a Lease-based leader gate. Rendering parity, observed-state
-//! aggregation, and the remediations land as 0055-T2..T6.
+//! Landed so far: the CRD types (schema golden-tested against the committed
+//! manifest), the reconcile skeleton (observe + status stamp), a Lease-based
+//! leader gate (T1), and [`render`] — the chart's object set produced from a CR,
+//! held identical to `helm template` by the CI render-parity gate (T2).
+//! Observed-state aggregation and the remediations land as 0055-T3..T6.
 
 pub mod controller;
 pub mod crd;
 pub mod leader;
+pub mod render;

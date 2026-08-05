@@ -2038,6 +2038,7 @@ dependencies = [
 name = "mqttd-operator"
 version = "0.9.0"
 dependencies = [
+ "aws-lc-rs",
  "futures-util",
  "k8s-openapi",
  "kube",
