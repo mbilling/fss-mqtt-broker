@@ -13,11 +13,13 @@
 //! identical to `helm template` by the CI render-parity gate (T2) — and
 //! [`probe`]/[`observe`], which read every broker's `/statusz` and aggregate it
 //! into the CR's status, conditions, and Events (T3, alert-only). The opt-in
-//! remediations land as 0055-T4..T6.
+//! remediations land as 0055-T5..T6; [`remediate`] carries T4's opt-in fence and
+//! storage expansion (planning is pure and guarded; nothing acts by default).
 
 pub mod controller;
 pub mod crd;
 pub mod leader;
 pub mod observe;
 pub mod probe;
+pub mod remediate;
 pub mod render;

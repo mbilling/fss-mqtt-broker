@@ -1,11 +1,13 @@
 //! The reconcile loop (ADR 0055 T3: observe → status/conditions/Events).
 //!
-//! T3 is deliberately **alert-only**: the reconciler reads every broker's
-//! `/statusz`, aggregates it ([`crate::observe`]), writes the verdict to the CR's
-//! status, and raises Events — but changes nothing in the cluster. Rendering the
-//! owned objects (T2's [`crate::render`]) is applied in T4 alongside the opt-in
-//! remediations, so an operator installed today is a *reporter*: exactly as
-//! conservative as having no operator, which is the ADR 0055 default posture.
+//! The reconciler reads every broker's `/statusz`, aggregates it
+//! ([`crate::observe`]), writes the verdict to the CR's status, raises Events —
+//! and then, **only if the CR opted in**, carries out a remediation
+//! ([`crate::remediate`], T4). With the default spec both switches are `Alert`,
+//! so an operator installed today is a *reporter*: exactly as conservative as
+//! having no operator, which is the ADR 0055 default posture. (Applying the
+//! rendered objects of T2's [`crate::render`] lands with the ownership work; T4
+//! acts only on pods and PVCs it was explicitly asked to remediate.)
 
 use crate::crd::MqttdCluster;
 use crate::observe::observe;
@@ -110,10 +112,37 @@ pub async fn reconcile(obj: Arc<MqttdCluster>, ctx: Arc<Context>) -> Result<Acti
         }
     }
 
+    // Opt-in remediation (T4). Planning is pure and guarded; with the default
+    // spec this returns nothing at all.
+    let pvc_names: Vec<String> = pods.iter().map(|(pod, _)| format!("data-{pod}")).collect();
+    let planned = crate::remediate::plan(&obj, &probes, &pvc_names);
+    for action in &planned {
+        let (reason, note) = crate::remediate::describe(action);
+        match crate::remediate::execute(&ctx.client, &ns, action).await {
+            Ok(()) => {
+                let recorder = Recorder::new(ctx.client.clone(), ctx.reporter.clone());
+                let ev = Event {
+                    type_: EventType::Warning,
+                    reason,
+                    note: Some(note),
+                    action: "Remediated".into(),
+                    secondary: None,
+                };
+                if let Err(e) = recorder.publish(&ev, &obj.object_ref(&())).await {
+                    warn!(error = %e, "failed to publish remediation event");
+                }
+            }
+            // A refused remediation is reported, never retried in a tight loop:
+            // the next reconcile re-plans from fresh evidence.
+            Err(e) => warn!(error = %e, ?action, "remediation failed"),
+        }
+    }
+
     info!(
         namespace = %ns, resource = %name,
         phase = observation.status.phase.as_deref().unwrap_or("?"),
         pods = pods.len(),
+        remediations = planned.len(),
         "observed"
     );
     Ok(Action::requeue(REQUEUE))
