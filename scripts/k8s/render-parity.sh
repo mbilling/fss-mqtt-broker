@@ -56,14 +56,15 @@ operator_docs = json.load(open(operator_path))
 #    itself. Their VALUES must differ; their presence is not load-bearing.
 #  * metadata.namespace: helm template omits it unless set on the object; the
 #    operator always sets it explicitly from the CR.
-#  * ServiceAccount / ServiceMonitor: chart-optional extras the operator does not
-#    own in T2 (it reuses the SA by name). Compared by presence, not content.
+#  * ServiceMonitor: chart-optional (Prometheus-Operator only), not owned by the
+#    operator. ServiceAccount IS compared — the StatefulSet references it, so an
+#    operator that failed to create one could not start a pod (found by the T7 e2e).
 PROVENANCE = {
     "helm.sh/chart",
     "app.kubernetes.io/managed-by",
     "app.kubernetes.io/version",
 }
-IGNORED_KINDS = {"ServiceAccount", "ServiceMonitor"}
+IGNORED_KINDS = {"ServiceMonitor"}
 
 def strip(node):
     """Recursively drop provenance labels and namespace so the comparison is

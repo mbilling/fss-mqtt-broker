@@ -53,6 +53,15 @@ sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
   -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
   -e "s/__READY_MIN__/${READY_MIN}/g" \
   /tmpl/mqttd.toml.tmpl > /config/mqttd.toml
+# A short write — e.g. a full ephemeral-storage volume — leaves sed exit 0 with a
+# 0-byte file, and the broker then boots on pure DEFAULTS (no listeners, node id
+# "node-local"): alive as a process, bound to nothing. An empty render is never a
+# valid config, so fail the init container loudly instead of starting a broker
+# that can only fail its probes.
+if [ ! -s /config/mqttd.toml ]; then
+  echo "FATAL: rendered config is empty — is /config out of space?" >&2
+  exit 1
+fi
 echo "rendered config for ${POD_NAME} (ordinal ${ORD}):"
 cat /config/mqttd.toml
 "#;
@@ -72,6 +81,10 @@ const DEFAULT_PVC_SIZE: &str = "10Gi";
 /// Every object the operator owns for one `MqttdCluster`.
 #[derive(Debug)]
 pub struct Rendered {
+    /// The pods' `ServiceAccount` — the `StatefulSet` names it, so the operator
+    /// must create it (a `StatefulSet` referencing an absent SA cannot start a
+    /// single pod; the T7 e2e caught exactly that).
+    pub serviceaccount: Value,
     /// The broker `StatefulSet`.
     pub statefulset: Value,
     /// Headless (peer/gossip) then client-facing Service.
@@ -86,7 +99,7 @@ impl Rendered {
     /// Every object as one list, in apply order.
     #[must_use]
     pub fn all(&self) -> Vec<&Value> {
-        let mut v = vec![&self.configmap];
+        let mut v = vec![&self.serviceaccount, &self.configmap];
         v.extend(self.services.iter());
         v.push(&self.pdb);
         v.push(&self.statefulset);
@@ -137,11 +150,24 @@ fn labels(names: &Names) -> Value {
 pub fn render(cr: &MqttdCluster) -> Rendered {
     let names = Names::of(cr);
     Rendered {
+        serviceaccount: serviceaccount(&names),
         configmap: configmap(cr, &names),
         services: vec![headless_service(&names), client_service(&names)],
         pdb: pdb(&names),
         statefulset: statefulset(cr, &names),
     }
+}
+
+fn serviceaccount(names: &Names) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": names.full,
+            "namespace": names.namespace,
+            "labels": labels(names),
+        },
+    })
 }
 
 fn configmap(cr: &MqttdCluster, names: &Names) -> Value {
@@ -438,8 +464,13 @@ mod tests {
         let r = render(&sample());
         assert_eq!(
             r.all().len(),
-            5,
-            "configmap + 2 services + pdb + statefulset"
+            6,
+            "serviceaccount + configmap + 2 services + pdb + statefulset"
+        );
+        assert_eq!(
+            r.serviceaccount["metadata"]["name"],
+            r.statefulset["spec"]["template"]["spec"]["serviceAccountName"],
+            "the StatefulSet must reference an SA the operator actually creates"
         );
         assert_eq!(r.statefulset["metadata"]["name"], "mqttd");
         assert_eq!(r.statefulset["spec"]["serviceName"], "mqttd-headless");

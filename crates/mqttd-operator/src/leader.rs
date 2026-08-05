@@ -91,10 +91,32 @@ fn expired(spec: &k8s_openapi::api::coordination::v1::LeaseSpec) -> bool {
     (now.as_second() - renew.0.as_second()) > duration
 }
 
-/// The current time as an RFC 3339 string the Lease `renewTime` accepts
-/// (second precision is sufficient for a 30 s lease).
+/// The current time as a Kubernetes `MicroTime` string.
+///
+/// The API server parses `Lease.spec.renewTime` as `MicroTime`, which demands
+/// **microsecond** precision — a second-precision RFC 3339 string is rejected
+/// with a 500 ("cannot parse \"Z\" as \".000000\""), the lease is never acquired,
+/// and the operator silently never reconciles. Caught by the T7 e2e; built from
+/// explicit parts rather than a format specifier so the precision is visible.
 fn chrono_now() -> String {
-    k8s_openapi::jiff::Timestamp::now()
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    let now = k8s_openapi::jiff::Timestamp::now();
+    let micros = now.subsec_nanosecond() / 1_000;
+    format!("{}.{micros:06}Z", now.strftime("%Y-%m-%dT%H:%M:%S"))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The Lease timestamp must carry microseconds — the API server rejects
+    /// second precision outright (the bug the T7 e2e found).
+    #[test]
+    fn lease_timestamps_carry_microsecond_precision() {
+        let t = super::chrono_now();
+        assert!(t.ends_with('Z'), "{t}");
+        let frac = t
+            .rsplit_once('.')
+            .map(|(_, f)| f.trim_end_matches('Z'))
+            .expect("a fractional part");
+        assert_eq!(frac.len(), 6, "microsecond precision required, got {t}");
+        assert!(frac.chars().all(|c| c.is_ascii_digit()), "{t}");
+    }
 }

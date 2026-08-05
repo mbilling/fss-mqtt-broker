@@ -21,6 +21,10 @@ schemars = "1"
 # Reading each broker's /statusz over plain HTTP on the ops network (ADR 0054);
 # no TLS features — the health listener is unauthenticated plaintext by design.
 reqwest = { workspace = true }
+# The process-level rustls CryptoProvider must be installed explicitly (ADR 0053:
+# aws-lc-rs everywhere). kube's TLS stack panics at first use without it — a
+# crash-loop the e2e caught and no unit test could.
+rustls = { workspace = true }
 # The config checksum behind the pod roll-on-change annotation; the workspace
 # crypto provider (ADR 0053), already in the tree.
 aws-lc-rs = { workspace = true }

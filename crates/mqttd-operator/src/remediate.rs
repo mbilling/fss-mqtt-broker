@@ -56,10 +56,18 @@ pub enum Action {
 }
 
 /// Decide what (if anything) to do. Pure: no I/O, no clock.
+///
+/// `quarantined` is the set of PVCs the operator has ALREADY fenced; a node is
+/// fenced once and only once (see [`plan_fence`]).
 #[must_use]
-pub fn plan(cr: &MqttdCluster, probes: &[PodProbe], pvcs: &[String]) -> Vec<Action> {
+pub fn plan(
+    cr: &MqttdCluster,
+    probes: &[PodProbe],
+    pvcs: &[String],
+    quarantined: &[String],
+) -> Vec<Action> {
     let mut actions = Vec::new();
-    if let Some(fence) = plan_fence(cr, probes) {
+    if let Some(fence) = plan_fence(cr, probes, quarantined) {
         // One destructive act per reconcile: a fence changes the very evidence
         // an expansion decision would rest on.
         return vec![fence];
@@ -72,7 +80,17 @@ pub fn plan(cr: &MqttdCluster, probes: &[PodProbe], pvcs: &[String]) -> Vec<Acti
 
 /// The split-brain fence, with every guard that keeps it from firing on a
 /// healthy fleet.
-fn plan_fence(cr: &MqttdCluster, probes: &[PodProbe]) -> Option<Action> {
+///
+/// Fires AT MOST ONCE per node. A fenced pod comes straight back — its volume is
+/// still there, still holding the divergent state — so it re-founds and is seen
+/// as split-brained again on the next pass. Re-killing it fixes nothing (only the
+/// documented manual wipe does), and it actively HARMS the incident: each delete
+/// removes the divergent pod from the observation, so the `SplitBrain` condition
+/// drops back to False within milliseconds and no alert or human ever sees it.
+/// The T7 e2e caught exactly that — a fence every 30s, forever, with a status
+/// that never stayed True long enough to assert on. So: fence once for
+/// containment and evidence, then leave the incident standing and visible.
+fn plan_fence(cr: &MqttdCluster, probes: &[PodProbe], quarantined: &[String]) -> Option<Action> {
     if cr.spec.remediation.split_brain != SplitBrainAction::Fence {
         return None; // opt-in; the default is Alert
     }
@@ -124,8 +142,12 @@ fn plan_fence(cr: &MqttdCluster, probes: &[PodProbe]) -> Option<Action> {
     if pod.is_empty() {
         return None;
     }
+    let pvc = format!("data-{pod}");
+    if quarantined.contains(&pvc) {
+        return None; // already fenced once: contain, then leave it visible
+    }
     Some(Action::Fence {
-        pvc: format!("data-{pod}"),
+        pvc,
         pod,
         cluster_id: minority_id.to_string(),
     })
@@ -344,6 +366,7 @@ mod tests {
             &cr(SplitBrainAction::Alert, BrownoutAction::Alert),
             &probes,
             &pvcs(),
+            &[],
         );
         assert!(actions.is_empty(), "alert-only defaults must not act");
     }
@@ -361,6 +384,7 @@ mod tests {
             &cr(SplitBrainAction::Fence, BrownoutAction::Alert),
             &probes,
             &pvcs(),
+            &[],
         );
         assert_eq!(
             actions,
@@ -375,6 +399,31 @@ mod tests {
         assert!(msg.contains("DATA UNTOUCHED"), "{msg}");
     }
 
+    /// A node is fenced ONCE. Its volume still holds the divergent state, so it
+    /// re-founds on every restart and keeps reading as split-brained; killing it
+    /// again each pass would neither fix it nor add evidence, and — because each
+    /// delete removes the divergent pod from the observation — it would flicker
+    /// the `SplitBrain` condition off within milliseconds. Found by the T7 e2e:
+    /// the operator fenced the same pod every 30s and the status never stayed
+    /// True long enough for an alert (or the test) to see it.
+    #[test]
+    fn an_already_quarantined_node_is_not_fenced_again() {
+        let probes = vec![
+            pod("mqttd-0", "aaa", false),
+            pod("mqttd-1", "aaa", false),
+            pod("mqttd-2", "bbb", true),
+        ];
+        let cr = cr(SplitBrainAction::Fence, BrownoutAction::Alert);
+        // First pass: containment fires.
+        assert_eq!(plan(&cr, &probes, &pvcs(), &[]).len(), 1);
+        // Second pass, same divergence, PVC already labelled: nothing at all.
+        assert!(
+            plan(&cr, &probes, &pvcs(), &["data-mqttd-2".to_string()]).is_empty(),
+            "a quarantined node must not be re-fenced; the incident stays visible \
+             until the documented manual wipe"
+        );
+    }
+
     /// A TIE is not evidence: 1-v-1 never fences, however tempting.
     #[test]
     fn a_tie_is_never_fenced() {
@@ -382,7 +431,8 @@ mod tests {
         assert!(plan(
             &cr(SplitBrainAction::Fence, BrownoutAction::Alert),
             &probes,
-            &pvcs()
+            &pvcs(),
+            &[]
         )
         .is_empty());
     }
@@ -406,7 +456,8 @@ mod tests {
             plan(
                 &cr(SplitBrainAction::Fence, BrownoutAction::Alert),
                 &probes,
-                &pvcs()
+                &pvcs(),
+                &[]
             )
             .is_empty(),
             "2 unreachable could join the minority and out-vote the majority"
@@ -422,6 +473,7 @@ mod tests {
             &cr(SplitBrainAction::Alert, BrownoutAction::ExpandPvc),
             &probes,
             &pvcs(),
+            &[],
         );
         assert_eq!(
             actions,
@@ -440,7 +492,7 @@ mod tests {
             expansion_max_size: Some("20Gi".into()),
         });
         assert!(
-            plan(&at_max, &probes, &pvcs()).is_empty(),
+            plan(&at_max, &probes, &pvcs(), &[]).is_empty(),
             "ceiling reached"
         );
 
@@ -452,7 +504,7 @@ mod tests {
             expansion_max_size: None,
         });
         assert!(
-            plan(&unbounded, &probes, &pvcs()).is_empty(),
+            plan(&unbounded, &probes, &pvcs(), &[]).is_empty(),
             "no ceiling, no growth"
         );
     }
@@ -466,7 +518,7 @@ mod tests {
             storage_class_name: None,
             expansion_max_size: Some("12Gi".into()),
         });
-        let actions = plan(&c, &[browned("mqttd-0")], &pvcs());
+        let actions = plan(&c, &[browned("mqttd-0")], &pvcs(), &[]);
         assert_eq!(
             actions,
             vec![Action::ExpandPvcs {
@@ -492,6 +544,7 @@ mod tests {
             &cr(SplitBrainAction::Fence, BrownoutAction::ExpandPvc),
             &probes,
             &pvcs(),
+            &[],
         );
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::Fence { .. }));

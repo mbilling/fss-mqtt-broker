@@ -20,3 +20,8 @@ __pycache__/
 
 # Release binary staging area for the container image build (ADR 0045)
 dist/
+
+# Linux binaries staged for the operator e2e images (scripts/k8s/operator-e2e.sh
+# removes them on a clean run; an aborted run leaves them behind)
+dist-e2e-mqttd
+dist-e2e-operator

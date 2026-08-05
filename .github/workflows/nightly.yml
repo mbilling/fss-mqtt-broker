@@ -159,6 +159,26 @@ jobs:
       - name: kind runtime smoke
         run: ./scripts/k8s/kind-smoke.sh
 
+  operator-e2e:
+    name: operator end-to-end (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+      # ADR 0055 T7: the runtime proof for the reconciler. Creates a cluster from
+      # a CR, asserts a routine rolling restart provokes NO fence (the safety
+      # property — unreachable pods are absent evidence, not a split brain), then
+      # induces a real split brain and asserts it is detected and fenced with the
+      # PVC quarantined by label rather than deleted.
+      - name: operator e2e
+        run: ./scripts/k8s/operator-e2e.sh
+
   oidc:
     name: OIDC integration (real Keycloak, forced rotation) (ADR 0050 T4)
     runs-on: ubuntu-latest
