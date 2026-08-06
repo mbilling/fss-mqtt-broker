@@ -71,6 +71,18 @@ const MAX_BACKLOG: usize = 10_000;
 /// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How many sweep ticks between offering every peer our retained digest — the
+/// retained set's ANTI-ENTROPY cadence (issue #87).
+///
+/// Without it, retained convergence rests on a single unacked fan-out frame at commit
+/// plus a digest exchanged only at link-up: one dropped or unencodable frame leaves a
+/// peer permanently, silently divergent until something flaps the link. The digest is
+/// small and idempotent — a peer whose set already matches early-returns and transfers
+/// nothing — so re-offering it on a slow cadence costs one frame per peer per period in
+/// the steady state and makes ANY missed update self-healing. Same shape as the fix for
+/// issue #92: a transient loss must not become a permanent divergence.
+const RETAINED_ANTIENTROPY_EVERY: u32 = 30;
+
 /// How many sweep ticks between reconciling persisted expiry deadlines from the durable
 /// store (ADR 0009 §3). This inherits deadlines for sessions a takeover handed this node
 /// without seeing their disconnect; takeover is rare and the scan is O(owned sessions), so
@@ -864,6 +876,9 @@ pub struct Hub {
     expiring: HashMap<ClientId, u64>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
+    /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
+    /// kept separate from the expiry counter so neither's phase perturbs the other.
+    retained_antientropy_tick: u32,
     /// Per-client subscription filters with their granted `QoS`.
     subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
     /// Routing index covering online clients and offline persistent sessions.
@@ -1237,6 +1252,7 @@ impl Hub {
                 session_expiry: HashMap::new(),
                 expiring: HashMap::new(),
                 expiry_reconcile_tick: 0,
+                retained_antientropy_tick: 0,
                 subs_by_client: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
@@ -3185,6 +3201,16 @@ impl Hub {
             self.spawn_inherited_session_scan();
         }
 
+        // Retained anti-entropy (issue #87): re-offer our digest to every peer on a
+        // slow cadence. A commit fans out ONE unacked frame; before this, a frame
+        // dropped as oversized/unencodable — or lost with the link still up — left
+        // that peer permanently divergent, because the only other reconciliation was
+        // a digest at link-up. Peers in sync compare equal and transfer nothing.
+        self.retained_antientropy_tick = self.retained_antientropy_tick.wrapping_add(1);
+        if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 {
+            self.broadcast_retained_digest().await;
+        }
+
         let now = self.clock.now_epoch_secs();
         let expired: Vec<ClientId> = self
             .expiring
@@ -3957,29 +3983,59 @@ impl Hub {
         let Some(peer) = self.peers.get(node) else {
             return;
         };
-        let Ok(retained) = self.retained.all().await else {
+        let Some((count, hash, value_hash)) = self.local_retained_digest().await else {
             return;
         };
-        // With no values AND no tombstone tokens there is nothing a peer could learn
-        // from us. A tombstone-only state still offers its digest: a peer holding a
-        // value for a topic we committed a clear for must see a difference and pull
-        // the tombstone (ADR 0037 P5) — going silent would strand its stale value.
+        let _ = peer.tx.send(PeerMessage::RetainedDigest {
+            count,
+            hash,
+            value_hash,
+        });
+    }
+
+    /// This node's retained digest, or `None` when there is nothing a peer could
+    /// learn from us.
+    ///
+    /// With no values AND no tombstone tokens we stay silent. A tombstone-only state
+    /// still offers its digest: a peer holding a value for a topic we committed a
+    /// clear for must see a difference and pull the tombstone (ADR 0037 P5) — going
+    /// silent would strand its stale value.
+    async fn local_retained_digest(&self) -> Option<(u64, u64, u64)> {
+        let retained = self.retained.all().await.ok()?;
         if retained.is_empty() && self.retained_tokens.is_empty() {
-            return;
+            return None;
         }
-        let (count, hash, value_hash) = retained_digest(retained.iter().map(|m| {
+        Some(retained_digest(retained.iter().map(|m| {
             (
                 m.topic.as_str(),
                 m.payload.as_ref(),
                 m.qos as u8,
                 AppProps::from(&m.app).encode(),
             )
-        }));
-        let _ = peer.tx.send(PeerMessage::RetainedDigest {
-            count,
-            hash,
-            value_hash,
-        });
+        })))
+    }
+
+    /// Offer EVERY peer our retained digest (issue #87): the periodic anti-entropy
+    /// that turns a missed fan-out frame into a self-healing gap rather than a
+    /// permanent divergence.
+    ///
+    /// The digest is computed once and fanned out, so the cost is one retained scan
+    /// per period regardless of peer count — the same scan a link-up already pays.
+    /// Peers already in sync compare equal and transfer nothing back.
+    async fn broadcast_retained_digest(&self) {
+        if self.peers.is_empty() {
+            return;
+        }
+        let Some((count, hash, value_hash)) = self.local_retained_digest().await else {
+            return;
+        };
+        for peer in self.peers.values() {
+            let _ = peer.tx.send(PeerMessage::RetainedDigest {
+                count,
+                hash,
+                value_hash,
+            });
+        }
     }
 
     /// Compare a peer's retained digest against our own (0014-T6 + ADR 0037 P1). Equal
@@ -6022,6 +6078,74 @@ mod tests {
                 assert_eq!(&messages[0].payload[..], b"r");
             }
             other => panic!("expected RetainedSnapshot, got {other:?}"),
+        }
+    }
+
+    /// A retained update whose fan-out frame never lands is HEALED by the periodic
+    /// digest, with the link never flapping (issue #87).
+    ///
+    /// A commit fans out exactly one frame, unacked and never retransmitted, and it
+    /// can legitimately be dropped (oversized/unencodable) with the link kept. Before
+    /// this, the only other reconciliation was a digest at link-up, so that peer
+    /// stayed silently divergent until something flapped the link — possibly forever.
+    /// Here the peer links up, the frames it would have received are discarded, and
+    /// the assertion is that the hub OFFERS ITS DIGEST AGAIN unprompted, which is what
+    /// gives the peer another chance to notice the gap and pull.
+    #[tokio::test(start_paused = true)]
+    async fn a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy() {
+        let tx = start_hub();
+        let mut peer = connect_peer(&tx, "n", 1);
+        publish_retained(&tx, "t", b"r");
+
+        // Everything the link-up and the commit produced is thrown away: this peer
+        // is now missing the retained value, and nothing will flap its link.
+        while tokio::time::timeout(Duration::from_millis(50), peer.recv())
+            .await
+            .is_ok()
+        {}
+
+        // Unprompted, on the anti-entropy cadence, our digest is offered again.
+        let mut offered = None;
+        for _ in 0..(super::RETAINED_ANTIENTROPY_EVERY + 2) {
+            tokio::time::sleep(super::SESSION_SWEEP_INTERVAL).await;
+            if let Ok(Some(PeerMessage::RetainedDigest { count, hash, .. })) =
+                tokio::time::timeout(Duration::from_millis(50), peer.recv()).await
+            {
+                offered = Some((count, hash));
+                break;
+            }
+        }
+        let (count, hash) = offered.expect(
+            "the retained digest must be re-offered without a link flap; \
+             otherwise a single dropped fan-out frame diverges the peer forever",
+        );
+        assert_eq!(count, 1, "the digest describes the retained value we hold");
+        assert_ne!(hash, 0);
+    }
+
+    /// The anti-entropy cadence stays SILENT when there is nothing to reconcile
+    /// (issue #87): a node holding no retained state must not wake its peers every
+    /// period just to say so.
+    #[tokio::test(start_paused = true)]
+    async fn periodic_anti_entropy_says_nothing_when_there_is_nothing_retained() {
+        let tx = start_hub();
+        let mut peer = connect_peer(&tx, "n", 1);
+        while tokio::time::timeout(Duration::from_millis(50), peer.recv())
+            .await
+            .is_ok()
+        {}
+
+        for _ in 0..(super::RETAINED_ANTIENTROPY_EVERY + 2) {
+            tokio::time::sleep(super::SESSION_SWEEP_INTERVAL).await;
+        }
+        // Other periodic traffic (interest gossip) is fine and expected; what must
+        // never appear is a digest describing an empty set.
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(50), peer.recv()).await
+        {
+            assert!(
+                !matches!(msg, PeerMessage::RetainedDigest { .. }),
+                "no retained state means no digest to offer, got {msg:?}"
+            );
         }
     }
 

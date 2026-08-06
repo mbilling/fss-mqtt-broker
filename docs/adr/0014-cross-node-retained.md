@@ -154,3 +154,26 @@ applies unchanged.
   local-read model stand.
 - **Leave it node-local.** Rejected: it silently violates retained semantics in a
   cluster, which is the whole point of the feature.
+
+## Amendment (2026-08-06): the digest also runs on a cadence, not only at link-up (issue #87)
+
+§3's digest was specified as a **link-up** exchange, on the reasoning that a commit's
+fan-out delivers the update and the digest only has to cover what a *new or
+reconnected* link missed. That leaves no reconciliation at all for an update lost on
+a link that stays up — and one can be: a commit fans out exactly one frame, unacked
+and never retransmitted, and an oversized or unencodable frame is dropped with the
+link deliberately kept. The result was a peer silently diverging on retained state
+until something happened to flap its link, which in a healthy cluster may be never.
+
+**The same digest is now also offered to every peer on a slow cadence**
+(`RETAINED_ANTIENTROPY_EVERY`, 30 sweep ticks ≈ 30 s). Nothing about the exchange
+changes: peers whose digest matches early-return and transfer nothing, so the steady
+state costs one small frame per peer per period, and any missed update — however it
+was missed — becomes self-healing rather than permanent. The digest is computed once
+per period and fanned out, so a period costs one retained scan regardless of peer
+count: the same scan a link-up already pays. A node holding no retained state offers
+nothing.
+
+This is the same lesson as issue #92 in a different subsystem: a transient loss must
+not be allowed to become a permanent divergence just because the only repair path is
+attached to an event that may not recur.
