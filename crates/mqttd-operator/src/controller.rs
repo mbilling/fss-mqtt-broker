@@ -302,3 +302,63 @@ pub async fn run(client: Client, namespace: &str) {
         })
         .await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{gvk_for, owner_reference};
+    use crate::crd::MqttdCluster;
+
+    fn cr(uid: &str) -> MqttdCluster {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "mqttd.io/v1alpha1",
+            "kind": "MqttdCluster",
+            "metadata": { "name": "e2e", "namespace": "ns", "uid": uid },
+            "spec": { "replicas": 3, "config": "" },
+        }))
+        .expect("sample CR")
+    }
+
+    /// The ownerReference is what makes `kubectl delete mqttdcluster` collect the whole
+    /// cluster instead of orphaning a StatefulSet, and what stops the objects outliving
+    /// the spec that describes them. Every field is load-bearing: `uid` is what the
+    /// garbage collector matches on (a name alone would let a RECREATED CR adopt the
+    /// old objects), `controller` marks ownership rather than mere reference, and
+    /// `blockOwnerDeletion` keeps the owner around until the children are gone.
+    #[test]
+    fn the_owner_reference_ties_objects_to_the_cr_by_uid() {
+        let owner = owner_reference(&cr("abc-123"));
+        assert_eq!(owner["kind"], "MqttdCluster");
+        assert_eq!(owner["apiVersion"], "mqttd.io/v1alpha1");
+        assert_eq!(owner["name"], "e2e");
+        assert_eq!(owner["uid"], "abc-123", "GC matches on uid, not name");
+        assert_eq!(owner["controller"], true);
+        assert_eq!(owner["blockOwnerDeletion"], true);
+    }
+
+    /// Every kind [`crate::render`] emits must resolve to a GVK, or `apply_owned` skips
+    /// it with a warning and the object is silently never created — which is exactly
+    /// how the missing ServiceAccount reached a cluster (T7). This test fails the moment
+    /// someone adds an object to the render without teaching the applier about it.
+    #[test]
+    fn every_rendered_kind_has_a_gvk() {
+        let rendered = crate::render::render(&cr("abc-123"));
+        for object in rendered.all() {
+            let kind = object["kind"]
+                .as_str()
+                .expect("every object names its kind");
+            assert!(
+                gvk_for(kind).is_some(),
+                "render emits {kind} but apply_owned has no GVK for it, so it would be \
+                 skipped and never created"
+            );
+        }
+    }
+
+    /// An unknown kind resolves to `None` rather than a guess: the applier's job is to
+    /// refuse what it does not understand, loudly.
+    #[test]
+    fn an_unknown_kind_has_no_gvk() {
+        assert!(gvk_for("Deployment").is_none());
+        assert!(gvk_for("").is_none());
+    }
+}

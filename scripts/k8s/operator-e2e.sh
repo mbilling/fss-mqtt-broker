@@ -2,7 +2,7 @@
 # Operator end-to-end (ADR 0055 T7) — the runtime proof that the reconciler does
 # what its unit tests claim, against a real API server.
 #
-# Five things are asserted, in order of how much they matter:
+# Six things are asserted, in order of how much they matter:
 #
 #   1. The operator CREATES a working cluster from a CR (apply → StatefulSet →
 #      3/3 Ready → status.phase=Ready with one clusterId).
@@ -20,6 +20,9 @@
 #      is still detected and fenced (PVC labelled, pod deleted, DATA NEVER
 #      DELETED), the verdict HOLDS because the fence fires once, and the
 #      re-founder has ALSO quarantined itself so it serves no clients.
+#   6. DELETING THE CR collects every owned object and keeps every volume.
+#
+# Plus, before any of it: the operator's RBAC is minimal, not merely sufficient.
 #
 # Requires: docker, kind, kubectl, cargo. Builds both images itself. Nightly tier.
 set -euo pipefail
@@ -120,7 +123,23 @@ kubectl apply -f "$REPO_ROOT/deploy/crds/mqttd.io_mqttdclusters.json"
 kubectl -n "$NS" apply -f "$REPO_ROOT/deploy/operator/operator.yaml"
 kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=120s
 
-log "1/5 — apply a CR; the operator must CREATE a working cluster"
+# The operator's RBAC must be MINIMAL, not merely sufficient. The e2e passing proves
+# sufficiency; nothing proved the limits, and the most load-bearing of them — "the
+# absence of a PVC delete verb is the never-destroy-data guarantee" — lived only in a
+# comment. Assert it, and assert a verb it DOES need, so a blanket deny (a broken
+# ServiceAccount reference, say) cannot make the negatives pass vacuously.
+sa="system:serviceaccount:$NS:mqttd-operator"
+can() { kubectl auth can-i "$1" "$2" --as="$sa" -n "$NS" 2>/dev/null; }
+[ "$(can delete persistentvolumeclaims)" = "no" ] \
+  || fail "the operator CAN delete PVCs — the never-destroy-data guarantee is gone"
+[ "$(can get secrets)" = "no" ] \
+  || fail "the operator can READ Secrets; it references them by name and must never read material"
+[ "$(can delete secrets)" = "no" ] || fail "the operator can delete Secrets"
+[ "$(can delete pods)" = "yes" ] \
+  || fail "the operator cannot delete pods — the fence needs that, so these can-i checks are vacuous"
+echo "RBAC is minimal: no PVC deletion, no Secret access, pod deletion (the fence) intact"
+
+log "1/6 — apply a CR; the operator must CREATE a working cluster"
 # Fence is enabled from the start: assertion 2 proves it does NOT fire on a
 # routine roll, which is only meaningful if it was armed the whole time.
 kubectl -n "$NS" apply -f - <<EOF
@@ -190,7 +209,7 @@ wait_for 180 "the StatefulSet to re-render with CLUSTER_ESTABLISHED" \
 kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
 echo "founder guard armed: ordinal 0 can no longer found"
 
-log "2/5 — a rolling restart must provoke NO fence (the safety property)"
+log "2/6 — a rolling restart must provoke NO fence (the safety property)"
 BEFORE_PVCS="$(kubectl -n "$NS" get pvc -l "$(printf 'mqttd.io/quarantined=true')" -o name | wc -l | tr -d ' ')"
 kubectl -n "$NS" rollout restart statefulset/e2e
 kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
@@ -203,7 +222,7 @@ AFTER_PVCS="$(kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | wc
 [ "$(cr_status clusterId)" = "$CLUSTER_ID" ] || fail "cluster identity changed across a roll"
 echo "rolling restart completed with no fence and a stable identity"
 
-log "3/5 — scale up then down; the operator must resize the set and keep data"
+log "3/6 — scale up then down; the operator must resize the set and keep data"
 # The rendered config carries REPLICAS (the readiness-floor math), so a scale is also
 # a config change: the operator must roll the set to the new shape, not just edit
 # .spec.replicas. Withheld until issue #92 was fixed — the roll a scale implies left
@@ -231,7 +250,7 @@ done
 [ "$(cr_condition SplitBrain)" = "False" ] || fail "a scale cycle was mistaken for a split brain"
 echo "scaled 3->4->3; identity stable, no fence, EVERY PVC intact (incl. the departed pod's)"
 
-log "4/5 — wipe the founder's volume; the guard must make it REJOIN, not re-found"
+log "4/6 — wipe the founder's volume; the guard must make it REJOIN, not re-found"
 # The same induction that used to create a split brain: destroy pod-0's data dir while
 # the cluster is live. With the founder guard armed (assertion 1) ordinal 0 renders
 # seeds, so the empty volume makes it a JOINER — it adopts the surviving identity and
@@ -260,7 +279,7 @@ kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | grep -q . \
   && fail "a PVC was quarantined — the operator fenced a node that should have rejoined"
 echo "founder guard held: pod-0 rejoined the SAME cluster ($CLUSTER_ID), no split brain, no fence"
 
-log "5/5 — break glass: allow re-founding, and the fence must still work"
+log "5/6 — break glass: allow re-founding, and the fence must still work"
 # The guard is the prevention; the fence is the containment behind it. Proving the fence
 # still fires needs a split brain, and with the guard armed one can no longer be induced —
 # so ask for founding back, exactly as an operator would after total volume loss.
@@ -300,4 +319,21 @@ ready0="$(kubectl -n "$NS" get pod e2e-0 \
   && fail "the re-founded pod-0 is READY — it is serving clients from an empty store"
 echo "break glass works: re-founding permitted, fenced once, self-quarantined (Ready=$ready0), data intact"
 
-log "OPERATOR E2E PASSED: created a cluster, ignored a routine roll, scaled without data loss, kept a wiped founder from splitting the cluster, and still fenced one when re-founding was explicitly allowed"
+log "6/6 — deleting the CR must collect the cluster but KEEP the data"
+# Ownership is asserted at creation (assertion 1); collection never was. Deleting the CR
+# must garbage-collect every object the operator owns — and must NOT take the volumes
+# with it, because volumeClaimTemplate PVCs are not owned by the CR and the retention
+# policy is Retain (issue #97). "Delete the CR" is a plausible way to rebuild a cluster,
+# and it must not be a way to lose one.
+pvcs_before="$(kubectl -n "$NS" get pvc --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+kubectl -n "$NS" delete mqttdcluster e2e --wait=true
+wait_for 180 "the StatefulSet to be garbage-collected" \
+  bash -c "! kubectl -n $NS get statefulset e2e >/dev/null 2>&1"
+wait_for 120 "the Services to be garbage-collected" \
+  bash -c "! kubectl -n $NS get service e2e >/dev/null 2>&1"
+pvcs_after="$(kubectl -n "$NS" get pvc --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+[ "$pvcs_before" = "$pvcs_after" ] \
+  || fail "deleting the CR destroyed volumes ($pvcs_before -> $pvcs_after) — data must survive"
+echo "CR deleted: owned objects collected, all $pvcs_after volumes retained"
+
+log "OPERATOR E2E PASSED: minimal RBAC, created a cluster, ignored a routine roll, scaled without data loss, kept a wiped founder from splitting the cluster, fenced one when re-founding was allowed, and collected the cluster on delete without losing a volume"
