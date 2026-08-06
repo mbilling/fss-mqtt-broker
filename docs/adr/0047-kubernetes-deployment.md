@@ -167,3 +167,32 @@ brownout/drain gauges, `/statusz`); the controller follows against proven signal
 If reopened, the operator wraps the existing contracts (drain via SIGUSR1, readiness
 via `/readyz`, config via the same TOML) rather than inventing new control surfaces —
 the no-code-coupling property this ADR's consequences noted is what keeps that cheap.
+
+## Amendment (2026-08-06): PVC retention defaults to Retain on scale-down (issue #97)
+
+The chart shipped `persistentVolumeClaimRetentionPolicy.whenScaled: Delete`, documented as
+"correct here, not data loss", on the reasoning that a scale-down runs the ADR 0043
+decommission drain first — the departing node hands every held key to the surviving
+replica set, so its volume afterwards holds only superseded state, and deleting it closes
+the stale-rejoin trap when a later scale-up reuses the ordinal.
+
+The reasoning is sound and carries an unstated precondition: **a survivor must remain to
+receive the drain.** Kubernetes applies the policy uniformly and has no notion of "shrink
+to a floor" versus "shrink to nothing", so at `--replicas=0` — the obvious way to restart
+a fleet or quiesce an environment — the drain has nowhere to hand state to and the
+deletion erases the only copy. Verified on kind: every PVC gone, and the cluster came back
+with a different identity and an empty store, with no warning and nothing in the runbook
+against it.
+
+**Both policies now default to `Retain`.** The cost is a visible, reversible orphan after
+each shrink (`kubectl delete pvc data-<sts>-<n>` when you are satisfied) and a reattached
+volume if an ordinal is reused; the benefit is that no scale operation can destroy the
+only copy of anything. Operators who shrink often and never scale to zero can set
+`whenScaled: Delete` back. The stale-rejoin trap the original setting closed is now the
+operator's to close deliberately, which is documented in OPERATIONS.md alongside the
+reuse-an-ordinal note.
+
+Found while testing an unrelated hypothesis about full-fleet restarts — which, separately,
+was refuted: a rolling restart or a delete-all recovers on its own with identity and lease
+group intact. The danger was never the restart; it was the volume deletion that scaling to
+zero used to trigger.

@@ -107,14 +107,26 @@ persistence:
   accessModes:
     - ReadWriteOnce
   # PVC lifecycle (StatefulSetAutoDeletePVC; honored on Kubernetes >= 1.27, inert before).
-  # whenScaled: Delete is CORRECT here, not data loss: scale-down runs the ADR 0043
-  # decommission drain first — the departing node hands every held key to the surviving
-  # replica set before exiting — so its PVC afterwards holds only stale, superseded state,
-  # and deleting it prevents the stale-data trap when a later scale-up reuses the ordinal.
-  # whenDeleted: Retain keeps data across a full release delete/reinstall.
+  #
+  # BOTH default to Retain, because Kubernetes applies whenScaled uniformly and the
+  # argument for deleting only holds at some replica counts (issue #97).
+  #
+  # The argument: an ordinary shrink runs the ADR 0043 decommission drain first, so the
+  # departing node hands every held key to the SURVIVING replica set and its volume
+  # afterwards holds only stale, superseded state. Deleting it then also closes the
+  # stale-rejoin trap when a later scale-up reuses the ordinal.
+  #
+  # Where it fails: `--replicas=0`. There is no survivor to receive the drain, so the
+  # deletion stops reclaiming migrated data and erases the only copy — every session,
+  # every retained message, and the cluster identity, silently, from an operation that
+  # looks like an ordinary restart. Verified on kind: the identity came back different.
+  #
+  # So the default is safe-by-default and the orphan is visible and reversible. Set
+  # whenScaled: Delete if you shrink often, never scale to zero, and would rather not
+  # reclaim volumes by hand — and see the stale-rejoin note in docs/OPERATIONS.md.
   retentionPolicy:
     whenDeleted: Retain
-    whenScaled: Delete
+    whenScaled: Retain
 
 # --- Scale-down / shutdown (ADR 0043 / 0019) ------------------------------------------------
 # preStop sends SIGUSR1 to begin a DECOMMISSION drain (hand every held key to its post-departure
