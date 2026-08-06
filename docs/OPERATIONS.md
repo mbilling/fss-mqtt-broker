@@ -111,6 +111,40 @@ re-bootstrap deliberately beside a cluster you are abandoning, set
 `MQTTD_REFOUND_GUARD=false` (env, so it needs no config edit or roll) or
 `[cluster] refound_guard = false`.
 
+## Volumes outlive pods (and why scaling to zero is not a restart)
+
+Both PVC retention policies default to **Retain** (issue #97), so a scale-down leaves the
+departed pod's volume behind:
+
+```
+kubectl -n <ns> get pvc            # data-<sts>-3 is still Bound after shrinking to 3
+kubectl -n <ns> delete pvc data-<sts>-3   # reclaim it once you are satisfied
+```
+
+That orphan is deliberate. `whenScaled: Delete` is a reasonable setting *while a survivor
+remains* — an ordinary shrink drains first (ADR 0043), so the departing volume holds only
+superseded state. But Kubernetes applies the policy uniformly, and at `--replicas=0`
+there is no survivor to drain to: the same setting erases the only copy of every session,
+every retained message, and the cluster identity. Silently, from an operation that looks
+like an ordinary restart. Set `persistence.retentionPolicy.whenScaled: Delete` only if
+you shrink often, never scale to zero, and would rather not reclaim by hand.
+
+**To restart a whole cluster, do not scale to zero.** Use a rolling restart, which is
+quorum-safe and keeps volumes and identity:
+
+```
+kubectl -n <ns> rollout restart statefulset/<sts>
+```
+
+A full-fleet restart *does* recover on its own (verified: pods return, identity and lease
+group intact, all Ready in ~15 s) — the danger was never the restart, it was the volume
+deletion that `--replicas=0` used to trigger.
+
+**Reusing an ordinal after a shrink.** With Retain, scaling back up reattaches the old
+volume rather than starting empty. That is usually what you want (the node rejoins with
+its state and back-fills). If you intend the ordinal to come back *fresh*, delete its PVC
+before scaling up.
+
 ## The founder rule (read before touching pod-0's storage)
 
 Pod-0 renders with **no seeds**: a pod-0 that starts with an *empty data dir and no

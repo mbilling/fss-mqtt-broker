@@ -329,11 +329,13 @@ fn statefulset(cr: &MqttdCluster, names: &Names) -> Value {
             // One pod at a time, in order (ADR 0039's rolling-upgrade motion).
             "podManagementPolicy": "OrderedReady",
             "updateStrategy": { "type": "RollingUpdate" },
-            // Post-drain data is migrated, so deleting a scaled-down pod's PVC is
-            // correct and closes the stale-rejoin trap (k8s >= 1.27).
+            // Both Retain (issue #97). Deleting a scaled-down pod's PVC is correct
+            // only while a SURVIVOR remains to receive the ADR 0043 drain, and
+            // Kubernetes applies the policy uniformly — at replicas=0 the same
+            // setting erases the only copy of every session and retained message.
             "persistentVolumeClaimRetentionPolicy": {
                 "whenDeleted": "Retain",
-                "whenScaled": "Delete",
+                "whenScaled": "Retain",
             },
             "selector": { "matchLabels": selector_labels(names) },
             "template": {
@@ -490,8 +492,8 @@ mod tests {
         let spec = &r.statefulset["spec"];
         assert_eq!(spec["podManagementPolicy"], "OrderedReady");
         assert_eq!(
-            spec["persistentVolumeClaimRetentionPolicy"]["whenScaled"],
-            "Delete"
+            spec["persistentVolumeClaimRetentionPolicy"]["whenScaled"], "Retain",
+            "a scale-down must not be able to destroy the only copy (issue #97)"
         );
         assert_eq!(
             spec["persistentVolumeClaimRetentionPolicy"]["whenDeleted"],

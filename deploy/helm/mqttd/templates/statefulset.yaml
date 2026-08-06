@@ -227,10 +227,10 @@ spec:
       {{- end }}
   {{- if .Values.persistence.enabled }}
   {{- with .Values.persistence.retentionPolicy }}
-  # PVC lifecycle (Kubernetes >= 1.27; inert on older clusters). whenScaled: Delete is safe
-  # BECAUSE scale-down drains first (preStop decommission hands all held state to survivors);
-  # deleting the shrunk pod's PVC prevents its stale data dir being reattached under the same
-  # node id by a later scale-up.
+  # PVC lifecycle (Kubernetes >= 1.27; inert on older clusters). Both default to Retain:
+  # `whenScaled: Delete` is only safe while a SURVIVOR remains to receive the ADR 0043
+  # drain, and Kubernetes applies the policy uniformly — at `--replicas=0` the same
+  # setting erases the only copy of every session and retained message (issue #97).
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: {{ .whenDeleted }}
     whenScaled: {{ .whenScaled }}
