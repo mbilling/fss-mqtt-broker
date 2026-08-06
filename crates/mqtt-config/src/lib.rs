@@ -195,7 +195,7 @@ pub struct AuthPenalty {
 }
 
 /// Cluster transport (peer links) and SWIM membership.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Cluster {
     /// Inter-node listener bind (`MQTTD_PEER_BIND`).
@@ -208,6 +208,40 @@ pub struct Cluster {
     pub peer_tls: PeerTls,
     /// SWIM gossip membership.
     pub swim: Swim,
+    /// Refuse to serve after re-founding a cluster beside a live one
+    /// (`MQTTD_REFOUND_GUARD`, default `true`).
+    ///
+    /// A node founds a cluster precisely because it starts with no seeds, and a node
+    /// whose data dir was lost cannot tell "first ever bootstrap" from "my volume was
+    /// wiped while the cluster kept running" — the wipe deleted exactly the state that
+    /// would have differed. So it mints a second identity beside the live one and, with
+    /// nothing to hold it back, passes readiness and starts serving clients an empty
+    /// session and retained store.
+    ///
+    /// The guard keys on the one signal only the *second* case produces: surviving peers
+    /// keep greeting this node, their datagrams carry the other identity, and they are
+    /// dropped as `cluster-mismatch`. On a genuine first bootstrap no peer exists to send
+    /// one, so the guard cannot fire. When it does fire the node latches `NotReady` for the
+    /// rest of the process, staying out of load-balancer rotation until a human runs the
+    /// documented wipe-and-rejoin.
+    ///
+    /// Set `false` only to re-bootstrap deliberately beside a cluster you are abandoning.
+    pub refound_guard: bool,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self {
+            peer_bind: None,
+            peer_advertise: None,
+            peers: Vec::new(),
+            peer_tls: PeerTls::default(),
+            swim: Swim::default(),
+            // Data-safe default (as with `durable.enabled`): a node that re-founds beside
+            // a live cluster must not serve from an empty store.
+            refound_guard: true,
+        }
+    }
 }
 
 /// Cluster-bus (peer link) mTLS material (`MQTTD_PEER_TLS_*`). Paths only.
@@ -589,6 +623,12 @@ impl Config {
         on!("MQTTD_SWIM_KEY_ACCEPT", v, {
             self.cluster.swim.key_accept = list(&v);
         });
+        on!("MQTTD_REFOUND_GUARD", v, {
+            self.cluster.refound_guard = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        });
         on!("MQTTD_SWIM_SIGNED", v, {
             self.cluster.swim.signed = Some(v);
         });
@@ -817,6 +857,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_SWIM_KEY_ACCEPT",
     "MQTTD_SWIM_SIGNED",
     "MQTTD_SWIM_REPLAY",
+    "MQTTD_REFOUND_GUARD",
     // durable
     "MQTTD_DURABLE_SESSIONS",
     "MQTTD_LEASE_VOTERS",
@@ -985,6 +1026,33 @@ mod tests {
         }
     }
 
+    /// The re-found guard is ON by default and takes the same falsey vocabulary. It must
+    /// be reachable by ENV specifically: the escape hatch is used mid-incident, when
+    /// editing a mounted config and rolling the pod is the thing you cannot do.
+    #[test]
+    fn the_refound_guard_defaults_on_and_env_can_disable_it() {
+        assert!(
+            Config::default().cluster.refound_guard,
+            "a node must not serve from an empty store after re-founding unless told to"
+        );
+        for (v, want) in [
+            ("0", false),
+            ("false", false),
+            ("OFF", false),
+            ("no", false),
+            ("1", true),
+            ("yes", true),
+        ] {
+            let mut c = Config::default();
+            c.overlay_from(getter(&[("MQTTD_REFOUND_GUARD", v)]))
+                .unwrap();
+            assert_eq!(c.cluster.refound_guard, want, "MQTTD_REFOUND_GUARD={v:?}");
+        }
+        // And from the file, for a deliberate, reviewed opt-out.
+        let c = Config::from_toml("[cluster]\nrefound_guard = false\n").unwrap();
+        assert!(!c.cluster.refound_guard);
+    }
+
     #[test]
     fn comma_lists_and_the_domain_map_parse() {
         let mut c = Config::default();
@@ -1033,8 +1101,8 @@ mod tests {
     /// a parseable one; everything else takes an arbitrary non-empty string.
     fn distinct_value(var: &str) -> &'static str {
         match var {
-            // Durable is on by default — the only value that *changes* it is a falsey one.
-            "MQTTD_DURABLE_SESSIONS" => "off",
+            // Data-safe defaults are ON, so only a falsey value *changes* them.
+            "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" => "off",
             // Presence flips anonymous on (default off).
             "MQTTD_ALLOW_ANONYMOUS" | "MQTTD_OIDC_ALLOW_HTTP" => "1",
             // Enums: any valid, non-default (default None) member.
@@ -1146,7 +1214,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            65,
+            66,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
     }

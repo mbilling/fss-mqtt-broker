@@ -424,6 +424,7 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | `MQTTD_SWIM_SEEDS` | Comma-separated gossip addresses of existing members |
 | `MQTTD_SWIM_KEY` | 64-hex-char cluster gossip key, **inline** (`openssl rand -hex 32`). A raw secret |
 | `MQTTD_SWIM_KEY_FILE` | Path to a file holding the 64-hex gossip key (ADR 0046 T5): the secret-by-reference form, mountable from a Secret so it stays out of the config file. Mutually exclusive with the inline `MQTTD_SWIM_KEY` |
+| `MQTTD_REFOUND_GUARD` | Refuse to serve after re-founding a cluster beside a live one — **on by default**; set `0`/`false`/`off`/`no` only to re-bootstrap deliberately beside a cluster you are abandoning. A node whose data dir was lost mints a second identity and would otherwise serve clients an empty store; it now latches NotReady once it hears the other cluster's gossip (a genuine first bootstrap hears none, so it is unaffected) |
 | `MQTTD_HEALTH_BIND` | HTTP health-probe bind, e.g. `0.0.0.0:8080` — serves `GET /livez`, `/readyz` & `/metrics` (Prometheus) |
 | `MQTTD_READY_MIN_MEMBERS` | Smallest mesh size `/readyz` accepts (default 1) |
 | `MQTTD_METRICS_BIND` | Optional separate bind for `GET /metrics`, to isolate the scrape from the health probes (internal/ops network only) |

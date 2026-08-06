@@ -87,22 +87,51 @@ gossip is arriving — find the re-founded node and fence it).
 wipe its data dir (including `cluster-id`), and rejoin it with seeds — it adopts the
 surviving cluster's identity and back-fills per ADR 0043.
 
+**The odd one out takes itself out of rotation.** A node that is **alone** in its
+membership view and is **hearing another cluster's gossip** is the divergent side of a
+split brain — it rejects every foreign datagram, so it never learns a peer, while the
+healthy majority has each other. It reports `NotReady` rather than serve clients an empty
+session and retained store, and says why, so this is not mistaken for a slow start:
+
+```
+curl -s <pod>:8080/statusz | jq .quarantine
+{ "active": true, "reason": "refounded-beside-live-cluster" }
+```
+
+Alert on `mqttd_refound_quarantine == 1`: unlike an ordinary NotReady pod, this one
+never recovers on its own. Two consequences to expect while it sits there — under
+`podManagementPolicy: OrderedReady` a NotReady pod-0 blocks replacement of higher
+ordinals, and it counts against the PodDisruptionBudget, so node drains stall. Both are
+the incident being loud, not a second fault. Clear it with the recovery above.
+
+A genuine first bootstrap is alone too, but hears no foreign gossip, so the guard cannot
+misfire there. The verdict is live, not latched: a node that rejoins properly serves
+again on its own. To
+re-bootstrap deliberately beside a cluster you are abandoning, set
+`MQTTD_REFOUND_GUARD=false` (env, so it needs no config edit or roll) or
+`[cluster] refound_guard = false`.
+
 ## The founder rule (read before touching pod-0's storage)
 
 Pod-0 renders with **no seeds**: a pod-0 that starts with an *empty data dir and no
 seeds* founds a **new** lease group. With its PV intact this never happens (it knows it
 is initialized and rejoins). But **never delete pod-0's PVC while a cluster is live** —
-a fresh, seedless pod-0 would found a second cluster beside the survivors (split
-brain). If pod-0's volume is lost:
+a fresh, seedless pod-0 would found a second cluster beside the survivors (split brain).
 
-1. Scale the StatefulSet so pod-0 is excluded from client traffic (it will not pass
-   the joiner readiness floor of other pods; the founder floor is 1 — act promptly).
-2. Recreate its PVC empty and give it seeds for recovery: temporarily set the
-   config's seed rendering via `helm upgrade --set-string` overriding `config` so
-   ordinal 0 also seeds to ordinal 1 (a values override of the `config` blob), let it
-   join as a *replacement* node ([ADR 0043](adr/0043-elastic-cluster-resize.md)'s
-   replace motion) and back-fill from the survivors.
-3. Restore the normal config with the next `helm upgrade`.
+If pod-0's volume is lost, the broker contains the damage itself: the re-founded pod-0
+is alone and hears the surviving cluster, so it self-quarantines (above) within about a
+second of its gossip socket binding — before it could pass readiness — and never enters
+the client Service. This holds across restarts, including the operator's fence deleting
+and recreating it. Recovery is then the
+ordinary replace motion — wipe its data dir and give it seeds so it JOINS
+([ADR 0043](adr/0043-elastic-cluster-resize.md)) and back-fills from the survivors.
+
+> **Note (2026-08-06):** an earlier version of this runbook said to give ordinal 0 seeds
+> with `helm upgrade --set-string` overriding `config`. That could not work: the
+> ordinal-0 "no seeds" decision lives in the **init-container script**, not in the
+> `config` blob, so overriding `config` cannot reach it. Rendering a pod-0 that joins
+> instead of founding is tracked as ADR 0055 T9; until it lands, recovery is the
+> self-quarantine above plus the manual wipe-and-rejoin.
 
 ## Rolling upgrades
 
@@ -132,6 +161,7 @@ the demo dashboard's "Operator signals" row):
 | **Split brain** | `count(count by (cluster_id) (mqttd_cluster_info == 1)) > 1` across the fleet | Fence the new founder (see split-brain detection above) |
 | **Unexpected founding** | `increase(mqttd_foundings_total[1h]) > 0` after day one | Same — a node founded a second cluster |
 | **Foreign gossip arriving** | `rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0` | Contained, but find and fix the re-founded node |
+| **Node self-quarantined** | `mqttd_refound_quarantine == 1` | This node re-founded beside a live cluster and took itself out of rotation; it never recovers on its own — wipe and rejoin it (see the founder rule) |
 | **Brownout** | `mqttd_brownout == 1` (page); `sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8` (warn) | Expand the PVC / raise the watermark / prune retained |
 | **Stuck drain** | `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m | Inspect the drain logs; the grace deadline will fall back to crash semantics |
 | **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | Node not catch-up-current; takeover from it would be degraded |

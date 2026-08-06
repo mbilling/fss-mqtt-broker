@@ -286,6 +286,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|d| std::path::Path::new(d).join("cluster-id")),
         )?,
     );
+    // Evidence for the re-found self-quarantine (issue #92 follow-up): set the first
+    // time the gossip driver drops a datagram from a FOREIGN cluster. Created here
+    // because health starts long before the gossip plane, and both need the handle.
+    //
+    // Cluster-configured is the same predicate the hub is told (peer/gossip networking
+    // is set up), hoisted so readiness can be armed before the cluster plane exists.
+    let cluster_configured = config.cluster.peer_bind.is_some()
+        || !config.cluster.peers.is_empty()
+        || config.cluster.swim.bind.is_some()
+        || !config.cluster.swim.seeds.is_empty();
+    let foreign_cluster_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Config stamp (ADR 0054 T3): checksum + generation of the applied config,
     // recorded at startup and on every successful reload.
     let config_stamp = Arc::new(mqttd::reload::ConfigStamp::default());
@@ -346,6 +357,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &store_snapshot,
         &config_stamp,
         &swim_key_fps,
+        // Arm the guard only for a cluster node that has not opted out.
+        (cluster_configured && config.cluster.refound_guard).then(|| foreign_cluster_seen.clone()),
     )
     .await?;
 
@@ -434,6 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         durable_plane.clone(),
         cluster_identity.clone(),
         swim_key_fps.clone(),
+        foreign_cluster_seen.clone(),
     )
     .await?;
 
@@ -1253,6 +1267,7 @@ async fn start_health(
     store_snapshot: &Arc<mqttd::store_watch::StoreSnapshot>,
     config_stamp: &Arc<mqttd::reload::ConfigStamp>,
     swim_key_fps: &Arc<std::sync::OnceLock<Vec<String>>>,
+    refound_evidence: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -1294,6 +1309,12 @@ async fn start_health(
             .as_ref()
             .map(|_| store_snapshot.clone()),
     );
+    // Re-found self-quarantine (issue #92 follow-up): a node that minted an identity
+    // this boot AND then hears gossip from another cluster refuses to serve.
+    let state = match refound_evidence {
+        Some(evidence) => state.with_refound_guard(evidence),
+        None => state,
+    };
     let draining = state.draining_handle();
     let decommission = state.decommission_slot();
     if let Some(bind) = &health_bind {
@@ -1689,6 +1710,9 @@ async fn start_swim(
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     cluster_identity: Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
     swim_key_fps: Arc<std::sync::OnceLock<Vec<String>>>,
+    // Set on the first FOREIGN-cluster datagram — the evidence the re-found
+    // self-quarantine keys on (issue #92 follow-up).
+    foreign_cluster_seen: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
@@ -1791,7 +1815,22 @@ async fn start_swim(
     // Count dropped gossip datagrams by reason on the metrics registry (ADR 0003-T6).
     let reject: swim_driver::RejectCounter = {
         let m = metrics.clone();
-        Arc::new(move |reason: &'static str| m.gossip_rejected(reason))
+        let seen = foreign_cluster_seen.clone();
+        Arc::new(move |reason: &'static str| {
+            m.gossip_rejected(reason);
+            // Foreign-cluster gossip is the evidence the self-quarantine keys on: another
+            // cluster is answering for this address space. Log ONCE, on the transition —
+            // this is the line that explains an otherwise inexplicable NotReady node.
+            if reason == "cluster-mismatch" && !seen.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                warn!(
+                    "gossip from a DIFFERENT cluster is arriving: if this node minted its \
+                     own identity at boot it has re-founded beside a live cluster and will \
+                     refuse to serve (see docs/OPERATIONS.md split-brain recovery); set \
+                     MQTTD_REFOUND_GUARD=false only to re-bootstrap deliberately"
+                );
+            }
+        })
     };
     // Rotation posture (ADR 0054 T3): the accepted-key fingerprints, for /statusz
     // and the swim_keys_accepted gauge (1 steady; 2 = a rotation window is open).

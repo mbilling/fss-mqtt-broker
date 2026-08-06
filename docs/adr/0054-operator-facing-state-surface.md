@@ -75,3 +75,51 @@ voter ids) goes in the JSON body; only bounded values become metrics.**
   persisted, gossip-propagated, and guarded (`cluster-mismatch` gossip rejections) —
   turning split-brain from undetectable to detected *and* contained; then key-
   rotation fingerprints and config checksum/generation for convergence checks.
+
+## Amendment (2026-08-06): the re-founder quarantines itself
+
+T2 made a second, separately-founded cluster **detectable** (compare `cluster_id` across
+`/statusz`) and **contained at the gossip layer** (foreign datagrams are dropped and
+counted). Containment was scoped to membership, and that scope turned out to be too
+narrow: the divergent node's own MQTT listener was untouched. A pod-0 whose volume is
+lost mints a new identity, its single-voter lease group elects itself, `members = 1`
+satisfies the founder's `ready_min_members = 1`, and `/readyz` returns 200 — so it joins
+the client Service endpoints and serves a share of connections from an empty session and
+retained store, beside the real cluster. Detection told an operator to "act promptly"; it
+did not stop the node serving in the meantime.
+
+**A node now refuses to serve when, with the guard armed (cluster networking configured
+and not disabled), both hold:** it has observed at least one `cluster-mismatch` gossip
+rejection, **and** its membership view holds only itself. Surfaced as `/statusz`'s
+`quarantine` block and the `mqttd_refound_quarantine` gauge.
+
+Those two identify the divergent node and only the divergent node. It rejects every
+foreign datagram, so it never learns a peer and its view stays at one; the healthy
+majority sees exactly the same foreign gossip — from the divergent node — but has each
+other, so it keeps serving. A genuine first bootstrap is alone too, but nothing is alive
+to send it foreign gossip, so the rule **cannot** fire there — which matters, because
+`podManagementPolicy: OrderedReady` means pod-0 must reach Ready alone or no other pod is
+ever created. The evidence lands ~1 s after the gossip socket binds, well inside the ~5 s
+the startup probe takes, so in practice the divergent node never reaches the Service.
+
+The first design keyed the rule on `ClusterIdentity::minted` — "this process minted an
+identity and then heard another cluster" — and the kind e2e falsified it. `minted` is
+per-PROCESS while the divergence lives on disk: the re-founder mints only in its first
+life, and once it has written the new `cluster-id`, every later life *loads* it and looks
+innocent. The operator's fence, by deleting the pod, is exactly what ends that first life,
+so the guard would have been inert in the case it was built for. Membership survives a
+restart; provenance does not.
+
+The verdict is evaluated live rather than latched, so a node that legitimately rejoins
+serves again with no operator action — and the divergent node cannot exploit that, since
+it rejects the very gossip that would grow its view.
+
+The latch fires regardless of gossip authentication. On an unauthenticated mesh a spoofed
+datagram could hold a founder NotReady — but that same port already accepts injected
+`Dead` claims that tear down routing, which is strictly worse, and the broker warns about
+it at startup. `[cluster] refound_guard = false` (env `MQTTD_REFOUND_GUARD`, so it is
+reachable mid-incident without a config roll) is the escape for a deliberate re-bootstrap
+beside a cluster being abandoned.
+
+This is containment, not prevention: the node still re-founds, and still needs the
+documented wipe-and-rejoin. Making a wiped pod-0 *join* instead of found is ADR 0055 T9.
