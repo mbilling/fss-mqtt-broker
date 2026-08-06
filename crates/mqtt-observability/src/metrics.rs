@@ -135,6 +135,7 @@ struct OtelInstruments {
     replica_groups_tracked: OtelGauge<i64>,
     cluster_info: OtelGauge<i64>,
     founder: OtelGauge<i64>,
+    refound_quarantine: OtelGauge<i64>,
     foundings: OtelCounter<u64>,
     config_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
@@ -188,6 +189,7 @@ impl OtelInstruments {
             replica_groups_tracked: meter.i64_gauge("replica_groups_tracked").build(),
             cluster_info: meter.i64_gauge("cluster_info").build(),
             founder: meter.i64_gauge("founder").build(),
+            refound_quarantine: meter.i64_gauge("refound_quarantine").build(),
             foundings: meter.u64_counter("foundings").build(),
             config_info: meter.i64_gauge("config_info").build(),
             swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
@@ -272,6 +274,7 @@ pub struct Metrics {
     cluster_info: Family<ClusterIdLabel, Gauge>,
     /// 1 when this node is the cluster founder (started seedless), else 0.
     founder: Gauge,
+    refound_quarantine: Gauge,
     /// Founding events: this process minted a NEW cluster identity. Exactly one,
     /// ever, on a healthy cluster's first boot — any increment after day one is
     /// the split-brain alarm.
@@ -550,6 +553,13 @@ impl Metrics {
             "founder",
             "1 if this node founded the cluster (started seedless), else 0",
         );
+        let refound_quarantine = register_gauge(
+            &mut registry,
+            "refound_quarantine",
+            "1 if this node re-founded a cluster beside a live one and has taken \
+             ITSELF out of rotation (it will not become ready again without the \
+             documented wipe-and-rejoin), else 0",
+        );
         let foundings_total = register_counter(
             &mut registry,
             "foundings",
@@ -631,6 +641,7 @@ impl Metrics {
             replica_groups_tracked,
             cluster_info,
             founder,
+            refound_quarantine,
             foundings_total,
             config_info,
             config_info_prev: std::sync::Mutex::new(None),
@@ -965,6 +976,17 @@ impl Metrics {
     pub fn set_founder(&self, founder: bool) {
         self.founder.set(i64::from(founder));
         self.otel.founder.record(i64::from(founder), &[]);
+    }
+
+    /// Publish the re-found self-quarantine state (issue #92 follow-up). `true` means
+    /// this node minted its own identity and then heard gossip from another cluster, so
+    /// it refuses to serve. Alert on it: unlike an ordinary `NotReady` pod, this one never
+    /// recovers on its own.
+    pub fn set_refound_quarantine(&self, quarantined: bool) {
+        self.refound_quarantine.set(i64::from(quarantined));
+        self.otel
+            .refound_quarantine
+            .record(i64::from(quarantined), &[]);
     }
 
     /// A founding event: this process minted a new cluster identity.

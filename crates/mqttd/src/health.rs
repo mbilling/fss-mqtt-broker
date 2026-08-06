@@ -111,6 +111,10 @@ pub struct HealthState {
     /// Accepted SWIM key fingerprints (rotation posture, ADR 0054 T3); filled
     /// once the gossip plane starts. Fingerprints only — never material.
     keys: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
+    /// Re-found self-quarantine (issue #92 follow-up): `(guard enabled and cluster
+    /// networking configured, foreign-cluster gossip seen)`. `None` when the guard is
+    /// off or this is not a cluster node. See [`Self::refound_quarantined`].
+    refound: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -133,7 +137,7 @@ struct Report {
     decommission: Option<(usize, u64, bool)>,
     /// Durable-serviceability signals (ADR 0049), reported in the body so an operator
     /// probing a suspect node can see a *green-but-degraded* durable plane — without
-    /// changing the ready/NotReady contract the plain `/readyz` status code carries.
+    /// changing the ready/`NotReady` contract the plain `/readyz` status code carries.
     /// `voters`: current lease-group voter count; `quorum_ack_age_ms`: ms since the
     /// leader last had a quorum ack (a growing value is the fsync-bound degradation
     /// behind the 2026-07-14 incident).
@@ -193,6 +197,7 @@ impl HealthState {
             decommission: Arc::new(OnceLock::new()),
             metrics: None,
             identity: None,
+            refound: None,
             brownout: None,
             stores: None,
             config: None,
@@ -226,6 +231,53 @@ impl HealthState {
     pub fn with_metrics(mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Arm the re-found self-quarantine (issue #92 follow-up, ADR 0054 amendment).
+    ///
+    /// `evidence` is set by the gossip driver the first time it drops a datagram from a
+    /// FOREIGN cluster. Pass `None` (do not call this) when `cluster.refound_guard` is
+    /// off or the node is not cluster-configured — a standalone broker has no second
+    /// cluster to be confused with.
+    #[must_use]
+    pub fn with_refound_guard(mut self, evidence: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.refound = Some(evidence);
+        self
+    }
+
+    /// Whether this node has quarantined ITSELF as the odd one out of a split brain.
+    ///
+    /// True when the guard is armed (cluster-configured, not disabled) and both:
+    ///
+    /// 1. **another cluster's gossip has been observed** — datagrams stamped with a
+    ///    different identity, which this node drops as `cluster-mismatch`; and
+    /// 2. **this node is alone** — its membership view holds only itself.
+    ///
+    /// Together those identify the divergent node and only the divergent node. It
+    /// rejects every foreign datagram, so it never learns a peer and its view stays at
+    /// one indefinitely; the healthy majority sees the same foreign gossip but has each
+    /// other, so it keeps serving. A genuine first bootstrap is alone too — but nothing
+    /// is alive to send it foreign gossip, so the first conjunct is unreachable and
+    /// ordered bring-up is unaffected.
+    ///
+    /// Deliberately **not** keyed on `ClusterIdentity::minted`. That was the first
+    /// design and the kind e2e falsified it: `minted` is per-PROCESS, while the
+    /// divergence lives on disk. The re-founder mints only in its first life; once it
+    /// has written the new `cluster-id`, every later life *loads* it and looks
+    /// innocent — and the operator's fence, by deleting the pod, is exactly what ends
+    /// that first life. Membership is the property that survives a restart.
+    ///
+    /// Evaluated live rather than latched, so a node that legitimately rejoins (its
+    /// view grows past one) serves again without an operator having to clear anything.
+    fn refound_quarantined(&self) -> bool {
+        let Some(evidence) = &self.refound else {
+            return false;
+        };
+        if !evidence.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        // `None` = not cluster-configured, which the arming check already excludes.
+        self.member_count().is_some_and(|n| n <= 1)
     }
 
     /// A handle to this state's draining flag (ADR 0019). Setting it makes `/readyz`
@@ -268,7 +320,15 @@ impl HealthState {
         let members = self.member_count();
         let lease_group_ready = self.durable.as_ref().map(DurablePlane::lease_group_ready);
         let draining = self.draining.load(std::sync::atomic::Ordering::Acquire);
-        let ready = !draining
+        let refound_quarantined = self.refound_quarantined();
+        // Publish it as a gauge too (ADR 0020): a node that has quarantined itself is
+        // NotReady forever, which no orchestrator-level alert distinguishes from a slow
+        // start. This is the alertable signal.
+        if let Some(m) = &self.metrics {
+            m.set_refound_quarantine(refound_quarantined);
+        }
+        let ready = !refound_quarantined
+            && !draining
             && live
             && members.is_none_or(|n| n >= self.min_members)
             && lease_group_ready.unwrap_or(true);
@@ -342,6 +402,16 @@ impl HealthState {
         // "every pod reports the SAME cluster_id".
         if let Some(id) = cluster.get() {
             let _ = write!(s, ",\"cluster_id\":\"{}\"", json_escape(&id));
+        }
+        // Self-quarantine (issue #92 follow-up): this node re-founded beside a live
+        // cluster and has taken itself out of rotation. Reported explicitly, because a
+        // node that is merely NotReady looks like one that is still starting — and this
+        // one will never become ready on its own.
+        if self.refound_quarantined() {
+            let _ = write!(
+                s,
+                ",\"quarantine\":{{\"active\":true,\"reason\":\"refounded-beside-live-cluster\"}}"
+            );
         }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
@@ -685,6 +755,95 @@ mod tests {
     }
 
     /// ADR 0054: `/statusz` reports the structured operator-facing state —
+    /// Build a state with the re-found guard armed. `members` is this node's
+    /// membership view size (1 = alone), `evidence` whether foreign-cluster gossip has
+    /// been seen.
+    fn guarded_state(
+        members: usize,
+        evidence: bool,
+    ) -> (HealthState, Arc<std::sync::atomic::AtomicBool>) {
+        let cluster = Arc::new(
+            mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+        );
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(evidence));
+        let state = HealthState::new(spawn_live_hub(), Some(placement(members)), None, 1)
+            .with_status(
+                "node-a".into(),
+                cluster,
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            )
+            .with_refound_guard(seen.clone());
+        (state, seen)
+    }
+
+    /// THE case the guard must never break: a genuine first bootstrap.
+    ///
+    /// pod-0 comes up alone, founds the cluster, and must reach Ready by itself — under
+    /// `podManagementPolicy: OrderedReady` nothing else is created until it does, so a
+    /// guard that refused readiness to a lone node would deadlock every fresh install.
+    /// It is safe because being alone is not enough: foreign gossip must ALSO have
+    /// arrived, and on a first boot nothing is alive to send any.
+    #[tokio::test]
+    async fn a_first_cold_start_is_ready_alone() {
+        let (state, _) = guarded_state(1, false);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(
+            status, 200,
+            "alone with no foreign gossip is a bootstrap, not a split brain"
+        );
+    }
+
+    /// The divergent node — alone, because it rejects every datagram from the cluster
+    /// that owns this address space — takes itself out of rotation rather than serve
+    /// clients an empty session and retained store (issue #92 follow-up).
+    #[tokio::test]
+    async fn a_node_alone_beside_a_foreign_cluster_quarantines_itself() {
+        let (state, _) = guarded_state(1, true);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(status, 503, "the odd one out must refuse to serve");
+
+        // And it must SAY so: a merely-`NotReady` node looks like one still starting,
+        // whereas this one will not recover without operator action.
+        let (status, body, _) = super::route(&state, "/statusz").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("\"quarantine\":{\"active\":true"),
+            "the quarantine must be visible in /statusz: {body}"
+        );
+        assert!(body.contains("refounded-beside-live-cluster"), "{body}");
+    }
+
+    /// The healthy majority sees exactly the same foreign gossip — from the divergent
+    /// node — and must keep serving. Being alone is what separates the two, so a node
+    /// with peers is never quarantined however much foreign gossip arrives.
+    #[tokio::test]
+    async fn the_healthy_majority_is_not_quarantined_by_foreign_gossip() {
+        let (state, _) = guarded_state(3, true);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(
+            status, 200,
+            "a node with peers is the cluster, not the odd one out"
+        );
+    }
+
+    /// The verdict tracks membership LIVE rather than latching: a node that rejoins
+    /// properly serves again with no operator action. (The divergent node cannot use
+    /// this to escape — it rejects the very gossip that would grow its view.)
+    #[tokio::test]
+    async fn rejoining_the_cluster_clears_the_quarantine() {
+        let (state, seen) = guarded_state(1, false);
+        seen.store(true, std::sync::atomic::Ordering::Release);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(status, 503, "alone + foreign gossip = quarantined");
+
+        let (rejoined, _) = guarded_state(2, true);
+        let (status, _, _) = super::route(&rejoined, "/readyz").await;
+        assert_eq!(status, 200, "once it has a peer it is no longer alone");
+    }
+
     /// identity, membership view, brownout state (with a since-timestamp while
     /// active), and the peer protocol range — and always answers 200 (only
     /// `/readyz` carries readiness in its status code).

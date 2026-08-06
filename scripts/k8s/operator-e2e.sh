@@ -16,7 +16,9 @@
 #   4. An INDUCED SPLIT BRAIN (wipe the founder's volume so it re-founds) is
 #      detected and, with remediation opt-in, fenced — PVC labelled, pod deleted,
 #      DATA NEVER DELETED — and the verdict HOLDS: the fence fires once, so the
-#      incident stays visible instead of flickering behind a restart loop.
+#      incident stays visible instead of flickering behind a restart loop. The
+#      re-founded pod must ALSO have quarantined itself, so it serves no clients
+#      while the incident stands.
 #
 # Requires: docker, kind, kubectl, cargo. Builds both images itself. Nightly tier.
 set -euo pipefail
@@ -255,6 +257,16 @@ for _ in $(seq 1 20); do
 done
 [ "$held" -ge 18 ] \
   || fail "SplitBrain held for only $held/20 samples — the operator is re-fencing and hiding the incident"
+
+# The re-founder must have taken ITSELF out of rotation (issue #92 follow-up): it minted
+# a second identity and then heard the surviving cluster's gossip, so it latches NotReady
+# rather than serve clients an empty session and retained store. Without this the pod is
+# Ready — the founder readiness floor is 1 — and takes a share of client connections.
+ready0="$(kubectl -n "$NS" get pod e2e-0 \
+  -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+[ "$ready0" = "True" ] \
+  && fail "the re-founded pod-0 is READY — it is serving clients from an empty store"
+echo "the re-founded pod-0 self-quarantined (Ready=$ready0), so it serves no clients"
 kubectl -n "$NS" get pvc data-e2e-0 >/dev/null || fail "the PVC was DELETED — data must never be destroyed"
 echo "split brain verdict STABLE ($held/20 samples) with the PVC intact"
 
