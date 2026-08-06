@@ -146,3 +146,43 @@ broker suites' job; the operator e2e asserts orchestration, not message durabili
 - New failure surface: the controller itself. Leader election, idempotent
   reconciliation, and the e2e suite are the mitigations; the broker never depends on
   the operator being alive (it only makes day-2 unattended).
+
+## Amendment (2026-08-06): the founder guard is a render-time property, not a remediation (T9)
+
+§3.1 listed three fence actions, the third being "re-render its seeds for the ADR 0043
+replace motion", and §3.5 promised a founder-PVC-loss guard: "before (re)creating pod-0,
+the operator checks for a live cluster whose identity pod-0's volume no longer carries".
+Neither was built. Both were nominally owned by T4, whose title named them and whose
+evidence did not — so nothing open tracked them, and the fence shipped doing two of its
+three jobs. The consequence was not cosmetic: a fenced pod-0 came straight back, re-founded,
+and (until the ADR 0054 amendment) served clients from an empty store.
+
+§3.5 is also **unimplementable as written**. The operator does not create pods — the
+StatefulSet controller does — and there is no hook between "pod-0 is about to be created"
+and "pod-0 starts". Any check at that moment races the kubelet. The guarantee has to be a
+standing property of what is rendered, true before the pod exists.
+
+**So the guard is render-time.** The per-pod init script gains `CLUSTER_ESTABLISHED`:
+when set, ordinal 0 renders seeds pointing at its peers instead of the empty list that
+makes it a founder, and a pod-0 whose volume is lost REJOINS and back-fills instead of
+minting a second identity. The chart exposes it as `clusterEstablished` (default false —
+a first install must be able to bootstrap); the operator sets it from `status.bootstrapped`,
+latched the first time exactly one cluster identity is observed from a reachable pod and
+monotonic thereafter, so absent evidence can never re-arm founding.
+
+Two carve-outs, both load-bearing: `replicaCount < 2` still founds (a single-node cluster
+has no survivor to split from), and `spec.bootstrapPolicy: AllowRebootstrap` is the
+break-glass for total volume loss or a deliberate re-bootstrap — it clears the latch
+rather than leaving it stale, and is loud while set.
+
+`READY_MIN` stays 1 for ordinal 0. The safety comes from the seed list being non-empty:
+with seeds, the node mints nothing and bootstraps no lease group, so readiness gates on
+real admission. Raising the floor would add a second, independent way to deadlock.
+
+`SplitBrainAction` gains no variant. The guard must apply under the default `Alert`
+posture — an operator installed with defaults must still be protected — and a "rejoin"
+remediation would imply the operator wiping a data dir, which the missing PVC-delete verb
+in its Role exists to forbid.
+
+§3.1's third action is therefore satisfied by construction rather than by the fence, and
+the fence keeps doing what it does: quarantine the PVC by label, delete the pod, once.

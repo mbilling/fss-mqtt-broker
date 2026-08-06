@@ -165,13 +165,35 @@ pub async fn reconcile(obj: Arc<MqttdCluster>, ctx: Arc<Context>) -> Result<Acti
 
     let pods = cluster_pods(&ctx.client, &obj).await?;
     let probes = probe_all(&ctx.http, &pods).await;
-    let observation = observe(&probes, obj.spec.replicas, obj.metadata.generation);
+    let mut observation = observe(&probes, obj.spec.replicas, obj.metadata.generation);
 
-    let patch = serde_json::json!({
+    // The founder latch (ADR 0055 T9). Once one cluster identity has been observed, a
+    // cluster demonstrably exists, so ordinal 0 must never found again — the next
+    // `apply_owned` renders it with seeds and a lost pod-0 volume REJOINS. Monotonic:
+    // absent evidence never re-arms founding.
+    let prev = obj.status.as_ref().and_then(|s| s.bootstrapped);
+    let latched = crate::observe::latch_bootstrapped(
+        prev,
+        obj.spec.bootstrap_policy,
+        observation.status.cluster_id.iter().count(),
+    );
+    observation.status.bootstrapped = latched;
+
+    // `Patch::Merge` omits `None` fields, which is what keeps the latch monotonic —
+    // but clearing it under AllowRebootstrap must actually reach the API, so that one
+    // case is patched as an explicit null.
+    let mut patch = serde_json::json!({
         "apiVersion": "mqttd.io/v1alpha1",
         "kind": "MqttdCluster",
         "status": observation.status,
     });
+    if latched.is_none() && prev.is_some() {
+        patch["status"]["bootstrapped"] = serde_json::Value::Null;
+        warn!(
+            resource = %name,
+            "bootstrapPolicy=AllowRebootstrap: ordinal 0 may FOUND a new cluster again —              set it back to Guarded once the cluster is re-formed"
+        );
+    }
     api.patch_status(&name, &PatchParams::apply(MANAGER), &Patch::Merge(&patch))
         .await?;
 

@@ -97,6 +97,21 @@ extraEnv: []
 #    value: /etc/mqttd/gossip/swim-key
 
 # --- Persistence (ADR 0018) -----------------------------------------------------------------
+# FOUNDER GUARD (ADR 0055 T9). Leave false for the FIRST install: ordinal 0 founds the
+# cluster precisely because it renders no seeds, and with this on nothing would ever
+# bootstrap. Turn it on once the cluster is formed:
+#
+#     helm upgrade <release> deploy/helm/mqttd --reuse-values --set clusterEstablished=true
+#
+# From then on ordinal 0 seeds to its peers like any joiner, so a pod-0 whose volume is
+# lost REJOINS and back-fills (ADR 0043) instead of founding a second cluster beside the
+# survivors. Ignored when replicaCount < 2 — a single-node cluster has no survivor to
+# split from and must still be able to found.
+#
+# The operator sets this for you: it latches status.bootstrapped the first time it
+# observes one cluster identity. Chart-only users flip it by hand, once.
+clusterEstablished: false
+
 # Each pod gets its OWN PersistentVolume (volumeClaimTemplate) for the redb data dir, so a
 # rescheduled pod reattaches its volume and recovers durable state — never the ephemeral trap.
 persistence:

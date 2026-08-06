@@ -47,6 +47,15 @@
               "spec": {
                 "description": "The desired state of one mqttd cluster.",
                 "properties": {
+                  "bootstrapPolicy": {
+                    "default": "Guarded",
+                    "description": "Whether ordinal 0 may found a cluster (ADR 0055 §3.5, T9).\n\nNOT a remediation: the guard is a rendering property that must hold before a\npod starts, and it applies with the default Alert-only posture — an operator\ninstalled with defaults must still be protected from a lost pod-0 volume.",
+                    "enum": [
+                      "Guarded",
+                      "AllowRebootstrap"
+                    ],
+                    "type": "string"
+                  },
                   "config": {
                     "description": "The broker config TOML template — the SAME contract as the chart's\n`values.config` (ADR 0046): `__NODE_ID__`, `__SEEDS__`,\n`__PEER_ADVERTISE__`, and `__READY_MIN__` are rendered per pod.",
                     "type": "string"
@@ -163,6 +172,11 @@
                 "description": "The observed state, aggregated from `/statusz` + metrics (ADR 0054).",
                 "nullable": true,
                 "properties": {
+                  "bootstrapped": {
+                    "description": "Whether a cluster has ever been observed to exist (ADR 0055 T9).\n\nLatched the first time exactly one cluster identity is seen from a REACHABLE\npod, and monotonic thereafter — `patch_status` merges, and this field is\nomitted when there is no opinion, so a pass that observes nothing leaves the\nprior value alone. Once latched, ordinal 0 renders seeds and can no longer\nfound. Cleared only under `bootstrapPolicy: AllowRebootstrap`.",
+                    "nullable": true,
+                    "type": "boolean"
+                  },
                   "brownout": {
                     "description": "Whether any pod reports disk brownout.",
                     "nullable": true,
