@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a capability or a change in behaviour.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Worth a look first: the [delivery
+        dashboard](https://github.com/mbilling/fss-mqtt-broker/blob/main/docs/delivery/STATUS.md)
+        lists what is built and what is planned, and the README's **Limitations**
+        section lists the known gaps. Yours may already be tracked — a comment on
+        the existing task is more useful than a new issue.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: >
+        The situation, not the solution. What are you doing, what stops you, and
+        what do you do instead today? A concrete workaround you dislike is the
+        most useful thing you can write here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+      description: If you have a shape in mind, sketch it — config, API, behaviour.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What else did you consider?
+      description: >
+        Including "do nothing". Significant decisions here are recorded as ADRs
+        with their alternatives, so this section tends to become the record.
+
+  - type: dropdown
+    id: security
+    attributes:
+      label: Does this touch a security boundary?
+      description: >
+        Authentication, authorization, transport, audit, or the cluster bus.
+        Changes there are held to a higher bar and default to refusing.
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
