@@ -14,7 +14,7 @@
 //! templates they mirror, and the parity diff operates on the same representation the
 //! cluster receives.
 
-use crate::crd::MqttdCluster;
+use crate::crd::{BootstrapPolicy, MqttdCluster};
 use kube::ResourceExt;
 use serde_json::{json, Value};
 
@@ -38,8 +38,18 @@ ORD="${POD_NAME##*-}"
 STS="${POD_NAME%-*}"
 SEED0="\"${STS}-0.${HEADLESS_DOMAIN}:7946\""
 SEED1="\"${STS}-1.${HEADLESS_DOMAIN}:7946\""
+SEED2="\"${STS}-2.${HEADLESS_DOMAIN}:7946\""
 if [ "$ORD" = "0" ]; then
-  SEEDS=""
+  # Ordinal 0 founds the cluster precisely BECAUSE it renders no seeds. Once a cluster
+  # exists, founding again is the split-brain bug: a pod-0 whose volume was lost would
+  # mint a SECOND identity beside the live one. CLUSTER_ESTABLISHED disarms the founder
+  # so pod-0 seeds to its peers like any joiner and a wiped volume REJOINS instead.
+  # A 1-replica cluster has no survivor to split from, so it may still found.
+  if [ "${CLUSTER_ESTABLISHED:-}" = "true" ] && [ "$REPLICAS" -gt 1 ]; then
+    if [ "$REPLICAS" = "2" ]; then SEEDS="$SEED1"; else SEEDS="${SEED1}, ${SEED2}"; fi
+  else
+    SEEDS=""
+  fi
   READY_MIN=1
 else
   if [ "$ORD" = "1" ]; then SEEDS="$SEED0"; else SEEDS="${SEED0}, ${SEED1}"; fi
@@ -52,19 +62,29 @@ PEER_ADVERTISE="${POD_NAME}.${HEADLESS_DOMAIN}:7001"
 sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
   -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
   -e "s/__READY_MIN__/${READY_MIN}/g" \
-  /tmpl/mqttd.toml.tmpl > /config/mqttd.toml
+  "${TMPL_DIR:-/tmpl}/mqttd.toml.tmpl" > "${OUT_DIR:-/config}/mqttd.toml"
 # A short write — e.g. a full ephemeral-storage volume — leaves sed exit 0 with a
 # 0-byte file, and the broker then boots on pure DEFAULTS (no listeners, node id
 # "node-local"): alive as a process, bound to nothing. An empty render is never a
 # valid config, so fail the init container loudly instead of starting a broker
 # that can only fail its probes.
-if [ ! -s /config/mqttd.toml ]; then
+if [ ! -s "${OUT_DIR:-/config}/mqttd.toml" ]; then
   echo "FATAL: rendered config is empty — is /config out of space?" >&2
   exit 1
 fi
 echo "rendered config for ${POD_NAME} (ordinal ${ORD}):"
-cat /config/mqttd.toml
+cat "${OUT_DIR:-/config}/mqttd.toml"
 "#;
+
+/// Whether ordinal 0 must be stopped from founding (ADR 0055 T9).
+///
+/// True once the operator has observed a cluster identity (`status.bootstrapped`) and
+/// the human has not asked to re-bootstrap. Deliberately a function of the CR alone, so
+/// `render` stays pure and the parity gate can drive both states.
+fn founding_disarmed(cr: &MqttdCluster) -> bool {
+    cr.spec.bootstrap_policy == BootstrapPolicy::Guarded
+        && cr.status.as_ref().and_then(|s| s.bootstrapped) == Some(true)
+}
 
 /// Default broker image when the CR does not pin one.
 const DEFAULT_IMAGE: &str = concat!(
@@ -290,6 +310,17 @@ fn statefulset(cr: &MqttdCluster, names: &Names) -> Value {
         .clone()
         .unwrap_or_else(|| DEFAULT_IMAGE.into());
     let headless_domain = format!("{}.{}.svc.cluster.local", names.headless, names.namespace);
+    // The render init container's environment. CLUSTER_ESTABLISHED is appended only
+    // once a cluster demonstrably exists (ADR 0055 T9), so a fresh CR renders exactly
+    // what the chart does with its default — and can still bootstrap.
+    let mut init_env = vec![
+        json!({ "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } }),
+        json!({ "name": "REPLICAS", "value": cr.spec.replicas.to_string() }),
+        json!({ "name": "HEADLESS_DOMAIN", "value": headless_domain }),
+    ];
+    if founding_disarmed(cr) {
+        init_env.push(json!({ "name": "CLUSTER_ESTABLISHED", "value": "true" }));
+    }
     let (secret_mounts, secret_volumes) = secret_wiring(cr);
     let persistence = cr.spec.persistence.as_ref();
     let size = persistence
@@ -364,11 +395,7 @@ fn statefulset(cr: &MqttdCluster, names: &Names) -> Value {
                             "securityContext": security_context(),
                             "command": ["/bin/sh", "-c"],
                             "args": [RENDER_SCRIPT],
-                            "env": [
-                                { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
-                                { "name": "REPLICAS", "value": cr.spec.replicas.to_string() },
-                                { "name": "HEADLESS_DOMAIN", "value": headless_domain },
-                            ],
+                            "env": init_env,
                             "volumeMounts": [
                                 { "name": "config-tmpl", "mountPath": "/tmpl" },
                                 { "name": "config", "mountPath": "/config" },
@@ -443,8 +470,8 @@ fn probe(path: &str, period: i64, failure_threshold: i64) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
-    use crate::crd::MqttdCluster;
+    use super::{render, Rendered, RENDER_SCRIPT};
+    use crate::crd::{BootstrapPolicy, MqttdCluster};
 
     fn sample() -> MqttdCluster {
         serde_json::from_value(serde_json::json!({
@@ -458,6 +485,148 @@ mod tests {
             }
         }))
         .expect("sample CR")
+    }
+
+    /// Run the REAL init script over the (ordinal, guard, replicas) matrix.
+    ///
+    /// The script is the mechanism — it decides, in shell, which pods may found a
+    /// cluster — and it is byte-identical in the chart and the operator, so until now
+    /// nothing exercised it outside a kind cluster. These cases are the whole contract.
+    #[test]
+    fn the_render_script_decides_seeds_by_ordinal_and_guard() {
+        fn render(ord: &str, established: Option<&str>, replicas: &str) -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "mqttd-render-{ord}-{}-{replicas}",
+                established.unwrap_or("unset")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            std::fs::write(
+                dir.join("mqttd.toml.tmpl"),
+                "seeds = [__SEEDS__]\nready_min_members = __READY_MIN__\nid = \"__NODE_ID__\"\npeer = \"__PEER_ADVERTISE__\"\n",
+            )
+            .expect("template");
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(RENDER_SCRIPT)
+                .env("POD_NAME", format!("mqttd-{ord}"))
+                .env("REPLICAS", replicas)
+                .env("HEADLESS_DOMAIN", "mqttd-headless.ns.svc.cluster.local")
+                .env("TMPL_DIR", &dir)
+                .env("OUT_DIR", &dir);
+            if let Some(v) = established {
+                cmd.env("CLUSTER_ESTABLISHED", v);
+            }
+            let out = cmd.output().expect("run the render script");
+            assert!(
+                out.status.success(),
+                "script failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::read_to_string(dir.join("mqttd.toml")).expect("rendered config")
+        }
+        /// Just the `seeds = [...]` line. The node's OWN address also appears in the
+        /// rendered config (as `peer_advertise`), so a whole-file search cannot tell
+        /// "seeds to itself" from "advertises itself".
+        fn seeds_line(config: &str) -> String {
+            config
+                .lines()
+                .find(|l| l.starts_with("seeds ="))
+                .unwrap_or_else(|| panic!("no seeds line in: {config}"))
+                .to_string()
+        }
+
+        // Ordinal 0, guard OFF: seedless, so it founds — the first-bootstrap path that
+        // must keep working, or nothing ever forms.
+        let c = render("0", None, "3");
+        assert_eq!(
+            seeds_line(&c),
+            "seeds = []",
+            "pod-0 must found a fresh cluster"
+        );
+        assert!(c.contains("ready_min_members = 1"), "{c}");
+
+        // Ordinal 0, guard ON: seeded to its PEERS (1 and 2, never itself), so a wiped
+        // volume rejoins instead of founding a second cluster.
+        let c = render("0", Some("true"), "3");
+        let seeds = seeds_line(&c);
+        assert!(
+            seeds.contains("mqttd-1.mqttd-headless"),
+            "must seed to pod-1: {seeds}"
+        );
+        assert!(
+            seeds.contains("mqttd-2.mqttd-headless"),
+            "must seed to pod-2: {seeds}"
+        );
+        assert!(
+            !seeds.contains("mqttd-0.mqttd-headless"),
+            "must NOT seed to itself — a node seeded only to itself still founds: {seeds}"
+        );
+        assert!(
+            c.contains("ready_min_members = 1"),
+            "the founder floor stays 1; safety comes from having seeds: {c}"
+        );
+
+        // Two replicas: the only peer is ordinal 1.
+        let c = render("0", Some("true"), "2");
+        let seeds = seeds_line(&c);
+        assert!(seeds.contains("mqttd-1.mqttd-headless"), "{seeds}");
+        assert!(
+            !seeds.contains("mqttd-2.mqttd-headless"),
+            "no pod-2 exists: {seeds}"
+        );
+
+        // ONE replica: no survivor to split from, so the guard must not strand it.
+        let c = render("0", Some("true"), "1");
+        assert_eq!(
+            seeds_line(&c),
+            "seeds = []",
+            "a single-node cluster has no survivor to split from and must still found"
+        );
+
+        // Joiners are unaffected by the guard, armed or not.
+        for guard in [None, Some("true")] {
+            let c = render("1", guard, "3");
+            assert!(seeds_line(&c).contains("mqttd-0.mqttd-headless"), "{c}");
+            assert!(c.contains("ready_min_members = 2"), "majority floor: {c}");
+            let c = render("2", guard, "3");
+            let seeds = seeds_line(&c);
+            assert!(seeds.contains("mqttd-0.mqttd-headless"), "{seeds}");
+            assert!(seeds.contains("mqttd-1.mqttd-headless"), "{seeds}");
+        }
+    }
+
+    /// The env that arms the guard is emitted ONLY when the CR proves a cluster exists,
+    /// so a fresh CR renders exactly what the chart's default does — and can bootstrap.
+    #[test]
+    fn cluster_established_is_rendered_only_once_bootstrapped() {
+        fn env_of(r: &Rendered) -> String {
+            r.statefulset["spec"]["template"]["spec"]["initContainers"][0]["env"].to_string()
+        }
+        let fresh = sample();
+        assert!(
+            !env_of(&render(&fresh)).contains("CLUSTER_ESTABLISHED"),
+            "a CR with no status must render the bootstrap-capable form"
+        );
+
+        let mut latched = sample();
+        latched.status = Some(crate::crd::MqttdClusterStatus {
+            bootstrapped: Some(true),
+            ..Default::default()
+        });
+        assert!(
+            env_of(&render(&latched)).contains("CLUSTER_ESTABLISHED"),
+            "once an identity has been observed, ordinal 0 must not found again"
+        );
+
+        // Break glass: the human asked to re-bootstrap, so the guard comes off even
+        // though the latch is set.
+        let mut broken_glass = latched.clone();
+        broken_glass.spec.bootstrap_policy = BootstrapPolicy::AllowRebootstrap;
+        assert!(
+            !env_of(&render(&broken_glass)).contains("CLUSTER_ESTABLISHED"),
+            "AllowRebootstrap must re-permit founding"
+        );
     }
 
     /// The rendered set is the chart's object set, named the chart's way.

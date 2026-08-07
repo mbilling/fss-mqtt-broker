@@ -2,7 +2,7 @@
 # Operator end-to-end (ADR 0055 T7) — the runtime proof that the reconciler does
 # what its unit tests claim, against a real API server.
 #
-# Four things are asserted, in order of how much they matter:
+# Five things are asserted, in order of how much they matter:
 #
 #   1. The operator CREATES a working cluster from a CR (apply → StatefulSet →
 #      3/3 Ready → status.phase=Ready with one clusterId).
@@ -13,12 +13,13 @@
 #   3. A SCALE cycle (3->4->3) resizes the set, keeps the cluster identity, raises
 #      no fence, and leaves EVERY claim intact — the departed pod's included, since
 #      no scale may destroy the only copy of anything (issue #97).
-#   4. An INDUCED SPLIT BRAIN (wipe the founder's volume so it re-founds) is
-#      detected and, with remediation opt-in, fenced — PVC labelled, pod deleted,
-#      DATA NEVER DELETED — and the verdict HOLDS: the fence fires once, so the
-#      incident stays visible instead of flickering behind a restart loop. The
-#      re-founded pod must ALSO have quarantined itself, so it serves no clients
-#      while the incident stands.
+#   4. WIPING THE FOUNDER'S VOLUME no longer splits the cluster: with the founder
+#      guard armed, ordinal 0 renders seeds, so an empty data dir makes it REJOIN
+#      the surviving cluster instead of minting a second one (ADR 0055 T9).
+#   5. BREAK GLASS — with re-founding explicitly re-permitted, a real split brain
+#      is still detected and fenced (PVC labelled, pod deleted, DATA NEVER
+#      DELETED), the verdict HOLDS because the fence fires once, and the
+#      re-founder has ALSO quarantined itself so it serves no clients.
 #
 # Requires: docker, kind, kubectl, cargo. Builds both images itself. Nightly tier.
 set -euo pipefail
@@ -119,7 +120,7 @@ kubectl apply -f "$REPO_ROOT/deploy/crds/mqttd.io_mqttdclusters.json"
 kubectl -n "$NS" apply -f "$REPO_ROOT/deploy/operator/operator.yaml"
 kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=120s
 
-log "1/4 — apply a CR; the operator must CREATE a working cluster"
+log "1/5 — apply a CR; the operator must CREATE a working cluster"
 # Fence is enabled from the start: assertion 2 proves it does NOT fire on a
 # routine roll, which is only meaningful if it was armed the whole time.
 kubectl -n "$NS" apply -f - <<EOF
@@ -179,7 +180,17 @@ kubectl -n "$NS" get statefulset e2e -o jsonpath='{.metadata.ownerReferences[0].
   | grep -q MqttdCluster || fail "StatefulSet is not owned by the CR"
 echo "cluster created by the operator; clusterId=$CLUSTER_ID, ownership confirmed"
 
-log "2/4 — a rolling restart must provoke NO fence (the safety property)"
+# The FOUNDER GUARD arms itself (ADR 0055 T9): having observed one identity, the
+# operator latches status.bootstrapped and re-renders ordinal 0 WITH seeds, so a
+# pod-0 that later loses its volume rejoins instead of founding a second cluster.
+wait_for 180 "status.bootstrapped to latch" \
+  bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath='{.status.bootstrapped}')\" = true ]"
+wait_for 180 "the StatefulSet to re-render with CLUSTER_ESTABLISHED" \
+  bash -c "kubectl -n $NS get statefulset e2e -o jsonpath='{.spec.template.spec.initContainers[0].env[*].name}' | grep -q CLUSTER_ESTABLISHED"
+kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
+echo "founder guard armed: ordinal 0 can no longer found"
+
+log "2/5 — a rolling restart must provoke NO fence (the safety property)"
 BEFORE_PVCS="$(kubectl -n "$NS" get pvc -l "$(printf 'mqttd.io/quarantined=true')" -o name | wc -l | tr -d ' ')"
 kubectl -n "$NS" rollout restart statefulset/e2e
 kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
@@ -192,7 +203,7 @@ AFTER_PVCS="$(kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | wc
 [ "$(cr_status clusterId)" = "$CLUSTER_ID" ] || fail "cluster identity changed across a roll"
 echo "rolling restart completed with no fence and a stable identity"
 
-log "3/4 — scale up then down; the operator must resize the set and keep data"
+log "3/5 — scale up then down; the operator must resize the set and keep data"
 # The rendered config carries REPLICAS (the readiness-floor math), so a scale is also
 # a config change: the operator must roll the set to the new shape, not just edit
 # .spec.replicas. Withheld until issue #92 was fixed — the roll a scale implies left
@@ -220,31 +231,59 @@ done
 [ "$(cr_condition SplitBrain)" = "False" ] || fail "a scale cycle was mistaken for a split brain"
 echo "scaled 3->4->3; identity stable, no fence, EVERY PVC intact (incl. the departed pod's)"
 
-log "4/4 — induce a split brain; it must be detected and fenced"
-# Wipe the founder's volume: pod-0 renders with no seeds, so an empty data dir
-# makes it found a NEW cluster beside the survivors — the exact scenario
-# OPERATIONS.md warns about.
+log "4/5 — wipe the founder's volume; the guard must make it REJOIN, not re-found"
+# The same induction that used to create a split brain: destroy pod-0's data dir while
+# the cluster is live. With the founder guard armed (assertion 1) ordinal 0 renders
+# seeds, so the empty volume makes it a JOINER — it adopts the surviving identity and
+# back-fills (ADR 0043) instead of minting a second cluster beside the survivors.
+kubectl -n "$NS" delete pod e2e-0 --wait=true
+kubectl -n "$NS" delete pvc data-e2e-0 --wait=false
+kubectl -n "$NS" delete pod e2e-0 --grace-period=0 --force >/dev/null 2>&1 || true
+wait_for 240 "pod-0 to come back" \
+  bash -c "[ \"\$(kubectl -n $NS get pod e2e-0 -o jsonpath='{.status.phase}' 2>/dev/null)\" = Running ]"
+
+# It must have rendered seeds — the mechanism, checked directly rather than inferred.
+kubectl -n "$NS" logs e2e-0 -c render-config 2>/dev/null | grep -E '^seeds = \[".+"\]' >/dev/null \
+  || fail "pod-0 rendered an EMPTY seed list — the founder guard did not apply, so it will re-found"
+
+# No split brain, and it STAYS that way: the identity is unchanged and nothing is fenced.
+held=0
+for _ in $(seq 1 20); do
+  [ "$(cr_condition SplitBrain)" = "False" ] && held=$((held + 1))
+  sleep 5
+done
+[ "$held" -ge 18 ] \
+  || fail "a split brain appeared after wiping pod-0 ($held/20 samples clean) — the guard failed"
+[ "$(cr_status clusterId)" = "$CLUSTER_ID" ] \
+  || fail "the cluster identity changed — pod-0 founded instead of joining"
+kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | grep -q . \
+  && fail "a PVC was quarantined — the operator fenced a node that should have rejoined"
+echo "founder guard held: pod-0 rejoined the SAME cluster ($CLUSTER_ID), no split brain, no fence"
+
+log "5/5 — break glass: allow re-founding, and the fence must still work"
+# The guard is the prevention; the fence is the containment behind it. Proving the fence
+# still fires needs a split brain, and with the guard armed one can no longer be induced —
+# so ask for founding back, exactly as an operator would after total volume loss.
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge -p '{"spec":{"bootstrapPolicy":"AllowRebootstrap"}}'
+wait_for 180 "the guard to disarm" \
+  bash -c "! kubectl -n $NS get statefulset e2e -o jsonpath='{.spec.template.spec.initContainers[0].env[*].name}' | grep -q CLUSTER_ESTABLISHED"
+kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
+
 kubectl -n "$NS" delete pod e2e-0 --wait=true
 kubectl -n "$NS" delete pvc data-e2e-0 --wait=false
 kubectl -n "$NS" delete pod e2e-0 --grace-period=0 --force >/dev/null 2>&1 || true
 wait_for 240 "the re-founded pod to come back" \
   bash -c "[ \"\$(kubectl -n $NS get pod e2e-0 -o jsonpath='{.status.phase}' 2>/dev/null)\" = Running ]"
 
-# Remediation: the minority founder's PVC is quarantined by LABEL, never deleted.
-wait_for 240 "the re-founder's PVC to be quarantined" \
+# Containment: PVC quarantined by LABEL, never deleted.
+wait_for 300 "the re-founder's PVC to be quarantined" \
   bash -c "kubectl -n $NS get pvc data-e2e-0 -o jsonpath='{.metadata.labels.mqttd\\.io/quarantined}' | grep -q true"
 kubectl -n "$NS" get pvc data-e2e-0 >/dev/null || fail "the PVC was DELETED — data must never be destroyed"
-echo "split brain FENCED: PVC quarantined by label, still present (data intact)"
 
-# Detection must PERSIST. A fenced pod comes straight back and re-founds (its
-# volume still holds the divergent state), so the divergence is real until a human
-# runs the documented wipe. The operator fences ONCE: it must not keep killing the
-# pod, because every kill removes the divergent node from the observation and drops
-# SplitBrain back to False. An earlier build did exactly that — fence every 30s,
-# condition True for ~25ms per cycle — which no alert and no human would ever see.
+# And the verdict holds: the fence fires ONCE, so the incident stays visible instead of
+# flickering behind a restart loop.
 wait_for 240 "SplitBrain=True" \
   bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath=\"{.status.conditions[?(@.type=='SplitBrain')].status}\")\" = True ]"
-echo "split brain DETECTED; checking the verdict HOLDS (no re-fence loop)"
 held=0
 for _ in $(seq 1 20); do
   [ "$(cr_condition SplitBrain)" = "True" ] && held=$((held + 1))
@@ -253,16 +292,12 @@ done
 [ "$held" -ge 18 ] \
   || fail "SplitBrain held for only $held/20 samples — the operator is re-fencing and hiding the incident"
 
-# The re-founder must have taken ITSELF out of rotation (issue #92 follow-up): it minted
-# a second identity and then heard the surviving cluster's gossip, so it latches NotReady
-# rather than serve clients an empty session and retained store. Without this the pod is
-# Ready — the founder readiness floor is 1 — and takes a share of client connections.
+# The re-founder must ALSO have taken itself out of rotation (ADR 0054 amendment): it is
+# alone and hearing the surviving cluster, so it refuses to serve an empty store.
 ready0="$(kubectl -n "$NS" get pod e2e-0 \
   -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
 [ "$ready0" = "True" ] \
   && fail "the re-founded pod-0 is READY — it is serving clients from an empty store"
-echo "the re-founded pod-0 self-quarantined (Ready=$ready0), so it serves no clients"
-kubectl -n "$NS" get pvc data-e2e-0 >/dev/null || fail "the PVC was DELETED — data must never be destroyed"
-echo "split brain verdict STABLE ($held/20 samples) with the PVC intact"
+echo "break glass works: re-founding permitted, fenced once, self-quarantined (Ready=$ready0), data intact"
 
-log "OPERATOR E2E PASSED: created a cluster, ignored a routine roll, scaled up and down without data loss, detected and fenced a real split brain exactly once"
+log "OPERATOR E2E PASSED: created a cluster, ignored a routine roll, scaled without data loss, kept a wiped founder from splitting the cluster, and still fenced one when re-founding was explicitly allowed"

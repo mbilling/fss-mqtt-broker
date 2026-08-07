@@ -5,6 +5,15 @@
 //! are comparable; the parity script supplies the matching `helm template` side.
 
 fn main() {
+    // `--established` renders the FOUNDER-GUARD-armed form (ADR 0055 T9), matching
+    // `helm template --set clusterEstablished=true`. Without it the sample has no
+    // status, which is the bootstrap-capable form the chart renders by default.
+    let established = std::env::args().any(|a| a == "--established");
+    let status = if established {
+        serde_json::json!({ "bootstrapped": true })
+    } else {
+        serde_json::Value::Null
+    };
     let cr: mqttd_operator::crd::MqttdCluster = serde_json::from_value(serde_json::json!({
         "apiVersion": "mqttd.io/v1alpha1",
         "kind": "MqttdCluster",
@@ -17,7 +26,8 @@ fn main() {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../deploy/helm/mqttd/parity-config.toml"
             )),
-        }
+        },
+        "status": status,
     }))
     .expect("sample CR");
     let rendered = mqttd_operator::render::render(&cr);

@@ -51,6 +51,13 @@ pub struct MqttdClusterSpec {
     /// the default posture is Alert-only.
     #[serde(default)]
     pub remediation: Remediation,
+    /// Whether ordinal 0 may found a cluster (ADR 0055 §3.5, T9).
+    ///
+    /// NOT a remediation: the guard is a rendering property that must hold before a
+    /// pod starts, and it applies with the default Alert-only posture — an operator
+    /// installed with defaults must still be protected from a lost pod-0 volume.
+    #[serde(default)]
+    pub bootstrap_policy: BootstrapPolicy,
     /// Presence starts an unattended three-phase SWIM key rotation
     /// (ADR 0003 / 0055 §3.3): the operator stages `newKeySecretRef`, flips the
     /// sealer, and closes the window, gating each phase on the ADR 0054
@@ -117,9 +124,25 @@ pub enum SplitBrainAction {
     /// is already limiting the blast radius).
     #[default]
     Alert,
-    /// Fence the new founder: delete its pod, quarantine its PVC by label,
-    /// apply the seeds-override recovery (OPERATIONS.md, automated).
+    /// Fence the new founder: delete its pod and quarantine its PVC by label
+    /// (never deleting data). Fires at most once per node. Preventing the
+    /// re-founding in the first place is `bootstrapPolicy`, not this.
     Fence,
+}
+
+/// Whether ordinal 0 is still allowed to found a cluster.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum BootstrapPolicy {
+    /// Once an identity has been observed (`status.bootstrapped`), ordinal 0 renders
+    /// SEEDS and can only ever join. A pod-0 whose volume is lost rejoins and
+    /// back-fills instead of founding a second cluster beside the survivors.
+    #[default]
+    Guarded,
+    /// Break glass: let ordinal 0 found again, and clear the latch. For total loss of
+    /// every volume, or a deliberate re-bootstrap beside a cluster being abandoned.
+    /// The operator raises a condition and an Event every reconcile while this is set,
+    /// so leaving it on is loud — it disables the protection entirely.
+    AllowRebootstrap,
 }
 
 /// What to do on a disk brownout.
@@ -162,6 +185,15 @@ pub struct MqttdClusterStatus {
     /// Whether any pod reports disk brownout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brownout: Option<bool>,
+    /// Whether a cluster has ever been observed to exist (ADR 0055 T9).
+    ///
+    /// Latched the first time exactly one cluster identity is seen from a REACHABLE
+    /// pod, and monotonic thereafter — `patch_status` merges, and this field is
+    /// omitted when there is no opinion, so a pass that observes nothing leaves the
+    /// prior value alone. Once latched, ordinal 0 renders seeds and can no longer
+    /// found. Cleared only under `bootstrapPolicy: AllowRebootstrap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrapped: Option<bool>,
     /// The spec generation this status reflects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,

@@ -11,7 +11,7 @@
 //! those are a split brain or a lost quorum, and a controller that confuses the two
 //! would fence healthy nodes during routine operations.
 
-use crate::crd::{MqttdClusterStatus, StatusCondition};
+use crate::crd::{BootstrapPolicy, MqttdClusterStatus, StatusCondition};
 use crate::probe::PodProbe;
 use std::collections::BTreeSet;
 
@@ -76,6 +76,35 @@ impl Facts<'_> {
     }
 }
 
+/// Whether ordinal 0 must be stopped from founding, given what we just observed.
+///
+/// `prev` is `status.bootstrapped` from the last pass. The latch closes the first time
+/// exactly ONE identity is seen from a reachable pod — proof a cluster exists — and
+/// never re-opens on its own:
+///
+/// * zero identities is absent evidence (an unreachable or still-starting fleet), never
+///   a reason to un-latch — that would re-arm founding at the worst moment;
+/// * a SPLIT BRAIN (two identities) is likewise no evidence about whether a cluster
+///   exists, so it leaves the latch exactly as it was;
+/// * `AllowRebootstrap` is the only thing that clears it, and only because a human
+///   asked for that in the spec.
+#[must_use]
+pub fn latch_bootstrapped(
+    prev: Option<bool>,
+    policy: BootstrapPolicy,
+    identities_seen: usize,
+) -> Option<bool> {
+    if policy == BootstrapPolicy::AllowRebootstrap {
+        // Explicitly cleared, so the state is honest rather than stale: an operator
+        // reading `bootstrapped: true` while founding is permitted would be misled.
+        return None;
+    }
+    if identities_seen == 1 {
+        return Some(true);
+    }
+    prev
+}
+
 /// Aggregate `probes` for a cluster whose spec asks for `desired` replicas.
 #[must_use]
 pub fn observe(probes: &[PodProbe], desired: i32, generation: Option<i64>) -> Observation {
@@ -95,6 +124,8 @@ pub fn observe(probes: &[PodProbe], desired: i32, generation: Option<i64>) -> Ob
             cluster_id: facts.cluster_id(),
             brownout: Some(facts.brownout),
             observed_generation: generation,
+            // Filled by the reconciler, which owns the previous value and the spec.
+            bootstrapped: None,
             conditions: conditions_for(&facts),
         },
         events: events_for(&facts),
@@ -308,6 +339,37 @@ fn cond(kind: &str, status: bool, reason: &str, message: &str) -> StatusConditio
 
 #[cfg(test)]
 mod tests {
+
+    /// The latch closes on proof a cluster exists, and never re-opens by itself
+    /// (ADR 0055 T9). Everything here is about NOT re-arming founding by accident:
+    /// absent evidence, a split brain, and a still-forming fleet must all leave the
+    /// previous verdict alone.
+    #[test]
+    fn the_bootstrap_latch_is_monotonic_and_closes_on_one_identity() {
+        use super::latch_bootstrapped as latch;
+        use crate::crd::BootstrapPolicy::{AllowRebootstrap, Guarded};
+
+        // One identity = a cluster exists. Latch.
+        assert_eq!(latch(None, Guarded, 1), Some(true));
+        assert_eq!(latch(Some(true), Guarded, 1), Some(true));
+
+        // Zero identities is ABSENT evidence — an unreachable or still-starting fleet,
+        // not proof the cluster is gone. Re-arming founding here is the whole bug.
+        assert_eq!(latch(Some(true), Guarded, 0), Some(true));
+        assert_eq!(
+            latch(None, Guarded, 0),
+            None,
+            "nothing observed, no opinion"
+        );
+
+        // A split brain says nothing about whether a cluster exists; hold the verdict.
+        assert_eq!(latch(Some(true), Guarded, 2), Some(true));
+
+        // Only a human asking clears it — and then it is CLEARED, not left stale, so
+        // `bootstrapped: true` never coexists with founding being permitted.
+        assert_eq!(latch(Some(true), AllowRebootstrap, 1), None);
+        assert_eq!(latch(None, AllowRebootstrap, 0), None);
+    }
     use super::{observe, COND_BROWNOUT, COND_CONVERGED, COND_DRAINING, COND_SPLIT_BRAIN};
     use crate::probe::{Brownout, ConfigStamp, Decommission, Keys, Member, PodProbe, PodStatus};
 

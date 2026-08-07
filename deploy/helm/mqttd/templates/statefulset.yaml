@@ -64,8 +64,18 @@ spec:
               STS="${POD_NAME%-*}"
               SEED0="\"${STS}-0.${HEADLESS_DOMAIN}:7946\""
               SEED1="\"${STS}-1.${HEADLESS_DOMAIN}:7946\""
+              SEED2="\"${STS}-2.${HEADLESS_DOMAIN}:7946\""
               if [ "$ORD" = "0" ]; then
-                SEEDS=""
+                # Ordinal 0 founds the cluster precisely BECAUSE it renders no seeds. Once a cluster
+                # exists, founding again is the split-brain bug: a pod-0 whose volume was lost would
+                # mint a SECOND identity beside the live one. CLUSTER_ESTABLISHED disarms the founder
+                # so pod-0 seeds to its peers like any joiner and a wiped volume REJOINS instead.
+                # A 1-replica cluster has no survivor to split from, so it may still found.
+                if [ "${CLUSTER_ESTABLISHED:-}" = "true" ] && [ "$REPLICAS" -gt 1 ]; then
+                  if [ "$REPLICAS" = "2" ]; then SEEDS="$SEED1"; else SEEDS="${SEED1}, ${SEED2}"; fi
+                else
+                  SEEDS=""
+                fi
                 READY_MIN=1
               else
                 if [ "$ORD" = "1" ]; then SEEDS="$SEED0"; else SEEDS="${SEED0}, ${SEED1}"; fi
@@ -78,18 +88,18 @@ spec:
               sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
                 -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
                 -e "s/__READY_MIN__/${READY_MIN}/g" \
-                /tmpl/mqttd.toml.tmpl > /config/mqttd.toml
+                "${TMPL_DIR:-/tmpl}/mqttd.toml.tmpl" > "${OUT_DIR:-/config}/mqttd.toml"
               # A short write — e.g. a full ephemeral-storage volume — leaves sed exit 0 with a
               # 0-byte file, and the broker then boots on pure DEFAULTS (no listeners, node id
               # "node-local"): alive as a process, bound to nothing. An empty render is never a
               # valid config, so fail the init container loudly instead of starting a broker
               # that can only fail its probes.
-              if [ ! -s /config/mqttd.toml ]; then
+              if [ ! -s "${OUT_DIR:-/config}/mqttd.toml" ]; then
                 echo "FATAL: rendered config is empty — is /config out of space?" >&2
                 exit 1
               fi
               echo "rendered config for ${POD_NAME} (ordinal ${ORD}):"
-              cat /config/mqttd.toml
+              cat "${OUT_DIR:-/config}/mqttd.toml"
           env:
             - name: POD_NAME
               valueFrom:
@@ -99,6 +109,11 @@ spec:
               value: {{ .Values.replicaCount | quote }}
             - name: HEADLESS_DOMAIN
               value: {{ printf "%s.%s.svc.cluster.local" (include "mqttd.headlessName" .) .Release.Namespace | quote }}
+            {{- if .Values.clusterEstablished }}
+            # Day-2 switch: the cluster exists, so ordinal 0 must never found again.
+            - name: CLUSTER_ESTABLISHED
+              value: "true"
+            {{- end }}
           volumeMounts:
             - name: config-tmpl
               mountPath: /tmpl
