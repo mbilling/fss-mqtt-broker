@@ -34,6 +34,27 @@ LABEL org.opencontainers.image.title="mqttd" \
 # release pipeline (or by hand for a local build) at dist/mqttd.
 COPY --chmod=0755 dist/mqttd /usr/local/bin/mqttd
 
+# A writable data directory, owned by the uid the image runs as.
+#
+# Without this the image's headline feature is unreachable: durable sessions are
+# ON by default, but every natural way to enable them in a container failed with
+# `create data dir /data: Permission denied`. distroless/static:nonroot runs as
+# uid 65532 and ships no directory that uid may write, so `MQTTD_DATA_DIR=/data`,
+# a named volume, and a subdirectory all fail alike — leaving `--user 0:0` (which
+# discards the non-root posture this image exists to provide) or a world-writable
+# host path as the only ways through.
+#
+# It is COPYed rather than created because there is no shell here to `mkdir` with,
+# and `WORKDIR`/`VOLUME` would create it owned by root. The ownership also matters
+# for volumes specifically: Docker seeds an empty named volume from the image path
+# it covers, ownership included, so `-v mqttd-data:/var/lib/mqttd` lands writable
+# instead of root-owned.
+#
+# MQTTD_DATA_DIR is deliberately NOT defaulted to it — unset still means in-memory,
+# exactly as the bare binary behaves. Opt in with:
+#   -e MQTTD_DATA_DIR=/var/lib/mqttd -v mqttd-data:/var/lib/mqttd
+COPY --chown=65532:65532 deploy/image/data-dir/ /var/lib/mqttd/
+
 # Conventional MQTT ports (plaintext / TLS). Actual binds are operator-chosen via
 # MQTTD_* config; EXPOSE here is documentation, not a binding.
 EXPOSE 1883 8883

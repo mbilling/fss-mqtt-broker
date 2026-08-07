@@ -253,3 +253,24 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
         run: cargo check ${{ matrix.args }} --all-features
+
+  image-smoke:
+    name: container image, as a user runs it
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Every other test drives the BINARY, which left the image itself untested —
+    # and the gap was not theoretical. The published v0.9.0-rc image runs as uid
+    # 65532 and shipped no directory that uid could write, so durable sessions
+    # (the headline feature, ON by default) could not be enabled in a container
+    # at all: MQTTD_DATA_DIR=/data, a named volume and a subdirectory all failed
+    # with Permission denied. Nothing caught it, because nothing ran the image.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl C toolchain + mosquitto clients
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools mosquitto-clients
+      - name: image smoke (nonroot data dir, restart durability, read-only rootfs)
+        run: ./scripts/image-smoke.sh
