@@ -23,6 +23,19 @@ ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 
 
+def github_anchor(heading: str) -> str:
+    """The fragment GitHub generates for a heading.
+
+    Lowercase, strip everything that is not a word character, space or hyphen,
+    then spaces become hyphens. `TLS 1.3 + mTLS` → `tls-13--mtls` — the dropped
+    `+` leaves the double hyphen, which is easy to get wrong by hand and is
+    exactly why this is computed rather than typed.
+    """
+    text = heading.strip().lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    return re.sub(r"\s", "-", text)
+
+
 def fail(problems: list[str]) -> None:
     print("README states facts the tree contradicts:\n", file=sys.stderr)
     for p in problems:
@@ -67,10 +80,24 @@ def main() -> int:
             f"the Workspace layout table lists `{name}`, which is not a crate in crates/"
         )
 
+    # --- intra-document anchors ------------------------------------------
+    # A `#section` link that points at a renamed heading does not error, it just
+    # silently does nothing — the reader clicks and stays put. The README now
+    # leans on them (a jump list, and the Status paragraph pointing at
+    # Limitations), so they are worth holding to the same standard as the counts.
+    headings = re.findall(r"^#{2,6}\s+(.+?)\s*$", text, re.MULTILINE)
+    anchors = {github_anchor(h) for h in headings}
+    for link in sorted(set(re.findall(r"\]\(#([^)]+)\)", text))):
+        if link not in anchors:
+            problems.append(f"link to #{link} matches no heading in README.md")
+
     if problems:
         fail(problems)
 
-    print(f"README facts check: {len(adrs)} ADRs, {len(crates)} crates — all match.")
+    print(
+        f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
+        f"{len(anchors)} anchors — all match."
+    )
     return 0
 
 
