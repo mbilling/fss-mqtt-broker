@@ -4182,19 +4182,32 @@ impl Hub {
                     m.retained_divergence();
                 }
             }
+            // Set only when the durable token rule says this value applies; consumed
+            // after the store accepts it.
+            let mut pending_token: Option<(u64, u64)> = None;
             if durable {
                 // Token rule (P5): strictly-higher wins; an untokened local value
                 // (no held token) loses to any committed token but an untokened
                 // entry only gap-fills an absent topic.
                 let token = (epoch, offset);
-                let apply = match self.retained_tokens.get(&topic) {
-                    Some(held) => token > *held,
-                    None => token > (0, 0) || held_value.is_none(),
+                // The DURABLE fence, not just the in-memory cache: this is the path that
+                // resurrects a deleted retained message when the survivors have restarted
+                // and lost their tombstones (issue #87 item 4).
+                let apply = if self.retained_tokens.contains_key(&topic)
+                    || self.durable_retained.is_some()
+                {
+                    !self.retained_is_stale(&topic, token).await
+                } else {
+                    token > (0, 0) || held_value.is_none()
                 };
                 if !apply {
                     continue;
                 }
-                self.retained_tokens.insert(topic.clone(), token);
+                // Deliberately NOT recorded here — see below. The token is written only
+                // after the store accepts the value, for the reason in
+                // `apply_retained_update`: a fence with no value behind it is
+                // unrepairable, including by this very path.
+                pending_token = Some(token);
             } else if held_value.is_some() || payload.is_empty() {
                 // Gap-fill only (ADR 0014 §3); a tombstone entry has nothing to fill.
                 continue;
@@ -4209,8 +4222,14 @@ impl Hub {
                 retain: true,
                 app: props.into(),
             };
+            let topic_key = message.topic.clone();
             if self.retained.set(&message).await.is_ok() {
+                if let Some(token) = pending_token {
+                    self.retained_tokens.insert(topic_key, token);
+                }
                 filled += 1;
+            } else if let Some(m) = &self.metrics {
+                m.retained_apply_failed();
             }
         }
         if filled > 0 {
@@ -4702,6 +4721,46 @@ impl Hub {
 
     /// Apply a **committed** retained value to the local cache iff its token exceeds
     /// the held one (ADR 0037 §3): monotonic per topic, idempotent, order-insensitive.
+    /// Whether `token` is STALE for `topic` — i.e. superseded, and must not be applied.
+    ///
+    /// The two sources answer different questions, and conflating them is a bug:
+    ///
+    /// * `retained_tokens` is "what this node has already APPLIED SUCCESSFULLY", so an
+    ///   equal token is a duplicate and is skipped. It is in-memory and does not survive a
+    ///   restart.
+    /// * the durable record is "what the cluster has COMMITTED". An equal token there is
+    ///   *this very commit* — the owner applying its own write, or a repair of one whose
+    ///   store write failed — so it must be APPLIED, not skipped. Only a strictly older
+    ///   token is stale.
+    ///
+    /// Reading the durable record is what makes tombstone fences survive a restart (issue
+    /// #87 item 4). They used to live only in the in-memory map, so a clear committed while
+    /// one node was down, followed by a restart of the survivors, left nobody holding the
+    /// fence — and the absent node's stale value was re-applied cluster-wide, resurrecting
+    /// a retained message the user had deleted. The periodic digest (0014-T10) spread it
+    /// faster, not slower. No schema change was needed: `RetainedEntry` already carries
+    /// `tombstone`, `epoch` and `offset`; `DurableRetained::get` simply had no production
+    /// caller, so the keyspace was written and never read.
+    async fn retained_is_stale(&self, topic: &str, token: (u64, u64)) -> bool {
+        if let Some(held) = self.retained_tokens.get(topic) {
+            return token <= *held;
+        }
+        let Some(durable) = self.durable_retained.as_ref() else {
+            return false;
+        };
+        match durable.get(topic).await {
+            Ok(Some(entry)) => token < (entry.epoch, entry.offset),
+            Ok(None) => false,
+            // A read failure must not invent a fence: treating it as "not stale" keeps the
+            // topic repairable, the same principle as not recording a token on a failed
+            // write.
+            Err(e) => {
+                debug!(topic = %topic, error = %e, "durable retained fence lookup failed");
+                false
+            }
+        }
+    }
+
     /// An empty payload is a committed clear — the cache drops the topic, but the
     /// tombstone's token is kept so a staler value cannot resurrect it.
     async fn apply_retained_update(
@@ -4712,15 +4771,10 @@ impl Hub {
         app: &AppProperties,
         token: (u64, u64),
     ) {
-        if self
-            .retained_tokens
-            .get(topic)
-            .is_some_and(|held| token <= *held)
-        {
+        if self.retained_is_stale(topic, token).await {
             debug!(topic = %topic, ?token, "stale/duplicate retained update skipped");
             return;
         }
-        self.retained_tokens.insert(topic.to_string(), token);
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
@@ -4728,9 +4782,26 @@ impl Hub {
             retain: true,
             app: app.clone(),
         };
+        // STORE FIRST, then record the token — and never the other way round (issue #87).
+        //
+        // The token is the fence that makes this idempotent: anything at or below it is
+        // skipped above. Recording it before the write meant a FAILED write left the node
+        // holding a fence with no value behind it, and nothing could ever get past:
+        // re-delivery of the same commit is skipped by the guard, and the periodic digest
+        // cannot repair it either, because the repairing snapshot carries the SAME token
+        // and `token > held` is false. One transient store error blackholed one topic on
+        // one node permanently, while its peers served the value normally — with no metric
+        // and no divergence signal, because a node with no value has nothing to compare.
         if let Err(e) = self.retained.set(&message).await {
+            // No token recorded: the next commit for this topic, and the next digest
+            // repair, both still apply.
             warn!(topic = %topic, error = %e, "failed to apply committed retained update");
+            if let Some(m) = &self.metrics {
+                m.retained_apply_failed();
+            }
+            return;
         }
+        self.retained_tokens.insert(topic.to_string(), token);
     }
 
     /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
@@ -7378,6 +7449,63 @@ mod tests {
     // ADR 0037 P6: bounded queue-until-heal for retained mutations.
     // -----------------------------------------------------------------------
 
+    /// A retained STORE whose writes can be made to fail — distinct from
+    /// [`FlakyRetained`], which is the durable commit log. Cloneable and
+    /// shared-state, so the test and the hub see the same store.
+    #[derive(Debug, Clone)]
+    struct FailingRetainedStore(Arc<FailingStoreState>);
+
+    #[derive(Debug)]
+    struct FailingStoreState {
+        healthy: std::sync::atomic::AtomicBool,
+        inner: mqtt_storage::MemoryRetainedStore,
+    }
+
+    impl FailingRetainedStore {
+        fn new() -> Self {
+            Self(Arc::new(FailingStoreState {
+                healthy: std::sync::atomic::AtomicBool::new(true),
+                inner: mqtt_storage::MemoryRetainedStore::new(),
+            }))
+        }
+        fn fail_writes(&self) {
+            self.0
+                .healthy
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn heal(&self) {
+            self.0
+                .healthy
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        async fn held(&self, filter: &str) -> Vec<mqtt_core::Message> {
+            use mqtt_storage::RetainedStore as _;
+            self.0.inner.matching(filter).await.unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::RetainedStore for FailingRetainedStore {
+        async fn set(
+            &self,
+            message: &mqtt_core::Message,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            if !self.0.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
+            self.0.inner.set(message).await
+        }
+        async fn matching(
+            &self,
+            filter: &str,
+        ) -> Result<Vec<mqtt_core::Message>, mqtt_storage::StorageError> {
+            self.0.inner.matching(filter).await
+        }
+        async fn all(&self) -> Result<Vec<mqtt_core::Message>, mqtt_storage::StorageError> {
+            self.0.inner.all().await
+        }
+    }
+
     /// A durable retained authority that fails every commit until healed — the
     /// minority side of a partition (`NoQuorum`), from the hub's point of view.
     #[derive(Debug, Default)]
@@ -7424,12 +7552,35 @@ mod tests {
             self.commit(topic, &[], true)
         }
 
+        /// Answer from the committed log, as a real durable keyspace does.
+        ///
+        /// This returned `Ok(None)` unconditionally until 2026-08-07, which was harmless
+        /// only because NOTHING IN PRODUCTION CALLED IT — the durable retained keyspace
+        /// was written and never read. Issue #87 item 4 is the cost of that: the tombstone
+        /// fences lived only in memory, so a restart lost them and deleted retained
+        /// messages could be resurrected. The fence now reads back through here, so the
+        /// double has to be honest.
         async fn get(
             &self,
-            _topic: &str,
+            topic: &str,
         ) -> Result<Option<mqtt_storage::retained_log::RetainedEntry>, mqtt_storage::StorageError>
         {
-            Ok(None)
+            let log = self.committed.lock().unwrap();
+            Ok(log
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (t, _, _))| t == topic)
+                .map(
+                    |(i, (_, payload, tombstone))| mqtt_storage::retained_log::RetainedEntry {
+                        payload: payload.clone(),
+                        qos: 0,
+                        tombstone: *tombstone,
+                        props: AppProps::default(),
+                        epoch: 0,
+                        offset: (i + 1) as u64,
+                    },
+                ))
         }
     }
 
@@ -7573,6 +7724,125 @@ mod tests {
     /// ADR 0037 §5: an owner-local commit that fails (no quorum — the minority side)
     /// re-queues and retries on the sweep tick; once quorum returns the whole queue
     /// commits **in publish order** and the committed values fan out.
+    /// A CLEARED retained topic must stay cleared across a restart (issue #87 item 4).
+    ///
+    /// `retained_tokens` is in-memory. A clear committed while one node was down, followed
+    /// by a restart of the survivors, left NOBODY holding the tombstone fence — so when the
+    /// absent node returned with its stale value, the snapshot path applied it and the
+    /// deleted retained message came back cluster-wide. Retraction was not durable. The
+    /// periodic digest made it spread faster, not slower.
+    ///
+    /// This models the restart directly: a fresh hub (empty `retained_tokens`, as after a
+    /// process start) with the durable record already holding the committed TOMBSTONE, then
+    /// a peer snapshot offering the stale pre-clear value.
+    #[tokio::test]
+    async fn a_cleared_retained_topic_is_not_resurrected_after_a_restart() {
+        let durable = Arc::new(FlakyRetained::default());
+        durable.heal();
+        // The clear is committed durably, as it would have been before the restart.
+        {
+            use mqtt_storage::retained_log::DurableRetained as _;
+            durable.clear("t").await.expect("commit the tombstone");
+        }
+
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        let store = FailingRetainedStore::new();
+        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_durable_retained(durable.clone());
+        tokio::spawn(hub.run());
+
+        // A peer that was absent for the clear offers its stale value. Its token is LOWER
+        // than the tombstone's, which is exactly what the fence exists to notice — and the
+        // fence is only available from the durable record on a fresh process.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![RetainedWireEntry {
+                topic: "t".into(),
+                payload: b"stale".to_vec(),
+                qos: 0,
+                epoch: 0,
+                offset: 0,
+                props: AppProps::default(),
+            }],
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            store.held("t").await.is_empty(),
+            "a deleted retained message was RESURRECTED by a peer snapshot after a restart \
+             — the tombstone fence must survive the process that recorded it"
+        );
+    }
+
+    /// A store write that FAILS must not fence the topic forever (issue #87 item 2).
+    ///
+    /// The token is the idempotence fence: anything at or below it is skipped. Recording it
+    /// before the write meant a failed write left a fence with no value behind it — and
+    /// nothing could get past. Re-delivery of the same commit is skipped by the guard, and
+    /// the periodic digest (0014-T10) cannot repair it either, because the repairing
+    /// snapshot carries the SAME token and `token > held` is false. One transient store
+    /// error blackholed one topic on one node permanently, while its peers served the value
+    /// normally, with no metric and no divergence signal — a node holding no value has
+    /// nothing to compare.
+    ///
+    /// So the assertion is not merely "the write failed": it is that the topic is still
+    /// REPAIRABLE afterwards, by the two paths that were previously fenced out.
+    #[tokio::test]
+    async fn a_failed_retained_store_write_leaves_the_topic_repairable() {
+        let store = FailingRetainedStore::new();
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        hub.attach_retained_store(Box::new(store.clone()));
+        tokio::spawn(hub.run());
+
+        // A committed retained update arrives while the store is refusing writes.
+        store.fail_writes();
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: 0,
+            epoch: 1,
+            offset: 1,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            store.held("t").await.is_empty(),
+            "precondition: the write really did fail"
+        );
+
+        // REPAIR PATH 1 — the same commit re-delivered (a retransmit, or the snapshot the
+        // digest pulls, both carrying the SAME token). Previously fenced: token <= held.
+        store.heal();
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: 0,
+            epoch: 1,
+            offset: 1,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held = store.held("t").await;
+        assert_eq!(
+            held.len(),
+            1,
+            "a re-delivery of the same commit must repair a topic whose write failed — \
+             this is the case the periodic digest could not fix"
+        );
+        assert_eq!(&held[0].payload[..], b"v1");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_failed_local_commit_retries_until_heal_and_keeps_order() {
         let flaky = Arc::new(FlakyRetained::default());

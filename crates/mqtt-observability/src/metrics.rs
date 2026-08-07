@@ -125,6 +125,7 @@ struct OtelInstruments {
     store_bytes: OtelGauge<i64>,
     quic_path_migrations: OtelCounter<u64>,
     retained_divergence: OtelCounter<u64>,
+    retained_apply_failed: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
     brownout: OtelGauge<i64>,
     store_max_bytes: OtelGauge<i64>,
@@ -179,6 +180,7 @@ impl OtelInstruments {
             store_bytes: meter.i64_gauge("store_bytes").build(),
             quic_path_migrations: meter.u64_counter("quic_path_migrations").build(),
             retained_divergence: meter.u64_counter("retained_divergence").build(),
+            retained_apply_failed: meter.u64_counter("retained_apply_failed").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
             brownout: meter.i64_gauge("brownout").build(),
             store_max_bytes: meter.i64_gauge("store_max_bytes").build(),
@@ -250,6 +252,7 @@ pub struct Metrics {
     store_bytes: Family<StoreLabel, Gauge>,
     quic_path_migrations_total: Counter,
     retained_divergence_total: Counter,
+    retained_apply_failed_total: Counter,
     retained_queue_dropped_total: Counter,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
     /// (`disk` today), 0 otherwise. The rejection counters record symptoms; this
@@ -488,6 +491,14 @@ impl Metrics {
             "quic_path_migrations",
             "QUIC connection path migrations observed (client address changed; same connection and session kept)",
         );
+        let retained_apply_failed_total = register_counter(
+            &mut registry,
+            "retained_apply_failed",
+            "Committed retained updates the local store REFUSED to write. Non-zero means \
+             this node is missing retained values its peers hold; the topic is repaired by \
+             the next commit or the periodic digest, but a persistent rate means the store \
+             is unhealthy and this node serves stale retained state",
+        );
         let retained_divergence_total = register_counter(
             &mut registry,
             "retained_divergence",
@@ -631,6 +642,7 @@ impl Metrics {
             store_bytes,
             quic_path_migrations_total,
             retained_divergence_total,
+            retained_apply_failed_total,
             retained_queue_dropped_total,
             brownout,
             store_max_bytes,
@@ -1082,6 +1094,16 @@ impl Metrics {
     pub fn retained_divergence(&self) {
         self.retained_divergence_total.inc();
         self.otel.retained_divergence.add(1, &[]);
+    }
+
+    /// A committed retained update could not be written to the local store (issue #87).
+    ///
+    /// The token is deliberately NOT recorded when this fires, so the topic stays
+    /// repairable — but the node is serving stale retained state for it until the next
+    /// commit or digest repair, and nothing else surfaces that. Alert on a sustained rate.
+    pub fn retained_apply_failed(&self) {
+        self.retained_apply_failed_total.inc();
+        self.otel.retained_apply_failed.add(1, &[]);
     }
 
     /// A queued retained mutation was dropped at the queue-until-heal bound
