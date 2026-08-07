@@ -126,7 +126,12 @@ echo "retained read back: '$got'"
 [ "$got" = "hello-v1" ] || { echo "FAIL: retained message not delivered"; exit 1; }
 
 log "Scale down 3 -> 2 (must DRAIN via preStop --decommission, not crash)"
-kubectl -n "$NS" scale "statefulset/$STS" --replicas=2
+# Scale through HELM, not `kubectl scale`: kubectl would take server-side-apply
+# ownership of .spec.replicas and every later `helm upgrade` would fail with a field
+# conflict (observed). It is also the more faithful gesture — a chart user scales by
+# changing the value they installed with.
+helm upgrade "$RELEASE" "$CHART" -n "$NS" -f "$SMOKE_VALUES" --reuse-values \
+  --set replicaCount=2 >/dev/null
 # The departing pod is ordinal 2. Give the drain + graceful shutdown time.
 kubectl -n "$NS" wait --for=delete "pod/$STS-2" --timeout=120s
 # The remaining pods stay Ready (quorum held); the retained state survives the shrink.
@@ -160,4 +165,75 @@ case "$not_ready" in
 esac
 echo "all pods still Ready 90s after the roll: $not_ready"
 
-log "SMOKE PASSED: cluster formed, drained on scale-down, and survived a quorum-safe roll that STAYED healthy"
+# Both split-brain mechanisms ship in the CHART as well as the operator, and until now
+# only the operator path was proven end to end — which is backwards: a chart-only
+# deployment has no controller to compensate, so it is the path that needs the proof
+# most. The cluster is at 2 replicas here (the scale-down above), which is enough: the
+# survivor is the majority and pod-0 is the one that re-founds.
+#
+# An attach-free reader (never `kubectl run --rm`: --attach is implied and hangs).
+statusz() { # statusz <ordinal> [jq-ish field]
+  kubectl -n "$NS" delete pod szread --ignore-not-found >/dev/null 2>&1
+  kubectl -n "$NS" run szread --image=busybox:1.36 --restart=Never --command -- \
+    sh -c "wget -qO- http://$STS-$1.$STS-headless.$NS.svc.cluster.local:8080/statusz 2>/dev/null" >/dev/null 2>&1
+  kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded pod/szread --timeout=60s >/dev/null 2>&1
+  kubectl -n "$NS" logs szread 2>/dev/null
+  kubectl -n "$NS" delete pod szread --ignore-not-found >/dev/null 2>&1
+}
+
+log "Founder guard — arming it must make a wiped pod-0 REJOIN (ADR 0055 T9)"
+# Order matters, and it cost a run to learn why. This step runs FIRST, on a healthy
+# cluster: a StatefulSet rolls highest-ordinal-first, so if pod-0 were already
+# NotReady (as the self-quarantine step below deliberately leaves it) the roll would
+# never reach ordinal 0 and the controller would recreate it at the OLD revision —
+# without the env, rendering empty seeds, and the test would fail for a reason that
+# has nothing to do with the guard.
+helm upgrade "$RELEASE" "$CHART" -n "$NS" -f "$SMOKE_VALUES" --reuse-values \
+  --set clusterEstablished=true >/dev/null
+kubectl -n "$NS" rollout status "statefulset/$STS" --timeout="$READY_TIMEOUT"
+kubectl -n "$NS" delete pod "$STS-0" --wait=true
+kubectl -n "$NS" delete pvc "data-$STS-0" --wait=false
+kubectl -n "$NS" delete pod "$STS-0" --grace-period=0 --force >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do
+  [ "$(kubectl -n "$NS" get pod "$STS-0" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] && break
+  sleep 5
+done
+[ "$(kubectl -n "$NS" get pod "$STS-0" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] \
+  || { echo "FAIL: pod-0 never became Ready with the guard armed — it did not rejoin"; exit 1; }
+kubectl -n "$NS" logs "$STS-0" -c render-config 2>/dev/null | grep -E '^seeds = \[".+"\]' >/dev/null \
+  || { echo "FAIL: pod-0 rendered an EMPTY seed list — the chart's founder guard did not apply"; exit 1; }
+id0="$(statusz 0 | sed 's/.*"cluster_id":"\([^"]*\)".*/\1/')"
+id1="$(statusz 1 | sed 's/.*"cluster_id":"\([^"]*\)".*/\1/')"
+[ -n "$id0" ] && [ "$id0" = "$id1" ] \
+  || { echo "FAIL: pod-0 did not rejoin — identities differ (pod-0=$id0 pod-1=$id1)"; exit 1; }
+echo "founder guard held on the CHART path: pod-0 rejoined the same cluster ($id0)"
+
+log "Self-quarantine — with the guard OFF, a re-founded pod-0 must refuse to serve"
+# Terminal step: it deliberately leaves one pod permanently NotReady, so nothing may
+# follow it. Disarm the guard first — with it armed the divergence this observes
+# cannot happen at all, which is the whole point of the step above.
+helm upgrade "$RELEASE" "$CHART" -n "$NS" -f "$SMOKE_VALUES" --reuse-values \
+  --set clusterEstablished=false >/dev/null
+kubectl -n "$NS" rollout status "statefulset/$STS" --timeout="$READY_TIMEOUT"
+kubectl -n "$NS" delete pod "$STS-0" --wait=true
+kubectl -n "$NS" delete pvc "data-$STS-0" --wait=false
+kubectl -n "$NS" delete pod "$STS-0" --grace-period=0 --force >/dev/null 2>&1 || true
+for _ in $(seq 1 40); do
+  kubectl -n "$NS" get pod "$STS-0" >/dev/null 2>&1 && break
+  sleep 3
+done
+sleep 45   # let it boot, mint its own identity, and hear the survivor's gossip
+sz="$(statusz 0)"
+case "$sz" in
+  *'"quarantine":{"active":true'*) : ;;
+  *) echo "FAIL: the re-founded pod-0 did not self-quarantine; /statusz was: $sz"; exit 1;;
+esac
+ready0="$(kubectl -n "$NS" get pod "$STS-0" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+[ "$ready0" = "True" ] && { echo "FAIL: the re-founded pod-0 is Ready — it is serving an empty store"; exit 1; }
+eps="$(kubectl -n "$NS" get endpoints "$RELEASE-mqttd" -o jsonpath='{.subsets[*].addresses[*].targetRef.name}' 2>/dev/null || true)"
+case "$eps" in
+  *"$STS-0"*) echo "FAIL: pod-0 is still in the client Service endpoints: $eps"; exit 1;;
+esac
+echo "self-quarantine held: pod-0 refuses readiness and is out of the Service endpoints"
+
+log "SMOKE PASSED: cluster formed, drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"

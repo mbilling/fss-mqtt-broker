@@ -2,7 +2,7 @@
 # Operator end-to-end (ADR 0055 T7) — the runtime proof that the reconciler does
 # what its unit tests claim, against a real API server.
 #
-# Six things are asserted, in order of how much they matter:
+# Nine things are asserted, in order of how much they matter:
 #
 #   1. The operator CREATES a working cluster from a CR (apply → StatefulSet →
 #      3/3 Ready → status.phase=Ready with one clusterId).
@@ -20,7 +20,14 @@
 #      is still detected and fenced (PVC labelled, pod deleted, DATA NEVER
 #      DELETED), the verdict HOLDS because the fence fires once, and the
 #      re-founder has ALSO quarantined itself so it serves no clients.
-#   6. DELETING THE CR collects every owned object and keeps every volume.
+#   6. THE OPERATOR RESTARTING mid-incident does not re-fence — fence-once is
+#      enforced by cluster state (the PVC label), not by operator memory.
+#   7. LEADER FAILOVER: with two replicas, killing the Lease holder hands over and
+#      the survivor actually reconciles.
+#   8. BROWNOUT is detected and surfaced (ExpandPvc had no runtime coverage at all);
+#      expansion itself is asserted only where the StorageClass can expand, and the
+#      run says which case it exercised rather than passing silently.
+#   9. DELETING THE CR collects every owned object and keeps every volume.
 #
 # Plus, before any of it: the operator's RBAC is minimal, not merely sufficient.
 #
@@ -319,7 +326,85 @@ ready0="$(kubectl -n "$NS" get pod e2e-0 \
   && fail "the re-founded pod-0 is READY — it is serving clients from an empty store"
 echo "break glass works: re-founding permitted, fenced once, self-quarantined (Ready=$ready0), data intact"
 
-log "6/6 — deleting the CR must collect the cluster but KEEP the data"
+log "6/9 — the operator restarting mid-incident must not re-fence"
+# Fence-once is enforced by CLUSTER state (the PVC's quarantine label), not by anything
+# the operator remembers. If it were in-memory, a restart — a crash, an eviction, a
+# rolling upgrade of the operator itself — would re-arm the fence and the pod would be
+# killed again, which is the loop that made the incident invisible in the first place.
+# The cluster is split-brained right now (step 5), so this is the interleaving that
+# matters.
+pod0_uid_before="$(kubectl -n "$NS" get pod e2e-0 -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+quarantined_before="$(kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | wc -l | tr -d ' ')"
+kubectl -n "$NS" delete pod -l app.kubernetes.io/name=mqttd-operator --wait=true
+kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=120s
+# Give the restarted operator several reconciles over the standing incident.
+sleep 75
+quarantined_after="$(kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | wc -l | tr -d ' ')"
+[ "$quarantined_before" = "$quarantined_after" ] \
+  || fail "a restarted operator quarantined more PVCs ($quarantined_before -> $quarantined_after)"
+pod0_uid_after="$(kubectl -n "$NS" get pod e2e-0 -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+[ "$pod0_uid_before" = "$pod0_uid_after" ] \
+  || fail "a restarted operator DELETED the fenced pod again (uid changed) — fence-once is in memory, not in cluster state"
+[ "$(cr_condition SplitBrain)" = "True" ] \
+  || fail "the restarted operator stopped reporting the standing split brain"
+echo "operator restart survived: no re-fence, pod untouched, verdict still raised"
+
+log "7/9 — leader election: killing the holder must not stop reconciliation"
+# The operator ships one replica, so the Lease path has never run with a contender —
+# including the microsecond MicroTime fix that a 500 from the API server once exposed.
+kubectl -n "$NS" scale deploy/mqttd-operator --replicas=2
+kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=180s
+wait_for 120 "a Lease holder to be recorded" \
+  bash -c "[ -n \"\$(kubectl -n $NS get lease mqttd-operator -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)\" ]"
+holder_before="$(kubectl -n "$NS" get lease mqttd-operator -o jsonpath='{.spec.holderIdentity}')"
+kubectl -n "$NS" delete pod "$holder_before" --wait=true 2>/dev/null || true
+# LEASE_SECS is 30, so the survivor may take that long to take over.
+wait_for 180 "the Lease to move to the surviving replica" \
+  bash -c "[ \"\$(kubectl -n $NS get lease mqttd-operator -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)\" != \"$holder_before\" ]"
+# Taking the Lease is not the same as USING it: require a reconcile after the handover.
+reconciled=""
+for _ in $(seq 1 24); do
+  if kubectl -n "$NS" logs -l app.kubernetes.io/name=mqttd-operator --since=30s --tail=-1 2>/dev/null | grep -q "reconciled"; then
+    reconciled=yes; break
+  fi
+  sleep 5
+done
+[ -n "$reconciled" ] || fail "the new Lease holder took over but never reconciled"
+kubectl -n "$NS" scale deploy/mqttd-operator --replicas=1
+kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=120s
+echo "leader failover works: the Lease moved and the survivor reconciled"
+
+log "8/9 — brownout must be DETECTED (the remediation with no runtime coverage)"
+# ExpandPvc has been unit-tested at plan() only and never run against a cluster.
+# store_max_bytes = 1 browns out immediately (a positive value is accepted; only 0 is
+# rejected), so no publish load is needed to reach the state.
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
+  -p '{"spec":{"remediation":{"brownout":"ExpandPvc"}}}'
+kubectl -n "$NS" get mqttdcluster e2e -o jsonpath='{.spec.config}' > /tmp/e2e-config.toml
+printf '\nstore_max_bytes = 1\n' >> /tmp/e2e-config.toml
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
+  -p "$(python3 -c "
+import json,sys
+print(json.dumps({'spec': {'config': open('/tmp/e2e-config.toml').read()}}))")"
+wait_for 300 "the Brownout condition to be raised" \
+  bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath=\"{.status.conditions[?(@.type=='Brownout')].status}\")\" = True ]"
+echo "brownout DETECTED and surfaced as a condition"
+# Expansion needs an expansion-capable StorageClass. kind's local-path provisioner is
+# usually not one, and a test that silently passes on a cluster that cannot expand
+# proves nothing — so say which case this run exercised.
+sc="$(kubectl -n "$NS" get pvc data-e2e-1 -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+expandable="$(kubectl get storageclass "$sc" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null || true)"
+if [ "$expandable" = "true" ]; then
+  wait_for 300 "the PVC to be expanded" \
+    bash -c "[ \"\$(kubectl -n $NS get pvc data-e2e-1 -o jsonpath='{.spec.resources.requests.storage}')\" != '1Gi' ]"
+  echo "brownout REMEDIATED: PVC expanded on an expansion-capable StorageClass ($sc)"
+else
+  echo "NOTE: StorageClass '$sc' has allowVolumeExpansion='$expandable' — expansion is NOT"
+  echo "      exercised on this cluster. Detection is asserted; the ExpandPvc patch path"
+  echo "      still needs a run against an expansion-capable CSI."
+fi
+
+log "9/9 — deleting the CR must collect the cluster but KEEP the data"
 # Ownership is asserted at creation (assertion 1); collection never was. Deleting the CR
 # must garbage-collect every object the operator owns — and must NOT take the volumes
 # with it, because volumeClaimTemplate PVCs are not owned by the CR and the retention
