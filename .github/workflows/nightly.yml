@@ -124,10 +124,12 @@ jobs:
           # exist in a fresh checkout — and libFuzzer hard-errors on a missing
           # explicit corpus dir ("The required directory ... does not exist").
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          # No `+nightly` override: it would bypass the PINNED nightly installed
-          # above (the pin is the default toolchain; `+nightly` re-selects the
-          # floating channel and its ICE).
-          cargo fuzz run ${{ matrix.target }} \
+          # `+nightly-2026-07-24` names the PINNED toolchain explicitly. Both prior
+          # forms were wrong: `+nightly` floats (run #16's tokio ICE on 008fa22ce),
+          # and NO override lets rust-toolchain.toml's STABLE 1.97.0 win (run #22:
+          # "the option `Z` is only accepted on the nightly compiler"). Keep this
+          # date in lockstep with the dtolnay toolchain step above.
+          cargo +nightly-2026-07-24 fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=720
 
