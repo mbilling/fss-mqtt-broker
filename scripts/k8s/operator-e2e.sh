@@ -13,20 +13,22 @@
 #   3. A SCALE cycle (3->4->3) resizes the set, keeps the cluster identity, raises
 #      no fence, and leaves EVERY claim intact — the departed pod's included, since
 #      no scale may destroy the only copy of anything (issue #97).
-#   4. WIPING THE FOUNDER'S VOLUME no longer splits the cluster: with the founder
+#   5. WIPING THE FOUNDER'S VOLUME no longer splits the cluster: with the founder
 #      guard armed, ordinal 0 renders seeds, so an empty data dir makes it REJOIN
 #      the surviving cluster instead of minting a second one (ADR 0055 T9).
-#   5. BREAK GLASS — with re-founding explicitly re-permitted, a real split brain
+#   6. BREAK GLASS — with re-founding explicitly re-permitted, a real split brain
 #      is still detected and fenced (PVC labelled, pod deleted, DATA NEVER
 #      DELETED), the verdict HOLDS because the fence fires once, and the
 #      re-founder has ALSO quarantined itself so it serves no clients.
-#   6. THE OPERATOR RESTARTING mid-incident does not re-fence — fence-once is
-#      enforced by cluster state (the PVC label), not by operator memory.
-#   7. LEADER FAILOVER: with two replicas, killing the Lease holder hands over and
-#      the survivor actually reconciles.
-#   8. BROWNOUT is detected and surfaced (ExpandPvc had no runtime coverage at all);
+#   4. BROWNOUT is detected and surfaced (ExpandPvc had no runtime coverage at all);
 #      expansion itself is asserted only where the StorageClass can expand, and the
-#      run says which case it exercised rather than passing silently.
+#      run says which case it exercised rather than passing silently. It runs here,
+#      while the cluster is HEALTHY, because it changes the config — and a config
+#      roll cannot complete once a later step has left a pod permanently unready.
+#   7. THE OPERATOR RESTARTING mid-incident does not re-fence — fence-once is
+#      enforced by cluster state (the PVC label), not by operator memory.
+#   8. LEADER FAILOVER: with two replicas, killing the Lease holder hands over and
+#      the survivor actually reconciles.
 #   9. DELETING THE CR collects every owned object and keeps every volume.
 #
 # Plus, before any of it: the operator's RBAC is minimal, not merely sufficient.
@@ -146,7 +148,7 @@ can() { kubectl auth can-i "$1" "$2" --as="$sa" -n "$NS" 2>/dev/null; }
   || fail "the operator cannot delete pods — the fence needs that, so these can-i checks are vacuous"
 echo "RBAC is minimal: no PVC deletion, no Secret access, pod deletion (the fence) intact"
 
-log "1/6 — apply a CR; the operator must CREATE a working cluster"
+log "1/9 — apply a CR; the operator must CREATE a working cluster"
 # Fence is enabled from the start: assertion 2 proves it does NOT fire on a
 # routine roll, which is only meaningful if it was armed the whole time.
 kubectl -n "$NS" apply -f - <<EOF
@@ -216,7 +218,7 @@ wait_for 180 "the StatefulSet to re-render with CLUSTER_ESTABLISHED" \
 kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
 echo "founder guard armed: ordinal 0 can no longer found"
 
-log "2/6 — a rolling restart must provoke NO fence (the safety property)"
+log "2/9 — a rolling restart must provoke NO fence (the safety property)"
 BEFORE_PVCS="$(kubectl -n "$NS" get pvc -l "$(printf 'mqttd.io/quarantined=true')" -o name | wc -l | tr -d ' ')"
 kubectl -n "$NS" rollout restart statefulset/e2e
 kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
@@ -229,7 +231,7 @@ AFTER_PVCS="$(kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | wc
 [ "$(cr_status clusterId)" = "$CLUSTER_ID" ] || fail "cluster identity changed across a roll"
 echo "rolling restart completed with no fence and a stable identity"
 
-log "3/6 — scale up then down; the operator must resize the set and keep data"
+log "3/9 — scale up then down; the operator must resize the set and keep data"
 # The rendered config carries REPLICAS (the readiness-floor math), so a scale is also
 # a config change: the operator must roll the set to the new shape, not just edit
 # .spec.replicas. Withheld until issue #92 was fixed — the roll a scale implies left
@@ -257,7 +259,80 @@ done
 [ "$(cr_condition SplitBrain)" = "False" ] || fail "a scale cycle was mistaken for a split brain"
 echo "scaled 3->4->3; identity stable, no fence, EVERY PVC intact (incl. the departed pod's)"
 
-log "4/6 — wipe the founder's volume; the guard must make it REJOIN, not re-found"
+log "4/9 — brownout must be DETECTED (the remediation with no runtime coverage)"
+# Placed HERE, while the cluster is healthy, and that placement is load-bearing: this
+# step changes the config, a config change rolls the StatefulSet, and a roll cannot
+# complete while any pod is unready — which the steps below deliberately arrange. Run
+# after them and the patch never reaches a single broker (observed: pods untouched,
+# no "disk watermark active" anywhere, brownout never raised).
+#
+# ExpandPvc has been unit-tested at plan() only and never run against a cluster.
+# store_max_bytes = 1 browns out immediately (a positive value is accepted; only 0 is
+# rejected), so no publish load is needed to reach the state.
+kubectl -n "$NS" get mqttdcluster e2e -o jsonpath='{.spec.config}' > /tmp/e2e-config-orig.toml
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
+  -p '{"spec":{"remediation":{"brownout":"ExpandPvc"}}}'
+# INSERT under [durable] — do not append. TOML is section-scoped, the config ends with
+# [runtime], and the structs are deny_unknown_fields, so an appended key lands in the
+# wrong table and `--check-config` rejects the whole file. (It did: the check-config
+# init container CrashLoopBackOff'd, which is that gate working exactly as intended.)
+python3 -c "
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).read().splitlines()
+out = []
+for line in lines:
+    out.append(line)
+    if line.strip() == '[durable]':
+        out.append('store_max_bytes = 1')
+assert any(l == 'store_max_bytes = 1' for l in out), 'no [durable] section to patch'
+open(dst, 'w').write('\n'.join(out) + '\n')
+" /tmp/e2e-config-orig.toml /tmp/e2e-config-brownout.toml
+grep -A 1 '^\[durable\]' /tmp/e2e-config-brownout.toml
+set_config() { # set_config <file>
+  kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
+    -p "$(python3 -c "
+import json,sys
+print(json.dumps({'spec': {'config': open(sys.argv[1]).read()}}))" "$1")"
+}
+set_config /tmp/e2e-config-brownout.toml
+# Wait for DIRECT evidence the config reached a broker, rather than for `rollout status`.
+# Whether a browned-out node stays Ready is precisely one of the things not yet
+# established, so gating on readiness here would couple this assertion to an unknown.
+wait_for 300 "a broker to load the watermark" \
+  bash -c "kubectl -n $NS logs -l app.kubernetes.io/name=mqttd -c mqttd --tail=-1 2>/dev/null | grep -q 'disk watermark active'"
+wait_for 240 "the Brownout condition to be raised" \
+  bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath=\"{.status.conditions[?(@.type=='Brownout')].status}\")\" = True ]"
+echo "brownout DETECTED and surfaced as a condition"
+ready_in_brownout="$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mqttd \
+  -o 'jsonpath={range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}' 2>/dev/null || true)"
+echo "readiness while browned out: $ready_in_brownout"
+
+# Expansion needs an expansion-capable StorageClass. kind's local-path provisioner is
+# usually not one, and a test that silently passes on a cluster that cannot expand
+# proves nothing — so say which case this run exercised.
+sc="$(kubectl -n "$NS" get pvc data-e2e-1 -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+expandable="$(kubectl get storageclass "$sc" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null || true)"
+if [ "$expandable" = "true" ]; then
+  wait_for 300 "the PVC to be expanded" \
+    bash -c "[ \"\$(kubectl -n $NS get pvc data-e2e-1 -o jsonpath='{.spec.resources.requests.storage}')\" != '1Gi' ]"
+  echo "brownout REMEDIATED: PVC expanded on an expansion-capable StorageClass ($sc)"
+else
+  echo "NOTE: StorageClass '$sc' has allowVolumeExpansion='$expandable' — expansion is NOT"
+  echo "      exercised on this cluster. Detection is asserted; the ExpandPvc patch path"
+  echo "      still needs a run against an expansion-capable CSI."
+fi
+
+# Revert, so everything below runs on a broker that is not refusing growth-writes.
+set_config /tmp/e2e-config-orig.toml
+kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
+  -p '{"spec":{"remediation":{"brownout":"Alert"}}}'
+kubectl -n "$NS" rollout status statefulset/e2e --timeout="$READY_TIMEOUT"
+wait_for 240 "the Brownout condition to clear" \
+  bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath=\"{.status.conditions[?(@.type=='Brownout')].status}\")\" != True ]"
+echo "watermark reverted; the cluster is out of brownout"
+
+log "5/9 — wipe the founder's volume; the guard must make it REJOIN, not re-found"
 # The same induction that used to create a split brain: destroy pod-0's data dir while
 # the cluster is live. With the founder guard armed (assertion 1) ordinal 0 renders
 # seeds, so the empty volume makes it a JOINER — it adopts the surviving identity and
@@ -286,7 +361,7 @@ kubectl -n "$NS" get pvc -l mqttd.io/quarantined=true -o name | grep -q . \
   && fail "a PVC was quarantined — the operator fenced a node that should have rejoined"
 echo "founder guard held: pod-0 rejoined the SAME cluster ($CLUSTER_ID), no split brain, no fence"
 
-log "5/6 — break glass: allow re-founding, and the fence must still work"
+log "6/9 — break glass: allow re-founding, and the fence must still work"
 # The guard is the prevention; the fence is the containment behind it. Proving the fence
 # still fires needs a split brain, and with the guard armed one can no longer be induced —
 # so ask for founding back, exactly as an operator would after total volume loss.
@@ -326,7 +401,7 @@ ready0="$(kubectl -n "$NS" get pod e2e-0 \
   && fail "the re-founded pod-0 is READY — it is serving clients from an empty store"
 echo "break glass works: re-founding permitted, fenced once, self-quarantined (Ready=$ready0), data intact"
 
-log "6/9 — the operator restarting mid-incident must not re-fence"
+log "7/9 — the operator restarting mid-incident must not re-fence"
 # Fence-once is enforced by CLUSTER state (the PVC's quarantine label), not by anything
 # the operator remembers. If it were in-memory, a restart — a crash, an eviction, a
 # rolling upgrade of the operator itself — would re-arm the fence and the pod would be
@@ -349,7 +424,7 @@ pod0_uid_after="$(kubectl -n "$NS" get pod e2e-0 -o jsonpath='{.metadata.uid}' 2
   || fail "the restarted operator stopped reporting the standing split brain"
 echo "operator restart survived: no re-fence, pod untouched, verdict still raised"
 
-log "7/9 — leader election: killing the holder must not stop reconciliation"
+log "8/9 — leader election: killing the holder must not stop reconciliation"
 # The operator ships one replica, so the Lease path has never run with a contender —
 # including the microsecond MicroTime fix that a 500 from the API server once exposed.
 kubectl -n "$NS" scale deploy/mqttd-operator --replicas=2
@@ -373,36 +448,6 @@ done
 kubectl -n "$NS" scale deploy/mqttd-operator --replicas=1
 kubectl -n "$NS" rollout status deploy/mqttd-operator --timeout=120s
 echo "leader failover works: the Lease moved and the survivor reconciled"
-
-log "8/9 — brownout must be DETECTED (the remediation with no runtime coverage)"
-# ExpandPvc has been unit-tested at plan() only and never run against a cluster.
-# store_max_bytes = 1 browns out immediately (a positive value is accepted; only 0 is
-# rejected), so no publish load is needed to reach the state.
-kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
-  -p '{"spec":{"remediation":{"brownout":"ExpandPvc"}}}'
-kubectl -n "$NS" get mqttdcluster e2e -o jsonpath='{.spec.config}' > /tmp/e2e-config.toml
-printf '\nstore_max_bytes = 1\n' >> /tmp/e2e-config.toml
-kubectl -n "$NS" patch mqttdcluster e2e --type=merge \
-  -p "$(python3 -c "
-import json,sys
-print(json.dumps({'spec': {'config': open('/tmp/e2e-config.toml').read()}}))")"
-wait_for 300 "the Brownout condition to be raised" \
-  bash -c "[ \"\$(kubectl -n $NS get mqttdcluster e2e -o jsonpath=\"{.status.conditions[?(@.type=='Brownout')].status}\")\" = True ]"
-echo "brownout DETECTED and surfaced as a condition"
-# Expansion needs an expansion-capable StorageClass. kind's local-path provisioner is
-# usually not one, and a test that silently passes on a cluster that cannot expand
-# proves nothing — so say which case this run exercised.
-sc="$(kubectl -n "$NS" get pvc data-e2e-1 -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
-expandable="$(kubectl get storageclass "$sc" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null || true)"
-if [ "$expandable" = "true" ]; then
-  wait_for 300 "the PVC to be expanded" \
-    bash -c "[ \"\$(kubectl -n $NS get pvc data-e2e-1 -o jsonpath='{.spec.resources.requests.storage}')\" != '1Gi' ]"
-  echo "brownout REMEDIATED: PVC expanded on an expansion-capable StorageClass ($sc)"
-else
-  echo "NOTE: StorageClass '$sc' has allowVolumeExpansion='$expandable' — expansion is NOT"
-  echo "      exercised on this cluster. Detection is asserted; the ExpandPvc patch path"
-  echo "      still needs a run against an expansion-capable CSI."
-fi
 
 log "9/9 — deleting the CR must collect the cluster but KEEP the data"
 # Ownership is asserted at creation (assertion 1); collection never was. Deleting the CR
