@@ -4190,9 +4190,15 @@ impl Hub {
                 // (no held token) loses to any committed token but an untokened
                 // entry only gap-fills an absent topic.
                 let token = (epoch, offset);
-                let apply = match self.retained_tokens.get(&topic) {
-                    Some(held) => token > *held,
-                    None => token > (0, 0) || held_value.is_none(),
+                // The DURABLE fence, not just the in-memory cache: this is the path that
+                // resurrects a deleted retained message when the survivors have restarted
+                // and lost their tombstones (issue #87 item 4).
+                let apply = if self.retained_tokens.contains_key(&topic)
+                    || self.durable_retained.is_some()
+                {
+                    !self.retained_is_stale(&topic, token).await
+                } else {
+                    token > (0, 0) || held_value.is_none()
                 };
                 if !apply {
                     continue;
@@ -4715,6 +4721,46 @@ impl Hub {
 
     /// Apply a **committed** retained value to the local cache iff its token exceeds
     /// the held one (ADR 0037 §3): monotonic per topic, idempotent, order-insensitive.
+    /// Whether `token` is STALE for `topic` — i.e. superseded, and must not be applied.
+    ///
+    /// The two sources answer different questions, and conflating them is a bug:
+    ///
+    /// * `retained_tokens` is "what this node has already APPLIED SUCCESSFULLY", so an
+    ///   equal token is a duplicate and is skipped. It is in-memory and does not survive a
+    ///   restart.
+    /// * the durable record is "what the cluster has COMMITTED". An equal token there is
+    ///   *this very commit* — the owner applying its own write, or a repair of one whose
+    ///   store write failed — so it must be APPLIED, not skipped. Only a strictly older
+    ///   token is stale.
+    ///
+    /// Reading the durable record is what makes tombstone fences survive a restart (issue
+    /// #87 item 4). They used to live only in the in-memory map, so a clear committed while
+    /// one node was down, followed by a restart of the survivors, left nobody holding the
+    /// fence — and the absent node's stale value was re-applied cluster-wide, resurrecting
+    /// a retained message the user had deleted. The periodic digest (0014-T10) spread it
+    /// faster, not slower. No schema change was needed: `RetainedEntry` already carries
+    /// `tombstone`, `epoch` and `offset`; `DurableRetained::get` simply had no production
+    /// caller, so the keyspace was written and never read.
+    async fn retained_is_stale(&self, topic: &str, token: (u64, u64)) -> bool {
+        if let Some(held) = self.retained_tokens.get(topic) {
+            return token <= *held;
+        }
+        let Some(durable) = self.durable_retained.as_ref() else {
+            return false;
+        };
+        match durable.get(topic).await {
+            Ok(Some(entry)) => token < (entry.epoch, entry.offset),
+            Ok(None) => false,
+            // A read failure must not invent a fence: treating it as "not stale" keeps the
+            // topic repairable, the same principle as not recording a token on a failed
+            // write.
+            Err(e) => {
+                debug!(topic = %topic, error = %e, "durable retained fence lookup failed");
+                false
+            }
+        }
+    }
+
     /// An empty payload is a committed clear — the cache drops the topic, but the
     /// tombstone's token is kept so a staler value cannot resurrect it.
     async fn apply_retained_update(
@@ -4725,11 +4771,7 @@ impl Hub {
         app: &AppProperties,
         token: (u64, u64),
     ) {
-        if self
-            .retained_tokens
-            .get(topic)
-            .is_some_and(|held| token <= *held)
-        {
+        if self.retained_is_stale(topic, token).await {
             debug!(topic = %topic, ?token, "stale/duplicate retained update skipped");
             return;
         }
@@ -7510,12 +7552,35 @@ mod tests {
             self.commit(topic, &[], true)
         }
 
+        /// Answer from the committed log, as a real durable keyspace does.
+        ///
+        /// This returned `Ok(None)` unconditionally until 2026-08-07, which was harmless
+        /// only because NOTHING IN PRODUCTION CALLED IT — the durable retained keyspace
+        /// was written and never read. Issue #87 item 4 is the cost of that: the tombstone
+        /// fences lived only in memory, so a restart lost them and deleted retained
+        /// messages could be resurrected. The fence now reads back through here, so the
+        /// double has to be honest.
         async fn get(
             &self,
-            _topic: &str,
+            topic: &str,
         ) -> Result<Option<mqtt_storage::retained_log::RetainedEntry>, mqtt_storage::StorageError>
         {
-            Ok(None)
+            let log = self.committed.lock().unwrap();
+            Ok(log
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (t, _, _))| t == topic)
+                .map(
+                    |(i, (_, payload, tombstone))| mqtt_storage::retained_log::RetainedEntry {
+                        payload: payload.clone(),
+                        qos: 0,
+                        tombstone: *tombstone,
+                        props: AppProps::default(),
+                        epoch: 0,
+                        offset: (i + 1) as u64,
+                    },
+                ))
         }
     }
 
@@ -7659,6 +7724,61 @@ mod tests {
     /// ADR 0037 §5: an owner-local commit that fails (no quorum — the minority side)
     /// re-queues and retries on the sweep tick; once quorum returns the whole queue
     /// commits **in publish order** and the committed values fan out.
+    /// A CLEARED retained topic must stay cleared across a restart (issue #87 item 4).
+    ///
+    /// `retained_tokens` is in-memory. A clear committed while one node was down, followed
+    /// by a restart of the survivors, left NOBODY holding the tombstone fence — so when the
+    /// absent node returned with its stale value, the snapshot path applied it and the
+    /// deleted retained message came back cluster-wide. Retraction was not durable. The
+    /// periodic digest made it spread faster, not slower.
+    ///
+    /// This models the restart directly: a fresh hub (empty `retained_tokens`, as after a
+    /// process start) with the durable record already holding the committed TOMBSTONE, then
+    /// a peer snapshot offering the stale pre-clear value.
+    #[tokio::test]
+    async fn a_cleared_retained_topic_is_not_resurrected_after_a_restart() {
+        let durable = Arc::new(FlakyRetained::default());
+        durable.heal();
+        // The clear is committed durably, as it would have been before the restart.
+        {
+            use mqtt_storage::retained_log::DurableRetained as _;
+            durable.clear("t").await.expect("commit the tombstone");
+        }
+
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        let store = FailingRetainedStore::new();
+        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_durable_retained(durable.clone());
+        tokio::spawn(hub.run());
+
+        // A peer that was absent for the clear offers its stale value. Its token is LOWER
+        // than the tombstone's, which is exactly what the fence exists to notice — and the
+        // fence is only available from the durable record on a fresh process.
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![RetainedWireEntry {
+                topic: "t".into(),
+                payload: b"stale".to_vec(),
+                qos: 0,
+                epoch: 0,
+                offset: 0,
+                props: AppProps::default(),
+            }],
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            store.held("t").await.is_empty(),
+            "a deleted retained message was RESURRECTED by a peer snapshot after a restart \
+             — the tombstone fence must survive the process that recorded it"
+        );
+    }
+
     /// A store write that FAILS must not fence the topic forever (issue #87 item 2).
     ///
     /// The token is the idempotence fence: anything at or below it is skipped. Recording it
