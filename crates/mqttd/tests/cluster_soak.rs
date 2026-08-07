@@ -103,7 +103,7 @@ async fn a_soak_under_sustained_load_shows_no_drift() {
     for n in &mut nodes {
         n.spawn();
     }
-    wait_all_ready(&nodes, seed).await;
+    wait_all_ready(&mut nodes, seed).await;
     let mut proc = proc_over(seed, nodes);
     establish_subscribers(&mut proc, 2).await;
 

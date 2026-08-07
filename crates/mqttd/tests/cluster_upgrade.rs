@@ -158,7 +158,7 @@ async fn a_rolling_upgrade_and_rollback_lose_no_acked_fact() {
         n.binary.clone_from(&baseline);
         n.spawn();
     }
-    wait_all_ready(&nodes, seed).await;
+    wait_all_ready(&mut nodes, seed).await;
     let mut proc = proc_over(seed, nodes);
     establish_subscribers(&mut proc, 2).await;
 

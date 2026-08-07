@@ -78,7 +78,7 @@ async fn run_schedule(seed: u64) {
     for n in &mut nodes {
         n.spawn();
     }
-    wait_all_ready(&nodes, seed).await;
+    wait_all_ready(&mut nodes, seed).await;
     let mut proc = proc_over(seed, nodes);
     establish_subscribers(&mut proc, 2).await;
 
@@ -218,7 +218,7 @@ async fn a_disk_bound_crash_mid_write_loses_no_acked_fact() {
     for n in &mut nodes {
         n.spawn();
     }
-    wait_all_ready(&nodes, seed).await;
+    wait_all_ready(&mut nodes, seed).await;
     let mut proc = proc_over(seed, nodes);
     establish_subscribers(&mut proc, 1).await;
 
@@ -315,7 +315,7 @@ async fn rapid_kill_restart_flapping_loses_no_acked_fact() {
     for n in &mut nodes {
         n.spawn();
     }
-    wait_all_ready(&nodes, seed).await;
+    wait_all_ready(&mut nodes, seed).await;
     let mut proc = proc_over(seed, nodes);
     establish_subscribers(&mut proc, 2).await;
 
@@ -362,5 +362,28 @@ async fn rapid_kill_restart_flapping_loses_no_acked_fact() {
     );
     for node in &mut proc.nodes {
         node.kill().await;
+    }
+}
+
+/// The harness must not draw spawned-node ports from the kernel's ephemeral
+/// range. It used to, and the cost was a red CI run: a node lost the race to an
+/// outbound source port, died with `AddrInUse`, and the cluster "never became
+/// ready". Ports below 32768 are never auto-assigned, so probing one free means
+/// it stays free until the child binds it.
+#[test]
+fn spawned_node_ports_come_from_outside_the_ephemeral_range() {
+    // 32768 is the low end of the Linux default ip_local_port_range; macOS
+    // starts higher still. Anything below it is ours alone.
+    const EPHEMERAL_LO: u16 = 32_768;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..200 {
+        for port in [proc_common::free_tcp_port(), proc_common::free_udp_port()] {
+            assert!(
+                port < EPHEMERAL_LO,
+                "port {port} is inside the ephemeral range — the kernel can hand it \
+                 to an outbound connection between our probe and the child's bind"
+            );
+            assert!(seen.insert(port), "port {port} handed out twice");
+        }
     }
 }
