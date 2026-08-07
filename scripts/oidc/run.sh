@@ -81,6 +81,44 @@ mint_token() { # mint_token <audience-client-id>
     -d "grant_type=password" -d "scope=openid" | jqget "['access_token']"
 }
 
+# Re-sign a token's payload with a throwaway RSA key, so its SIGNATURE is valid-looking
+# but the key is one the IdP never published — the "withdrawn key" shape, without having
+# to actually retire a Keycloak component mid-run.
+forge_with_foreign_key() { # forge_with_foreign_key <template-token>
+  python3 - "$1" "$WORK" <<'PY'
+import base64, json, subprocess, sys, pathlib
+tok, work = sys.argv[1], pathlib.Path(sys.argv[2])
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=")
+def unb64u(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+h, p, _ = tok.split(".")
+hdr, payload = json.loads(unb64u(h)), json.loads(unb64u(p))
+hdr["kid"] = "never-published-kid"
+key = work / "foreign.pem"
+subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"], check=True,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+signing = b64u(json.dumps(hdr).encode()) + b"." + b64u(json.dumps(payload).encode())
+sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key)],
+                     input=signing, capture_output=True, check=True).stdout
+print((signing + b"." + b64u(sig)).decode())
+PY
+}
+
+# Rewrite one claim of a token WITHOUT re-signing. The signature no longer matches, which
+# is exactly the point for `exp`/`iss`: a broker that rejects these must be checking the
+# claim, and one that accepts them is not validating at all.
+tamper_claim() { # tamper_claim <token> <claim> <json-value>
+  python3 - "$1" "$2" "$3" <<'PY'
+import base64, json, sys
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=")
+def unb64u(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+tok, claim, value = sys.argv[1], sys.argv[2], sys.argv[3]
+h, p, sig = tok.split(".")
+payload = json.loads(unb64u(p))
+payload[claim] = json.loads(value)
+print(f"{h}.{b64u(json.dumps(payload).encode()).decode()}.{sig}")
+PY
+}
+
 # Connect with a token in the password field; echoes CONNACK outcome as ok/deny.
 try_connect() { # try_connect <token>
   if mosquitto_pub -h "$BROKER_HOST" -p "$BROKER_PORT" -i "oidc-probe-$RANDOM" \
@@ -164,6 +202,22 @@ WRONG_AUD="$(mint_token "other-aud")"
 # 2c. garbage token rejects
 [[ "$(try_connect "aaa.bbb.ccc")" == "deny" ]] && ok "garbage token is rejected" || bad "garbage token was accepted"
 
+# 2d. EXPIRED token rejects (ACCEPTANCE BAR item 2 — never previously exercised).
+EXPIRED="$(tamper_claim "$TOKEN" exp 1)"
+[[ "$(try_connect "$EXPIRED")" == "deny" ]] && ok "expired token is rejected" || bad "EXPIRED token was accepted"
+
+# 2e. WRONG ISSUER rejects (ACCEPTANCE BAR item 2 — never previously exercised).
+WRONG_ISS="$(tamper_claim "$TOKEN" iss '"https://evil.example/realms/other"')"
+[[ "$(try_connect "$WRONG_ISS")" == "deny" ]] && ok "wrong-issuer token is rejected" || bad "WRONG-ISSUER token was accepted"
+
+# 2f. A token signed by a key the IdP never published rejects (ACCEPTANCE BAR item 4).
+# This is the withdrawn-key shape: well-formed, correctly signed, unknown kid. It must not
+# be rescued by the unknown-kid refetch path — a refetch that cannot find the kid must deny.
+FOREIGN="$(forge_with_foreign_key "$TOKEN")"
+[[ "$(try_connect "$FOREIGN")" == "deny" ]] \
+  && ok "token signed with an unpublished key is rejected (withdrawn-key shape)" \
+  || bad "token signed with a key the IdP NEVER PUBLISHED was accepted"
+
 # --- 3. Rotate keys mid-run; new-kid token accepted without restart --------
 # Add a fresh RSA signing key component (higher priority) → Keycloak signs new tokens with
 # a new kid while still publishing the old key in the JWKS.
@@ -189,6 +243,33 @@ docker stop "$KC_NAME" >/dev/null 2>&1 || true
 [[ "$(try_connect "$ROTATED_TOKEN")" == "accept" ]] \
   && ok "cached keys keep validating while the IdP is down (last-known-good)" \
   || bad "broker failed closed immediately on IdP outage (should ride cache)"
+
+# --- 5. Staleness forced to zero → fail closed (ACCEPTANCE BAR item 5) -----
+# The IdP is still down from step 4. Restart the broker with a zero staleness budget: it
+# must now REFUSE the very token it accepted a moment ago on cached keys. This is the
+# other half of the last-known-good policy — riding the cache is a choice, and an operator
+# who sets the budget to zero must get fail-closed instead.
+kill "$BROKER_PID" 2>/dev/null || true
+wait "$BROKER_PID" 2>/dev/null || true
+MQTTD_PLAINTEXT_BIND="${BROKER_HOST}:${BROKER_PORT}" \
+MQTTD_ALLOW_ANONYMOUS= \
+MQTTD_OIDC_ISSUER="$ISSUER" \
+MQTTD_OIDC_AUDIENCE="$CLIENT_AUD" \
+MQTTD_OIDC_ALLOW_HTTP=1 \
+MQTTD_OIDC_JWKS_REFRESH=300 \
+MQTTD_OIDC_MAX_STALE=0 \
+RUST_LOG="mqttd::oidc=info,warn" \
+  "$MQTTD_BIN" >"$WORK/broker-stale0.log" 2>&1 &
+BROKER_PID=$!
+sleep 3
+if kill -0 "$BROKER_PID" 2>/dev/null; then
+  [[ "$(try_connect "$ROTATED_TOKEN")" == "deny" ]] \
+    && ok "staleness budget 0 fails CLOSED while the IdP is unreachable" \
+    || bad "staleness budget 0 still ACCEPTED a token with no reachable IdP"
+else
+  # Refusing to start at all with no reachable IdP and a zero budget is also fail-closed.
+  ok "staleness budget 0 fails closed (broker refused to serve without a reachable IdP)"
+fi
 
 echo
 echo "=== OIDC integration: $PASS passed, $FAIL failed ==="
