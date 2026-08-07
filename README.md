@@ -260,6 +260,27 @@ be found. Each is tracked; none is a silent surprise.
 - **No production track record.** No tagged release has been cut, and nobody is
   running this in anger yet.
 
+## Supported Rust, platforms, and stability
+
+- **Minimum supported Rust: 1.88** for the broker and its libraries; **1.89** for
+  the `mqttd-operator` crate alone. Both are verified nightly against those exact
+  toolchains rather than asserted — see the `msrv` job in
+  [`.github/workflows/nightly.yml`](.github/workflows/nightly.yml).
+- **Builds** are produced with a pinned **1.97.0** toolchain
+  ([`rust-toolchain.toml`](rust-toolchain.toml)). That is a *reproducibility*
+  anchor, not a requirement on you: it is what makes "rebuild the tag and get
+  identical bytes" checkable (ADR 0045 T2).
+- **Released binaries:** `linux/amd64` and `linux/arm64`, statically linked
+  against musl, signed with SBOM and SLSA provenance. Other platforms build from
+  source; they are not released artifacts and are not tested in CI.
+- **Stability:** this is **pre-1.0**. The compatibility policy of
+  [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) — semver, adjacent
+  version skew, sequential majors — **applies from 1.0.0**. Until then, wire and
+  on-disk schema reshapes are permitted between releases, deliberately, so the
+  cheap moment to fix a format is not missed. MQTT itself is unaffected: clients
+  speak the published 3.1.1 / 5.0 specifications, which this policy does not
+  touch.
+
 ## Workspace layout
 
 | Crate | Responsibility |
