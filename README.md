@@ -441,8 +441,23 @@ cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc \
   --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
+# Run it, hardened, with durable state on a volume:
+docker run -d --name mqttd \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v mqttd-data:/var/lib/mqttd -p 1883:1883 -p 8080:8080 \
+  -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
+  -e MQTTD_DATA_DIR=/var/lib/mqttd -e MQTTD_HEALTH_BIND=0.0.0.0:8080 \
+  ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc
+# (plaintext + anonymous for a first look only — see the secured quickstart below)
+
 # Or download a binary from the GitHub Release and verify + reproduce it — see RELEASING.md.
 ```
+
+> **`/var/lib/mqttd` is the image's data directory** and the only path inside the
+> image the broker's uid (65532) may write. Durable sessions are on by default but
+> keep state **in memory** until `MQTTD_DATA_DIR` is set, so persistence needs both
+> the env var and a volume. The image runs non-root under a read-only root
+> filesystem with every capability dropped.
 
 > **What exists today:** a **`v0.9.0-rc` pre-release** — both musl binaries with
 > signatures and certificates, a signed CycloneDX SBOM, a multi-arch image, and
