@@ -370,6 +370,85 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
 mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
 ```
 
+### Single node, secured (TLS 1.3 + mTLS + ACL)
+
+The path to run if you are evaluating this as a **secure** broker: no plaintext
+listener, no anonymous clients, client certificates required, and a deny-by-default
+topic policy. CI runs these exact commands (`scripts/quickstart-smoke.sh`).
+
+```sh
+# 1. A local CA, a server cert for 127.0.0.1, and a client cert whose CN is the
+#    client's identity. The clientAuth EKU is REQUIRED — rustls rejects a client
+#    certificate without it.
+mkdir -p pki && (cd pki && \
+  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+    -keyout ca.key -out ca.crt -subj '/CN=mqttd-quickstart-ca' && \
+  openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
+    -subj '/CN=127.0.0.1' && \
+  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out server.crt -days 365 \
+    -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth') && \
+  for cn in sensor-1 sensor-2; do \
+    openssl req -newkey rsa:2048 -nodes -keyout "$cn.key" -out "$cn.csr" \
+      -subj "/CN=$cn" && \
+    openssl x509 -req -in "$cn.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
+      -out "$cn.crt" -days 365 \
+      -extfile <(printf 'extendedKeyUsage=clientAuth'); \
+  done)
+
+# 2. Deny by default. `%i` substitutes the authenticated identity — here the
+#    certificate CN — so this ONE rule confines every device to its own subtree:
+#    sensor-1 gets sensors/sensor-1/#, sensor-2 gets sensors/sensor-2/#, and
+#    neither can reach the other's.
+cat > acl.toml <<'EOF'
+default = "deny"
+
+[[rules]]
+identities = ["sensor-1", "sensor-2"]
+actions = ["publish", "subscribe"]
+effect = "allow"
+topics = ["sensors/%i/#"]
+EOF
+
+# 3. Run it. No MQTTD_PLAINTEXT_BIND, no MQTTD_ALLOW_ANONYMOUS — the broker logs
+#    an INSECURE warning for either, and this configuration logs none.
+MQTTD_TLS_BIND=127.0.0.1:8883 \
+MQTTD_TLS_CERT=pki/server.crt MQTTD_TLS_KEY=pki/server.key \
+MQTTD_TLS_CLIENT_CA=pki/ca.crt \
+MQTTD_ACL_FILE=acl.toml \
+cargo run --bin mqttd &
+
+# 4. A foreign client over mutual TLS, inside its own subtree:
+mosquitto_sub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
+  --cert pki/sensor-1.crt --key pki/sensor-1.key -t 'sensors/sensor-1/#' &
+mosquitto_pub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
+  --cert pki/sensor-1.crt --key pki/sensor-1.key \
+  -t 'sensors/sensor-1/temp' -m '21.5C'
+
+# 5. And the two refusals that make it a security boundary.
+#    No client certificate at all — the TLS handshake itself fails:
+mosquitto_pub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
+  -t 'sensors/sensor-1/temp' -m 'nope'
+#    A valid, fully authenticated certificate reaching into ANOTHER device's
+#    subtree — subscription denied, and nothing is ever delivered:
+mosquitto_sub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
+  --cert pki/sensor-2.crt --key pki/sensor-2.key -t 'sensors/sensor-1/#'
+```
+
+> **Checking the second refusal yourself:** don't read `mosquitto_sub`'s exit
+> status — it exits **0** when every filter is denied and 27 on a clean timeout,
+> which is the opposite of what it looks like. Judge it by delivery: publish as
+> `sensor-1` while `sensor-2` is subscribed to `sensors/sensor-1/#`, and confirm
+> nothing arrives. That is exactly what CI asserts, and it fails if the `%i` is
+> dropped from the rule.
+
+> **One behaviour to know before you rely on it:** a *denied publish* is dropped
+> but still **acknowledged** — MQTT 3.1.1 has no negative PUBACK, and withholding
+> the ack would leave a conforming publisher retrying forever. So a publisher
+> cannot tell that it was refused. The denial is recorded in the audit log as
+> `acl.deny.publish`; that, not the client's return code, is where you see it.
+> Denied *subscriptions* are refused visibly, with a per-filter reason code.
+
 ### Two-node cluster via gossip discovery (insecure, local testing)
 
 Nodes find each other through SWIM and establish the peer mesh automatically —

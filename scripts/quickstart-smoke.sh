@@ -17,7 +17,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-for tool in mosquitto_pub mosquitto_sub python3 curl; do
+for tool in mosquitto_pub mosquitto_sub python3 curl openssl; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FATAL: '$tool' not found on PATH"; exit 2; }
 done
 
@@ -100,9 +100,156 @@ wait "$SUB" 2>/dev/null || true
 GOT="$(cat "$OUT")"
 if [[ "$GOT" == "hi" ]]; then
   echo "  ok   — a publish on node B was delivered to a subscriber on node A"
-  echo "QUICKSTART OK"
 else
   echo "  FAIL — cross-node delivery: expected [hi] got [$GOT]"
   echo "QUICKSTART FAILED"
   exit 1
 fi
+
+# ===========================================================================
+# The SECURED quickstart (ADR 0051 T2). The insecure two-node loop above is for
+# a first look; this is the path someone evaluating a security-first broker will
+# copy. It was the only documented quickstart that did not exist: every
+# getting-started command in the README ran with plaintext and anonymous
+# clients, which is a poor advertisement for the product's own thesis.
+#
+# Same rule as above — deviations from the README block are mechanical only
+# (ephemeral ports, a prebuilt binary, a polled health port).
+# ===========================================================================
+echo
+echo "── The README quickstart: single node, secured (TLS 1.3 + mTLS + ACL) ──"
+
+PKI="$WORK/pki"; mkdir -p "$PKI"
+# README step 1, verbatim in substance: a CA, a 127.0.0.1 server leaf, and a
+# client leaf whose CN is the identity. clientAuth is REQUIRED — rustls/webpki
+# rejects a client cert without that EKU, and `openssl x509 -req` omits it.
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout "$PKI/ca.key" -out "$PKI/ca.crt" -subj '/CN=mqttd-quickstart-ca' >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout "$PKI/server.key" -out "$PKI/server.csr" \
+  -subj '/CN=127.0.0.1' >/dev/null 2>&1
+openssl x509 -req -in "$PKI/server.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+  -CAcreateserial -out "$PKI/server.crt" -days 365 \
+  -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth') >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout "$PKI/sensor-1.key" -out "$PKI/sensor-1.csr" \
+  -subj '/CN=sensor-1' >/dev/null 2>&1
+openssl x509 -req -in "$PKI/sensor-1.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+  -CAcreateserial -out "$PKI/sensor-1.crt" -days 365 \
+  -extfile <(printf 'extendedKeyUsage=clientAuth') >/dev/null 2>&1
+# A SECOND device, so isolation can be proven between two real identities rather
+# than inferred from one client's error message.
+openssl req -newkey rsa:2048 -nodes -keyout "$PKI/sensor-2.key" -out "$PKI/sensor-2.csr" \
+  -subj '/CN=sensor-2' >/dev/null 2>&1
+openssl x509 -req -in "$PKI/sensor-2.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+  -CAcreateserial -out "$PKI/sensor-2.crt" -days 365 \
+  -extfile <(printf 'extendedKeyUsage=clientAuth') >/dev/null 2>&1
+
+# README step 2: deny by default, one rule, `%i` confining each identity to its
+# own subtree.
+cat > "$WORK/acl.toml" <<'ACL'
+default = "deny"
+
+[[rules]]
+identities = ["sensor-1", "sensor-2"]
+actions = ["publish", "subscribe"]
+effect = "allow"
+topics = ["sensors/%i/#"]
+ACL
+
+read -r S_TLS S_HEALTH < <(python3 -c "
+import socket
+ss=[socket.socket() for _ in range(2)]
+[s.bind(('127.0.0.1',0)) for s in ss]
+print(*[s.getsockname()[1] for s in ss])
+[s.close() for s in ss]")
+
+# README step 3: no plaintext bind, no anonymous. The log assertion below is the
+# point of saying so — it is checked, not asserted.
+SEC_LOG="$WORK/secured.log"
+MQTTD_NODE_ID=secured \
+MQTTD_TLS_BIND="127.0.0.1:$S_TLS" \
+MQTTD_TLS_CERT="$PKI/server.crt" \
+MQTTD_TLS_KEY="$PKI/server.key" \
+MQTTD_TLS_CLIENT_CA="$PKI/ca.crt" \
+MQTTD_ACL_FILE="$WORK/acl.toml" \
+MQTTD_HEALTH_BIND="127.0.0.1:$S_HEALTH" \
+RUST_LOG=info "$MQTTD_BIN" >"$SEC_LOG" 2>&1 &
+PIDS+=("$!")
+wait_ready "$S_HEALTH" secured-node
+
+# The claim the README makes about this configuration: it logs NO insecure-mode
+# warning. Every opt-out of a secure default is loudly logged, so the absence of
+# those lines is a real signal — and a regression here (a plaintext listener
+# creeping into the documented block) would otherwise pass unnoticed.
+if grep -q "INSECURE" "$SEC_LOG"; then
+  echo "  FAIL — the 'secured' quickstart logged an INSECURE warning:"
+  grep "INSECURE" "$SEC_LOG" | sed 's/^/         /'
+  echo "QUICKSTART FAILED"; exit 1
+fi
+echo "  ok   — the secured configuration logs no INSECURE warning"
+
+MOSQ_TLS=(--cafile "$PKI/ca.crt" --cert "$PKI/sensor-1.crt" --key "$PKI/sensor-1.key")
+
+# README step 4: a foreign client over mutual TLS, inside its own subtree.
+SEC_OUT="$WORK/secured-out.txt"
+mosquitto_sub -h 127.0.0.1 -p "$S_TLS" "${MOSQ_TLS[@]}" -i qs-sec-sub \
+  -t 'sensors/sensor-1/#' -C 1 -W 8 >"$SEC_OUT" 2>/dev/null &
+SSUB=$!
+sleep 1
+mosquitto_pub -h 127.0.0.1 -p "$S_TLS" "${MOSQ_TLS[@]}" -i qs-sec-pub \
+  -t 'sensors/sensor-1/temp' -m '21.5C' 2>/dev/null || true
+wait "$SSUB" 2>/dev/null || true
+SGOT="$(cat "$SEC_OUT")"
+if [[ "$SGOT" != "21.5C" ]]; then
+  echo "  FAIL — mTLS round-trip inside the grant: expected [21.5C] got [$SGOT]"
+  echo "QUICKSTART FAILED"; exit 1
+fi
+echo "  ok   — an mTLS client published and received inside its own subtree"
+
+# README step 5, first refusal: no client certificate — the TLS handshake fails,
+# so nothing reaches the MQTT layer at all.
+if mosquitto_pub -h 127.0.0.1 -p "$S_TLS" --cafile "$PKI/ca.crt" -i qs-sec-nocert \
+     -t 'sensors/sensor-1/temp' -m 'nope' >/dev/null 2>&1; then
+  echo "  FAIL — a client with NO certificate was accepted by an mTLS listener"
+  echo "QUICKSTART FAILED"; exit 1
+fi
+echo "  ok   — a client with no certificate is refused at the TLS handshake"
+
+# Second refusal, and the one that matters: two REAL identities, isolated from
+# each other. sensor-2 holds a perfectly valid certificate and a grant of its
+# own — it is simply not allowed into sensor-1's subtree.
+#
+# This is asserted by absence of delivery, not by a client exit code:
+# mosquitto_sub exits 0 when every filter is denied and 27 on a clean timeout,
+# so the exit status says the opposite of what it looks like it says.
+MOSQ_TLS2=(--cafile "$PKI/ca.crt" --cert "$PKI/sensor-2.crt" --key "$PKI/sensor-2.key")
+LEAK="$WORK/leak.txt"
+mosquitto_sub -h 127.0.0.1 -p "$S_TLS" "${MOSQ_TLS2[@]}" -i qs-sec-nosy \
+  -t 'sensors/sensor-1/#' -C 1 -W 4 >"$LEAK" 2>/dev/null &
+NOSY=$!
+sleep 1
+mosquitto_pub -h 127.0.0.1 -p "$S_TLS" "${MOSQ_TLS[@]}" -i qs-sec-pub2 \
+  -t 'sensors/sensor-1/temp' -m 'private' 2>/dev/null || true
+wait "$NOSY" 2>/dev/null || true
+if [[ -s "$LEAK" ]]; then
+  echo "  FAIL — sensor-2 received sensor-1's traffic: [$(cat "$LEAK")]"
+  echo "QUICKSTART FAILED"; exit 1
+fi
+echo "  ok   — sensor-2 is denied sensor-1's subtree and receives nothing"
+
+# And the same certificate works perfectly inside its OWN grant, so the previous
+# assertion proves isolation rather than a broken client.
+OWN="$WORK/own.txt"
+mosquitto_sub -h 127.0.0.1 -p "$S_TLS" "${MOSQ_TLS2[@]}" -i qs-sec-own \
+  -t 'sensors/sensor-2/#' -C 1 -W 8 >"$OWN" 2>/dev/null &
+OSUB=$!
+sleep 1
+mosquitto_pub -h 127.0.0.1 -p "$S_TLS" "${MOSQ_TLS2[@]}" -i qs-sec-own-pub \
+  -t 'sensors/sensor-2/temp' -m 'mine' 2>/dev/null || true
+wait "$OSUB" 2>/dev/null || true
+if [[ "$(cat "$OWN")" != "mine" ]]; then
+  echo "  FAIL — sensor-2 could not use its OWN subtree: got [$(cat "$OWN")]"
+  echo "QUICKSTART FAILED"; exit 1
+fi
+echo "  ok   — the same certificate works normally inside its own subtree"
+
+echo "QUICKSTART OK"
