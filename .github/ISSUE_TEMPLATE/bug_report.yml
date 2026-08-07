@@ -1,0 +1,72 @@
+name: Bug report
+description: Something behaves differently from what is documented or expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        **Not for security vulnerabilities** — use
+        [private vulnerability reporting](https://github.com/mbilling/fss-mqtt-broker/security/advisories/new)
+        instead, so a fix can ship before the problem is public.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect instead?
+      description: >
+        If a document made you expect something different, quote it — a
+        misleading doc is treated as a real defect here, not a lesser one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How can we reproduce it?
+      description: >
+        Exact commands, config or env vars. A minimal case beats a complete one.
+        If it is intermittent, say so and say roughly how often — an
+        intermittent failure of an acknowledged guarantee is treated seriously.
+      placeholder: |
+        1. MQTTD_TLS_BIND=… mqttd
+        2. mosquitto_pub …
+        3. observed: …
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Run with `RUST_LOG=info` (or `debug` for the noisy detail) and paste the
+        relevant part. `/statusz` output helps for anything cluster-related.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "v0.9.0, or the commit SHA you built"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: durable
+    attributes:
+      label: Durable sessions
+      description: >
+        On by default. Several behaviours differ between durable and
+        non-durable, so this changes where we look first.
+      options:
+        - "On (default)"
+        - "Off"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Deployment
+      placeholder: "single node / 3-node cluster / Helm chart on k8s / kind"

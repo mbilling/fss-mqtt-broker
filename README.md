@@ -792,6 +792,19 @@ Every significant decision is recorded as an ADR. See
 [**delivery dashboard**](docs/delivery/STATUS.md) for the full catalogue of decisions
 and their live build status.
 
+## Contributing
+
+Bug reports, questions and patches are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md) — it covers the build/test gates and the two
+local conventions worth knowing before your first PR. Participation is governed
+by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+**Suspected vulnerabilities do not go in public issues** — use GitHub's private
+vulnerability reporting; the policy is in [SECURITY.md](SECURITY.md).
+
+Release notes live in [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases);
+[CHANGELOG.md](CHANGELOG.md) explains where to look for what.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
