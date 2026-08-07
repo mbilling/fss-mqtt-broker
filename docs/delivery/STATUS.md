@@ -53,7 +53,7 @@
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/8 done](0044-release-readiness-assurance.md) | 1 open |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Proposed | [4/5 done](0045-release-engineering-and-distribution.md) | 1 open |
-| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/5 done](0046-file-based-configuration.md) | — |
+| [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/6 done](0046-file-based-configuration.md) | 1 open |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [8/8 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [2/4 done](0048-comparative-benchmarking.md) | 2 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
@@ -127,6 +127,10 @@
 **0045 — Release engineering and distribution (signed, reproducible, SBOM-attested)**
 
 - `0045-T5` 🚧 in-progress: SBOM per release (CycloneDX or SPDX) attached to the release and image; cargo-deny/cargo-audit run on the release commit; RELEASING.md + README verify docs; cut the first 0.x release — "CycloneDX SBOM (cargo-cyclonedx) + cargo-deny/cargo-audit gate on the release commit + RELEASING.md + README Install/verify — all in place; remaining: cut the first 0.x release (a maintainer signed-tag push, gated on the ADR 0044 readiness checklist)"
+
+**0046 — File-based configuration (layered over env, hot-reloadable, GitOps-friendly)**
+
+- `0046-T6` ⬜ planned: Unrecognized CLI arguments are an error, not silence — mqttd accepts only --check-config and --decommission and IGNORES everything else, so a typo (`--check-confg`) or an unsupported flag (`--version`) starts a real broker instead of failing; refuse unknown args at startup and print the accepted set (2026-08-07 amendment)
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 

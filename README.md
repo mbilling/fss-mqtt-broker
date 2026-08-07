@@ -302,10 +302,11 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 - **Subscription digests (bloom)** for sub-linear fan-out.
 - MQTT 5 **Server-Reference redirect** for v5 clients that opt into following it
   (the session relay remains the universal path meanwhile — ADR 0005 P3).
-- **The first tagged release.** The signed, reproducible, SBOM-attested release
+- **The first non-prerelease tag.** The signed, reproducible, SBOM-attested
   pipeline ([ADR 0045](docs/adr/0045-release-engineering-and-distribution.md)) is
-  in place; pushing the first `v0.x` tag cuts the first release — see
-  [Install](#install) and [RELEASING.md](RELEASING.md).
+  in place and **has produced a real release**: `v0.9.0-rc`, whose signatures,
+  SBOM, image and provenance all verify. What remains is cutting the
+  non-prerelease tag — see [Install](#install) and [RELEASING.md](RELEASING.md).
 
 ## How it compares
 
@@ -427,18 +428,28 @@ build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook
 ```sh
 # Container image — fully-static musl binary on distroless/static, non-root,
 # multi-arch (linux/amd64 + linux/arm64), nothing but the broker and a CA bundle:
-docker run --rm ghcr.io/mbilling/fss-mqtt-broker:latest --version   # (once the first tag is cut)
+docker run --rm ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc --check-config
+# → config OK: defaults + MQTTD_* env overlay validates (no config file set)
+#
+# Note: there is no `--version` flag. mqttd recognises only `--check-config` and
+# `--decommission`, and IGNORES anything else — so an unrecognised flag starts a
+# real broker instead of erroring (tracked as ADR 0046 T6). The running version
+# is logged at startup: `starting mqttd version="0.9.0"`.
 
 # Verify the image signature before trusting it:
-cosign verify ghcr.io/mbilling/fss-mqtt-broker:<version> \
+cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc \
   --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # Or download a binary from the GitHub Release and verify + reproduce it — see RELEASING.md.
 ```
 
-> The signed, reproducible, SBOM-attested pipeline is in place; the **first `v0.x`
-> tag** cuts the first published release. Until then, build from source
+> **What exists today:** a **`v0.9.0-rc` pre-release** — both musl binaries with
+> signatures and certificates, a signed CycloneDX SBOM, a multi-arch image, and
+> SLSA provenance. Every one of those has been verified end to end against the
+> published artifacts, so this is a real thing you can pull and check, not a
+> pipeline that merely exists. **No non-prerelease tag has been cut yet**, so
+> there is no `:latest`; pin the version, or build from source
 > ([Build & test](#build--test)).
 
 ## Running
