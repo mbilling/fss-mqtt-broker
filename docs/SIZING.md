@@ -85,8 +85,9 @@ hard wall — hence the headroom.
 Past the headroom, actual disk-full **fails closed**: a write that cannot be made
 durable withholds the publisher's ack (the publisher retries; nothing is silently
 lost). This is crash-tested in the harshest form — the kernel killing the process
-mid-write — with recovery and back-fill verified (ADR 0044 P2). There is no per-store
-quota yet (ADR 0041 amendment T7).
+mid-write — with recovery and back-fill verified (ADR 0044 P2). The watermark is an
+**aggregate** over all four stores: there is no per-store quota yet, so one store can
+consume the whole budget and brown out the others (ADR 0041 amendment T9).
 
 If `MQTTD_DATA_DIR` is unset, none of this applies — all state is in memory and the
 memory formula is the only budget.
@@ -111,9 +112,19 @@ Verify your numbers under load with the bench harness (`bench/run.sh`) and watch
 
 ## What cannot be bounded today
 
-Printed here so nobody discovers it in production: total process RSS (no knob —
-container limits + this page), per-connection **write** buffering (bounded only
-indirectly by backlog/queue caps), per-store disk share (aggregate mark only), and
-bridge-spool **bytes** (count cap only, default 10 000 messages). All four are
-recorded losses in [COMPARISON.md](COMPARISON.md) and tracked as ADR 0041 amendment
-tasks (T6–T8).
+Printed here so nobody discovers it in production:
+
+| Axis | What bounds it today | Tracked by |
+|---|---|---|
+| Total process RSS | Nothing — container limits + this page | 0041-T8 |
+| Offline queue **bytes** | Message count only (`MQTTD_MAX_QUEUED_MESSAGES`) | 0041-T6 |
+| Bridge-spool **bytes** | Message count only (default 10 000) | 0041-T7 |
+| Per-store disk share | Aggregate watermark only | 0041-T9 |
+| Per-connection **write** buffering | `MAX_BACKLOG`, a hard-coded **10 000 messages** per stalled subscriber — bounded in count, **unbounded in bytes, and not configurable at all** | 0041-T10 |
+
+The last row is the sharpest edge: a subscriber that stops reading can hold up to
+10 000 messages, and at the 1 MiB default packet size that is ~10 GiB of headroom per
+connection that no setting can lower. Cap `MQTTD_MAX_PACKET_SIZE` to bound it in
+practice — the product of the two is the real worst case.
+
+All five are recorded losses in [COMPARISON.md](COMPARISON.md).

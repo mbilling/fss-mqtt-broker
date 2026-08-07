@@ -37,6 +37,12 @@ tasks:
   - id: 0041-T8
     title: Process-memory watermark — MQTTD_MEMORY_MAX_BYTES, RSS poller + edge-triggered brownout reusing the T5 refusal paths; growth refused, maintenance continues, recovery restores; explicitly not allocation-denial or per-connection force-shutdown (2026-08-04 amendment)
     status: planned
+  - id: 0041-T9
+    title: Per-store disk bound — a share of MQTTD_STORE_MAX_BYTES per redb store (sessions/retained/replicas/lease) so one store cannot consume the whole watermark and brown out the others; same T4 refusal behaviors, counted per store (2026-08-07 amendment)
+    status: planned
+  - id: 0041-T10
+    title: Per-connection write-buffer bound — MAX_BACKLOG (hub.rs, 10 000 messages per stalled subscriber) becomes byte-aware and configurable; today it is a hard-coded count, so a slow consumer's backlog is bounded in messages but unbounded in bytes and cannot be tuned (2026-08-07 amendment)
+    status: planned
 ---
 
 # Delivery — ADR 0041: Resource governance
@@ -73,6 +79,8 @@ defaults, and a metric per cap.
 | 0041-T6 | ⬜ planned | — |  |
 | 0041-T7 | ⬜ planned | — |  |
 | 0041-T8 | ⬜ planned | — |  |
+| 0041-T9 | ⬜ planned | — |  |
+| 0041-T10 | ⬜ planned | — |  |
 <!-- /status-table:0041 -->
 
 ## Changelog
