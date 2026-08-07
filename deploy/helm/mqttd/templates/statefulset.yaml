@@ -73,10 +73,19 @@ spec:
                 # A 1-replica cluster has no survivor to split from, so it may still found.
                 if [ "${CLUSTER_ESTABLISHED:-}" = "true" ] && [ "$REPLICAS" -gt 1 ]; then
                   if [ "$REPLICAS" = "2" ]; then SEEDS="$SEED1"; else SEEDS="${SEED1}, ${SEED2}"; fi
+                  # An armed ordinal 0 is a JOINER in every respect, so it takes the joiner's
+                  # readiness floor too. Leaving it at 1 was justified as "with seeds it mints
+                  # nothing and bootstraps no lease group, so readiness gates on real admission" —
+                  # true only when DURABLE is on. With durable off there is no lease gate at all,
+                  # and member_count() counts self, so a floor of 1 let an isolated pod-0 report
+                  # Ready and serve clients an empty store. The floor is the only protection there.
+                  READY_MIN=$(( REPLICAS / 2 + 1 ))
                 else
                   SEEDS=""
+                  # Founder, or a single-node cluster: it must be able to come Ready ALONE, or
+                  # ordered bring-up never starts and a 1-replica deployment is never healthy.
+                  READY_MIN=1
                 fi
-                READY_MIN=1
               else
                 if [ "$ORD" = "1" ]; then SEEDS="$SEED0"; else SEEDS="${SEED0}, ${SEED1}"; fi
                 READY_MIN=$(( REPLICAS / 2 + 1 ))

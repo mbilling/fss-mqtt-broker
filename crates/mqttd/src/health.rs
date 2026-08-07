@@ -779,6 +779,43 @@ mod tests {
         (state, seen)
     }
 
+    /// A NON-DURABLE node alone must be healthy when it is *meant* to be alone.
+    ///
+    /// This is the single-node deployment: nothing to join, nothing to lose, and a
+    /// readiness floor of 1. It must serve.
+    #[tokio::test]
+    async fn a_lone_single_node_is_healthy_without_durable() {
+        // No durable plane => `lease_group_ready` is None and cannot gate; the floor is
+        // the only check, and it is satisfied.
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(status, 200, "a single-node cluster must be healthy alone");
+    }
+
+    /// ...and a NON-DURABLE node that is short of its expected members must NOT be.
+    ///
+    /// With durable on, an unadmitted node is caught by `lease_group_ready`. With durable
+    /// off there is no lease gate at all, and `member_count()` counts SELF — so an
+    /// isolated node reports 1. The readiness floor is the only thing standing between
+    /// "isolated" and "serving clients an empty store", which is why an armed ordinal 0
+    /// now renders the joiner's majority floor instead of 1.
+    #[tokio::test]
+    async fn a_non_durable_node_below_its_member_floor_is_not_ready() {
+        // Alone (member_count = 1) but expecting a majority of 3.
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 2);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(
+            status, 503,
+            "an isolated node must not serve when it expects company"
+        );
+
+        // With the majority present it serves again — the floor gates on membership, not
+        // on being lonely forever.
+        let state = HealthState::new(spawn_live_hub(), Some(placement(2)), None, 2);
+        let (status, _, _) = super::route(&state, "/readyz").await;
+        assert_eq!(status, 200, "a majority is enough to serve");
+    }
+
     /// THE case the guard must never break: a genuine first bootstrap.
     ///
     /// pod-0 comes up alone, founds the cluster, and must reach Ready by itself — under
