@@ -145,6 +145,18 @@ volume rather than starting empty. That is usually what you want (the node rejoi
 its state and back-fills). If you intend the ordinal to come back *fresh*, delete its PVC
 before scaling up.
 
+## Seed lists: automatic on Kubernetes, yours everywhere else
+
+On Kubernetes the chart and the operator derive each joiner's seeds from stable ordinals
+(pod-0, pod-1), which is safe because a StatefulSet keeps ordinals stable and removes the
+**highest** first on scale-down — so a seed target cannot be decommissioned out from under
+a joiner, and a joiner retries its seeds every protocol period until one answers.
+
+Anywhere else — bare metal, compose, systemd — `MQTTD_SWIM_SEEDS` is **yours to maintain**.
+If you decommission a node that other nodes name as a seed, update their seed lists;
+nothing rewrites them at runtime. A joiner whose every seed is gone will retry forever
+without joining.
+
 ## The founder rule (read before touching pod-0's storage)
 
 Pod-0 renders with **no seeds**: a pod-0 that starts with an *empty data dir and no

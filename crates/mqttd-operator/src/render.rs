@@ -47,10 +47,19 @@ if [ "$ORD" = "0" ]; then
   # A 1-replica cluster has no survivor to split from, so it may still found.
   if [ "${CLUSTER_ESTABLISHED:-}" = "true" ] && [ "$REPLICAS" -gt 1 ]; then
     if [ "$REPLICAS" = "2" ]; then SEEDS="$SEED1"; else SEEDS="${SEED1}, ${SEED2}"; fi
+    # An armed ordinal 0 is a JOINER in every respect, so it takes the joiner's
+    # readiness floor too. Leaving it at 1 was justified as "with seeds it mints
+    # nothing and bootstraps no lease group, so readiness gates on real admission" —
+    # true only when DURABLE is on. With durable off there is no lease gate at all,
+    # and member_count() counts self, so a floor of 1 let an isolated pod-0 report
+    # Ready and serve clients an empty store. The floor is the only protection there.
+    READY_MIN=$(( REPLICAS / 2 + 1 ))
   else
     SEEDS=""
+    # Founder, or a single-node cluster: it must be able to come Ready ALONE, or
+    # ordered bring-up never starts and a 1-replica deployment is never healthy.
+    READY_MIN=1
   fi
-  READY_MIN=1
 else
   if [ "$ORD" = "1" ]; then SEEDS="$SEED0"; else SEEDS="${SEED0}, ${SEED1}"; fi
   READY_MIN=$(( REPLICAS / 2 + 1 ))
@@ -487,54 +496,63 @@ mod tests {
         .expect("sample CR")
     }
 
-    /// Run the REAL init script over the (ordinal, guard, replicas) matrix.
+    /// Run the REAL init script with the given inputs; return the rendered config.
     ///
-    /// The script is the mechanism — it decides, in shell, which pods may found a
-    /// cluster — and it is byte-identical in the chart and the operator, so until now
-    /// nothing exercised it outside a kind cluster. These cases are the whole contract.
+    /// The script is the mechanism — it decides, in shell, which pods may found a cluster
+    /// and what each one's readiness floor is — and it is byte-identical in the chart and
+    /// the operator, so until now nothing exercised it outside a kind cluster.
+    fn render_script_output(ord: &str, established: Option<&str>, replicas: &str) -> String {
+        // Unique per invocation: tests run in parallel threads and several share input
+        // combinations, so a name derived from the inputs alone would have one test
+        // wiping the directory another is mid-render in.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mqttd-render-{ord}-{}-{replicas}-{}",
+            established.unwrap_or("unset"),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("mqttd.toml.tmpl"),
+            "seeds = [__SEEDS__]\nready_min_members = __READY_MIN__\nid = \"__NODE_ID__\"\npeer = \"__PEER_ADVERTISE__\"\n",
+        )
+        .expect("template");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(RENDER_SCRIPT)
+            .env("POD_NAME", format!("mqttd-{ord}"))
+            .env("REPLICAS", replicas)
+            .env("HEADLESS_DOMAIN", "mqttd-headless.ns.svc.cluster.local")
+            .env("TMPL_DIR", &dir)
+            .env("OUT_DIR", &dir);
+        if let Some(v) = established {
+            cmd.env("CLUSTER_ESTABLISHED", v);
+        }
+        let out = cmd.output().expect("run the render script");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(dir.join("mqttd.toml")).expect("rendered config")
+    }
+
+    /// Just the `seeds = [...]` line. The node's OWN address also appears in the rendered
+    /// config (as `peer_advertise`), so a whole-file search cannot tell "seeds to itself"
+    /// from "advertises itself".
+    fn seeds_line(config: &str) -> String {
+        config
+            .lines()
+            .find(|l| l.starts_with("seeds ="))
+            .unwrap_or_else(|| panic!("no seeds line in: {config}"))
+            .to_string()
+    }
+
+    /// Which pods may FOUND a cluster, and who each one seeds to.
     #[test]
     fn the_render_script_decides_seeds_by_ordinal_and_guard() {
-        fn render(ord: &str, established: Option<&str>, replicas: &str) -> String {
-            let dir = std::env::temp_dir().join(format!(
-                "mqttd-render-{ord}-{}-{replicas}",
-                established.unwrap_or("unset")
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            std::fs::write(
-                dir.join("mqttd.toml.tmpl"),
-                "seeds = [__SEEDS__]\nready_min_members = __READY_MIN__\nid = \"__NODE_ID__\"\npeer = \"__PEER_ADVERTISE__\"\n",
-            )
-            .expect("template");
-            let mut cmd = std::process::Command::new("sh");
-            cmd.arg("-c")
-                .arg(RENDER_SCRIPT)
-                .env("POD_NAME", format!("mqttd-{ord}"))
-                .env("REPLICAS", replicas)
-                .env("HEADLESS_DOMAIN", "mqttd-headless.ns.svc.cluster.local")
-                .env("TMPL_DIR", &dir)
-                .env("OUT_DIR", &dir);
-            if let Some(v) = established {
-                cmd.env("CLUSTER_ESTABLISHED", v);
-            }
-            let out = cmd.output().expect("run the render script");
-            assert!(
-                out.status.success(),
-                "script failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            std::fs::read_to_string(dir.join("mqttd.toml")).expect("rendered config")
-        }
-        /// Just the `seeds = [...]` line. The node's OWN address also appears in the
-        /// rendered config (as `peer_advertise`), so a whole-file search cannot tell
-        /// "seeds to itself" from "advertises itself".
-        fn seeds_line(config: &str) -> String {
-            config
-                .lines()
-                .find(|l| l.starts_with("seeds ="))
-                .unwrap_or_else(|| panic!("no seeds line in: {config}"))
-                .to_string()
-        }
+        let render = render_script_output;
 
         // Ordinal 0, guard OFF: seedless, so it founds — the first-bootstrap path that
         // must keep working, or nothing ever forms.
@@ -563,8 +581,8 @@ mod tests {
             "must NOT seed to itself — a node seeded only to itself still founds: {seeds}"
         );
         assert!(
-            c.contains("ready_min_members = 1"),
-            "the founder floor stays 1; safety comes from having seeds: {c}"
+            c.contains("ready_min_members = 2"),
+            "an armed ordinal 0 is a joiner and takes the joiner's majority floor: {c}"
         );
 
         // Two replicas: the only peer is ordinal 1.
@@ -593,6 +611,42 @@ mod tests {
             let seeds = seeds_line(&c);
             assert!(seeds.contains("mqttd-0.mqttd-headless"), "{seeds}");
             assert!(seeds.contains("mqttd-1.mqttd-headless"), "{seeds}");
+        }
+    }
+
+    /// The readiness floor follows the guard, and getting it wrong is what let an
+    /// isolated pod-0 serve clients an empty store.
+    ///
+    /// An UNARMED ordinal 0 is the founder: it must come Ready alone or ordered bring-up
+    /// never starts, and a single-node deployment is never healthy. An ARMED ordinal 0 is
+    /// a joiner and takes the joiner's MAJORITY floor. The floor was previously left at 1
+    /// for ordinal 0 on the reasoning that an unadmitted node is caught by the lease gate
+    /// — true only with durable sessions ON. Without a durable plane `lease_group_ready`
+    /// is `None` and cannot gate, and `member_count()` counts self, so the floor is the only
+    /// protection there.
+    #[test]
+    fn the_readiness_floor_follows_the_founder_guard() {
+        fn floor(ord: &str, established: Option<&str>, replicas: &str) -> String {
+            let c = render_script_output(ord, established, replicas);
+            c.lines()
+                .find(|l| l.starts_with("ready_min_members ="))
+                .unwrap_or_else(|| panic!("no floor line in: {c}"))
+                .to_string()
+        }
+
+        // Founder, and the lone single node: healthy by itself.
+        assert_eq!(floor("0", None, "3"), "ready_min_members = 1");
+        assert_eq!(floor("0", Some("true"), "1"), "ready_min_members = 1");
+
+        // Armed ordinal 0 = joiner = majority.
+        assert_eq!(floor("0", Some("true"), "3"), "ready_min_members = 2");
+        assert_eq!(floor("0", Some("true"), "4"), "ready_min_members = 3");
+        assert_eq!(floor("0", Some("true"), "5"), "ready_min_members = 3");
+
+        // Joiners are unchanged, armed or not.
+        for guard in [None, Some("true")] {
+            assert_eq!(floor("1", guard, "3"), "ready_min_members = 2");
+            assert_eq!(floor("2", guard, "5"), "ready_min_members = 3");
         }
     }
 

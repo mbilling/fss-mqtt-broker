@@ -175,9 +175,29 @@ has no survivor to split from), and `spec.bootstrapPolicy: AllowRebootstrap` is 
 break-glass for total volume loss or a deliberate re-bootstrap — it clears the latch
 rather than leaving it stale, and is loud while set.
 
-`READY_MIN` stays 1 for ordinal 0. The safety comes from the seed list being non-empty:
-with seeds, the node mints nothing and bootstraps no lease group, so readiness gates on
-real admission. Raising the floor would add a second, independent way to deadlock.
+`READY_MIN` follows the guard. An **unarmed** ordinal 0 keeps 1 — it is the founder and
+must come Ready alone, or ordered bring-up never starts and a single-node deployment is
+never healthy. An **armed** ordinal 0 is a joiner in every respect and takes the joiner's
+majority floor.
+
+*Corrected 2026-08-07.* This originally read "`READY_MIN` stays 1 for ordinal 0; the
+safety comes from the seed list being non-empty — with seeds the node mints nothing and
+bootstraps no lease group, so readiness gates on real admission." That is true **only when
+durable sessions are enabled**: `lease_group_ready` is `None` without a durable plane and
+cannot gate, and `member_count()` counts self, so an isolated pod-0 reported `members = 1`
+against a floor of 1 and served clients an empty store. The floor is the only protection
+there. The unstated precondition is the same defect shape as `whenScaled: Delete` ("safe
+because the drain hands state to survivors" — only while a survivor remains) and ADR
+0047's founder-rule claim; it was written into the justification while fixing that very
+class of error.
+
+**Scope: automatic seed lists are a Kubernetes affordance.** Deriving a joiner's seeds
+from stable ordinals works because a StatefulSet guarantees them — ordinals are stable and
+scale-down removes the highest first, so a seed target cannot be decommissioned out from
+under a joiner. Outside an orchestrated environment there is no such guarantee, and
+maintaining `MQTTD_SWIM_SEEDS` — including after decommissioning a node named in it — is
+the operator's responsibility. The broker deliberately does not try to rewrite seed lists
+at runtime.
 
 `SplitBrainAction` gains no variant. The guard must apply under the default `Alert`
 posture — an operator installed with defaults must still be protected — and a "rejoin"
