@@ -175,6 +175,17 @@ def build_dashboard(docs: list[dict]) -> str:
             tail.append(f"{opened} open")
         if deferred:
             tail.append(f"{deferred} deferred")
+        # The delivery doc's adr_status is rendered verbatim for migrated docs, so a
+        # doc whose frontmatter drifts from its ADR's `**Status:**` line would print a
+        # stale decision and nothing would notice (found in the 2026-08-07 audit: the
+        # fallback below only runs for UN-migrated docs). Cross-check them.
+        adr_says = adr_status_line(num)
+        if adr_says != "—" and adr_says != d["adr_status"]:
+            raise DocError(
+                f"{d['_path'].name}: adr_status is {d['adr_status']!r} but "
+                f"docs/adr/{num}-*.md says {adr_says!r} — the delivery record and the "
+                f"decision disagree; fix whichever is wrong"
+            )
         out.append(f"| {num_cell} | {title} | {d['adr_status']} | {prog_cell} | {', '.join(tail) or '—'} |")
 
     # Open + deferred detail across all migrated docs.
