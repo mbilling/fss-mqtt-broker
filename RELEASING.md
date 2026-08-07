@@ -93,6 +93,11 @@ cosign verify-blob "$NAME" \
 sha256sum -c "${NAME}.sha256"
 ```
 
+> On **cosign 3.x**, `--certificate` and `--signature` print a deprecation notice
+> pointing at `--bundle`. They still work and still verify; the release publishes
+> the separate `.pem`/`.sig` files these flags expect. Expect to revisit this when
+> cosign removes them.
+
 ### 2. Reproduce the binary yourself (the strongest check)
 
 The build is byte-reproducible. Rebuild the tag and confirm the checksum matches
@@ -117,20 +122,43 @@ cosign verify "ghcr.io/${REPO}:${VERSION}" \
   --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer "$ISSUER" | jq .
 
-# Provenance + SBOM attestations (attached to the image in the registry):
+# Provenance attestation (attached to the image in the registry).
+# NOTE: the type is `slsaprovenance1`, not `slsaprovenance` — the bare name is
+# cosign's alias for SLSA v0.2, while this pipeline emits v1, so the shorter
+# spelling fails with "none of the attestations matched the predicate type".
 cosign verify-attestation "ghcr.io/${REPO}:${VERSION}" \
-  --type slsaprovenance \
+  --type slsaprovenance1 \
   --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer "$ISSUER" >/dev/null && echo "provenance OK"
 ```
 
 ### 4. Read the SBOM
 
+The SBOM is attached to the GitHub Release as `sbom-${VERSION}.cdx.json` (with
+its own `.sig`/`.pem`, verifiable exactly like a binary in step 1), and to the
+image as a **signed attestation**:
+
 ```sh
-# Attached to the GitHub Release as sbom-${VERSION}.cdx.json, and to the image:
-cosign download sbom "ghcr.io/${REPO}:${VERSION}" 2>/dev/null || true
-jq '.components | length' sbom-${VERSION}.cdx.json   # dependency count
+# From the release — verify it, then read it:
+cosign verify-blob "sbom-${VERSION}.cdx.json" \
+  --certificate "sbom-${VERSION}.cdx.json.pem" \
+  --signature "sbom-${VERSION}.cdx.json.sig" \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer "$ISSUER"
+jq '.components | length' "sbom-${VERSION}.cdx.json"   # dependency count
+
+# Or from the image, authenticated in one step:
+cosign verify-attestation "ghcr.io/${REPO}:${VERSION}" \
+  --type https://cyclonedx.org/bom \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer "$ISSUER" \
+  | jq -r .payload | base64 -d | jq '.predicate.components | length'
 ```
+
+> Do **not** use `cosign download sbom`. It is deprecated, prints nothing here,
+> and — as cosign itself warns — would not authenticate the SBOM even if it did.
+> The runbook used to suggest it with a trailing `|| true`, which turned the
+> failure into a silent success.
 
 ## The reproducibility contract
 
