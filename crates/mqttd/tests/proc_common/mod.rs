@@ -183,23 +183,65 @@ pub struct ProcNode {
 /// A fixed (test-only) gossip key so the mesh runs authenticated, as deployed.
 pub const SWIM_KEY: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
 
-/// Reserve a free TCP port by binding to :0 and dropping the listener. The
-/// tiny release-to-reuse race is acceptable in tests (nothing else on the
-/// runner races for ephemeral ports at this rate).
+/// Ports handed to spawned brokers come from a band BELOW the kernel's
+/// ephemeral range — never from `bind(:0)`.
+///
+/// The old approach (bind `:0`, read the port, drop the listener, pass the
+/// number to a child) called its race "tiny", on the reasoning that "nothing
+/// else on the runner races for ephemeral ports at this rate". That reasoning
+/// omitted the brokers themselves. `bind(:0)` draws from `ip_local_port_range`
+/// — 32768-60999 on the runners — which is the very pool the kernel draws from
+/// for the OUTBOUND source port of every peer link, gossip probe and client
+/// connection these nodes make. The window is not tiny: every `connect()` by
+/// every node of every concurrently-running test is another draw against it.
+///
+/// It cost a CI run to learn: node `proc918-c` died at startup with
+/// `AddrInUse`, so a 3-node cluster formed with 2 and the test reported only
+/// "spawned cluster never became ready".
+///
+/// Below the ephemeral range nothing is auto-assigned, so a port that probes
+/// free stays free until we bind it. The one remaining competitor is another
+/// test *binary* probing concurrently (cargo runs them in parallel), which the
+/// pid-derived start offset spreads apart — and which `wait_all_ready` now
+/// reports precisely rather than as a timeout.
+const PORT_BAND_LO: u16 = 20_000;
+const PORT_BAND_HI: u16 = 32_000;
+
+/// The next port number to probe. Distinct per call within a process, and
+/// started at a pid-derived offset so sibling test binaries do not march in
+/// step through the same band.
+fn next_port_candidate() -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    static CURSOR: OnceLock<AtomicU32> = OnceLock::new();
+    let span = u32::from(PORT_BAND_HI - PORT_BAND_LO);
+    let cursor =
+        CURSOR.get_or_init(|| AtomicU32::new(std::process::id().wrapping_mul(2_654_435_761)));
+    let offset = cursor.fetch_add(1, Ordering::Relaxed) % span; // < span, so fits u16
+    PORT_BAND_LO + u16::try_from(offset).expect("offset is bounded by the band width")
+}
+
+/// Reserve a free TCP port: probe candidates in the band until one binds, then
+/// release it. Unlike the `:0` version, the released port cannot be handed to
+/// somebody else by the kernel in the meantime.
 pub fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    for _ in 0..PORT_BAND_HI - PORT_BAND_LO {
+        let port = next_port_candidate();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free TCP port in {PORT_BAND_LO}..{PORT_BAND_HI}");
 }
 
 pub fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    for _ in 0..PORT_BAND_HI - PORT_BAND_LO {
+        let port = next_port_candidate();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free UDP port in {PORT_BAND_LO}..{PORT_BAND_HI}");
 }
 
 impl ProcNode {
@@ -242,6 +284,15 @@ impl ProcNode {
             .spawn()
             .expect("spawn mqttd binary");
         self.child = Some(child);
+    }
+
+    /// `Some(status)` if the process is no longer running, without blocking.
+    /// A node the test believes it started but which has died is a different
+    /// fact from a node that is slow, and the two must not be reported alike.
+    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
     }
 
     /// `SIGKILL` the process and reap it — the kernel-mediated crash: no
@@ -869,11 +920,21 @@ pub async fn retained_seen(addr: SocketAddr, client_id: &str, topic: &str) -> Op
 
 /// Bring-up on the operator's signal: every spawned node's `/readyz` reports
 /// full membership and a ready lease group.
-pub async fn wait_all_ready(nodes: &[ProcNode], seed: u64) {
+pub async fn wait_all_ready(nodes: &mut [ProcNode], seed: u64) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        // A node that is not RUNNING will never become ready. Say which one and
+        // why, now — rather than burning the full 60s to report a generic
+        // timeout whose real cause (a startup `AddrInUse`) was legible only to
+        // someone who read three log tails to the bottom.
+        for n in nodes.iter_mut() {
+            if let Some(status) = n.exited() {
+                let tail = log_tail(&n.log_path);
+                panic!("seed {seed}: node {} exited during bring-up ({status}) — it cannot become ready\n---- log tail of {} ----\n{tail}", n.id, n.id);
+            }
+        }
         let mut all = true;
-        for n in nodes {
+        for n in nodes.iter() {
             match n.readyz().await {
                 Some((ready, members, _)) => {
                     if !ready || members != nodes.len() {
@@ -887,10 +948,10 @@ pub async fn wait_all_ready(nodes: &[ProcNode], seed: u64) {
             return;
         }
         if Instant::now() >= deadline {
-            for n in nodes {
+            for n in nodes.iter() {
                 eprintln!("---- log tail of {} ----\n{}", n.id, log_tail(&n.log_path));
             }
-            panic!("seed {seed}: spawned cluster never became ready (log tails above)");
+            panic!("seed {seed}: spawned cluster never became ready — every node is still RUNNING but did not converge (log tails above)");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
