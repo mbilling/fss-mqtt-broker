@@ -162,7 +162,11 @@ jobs:
   operator-e2e:
     name: operator end-to-end (kind)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 60, not 45: the run grew from 3 assertions to 9 (RBAC minimality, scale, founder
+    # guard, break-glass fence, operator restart mid-incident, leader failover, brownout
+    # detection, CR-deletion GC), and several of them wait out real timers — a 30s Lease
+    # takeover, a 100-sample stability window, a settle after each roll.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
