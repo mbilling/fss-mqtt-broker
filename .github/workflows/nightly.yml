@@ -200,3 +200,56 @@ jobs:
       # docker is preinstalled on ubuntu-latest runners.
       - name: OIDC lifecycle against Keycloak
         run: ./scripts/oidc/run.sh
+
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The declared `rust-version` is a PROMISE to anyone pinning an older
+    # toolchain, and nothing checked it: every other job runs `stable` or the
+    # 1.97.0 reproducibility pin, so "1.88" was an untested claim.
+    #
+    # It runs nightly rather than per-PR because an MSRV break comes from a
+    # dependency bump or a new language feature — rare, and fine to learn about
+    # within a day — while the check costs ~20 minutes on a cold cache.
+    #
+    # rust-toolchain.toml pins 1.97.0 for EVERY cargo invocation in this repo and
+    # overrides an installed default: exactly the trap the fuzz job documents
+    # ("a `cargo +nightly` that ignores the dated install is exactly the bug that
+    # made the first pin a no-op"). RUSTUP_TOOLCHAIN is what beats it — so it is
+    # set per step, and the job ASSERTS the version actually in use before
+    # checking anything. A verification job silently running the wrong toolchain
+    # is worse than no job at all.
+    strategy:
+      fail-fast: false # each declared MSRV is its own promise; report both
+      matrix:
+        include:
+          - toolchain: "1.88.0"
+            args: "--workspace --exclude mqttd-operator"
+            why: "the workspace rust-version"
+          - toolchain: "1.89.0"
+            args: "--workspace"
+            why: "mqttd-operator declares 1.89"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: the toolchain under test really is ${{ matrix.toolchain }}
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          got="$(rustc --version)"
+          echo "$got"
+          case "$got" in
+            "rustc ${{ matrix.toolchain }}"*) ;;
+            *)
+              echo "::error title=MSRV job ran the wrong toolchain::expected rustc ${{ matrix.toolchain }}, got '$got' — rust-toolchain.toml won over RUSTUP_TOOLCHAIN"
+              exit 1
+              ;;
+          esac
+      - name: cargo check on ${{ matrix.toolchain }} (${{ matrix.why }})
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: cargo check ${{ matrix.args }} --all-features
