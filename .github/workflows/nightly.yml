@@ -109,7 +109,7 @@ jobs:
       # sanitizer flags; nightly run #16). Bump the date deliberately, on green.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-24
+          toolchain: nightly-2026-07-20
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -124,12 +124,12 @@ jobs:
           # exist in a fresh checkout — and libFuzzer hard-errors on a missing
           # explicit corpus dir ("The required directory ... does not exist").
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          # `+nightly-2026-07-24` names the PINNED toolchain explicitly. Both prior
+          # `+nightly-2026-07-20` names the PINNED toolchain explicitly. Both prior
           # forms were wrong: `+nightly` floats (run #16's tokio ICE on 008fa22ce),
           # and NO override lets rust-toolchain.toml's STABLE 1.97.0 win (run #22:
           # "the option `Z` is only accepted on the nightly compiler"). Keep this
           # date in lockstep with the dtolnay toolchain step above.
-          cargo +nightly-2026-07-24 fuzz run ${{ matrix.target }} \
+          cargo +nightly-2026-07-20 fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time=720
 
