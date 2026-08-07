@@ -319,7 +319,7 @@ mod tests {
     }
 
     /// The ownerReference is what makes `kubectl delete mqttdcluster` collect the whole
-    /// cluster instead of orphaning a StatefulSet, and what stops the objects outliving
+    /// cluster instead of orphaning a `StatefulSet`, and what stops the objects outliving
     /// the spec that describes them. Every field is load-bearing: `uid` is what the
     /// garbage collector matches on (a name alone would let a RECREATED CR adopt the
     /// old objects), `controller` marks ownership rather than mere reference, and
@@ -337,7 +337,7 @@ mod tests {
 
     /// Every kind [`crate::render`] emits must resolve to a GVK, or `apply_owned` skips
     /// it with a warning and the object is silently never created — which is exactly
-    /// how the missing ServiceAccount reached a cluster (T7). This test fails the moment
+    /// how the missing `ServiceAccount` reached a cluster (T7). This test fails the moment
     /// someone adds an object to the render without teaching the applier about it.
     #[test]
     fn every_rendered_kind_has_a_gvk() {
