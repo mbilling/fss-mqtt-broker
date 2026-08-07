@@ -49,6 +49,11 @@ jobs:
       - uses: actions/checkout@v5
       - name: Status dashboard is up to date
         run: python3 scripts/gen-status.py --check
+      # ADR 0051 T1: the README's counts and crate list are derivable from the
+      # tree, so they must not be able to drift from it silently — they had,
+      # in both directions, before this ran.
+      - name: README states derivable facts correctly
+        run: python3 scripts/check-readme-facts.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)

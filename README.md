@@ -1,7 +1,7 @@
 # mqttd — a security-first, cluster-native MQTT broker
 
 > An MQTT 3.1.1 + 5.0 broker built to be the most cyber-secure
-> broker available, with linear horizontal scalability and a 100% open feature
+> broker available, designed to scale horizontally, with a 100% open feature
 > set.
 
 **Status:** MQTT **3.1.1 and 5.0** are served — over TCP, TLS 1.3, WebSocket
@@ -20,12 +20,16 @@ governance (connection caps, per-client quotas, publish-rate limits, bounded
 queues), and a continuous-assurance program (out-of-process fault/upgrade
 harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
 performance baselines, and two independent foreign-client conformance oracles)
-all ship. The main thing not yet done is cutting a tagged release.
+all ship. **No tagged release has been cut yet**, and the known gaps are listed
+in [**Limitations**](#limitations) rather than left to be discovered — the
+largest are that memory is not bounded in bytes (only by message counts), the
+Kubernetes operator is not packaged for installation, and the horizontal
+scaling curve has not been measured.
 
 See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (44 ADRs, per-task status).
+record of exactly what is built (55 ADRs, per-task status).
 
 ## Principles
 
@@ -33,8 +37,11 @@ record of exactly what is built (44 ADRs, per-task status).
   opted into and is loudly logged.
 - **Open == Enterprise.** One Apache-2.0 codebase, no gated features. Only
   support, SLAs, and certified builds are paid.
-- **Linear scalability.** Shared-nothing nodes; no coordinator on the publish
-  hot path.
+- **Horizontal scalability by design.** Shared-nothing nodes; no coordinator on
+  the publish hot path. The *shape* of the scaling curve is not yet measured —
+  doing so honestly needs multi-host hardware
+  ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this is a
+  statement about the architecture, not a benchmarked result.
 - **Memory safety.** Rust, `#![forbid(unsafe_code)]` across crates.
 
 ## What works today
@@ -64,7 +71,8 @@ v5-framed packets with properties. The semantics are implemented, not just the c
 - **Shared subscriptions** (`$share/<group>/<filter>`), including
   **cluster-wide** shared groups selected across the mesh
   ([ADR 0010](docs/adr/0010-shared-subscriptions.md),
-  [0015](docs/adr/0015-cluster-shared-subscriptions.md)) — the linear-scaling lever.
+  [0015](docs/adr/0015-cluster-shared-subscriptions.md)) — the lever for spreading
+  one topic's load across nodes.
 - **User Properties** forwarded end to end through delivery
   ([ADR 0030](docs/adr/0030-user-property-forwarding.md)).
 - **Enhanced authentication** — the v5 `AUTH` exchange, e.g. challenge/response
@@ -228,6 +236,30 @@ version:
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
 | Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery yet — and **no production track record**: the matrix says so in as many words. |
 
+## Limitations
+
+The gaps worth knowing before you evaluate this, stated here rather than left to
+be found. Each is tracked; none is a silent surprise.
+
+- **Memory is bounded by counts, not bytes.** There is no total-memory knob. The
+  sharpest edge is `MAX_BACKLOG`: a subscriber that stops reading can hold up to
+  **10 000 messages**, hard-coded and not configurable, so at the 1 MiB default
+  packet size that is ~10 GiB of worst-case headroom per connection. Cap
+  `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full arithmetic and a bounded
+  preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T8, T10).
+- **Disk is bounded in aggregate, not per store.** One store can consume the whole
+  `MQTTD_STORE_MAX_BYTES` watermark and brown out the others (ADR 0041 T9).
+  Disk-full itself fails closed and is crash-tested mid-write.
+- **The Kubernetes operator is not installable.** It is built and end-to-end
+  tested, but no image is published and its manifest is pinned to a kind-local
+  tag. The **Helm chart is the supported path** (ADR 0055 T8).
+- **The horizontal scaling curve is unmeasured.** The architecture is
+  shared-nothing with no coordinator on the publish hot path, but measuring what
+  that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
+  as design intent.
+- **No production track record.** No tagged release has been cut, and nobody is
+  running this in anger yet.
+
 ## Workspace layout
 
 | Crate | Responsibility |
@@ -240,7 +272,9 @@ version:
 | `mqtt-cluster` | SWIM membership + gossip auth, HRW placement ring, peer wire protocol |
 | `mqtt-observability` | Tracing + a hash-chained, tamper-evident audit log |
 | `mqtt-config` | Typed config with secure defaults |
+| `mqtt-bridge` | Outbound bridging to an upstream broker: durable spool, QoS-1 replay |
 | `mqttd` | The server binary: hub routing actor, connections, peer mesh |
+| `mqttd-operator` | Kubernetes operator for the `MqttdCluster` CRD (**not yet packaged for install** — the Helm chart is the supported path) |
 
 ## Build & test
 
@@ -642,7 +676,7 @@ on a 4-core Xeon, `--release` (full numbers and method in
 - **MQTT codec** — a 256-byte PUBLISH encodes in ~270 ns and decodes in ~190 ns; the
   codec alone sustains on the order of a couple of million messages per second per core.
 - **Durable plane** — an in-memory replica apply runs in ~290 ns; a peer replication
-  frame encodes in ~280 ns and decodes in ~420 ns (the fsync cost is the disk's, not the
+  frame encodes in ~439 ns and decodes in ~357 ns (the fsync cost is the disk's, not the
   broker's — this is the CPU work a code change can regress).
 
 These are micro-benchmarks — the broker's own CPU work, isolated from network and disk —

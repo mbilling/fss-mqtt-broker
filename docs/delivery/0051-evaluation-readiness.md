@@ -4,7 +4,7 @@ title: "Evaluation readiness: an assessable, comparable, migratable first releas
 adr_status: Proposed
 tasks:
   - id: 0051-T1
-    title: README truthing & restructure — differentiators and a TOC up top, an architecture sketch, a Bridge section + the missing mqtt-bridge crate-table row, stale facts fixed (44→50 ADRs) with a CI guard on derivable facts, and the MSRV / supported-platforms / pre-1.0-stability statements
+    title: README truthing & restructure — differentiators and a TOC up top, an architecture sketch, a Bridge section + the missing mqtt-bridge crate-table row, stale facts fixed (44→55 ADRs) with a CI guard on derivable facts, and the MSRV / supported-platforms / pre-1.0-stability statements
     status: planned
   - id: 0051-T2
     title: Secured quickstart — generate certs → TLS + mTLS + ACL → foreign client connects, as a copy-paste block beside the plaintext one, wired into the quickstart-as-test CI job so the secure path cannot rot
