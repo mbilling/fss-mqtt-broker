@@ -31,6 +31,14 @@ See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
 record of exactly what is built (55 ADRs, per-task status).
 
+**Jump to:** [What works today](#what-works-today) ·
+[Security](#security) · [Clustering](#clustering) ·
+[Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
+[**Limitations**](#limitations) · [Install](#install) ·
+[Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
+[Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
+[Performance](#performance) · [Contributing](#contributing)
+
 ## Principles
 
 - **Security is the product.** Secure by default; every insecure mode must be
@@ -43,6 +51,56 @@ record of exactly what is built (55 ADRs, per-task status).
   ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this is a
   statement about the architecture, not a benchmarked result.
 - **Memory safety.** Rust, `#![forbid(unsafe_code)]` across crates.
+
+## What's different about it
+
+Four things this does that the brokers it is usually compared against do not.
+The full matrix — including every cell we lose — is
+[`docs/COMPARISON.md`](docs/COMPARISON.md).
+
+- **Durable sessions are on by default**, quorum-replicated, with an acked QoS
+  1/2 message surviving the loss of the node that accepted it. Mosquitto and
+  NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's
+  durable sessions are opt-in.
+- **A policy reload evicts live sessions.** Revoke a certificate, remove a user,
+  or tighten a grant, and the *already-connected* client is cut — not left
+  running until it happens to reconnect. No compared broker documents this.
+- **Clustering is not a paid feature.** Apache-2.0 including signed,
+  reproducible binaries. EMQX has been BSL 1.1 since 5.9 with clustering
+  commercial; VerneMQ's production binaries are EULA-paid.
+- **The claims are checkable.** Every capability maps to a task with evidence in
+  the [delivery dashboard](docs/delivery/STATUS.md), the numbers in this file are
+  CI-guarded against the tree, and what is *missing* is listed in
+  [Limitations](#limitations) rather than left to be discovered.
+
+## How it fits together
+
+```text
+        MQTT clients  (TCP · TLS 1.3 · WebSocket · QUIC)
+              │  identity: mTLS-CN / password / JWT / OIDC
+              ▼        ↓ deny-by-default topic ACL
+       ┌──────────────────────────────────────────┐
+       │  node                                    │
+       │   listeners → per-connection tasks       │
+       │                    │                     │
+       │                    ▼                     │
+       │            hub (routing actor)           │   one hub per node owns
+       │        subscriptions · retained · queues │   routing; no lock on the
+       │                    │                     │   publish hot path
+       └────────────────────┼─────────────────────┘
+                            │
+   ┌────────────────────────┼────────────────────────┐
+   │ SWIM gossip            │ peer links (mTLS)      │  one trust domain =
+   │ membership, interest   │ interest-based forward │  one logical broker
+   └────────────────────────┼────────────────────────┘
+                            ▼
+              durable plane — openraft lease group
+              epoch-fenced quorum replication of
+              sessions, queues and retained state
+```
+
+Crossing into a **different** trust domain is a separate tool with its own
+process and credentials — see [Bridging](#bridging-to-other-security-zones).
 
 ## What works today
 
@@ -181,6 +239,33 @@ Both protocol versions round-trip against two independent foreign clients
   included. Proven end to end: concurrent same-topic writes on two nodes and
   divergent writes across a severed-and-healed partition both converge cluster-wide
   (`retained_divergence_total` stays 0).
+
+### Bridging to other security zones
+
+The cluster mesh makes N nodes behave as **one logical broker inside one trust
+domain**. Reaching a broker in a *different* zone — a partner's, a cloud IoT
+platform, an edge site forwarding upward, or any third-party broker — is the
+opposite problem, and gets its own tool: `mqtt-bridge`, a **standalone binary**
+([ADR 0025](docs/adr/0025-boundary-bridge.md)).
+
+It is an ordinary MQTT client to both sides rather than an in-process plugin, so
+the boundary crossing is a small, isolated, auditable unit with its own identity,
+credentials, and failure domain — a compromise of the far side does not land
+inside the broker.
+
+- **Deny by default, direction enforced.** Nothing is forwarded until a rule says
+  so, and each rule is `out`, `in`, or `both` — one-way flow is a *mechanism*,
+  not a configuration habit, so a data-diode-style crossing is expressible.
+- **Loop prevention** on two levels: an `fss-bridge-hop-count` limit (default 8),
+  and topic remapping that structurally stops a forwarded message from matching
+  the rule that would send it straight back.
+- **Store-and-forward** over a bounded spool: a momentarily unreachable side is
+  buffered and replayed on reconnect (bounded by message count — see
+  [Limitations](#limitations)).
+- **HA without duplicates.** Two or more bridge instances sharing a
+  `share_group` take the local stream through a **shared subscription**, so
+  adding an instance adds redundancy rather than duplicate deliveries.
+- Per-side TLS/mTLS and least-privilege credentials, with its own metrics.
 
 ### Observability & resource governance
 - **Prometheus metrics** on `GET /metrics` (`MQTTD_METRICS_BIND`), plus optional
