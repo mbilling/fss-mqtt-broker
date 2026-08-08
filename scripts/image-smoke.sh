@@ -51,6 +51,13 @@ if [[ -z "$IMAGE" ]]; then
     mkdir -p dist && cp "target/${TARGET}/release/mqttd" dist/mqttd
   fi
   docker build -q -t "$IMAGE" . >/dev/null
+else
+  # A registry reference has to be pulled before `docker inspect` can read it —
+  # inspect only ever looks at LOCAL images, so without this the run dies on the
+  # nonroot check with a bare "No such object", which reads like the image is
+  # broken rather than absent.
+  echo "pulling ${IMAGE} ..."
+  docker pull -q "$IMAGE" >/dev/null
 fi
 echo "image under test: $IMAGE"
 
