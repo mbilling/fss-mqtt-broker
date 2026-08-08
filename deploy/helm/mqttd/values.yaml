@@ -234,3 +234,91 @@ serviceAccount:
 
 nameOverride: ""
 fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Boundary bridge (ADR 0025) — OFF by default.
+#
+# Deployed BESIDE the broker, never inside it: the bridge is an MQTT client to
+# both sides with its own identity, credentials and failure domain, and it
+# usually belongs in a different security zone from the cluster it bridges.
+# ---------------------------------------------------------------------------
+bridge:
+  enabled: false
+
+  image:
+    repository: ghcr.io/mbilling/fss-mqtt-broker-bridge
+    # Defaults to .Chart.appVersion when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # Run >=2 ONLY with a non-empty `share_group` in the config below: the replicas
+  # then take the local stream through a shared subscription, so adding one adds
+  # redundancy instead of duplicate deliveries.
+  replicaCount: 1
+
+  # The bridge's whole configuration (ADR 0025 §3), rendered to a ConfigMap.
+  #
+  # __POD_NAME__ is substituted with the pod's own name before the bridge starts.
+  # USE IT IN EVERY client_id. MQTT client ids must be unique, and the bridge's
+  # built-in default is the CONSTANT `fss-bridge-local` — so two replicas sharing
+  # it would take over each other's session in a reconnect loop rather than
+  # running as an HA pair. The placeholder is how each replica gets its own.
+  #
+  # Secrets are referenced BY PATH (password_file, TLS key files) and mounted via
+  # `extraVolumes`/`extraVolumeMounts` from a Secret — never inlined here.
+  config: |
+    hop_count_limit = 8
+    # Non-empty + replicaCount >= 2 = HA without duplicate forwarding.
+    share_group = ""
+    metrics_bind = "0.0.0.0:8090"
+
+    [local]
+    # The cluster's own client service; any node will do.
+    url = "mqttd:1883"
+    client_id = "bridge-__POD_NAME__"
+
+    [spool]
+    # Store-and-forward across an upstream outage. Set persistence.enabled to keep
+    # it across a restart.
+    dir = "/var/lib/mqtt-bridge"
+    max_messages = 10000
+
+    # Deny-by-default: nothing crosses until a rule says so.
+    # [[upstreams]]
+    # name = "partner"
+    # url = "partner.example:8883"
+    # client_id = "bridge-partner-__POD_NAME__"
+    # username = "bridge"
+    # password_file = "/etc/mqtt-bridge/secrets/partner-password"
+    # [upstreams.tls]
+    # ca = "/etc/mqtt-bridge/secrets/partner-ca.pem"
+    # [[upstreams.rules]]
+    # direction = "out"          # out | in | both — one-way is enforced in code
+    # filter = "telemetry/#"
+    # qos = 1
+
+  # Per-replica spool volume. Without it the spool is lost on restart, so anything
+  # buffered during an upstream outage is gone.
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+
+  # Extra mounts for credentials and TLS material (from Secrets).
+  extraVolumes: []
+  #  - name: bridge-secrets
+  #    secret:
+  #      secretName: bridge-credentials
+  extraVolumeMounts: []
+  #  - name: bridge-secrets
+  #    mountPath: /etc/mqtt-bridge/secrets
+  #    readOnly: true
+
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}

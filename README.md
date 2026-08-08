@@ -302,6 +302,18 @@ docker run -d --name mqtt-bridge \
 `/var/lib/mqtt-bridge` is the image's spool directory — point `spool.dir` at it to
 make buffering survive a restart.
 
+On Kubernetes the chart deploys it beside the broker, opt-in:
+
+```sh
+helm upgrade --install mqttd deploy/helm/mqttd --set bridge.enabled=true
+```
+
+It renders a StatefulSet, not a Deployment, for two reasons: the spool is
+per-replica state, and every replica needs its **own MQTT client id** — the
+built-in default is a constant, so replicas sharing it would take over each
+other's session instead of forming the HA pair a `share_group` promises. Put
+`__POD_NAME__` in each `client_id` and the chart substitutes the pod name.
+
 ### Observability & resource governance
 - **Prometheus metrics** on `GET /metrics` (`MQTTD_METRICS_BIND`), plus optional
   OTLP push to an OpenTelemetry Collector; Kubernetes-style `GET /livez` +
@@ -374,9 +386,6 @@ be found. Each is tracked; none is a silent surprise.
 - **The Kubernetes operator is not installable.** It is built and end-to-end
   tested, but no image is published and its manifest is pinned to a kind-local
   tag. The **Helm chart is the supported path** (ADR 0055 T8).
-- **The Helm chart does not deploy the bridge.** The bridge has its own signed
-  binary and image, but the chart runs the broker only; bridging is deployed
-  separately today (ADR 0025 T12).
 - **The horizontal scaling curve is unmeasured.** The architecture is
   shared-nothing with no coordinator on the publish hot path, but measuring what
   that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
