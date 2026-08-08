@@ -21,6 +21,9 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # The bridge ships as its OWN image, not a second entrypoint into the broker's
+  # (ADR 0025: separate process, separate identity, separate failure domain).
+  BRIDGE_IMAGE_NAME: ${{ github.repository }}-bridge
 
 jobs:
   # ── Gate: the release commit must pass the same supply-chain audit CI runs ──
@@ -77,36 +80,48 @@ jobs:
       # the same tag, then assert the two binaries are identical.
       - name: Verify reproducibility (clean rebuild is byte-identical)
         run: |
-          BIN="target/${{ matrix.target }}/release/mqttd"
-          sha256sum "$BIN" | awk '{print $1}' > first.sha256
+          # BOTH shipped binaries must be reproducible, not just the broker's —
+          # a signature over a binary nobody can regenerate proves less.
+          for b in mqttd mqtt-bridge; do
+            sha256sum "target/${{ matrix.target }}/release/$b" | awk '{print $1}' >> first.sha256
+          done
           cargo clean
           scripts/release/build-repro.sh ${{ matrix.target }}
-          sha256sum "$BIN" | awk '{print $1}' > second.sha256
+          for b in mqttd mqtt-bridge; do
+            sha256sum "target/${{ matrix.target }}/release/$b" | awk '{print $1}' >> second.sha256
+          done
           if ! diff -q first.sha256 second.sha256; then
             echo "::error title=Reproducibility::rebuild of the tag was not byte-identical"
-            echo "first:  $(cat first.sha256)"; echo "second: $(cat second.sha256)"
+            paste first.sha256 second.sha256
             exit 1
           fi
-          echo "reproducible: $(cat first.sha256)"
+          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\n') first.sha256
 
       - name: Stage artifact + checksum
         id: stage
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="mqttd-${VERSION}-${{ matrix.target }}"
+          BRIDGE_NAME="mqtt-bridge-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
-          # The container image copies from dist/mqttd (arch-native).
+          cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
+          # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
+          cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
           ( cd out && sha256sum "${NAME}" > "${NAME}.sha256" )
+          ( cd out && sha256sum "${BRIDGE_NAME}" > "${BRIDGE_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # SLSA build provenance for the binary — what commit/workflow produced it.
       - name: Attest binary provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: out/${{ steps.stage.outputs.name }}
+          subject-path: |
+            out/${{ steps.stage.outputs.name }}
+            out/${{ steps.stage.outputs.bridge_name }}
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
@@ -136,15 +151,33 @@ jobs:
       # Hand the per-arch digest to the release job via an artifact. (Matrix job
       # outputs are last-writer-wins across legs, so they cannot carry one value
       # per arch — a file-per-arch artifact is the correct handoff.)
-      - name: Record image digest
+      - name: Build and push single-arch BRIDGE image by digest
+        id: push_bridge
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.bridge
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.stage.outputs.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Record image digests
         run: |
-          mkdir -p digests
+          mkdir -p digests bridge-digests
           echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.arch }}"
+          echo "${{ steps.push_bridge.outputs.digest }}" > "bridge-digests/${{ matrix.arch }}"
       - name: Upload image digest
         uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
           path: digests/${{ matrix.arch }}
+          retention-days: 7
+      - name: Upload bridge image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-digest-${{ matrix.arch }}
+          path: bridge-digests/${{ matrix.arch }}
           retention-days: 7
 
   # ── Assemble the multi-arch manifest, SBOM, signatures, and the Release ──
@@ -190,6 +223,12 @@ jobs:
           pattern: digest-*
           path: digests
           merge-multiple: true
+      - name: Download bridge image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bridge-digest-*
+          path: bridge-digests
+          merge-multiple: true
 
       # ── Multi-arch manifest from the per-arch digests pushed by `build` ──
       - name: Create and push multi-arch manifest
@@ -211,6 +250,25 @@ jobs:
           DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${{ steps.v.outputs.version }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
+      - name: Create and push multi-arch BRIDGE manifest
+        id: bridge_manifest
+        run: |
+          IMAGE="${REGISTRY}/${BRIDGE_IMAGE_NAME}"
+          TAGS=(--tag "${IMAGE}:${{ steps.v.outputs.version }}")
+          if [[ "${{ steps.v.outputs.prerelease }}" == "false" ]]; then
+            TAGS+=(--tag "${IMAGE}:latest")
+          fi
+          REFS=()
+          for f in bridge-digests/*; do
+            REFS+=("${IMAGE}@$(cat "$f")")
+          done
+          if [ "${#REFS[@]}" -eq 0 ]; then
+            echo "::error title=Manifest::no per-arch bridge digests found"; exit 1
+          fi
+          docker buildx imagetools create "${TAGS[@]}" "${REFS[@]}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${{ steps.v.outputs.version }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
       # ── SBOM: CycloneDX for the broker binary, from the locked source graph ──
       - name: Generate CycloneDX SBOM
         run: |
@@ -225,13 +283,19 @@ jobs:
           git diff --exit-code Cargo.lock || {
             echo "::error title=SBOM::SBOM generation mutated Cargo.lock (resolution drifted from the tagged lockfile)"; exit 1;
           }
-          SBOM="$(find . -name 'mqttd.cdx.json' -print -quit)"
-          if [ -z "$SBOM" ]; then
-            echo "::error title=SBOM::cargo-cyclonedx produced no mqttd.cdx.json"; exit 1
-          fi
           mkdir -p assets
-          cp "$SBOM" "assets/sbom-${{ steps.v.outputs.version }}.cdx.json"
-          echo "SBOM: $SBOM ($(wc -c < "$SBOM") bytes)"
+          # One SBOM per shipped binary: each carries only ITS transitive graph,
+          # so the bridge's SBOM does not imply the broker's dependencies are in
+          # the bridge image, or vice versa.
+          for pair in "mqttd:sbom" "mqtt-bridge:sbom-bridge"; do
+            crate="${pair%%:*}"; out="${pair##*:}"
+            SBOM="$(find . -name "${crate}.cdx.json" -print -quit)"
+            if [ -z "$SBOM" ]; then
+              echo "::error title=SBOM::cargo-cyclonedx produced no ${crate}.cdx.json"; exit 1
+            fi
+            cp "$SBOM" "assets/${out}-${{ steps.v.outputs.version }}.cdx.json"
+            echo "SBOM: $SBOM -> ${out}-${{ steps.v.outputs.version }}.cdx.json ($(wc -c < "$SBOM") bytes)"
+          done
 
       # ── Keyless signatures (cosign) over every release asset ──
       - name: Sign binaries, checksums, and SBOM (keyless)
@@ -264,6 +328,26 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           sbom-path: assets/sbom-${{ steps.v.outputs.version }}.cdx.json
+          push-to-registry: true
+
+      # The bridge image gets the same treatment — an unsigned second image would
+      # be the weak link in a supply chain the broker image takes seriously.
+      - name: Sign bridge image (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: cosign sign --yes "${REGISTRY}/${BRIDGE_IMAGE_NAME}@${{ steps.bridge_manifest.outputs.digest }}"
+      - name: Attest bridge image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }}
+          subject-digest: ${{ steps.bridge_manifest.outputs.digest }}
+          push-to-registry: true
+      - name: Attest bridge image SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }}
+          subject-digest: ${{ steps.bridge_manifest.outputs.digest }}
+          sbom-path: assets/sbom-bridge-${{ steps.v.outputs.version }}.cdx.json
           push-to-registry: true
 
       # ── Publish the GitHub Release with all verifiable assets ──

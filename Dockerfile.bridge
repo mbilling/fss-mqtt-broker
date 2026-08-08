@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+#
+# Hardened runtime image for the boundary bridge (ADR 0025, ADR 0045 T4).
+#
+# A SEPARATE image from the broker's, not a second entrypoint into it. That is
+# the whole point of ADR 0025: the bridge is an MQTT client to both sides, with
+# its own identity, credentials and failure domain, and it is typically deployed
+# where the broker is not — a DMZ, an edge site, next to a partner link. Folding
+# it into the broker image would put a boundary-crossing binary inside every
+# broker deployment that never bridges anything, and would falsify the broker
+# image's own claim to carry "nothing but the broker and a CA bundle".
+#
+# Same base and same posture as the broker image: distroless/static, no libc, no
+# shell, no package manager, uid 65532.
+#
+# The binary is built reproducibly OUTSIDE the image and copied in — the image
+# contains the *exact* signed, checksummed binary from the release, not a second
+# one compiled here that could drift from it. The release pipeline stages the
+# per-arch binary at `dist/mqtt-bridge` before building.
+#
+# Build (from repo root, after staging the binary):
+#   cp target/<musl-triple>/release/mqtt-bridge dist/mqtt-bridge
+#   docker build -t mqtt-bridge:dev -f Dockerfile.bridge .
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ARG VCS_REF=unknown
+ARG VERSION=0.0.0
+LABEL org.opencontainers.image.title="mqtt-bridge" \
+      org.opencontainers.image.description="Boundary MQTT bridge for mqttd — deny-by-default, direction-enforced forwarding between security zones" \
+      org.opencontainers.image.source="https://github.com/mbilling/fss-mqtt-broker" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${VERSION}"
+
+COPY --chmod=0755 dist/mqtt-bridge /usr/local/bin/mqtt-bridge
+
+# A writable spool directory, owned by the uid the image runs as.
+#
+# Same lesson as the broker image (0045-T6): distroless/static:nonroot ships no
+# directory uid 65532 can write, so a disk-backed spool — the bridge's
+# store-and-forward durability — would fail with `Permission denied` on every
+# natural path. Docker seeds an empty named volume from the image path it covers,
+# ownership included, so `-v bridge-spool:/var/lib/mqtt-bridge` lands writable.
+#
+# Point `spool.dir` at it in the config to make buffering survive a restart:
+#   -v bridge-spool:/var/lib/mqtt-bridge
+COPY --chown=65532:65532 deploy/image/data-dir/ /var/lib/mqtt-bridge/
+
+# The bridge takes its whole configuration from one TOML file (ADR 0025 §3):
+#   -v ./bridge.toml:/etc/mqtt-bridge/bridge.toml
+#   mqtt-bridge /etc/mqtt-bridge/bridge.toml
+# Credentials for each side are referenced BY PATH from that file and mounted
+# from a Secret — least privilege per side, never inlined.
+#
+# Prometheus metrics are served at GET /metrics on `metrics_bind`.
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/mqtt-bridge"]

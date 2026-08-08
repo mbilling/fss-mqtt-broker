@@ -287,10 +287,20 @@ in-process window cannot. A ready-made Grafana dashboard with those windows,
 connection state, spool depth and loss panels is at
 [`demo/grafana/dashboards/mqttd-bridge.json`](demo/grafana/dashboards/mqttd-bridge.json).
 
-> **The bridge is not packaged yet.** No release publishes a `mqtt-bridge` binary
-> or image, and it is not inside the broker image — today it must be built from
-> source (`cargo build -p mqtt-bridge`). Tracked as
-> [ADR 0025](docs/adr/0025-boundary-bridge.md) T12.
+**Running it.** The bridge ships as its own signed binary and its own hardened
+image — a separate process from the broker, as its own security rationale
+requires:
+
+```sh
+docker run -d --name mqtt-bridge \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v ./bridge.toml:/etc/bridge.toml:ro -v bridge-spool:/var/lib/mqtt-bridge \
+  -p 8090:8090 \
+  ghcr.io/mbilling/fss-mqtt-broker-bridge:latest /etc/bridge.toml
+```
+
+`/var/lib/mqtt-bridge` is the image's spool directory — point `spool.dir` at it to
+make buffering survive a restart.
 
 ### Observability & resource governance
 - **Prometheus metrics** on `GET /metrics` (`MQTTD_METRICS_BIND`), plus optional
@@ -364,10 +374,9 @@ be found. Each is tracked; none is a silent surprise.
 - **The Kubernetes operator is not installable.** It is built and end-to-end
   tested, but no image is published and its manifest is pinned to a kind-local
   tag. The **Helm chart is the supported path** (ADR 0055 T8).
-- **The bridge is not packaged.** `mqtt-bridge` is complete and tested, but no
-  release publishes a binary or image for it and it is not in the broker image,
-  so running it means building from source (ADR 0025 T12). The **Helm chart does
-  not deploy it** either.
+- **The Helm chart does not deploy the bridge.** The bridge has its own signed
+  binary and image, but the chart runs the broker only; bridging is deployed
+  separately today (ADR 0025 T12).
 - **The horizontal scaling curve is unmeasured.** The architecture is
   shared-nothing with no coordinator on the publish hot path, but measuring what
   that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
