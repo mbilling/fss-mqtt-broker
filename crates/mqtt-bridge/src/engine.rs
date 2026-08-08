@@ -362,10 +362,85 @@ fn subscriptions_for(cfg: &BridgeConfig, side: Side) -> Vec<(String, u8)> {
     }
 }
 
+/// This host's name, as the runtime sees it — the stable, per-instance part of a
+/// default client id.
+///
+/// Two properties are required and both matter:
+///
+/// - **Distinct per instance**, or replicas collide (see [`default_client_id`]).
+/// - **Stable across restarts**, because the local side uses a persistent session
+///   (`clean_session=false`). An id that changed on every start would orphan the
+///   previous session — and its queued messages — on the broker each time.
+///
+/// A hostname satisfies both: Kubernetes sets it to the pod name (stable for a
+/// `StatefulSet` ordinal), and on a normal host it is the machine name. Checked in
+/// order because neither source is universal: `HOSTNAME` is set by container
+/// runtimes and shells, `/etc/hostname` is bind-mounted into containers by the
+/// runtime and so is present even in a distroless image with no shell.
+fn host_identity() -> Option<String> {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        let h = h.trim().to_string();
+        if !h.is_empty() {
+            return Some(h);
+        }
+    }
+    if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
+        let h = h.trim().to_string();
+        if !h.is_empty() {
+            return Some(h);
+        }
+    }
+    None
+}
+
+/// The client id used for a side when the config does not set one.
+///
+/// **Unique per instance, by default.** This used to return the constant
+/// `fss-bridge-local`, which is safe for exactly one bridge and quietly
+/// catastrophic for two: MQTT keys a session by client id and requires the broker
+/// to disconnect the existing client when a new one connects with the same id, so
+/// two replicas evicted each other in a permanent reconnect loop — turning the HA
+/// that a shared subscription is supposed to buy into an outage. Nothing warned;
+/// the config comment said "each instance still needs a distinct `client_id`" and
+/// the default made it easy to never notice.
+///
+/// Deriving from the hostname makes replicas distinct without configuration, and
+/// keeps each id stable across restarts so a persistent session resumes rather
+/// than being orphaned.
+///
+/// Note on length: MQTT guarantees server support only for ids up to 23 bytes,
+/// and a long hostname can exceed that. The id is deliberately **not** truncated —
+/// truncation could map two hosts onto one id, which is the very failure this
+/// exists to prevent. A strict upstream is handled by setting `client_id`
+/// explicitly for that endpoint, which is a loud, immediate connect error rather
+/// than a silent takeover.
 fn default_client_id(side: Side) -> String {
+    client_id_for(host_identity().as_deref(), side)
+}
+
+/// The pure half of [`default_client_id`]: given a host identity (or none), the id.
+///
+/// Split out so the naming rules are testable without mutating process-wide
+/// environment — which, when a test did it, raced every other test reading it.
+fn client_id_for(host: Option<&str>, side: Side) -> String {
+    let Some(host) = host else {
+        // No identity available: fall back to the old constants and say so. Any
+        // second instance sharing this fallback WILL fight over the session, so
+        // this is a real warning, not noise.
+        warn!(
+            "could not determine this host's name (no HOSTNAME, no /etc/hostname); \
+             falling back to a FIXED bridge client id. Running more than one bridge \
+             instance with this default will make them evict each other's MQTT \
+             session — set `client_id` explicitly on each side."
+        );
+        return match side {
+            Side::Local => "fss-bridge-local".to_string(),
+            Side::Upstream(i) => format!("fss-bridge-upstream-{i}"),
+        };
+    };
     match side {
-        Side::Local => "fss-bridge-local".to_string(),
-        Side::Upstream(i) => format!("fss-bridge-upstream-{i}"),
+        Side::Local => format!("bridge-{host}"),
+        Side::Upstream(i) => format!("bridge-{host}-{i}"),
     }
 }
 
@@ -423,4 +498,68 @@ fn connect_options(
         keep_alive: KEEP_ALIVE,
         clean_start: !persistent,
     })
+}
+
+#[cfg(test)]
+mod default_id_tests {
+    use super::{client_id_for, default_client_id, host_identity, Side};
+
+    #[test]
+    fn a_host_identity_makes_replicas_distinct() {
+        // THE regression: the default was the CONSTANT `fss-bridge-local`, so two
+        // replicas claimed one session and MQTT made them evict each other in a
+        // permanent loop — the HA a shared subscription offers, inverted.
+        let a = client_id_for(Some("mqttd-bridge-0"), Side::Local);
+        let b = client_id_for(Some("mqttd-bridge-1"), Side::Local);
+        assert_ne!(a, b, "two pods must not share a client id");
+        assert_eq!(a, "bridge-mqttd-bridge-0");
+        assert_ne!(a, "fss-bridge-local", "still the colliding constant");
+    }
+
+    #[test]
+    fn every_side_of_one_bridge_is_distinct_too() {
+        let host = Some("h1");
+        let ids = [
+            client_id_for(host, Side::Local),
+            client_id_for(host, Side::Upstream(0)),
+            client_id_for(host, Side::Upstream(1)),
+        ];
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "sides collided: {ids:?}");
+    }
+
+    #[test]
+    fn the_id_is_stable_for_a_given_host() {
+        // The local side keeps a PERSISTENT session, so an id that varied between
+        // starts would orphan the previous session and everything queued on it.
+        assert_eq!(
+            client_id_for(Some("h1"), Side::Local),
+            client_id_for(Some("h1"), Side::Local)
+        );
+    }
+
+    #[test]
+    fn without_a_host_it_falls_back_and_is_honest_about_it() {
+        // No identity available: the old constants come back, and the caller warns
+        // loudly that a second instance will fight over the session.
+        assert_eq!(client_id_for(None, Side::Local), "fss-bridge-local");
+        assert_eq!(
+            client_id_for(None, Side::Upstream(3)),
+            "fss-bridge-upstream-3"
+        );
+    }
+
+    #[test]
+    fn the_live_default_uses_whatever_identity_this_machine_has() {
+        // Reads the real environment rather than mutating it, so it cannot race
+        // other tests. Where an identity exists the id must carry it.
+        let id = default_client_id(Side::Local);
+        match host_identity() {
+            Some(host) => assert!(
+                id.contains(&host),
+                "default id {id:?} does not carry host {host:?}; replicas would collide"
+            ),
+            None => assert_eq!(id, "fss-bridge-local"),
+        }
+    }
 }

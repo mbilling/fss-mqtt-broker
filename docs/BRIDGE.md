@@ -53,7 +53,7 @@ own restart without a gap.
 share_group = ""              # no group: this instance takes the whole stream
 [local]
 url = "mqttd:1883"
-client_id = "bridge-a"        # still give it one; see below
+# client_id is optional: unset defaults to bridge-<hostname>
 ```
 
 **What you get:** the crossing works, and an upstream outage is buffered in the
@@ -134,8 +134,14 @@ MQTT identifies a session by client id, and requires the broker to disconnect th
 existing client when a new one connects with the same id. mqttd implements that
 (`session_takeover_publishes_will`), as it must.
 
-The bridge's built-in default id is a **constant** — `fss-bridge-local` — so
-replicas that don't set one collide:
+**The default is now safe:** an unset `client_id` derives from the host name —
+`bridge-<hostname>` — which Kubernetes sets to the pod name, so replicas are
+distinct without configuration and each id is stable across restarts (the local
+side keeps a persistent session, so an id that changed on each start would orphan
+it). Two replicas with no `client_id` at all now run correctly.
+
+It used to be the **constant** `fss-bridge-local`, and setting the same id
+explicitly on two replicas still reproduces the failure exactly:
 
 ```
    bridge-0 connects as fss-bridge-local   →  accepted
@@ -149,13 +155,25 @@ Neither replica stays connected long enough to be a useful group member, and eve
 takeover fires the evicted client's Will. Two healthy processes, configured for
 redundancy, produce an outage.
 
+Measured, two replicas over 30 seconds:
+
+| | reconnects per replica | forwarding |
+|---|---|---|
+| **shared** client id | **73** | unusable |
+| distinct (the default now) | **1** | 6 messages in → 6 out, split 3/3 |
+
 The local side also uses a **persistent** session (`clean_session=false`) so a brief
 restart resumes its subscription — which means colliding replicas would be
 inheriting and clobbering each other's stored queue, not merely stealing a socket.
 
-Put `__POD_NAME__` in every `client_id` and the chart's init container substitutes
-the pod's name. CI fails the build if any `client_id` loses it
+The chart is explicit anyway: put `__POD_NAME__` in every `client_id` and its init
+container substitutes the pod's name, so the id is visible in the config rather
+than implied by the environment. CI fails the build if any `client_id` loses it
 (`scripts/k8s/check-bridge-chart.sh`).
+
+If the host name cannot be determined at all (no `HOSTNAME`, no `/etc/hostname`)
+the bridge falls back to the old constants **and logs a warning saying so** — a
+second instance on that fallback would still collide.
 
 ---
 
@@ -203,7 +221,7 @@ has panels for all three.
 | Survives a bridge restart without a gap | ✖ | ✔ |
 | Survives losing a bridge pod | ✖ | ✔ (live stream) |
 | Buffered backlog survives losing that pod | ✔ (same PVC on restart) | ✔ only when the ordinal returns |
-| Distinct `client_id` required | good practice | **mandatory** |
+| Distinct `client_id` | automatic (host-derived) | automatic; the chart sets it explicitly too |
 | Upstream credentials | one set per upstream | the same set, used by every replica |
 
 Start standalone. Move to HA when a forwarding gap during a restart is a problem

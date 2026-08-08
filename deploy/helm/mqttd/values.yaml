@@ -259,10 +259,11 @@ bridge:
   # The bridge's whole configuration (ADR 0025 §3), rendered to a ConfigMap.
   #
   # __POD_NAME__ is substituted with the pod's own name before the bridge starts.
-  # USE IT IN EVERY client_id. MQTT client ids must be unique, and the bridge's
-  # built-in default is the CONSTANT `fss-bridge-local` — so two replicas sharing
-  # it would take over each other's session in a reconnect loop rather than
-  # running as an HA pair. The placeholder is how each replica gets its own.
+  # Use it in every client_id. MQTT client ids must be unique — replicas sharing
+  # one take over each other's session in a reconnect loop instead of running as
+  # an HA pair. An unset client_id now defaults to bridge-<hostname>, which is
+  # already per-pod; setting it here keeps the identity visible in the config
+  # rather than implied by the environment.
   #
   # Secrets are referenced BY PATH (password_file, TLS key files) and mounted via
   # `extraVolumes`/`extraVolumeMounts` from a Secret — never inlined here.
