@@ -164,6 +164,13 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
   {{- if .Values.bridge.persistence.enabled }}
+  # Explicit, not inherited. A retired ordinal's spool may still hold messages
+  # that only that ordinal can replay, so deleting its volume on scale-down would
+  # discard them silently — the shape of #97, where a scale-to-zero destroyed
+  # every broker volume because the policy was left to a default.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: {{ .Values.bridge.persistence.retentionPolicy.whenDeleted }}
+    whenScaled: {{ .Values.bridge.persistence.retentionPolicy.whenScaled }}
   volumeClaimTemplates:
     - metadata:
         name: spool

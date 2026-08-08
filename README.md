@@ -314,6 +314,9 @@ built-in default is a constant, so replicas sharing it would take over each
 other's session instead of forming the HA pair a `share_group` promises. Put
 `__POD_NAME__` in each `client_id` and the chart substitutes the pod name.
 
+Standalone and HA topologies, with schematics and what HA does *not* cover:
+[**docs/BRIDGE.md**](docs/BRIDGE.md).
+
 ### Observability & resource governance
 - **Prometheus metrics** on `GET /metrics` (`MQTTD_METRICS_BIND`), plus optional
   OTLP push to an OpenTelemetry Collector; Kubernetes-style `GET /livez` +

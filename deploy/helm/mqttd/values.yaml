@@ -305,6 +305,11 @@ bridge:
     storageClassName: ""
     accessModes:
       - ReadWriteOnce
+    # Both Retain, deliberately. A replica's spool can only be replayed by that
+    # replica, so a volume deleted on scale-down takes its unsent backlog with it.
+    retentionPolicy:
+      whenDeleted: Retain
+      whenScaled: Retain
 
   # Extra mounts for credentials and TLS material (from Secrets).
   extraVolumes: []
