@@ -13,15 +13,24 @@ Every release publishes, for the tagged commit:
 - **Reproducible binaries** — `linux/amd64` and `linux/arm64`, each with a
   `.sha256` checksum. Anyone can rebuild the tag and get byte-identical output
   (see [Verifying](#verifying-a-release)).
-- **A hardened container image** — `ghcr.io/mbilling/fss-mqtt-broker:X.Y.Z`
-  (and `:latest` for a non-prerelease), distroless/static (fully-static musl binary), non-root, multi-arch.
+- **A reproducible bridge binary** — `mqtt-bridge`, both targets, checksummed and
+  signed exactly like the broker's. The boundary bridge (ADR 0025) used to ship in
+  no artifact at all, so running it meant building from source.
+- **Two hardened container images** — `ghcr.io/mbilling/fss-mqtt-broker:X.Y.Z` and
+  `ghcr.io/mbilling/fss-mqtt-broker-bridge:X.Y.Z` (each also `:latest` for a
+  non-prerelease), distroless/static (fully-static musl binaries), non-root,
+  multi-arch. The bridge is a **separate image**, not a second entrypoint into the
+  broker's: it is a separate process with its own identity, credentials and failure
+  domain, usually deployed where the broker is not.
 - **Keyless signatures** — every binary, checksum, and the SBOM is
   cosign-signed via GitHub OIDC (no long-lived key); the image is cosign-signed
   by digest. All signatures are recorded in the public Rekor transparency log.
 - **Build provenance** — SLSA build-provenance attestations for the binaries and
   the image (what commit, workflow, and inputs produced them).
-- **An SBOM** — a CycloneDX (`sbom-X.Y.Z.cdx.json`) enumerating the binary's full
-  transitive dependency graph, attached to the release and to the image.
+- **An SBOM per binary** — CycloneDX `sbom-X.Y.Z.cdx.json` and
+  `sbom-bridge-X.Y.Z.cdx.json`, each enumerating only *its* transitive graph, so the
+  bridge's dependencies are not implied to be in the broker image or vice versa.
+  Attached to the release and to the matching image.
 
 The release commit must also pass the **supply-chain audit** (`cargo deny` +
 `cargo audit`) — it is the first gate in the pipeline.
