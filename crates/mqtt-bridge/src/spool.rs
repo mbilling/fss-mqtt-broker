@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -34,6 +35,15 @@ const SPOOL: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("spool");
 pub struct Spool {
     cap: usize,
     inner: Mutex<Inner>,
+    /// Messages discarded because the spool was already at `cap`.
+    ///
+    /// Drop-oldest is the intended policy (§7) — a bounded buffer must shed
+    /// something — but it used to happen in total silence: `push` evicted and
+    /// returned `Ok(())` with no counter, no log, and no error. Store-and-forward
+    /// is the bridge's durability story, so the moment it starts shedding is
+    /// exactly the moment an operator needs to know. Counted here and exported as
+    /// `fss_bridge_dropped_total{reason="spool-full"}`.
+    dropped: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -61,6 +71,7 @@ impl Spool {
         Self {
             cap: cap.max(1),
             inner: Mutex::new(Inner::Mem(VecDeque::new())),
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -83,6 +94,7 @@ impl Spool {
         Ok(Self {
             cap: cap.max(1),
             inner: Mutex::new(Inner::Disk { db, next }),
+            dropped: AtomicU64::new(0),
         })
     }
 
@@ -99,6 +111,7 @@ impl Spool {
             Inner::Mem(q) => {
                 if q.len() >= self.cap {
                     q.pop_front();
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 q.push_back(msg.clone());
                 Ok(())
@@ -117,6 +130,7 @@ impl Spool {
                         let oldest = t.first().map_err(backend)?.map(|(k, _)| k.value());
                         if let Some(k) = oldest {
                             t.remove(k).map_err(backend)?;
+                            self.dropped.fetch_add(1, Ordering::Relaxed);
                         } else {
                             break;
                         }
@@ -191,6 +205,26 @@ impl Spool {
     }
 
     /// Whether the spool is empty.
+    ///
+    /// # Errors
+    /// [`SpoolError::Backend`] on a disk failure.
+    /// How many messages this spool has discarded to stay within `cap`.
+    ///
+    /// Non-zero means store-and-forward is shedding: the side has been down long
+    /// enough, or busy enough, that the bound was reached and the oldest queued
+    /// messages were thrown away. Exported so that is visible rather than silent.
+    #[must_use]
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The configured bound, so a depth reading can be read as a fraction of it.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Whether the spool holds nothing.
     ///
     /// # Errors
     /// [`SpoolError::Backend`] on a disk failure.

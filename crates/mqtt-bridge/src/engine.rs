@@ -44,7 +44,10 @@ impl Bridge {
     #[must_use]
     pub fn start(cfg: BridgeConfig) -> Self {
         let cfg = Arc::new(cfg);
-        let metrics = Arc::new(BridgeMetrics::new());
+        // Register the label values up front, from config: metric cardinality is then
+        // bounded by the configuration rather than by traffic.
+        let upstream_names: Vec<String> = cfg.upstreams.iter().map(|u| u.name.clone()).collect();
+        let metrics = Arc::new(BridgeMetrics::for_upstreams(&upstream_names));
         let n_sides = 1 + cfg.upstreams.len();
 
         // One command channel per side (index 0 = local, i+1 = upstream i). The router keeps
@@ -99,6 +102,16 @@ impl Bridge {
                 connected[i + 1].clone(),
             ));
         }
+
+        // Publish the live per-side state the gauges read. These are clones of the very
+        // flags and spools the engine uses, so `fss_bridge_connected` and
+        // `fss_bridge_spool_depth` cannot drift from the state they describe.
+        let mut side_names = Vec::with_capacity(n_sides);
+        side_names.push("local".to_string());
+        for u in &cfg.upstreams {
+            side_names.push(u.name.clone());
+        }
+        metrics.register_sides(side_names, connected.clone(), spools.clone());
 
         tasks.push(spawn_router(
             cfg,
@@ -169,7 +182,7 @@ fn spawn_supervisor(
             match MqttClient::connect(&opts).await {
                 Ok(client) => {
                     backoff = BACKOFF_START;
-                    metrics.reconnect();
+                    metrics.reconnect(side_index(side));
                     info!(?side, addr = %opts.addr, subs = subs.len(), "bridge side connected");
                     // (Re)subscribe for this side's open direction(s) only.
                     let mut pkid: u16 = 1;
@@ -221,7 +234,13 @@ fn spawn_router(
                     Side::Local => (CrossDirection::Out, upstream_name(&cfg, f.dest)),
                     Side::Upstream(_) => (CrossDirection::In, upstream_name(&cfg, side)),
                 };
-                metrics.forwarded(up_name, dir, &publish.topic, &f.topic);
+                metrics.forwarded(
+                    up_name,
+                    dir,
+                    &publish.topic,
+                    &f.topic,
+                    publish.payload.len(),
+                );
                 // Forward the publisher's user properties, with the hop count incremented.
                 let properties = set_hop_count(&publish.properties, hop + 1);
                 if connected[idx].load(Ordering::SeqCst) {
