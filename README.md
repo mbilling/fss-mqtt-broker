@@ -265,7 +265,32 @@ inside the broker.
 - **HA without duplicates.** Two or more bridge instances sharing a
   `share_group` take the local stream through a **shared subscription**, so
   adding an instance adds redundancy rather than duplicate deliveries.
-- Per-side TLS/mTLS and least-privilege credentials, with its own metrics.
+- Per-side TLS/mTLS and least-privilege credentials.
+
+**Observability.** The bridge serves Prometheus text at `GET /metrics` on
+`metrics_bind`. The set answers the questions a boundary actually raises:
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `fss_bridge_connected` | gauge | `side` | **Is this side up right now?** (1/0) |
+| `fss_bridge_spool_depth` | gauge | `side` | **How much is buffered** for a side that is down or behind |
+| `fss_bridge_spool_capacity` | gauge | `side` | the bound, so depth reads as a fraction of it |
+| `fss_bridge_forwarded_total` | counter | `upstream`, `direction` | messages across each boundary, each way |
+| `fss_bridge_forwarded_bytes_total` | counter | `upstream`, `direction` | the same in bytes — a size change hides in message rate |
+| `fss_bridge_dropped_total` | counter | `reason`, `side` | `hop-limit` (loop protection working) and **`spool-full` (real message loss)** |
+| `fss_bridge_reconnects_total` | counter | `side` | flapping, per side |
+
+There are deliberately **no 1/5/15-minute metrics**. Windowed rates belong in the
+query layer — `rate(fss_bridge_forwarded_total[5m])` — because Prometheus computes
+them correctly across counter resets and multiple bridge replicas, which an
+in-process window cannot. A ready-made Grafana dashboard with those windows,
+connection state, spool depth and loss panels is at
+[`demo/grafana/dashboards/mqttd-bridge.json`](demo/grafana/dashboards/mqttd-bridge.json).
+
+> **The bridge is not packaged yet.** No release publishes a `mqtt-bridge` binary
+> or image, and it is not inside the broker image — today it must be built from
+> source (`cargo build -p mqtt-bridge`). Tracked as
+> [ADR 0025](docs/adr/0025-boundary-bridge.md) T12.
 
 ### Observability & resource governance
 - **Prometheus metrics** on `GET /metrics` (`MQTTD_METRICS_BIND`), plus optional
@@ -339,6 +364,10 @@ be found. Each is tracked; none is a silent surprise.
 - **The Kubernetes operator is not installable.** It is built and end-to-end
   tested, but no image is published and its manifest is pinned to a kind-local
   tag. The **Helm chart is the supported path** (ADR 0055 T8).
+- **The bridge is not packaged.** `mqtt-bridge` is complete and tested, but no
+  release publishes a binary or image for it and it is not in the broker image,
+  so running it means building from source (ADR 0025 T12). The **Helm chart does
+  not deploy it** either.
 - **The horizontal scaling curve is unmeasured.** The architecture is
   shared-nothing with no coordinator on the publish hot path, but measuring what
   that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
