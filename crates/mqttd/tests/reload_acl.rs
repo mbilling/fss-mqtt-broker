@@ -149,6 +149,7 @@ async fn start_reloadable_node(
                 identity_source: mqtt_auth::mtls::IdentitySource::default(),
                 audit: Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
+                node: None,
                 store: None,
                 connect_timeout: Duration::from_secs(10),
                 shutdown: None,

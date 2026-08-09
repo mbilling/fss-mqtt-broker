@@ -239,6 +239,16 @@ pub struct ConnPolicy {
     pub audit: Arc<dyn AuditSink>,
     /// Session relocation context; `None` outside a cluster (serve locally).
     pub proxy: Option<ProxyContext>,
+    /// This node's id, when it has one.
+    ///
+    /// Deliberately its **own** field rather than read off [`ProxyContext`]. The
+    /// first version of the assigned-client-id fix took it from there, since a
+    /// proxy context happens to carry one — but that ties "what am I called" to
+    /// "is session relocation configured", two things that are equal today and
+    /// need not stay that way. A deployment that clustered without a proxy context
+    /// would have silently gone back to handing out colliding ids, which is the
+    /// class of unstated precondition this codebase keeps paying for.
+    pub node: Option<NodeId>,
     /// The session store, shared with the hub, backing the **durable** QoS-2 inbound
     /// dedup window (ADR 0007 §5): `record_received` quorum-replicates the packet id
     /// before PUBREC, so exactly-once survives a failover. `None` falls back to a
@@ -313,6 +323,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         identity_source: IdentitySource::default(),
         audit: Arc::new(AuditLog::new()),
         proxy: None,
+        node: None,
         store: None,
         connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
@@ -511,12 +522,8 @@ where
     writer.set_version(connect.protocol);
 
     // Client-id validation may already reject the CONNECT.
-    let Some((client, server_assigned_id)) = validate_connect(
-        &mut writer,
-        &connect,
-        policy.proxy.as_ref().map(|p| &p.node),
-    )
-    .await?
+    let Some((client, server_assigned_id)) =
+        validate_connect(&mut writer, &connect, policy.node.as_ref()).await?
     else {
         return Ok(());
     };
@@ -2004,6 +2011,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2038,6 +2046,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2151,6 +2160,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2203,6 +2213,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2304,6 +2315,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             shutdown: None,
@@ -2548,6 +2560,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: audit.clone(),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -3200,6 +3213,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: Some(store),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,

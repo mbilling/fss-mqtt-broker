@@ -380,6 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (policy, mut reloader) = client_policy(
         &live_config,
+        &node_id,
         Some(proxy),
         store,
         shutdown.clone(),
@@ -403,6 +404,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rotated cluster cert/key/CA is served on the next peer handshake.
     if let Some(parts) = peer_tls_reload {
         reloader.attach_peer_tls(parts.acceptor_tx, parts.connector_tx, parts.build);
+    }
+
+    // A cluster whose nodes all answer to the same name is broken in ways that
+    // surface late and confusingly: session placement is keyed by node id (the HRW
+    // ring), gossip identifies members by it, and a server-assigned client id is
+    // qualified with it. Kubernetes users never meet this because the chart sets
+    // MQTTD_NODE_ID from the pod name — which is exactly why it is worth saying out
+    // loud for everyone deploying a cluster any other way.
+    let clustered = config.cluster.peer_bind.is_some()
+        || config.cluster.swim.bind.is_some()
+        || !config.cluster.peers.is_empty()
+        || !config.cluster.swim.seeds.is_empty();
+    if clustered && config.node.id == mqtt_config::DEFAULT_NODE_ID {
+        warn!(
+            node_id = %config.node.id,
+            "clustering is configured but MQTTD_NODE_ID is still the default — every \
+             node will answer to the same id, which breaks session placement, gossip \
+             identity, and server-assigned client ids. Set a UNIQUE MQTTD_NODE_ID per node."
+        );
     }
 
     // Cluster peer mesh (opt-in).
@@ -774,6 +794,11 @@ async fn start_client_listeners(
 /// the insecure fallbacks are explicit and loudly logged.
 fn client_policy(
     live: &Arc<RwLock<Config>>,
+    // This node's id, passed explicitly rather than read off `proxy`: what this
+    // node is called and whether session relocation is configured are two separate
+    // facts, and a server-assigned client id must stay unique across the cluster
+    // even if they ever stop coinciding.
+    node: &NodeId,
     proxy: Option<conn::ProxyContext>,
     store: Arc<dyn SessionStore>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -833,6 +858,7 @@ fn client_policy(
         ),
         audit,
         proxy,
+        node: Some(node.clone()),
         store: Some(store),
         connect_timeout: conn::DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,

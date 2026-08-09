@@ -53,10 +53,17 @@ pub struct Node {
     pub failure_domains: BTreeMap<String, String>,
 }
 
+/// The node id a broker uses when the operator sets none.
+///
+/// Fine for a single node; **wrong for every node in a cluster**, since they would
+/// all answer to it. Exposed so startup can warn when clustering is configured and
+/// this is still the value.
+pub const DEFAULT_NODE_ID: &str = "node-local";
+
 impl Default for Node {
     fn default() -> Self {
         Self {
-            id: "node-local".to_string(),
+            id: DEFAULT_NODE_ID.to_string(),
             data_dir: None,
             failure_domain: None,
             failure_domains: BTreeMap::new(),
