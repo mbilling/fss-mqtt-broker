@@ -81,6 +81,12 @@ jobs:
             MQTTD_HEALTH_BIND=127.0.0.1:$HPORT RUST_LOG=off target/debug/mqttd &
           for _ in $(seq 1 100); do curl -fsS http://127.0.0.1:$HPORT/readyz >/dev/null 2>&1 && break; sleep 0.1; done
           MQTT_PORT=$PORT python3 scripts/interop/paho_conformance.py
+      # ADR 0051 T6: the migration converter's output must be accepted by the real
+      # broker, not merely well-formed. A migration tool that emits plausible TOML
+      # the broker then rejects burns the evaluation it exists to enable.
+      - name: Mosquitto migration converter (output boots the broker)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-mosquitto.sh
+
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 
