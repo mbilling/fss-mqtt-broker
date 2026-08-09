@@ -460,6 +460,11 @@ be found. Each is tracked; none is a silent surprise.
   tracked in [#124](https://github.com/mbilling/fss-mqtt-broker/issues/124); the
   reproduction ships as an ignored test
   (`crates/mqttd/tests/inflight_durability.rs`).
+- **Migration tooling covers Mosquitto only.**
+  `scripts/migrate/from-mosquitto.py` translates `mosquitto.conf` and its
+  `acl_file`, marking anything without an equivalent as `TODO(migrate)` in the
+  output rather than dropping it silently. EMQX and HiveMQ converters do not
+  exist yet.
 - **TLS 1.3 only.** There is no TLS 1.2 listener. Modern clients are unaffected,
   but **older device firmware that cannot negotiate 1.3 will simply fail to
   connect** — check your fleet before planning a migration, because the failure
