@@ -120,7 +120,7 @@ Printed here so nobody discovers it in production:
 | Offline queue **bytes** | Message count only (`MQTTD_MAX_QUEUED_MESSAGES`) | 0041-T6 |
 | Bridge-spool **bytes** | Message count only (default 10 000) | 0041-T7 |
 | Per-store disk share | Aggregate watermark only | 0041-T9 |
-| Per-connection **write** buffering | `MAX_BACKLOG`, a hard-coded **10 000 messages** per stalled subscriber — bounded in count, **unbounded in bytes, and not configurable at all** | 0041-T10 |
+| Per-connection **write** buffering | Two hard-coded count caps, neither in bytes and neither configurable: `MAX_BACKLOG` (10 000 messages, QoS 1/2, drop-oldest) and the outbound queue (10 000 packets, QoS 0, shed and counted) | 0041-T10 |
 
 The last row is the sharpest edge: a subscriber that stops reading can hold up to
 10 000 messages, and at the 1 MiB default packet size that is ~10 GiB of headroom per

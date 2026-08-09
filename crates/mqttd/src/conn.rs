@@ -585,7 +585,11 @@ where
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
     let will = connect.last_will.map(into_will);
-    let (out_tx, mut out_rx): (Outbound, _) = mpsc::unbounded_channel();
+    // The writer half owns `out_depth` and decrements it as it drains, so the hub
+    // can see how far behind this client is and shed `QoS 0` rather than queue it
+    // without limit (#123).
+    let (raw_out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, out_depth) = Outbound::new(raw_out_tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     // The client's Receive Maximum bounds how many unacked QoS>0 PUBLISHes the hub
     // may have outstanding to it (ADR 0012); 0/absent means unlimited.
@@ -693,6 +697,7 @@ where
         auth_method,
         policy,
         &mut out_rx,
+        &out_depth,
         connect.keep_alive,
         connect.protocol == ProtocolVersion::V5,
         // The client's advertised MQTT 5 Maximum Packet Size (ADR 0041 T4): the
@@ -1426,6 +1431,9 @@ async fn serve<R, W>(
     auth_method: Option<String>,
     policy: &ConnPolicy,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
+    // Decremented as packets are drained, so the hub can see this client's
+    // backlog and shed `QoS 0` rather than queue it without limit (#123).
+    out_depth: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     keep_alive: u16,
     is_v5: bool,
     client_max_packet: Option<u32>,
@@ -1486,6 +1494,9 @@ where
                 }
             }
             maybe_out = out_rx.recv() => {
+                if maybe_out.is_some() {
+                    out_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 match maybe_out {
                     // Rewrite outbound PUBLISHes to use topic aliases where the
                     // client allowed them (ADR 0011 §3); other packets pass through.
@@ -2877,7 +2888,7 @@ mod tests {
             .expect("attach")
             .expect("outbound sender");
 
-        out.send(server_publish("room/temp")).unwrap();
+        assert!(out.send(server_publish("room/temp")));
         match recv(&mut reader).await {
             Some(Packet::Publish(p)) => {
                 assert_eq!(p.topic, "room/temp", "first send keeps the full topic");
@@ -2886,7 +2897,7 @@ mod tests {
             other => panic!("expected PUBLISH, got {other:?}"),
         }
 
-        out.send(server_publish("room/temp")).unwrap();
+        assert!(out.send(server_publish("room/temp")));
         match recv(&mut reader).await {
             Some(Packet::Publish(p)) => {
                 assert_eq!(p.topic, "", "second send references the alias");

@@ -26,8 +26,12 @@
 //!
 //! The per-session **offline queue** is bounded (ADR 0001 §6, workstream A): a
 //! cap with a drop-oldest/reject-newest policy. The per-connection **outbound
-//! socket channel** is still unbounded; a bounded channel with an overload
-//! policy remains a hardening item.
+//! socket channel** stays unbounded by design — a bounded one would make the hub
+//! block or drop control packets for one slow client — but its depth is tracked
+//! ([`Outbound`]) so `QoS 0`, which nothing else bounds, is shed rather than
+//! accumulated (#123).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
@@ -145,8 +149,70 @@ pub struct RemoteSharedGroup {
     pub members: Vec<(ClientId, QoS, bool)>,
 }
 
-/// Sender for packets destined to a single client's socket.
-pub type Outbound = mpsc::UnboundedSender<Packet>;
+/// Sender for packets destined to a single client's socket, carrying a live count
+/// of what is queued but not yet written.
+///
+/// The channel is unbounded *by design* — a bounded one would make the hub block
+/// or drop control packets, and the hub must never stall on one slow client. But
+/// unbounded with no visibility was a memory leak with a nice name: `QoS 1/2` is
+/// bounded by [`MAX_BACKLOG`] via the flow-control path, while **`QoS 0` went
+/// straight into this channel with no cap, no counter and no shed policy** (#123).
+/// `QoS 0` is also exempt from Receive Maximum, so nothing else applied
+/// backpressure — a subscriber that stopped reading a busy topic grew this
+/// without limit.
+///
+/// So the depth is tracked here: cheap on the hot path (one relaxed add, one
+/// relaxed sub), and it lets the hub shed `QoS 0` — which MQTT defines as
+/// at-most-once, so dropping it is legal — while every other packet still flows.
+#[derive(Clone, Debug)]
+pub struct Outbound {
+    tx: mpsc::UnboundedSender<Packet>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl Outbound {
+    /// Wrap a channel, returning the sender and the counter its reader must
+    /// decrement as it drains.
+    #[must_use]
+    pub fn new(tx: mpsc::UnboundedSender<Packet>) -> (Self, Arc<AtomicUsize>) {
+        let depth = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                tx,
+                depth: depth.clone(),
+            },
+            depth,
+        )
+    }
+
+    /// Queue a packet.
+    ///
+    /// `false` when the receiver is gone (the client left). Callers all treat that
+    /// the same way — the packet is dropped and a Detach is already in flight — so
+    /// this is a plain bool rather than a `Result` carrying a whole `Packet` back.
+    pub fn send(&self, packet: Packet) -> bool {
+        self.depth.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(packet).is_err() {
+            // Never queued, so never drained: keep the count honest.
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Packets queued for this client but not yet written to its socket.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
+}
+
+/// How many packets may sit unwritten for one client before `QoS 0` is shed.
+///
+/// Sized so it is unreachable by well-behaved clients and by the `QoS 1/2` paths
+/// (which [`MAX_BACKLOG`] already bounds), and only bites a consumer that has
+/// genuinely stopped reading.
+pub const MAX_OUTBOUND_QUEUE: usize = 10_000;
 
 /// Sender for messages destined to a peer node's link.
 pub type PeerOutbound = mpsc::UnboundedSender<PeerMessage>;
@@ -2655,6 +2721,25 @@ impl Hub {
         message_expiry: Option<u32>,
     ) {
         if message.qos == QoS::AtMostOnce {
+            // QoS 0 is the only path with no other bound: the QoS 1/2 backlog is
+            // capped by MAX_BACKLOG below, and Receive Maximum does not apply to
+            // QoS 0 — so without this a subscriber that stopped reading a busy
+            // topic grew its outbound channel without limit (#123).
+            //
+            // At-most-once is exactly the delivery contract that permits dropping,
+            // so shedding here is legal where dropping a QoS 1/2 message or an ack
+            // would not be. Counted and logged: a silent drop would be the same
+            // defect in a different place.
+            if tx.depth() >= MAX_OUTBOUND_QUEUE {
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("outbound-full");
+                }
+                warn!(
+                    client = %client.0, cap = MAX_OUTBOUND_QUEUE, topic = %message.topic,
+                    "outbound queue full: shedding QoS 0 for a subscriber that is not reading"
+                );
+                return;
+            }
             // Ignore send errors: a closed channel means the client is gone and a
             // Detach is already in flight.
             let _ = tx.send(publish_packet(
@@ -5000,7 +5085,7 @@ mod tests {
     use super::{
         Admission, AttachOutcome, AuthMethod, Backlog, Hub, HubCommand, Inflight, Outbound,
         PeerOutbound, ProtocolVersion, RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG,
-        REPLAY_LIMIT,
+        MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
@@ -5086,7 +5171,10 @@ mod tests {
     /// Send a persistent (resume) `Attach` and return the raw [`AttachOutcome`] so a
     /// test can assert a reject (`Unavailable`) as well as a present/absent session.
     async fn attach_outcome(tx: &HubTx, client: &str, conn_id: u64) -> AttachOutcome {
-        let (out_tx, _out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
@@ -5112,7 +5200,10 @@ mod tests {
         owner: &str,
         conn_id: u64,
     ) -> AttachOutcome {
-        let (out_tx, _out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
@@ -5366,7 +5457,10 @@ mod tests {
         session_expiry: u32,
         receive_maximum: u16,
     ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
-        let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId(client.into()),
@@ -5443,6 +5537,48 @@ mod tests {
             reply: None,
         })
         .unwrap();
+    }
+
+    /// A subscriber that stops reading must not be able to grow its outbound queue
+    /// without limit (#123).
+    ///
+    /// `QoS 0` was the one delivery path with no bound at all: the `QoS 1/2` backlog is
+    /// capped by `MAX_BACKLOG`, and Receive Maximum does not apply to `QoS 0`, so a
+    /// stalled consumer on a busy topic accumulated packets until the process died.
+    /// The README even documented `MAX_BACKLOG` as *the* per-connection bound,
+    /// which was true for `QoS 1/2` and false here.
+    ///
+    /// The receiver is deliberately never drained — that is the whole scenario.
+    #[tokio::test]
+    async fn a_stalled_qos0_subscriber_is_shed_not_queued_without_limit() {
+        let tx = start_hub();
+        // Held and never read from: this client has stopped consuming.
+        let (mut stalled_rx, _) = attach(&tx, "stalled", 1, true).await;
+        subscribe(&tx, "stalled", "flood/#");
+
+        // Publish comfortably past the cap.
+        let over = MAX_OUTBOUND_QUEUE + 5_000;
+        for _ in 0..over {
+            publish(&tx, "flood/x", b"drop-me");
+        }
+        // Let the hub work through them.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Count what actually accumulated.
+        let mut queued = 0usize;
+        while stalled_rx.try_recv().is_ok() {
+            queued += 1;
+        }
+
+        assert!(
+            queued <= MAX_OUTBOUND_QUEUE,
+            "outbound queue grew to {queued} for a subscriber that never read — \
+             the cap of {MAX_OUTBOUND_QUEUE} was not enforced"
+        );
+        assert!(
+            queued > 0,
+            "nothing was queued at all: the test never exercised the delivery path"
+        );
     }
 
     /// ADR 0020 (T8): a publish round-trip moves the metrics counters — the received and
@@ -5706,7 +5842,10 @@ mod tests {
         subscribe(&tx, "watcher", "wills/victim");
 
         // The victim: a v5 client with a will, admitted by certificate.
-        let (out_tx, mut victim): (Outbound, _) = mpsc::unbounded_channel();
+        let (out_tx, mut victim) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("victim".into()),
@@ -5822,7 +5961,10 @@ mod tests {
             let tx = tx.clone();
             let client = client.to_string();
             async move {
-                let (out_tx, out_rx): (Outbound, _) = mpsc::unbounded_channel();
+                let (out_tx, out_rx) = {
+                    let (t, r) = mpsc::unbounded_channel();
+                    (Outbound::new(t).0, r)
+                };
                 let (reply_tx, reply_rx) = oneshot::channel();
                 tx.send(HubCommand::Attach {
                     client: ClientId(client),
@@ -8798,7 +8940,10 @@ mod tests {
         let tx = start_hub_with_arc(store);
 
         // Kick off a persistent attach for "a" that will not resolve.
-        let (out_tx, _out_rx): (Outbound, _) = mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
         let (reply_tx, mut a_reply) = oneshot::channel();
         tx.send(HubCommand::Attach {
             client: ClientId("a".into()),
