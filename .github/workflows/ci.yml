@@ -134,6 +134,12 @@ jobs:
             --set replicaCount=1 --set podDisruptionBudget.enabled=false \
             --set persistence.enabled=false | \
             kubeconform -strict -summary -ignore-missing-schemas -schema-location default
+      # ADR 0025 T12: the bridge is opt-in, and when enabled every client_id must
+      # be per-replica — replicas sharing one take over each other's MQTT session,
+      # turning the shared-subscription HA pair into a reconnect loop.
+      - name: Bridge chart (opt-in, per-replica client id, schema)
+        run: ./scripts/k8s/check-bridge-chart.sh
+
       # ADR 0055 T2: the operator and the chart must render the SAME objects. Two
       # supported deployment paths that disagree are worse than one, so this diffs
       # them for equivalent inputs and fails on any load-bearing divergence.

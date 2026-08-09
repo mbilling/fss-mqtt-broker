@@ -1,0 +1,187 @@
+{{- if .Values.bridge.enabled }}
+{{/*
+  Boundary bridge (ADR 0025), deployed beside the broker.
+
+  A StatefulSet rather than a Deployment for two reasons, both load-bearing:
+
+  1. MQTT client ids must be unique, and the bridge's built-in default is the
+     CONSTANT `fss-bridge-local`. Two replicas sharing it take over each other's
+     session in a reconnect loop — so the very HA the shared-subscription design
+     offers would break. Stable pod names give each replica its own id, injected
+     below by substituting __POD_NAME__ into the config.
+  2. The store-and-forward spool is per-replica state. A Deployment's shared or
+     ephemeral storage would lose exactly the messages the spool exists to keep.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mqttd.bridgeFullname" . }}
+  labels:
+    {{- include "mqttd.bridgeLabels" . | nindent 4 }}
+data:
+  bridge.toml: |
+{{ .Values.bridge.config | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mqttd.bridgeFullname" . }}
+  labels:
+    {{- include "mqttd.bridgeLabels" . | nindent 4 }}
+spec:
+  # Headless: the bridge is scraped per pod and dials outward; nothing dials in.
+  clusterIP: None
+  selector:
+    {{- include "mqttd.bridgeSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8090
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mqttd.bridgeFullname" . }}
+  labels:
+    {{- include "mqttd.bridgeLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "mqttd.bridgeFullname" . }}
+  replicas: {{ .Values.bridge.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mqttd.bridgeSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mqttd.bridgeLabels" . | nindent 8 }}
+        {{- with .Values.bridge.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Re-render + roll when the bridge config changes.
+        checksum/config: {{ .Values.bridge.config | sha256sum }}
+        {{- if .Values.metrics.podAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        prometheus.io/path: "/metrics"
+        {{- end }}
+        {{- with .Values.bridge.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # Give this replica its own client id. The bridge image is distroless (no
+        # shell), so the substitution happens here, in the same tiny busybox the
+        # broker uses to render its per-pod config.
+        - name: render-config
+          image: "{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}"
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              sed "s/__POD_NAME__/${POD_NAME}/g" /config/bridge.toml > /rendered/bridge.toml
+              # An empty render would start the bridge on a config that is not the
+              # one meant — fail loudly instead (the same guard the broker's
+              # init step carries, for the same reason).
+              if [ ! -s /rendered/bridge.toml ]; then
+                echo "FATAL: rendered bridge config is empty" >&2
+                exit 1
+              fi
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: rendered
+              mountPath: /rendered
+      containers:
+        - name: bridge
+          image: {{ include "mqttd.bridgeImage" . }}
+          imagePullPolicy: {{ .Values.bridge.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["/etc/mqtt-bridge/bridge.toml"]
+          ports:
+            - name: metrics
+              containerPort: 8090
+              protocol: TCP
+          # No readiness probe on connectivity by design: a bridge whose upstream
+          # is down is doing its job — spooling — not failing. Liveness is the
+          # metrics endpoint answering at all.
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: rendered
+              mountPath: /etc/mqtt-bridge
+              readOnly: true
+            - name: spool
+              mountPath: /var/lib/mqtt-bridge
+            {{- with .Values.bridge.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.bridge.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "mqttd.bridgeFullname" . }}
+        - name: rendered
+          emptyDir: {}
+        {{- if not .Values.bridge.persistence.enabled }}
+        - name: spool
+          emptyDir: {}
+        {{- end }}
+        {{- with .Values.bridge.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.bridge.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bridge.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.bridge.persistence.enabled }}
+  # Explicit, not inherited. A retired ordinal's spool may still hold messages
+  # that only that ordinal can replay, so deleting its volume on scale-down would
+  # discard them silently — the shape of #97, where a scale-to-zero destroyed
+  # every broker volume because the policy was left to a default.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: {{ .Values.bridge.persistence.retentionPolicy.whenDeleted }}
+    whenScaled: {{ .Values.bridge.persistence.retentionPolicy.whenScaled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: spool
+      spec:
+        accessModes:
+          {{- toYaml .Values.bridge.persistence.accessModes | nindent 10 }}
+        {{- if .Values.bridge.persistence.storageClassName }}
+        storageClassName: {{ .Values.bridge.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.bridge.persistence.size | quote }}
+  {{- end }}
+{{- end }}

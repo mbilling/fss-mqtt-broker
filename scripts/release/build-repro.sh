@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproducible release build of the mqttd binary (ADR 0045 T2).
+# Reproducible release build of the shipped binaries — mqttd and mqtt-bridge (ADR 0045 T2).
 #
 # This is THE build recipe: the release workflow runs it, and a third party
 # verifying a release runs the *same* script against the same tag. Same tag +
@@ -59,6 +59,19 @@ export TZ=UTC
 echo "reproducible build: target=${TARGET} SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" >&2
 
 rustup target add "$TARGET" >&2 2>/dev/null || true
-cargo build --release --locked --target "$TARGET" -p mqttd >&2
 
+# Both shipped binaries, built under the same recipe so both are reproducible and
+# both can be verified the same way. The bridge is a SEPARATE process by design
+# (ADR 0025: its own identity, credentials and failure domain), so it is a second
+# binary and a second image rather than a second entrypoint into the broker's.
+PACKAGES=("${@:2}")
+if [ "${#PACKAGES[@]}" -eq 0 ]; then
+  PACKAGES=(mqttd mqtt-bridge)
+fi
+for pkg in "${PACKAGES[@]}"; do
+  cargo build --release --locked --target "$TARGET" -p "$pkg" >&2
+done
+
+# stdout stays the broker path: callers (and RELEASING.md) treat this script's
+# output as "the binary to checksum", and quietly changing that would break them.
 echo "${REPO_ROOT}/target/${TARGET}/release/mqttd"

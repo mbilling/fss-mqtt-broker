@@ -55,3 +55,32 @@ app.kubernetes.io/component: broker
 {{- define "mqttd.image" -}}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
 {{- end -}}
+
+{{/* ---------------------------------------------------------------------- */}}
+{{/* Boundary bridge (ADR 0025). Opt-in, and deployed BESIDE the broker       */}}
+{{/* rather than inside it: separate process, separate identity, separate     */}}
+{{/* failure domain — usually a different security zone entirely.            */}}
+{{/* ---------------------------------------------------------------------- */}}
+
+{{- define "mqttd.bridgeFullname" -}}
+{{- printf "%s-bridge" (include "mqttd.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "mqttd.bridgeSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "mqttd.name" . }}-bridge
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "mqttd.bridgeLabels" -}}
+helm.sh/chart: {{ include "mqttd.chart" . }}
+{{ include "mqttd.bridgeSelectorLabels" . }}
+app.kubernetes.io/component: bridge
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "mqttd.bridgeImage" -}}
+{{- printf "%s:%s" .Values.bridge.image.repository (default .Chart.AppVersion .Values.bridge.image.tag) -}}
+{{- end -}}
