@@ -1,4 +1,4 @@
-//! Does an acknowledged QoS 1 message survive a crash while it is **in flight to
+//! Does an acknowledged `QoS 1` message survive a crash while it is **in flight to
 //! an online subscriber**? (issue #124)
 //!
 //! The README's headline guarantee is that no acknowledged fact is lost. That is
@@ -14,17 +14,17 @@
 //!
 //! So this test asks the question directly, against the real binary:
 //!
-//!   1. a PERSISTENT subscriber is online and subscribed at QoS 1;
-//!   2. a publisher sends QoS 1 and **receives its PUBACK** — the broker has now
+//!   1. a PERSISTENT subscriber is online and subscribed at `QoS 1`;
+//!   2. a publisher sends `QoS 1` and **receives its `PUBACK`** — the broker has now
 //!      promised to deliver;
 //!   3. the subscriber receives the PUBLISH and deliberately does **not** PUBACK,
 //!      so the message is genuinely in flight, exactly as it would be for a device
 //!      on a slow link;
-//!   4. the broker is SIGKILLed — no flush, no goodbye;
+//!   4. the broker is `SIGKILL`ed — no flush, no goodbye;
 //!   5. it restarts on the same data directory and the subscriber resumes its
 //!      session.
 //!
-//! MQTT requires an unacknowledged QoS 1 message to be redelivered on session
+//! MQTT requires an unacknowledged `QoS 1` message to be redelivered on session
 //! resume. If it is not, an acknowledged fact was lost and the guarantee is
 //! narrower than the README states.
 //!
