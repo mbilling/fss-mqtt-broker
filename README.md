@@ -15,7 +15,10 @@ with dynamic cross-node routing, and a full identity/authorization stack
 epoch-fenced quorum replication) is **on by default** and proven over a real
 cluster, with **cross-node takeover** (a replica serves a session after its
 owner dies) and **data-safe elastic resize** (grow, shrink, and rolling
-replacement without losing an acknowledged fact). Prometheus metrics, resource
+replacement without losing an acknowledged fact). One case is **not** covered
+and is worth knowing before you rely on it: a QoS 1/2 message already in flight
+to an *online* subscriber is held in memory, so a crash in that window loses it
+even though the publisher was acknowledged — see [Limitations](#limitations). Prometheus metrics, resource
 governance (connection caps, per-client quotas, publish-rate limits, bounded
 queues), and a continuous-assurance program (out-of-process fault/upgrade
 harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
@@ -60,9 +63,11 @@ The full matrix — including every cell we lose — is
 [`docs/COMPARISON.md`](docs/COMPARISON.md).
 
 - **Durable sessions are on by default**, quorum-replicated, with an acked QoS
-  1/2 message surviving the loss of the node that accepted it. Mosquitto and
-  NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's
-  durable sessions are opt-in.
+  1/2 message surviving the loss of the node that accepted it — *while it is
+  queued for a disconnected subscriber*. A message already in flight to an
+  online subscriber is the documented exception
+  ([Limitations](#limitations)). Mosquitto and NanoMQ are single-node; VerneMQ
+  documents queue loss on node death; EMQX's durable sessions are opt-in.
 - **A policy reload evicts live sessions.** Revoke a certificate, remove a user,
   or tighten a grant, and the *already-connected* client is cut — not left
   running until it happens to reconnect. No compared broker documents this.
@@ -367,7 +372,7 @@ version:
 
 |  | mqttd's answer |
 |---|---|
-| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses). Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
+| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss on the offline-queue path (proven under SIGKILL/partition harnesses) — **except a message already in flight to an online subscriber, which is in-memory only** ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124)). Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
 | Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery yet — and **no production track record**: the matrix says so in as many words. |
@@ -393,6 +398,16 @@ be found. Each is tracked; none is a silent surprise.
   shared-nothing with no coordinator on the publish hot path, but measuring what
   that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
   as design intent.
+- **An acked message in flight to an ONLINE subscriber is not durable.** Durable
+  sessions cover the offline path: a message queued for a *disconnected*
+  persistent subscriber is quorum-replicated before the publisher is
+  acknowledged. But once a subscriber is connected, the broker sends live and
+  tracks the un-acknowledged message **in memory only** — so if the node dies
+  between the publisher's PUBACK and the subscriber's, that message is gone and
+  is not redelivered on session resume. Reproduced against the real binary and
+  tracked in [#124](https://github.com/mbilling/fss-mqtt-broker/issues/124); the
+  reproduction ships as an ignored test
+  (`crates/mqttd/tests/inflight_durability.rs`).
 - **No production track record.** `v0.9.0` is released and verifiable, but nobody
   is running this in anger yet — there is no operational history behind it.
 
