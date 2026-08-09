@@ -382,12 +382,15 @@ version:
 The gaps worth knowing before you evaluate this, stated here rather than left to
 be found. Each is tracked; none is a silent surprise.
 
-- **Memory is bounded by counts, not bytes.** There is no total-memory knob. The
-  sharpest edge is `MAX_BACKLOG`: a subscriber that stops reading can hold up to
-  **10 000 messages**, hard-coded and not configurable, so at the 1 MiB default
-  packet size that is ~10 GiB of worst-case headroom per connection. Cap
-  `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full arithmetic and a bounded
-  preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T8, T10).
+- **Memory is bounded by counts, not bytes.** There is no total-memory knob. A
+  subscriber that stops reading is bounded two ways, both by message count and
+  neither by bytes: QoS 1/2 by `MAX_BACKLOG` (10 000 messages, drop-oldest) and
+  QoS 0 by the outbound-queue cap (10 000 packets, shed and counted as
+  `publish_dropped{reason="outbound-full"}`). Both are hard-coded. At the 1 MiB
+  default packet size that is still ~10 GiB of worst-case headroom per
+  connection, so cap `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full
+  arithmetic and a bounded preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T8,
+  T10).
 - **Disk is bounded in aggregate, not per store.** One store can consume the whole
   `MQTTD_STORE_MAX_BYTES` watermark and brown out the others (ADR 0041 T9).
   Disk-full itself fails closed and is crash-tested mid-write.
