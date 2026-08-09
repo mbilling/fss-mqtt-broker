@@ -261,9 +261,11 @@ bridge:
   # __POD_NAME__ is substituted with the pod's own name before the bridge starts.
   # Use it in every client_id. MQTT client ids must be unique — replicas sharing
   # one take over each other's session in a reconnect loop instead of running as
-  # an HA pair. An unset client_id now defaults to bridge-<hostname>, which is
-  # already per-pod; setting it here keeps the identity visible in the config
-  # rather than implied by the environment.
+  # an HA pair. An unset client_id is now generated per instance in MQTT's
+  # guaranteed-support shape (<=23 bytes, alphanumeric), so it is already per-pod;
+  # setting it here keeps the identity visible in the config rather than implied
+  # by the environment. Anything you set is used VERBATIM — keep it within 23
+  # alphanumeric bytes if an upstream is strict.
   #
   # Secrets are referenced BY PATH (password_file, TLS key files) and mounted via
   # `extraVolumes`/`extraVolumeMounts` from a Secret — never inlined here.

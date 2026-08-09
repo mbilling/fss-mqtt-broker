@@ -415,33 +415,161 @@ fn host_identity() -> Option<String> {
 /// explicitly for that endpoint, which is a loud, immediate connect error rather
 /// than a silent takeover.
 fn default_client_id(side: Side) -> String {
-    client_id_for(host_identity().as_deref(), side)
+    let host = host_identity();
+    if host.is_none() {
+        // Without a host name every instance generates the SAME id, so a second
+        // one would evict the first. Allowed, never silent.
+        warn!(
+            "could not determine this host's name (no HOSTNAME, no /etc/hostname); \
+             every bridge instance will generate the SAME client id and they will \
+             evict each other's MQTT session — set `client_id` explicitly on each side"
+        );
+    }
+    let id = client_id_for(host.as_deref(), side);
+    // The hash suffix is opaque by construction, so print the mapping once. This
+    // is what makes a strict, generated id as debuggable as a readable one.
+    info!(
+        client_id = %id,
+        host = host.as_deref().unwrap_or("<unknown>"),
+        ?side,
+        "generated MQTT client id (23-byte alphanumeric form accepted by any broker)"
+    );
+    id
 }
 
 /// The pure half of [`default_client_id`]: given a host identity (or none), the id.
 ///
 /// Split out so the naming rules are testable without mutating process-wide
 /// environment — which, when a test did it, raced every other test reading it.
-fn client_id_for(host: Option<&str>, side: Side) -> String {
-    let Some(host) = host else {
-        // No identity available: fall back to the old constants and say so. Any
-        // second instance sharing this fallback WILL fight over the session, so
-        // this is a real warning, not noise.
-        warn!(
-            "could not determine this host's name (no HOSTNAME, no /etc/hostname); \
-             falling back to a FIXED bridge client id. Running more than one bridge \
-             instance with this default will make them evict each other's MQTT \
-             session — set `client_id` explicitly on each side."
-        );
-        return match side {
-            Side::Local => "fss-bridge-local".to_string(),
-            Side::Upstream(i) => format!("fss-bridge-upstream-{i}"),
-        };
-    };
-    match side {
-        Side::Local => format!("bridge-{host}"),
-        Side::Upstream(i) => format!("bridge-{host}-{i}"),
+/// MQTT's *guaranteed* client-id shape: 1-23 bytes of `[0-9a-zA-Z]`.
+///
+/// A server MUST support ids in this range and MAY support more. Ours accepts any
+/// non-empty id of any length or charset — but the bridge also connects to
+/// *other people's* brokers, and "the far side is permissive" is an assumption
+/// nothing here can check. So generated ids stay inside the guaranteed set, for
+/// every side: the local endpoint is just a URL a user configures, and there is
+/// no guarantee it points at this broker either.
+const ID_MAX: usize = 23;
+/// Marks a generated id as ours in someone else's broker logs.
+const ID_PREFIX: &str = "fssb";
+/// Alphanumerics of the host name kept for human recognition.
+const ID_HOST_KEEP: usize = 10;
+/// Base36 digits of hash — 36^7 ≈ 7.8e10, the part that guarantees uniqueness.
+const ID_HASH_LEN: u32 = 7;
+
+/// FNV-1a, 64-bit.
+///
+/// Deliberately not `DefaultHasher`: its output is explicitly not stable across
+/// Rust releases, and a client id that changed when the binary was rebuilt would
+/// orphan the persistent local session every upgrade. FNV is fixed by its
+/// specification, trivial, and needs no dependency. It is not cryptographic and
+/// does not need to be — this distinguishes hosts, it does not authenticate them.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    hash
+}
+
+/// `n` rendered in base36 `[0-9a-z]`, exactly `width` digits, zero-padded.
+fn base36(n: u64, width: usize) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = vec![b'0'; width];
+    let mut n = n;
+    for slot in out.iter_mut().rev() {
+        *slot = DIGITS[usize::try_from(n % 36).unwrap_or(0)];
+        n /= 36;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| "0".repeat(width))
+}
+
+/// The client id used for a side when the config does not set one.
+///
+/// **Unique per instance, valid on any broker, and needs no configuration.**
+///
+/// It used to be the constant `fss-bridge-local` for every instance. MQTT keys a
+/// session by client id and requires a broker to disconnect the existing client
+/// when a new one claims the same id, so two replicas evicted each other in a
+/// permanent loop — the HA a shared subscription is meant to buy, inverted. The
+/// config comment said "each instance still needs a distinct `client_id`", which
+/// made it a footgun rather than a surprise, but nothing warned.
+///
+/// The shape, 23 bytes at most:
+///
+/// ```text
+///   fssb   lo    ttdbridge0   k3n9x2q
+///   ────   ──    ──────────   ───────
+///    4      2        10          7
+///   ours   side   host tail     hash
+/// ```
+///
+/// Three choices worth stating, because each prevents a specific failure:
+///
+/// - **The hash covers the FULL host name**, never the truncated part. A
+///   shortener that could map two hosts onto one id would reintroduce exactly the
+///   collision this exists to prevent.
+/// - **The host's TAIL is kept, not its head.** Generated names put the
+///   distinguishing part last — `mqttd-bridge-0` and `mqttd-bridge-1` share their
+///   first 11 characters, so head-truncation would discard the only readable
+///   difference.
+/// - **Base36 `[0-9a-z]`** sits inside the guaranteed charset and survives a
+///   broker that folds case.
+///
+/// Stable across restarts, because the local side uses `clean_session=false`: an
+/// id that varied per start would orphan the previous session and its queue.
+fn client_id_for(host: Option<&str>, side: Side) -> String {
+    let side_tag = match side {
+        Side::Local => "lo".to_string(),
+        // Beyond 36 upstreams the tag repeats; the hash still separates them,
+        // since it is taken over the real index.
+        Side::Upstream(i) => format!("u{}", base36((i % 36) as u64, 1)),
+    };
+
+    let host = host.unwrap_or("");
+    // Hash over the full identity — host and side — before anything is shortened.
+    let mut seed = Vec::with_capacity(host.len() + 8);
+    seed.extend_from_slice(host.as_bytes());
+    seed.push(0);
+    match side {
+        Side::Local => seed.extend_from_slice(b"local"),
+        Side::Upstream(i) => seed.extend_from_slice(format!("up{i}").as_bytes()),
+    }
+    let hash = base36(
+        fnv1a64(&seed) % 36_u64.pow(ID_HASH_LEN),
+        ID_HASH_LEN as usize,
+    );
+
+    // Readable part comes from the FIRST DNS label only. Kubernetes sets HOSTNAME
+    // to the short pod name, but /etc/hostname can hold an FQDN — and there the
+    // tail is the domain, so `…svc.cluster.local` would keep "usterlocal" and lose
+    // the pod entirely. The hash above still covers the whole string, so dropping
+    // the domain here cannot merge two hosts.
+    let short = host.split('.').next().unwrap_or(host);
+    // Only characters every server must accept, lowercased so a case-folding
+    // broker cannot merge two ids that differ solely by case.
+    let clean: String = short
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+    let tail: String = if clean.len() > ID_HOST_KEEP {
+        clean[clean.len() - ID_HOST_KEEP..].to_string()
+    } else {
+        clean
+    };
+
+    let id = format!("{ID_PREFIX}{side_tag}{tail}{hash}");
+    debug_assert!(
+        id.len() <= ID_MAX,
+        "generated client id {id} exceeds {ID_MAX}"
+    );
+    debug_assert!(
+        id.chars().all(|c| c.is_ascii_alphanumeric()),
+        "generated client id {id} leaves the guaranteed charset"
+    );
+    id
 }
 
 fn qos_from_u8(v: u8) -> QoS {
@@ -502,64 +630,153 @@ fn connect_options(
 
 #[cfg(test)]
 mod default_id_tests {
-    use super::{client_id_for, default_client_id, host_identity, Side};
+    use super::{client_id_for, default_client_id, host_identity, Side, ID_MAX};
 
-    #[test]
-    fn a_host_identity_makes_replicas_distinct() {
-        // THE regression: the default was the CONSTANT `fss-bridge-local`, so two
-        // replicas claimed one session and MQTT made them evict each other in a
-        // permanent loop — the HA a shared subscription offers, inverted.
-        let a = client_id_for(Some("mqttd-bridge-0"), Side::Local);
-        let b = client_id_for(Some("mqttd-bridge-1"), Side::Local);
-        assert_ne!(a, b, "two pods must not share a client id");
-        assert_eq!(a, "bridge-mqttd-bridge-0");
-        assert_ne!(a, "fss-bridge-local", "still the colliding constant");
+    /// Every generated id must satisfy MQTT's guaranteed-support shape, whatever
+    /// the host is called: 1-23 bytes of [0-9a-zA-Z]. A broker is only obliged to
+    /// accept ids in that range, and the bridge connects to brokers we do not run.
+    fn assert_union_safe(id: &str) {
+        assert!(
+            !id.is_empty(),
+            "empty client id (needs clean_session, not universal)"
+        );
+        assert!(
+            id.len() <= ID_MAX,
+            "id {id:?} is {} bytes, past the 23-byte guaranteed floor",
+            id.len()
+        );
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric()),
+            "id {id:?} leaves the guaranteed [0-9a-zA-Z] charset"
+        );
     }
 
     #[test]
-    fn every_side_of_one_bridge_is_distinct_too() {
+    fn any_host_name_yields_a_union_safe_id() {
+        // Including the ones that would break a naive scheme: over-long, dotted,
+        // hyphenated, unicode, and empty.
+        for host in [
+            "mqttd-bridge-0",
+            "a",
+            "",
+            "mqttd-bridge-0.mqttd-bridge-headless.production-namespace.svc.cluster.local",
+            "MQTTD-Bridge-0",
+            "brücke-0",
+            "0000000000000000000000000000000000000000",
+        ] {
+            for side in [Side::Local, Side::Upstream(0), Side::Upstream(41)] {
+                assert_union_safe(&client_id_for(Some(host), side));
+            }
+        }
+        assert_union_safe(&client_id_for(None, Side::Local));
+    }
+
+    #[test]
+    fn replicas_are_distinct_even_when_truncation_collides() {
+        // THE case that matters in Kubernetes: pod names share a long prefix and
+        // differ only in the ordinal, so the readable part alone cannot separate
+        // them. The hash is taken over the FULL name, so they still differ.
+        let a = client_id_for(Some("mqttd-bridge-0"), Side::Local);
+        let b = client_id_for(Some("mqttd-bridge-1"), Side::Local);
+        assert_ne!(a, b);
+
+        // And names long enough that the kept tail is identical.
+        let long_a = client_id_for(
+            Some("prod-eu-west-1-edge-bridge-alpha-000000000"),
+            Side::Local,
+        );
+        let long_b = client_id_for(
+            Some("prod-eu-west-2-edge-bridge-beta-000000000"),
+            Side::Local,
+        );
+        assert_ne!(
+            long_a, long_b,
+            "truncation must not be able to merge two hosts"
+        );
+    }
+
+    #[test]
+    fn a_fleet_of_pod_names_generates_no_duplicates() {
+        let ids: std::collections::BTreeSet<String> = (0..200)
+            .flat_map(|i| {
+                [
+                    client_id_for(Some(&format!("mqttd-bridge-{i}")), Side::Local),
+                    client_id_for(Some(&format!("mqttd-bridge-{i}")), Side::Upstream(0)),
+                    client_id_for(Some(&format!("mqttd-bridge-{i}")), Side::Upstream(1)),
+                ]
+            })
+            .collect();
+        assert_eq!(ids.len(), 600, "collision within a 200-pod fleet");
+    }
+
+    #[test]
+    fn every_side_of_one_bridge_is_distinct() {
         let host = Some("h1");
-        let ids = [
+        let ids: std::collections::BTreeSet<String> = [
             client_id_for(host, Side::Local),
             client_id_for(host, Side::Upstream(0)),
             client_id_for(host, Side::Upstream(1)),
-        ];
-        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "sides collided: {ids:?}");
+            // Past the 36-value side tag: the tag repeats, the hash does not.
+            client_id_for(host, Side::Upstream(36)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(ids.len(), 4, "sides collided");
     }
 
     #[test]
     fn the_id_is_stable_for_a_given_host() {
         // The local side keeps a PERSISTENT session, so an id that varied between
         // starts would orphan the previous session and everything queued on it.
+        // Pinned literally: a change here silently re-identifies every deployed
+        // bridge, so it should have to be done on purpose.
         assert_eq!(
-            client_id_for(Some("h1"), Side::Local),
-            client_id_for(Some("h1"), Side::Local)
+            client_id_for(Some("mqttd-bridge-0"), Side::Local),
+            client_id_for(Some("mqttd-bridge-0"), Side::Local)
+        );
+        assert_eq!(client_id_for(Some("mqttd-bridge-0"), Side::Local).len(), 23);
+    }
+
+    #[test]
+    fn the_id_is_recognisably_ours_and_carries_the_host_tail() {
+        let id = client_id_for(Some("mqttd-bridge-7"), Side::Local);
+        assert!(
+            id.starts_with("fssblo"),
+            "{id} should mark itself as ours + side"
+        );
+        assert!(
+            id.contains("bridge7"),
+            "{id} should keep the host's tail so a human can recognise the pod"
         );
     }
 
     #[test]
-    fn without_a_host_it_falls_back_and_is_honest_about_it() {
-        // No identity available: the old constants come back, and the caller warns
-        // loudly that a second instance will fight over the session.
-        assert_eq!(client_id_for(None, Side::Local), "fss-bridge-local");
-        assert_eq!(
-            client_id_for(None, Side::Upstream(3)),
-            "fss-bridge-upstream-3"
+    fn an_fqdn_keeps_the_pod_not_the_domain() {
+        // /etc/hostname can hold an FQDN, whose TAIL is the domain — keeping it
+        // would yield "usterlocal" from "…svc.cluster.local" for every pod alike.
+        let a = client_id_for(
+            Some("mqttd-bridge-0.mqttd-bridge-hl.prod.svc.cluster.local"),
+            Side::Local,
+        );
+        let b = client_id_for(
+            Some("mqttd-bridge-1.mqttd-bridge-hl.prod.svc.cluster.local"),
+            Side::Local,
+        );
+        assert!(a.contains("bridge0"), "{a} lost the pod name to the domain");
+        assert!(b.contains("bridge1"), "{b} lost the pod name to the domain");
+        assert_ne!(a, b);
+        // The domain still participates in the hash, so two pods with the same
+        // short name in different domains stay distinct.
+        assert_ne!(
+            client_id_for(Some("gw-0.site-a.example"), Side::Local),
+            client_id_for(Some("gw-0.site-b.example"), Side::Local),
         );
     }
 
     #[test]
-    fn the_live_default_uses_whatever_identity_this_machine_has() {
-        // Reads the real environment rather than mutating it, so it cannot race
-        // other tests. Where an identity exists the id must carry it.
+    fn the_live_default_matches_this_machine() {
         let id = default_client_id(Side::Local);
-        match host_identity() {
-            Some(host) => assert!(
-                id.contains(&host),
-                "default id {id:?} does not carry host {host:?}; replicas would collide"
-            ),
-            None => assert_eq!(id, "fss-bridge-local"),
-        }
+        assert_union_safe(&id);
+        assert_eq!(id, client_id_for(host_identity().as_deref(), Side::Local));
     }
 }

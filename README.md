@@ -311,9 +311,10 @@ helm upgrade --install mqttd deploy/helm/mqttd --set bridge.enabled=true
 It renders a StatefulSet, not a Deployment, for two reasons: the spool is
 per-replica state, and every replica needs its **own MQTT client id** — replicas
 sharing one take over each other's session instead of forming the HA pair a
-`share_group` promises. An unset `client_id` defaults to `bridge-<hostname>`, so
-that is already per-pod; the chart also lets you write `__POD_NAME__` into one
-explicitly.
+`share_group` promises. An unset `client_id` is generated per instance in MQTT's
+guaranteed-support shape (≤23 bytes, alphanumeric — accepted by any broker), so it
+is already per-pod; the chart also lets you write `__POD_NAME__` into one
+explicitly. See [docs/BRIDGE.md](docs/BRIDGE.md).
 
 Standalone and HA topologies, with schematics and what HA does *not* cover:
 [**docs/BRIDGE.md**](docs/BRIDGE.md).

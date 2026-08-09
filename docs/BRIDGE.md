@@ -53,7 +53,7 @@ own restart without a gap.
 share_group = ""              # no group: this instance takes the whole stream
 [local]
 url = "mqttd:1883"
-# client_id is optional: unset defaults to bridge-<hostname>
+# client_id is optional: unset generates a per-instance, 23-byte-safe id
 ```
 
 **What you get:** the crossing works, and an upstream outage is buffered in the
@@ -134,11 +134,40 @@ MQTT identifies a session by client id, and requires the broker to disconnect th
 existing client when a new one connects with the same id. mqttd implements that
 (`session_takeover_publishes_will`), as it must.
 
-**The default is now safe:** an unset `client_id` derives from the host name —
-`bridge-<hostname>` — which Kubernetes sets to the pod name, so replicas are
-distinct without configuration and each id is stable across restarts (the local
-side keeps a persistent session, so an id that changed on each start would orphan
-it). Two replicas with no `client_id` at all now run correctly.
+**The default is now safe.** An unset `client_id` is generated per instance, in
+MQTT's *guaranteed-support* shape — at most 23 bytes of `[0-9a-zA-Z]`, which every
+broker must accept:
+
+```
+  fssb   lo    ttdbridge0   cuv2nyb        →  fssblottdbridge0cuv2nyb
+  ────   ──    ──────────   ───────
+   4      2        10          7
+  ours   side   host tail     hash
+```
+
+- `fssb` marks it as ours in someone else's broker logs.
+- `lo` / `u0`…`uz` is the side (local, or upstream *n*).
+- The host tail keeps the recognisable part of the pod name — the **first DNS
+  label**, so an FQDN yields `bridge0`, not `usterlocal` from `…svc.cluster.local`.
+- The hash is taken over the **full** host name and side, so truncation can never
+  merge two hosts.
+
+Kubernetes sets the hostname to the pod name, so replicas are distinct with no
+configuration, and each id is stable across restarts (the local side keeps a
+persistent session, so an id that changed on each start would orphan it). The
+mapping is logged once at startup, so the opaque suffix is still traceable:
+
+```
+generated MQTT client id … client_id=fssblottdbridge0cuv2nyb host=mqttd-bridge-0 side=Local
+```
+
+**Why the strict shape on every side, not just upstreams?** A broker need only
+support ids of 1–23 alphanumeric bytes; ours accepts anything. But the `local`
+endpoint is just a URL a user configures — nothing guarantees it points at this
+broker. "The near side is permissive" is an assumption the code cannot check, so
+it does not make one.
+
+Two replicas with no `client_id` at all now run correctly.
 
 It used to be the **constant** `fss-bridge-local`, and setting the same id
 explicitly on two replicas still reproduces the failure exactly:
