@@ -239,6 +239,16 @@ pub struct ConnPolicy {
     pub audit: Arc<dyn AuditSink>,
     /// Session relocation context; `None` outside a cluster (serve locally).
     pub proxy: Option<ProxyContext>,
+    /// This node's id, when it has one.
+    ///
+    /// Deliberately its **own** field rather than read off [`ProxyContext`]. The
+    /// first version of the assigned-client-id fix took it from there, since a
+    /// proxy context happens to carry one — but that ties "what am I called" to
+    /// "is session relocation configured", two things that are equal today and
+    /// need not stay that way. A deployment that clustered without a proxy context
+    /// would have silently gone back to handing out colliding ids, which is the
+    /// class of unstated precondition this codebase keeps paying for.
+    pub node: Option<NodeId>,
     /// The session store, shared with the hub, backing the **durable** QoS-2 inbound
     /// dedup window (ADR 0007 §5): `record_received` quorum-replicates the packet id
     /// before PUBREC, so exactly-once survives a failover. `None` falls back to a
@@ -313,6 +323,7 @@ pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
         identity_source: IdentitySource::default(),
         audit: Arc::new(AuditLog::new()),
         proxy: None,
+        node: None,
         store: None,
         connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         enhanced: None,
@@ -511,7 +522,9 @@ where
     writer.set_version(connect.protocol);
 
     // Client-id validation may already reject the CONNECT.
-    let Some(client) = validate_connect(&mut writer, &connect).await? else {
+    let Some((client, server_assigned_id)) =
+        validate_connect(&mut writer, &connect, policy.node.as_ref()).await?
+    else {
         return Ok(());
     };
 
@@ -643,8 +656,19 @@ where
     };
     // Build the v5 CONNACK properties (Topic Alias Maximum, Receive Maximum) and the
     // per-connection alias maps (ADR 0011, ADR 0012).
-    let (connack_props, mut inbound_aliases, mut outbound_aliases) =
+    let (mut connack_props, mut inbound_aliases, mut outbound_aliases) =
         negotiate_v5_properties(connect.protocol, &connect.properties);
+    // MQTT 5.0 §3.2.2.3.7: a client that connects with a zero-length id MUST be told
+    // the id the server picked — otherwise it cannot correlate its own session, and
+    // anything it reads back (audit, `%c` ACL substitution, our logs) names an
+    // identity it has never seen. v3.1.1 has no property to carry it.
+    if server_assigned_id && connect.protocol == ProtocolVersion::V5 {
+        connack_props
+            .0
+            .push(mqtt_codec::Property::AssignedClientIdentifier(
+                client.0.clone(),
+            ));
+    }
     writer
         .send(&Packet::ConnAck(ConnAck {
             properties: connack_props,
@@ -862,15 +886,50 @@ fn connack_code(v3: u8, version: ProtocolVersion) -> u8 {
 /// session (the server assigns an id); pairing it with a persistent session is
 /// rejected per spec. The protocol version itself is already negotiated (v3.1.1 and
 /// v5 are both accepted; an unknown level is refused at the codec).
+/// Build the id for a client that sent none.
+///
+/// `node` is this node's id when clustered (`None` when not). It is part of the id
+/// because [`AUTO_ID`] is **per process**: every node started its counter at 1, so
+/// every node's first zero-id client was `auto-1`, and two unrelated clients on two
+/// nodes ended up sharing one session identity — which is exactly what the cluster
+/// keys session ownership by. Unclustered there is one process, so the counter
+/// alone is already unique among live clients.
+///
+/// Uniqueness only has to hold among *live* clients: a zero-length id is legal only
+/// with `clean_session`, so nothing is ever persisted under one of these.
+fn assigned_client_id(node: Option<&NodeId>, n: u64) -> String {
+    match node {
+        Some(node) => format!("auto-{}-{n}", node.0),
+        None => format!("auto-{n}"),
+    }
+}
+
+/// Validate the CONNECT's client id, assigning one when the client sent none.
+///
+/// Returns the id and whether the **server** assigned it — the caller needs that
+/// to satisfy MQTT 5.0 §3.2.2.3.7, which requires an assigned id to be handed back
+/// in the CONNACK.
+///
+/// `node` is this node's id when clustered. It is part of an assigned id because
+/// the counter behind it is **per process**: two nodes each started at 1 and each
+/// handed out `auto-1`, so two unrelated clients on different nodes ended up
+/// sharing one session identity — and session ownership across the cluster is keyed
+/// by exactly that. Uniqueness among *live* clients is all that is required here
+/// (an empty id is only legal with `clean_session`, so nothing is persisted under
+/// it), and node id + monotonic counter gives that: the counter is unique within a
+/// node's lifetime, and the node id is unique within the cluster.
 async fn validate_connect<W>(
     writer: &mut FrameWriter<W>,
     connect: &Connect,
-) -> Result<Option<ClientId>, NetError>
+    node: Option<&NodeId>,
+) -> Result<Option<(ClientId, bool)>, NetError>
 where
     W: AsyncWrite + Unpin,
 {
     if connect.client_id.is_empty() {
         if !connect.clean_session {
+            // A zero-length id has no session to resume, so a persistent session
+            // cannot be built on one — the spec's Identifier Rejected case.
             writer
                 .send(&Packet::ConnAck(ConnAck {
                     properties: mqtt_codec::Properties::new(),
@@ -880,12 +939,10 @@ where
                 .await?;
             return Ok(None);
         }
-        return Ok(Some(ClientId(format!(
-            "auto-{}",
-            AUTO_ID.fetch_add(1, Ordering::Relaxed)
-        ))));
+        let n = AUTO_ID.fetch_add(1, Ordering::Relaxed);
+        return Ok(Some((ClientId(assigned_client_id(node, n)), true)));
     }
-    Ok(Some(ClientId(connect.client_id.clone())))
+    Ok(Some((ClientId(connect.client_id.clone()), false)))
 }
 
 /// The authentication gate: run the MQTT 5.0 enhanced (AUTH) exchange when the
@@ -1864,6 +1921,45 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use super::{assigned_client_id, NodeId};
+
+    /// Two nodes must never hand out the same server-assigned id.
+    ///
+    /// `AUTO_ID` is per PROCESS, so every node's counter starts at 1 and every
+    /// node's first zero-id client was called `auto-1`. Session ownership across
+    /// the cluster is keyed by client id, so two unrelated clients on two nodes
+    /// were one session as far as the cluster was concerned.
+    ///
+    /// This is asserted on the naming rule rather than end to end on purpose: two
+    /// "nodes" in one test process SHARE the counter, so they draw different values
+    /// and their ids differ even with the bug present. An in-process test of this
+    /// would pass either way — it would prove nothing. What guarantees it across
+    /// real processes is that the id carries the node's own id, which ADR 0016 makes
+    /// unique within a cluster by binding it to the peer certificate's CN.
+    #[test]
+    fn an_assigned_id_is_unique_across_nodes_not_just_within_one() {
+        let a = assigned_client_id(Some(&NodeId("node-a".into())), 1);
+        let b = assigned_client_id(Some(&NodeId("node-b".into())), 1);
+        assert_ne!(
+            a, b,
+            "both nodes' first client got {a} — one shared session identity"
+        );
+        assert!(a.contains("node-a"), "{a} must carry its node id");
+
+        // Within one node the counter still separates clients.
+        assert_ne!(
+            assigned_client_id(Some(&NodeId("node-a".into())), 1),
+            assigned_client_id(Some(&NodeId("node-a".into())), 2)
+        );
+    }
+
+    /// Unclustered there is a single process, so the counter alone is unique and
+    /// the id stays short.
+    #[test]
+    fn an_unclustered_assigned_id_needs_no_node_qualifier() {
+        assert_eq!(assigned_client_id(None, 7), "auto-7");
+    }
+
     use super::{
         auth_handle, authz_handle, handle_stream, jwt_password_str, wire_limits, ConnPolicy,
         DEFAULT_CONNECT_TIMEOUT,
@@ -1915,6 +2011,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -1949,6 +2046,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2062,6 +2160,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2114,6 +2213,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -2215,6 +2315,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             shutdown: None,
@@ -2459,6 +2560,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: audit.clone(),
             proxy: None,
+            node: None,
             store: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,
@@ -3111,6 +3213,7 @@ mod tests {
             identity_source: mqtt_auth::mtls::IdentitySource::default(),
             audit: Arc::new(mqtt_observability::AuditLog::new()),
             proxy: None,
+            node: None,
             store: Some(store),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             enhanced: None,

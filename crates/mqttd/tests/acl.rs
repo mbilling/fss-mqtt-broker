@@ -49,6 +49,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
                 identity_source: mqtt_auth::mtls::IdentitySource::default(),
                 audit: Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
+                node: None,
                 store: None,
                 connect_timeout: std::time::Duration::from_secs(10),
                 shutdown: None,

@@ -298,6 +298,7 @@ async fn start_proxy_node(
             placement: placement.clone(),
             connector: None, // plaintext mesh
         }),
+        node: Some(node_id.clone()),
         store: None,
         connect_timeout: std::time::Duration::from_secs(10),
         shutdown: None,

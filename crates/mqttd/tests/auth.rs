@@ -41,6 +41,7 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
                 identity_source: mqtt_auth::mtls::IdentitySource::default(),
                 audit: std::sync::Arc::new(mqtt_observability::AuditLog::new()),
                 proxy: None,
+                node: None,
                 store: None,
                 connect_timeout: std::time::Duration::from_secs(10),
                 shutdown: None,

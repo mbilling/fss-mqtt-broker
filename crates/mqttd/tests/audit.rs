@@ -42,6 +42,7 @@ async fn start_node(
         identity_source: mqtt_auth::mtls::IdentitySource::default(),
         audit: audit.clone(),
         proxy: None,
+        node: None,
         store: None,
         connect_timeout: std::time::Duration::from_secs(10),
         shutdown: None,
