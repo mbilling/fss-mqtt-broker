@@ -20,7 +20,8 @@ governance (connection caps, per-client quotas, publish-rate limits, bounded
 queues), and a continuous-assurance program (out-of-process fault/upgrade
 harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
 performance baselines, and two independent foreign-client conformance oracles)
-all ship. **No tagged release has been cut yet**, and the known gaps are listed
+all ship. **v0.9.0 is released** — signed, reproducible, SBOM-attested — and the
+known gaps are listed
 in [**Limitations**](#limitations) rather than left to be discovered — the
 largest are that memory is not bounded in bytes (only by message counts), the
 Kubernetes operator is not packaged for installation, and the horizontal
@@ -354,11 +355,8 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 - **Subscription digests (bloom)** for sub-linear fan-out.
 - MQTT 5 **Server-Reference redirect** for v5 clients that opt into following it
   (the session relay remains the universal path meanwhile — ADR 0005 P3).
-- **The first non-prerelease tag.** The signed, reproducible, SBOM-attested
-  pipeline ([ADR 0045](docs/adr/0045-release-engineering-and-distribution.md)) is
-  in place and **has produced a real release**: `v0.9.0-rc`, whose signatures,
-  SBOM, image and provenance all verify. What remains is cutting the
-  non-prerelease tag — see [Install](#install) and [RELEASING.md](RELEASING.md).
+- **Production users.** `v0.9.0` is cut and every artifact verifies, but nobody is
+  running this in anger yet — see [Limitations](#limitations).
 
 ## How it compares
 
@@ -395,8 +393,8 @@ be found. Each is tracked; none is a silent surprise.
   shared-nothing with no coordinator on the publish hot path, but measuring what
   that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
   as design intent.
-- **No production track record.** No tagged release has been cut, and nobody is
-  running this in anger yet.
+- **No production track record.** `v0.9.0` is released and verifiable, but nobody
+  is running this in anger yet — there is no operational history behind it.
 
 ## Supported Rust, platforms, and stability
 
@@ -480,7 +478,7 @@ build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook
 ```sh
 # Container image — fully-static musl binary on distroless/static, non-root,
 # multi-arch (linux/amd64 + linux/arm64), nothing but the broker and a CA bundle:
-docker run --rm ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc --check-config
+docker run --rm ghcr.io/mbilling/fss-mqtt-broker:latest --check-config
 # → config OK: defaults + MQTTD_* env overlay validates (no config file set)
 #
 # Note: there is no `--version` flag. mqttd recognises only `--check-config` and
@@ -489,7 +487,7 @@ docker run --rm ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc --check-config
 # is logged at startup: `starting mqttd version="0.9.0"`.
 
 # Verify the image signature before trusting it:
-cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc \
+cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0 \
   --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
@@ -499,7 +497,7 @@ docker run -d --name mqttd \
   -v mqttd-data:/var/lib/mqttd -p 1883:1883 -p 8080:8080 \
   -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
   -e MQTTD_DATA_DIR=/var/lib/mqttd -e MQTTD_HEALTH_BIND=0.0.0.0:8080 \
-  ghcr.io/mbilling/fss-mqtt-broker:0.9.0-rc
+  ghcr.io/mbilling/fss-mqtt-broker:latest
 # (plaintext + anonymous for a first look only — see the secured quickstart below)
 
 # Or download a binary from the GitHub Release and verify + reproduce it — see RELEASING.md.
@@ -511,13 +509,12 @@ docker run -d --name mqttd \
 > the env var and a volume. The image runs non-root under a read-only root
 > filesystem with every capability dropped.
 
-> **What exists today:** a **`v0.9.0-rc` pre-release** — both musl binaries with
-> signatures and certificates, a signed CycloneDX SBOM, a multi-arch image, and
-> SLSA provenance. Every one of those has been verified end to end against the
-> published artifacts, so this is a real thing you can pull and check, not a
-> pipeline that merely exists. **No non-prerelease tag has been cut yet**, so
-> there is no `:latest`; pin the version, or build from source
-> ([Build & test](#build--test)).
+> **What exists today: `v0.9.0`** — both musl binaries with signatures and
+> certificates, a signed CycloneDX SBOM, a multi-arch image, and SLSA provenance,
+> plus the same set for `mqtt-bridge`. Every one has been verified end to end
+> against the published artifacts, so this is a real thing you can pull and check,
+> not a pipeline that merely exists. `:latest` tracks the newest non-prerelease;
+> pin the version for reproducibility.
 
 ## Running
 

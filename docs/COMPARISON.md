@@ -35,7 +35,7 @@ production binaries.
 
 **Do not choose mqttd (yet) if** you need a built-in dashboard, a rule engine, MQTT-SN
 or CoAP gateways, an HTTP management API — or a broker with a production track record:
-mqttd currently has **no released version and no production users**. What it offers
+mqttd has a released version (`v0.9.0`) but **no production users**. What it offers
 against that last, honestly disqualifying-for-some fact is verifiability: reproducible
 builds, signed artifacts, SBOM, continuous fuzzing, and conformance CI against foreign
 clients — trust that can be checked instead of assumed.
@@ -147,11 +147,11 @@ Packet-size enforcement is compared in the Protocol table above.
 ## Footprint & maturity — where we lose
 
 - **Footprint:** NanoMQ (sub-MB binary claims, ~4.6 MB image) and Mosquitto (a few-MB
-  single-threaded C daemon) beat everyone; mqttd's distroless image is ~27 MB; EMQX and
+  single-threaded C daemon) beat everyone; mqttd's distroless image is ~14 MB; EMQX and
   VerneMQ carry a BEAM runtime. If kilobytes decide, mqttd is not the answer.
 - **Maturity:** Mosquitto has been ubiquitous since ~2010; EMQX runs enormous fleets;
-  VerneMQ has a decade of production; NanoMQ is LF Edge-backed. **mqttd has no released
-  version and no production users.** The mitigations are verifiability (reproduce the
+  VerneMQ has a decade of production; NanoMQ is LF Edge-backed. **mqttd has a
+  release (`v0.9.0`) but no operational track record and no production users.** The mitigations are verifiability (reproduce the
   build, check the signature, read the SBOM), two foreign-client conformance oracles in
   CI, and a continuous-assurance program (fuzzing, soak, fault/upgrade harnesses) — but
   a mitigations list is not a track record, and pretending otherwise would break this
