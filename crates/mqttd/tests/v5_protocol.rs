@@ -492,3 +492,63 @@ async fn v5_enhanced_auth_then_reauthentication() {
         .await;
     assert_eq!(c.expect_auth().await.reason, 0x00, "re-auth succeeded");
 }
+
+// --- server-assigned client identifier ---------------------------------------
+
+fn assigned_client_id(props: &Properties) -> Option<String> {
+    find(props, |p| match p {
+        Property::AssignedClientIdentifier(v) => Some(v.clone()),
+        _ => None,
+    })
+}
+
+/// MQTT 5.0 §3.2.2.3.7: a client that connects with a zero-length id MUST be told
+/// which id the server picked.
+///
+/// The broker assigned one and never sent it back, so a v5 client could not learn
+/// its own identity — the one that shows up in our audit log, in `%c` ACL
+/// substitution, and in every message it publishes.
+#[tokio::test]
+async fn a_zero_length_client_id_is_assigned_and_returned() {
+    let addr = start_broker().await;
+    let (_c, ack) = Client::connect_v5(addr, "", true, vec![]).await;
+    assert_eq!(ack.code, 0, "a zero-length id with clean start is legal");
+
+    let assigned = assigned_client_id(&ack.properties)
+        .expect("CONNACK must carry the Assigned Client Identifier (MQTT 5.0 §3.2.2.3.7)");
+    assert!(!assigned.is_empty(), "assigned id must not itself be empty");
+
+    // Two such clients must not be handed the same identity.
+    let (_c2, ack2) = Client::connect_v5(addr, "", true, vec![]).await;
+    let assigned2 = assigned_client_id(&ack2.properties).expect("second assignment");
+    assert_ne!(
+        assigned, assigned2,
+        "two zero-id clients were given the same identity"
+    );
+}
+
+/// A client that supplies its own id must NOT be told a different one — the
+/// property is only for ids the server chose.
+#[tokio::test]
+async fn a_client_supplied_id_is_not_reassigned() {
+    let addr = start_broker().await;
+    let (_c, ack) = Client::connect_v5(addr, "i-chose-this", true, vec![]).await;
+    assert_eq!(ack.code, 0);
+    assert_eq!(
+        assigned_client_id(&ack.properties),
+        None,
+        "the server must not claim to have assigned an id the client supplied"
+    );
+}
+
+/// A zero-length id with `clean_start = false` has no session to resume, so it is
+/// refused rather than silently given a fresh one.
+#[tokio::test]
+async fn a_zero_length_id_without_clean_start_is_refused() {
+    let addr = start_broker().await;
+    let (_c, ack) = Client::connect_v5(addr, "", false, vec![]).await;
+    assert_ne!(
+        ack.code, 0,
+        "zero-length id + persistent session must be refused"
+    );
+}
