@@ -69,10 +69,13 @@ On session resume after a restart:
 ### 4. Measured before merge, in the existing harness
 
 The per-delivery cost is one additional durable write at allocation, one at PUBREC, one
-delete at PUBCOMP, on QoS 2 flows only. The bench lane that produced the QoS 2 baseline
-numbers runs before/after, and the delta is recorded in the delivery document. This ADR
-is contingent on that delta being defensible; if it is not, Decision 2's fallback becomes
-the decision.
+delete at PUBCOMP, on QoS 2 flows only. The delta is recorded in the delivery
+document (T5). **Measured 2026-08-11**: the QoS 2 persistent-durable lane roughly doubles
+in wall time (dev-grade, single machine), the QoS 1 control lane is unchanged, and the
+verdict is **defensible — Decision 2 stands**. One correction to the original plan here:
+the comparative bench lane runs durable-off with clean sessions, where this code never
+executes, so measuring there would have reported a zero delta without running the code. A
+dedicated harness exercising exactly the changed path was used instead.
 
 ### 5. Schema
 
