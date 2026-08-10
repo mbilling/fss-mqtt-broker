@@ -968,6 +968,41 @@ helm install mqttd deploy/helm/mqttd \
 Validate a rendered config without a cluster: `mqttd --check-config --config <file>`. See
 [`docs/mqttd.example.toml`](docs/mqttd.example.toml) for every setting.
 
+### Without Kubernetes (Compose, systemd)
+
+Kubernetes is not required, and the non-Kubernetes path is a shipped artifact rather than
+prose. [`deploy/`](deploy) has all four packagings side by side; the two that need no
+cluster:
+
+```sh
+cd deploy/compose && ./bootstrap.sh && docker compose up -d   # three nodes, one host
+```
+
+```sh
+sudo install -m 0644 deploy/systemd/mqttd.service /etc/systemd/system/
+sudo install -m 0640 deploy/systemd/mqttd.env.example /etc/mqttd/mqttd.env
+sudo systemctl enable --now mqttd                              # bare metal / VMs
+```
+
+Both are configured exactly as the chart is (`MQTTD_*`, secrets by path) and are secure by
+default: authentication on, deny-by-default ACLs, an authenticated gossip mesh,
+majority-aware readiness, a memory bound. The systemd unit is hardened
+(`ProtectSystem=strict`, empty `CapabilityBoundingSet`, `SystemCallFilter=@system-service`).
+
+Two things Kubernetes was doing for you become yours:
+
+- **Seed lists and the founder rule.** Exactly one node bootstraps with an *empty* seed
+  list — that is what makes it found the cluster — and must be given seeds afterwards.
+  Both READMEs and the annotated env file say where this bites.
+- **Health checks.** `mqttd --probe /readyz` (or `/livez`) asks this node's own health
+  endpoint and exits non-zero on anything but `200`, because the image is distroless and
+  Compose/systemd health is a *command*, not an HTTP GET. `/livez` passing while `/readyz`
+  fails is a minority node: pull it from the load balancer, do not restart it.
+
+`scripts/deploy-smoke.sh` boots three real nodes from the shipped env file on every CI run
+and proves the security posture, cross-node routing, an acked QoS 1 message surviving
+`SIGKILL` of the node that accepted it, and the readiness floor.
+
 ## Resizing the cluster
 
 Grow, shrink, and replace are first-class, **data-safe** operations on a running

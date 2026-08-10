@@ -196,3 +196,58 @@ Found while testing an unrelated hypothesis about full-fleet restarts — which,
 was refuted: a rolling restart or a delete-all recovers on its own with identity and lease
 group intact. The danger was never the restart; it was the volume deletion that scaling to
 zero used to trigger.
+
+## Amendment (2026-08-10): the same deployment, off Kubernetes (T9)
+
+This record decided how mqttd is deployed *on Kubernetes*, and stopped there. What that
+left, in practice, was a project that looked deployable only on Kubernetes: the chart was
+the one artifact a user could copy, the operator is not installable (T8), and everything
+else was prose in `OPERATIONS.md` — accurate prose, with nothing behind it. Every outside
+reviewer read it the same way, and it is not what the broker actually requires: it is a
+single static binary configured entirely by environment.
+
+**`deploy/compose/` and `deploy/systemd/` now ship**, configured identically to the chart
+(`MQTTD_*` environment, secrets by path) and secure by default: authentication on,
+deny-by-default topic ACLs, an authenticated gossip mesh, majority-aware readiness, and a
+memory bound — because the broker still has no total-memory knob, so the cgroup limit is
+the bound (ADR 0041 T8 remains open, and `docs/SIZING.md` says so).
+
+### What Kubernetes was doing for us that these cannot
+
+**Seed lists and the founder rule.** The chart derives node identity, seeds and the
+readiness floor from StatefulSet ordinals. Off Kubernetes the operator maintains them.
+Exactly one node bootstraps with an *empty* seed list — that is what makes it found the
+lease group — and it must be given seeds afterwards, or a lost data directory makes it
+found a second cluster. This is stated in both READMEs and in the annotated env file.
+The broker still contains the failure (a re-founder self-quarantines, ADR 0054), but
+containment is the backstop, not the plan.
+
+**Health checks.** Kubernetes probes with `httpGet`, performed by the kubelet outside the
+container, so the image never needed an HTTP client. Compose, Podman and systemd all
+express health as a *command the container runs*, and the image is distroless — no shell,
+no `curl`. The only thing available to put in a healthcheck was `--check-config`, which
+validates configuration and says nothing about whether the broker is serving. That is a
+health check that cannot fail, and it is worse than none: the orchestrator reports a
+wedged broker as healthy.
+
+`mqttd --probe [/readyz|/livez]` closes that. It asks this node's own health endpoint over
+a hand-rolled HTTP/1.0 request — matching the equally hand-rolled server, and adding no
+dependency — and exits `0` only on `200`. The distinction it preserves is the one that
+matters operationally: a minority node answers `/livez` (do not restart me) while failing
+`/readyz` (do not send me clients), and only a probe that tells those apart can express
+"pull this from the load balancer but leave it running".
+
+### Tested, not merely written
+
+`scripts/deploy-smoke.sh` runs in CI. It **parses `deploy/systemd/mqttd.env.example`**
+rather than restating its values, so a setting renamed in the artifact and not in the test
+fails loudly instead of drifting; it boots three real nodes from those values; and it
+asserts the claims the artifacts make — anonymous refused, a `--hash-password` line
+authenticating, the ACL granting a device its own subtree and returning SUBACK `128` for
+another's, cross-node routing, an acknowledged `QoS` 1 message surviving `SIGKILL` of the
+node that accepted it, and a minority node reporting live-but-not-ready. `docker compose
+config` and `systemd-analyze verify` run when available and **skip loudly** when not.
+
+The `systemd-analyze` check earns its place for a specific reason: systemd *silently
+ignores* a directive it does not recognise, so a typo'd hardening option leaves a unit that
+looks hardened and is not.

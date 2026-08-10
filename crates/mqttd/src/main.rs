@@ -205,6 +205,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hash_password_cli();
     }
 
+    // `--probe [/readyz|/livez]` asks the RUNNING broker's health endpoint and exits with
+    // its verdict — the health check for orchestrators that run a command (Compose,
+    // Podman, systemd) rather than performing the HTTP GET themselves, on an image with
+    // no shell and no curl.
+    if std::env::args().skip(1).any(|a| a == "--probe") {
+        probe_health().await;
+    }
+
     // ADR 0047 T4: `--decommission` sends SIGUSR1 to the running broker (PID 1 in a distroless
     // container, which has no shell/`kill`) and waits for the drain + graceful shutdown to
     // complete — the Kubernetes `preStop` hook. Handled here so it never touches the network.
@@ -2457,6 +2465,110 @@ fn check_config() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// `mqttd --probe [/readyz|/livez] [--url <host:port>]`: ask this node's own health
+/// endpoint and exit `0` only on `200 OK`.
+///
+/// The image is distroless — no shell, no `curl`, no `wget`. Kubernetes does not care
+/// (an `httpGet` probe is performed by the kubelet, outside the container), but Docker
+/// Compose, Podman and systemd all express health as *a command the container or unit
+/// runs*, and there was no command to run. Compose files were therefore reduced to
+/// health checks that could not fail — which is worse than none, because the orchestrator
+/// then reports a wedged broker as healthy.
+///
+/// Defaults to `/readyz` on the configured `MQTTD_HEALTH_BIND`, with `0.0.0.0` rewritten
+/// to `127.0.0.1` (you cannot connect *to* a wildcard). Speaks just enough HTTP/1.0 to
+/// ask the question, using the same tokio runtime the broker already links.
+async fn probe_health() -> ! {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let idx = args.iter().position(|a| a == "--probe").unwrap_or(0);
+    // `--probe /livez` — a path argument, if the next token is one (not another flag).
+    let path = args
+        .get(idx + 1)
+        .filter(|a| a.starts_with('/'))
+        .cloned()
+        .unwrap_or_else(|| "/readyz".to_string());
+    let explicit_url = args
+        .iter()
+        .position(|a| a == "--url")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    let Some(target) = explicit_url.or_else(health_bind_from_config) else {
+        eprintln!(
+            "error: no health endpoint to probe. Set MQTTD_HEALTH_BIND (or pass \
+             --url <host:port>) — the broker serves /livez and /readyz there."
+        );
+        std::process::exit(2);
+    };
+    // A wildcard bind is not an address you can dial.
+    let target = target
+        .replace("0.0.0.0:", "127.0.0.1:")
+        .replace("[::]:", "[::1]:");
+
+    // `main` is already `#[tokio::main]`, so this awaits on the existing runtime rather
+    // than building a nested one (which panics).
+    match probe_once(&target, &path).await {
+        Ok(200) => {
+            println!("{path} 200");
+            std::process::exit(0);
+        }
+        Ok(status) => {
+            eprintln!("{path} {status} (not ready)");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{path} unreachable at {target}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The `MQTTD_HEALTH_BIND` the broker would use, read through the ordinary config path so
+/// a probe honours a config file exactly as the running broker does.
+fn health_bind_from_config() -> Option<String> {
+    let path = config_path().ok()?;
+    Config::load(path.as_deref())
+        .ok()?
+        .listeners
+        .health_bind
+        .clone()
+}
+
+/// One HTTP/1.0 `GET`, returning the numeric status. Hand-rolled to match the equally
+/// hand-rolled server (`health.rs`) and to add no dependency for a three-line request.
+async fn probe_once(target: &str, path: &str) -> std::io::Result<u16> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let connect = tokio::net::TcpStream::connect(target);
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), connect)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
+    // HTTP/1.0: the server closes when done, so there is no keep-alive framing to parse.
+    let request = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut response = Vec::new();
+    let read = stream.read_to_end(&mut response);
+    tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))??;
+
+    // "HTTP/1.1 200 OK" -> 200
+    let head = String::from_utf8_lossy(&response);
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "no HTTP status in the response: {:?}",
+                    head.chars().take(60).collect::<String>()
+                ),
+            )
+        })
 }
 
 /// `mqttd --hash-password [<username>]`: read a password from **stdin** and print the
