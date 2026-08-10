@@ -1,0 +1,25 @@
+# `mqttui` — a terminal UI for running this repository's demo, migration and test scripts
+# (ADR 0056). Deliberately its OWN workspace with its OWN lockfile: the broker's graph is
+# audited by cargo-deny/cargo-audit on every push and its lockfile is what the SBOM is cut
+# from, so nothing here may reach it.
+[workspace]
+
+[package]
+name = "mqttui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Run the mqttd demo, migration and test scripts from one place"
+repository = "https://github.com/mbilling/fss-mqtt-broker"
+
+[dependencies]
+# T1 is the manifest and a headless runner; ratatui arrives with T2. Keeping this list
+# near-empty is the point — the tool has to be worth installing before it is worth
+# decorating, and a manifest with no UI is already useful.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

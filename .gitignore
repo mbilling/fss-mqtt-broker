@@ -1,4 +1,6 @@
 /target
+# mqttui is a separate workspace (ADR 0056 §1), so it builds into its own target dir.
+/tools/mqttui/target
 **/target
 # cargo-fuzz artifacts
 **/fuzz/corpus

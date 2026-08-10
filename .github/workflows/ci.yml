@@ -98,6 +98,33 @@ jobs:
       - name: Deployment smoke (compose + systemd reference deployment)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/deploy-smoke.sh
 
+  mqttui:
+    name: mqttui (separate workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/mqttui
+      # ADR 0056 §1: mqttui is its OWN workspace with its OWN lockfile, so ratatui and
+      # crossterm can never enter the broker's dependency graph — the one cargo-deny and
+      # cargo-audit gate and the SBOM is cut from. It is built and linted here, and never
+      # from the root workspace.
+      - name: Format
+        run: cargo fmt --all --manifest-path tools/mqttui/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path tools/mqttui/Cargo.toml --all-targets -- -D warnings
+      # ADR 0056 §3: the completeness guard. A launcher that silently shows a subset of the
+      # scripts becomes the list people trust, so an executable — or merely present —
+      # script that nobody declared fails the build here.
+      - name: Test (includes the manifest completeness guard)
+        run: cargo test --manifest-path tools/mqttui/Cargo.toml
+      - name: The manifest covers every script
+        run: cargo run --quiet --manifest-path tools/mqttui/Cargo.toml -- --check
+
   supply-chain:
     name: supply-chain audit
     runs-on: ubuntu-latest
