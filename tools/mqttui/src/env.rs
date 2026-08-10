@@ -30,6 +30,38 @@ pub fn resolve(task: &Task, overrides: &BTreeMap<String, String>) -> Vec<(String
         .collect()
 }
 
+/// A task's command-line arguments, with `${VAR}` replaced by the resolved value.
+///
+/// An argument that references a variable with no value is **dropped entirely**, not passed
+/// as an empty string — an empty positional argument becomes a path of "" and produces an
+/// error about a file that was never named, which is a worse thing to hand someone than the
+/// script's own usage message.
+#[must_use]
+pub fn args(task: &Task, overrides: &BTreeMap<String, String>) -> Vec<String> {
+    let resolved: BTreeMap<&str, &str> = task
+        .env
+        .iter()
+        .map(|e| (e.name.as_str(), current(task, overrides, &e.name)))
+        .collect();
+
+    task.args
+        .iter()
+        .filter_map(|arg| {
+            let mut out = arg.clone();
+            for (name, value) in &resolved {
+                let needle = format!("${{{name}}}");
+                if out.contains(&needle) {
+                    if value.is_empty() {
+                        return None;
+                    }
+                    out = out.replace(&needle, value);
+                }
+            }
+            Some(out)
+        })
+        .collect()
+}
+
 /// The value a field should show: the user's override if there is one, else the default.
 #[must_use]
 pub fn current<'a>(task: &'a Task, overrides: &'a BTreeMap<String, String>, name: &str) -> &'a str {
@@ -62,6 +94,8 @@ mod tests {
             duration: String::new(),
             caution: None,
             hidden: false,
+            needs_checkout: false,
+            args: vec![],
             env: env
                 .into_iter()
                 .map(|(n, d)| EnvVar {
@@ -95,6 +129,31 @@ mod tests {
         let mut over = BTreeMap::new();
         over.insert("MQTTD_BIN".to_string(), String::new());
         assert!(resolve(&t, &over).is_empty());
+    }
+
+    /// A declared variable is not automatically an argument — this is the wiring that makes
+    /// "passed as the first argument" true rather than merely written down.
+    #[test]
+    fn arguments_substitute_the_resolved_value() {
+        let mut t = task_with(vec![("INPUT", "/etc/mosquitto/mosquitto.conf")]);
+        t.args = vec!["${INPUT}".to_string()];
+        assert_eq!(
+            args(&t, &BTreeMap::new()),
+            vec!["/etc/mosquitto/mosquitto.conf"]
+        );
+
+        let mut over = BTreeMap::new();
+        over.insert("INPUT".to_string(), "/tmp/mine.conf".to_string());
+        assert_eq!(args(&t, &over), vec!["/tmp/mine.conf"]);
+    }
+
+    /// An unset variable drops its argument rather than passing "" — otherwise the script
+    /// reports a problem with a file nobody named.
+    #[test]
+    fn an_unset_variable_drops_its_argument() {
+        let mut t = task_with(vec![("INPUT", "")]);
+        t.args = vec!["${INPUT}".to_string()];
+        assert!(args(&t, &BTreeMap::new()).is_empty());
     }
 
     /// What the UI shows must be what the run gets — one function, so they cannot drift.

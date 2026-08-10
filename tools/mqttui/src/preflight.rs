@@ -87,6 +87,8 @@ mod tests {
             duration: String::new(),
             caution: None,
             hidden: false,
+            needs_checkout: false,
+            args: vec![],
             env: Vec::new(),
         }
     }

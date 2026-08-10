@@ -20,6 +20,11 @@ toml = "0.8"
 # dependency graph — they live here, in this workspace's lockfile, and nowhere else.
 ratatui = "0.29"
 crossterm = "0.28"
+# T7: the demo, Kubernetes and compose examples travel INSIDE the binary — measured at
+# 161 KB compressed for the whole surface, so this costs nothing worth discussing and buys
+# offline operation, version-locking to the binary that was tested with it, and executing
+# nothing that arrived over the network.
+include_dir = "0.7"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

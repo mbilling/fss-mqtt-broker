@@ -15,6 +15,7 @@
 //! mqttui migrate mosquitto …    convert a Mosquitto deployment, no Python needed
 //! ```
 
+mod embedded;
 mod env;
 mod manifest;
 mod migrate;
@@ -27,6 +28,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use manifest::{Manifest, Task};
+
+/// Where a clone comes from. Printed rather than assumed, because the people who hit these
+/// messages are by definition running a binary with no repository next to it.
+const REPO: &str = "https://github.com/mbilling/fss-mqtt-broker";
 
 fn main() -> ExitCode {
     restore_sigpipe();
@@ -56,22 +61,34 @@ fn main() -> ExitCode {
         };
     }
 
-    // T7 will embed the examples so this works outside a checkout. Until then, say what is
-    // wrong and how to fix it rather than failing obscurely.
+    // In a checkout, everything is available from disk. Standalone, the embedded examples
+    // are unpacked and only what travelled can run (ADR 0056 T7) — and the difference is
+    // stated, never hidden behind a shorter list.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let Some(root) = manifest::find_repo_root(&cwd) else {
-        eprintln!(
-            "mqttui: not inside a checkout of fss-mqtt-broker.\n\n\
-             This build runs the repository's scripts, so it needs the repository:\n  \
-             git clone https://github.com/mbilling/fss-mqtt-broker\n\n\
-             (A standalone build that carries the demo and Kubernetes examples with it is \
-             ADR 0056 T7.)"
-        );
-        return ExitCode::from(2);
+    let source = match manifest::find_repo_root(&cwd) {
+        Some(root) => embedded::Source::Checkout(root),
+        None => match embedded::unpack() {
+            Ok(root) => embedded::Source::Embedded(root),
+            Err(e) => {
+                eprintln!("mqttui: could not unpack the bundled examples: {e}");
+                return ExitCode::from(2);
+            }
+        },
     };
+    let root = source.root().to_path_buf();
 
-    let manifest_path = manifest_path(&root);
-    let manifest = match Manifest::load(&manifest_path, &root) {
+    // The manifest ships with the binary, so it is the same list either way; what differs
+    // is which of its tasks this machine can actually run.
+    let loaded = match &source {
+        // In a checkout the on-disk manifest is authoritative and every script it names
+        // must exist — a manifest pointing at a missing script would fail at the worst
+        // possible moment.
+        embedded::Source::Checkout(_) => Manifest::load(&manifest_path(&root), &root),
+        // Standalone, repo-only tasks are legitimately absent; they are reported as
+        // unavailable, not treated as a broken manifest.
+        embedded::Source::Embedded(_) => Manifest::parse(manifest::EMBEDDED),
+    };
+    let manifest = match loaded {
         Ok(m) => m,
         Err(e) => {
             eprintln!("mqttui: {e}");
@@ -105,7 +122,7 @@ fn main() -> ExitCode {
 
     match args[0].as_str() {
         "--list" => {
-            list(&manifest, args.iter().any(|a| a == "--all"));
+            list(&manifest, args.iter().any(|a| a == "--all"), &source);
             ExitCode::SUCCESS
         }
         "--show" => match args.get(1).and_then(|id| manifest.get(id)) {
@@ -116,7 +133,7 @@ fn main() -> ExitCode {
             None => unknown_task(args.get(1), &manifest),
         },
         "--run" => match args.get(1).and_then(|id| manifest.get(id)) {
-            Some(task) => run(task, &root),
+            Some(task) => run(task, &root, &source),
             None => unknown_task(args.get(1), &manifest),
         },
         "--check" => check_complete(&manifest, &root),
@@ -229,14 +246,19 @@ fn unknown_task(id: Option<&String>, manifest: &Manifest) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn list(manifest: &Manifest, all: bool) {
+fn list(manifest: &Manifest, all: bool, source: &embedded::Source) {
     let groups = manifest.visible_by_group();
     let mut hidden_count = 0;
     for (group, tasks) in groups {
         println!("\n{group}");
         for t in tasks {
-            let missing = preflight::missing_required(t);
-            let mark = if missing.is_empty() { " " } else { "!" };
+            let mark = if !source.can_run(t) {
+                "-"
+            } else if preflight::missing_required(t).is_empty() {
+                " "
+            } else {
+                "!"
+            };
             println!("  {mark} {:<20} {}", t.id, t.name);
         }
     }
@@ -259,6 +281,24 @@ fn list(manifest: &Manifest, all: bool) {
     println!(
         "`!` marks a task whose required tools are missing — `mqttui --show <id>` says which."
     );
+    if matches!(source, embedded::Source::Embedded(_)) {
+        // Said plainly, because a shorter list with no explanation is the silent-subset
+        // failure the manifest exists to prevent — the user must know something is absent
+        // and why, not merely not see it.
+        let repo_only = manifest
+            .visible()
+            .filter(|t| source.availability(t) == embedded::Availability::NeedsCheckout)
+            .count();
+        let unbundled = manifest
+            .visible()
+            .filter(|t| source.availability(t) == embedded::Availability::NotBundled)
+            .count();
+        println!(
+            "`-` marks a task this standalone binary cannot run: {repo_only} operate on the\n\
+             repository itself, {unbundled} are not bundled. All of them run from a clone:\n  \
+               git clone {REPO}"
+        );
+    }
 }
 
 fn show(task: &Task, root: &Path) {
@@ -308,7 +348,28 @@ fn show(task: &Task, root: &Path) {
 /// `Ctrl-C` reaches the whole group, which is what makes each script's own `trap EXIT`
 /// run. The full teardown story, where the runner signals and then *verifies* what
 /// survived, is T6.
-fn run(task: &Task, root: &Path) -> ExitCode {
+fn run(task: &Task, root: &Path, source: &embedded::Source) -> ExitCode {
+    match source.availability(task) {
+        embedded::Availability::Yes => {}
+        embedded::Availability::NeedsCheckout => {
+            eprintln!(
+                "mqttui: '{}' operates on the repository itself — it builds it, or diffs its\n\
+                 rendered output — so no release of mqttui can carry it. Run it from a clone:\n  \
+                   git clone {REPO} && cd fss-mqtt-broker && mqttui --run {}",
+                task.id, task.id
+            );
+            return ExitCode::from(2);
+        }
+        embedded::Availability::NotBundled => {
+            eprintln!(
+                "mqttui: '{}' is not part of the bundled examples — its fixtures are far larger\n\
+                 than the examples this binary carries. It runs from a clone:\n  \
+                   git clone {REPO} && cd fss-mqtt-broker && mqttui --run {}",
+                task.id, task.id
+            );
+            return ExitCode::from(2);
+        }
+    }
     let missing = preflight::missing_required(task);
     if !missing.is_empty() {
         eprintln!(
@@ -341,13 +402,19 @@ fn run(task: &Task, root: &Path) -> ExitCode {
     } else {
         Command::new(&script)
     };
+    // Headless, the user's own environment IS the set of overrides — then resolved by the
+    // same function the UI uses, so what `--show` prints and what a run gets cannot drift.
+    let overrides: std::collections::BTreeMap<String, String> = task
+        .env
+        .iter()
+        .filter_map(|e| std::env::var(&e.name).ok().map(|v| (e.name.clone(), v)))
+        .collect();
+    cmd.args(env::args(task, &overrides));
     // Every script does `cd "$(dirname "$0")/.."`, so the repository root is the only
     // working directory they are written for.
     cmd.current_dir(root);
-    for e in &task.env {
-        if !e.default.is_empty() && std::env::var_os(&e.name).is_none() {
-            cmd.env(&e.name, &e.default);
-        }
+    for (k, v) in env::resolve(task, &overrides) {
+        cmd.env(k, v);
     }
 
     eprintln!("mqttui: running {} ({})\n", task.id, task.script);
