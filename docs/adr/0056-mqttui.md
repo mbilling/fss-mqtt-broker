@@ -91,16 +91,54 @@ repository — the README's ADR count drifted three behind before anyone noticed
 directions (`gen-status.py --check`), and a compose health check that could not fail
 shipped in the reference deployment (ADR 0047 T9). The guard is the feature.
 
-### 4. Cancellation signals the process group
+### 4. Teardown is signal-the-group, wait, verify, report — not a promise of no orphans
 
 Every script traps `EXIT` to clean up brokers, containers and temporary directories.
-Signalling only the immediate child leaves those orphaned. The runner signals the **process
-group**, so a cancelled task cleans up exactly as an interrupted terminal run does.
+Signalling only the immediate child leaves those orphaned. So `mqttui` signals the
+**process group** and **waits** for it, rather than detaching — a cancelled task then
+tears down exactly as an interrupted terminal run does.
+
+That is the part that can be guaranteed, and the guarantee stops there. A script whose
+trap is buggy, or which was `SIGKILL`ed, can still leak; `mqttui` cannot make another
+program's cleanup correct. Rather than claim otherwise, it **verifies** afterwards — stray
+broker processes, `kind` clusters, compose stacks — and **reports what survived**, offering
+to remove it and leaving anything declined visible in the environment panel (§5).
+
+The distinction is the whole point. "Quitting leaves no orphans" is a claim that cannot be
+checked and would quietly stop being true; "it signals correctly, waits, and tells you what
+is left" is a claim that can be, and it is strictly more useful when something does leak.
+This project has shipped the other kind before — a compose health check that could not fail
+(ADR 0047 T9) — and the lesson is cheaper to apply than to relearn.
 
 Not hypothetical: stray brokers accumulating from panicking tests actively poisoned later
 runs while issue #124's regression test was being written, until a `Drop` guard was added.
+Probing this machine while designing the panel below found **twenty** orphaned brokers from
+one day's test runs, none of them visible until something asked.
 
-### 5. Headless mode shares the manifest
+### 5. It shows the state of the machine it is about to act on
+
+Docker, the current Kubernetes context, `kind` clusters, compose stacks, stray broker
+processes, and the ports these scripts use — surfaced continuously, with explicit,
+confirmed cleanup actions.
+
+The **Kubernetes context is a safety feature, not a convenience.**
+`scripts/k8s/kind-smoke.sh` and `scripts/k8s/operator-e2e.sh` run `kubectl` against
+whatever context is current. Showing that context before the user commits is the difference
+between a smoke test and an incident, and no amount of documentation substitutes for it
+being on screen.
+
+Two constraints, from measured costs (`docker ps` 0.01s, `kind get clusters` 0.06s,
+`kubectl config current-context` 0.22s, `docker compose ls` **1.9s**): probes run off the
+UI thread under a bound, so an unreachable context reports `unreachable` instead of
+freezing the interface; and the expensive probe refreshes on demand, with staleness shown
+rather than hidden.
+
+**Probing is read-only and unconditional. Acting is never automatic.** No implicit cleanup
+at startup, and every destructive action names the specific processes or clusters it will
+remove. A tool that kills things the user did not ask it to kill is worse than one that
+only shows them.
+
+### 6. Headless mode shares the manifest
 
 `mqttui --list` and `mqttui --run <id>` work without the TUI, over the same declarations. This keeps the
 manifest honest (it must be sufficient to *run* a task, not merely describe it) and leaves
