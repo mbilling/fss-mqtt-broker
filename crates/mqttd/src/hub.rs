@@ -2409,6 +2409,22 @@ impl Hub {
             }
         }
 
+        // The durable outbound table (ADR 0057): `QoS` 2 deliveries whose packet id and
+        // phase survived a broker restart. Keyed by offset so the replay below can marry
+        // each entry back to its message. On a plain client reconnect these ids are also
+        // in the in-memory table and were resumed above — `resumed_offsets` keeps the
+        // replay away from them, so the map only acts when memory is gone, which is
+        // exactly the restart this table exists for.
+        let mut restored: std::collections::BTreeMap<Offset, (u16, bool)> =
+            std::collections::BTreeMap::new();
+        if !clean_start {
+            if let Ok(entries) = self.store.outbound(&client).await {
+                for e in entries {
+                    restored.insert(e.offset, (e.packet_id, e.pubrec_seen));
+                }
+            }
+        }
+
         // Replay queued messages (they land in the channel after CONNACK). The lease is
         // warm (recovery just succeeded), so these reads are fast and local. A message
         // whose MQTT 5.0 expiry deadline has passed is dropped, not delivered, and the
@@ -2435,6 +2451,48 @@ impl Hub {
                     if resumed_offsets.contains(&qm.offset) {
                         debug!(client = %client.0, offset = qm.offset,
                                "queued message is still in flight in memory; not replaying");
+                        restored.remove(&qm.offset);
+                        continue;
+                    }
+                    // A broker restart with a durably-recorded id (ADR 0057): resume the
+                    // handshake mid-phrase UNDER THE ORIGINAL ID, never through a fresh
+                    // allocation. Before PUBREC: the PUBLISH goes out again with DUP and
+                    // the id the subscriber may already hold. After PUBREC: a bare
+                    // PUBREL — the subscriber has the message; re-publishing it is the
+                    // #130 duplicate this table exists to prevent.
+                    if let Some((pkid, pubrec_seen)) = restored.remove(&qm.offset) {
+                        let state = if pubrec_seen {
+                            OutState::AwaitingPubComp
+                        } else {
+                            OutState::AwaitingPubRec
+                        };
+                        self.inflight
+                            .entry(client.clone())
+                            .or_default()
+                            .pending
+                            .insert(
+                                pkid,
+                                PendingOut {
+                                    message: qm.message.clone(),
+                                    state,
+                                    offset: Some(qm.offset),
+                                },
+                            );
+                        let packet = if pubrec_seen {
+                            Packet::PubRel(pkid.into())
+                        } else {
+                            publish_packet(
+                                &qm.message.topic,
+                                qm.message.payload.clone(),
+                                qm.message.qos,
+                                Some(pkid),
+                                true,
+                                false,
+                                None,
+                                &qm.message.app,
+                            )
+                        };
+                        let _ = outbound.send(packet);
                         continue;
                     }
                     // A queued message that only a revoked grant admits is dropped
@@ -2491,6 +2549,24 @@ impl Hub {
                     // message that went on the wire is truncated when the subscriber
                     // acknowledges it, not when it was sent (#124).
                     self.truncate_acked(&client).await;
+                }
+            }
+
+            // Table entries whose message is no longer in the queue — an earlier clear
+            // failed and its truncation went through anyway (ADR 0057's tolerated
+            // failure). Released phase: send the spurious PUBREL the tolerance priced
+            // in; the subscriber's PUBCOMP (MQTT-4.3.3) clears the entry, because
+            // pub_comp clears unconditionally. Unreleased phase: the PUBLISH cannot be
+            // reconstructed AND the message left the log, which means it was let go of —
+            // clear the id rather than carry it forever.
+            for (offset, (pkid, pubrec_seen)) in restored {
+                if pubrec_seen {
+                    debug!(client = %client.0, pkid, offset,
+                           "orphaned outbound QoS2 id in released phase; sending PUBREL");
+                    let _ = outbound.send(Packet::PubRel(pkid.into()));
+                } else if let Err(e) = self.store.clear_outbound(&client, pkid).await {
+                    warn!(client = %client.0, pkid, error = %e,
+                          "orphaned outbound QoS2 id could not be cleared");
                 }
             }
         }
@@ -3277,15 +3353,17 @@ impl Hub {
     /// releasing the message's durable log entry (#124).
     async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubComp);
+        // ADR 0057: release the durable id UNCONDITIONALLY, not only when an in-memory
+        // entry completed. A PUBCOMP with no pending entry is how an ORPHANED table entry
+        // (a clear that failed earlier, tolerated by design) finally releases: the
+        // restore sent its spurious PUBREL, the subscriber answered (MQTT-4.3.3), and
+        // this is the retry the tolerance was counting on. Clearing an id the store does
+        // not hold is a no-op. A failure here is logged, and the same cycle retries it.
+        if let Err(e) = self.store.clear_outbound(client, pkid).await {
+            warn!(client = %client.0, pkid, error = %e,
+                  "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
+        }
         if completed {
-            // ADR 0057: the handshake is done; release the durable id. A failure here is
-            // logged and tolerated rather than retried: the worst a leftover entry can do
-            // is make a restore send one spurious PUBREL, which the subscriber answers
-            // with PUBCOMP (MQTT-4.3.3), and THAT PUBCOMP retries this clear.
-            if let Err(e) = self.store.clear_outbound(client, pkid).await {
-                warn!(client = %client.0, pkid, error = %e,
-                      "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
-            }
             self.truncate_acked(client).await;
             self.drain_backlog(client).await;
         }
@@ -7877,6 +7955,121 @@ mod tests {
         assert!(
             store.outbound(&c).await.unwrap().is_empty(),
             "no outbound id is recorded at `QoS` 1"
+        );
+    }
+
+    /// ADR 0057 T3, the #130 acceptance shape in-process: subscriber PUBRECs, the broker
+    /// "restarts" (a second hub over the SAME store — memory gone, durable state not),
+    /// and the resumed session receives a bare PUBREL **under the id it already knows**.
+    /// Never a second PUBLISH: the subscriber holds the message and owes only release.
+    #[tokio::test]
+    async fn a_restart_after_pubrec_resumes_with_pubrel_under_the_original_id() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let tx1 = start_hub_with_arc(store.clone());
+        let (mut rx1, _) = attach_full(&tx1, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx1, "c", "t", QoS::ExactlyOnce);
+        publish_qos2(&tx1, "t", b"survivor");
+        let pkid = pkid_of(&recv_packet(&mut rx1).await.unwrap());
+        pub_rec(&tx1, "c", pkid);
+        assert!(
+            matches!(&recv_packet(&mut rx1).await.unwrap(), Packet::PubRel(k) if k.pkid == pkid)
+        );
+        // Crash here: PUBCOMP never arrives. hub2 shares only the durable store.
+
+        let tx2 = start_hub_with_arc(store.clone());
+        let (mut rx2, present) = attach_full(&tx2, "c", 2, false, u32::MAX, 8).await;
+        assert!(present, "the durable session resumed");
+        let resumed = recv_packet(&mut rx2).await.unwrap();
+        assert!(
+            matches!(&resumed, Packet::PubRel(k) if k.pkid == pkid),
+            "expected PUBREL under the ORIGINAL id {pkid}, got {resumed:?} — a PUBLISH \
+             here is the #130 duplicate"
+        );
+        assert!(
+            recv_packet(&mut rx2).await.is_none(),
+            "and nothing else: the replay must not also send the message under a fresh id"
+        );
+
+        pub_comp(&tx2, "c", pkid);
+        attach_full(&tx2, "sync-probe", 9, true, 0, 8).await;
+        let c = ClientId("c".into());
+        assert!(store.outbound(&c).await.unwrap().is_empty(), "id released");
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "log released (#124)"
+        );
+    }
+
+    /// The other phase: a restart BEFORE the PUBREC arrived re-sends the PUBLISH with DUP
+    /// under the original id — the subscriber may or may not have seen it, and its dedup
+    /// window matches the id either way. Exactly one copy goes out.
+    #[tokio::test]
+    async fn a_restart_before_pubrec_republishes_dup_under_the_original_id() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let tx1 = start_hub_with_arc(store.clone());
+        let (mut rx1, _) = attach_full(&tx1, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx1, "c", "t", QoS::ExactlyOnce);
+        publish_qos2(&tx1, "t", b"pre-rec");
+        let pkid = pkid_of(&recv_packet(&mut rx1).await.unwrap());
+        // Crash before any PUBREC.
+
+        let tx2 = start_hub_with_arc(store.clone());
+        let (mut rx2, _) = attach_full(&tx2, "c", 2, false, u32::MAX, 8).await;
+        let resumed = recv_packet(&mut rx2).await.unwrap();
+        match &resumed {
+            Packet::Publish(pb) => {
+                assert_eq!(
+                    pb.pkid,
+                    Some(pkid),
+                    "the ORIGINAL id, not a fresh allocation"
+                );
+                assert!(pb.dup, "a possible re-send carries DUP [MQTT-4.4.0-1]");
+                assert_eq!(&pb.payload[..], b"pre-rec");
+            }
+            other => panic!("expected the re-published message, got {other:?}"),
+        }
+        assert!(recv_packet(&mut rx2).await.is_none(), "exactly one copy");
+
+        // The handshake continues normally under that id.
+        pub_rec(&tx2, "c", pkid);
+        assert!(
+            matches!(&recv_packet(&mut rx2).await.unwrap(), Packet::PubRel(k) if k.pkid == pkid)
+        );
+
+        // And a fresh delivery cannot collide with the restored id.
+        publish_qos2(&tx2, "t", b"fresh");
+        let fresh = recv_packet(&mut rx2).await.unwrap();
+        assert_ne!(
+            pkid_of(&fresh),
+            pkid,
+            "the allocator skips restored in-flight ids"
+        );
+    }
+
+    /// An orphaned table entry — released phase, but its message already left the log
+    /// (an earlier clear failed; ADR 0057 tolerates that). The restore sends the priced-in
+    /// spurious PUBREL; the subscriber's PUBCOMP clears the orphan, because `pub_comp`
+    /// clears unconditionally. This is the tolerance's other half — without it the orphan
+    /// would send one PUBREL per restore, forever.
+    #[tokio::test]
+    async fn an_orphaned_released_id_is_cleared_by_the_spurious_pubrel_cycle() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let c = ClientId("c".into());
+        // A session whose table holds a released id with NO matching queue entry.
+        store.ensure_session(&c).await.unwrap();
+        store.record_outbound(&c, 55, 999).await.unwrap();
+        store.advance_outbound(&c, 55).await.unwrap();
+
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        let spurious = recv_packet(&mut rx).await.unwrap();
+        assert!(matches!(&spurious, Packet::PubRel(k) if k.pkid == 55));
+
+        pub_comp(&tx, "c", 55);
+        attach_full(&tx, "sync-probe", 9, true, 0, 8).await;
+        assert!(
+            store.outbound(&c).await.unwrap().is_empty(),
+            "the PUBCOMP cleared the orphan even though no pending entry completed"
         );
     }
 
