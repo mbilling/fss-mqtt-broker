@@ -49,8 +49,8 @@ use mqtt_core::{
 use mqtt_storage::app_props::AppProps;
 use mqtt_storage::retained_log::DurableRetained;
 use mqtt_storage::{
-    Enqueued, MemoryRetainedStore, MemorySessionStore, RetainedStore, SessionClaim, SessionStore,
-    StorageError,
+    Enqueued, MemoryRetainedStore, MemorySessionStore, Offset, RetainedStore, SessionClaim,
+    SessionStore, StorageError,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -365,6 +365,12 @@ enum OutState {
 struct PendingOut {
     message: Message,
     state: OutState,
+    /// Where this message lives in the session's durable log, if it was recorded
+    /// there before being put on the wire (#124). The log is truncated through it
+    /// only once the subscriber acknowledges, so a crash mid-flight redelivers it.
+    /// `None` for a clean session, a retained replay, or a deliberate skip
+    /// (brownout) — none of which owe a redelivery.
+    offset: Option<Offset>,
 }
 
 /// A `QoS` > 0 message held back because the session's Receive Maximum quota is full
@@ -374,6 +380,23 @@ struct Backlog {
     message: Message,
     retain: bool,
     message_expiry: Option<u32>,
+    /// Its durable log offset, as for [`PendingOut::offset`] (#124).
+    offset: Option<Offset>,
+}
+
+/// The outcome of a durable append to a session's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Appended {
+    /// Recorded at this offset; the log is truncated through it once the subscriber
+    /// acknowledges.
+    At(Offset),
+    /// Deliberately not recorded — disk brownout, or the queue cap rejected it. Both are
+    /// counted and logged, and the publisher is still acknowledged: the message was
+    /// refused under a stated policy, not lost.
+    Skipped,
+    /// The write failed. The publisher's acknowledgement must be withheld so it retries
+    /// (ADR 0041 T5).
+    Failed,
 }
 
 /// Per-session outbound `QoS` bookkeeping. Survives disconnects so persistent
@@ -392,6 +415,17 @@ struct Inflight {
     receive_maximum: u16,
     /// `QoS` > 0 messages waiting for quota; drained FIFO as PUBACK/PUBCOMP frees slots.
     backlog: VecDeque<Backlog>,
+    /// Durable log offsets appended for this session and not yet acknowledged by the
+    /// subscriber (#124). The log is truncated only through the **contiguous** acked
+    /// prefix, so an out-of-order PUBACK cannot discard a message still in flight
+    /// behind it.
+    outstanding: BTreeSet<Offset>,
+    /// The highest offset ever tracked, so a fully drained session truncates its whole
+    /// log rather than stalling at the last released offset.
+    high_water: Offset,
+    /// The last offset already handed to [`SessionStore::ack`], so an advance that would
+    /// not move the truncation point costs no store write.
+    acked_through: Offset,
 }
 
 impl Default for Inflight {
@@ -402,6 +436,9 @@ impl Default for Inflight {
             pending: BTreeMap::new(),
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
             backlog: VecDeque::new(),
+            outstanding: BTreeSet::new(),
+            high_water: 0,
+            acked_through: 0,
         }
     }
 }
@@ -412,13 +449,48 @@ impl Inflight {
         self.pending.len() >= self.receive_maximum as usize
     }
 
+    /// Raise the truncation ceiling to cover `offset` without owing a delivery for it —
+    /// for a replayed entry that is dropped rather than sent (expired, or admitted only
+    /// by a revoked grant). Without this a session whose whole replay was dropped would
+    /// never truncate those entries.
+    fn note_offset(&mut self, offset: Offset) {
+        self.high_water = self.high_water.max(offset);
+    }
+
+    /// Record that `offset` is owed to the subscriber until it acknowledges (#124).
+    fn track(&mut self, offset: Offset) {
+        self.note_offset(offset);
+        self.outstanding.insert(offset);
+    }
+
+    /// The subscriber has acknowledged the message stored at `offset`.
+    fn release(&mut self, offset: Offset) {
+        self.outstanding.remove(&offset);
+    }
+
+    /// Advance the durable truncation point to the contiguous acked prefix, returning it
+    /// only if it actually moved (so a redundant `ack` never reaches the store).
+    fn advance_ack(&mut self) -> Option<Offset> {
+        let safe = match self.outstanding.iter().next() {
+            // Everything strictly below the oldest still-owed message is settled.
+            Some(oldest) => oldest.saturating_sub(1),
+            // Nothing owed: the whole log is settled.
+            None => self.high_water,
+        };
+        (safe > self.acked_through).then(|| {
+            self.acked_through = safe;
+            safe
+        })
+    }
+
     /// Append to the flow-control backlog, evicting the oldest entry when the cap is
-    /// reached (drop-oldest, ADR 0012). Returns `true` if a message was evicted.
-    fn push_backlog(&mut self, entry: Backlog) -> bool {
-        let evicted = self.backlog.len() >= MAX_BACKLOG;
-        if evicted {
-            self.backlog.pop_front();
-        }
+    /// reached (drop-oldest, ADR 0012). Returns the evicted entry, if any — the caller
+    /// must [`release`](Self::release) its durable offset, since nothing will deliver
+    /// it and an offset owed forever would stop the log ever being truncated.
+    fn push_backlog(&mut self, entry: Backlog) -> Option<Backlog> {
+        let evicted = (self.backlog.len() >= MAX_BACKLOG)
+            .then(|| self.backlog.pop_front())
+            .flatten();
         self.backlog.push_back(entry);
         evicted
     }
@@ -2238,8 +2310,16 @@ impl Hub {
 
         // Resume in-flight QoS state: unacked PUBLISHes go out again with DUP
         // [MQTT-4.4.0-1]; half-completed QoS 2 deliveries resume at PUBREL.
+        //
+        // Their log offsets (#124) are collected so the replay below does not send the
+        // same messages a second time. The set is empty after a broker restart — the
+        // in-flight table is memory — which is exactly when the replay must carry them.
+        let mut resumed_offsets: HashSet<Offset> = HashSet::new();
         if let Some(inf) = self.inflight.get(&client) {
             for (pkid, p) in &inf.pending {
+                if let Some(offset) = p.offset {
+                    resumed_offsets.insert(offset);
+                }
                 let packet = match p.state {
                     OutState::AwaitingPubAck | OutState::AwaitingPubRec => publish_packet(
                         &p.message.topic,
@@ -2267,6 +2347,24 @@ impl Hub {
                 let mut last = 0;
                 for qm in pending {
                     last = qm.offset;
+                    // Raise the truncation ceiling for every entry read, so the ones
+                    // dropped below are let go of even though nothing will deliver
+                    // them (#124). Entries that ARE sent additionally become owed, in
+                    // `send_to_client`, and hold the ceiling down until acknowledged.
+                    self.inflight
+                        .entry(client.clone())
+                        .or_default()
+                        .note_offset(qm.offset);
+                    // Still in the in-flight table means this is a client reconnect, not
+                    // a broker restart: the DUP resume above already re-sent it under its
+                    // original packet id — and for `QoS` 2 possibly as a bare PUBREL,
+                    // because the client has acknowledged receipt and only owes the
+                    // release. Replaying the PUBLISH here would deliver it twice.
+                    if resumed_offsets.contains(&qm.offset) {
+                        debug!(client = %client.0, offset = qm.offset,
+                               "queued message is still in flight in memory; not replaying");
+                        continue;
+                    }
                     // A queued message that only a revoked grant admits is dropped
                     // (ADR 0040 T3): delivering it would leak data the new policy
                     // denies. A topic a surviving grant also matches still replays.
@@ -2298,18 +2396,29 @@ impl Hub {
                                 &qm.message,
                                 false,
                                 Some(remaining),
+                                Some(qm.offset),
                             )
                             .await;
                         }
                         None => {
-                            self.send_to_client(&client, &outbound, &qm.message, false, None)
-                                .await;
+                            self.send_to_client(
+                                &client,
+                                &outbound,
+                                &qm.message,
+                                false,
+                                None,
+                                Some(qm.offset),
+                            )
+                            .await;
                         }
                     }
                 }
                 if last > 0 {
                     debug!(client = %client.0, up_to = last, "replayed queued messages");
-                    let _ = self.store.ack(&client, last).await;
+                    // Truncate only the entries this replay let go of — a `QoS` > 0
+                    // message that went on the wire is truncated when the subscriber
+                    // acknowledges it, not when it was sent (#124).
+                    self.truncate_acked(&client).await;
                 }
             }
         }
@@ -2427,7 +2536,10 @@ impl Hub {
 
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             for m in retained_replay {
-                self.send_to_client(client, &tx, &m, true, None).await;
+                // No session-log offset (#124): a retained value is durable in the
+                // retained store, and a crash mid-delivery loses the delivery, not the
+                // fact — the value is still there and is replayed to the next subscribe.
+                self.send_to_client(client, &tx, &m, true, None, None).await;
             }
         }
     }
@@ -2523,74 +2635,109 @@ impl Hub {
             retain: false,
             app: app.clone(),
         };
+        let persistent = self.is_persistent(client);
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
-            self.send_to_client(client, &tx, &message, false, message_expiry)
+            // Durability follows the SESSION, not the connection (#124). A persistent
+            // subscriber is owed redelivery of anything unacknowledged, so the record
+            // has to exist before the packet reaches the wire — otherwise a crash in
+            // between loses a message the publisher was already acked for, and there is
+            // no trace of it anywhere. A clean session is skipped because it has nothing
+            // to resume into, and `QoS` 0 because at-most-once owes no redelivery.
+            let mut offset = None;
+            if persistent && qos != QoS::AtMostOnce {
+                match self.durable_append(client, &message, message_expiry).await {
+                    Appended::At(o) => offset = Some(o),
+                    Appended::Skipped => {}
+                    // The publisher's ack is withheld, so it retries; delivering live
+                    // anyway would promise a redelivery the store cannot honour.
+                    Appended::Failed => return false,
+                }
+            }
+            self.send_to_client(client, &tx, &message, false, message_expiry, offset)
                 .await;
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
             }
             return true;
         }
-        if self.is_persistent(client) {
-            // Disk brownout (ADR 0041 T5): an offline enqueue GROWS the store —
-            // refused above the watermark, counted, like a queue overflow.
-            if self.brownout {
-                warn!(client = %client.0, topic = %topic,
-                      "brownout: offline enqueue refused (ADR 0041)");
-                if let Some(m) = &self.metrics {
-                    m.publish_dropped("brownout");
-                }
-                return true;
-            }
-            // Offline but persistent: queue for replay on reconnect. The absolute
-            // deadline (ADR 0009 §3) is receipt time plus the interval. The queue is
-            // bounded (ADR 0001 §6); log when the cap drops messages.
-            let expiry_at =
-                message_expiry.map(|secs| self.clock.now_epoch_secs() + u64::from(secs));
-            // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
-            // The latency histogram is only meaningful when the store is the replicated
-            // one, so gate it on durable mode; a failure reason is recorded either way.
-            let durable = self.durable_plane.is_some();
-            let started = Instant::now();
-            let result = self
-                .store
-                .enqueue_with_expiry(client, &message, expiry_at)
-                .await;
-            if durable {
-                if let Some(m) = &self.metrics {
-                    m.observe_durable_append_latency(started.elapsed().as_secs_f64());
-                }
-            }
-            match result {
-                Ok(Enqueued::Stored { evicted, .. }) if evicted > 0 => {
-                    warn!(client = %client.0, evicted, topic = %topic,
-                          "offline queue full: evicted oldest message(s)");
-                    if let Some(m) = &self.metrics {
-                        m.publish_dropped("queue-overflow");
-                    }
-                }
-                Ok(Enqueued::Rejected) => {
-                    warn!(client = %client.0, topic = %topic,
-                          "offline queue full: dropped message (reject-newest)");
-                    if let Some(m) = &self.metrics {
-                        m.publish_dropped("queue-overflow");
-                    }
-                }
-                Ok(Enqueued::Stored { .. }) => {}
-                Err(e) => {
-                    if let Some(m) = &self.metrics {
-                        m.durable_append_failed(durable_failure_reason(&e));
-                    }
-                    warn!(client = %client.0, error = %e,
-                          "failed to enqueue offline message; withholding the publisher's ack (ADR 0041 T5)");
-                    // Fail closed like the local ack path (ADR 0018): the caller
-                    // withholds the publisher's acknowledgement so it retries,
-                    // instead of acking a message a subscriber will never see.
-                    return false;
-                }
-            }
+        if persistent {
+            // Offline but persistent: queue for replay on reconnect.
+            return !matches!(
+                self.durable_append(client, &message, message_expiry).await,
+                Appended::Failed
+            );
         }
         true
+    }
+
+    /// Append `message` to `client`'s durable session log — the write the publisher's
+    /// `QoS` ≥ 1 acknowledgement is gated on (ADR 0001).
+    ///
+    /// The absolute deadline (ADR 0009 §3) is receipt time plus the interval. The queue
+    /// is bounded (ADR 0001 §6); a cap that drops messages is logged and counted.
+    async fn durable_append(
+        &mut self,
+        client: &ClientId,
+        message: &Message,
+        message_expiry: Option<u32>,
+    ) -> Appended {
+        // Disk brownout (ADR 0041 T5): an enqueue GROWS the store — refused above the
+        // watermark, counted, like a queue overflow. An online subscriber still gets the
+        // message live; it is the durable copy that is refused, not the delivery.
+        if self.brownout {
+            warn!(client = %client.0, topic = %message.topic,
+                  "brownout: durable enqueue refused (ADR 0041)");
+            if let Some(m) = &self.metrics {
+                m.publish_dropped("brownout");
+            }
+            return Appended::Skipped;
+        }
+        let expiry_at = message_expiry.map(|secs| self.clock.now_epoch_secs() + u64::from(secs));
+        // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
+        // The latency histogram is only meaningful when the store is the replicated
+        // one, so gate it on durable mode; a failure reason is recorded either way.
+        let durable = self.durable_plane.is_some();
+        let started = Instant::now();
+        let result = self
+            .store
+            .enqueue_with_expiry(client, message, expiry_at)
+            .await;
+        if durable {
+            if let Some(m) = &self.metrics {
+                m.observe_durable_append_latency(started.elapsed().as_secs_f64());
+            }
+        }
+        match result {
+            Ok(Enqueued::Stored { offset, evicted }) => {
+                if evicted > 0 {
+                    warn!(client = %client.0, evicted, topic = %message.topic,
+                          "session queue full: evicted oldest message(s)");
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("queue-overflow");
+                    }
+                }
+                Appended::At(offset)
+            }
+            Ok(Enqueued::Rejected) => {
+                warn!(client = %client.0, topic = %message.topic,
+                      "session queue full: dropped message (reject-newest)");
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("queue-overflow");
+                }
+                Appended::Skipped
+            }
+            Err(e) => {
+                if let Some(m) = &self.metrics {
+                    m.durable_append_failed(durable_failure_reason(&e));
+                }
+                warn!(client = %client.0, error = %e,
+                      "failed to enqueue message; withholding the publisher's ack (ADR 0041 T5)");
+                // Fail closed like the local ack path (ADR 0018): the caller withholds
+                // the publisher's acknowledgement so it retries, instead of acking a
+                // message a subscriber will never see.
+                Appended::Failed
+            }
+        }
     }
 
     /// Route a message to the shared subscriptions matching `topic`: for each group,
@@ -2712,6 +2859,12 @@ impl Hub {
     /// Send one message to an online client at its (already downgraded) `QoS`,
     /// registering `QoS` > 0 deliveries in the in-flight table. `message_expiry` is
     /// the MQTT 5.0 Message Expiry Interval to forward (the remaining seconds), if any.
+    ///
+    /// `offset` is the message's place in the session's durable log when it has one
+    /// (#124) — the caller appends *before* calling, so the record already exists when
+    /// the packet reaches the wire. It is tracked as owed here, whether the message goes
+    /// out now or waits in the flow-control backlog, and released when the subscriber
+    /// acknowledges it.
     async fn send_to_client(
         &mut self,
         client: &ClientId,
@@ -2719,7 +2872,16 @@ impl Hub {
         message: &Message,
         retain: bool,
         message_expiry: Option<u32>,
+        offset: Option<Offset>,
     ) {
+        // `QoS` 0 owes no acknowledgement, so a replayed one is settled the moment it is
+        // handed to the channel — only `QoS` > 0 becomes owed.
+        if let Some(offset) = offset.filter(|_| message.qos != QoS::AtMostOnce) {
+            self.inflight
+                .entry(client.clone())
+                .or_default()
+                .track(offset);
+        }
         if message.qos == QoS::AtMostOnce {
             // QoS 0 is the only path with no other bound: the QoS 1/2 backlog is
             // capped by MAX_BACKLOG below, and Receive Maximum does not apply to
@@ -2765,13 +2927,23 @@ impl Hub {
                 message: message.clone(),
                 retain,
                 message_expiry,
+                offset,
             });
-            if evicted {
+            if let Some(evicted) = evicted {
+                if let Some(offset) = evicted.offset {
+                    inf.release(offset);
+                }
                 warn!(client = %client.0, cap = MAX_BACKLOG,
                       "flow-control backlog full: evicted oldest message");
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("backlog-overflow");
+                }
+                // Nothing will deliver the evicted message, so its offset no longer
+                // holds the truncation point back.
+                self.truncate_acked(client).await;
             }
         } else {
-            self.send_qos_publish(client, tx, message, retain, message_expiry)
+            self.send_qos_publish(client, tx, message, retain, message_expiry, offset)
                 .await;
         }
     }
@@ -2830,6 +3002,7 @@ impl Hub {
         message: &Message,
         retain: bool,
         message_expiry: Option<u32>,
+        offset: Option<Offset>,
     ) {
         let pkid = self.alloc_pkid(client).await;
         let inf = self.inflight.entry(client.clone()).or_default();
@@ -2843,6 +3016,7 @@ impl Hub {
             PendingOut {
                 message: message.clone(),
                 state,
+                offset,
             },
         );
         let _ = tx.send(publish_packet(
@@ -2877,27 +3051,53 @@ impl Hub {
                 &entry.message,
                 entry.retain,
                 entry.message_expiry,
+                entry.offset,
             )
             .await;
         }
     }
 
-    /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012).
+    /// PUBACK: completes a `QoS` 1 delivery, freeing a quota slot (ADR 0012) and
+    /// releasing the message's durable log entry (#124).
     async fn pub_ack(&mut self, client: &ClientId, pkid: u16) {
-        let completed = self.inflight.get_mut(client).is_some_and(|inf| {
-            if inf
-                .pending
-                .get(&pkid)
-                .is_some_and(|p| p.state == OutState::AwaitingPubAck)
-            {
-                inf.pending.remove(&pkid);
-                true
-            } else {
-                false
-            }
-        });
+        let completed = self.complete_pending(client, pkid, OutState::AwaitingPubAck);
         if completed {
+            self.truncate_acked(client).await;
             self.drain_backlog(client).await;
+        }
+    }
+
+    /// Remove `pkid` from the in-flight table if it is in `expected` state, releasing its
+    /// durable offset. Returns whether the delivery completed.
+    fn complete_pending(&mut self, client: &ClientId, pkid: u16, expected: OutState) -> bool {
+        let Some(inf) = self.inflight.get_mut(client) else {
+            return false;
+        };
+        if !inf.pending.get(&pkid).is_some_and(|p| p.state == expected) {
+            return false;
+        }
+        if let Some(offset) = inf.pending.remove(&pkid).and_then(|p| p.offset) {
+            inf.release(offset);
+        }
+        true
+    }
+
+    /// Truncate the session's durable log through the **contiguous** prefix the subscriber
+    /// has acknowledged (#124). A message is written before it goes on the wire, so this is
+    /// what finally lets go of it; nothing is truncated on send.
+    async fn truncate_acked(&mut self, client: &ClientId) {
+        let Some(up_to) = self
+            .inflight
+            .get_mut(client)
+            .and_then(Inflight::advance_ack)
+        else {
+            return;
+        };
+        if let Err(e) = self.store.ack(client, up_to).await {
+            // Not fatal: the entries stay in the log and are replayed on the next resume.
+            // A duplicate at QoS 1 is spec-legal; losing one would not be.
+            debug!(client = %client.0, up_to, error = %e,
+                   "failed to truncate the acknowledged session log");
         }
     }
 
@@ -2920,21 +3120,12 @@ impl Hub {
         }
     }
 
-    /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012).
+    /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012) and
+    /// releasing the message's durable log entry (#124).
     async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
-        let completed = self.inflight.get_mut(client).is_some_and(|inf| {
-            if inf
-                .pending
-                .get(&pkid)
-                .is_some_and(|p| p.state == OutState::AwaitingPubComp)
-            {
-                inf.pending.remove(&pkid);
-                true
-            } else {
-                false
-            }
-        });
+        let completed = self.complete_pending(client, pkid, OutState::AwaitingPubComp);
         if completed {
+            self.truncate_acked(client).await;
             self.drain_backlog(client).await;
         }
     }
@@ -3180,9 +3371,19 @@ impl Hub {
     /// quota, ADR 0012) into the durable offline queue so they replay on reconnect
     /// rather than being lost when the connection ends. Already-sent in-flight
     /// entries keep their DUP-redelivery behaviour and are left untouched.
+    ///
+    /// An entry that already carries a log offset (#124) is dropped from memory instead
+    /// of spilled: it is in the log already and stays *owed* there, so the truncation
+    /// point cannot pass it and the reconnect replays it. Re-enqueuing it would put a
+    /// second copy in the log. What still spills is the case the offset does not cover —
+    /// a message the store deliberately did not record (brownout).
     async fn flush_backlog_to_store(&mut self, client: &ClientId) {
         let backlog: Vec<Backlog> = match self.inflight.get_mut(client) {
-            Some(inf) if !inf.backlog.is_empty() => inf.backlog.drain(..).collect(),
+            Some(inf) if !inf.backlog.is_empty() => inf
+                .backlog
+                .drain(..)
+                .filter(|e| e.offset.is_none())
+                .collect(),
             _ => return,
         };
         let now = self.clock.now_epoch_secs();
@@ -6985,17 +7186,20 @@ mod tests {
             },
             retain: false,
             message_expiry: None,
+            offset: None,
         };
         for i in 0..MAX_BACKLOG {
             assert!(
-                !inf.push_backlog(entry(format!("t{i}"))),
+                inf.push_backlog(entry(format!("t{i}"))).is_none(),
                 "no eviction under the cap"
             );
         }
         // At the cap, the next push evicts the oldest (t0) and stays bounded.
-        assert!(
-            inf.push_backlog(entry("overflow".into())),
-            "eviction at the cap"
+        assert_eq!(
+            inf.push_backlog(entry("overflow".into()))
+                .map(|e| e.message.topic),
+            Some("t0".to_string()),
+            "the oldest is the one evicted at the cap"
         );
         assert_eq!(inf.backlog.len(), MAX_BACKLOG, "backlog stays bounded");
         assert_eq!(
@@ -7068,6 +7272,126 @@ mod tests {
             payload_of(&recv_packet(&mut rx2).await.unwrap()),
             b"m2",
             "then the spilled backlog"
+        );
+        assert!(
+            recv_packet(&mut rx2).await.is_none(),
+            "neither message may arrive a second time: both are in the durable log \
+             (#124) AND held in memory, and the replay must not duplicate what the \
+             DUP resume already sent"
+        );
+    }
+
+    /// The truncation arithmetic behind #124, in isolation, because it is the part that
+    /// silently loses data if it is wrong: the log may only be truncated through the
+    /// **contiguous** acknowledged prefix. An out-of-order PUBACK for a later message
+    /// must not take an earlier, still-unacknowledged one with it.
+    #[test]
+    fn the_log_truncates_only_through_the_contiguous_acked_prefix() {
+        let mut inf = Inflight::default();
+        for offset in 1..=3 {
+            inf.track(offset);
+        }
+        assert_eq!(
+            inf.advance_ack(),
+            None,
+            "nothing acknowledged yet: offset 1 is still owed, so there is no prefix"
+        );
+
+        // The MIDDLE message is acknowledged first — legal, since Receive Maximum > 1
+        // allows several in flight and MQTT does not require ordered acknowledgement.
+        inf.release(2);
+        assert_eq!(
+            inf.advance_ack(),
+            None,
+            "offset 1 is still owed, so 2 may not be truncated away behind it"
+        );
+
+        inf.release(1);
+        assert_eq!(
+            inf.advance_ack(),
+            Some(2),
+            "1 and 2 are now both settled; 3 is still owed and holds the point at 2"
+        );
+        assert_eq!(inf.advance_ack(), None, "no advance means no store write");
+
+        inf.release(3);
+        assert_eq!(
+            inf.advance_ack(),
+            Some(3),
+            "with nothing owed the whole log is settled, up to the high-water mark"
+        );
+    }
+
+    /// An entry that was read from the log but deliberately NOT delivered (expired, or
+    /// admitted only by a revoked grant) must still be let go of — otherwise a session
+    /// whose entire replay was dropped would hold its log forever.
+    #[test]
+    fn a_dropped_replay_entry_does_not_pin_the_log() {
+        let mut inf = Inflight::default();
+        inf.note_offset(1); // read and dropped
+        inf.note_offset(2);
+        inf.track(2); // read and sent
+        assert_eq!(inf.advance_ack(), Some(1), "the dropped entry is settled");
+        inf.release(2);
+        assert_eq!(inf.advance_ack(), Some(2));
+    }
+
+    /// #124: a `QoS` 1 message delivered LIVE to a persistent subscriber is in the
+    /// durable log before it reaches the wire, and stays there until that subscriber
+    /// acknowledges it — which is what makes it survive a crash in between.
+    #[tokio::test]
+    async fn a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "t", b"live");
+        let delivered = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&delivered), b"live");
+
+        let queued = store.pending(&ClientId("c".into()), 0, 16).await.unwrap();
+        assert_eq!(
+            queued.len(),
+            1,
+            "the message must be in the durable log WHILE it is in flight — the \
+             publisher has been acked and is owed a redelivery if the broker dies"
+        );
+        assert_eq!(&queued[0].message.payload[..], b"live");
+
+        pub_ack(&tx, "c", pkid_of(&delivered));
+        // The PUBACK is processed on the hub loop; a round-trip through it orders this
+        // read after the truncation rather than racing it.
+        subscribe_qos(&tx, "c", "sync", QoS::AtMostOnce);
+        attach_full(&tx, "sync-probe", 9, true, 0, 8).await;
+
+        let after = store.pending(&ClientId("c".into()), 0, 16).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "the subscriber acknowledged, so the log entry is released: {after:?}"
+        );
+    }
+
+    /// The other half of the #124 rule: durability follows the SESSION. A clean session
+    /// has nothing to resume into, so it must not pay for a durable write per delivery —
+    /// this is the escape hatch the README points throughput-sensitive users at.
+    #[tokio::test]
+    async fn a_live_qos1_delivery_to_a_clean_session_writes_nothing() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, true, 0, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "t", b"live");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"live");
+
+        assert!(
+            store
+                .pending(&ClientId("c".into()), 0, 16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a clean session owes no redelivery, so nothing is written"
         );
     }
 

@@ -8,7 +8,7 @@
 
 | ADR | Title | Decision | Tasks | Open / deferred |
 |-----|-------|----------|-------|-----------------|
-| [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [10/11 done](0001-session-durability.md) | 1 deferred |
+| [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [11/12 done](0001-session-durability.md) | 1 deferred |
 | [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [10/10 done](0002-transport-security.md) | — |
 | [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
 | [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [10/13 done](0004-identity-and-authentication.md) | 1 deferred |

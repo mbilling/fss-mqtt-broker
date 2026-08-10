@@ -576,20 +576,30 @@ impl Proc {
 
     /// Drain everything queued on subscriber `i`'s live connection, acking
     /// each `QoS` 1 publish, until a short quiet window passes.
+    ///
+    /// A `QoS` 1 payload counts as **received** only once its PUBACK has been written —
+    /// not when the socket saw it. The difference is the whole of issue #124: a message
+    /// the subscriber has seen but not acknowledged is still owed, and recording it on
+    /// arrival made this oracle unable to distinguish "delivered" from "delivered and
+    /// then lost by a broker that died before the acknowledgement". `QoS` 0 has no ack,
+    /// so arrival is all there is.
     pub async fn drain_subscriber(&mut self, i: usize) {
         loop {
             let Some(conn) = self.subs[i].conn.as_mut() else {
                 return;
             };
             match conn.recv_bounded(Duration::from_millis(700)).await {
-                common::Recv::Packet(Packet::Publish(p)) => {
-                    self.subs[i].received.insert(p.payload.to_vec());
-                    if let Some(pkid) = p.pkid {
+                common::Recv::Packet(Packet::Publish(p)) => match p.pkid {
+                    Some(pkid) => {
                         if let Some(c) = self.subs[i].conn.as_mut() {
                             c.puback(pkid).await;
+                            self.subs[i].received.insert(p.payload.to_vec());
                         }
                     }
-                }
+                    None => {
+                        self.subs[i].received.insert(p.payload.to_vec());
+                    }
+                },
                 common::Recv::Packet(_) => {}
                 common::Recv::Closed => {
                     self.subs[i].conn = None;

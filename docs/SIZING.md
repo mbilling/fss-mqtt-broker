@@ -92,6 +92,30 @@ consume the whole budget and brown out the others (ADR 0041 amendment T9).
 If `MQTTD_DATA_DIR` is unset, none of this applies — all state is in memory and the
 memory formula is the only budget.
 
+### What actually writes to disk on the publish path
+
+One store write per **QoS 1/2 message per matching persistent subscriber** — whether
+that subscriber is offline *or* connected. The durable record is what the publisher's
+PUBACK promises, so it is written before the message goes on the wire; the entry is
+released when that subscriber acknowledges (issue #124).
+
+That makes the write rate, not the resting size, the thing to size for:
+
+```
+store writes/s ≈ Σ over QoS 1/2 publishes ( matching PERSISTENT subscribers )
+```
+
+Three cases cost nothing: **QoS 0** at any time, any message to a **clean session**
+(`clean_session=true` / zero Session Expiry — it has nothing to resume into), and any
+message to a subscriber with no matching persistent session at all. A fan-out of one
+QoS 1 publish to 100 persistent subscribers is 100 durable writes; to 100 clean ones it
+is zero. In a cluster each of those writes is also quorum-replicated (R=3 by default),
+so it costs a cross-node round trip as well.
+
+If a topic's subscribers do not need redelivery across a broker restart, connecting them
+with a clean session is the whole optimisation — there is no flag to turn durability off
+for a session that asked for it, by design.
+
 ## Worked example — 4 GiB RAM / 20 GiB disk
 
 Target: leave ~1 GiB for OS/page cache; broker budget ~3 GiB RSS, 16 GiB store.
