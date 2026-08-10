@@ -1,0 +1,269 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "mqttdclusters.mqttd.io"
+  },
+  "spec": {
+    "group": "mqttd.io",
+    "names": {
+      "kind": "MqttdCluster",
+      "plural": "mqttdclusters",
+      "shortNames": [
+        "mqc"
+      ],
+      "singular": "mqttdcluster"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.replicas",
+            "name": "Replicas",
+            "type": "integer"
+          },
+          {
+            "jsonPath": ".status.readyReplicas",
+            "name": "Ready",
+            "type": "integer"
+          },
+          {
+            "jsonPath": ".status.phase",
+            "name": "Phase",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.clusterId",
+            "name": "ClusterId",
+            "type": "string"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "An mqttd broker cluster managed by the operator (ADR 0055)",
+            "properties": {
+              "spec": {
+                "description": "The desired state of one mqttd cluster.",
+                "properties": {
+                  "bootstrapPolicy": {
+                    "default": "Guarded",
+                    "description": "Whether ordinal 0 may found a cluster (ADR 0055 §3.5, T9).\n\nNOT a remediation: the guard is a rendering property that must hold before a\npod starts, and it applies with the default Alert-only posture — an operator\ninstalled with defaults must still be protected from a lost pod-0 volume.",
+                    "enum": [
+                      "Guarded",
+                      "AllowRebootstrap"
+                    ],
+                    "type": "string"
+                  },
+                  "config": {
+                    "description": "The broker config TOML template — the SAME contract as the chart's\n`values.config` (ADR 0046): `__NODE_ID__`, `__SEEDS__`,\n`__PEER_ADVERTISE__`, and `__READY_MIN__` are rendered per pod.",
+                    "type": "string"
+                  },
+                  "gossipKeyRotation": {
+                    "description": "Presence starts an unattended three-phase SWIM key rotation\n(ADR 0003 / 0055 §3.3): the operator stages `newKeySecretRef`, flips the\nsealer, and closes the window, gating each phase on the ADR 0054\nverification signals. Cleared by the operator when the rotation completes.",
+                    "nullable": true,
+                    "properties": {
+                      "newKeySecretRef": {
+                        "description": "The Secret holding the NEW key (key `swim-key`). The operator re-points\nreferences and rolls; it never reads the material.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "newKeySecretRef"
+                    ],
+                    "type": "object"
+                  },
+                  "image": {
+                    "description": "The broker image (repository:tag). Defaults to the operator's pinned\nrelease when empty.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "persistence": {
+                    "description": "Per-pod persistent volume settings (mirrors the chart's `persistence`).",
+                    "nullable": true,
+                    "properties": {
+                      "expansionMaxSize": {
+                        "description": "Upper bound for brownout-driven PVC expansion (ADR 0055 §3.2). Unset =\nexpansion remediation refuses to act (alert only).",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "size": {
+                        "description": "PVC size (e.g. `10Gi`).",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "storageClassName": {
+                        "description": "`StorageClass`; empty = the cluster default. Brownout `ExpandPvc`\nremediation requires a class with `allowVolumeExpansion`.",
+                        "nullable": true,
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "remediation": {
+                    "default": {
+                      "brownout": "Alert",
+                      "splitBrain": "Alert"
+                    },
+                    "description": "Remediation switches (ADR 0055 §3): every destructive action is opt-in;\nthe default posture is Alert-only.",
+                    "properties": {
+                      "brownout": {
+                        "default": "Alert",
+                        "description": "Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — patch\nPVC sizes up to `persistence.expansionMaxSize` and raise the watermark.",
+                        "enum": [
+                          "Alert",
+                          "ExpandPvc"
+                        ],
+                        "type": "string"
+                      },
+                      "splitBrain": {
+                        "default": "Alert",
+                        "description": "Split-brain (two cluster identities observed, ADR 0054 T2):\n`Alert` (default) or `Fence` — delete the new-founder pod, quarantine\nits PVC by label (never delete data), seed-override recovery.",
+                        "enum": [
+                          "Alert",
+                          "Fence"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "replicas": {
+                    "description": "Cluster size. Pod 0 is the gossip founder; use an odd number >= 3 for a\ndurable quorum (the same contract as the chart's `replicaCount`).",
+                    "format": "int32",
+                    "type": "integer"
+                  },
+                  "secrets": {
+                    "description": "Secret material by PATH (ADR 0046 T5), mirroring the chart's `secrets`\nblock. The operator only ever references these Secrets — it never reads\nkey material.",
+                    "nullable": true,
+                    "properties": {
+                      "acl": {
+                        "description": "Topic ACL policy (`ConfigMap` name, key `acl.toml`).",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "gossipKey": {
+                        "description": "Gossip key file (Secret with key `swim-key`).",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "peerTls": {
+                        "description": "Cluster-bus mTLS material (Secret with `ca.crt`/`tls.crt`/`tls.key`).",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "tls": {
+                        "description": "Server TLS keypair (a `kubernetes.io/tls` Secret).",
+                        "nullable": true,
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "config",
+                  "replicas"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "description": "The observed state, aggregated from `/statusz` + metrics (ADR 0054).",
+                "nullable": true,
+                "properties": {
+                  "bootstrapped": {
+                    "description": "Whether a cluster has ever been observed to exist (ADR 0055 T9).\n\nLatched the first time exactly one cluster identity is seen from a REACHABLE\npod, and monotonic thereafter — `patch_status` merges, and this field is\nomitted when there is no opinion, so a pass that observes nothing leaves the\nprior value alone. Once latched, ordinal 0 renders seeds and can no longer\nfound. Cleared only under `bootstrapPolicy: AllowRebootstrap`.",
+                    "nullable": true,
+                    "type": "boolean"
+                  },
+                  "brownout": {
+                    "description": "Whether any pod reports disk brownout.",
+                    "nullable": true,
+                    "type": "boolean"
+                  },
+                  "clusterId": {
+                    "description": "The cluster identity every pod must agree on (ADR 0054 T2). Two values\nacross the fleet is the `SplitBrain` condition.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "conditions": {
+                    "description": "Kubernetes-conventional conditions (`SplitBrain`, `Converged`,\n`RotationInProgress`, `Reconciled`, …).",
+                    "items": {
+                      "description": "A minimal Kubernetes-style condition (own type: k8s-openapi's `Condition`\ndoes not derive `JsonSchema`).",
+                      "properties": {
+                        "lastTransitionTime": {
+                          "description": "RFC 3339 transition timestamp.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "Human-readable detail.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "description": "Machine-readable reason.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`True` / `False` / `Unknown`.",
+                          "type": "string"
+                        },
+                        "type": {
+                          "description": "Condition type, e.g. `Reconciled`, `SplitBrain`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "members": {
+                    "description": "Mesh members observed (from `/statusz`).",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "observedGeneration": {
+                    "description": "The spec generation this status reflects.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "phase": {
+                    "description": "Coarse lifecycle: `Pending`, `Forming`, `Ready`, `Degraded`, `SplitBrain`.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "readyReplicas": {
+                    "description": "Pods currently passing readiness.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "MqttdCluster",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

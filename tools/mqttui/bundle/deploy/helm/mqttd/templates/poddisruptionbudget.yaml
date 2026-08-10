@@ -1,0 +1,16 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# A node drain / voluntary disruption may take at most one broker at a time — never two, which
+# for an odd quorum would risk losing consensus (ADR 0039 / 0047). Not optional for a quorum
+# system.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "mqttd.fullname" . }}
+  labels:
+    {{- include "mqttd.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "mqttd.selectorLabels" . | nindent 6 }}
+{{- end }}

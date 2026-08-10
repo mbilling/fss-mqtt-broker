@@ -69,7 +69,17 @@ if [ "${#PACKAGES[@]}" -eq 0 ]; then
   PACKAGES=(mqttd mqtt-bridge)
 fi
 for pkg in "${PACKAGES[@]}"; do
-  cargo build --release --locked --target "$TARGET" -p "$pkg" >&2
+  if [ "$pkg" = "mqttui" ]; then
+    # mqttui is a SEPARATE workspace with its own lockfile (ADR 0056 §1) — the boundary is
+    # the lockfile, so that a terminal UI's dependency tree can never reach the broker's.
+    # It is therefore built through its own manifest, which is what makes `--locked` bind
+    # to *its* lock rather than the broker's. Same recipe otherwise: same rustc, same
+    # remapping, same SOURCE_DATE_EPOCH, so it is reproducible and verifiable identically.
+    cargo build --release --locked --target "$TARGET" \
+      --manifest-path tools/mqttui/Cargo.toml >&2
+  else
+    cargo build --release --locked --target "$TARGET" -p "$pkg" >&2
+  fi
 done
 
 # stdout stays the broker path: callers (and RELEASING.md) treat this script's

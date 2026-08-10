@@ -74,28 +74,47 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Reproducible build
-        run: scripts/release/build-repro.sh ${{ matrix.target }}
+        # mqttui is named explicitly: it lives in its own workspace with its own lockfile
+        # (ADR 0056 §1), so it is not part of the default package set.
+        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui
 
       # Independent proof of byte-reproducibility: fully clean and rebuild from
       # the same tag, then assert the two binaries are identical.
       - name: Verify reproducibility (clean rebuild is byte-identical)
         run: |
-          # BOTH shipped binaries must be reproducible, not just the broker's —
-          # a signature over a binary nobody can regenerate proves less.
-          for b in mqttd mqtt-bridge; do
-            sha256sum "target/${{ matrix.target }}/release/$b" | awk '{print $1}' >> first.sha256
+          # EVERY shipped binary must be reproducible, not just the broker's — a signature
+          # over a binary nobody can regenerate proves less. mqttui's artefacts live under
+          # its own workspace, so its path differs from the other two.
+          paths() {
+            echo "target/${{ matrix.target }}/release/mqttd"
+            echo "target/${{ matrix.target }}/release/mqtt-bridge"
+            echo "tools/mqttui/target/${{ matrix.target }}/release/mqttui"
+          }
+          paths | while read -r b; do
+            sha256sum "$b" | awk '{print $1}' >> first.sha256
           done
+          # BOTH workspaces must be cleaned. `cargo clean` at the root does not touch
+          # tools/mqttui/target, so leaving it would re-checksum the very same file and the
+          # comparison would pass without a rebuild having happened — a check that cannot
+          # fail is worse than no check, because it reports the property it never tested.
           cargo clean
-          scripts/release/build-repro.sh ${{ matrix.target }}
-          for b in mqttd mqtt-bridge; do
-            sha256sum "target/${{ matrix.target }}/release/$b" | awk '{print $1}' >> second.sha256
+          cargo clean --manifest-path tools/mqttui/Cargo.toml
+          for b in $(paths); do
+            if [ -e "$b" ]; then
+              echo "::error title=Reproducibility::$b survived the clean, so the rebuild below would not be a rebuild"
+              exit 1
+            fi
+          done
+          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui
+          paths | while read -r b; do
+            sha256sum "$b" | awk '{print $1}' >> second.sha256
           done
           if ! diff -q first.sha256 second.sha256; then
             echo "::error title=Reproducibility::rebuild of the tag was not byte-identical"
             paste first.sha256 second.sha256
             exit 1
           fi
-          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\n') first.sha256
+          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttui\n') first.sha256
 
       - name: Stage artifact + checksum
         id: stage
@@ -103,16 +122,23 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="mqttd-${VERSION}-${{ matrix.target }}"
           BRIDGE_NAME="mqtt-bridge-${VERSION}-${{ matrix.target }}"
+          UI_NAME="mqttui-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
           cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
+          # mqttui ships as a signed binary but NOT in the container image: it is a terminal
+          # UI for a human at a keyboard, and adding a TUI to the broker image would grow
+          # the runtime attack surface for something nothing in the image can use.
+          cp "tools/mqttui/target/${{ matrix.target }}/release/mqttui" "out/${UI_NAME}"
           # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
           cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
           ( cd out && sha256sum "${NAME}" > "${NAME}.sha256" )
           ( cd out && sha256sum "${BRIDGE_NAME}" > "${BRIDGE_NAME}.sha256" )
+          ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # SLSA build provenance for the binary — what commit/workflow produced it.
@@ -122,6 +148,7 @@ jobs:
           subject-path: |
             out/${{ steps.stage.outputs.name }}
             out/${{ steps.stage.outputs.bridge_name }}
+            out/${{ steps.stage.outputs.ui_name }}
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
@@ -296,6 +323,21 @@ jobs:
             cp "$SBOM" "assets/${out}-${{ steps.v.outputs.version }}.cdx.json"
             echo "SBOM: $SBOM -> ${out}-${{ steps.v.outputs.version }}.cdx.json ($(wc -c < "$SBOM") bytes)"
           done
+
+          # mqttui is a SEPARATE workspace with its own lockfile (ADR 0056 §1), so the run
+          # above cannot see it — its graph is deliberately not in the broker's. It is a
+          # published, signed artifact, so by ADR 0045's own standard it gets an SBOM too,
+          # cut from ITS lockfile.
+          cargo cyclonedx --format json --manifest-path tools/mqttui/Cargo.toml
+          git diff --exit-code tools/mqttui/Cargo.lock || {
+            echo "::error title=SBOM::mqttui SBOM generation mutated tools/mqttui/Cargo.lock"; exit 1;
+          }
+          UI_SBOM="$(find tools/mqttui -name 'mqttui.cdx.json' -print -quit)"
+          if [ -z "$UI_SBOM" ]; then
+            echo "::error title=SBOM::cargo-cyclonedx produced no mqttui.cdx.json"; exit 1
+          fi
+          cp "$UI_SBOM" "assets/sbom-mqttui-${{ steps.v.outputs.version }}.cdx.json"
+          echo "SBOM: $UI_SBOM -> sbom-mqttui-${{ steps.v.outputs.version }}.cdx.json ($(wc -c < "$UI_SBOM") bytes)"
 
       # ── Keyless signatures (cosign) over every release asset ──
       - name: Sign binaries, checksums, and SBOM (keyless)

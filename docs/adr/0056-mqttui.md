@@ -246,7 +246,8 @@ work that cannot help.
 ### Decision A — the examples are embedded, not fetched
 
 The full example surface — `demo/`, `deploy/helm/`, `deploy/compose/`, `deploy/crds/`,
-`scripts/migrate/`, `scripts/k8s/` — is **161 KB compressed** (measured). Embedding it with
+`scripts/migrate/`, `scripts/k8s/` — is **190 KB compressed** (re-measured 2026-08-10 when
+T9 vendored it; the earlier 161 KB predates `deploy/` growing). Embedding it with
 `include_dir!` costs nothing worth discussing and buys three things: it works offline, it
 is version-locked to the binary that was tested with it, and **it executes nothing that
 arrived over the network**.
@@ -284,7 +285,27 @@ knowingly.
 
 Decision 1 is unaffected and is now doing more work than before: `mqttui` is published as
 its **own** crate from its **own** workspace, so `ratatui` never enters the broker's
-dependency graph even though both are now released artifacts.
+dependency graph even though both are now released artifacts. Its SBOM is cut from its own
+lockfile for the same reason.
+
+**Publishing forced the examples to be vendored.** `include_dir!` reads the filesystem at
+compile time and `cargo package` includes only files beneath the package root, so
+`include_dir!("$CARGO_MANIFEST_DIR/../../demo")` builds perfectly from a checkout and
+produces a crate that **cannot compile once published**. Found by running
+`cargo publish --dry-run`, not by reasoning about it. `tools/mqttui/bundle/` is therefore a
+generated copy maintained by `scripts/vendor-mqttui-examples.sh`, with the originals
+remaining the source of truth and a CI-gated `--check` mode — the same arrangement as
+`gen-status.py` and the delivery docs, and for the same reason: a stale copy would hand a
+`cargo install` user a different demo from the one in this repository.
+
+**`mqttui` is not added to the container images.** It is a terminal UI for a human at a
+keyboard; nothing in a distroless image can use one, so including it would grow the runtime
+attack surface for no user.
+
+**The crates.io publish stays a manual step** (`RELEASING.md` step 7). A crates.io version
+is permanent and cannot be re-uploaded, and that is not a property to put behind an
+automatic trigger. CI proves the crate packs and builds from its own tarball on every PR,
+so the manual step is a formality rather than a risk.
 
 ### Decision D — the migration converter is reimplemented in Rust
 

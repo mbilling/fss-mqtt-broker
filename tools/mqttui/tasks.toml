@@ -26,12 +26,21 @@
 [[task]]
 id = "demo-quic-certs"
 group = "Demo"
-name = "Generate the demo QUIC certificates"
+name = "Mint the demo QUIC PKI (run by the stack itself)"
 script = "demo/quic/gen-certs.sh"
+# Stack plumbing, not a task a user should start. It writes to CERT_DIR, whose default
+# `/certs` is a path inside the demo container, and the certificates it mints live in the
+# `quic-certs` Docker volume that eight services mount. Run on a host it fails with
+# `mkdir: /certs: Read-only file system`, and even given a writable CERT_DIR it would put
+# the PKI where the stack never looks. An earlier version of this manifest offered it and
+# told the user to "run it once before demo-stack" — found by running it standalone.
+hidden = true
+needs_checkout = false
 about = """
 Mints a throwaway CA plus server and client certificates for the MQTT-over-QUIC listener
-(ADR 0036). QUIC mandates TLS 1.3 and this demo requires client certificates, so the stack
-will not start without these. Run once before `demo-stack`.
+(ADR 0036). `demo-stack` runs this itself: docker-compose.yml declares a `quic-certs` init
+service with CERT_DIR=/certs writing into a named volume, and every broker depends on it.
+There is nothing to do by hand.
 """
 requires = ["openssl"]
 duration = "~2s"
@@ -382,6 +391,24 @@ about = "Validates the ADR count, crate table and anchors against the repository
 requires = ["python3"]
 duration = "~1s"
 hidden = true
+
+[[task]]
+id = "vendor-examples"
+group = "Internal"
+name = "Refresh the vendored example bundle inside the mqttui package"
+script = "scripts/vendor-mqttui-examples.sh"
+# Copies FROM this repository's demo/, deploy/ and scripts/ — there is nothing to copy
+# without them.
+needs_checkout = true
+hidden = true
+about = """
+tools/mqttui/bundle/ is a generated copy of demo/, deploy/, scripts/migrate/ and
+scripts/k8s/. It exists because `cargo package` includes only files beneath the package
+root, so include_dir! pointing at ../../ builds from a checkout and produces a crate that
+cannot compile once published. CI runs `--check`, so the copy cannot go stale unnoticed.
+"""
+requires = ["diff"]
+duration = "~1s"
 
 [[task]]
 id = "gen-bridge-dashboard"

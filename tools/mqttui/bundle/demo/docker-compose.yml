@@ -1,0 +1,310 @@
+name: mqttd-demo
+
+# A 7-node durable mqttd cluster plus a Grafana / Prometheus / Alloy observability
+# stack (EXPERIMENT: scaled up from the baseline 3-node demo). Each broker BOTH exposes
+# Prometheus /metrics (scraped by Alloy) and pushes OTLP/HTTP to Alloy — so both metric
+# paths are exercised. A small load generator drives cross-node traffic so the dashboard
+# is populated.
+#
+#   cd demo && docker compose up --build
+#   Grafana:    http://localhost:3000  (anonymous admin) -> "mqttd — broker overview"
+#   Prometheus: http://localhost:9090
+#   Alloy UI:   http://localhost:12345
+#   MQTT:       localhost:1883 / 1884 / 1885 / 1887 / 1888 / 1889 / 1891  (mqttd-1..7)
+
+x-broker-env: &broker-env
+  MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext, loudly logged insecure
+  MQTTD_WS_BIND: 0.0.0.0:1890          # demo only — native MQTT-over-WebSocket (ADR 0035),
+                                       # plaintext; lets the browser playground be real mqttd
+                                       # sessions (no mosquitto gateway)
+  MQTTD_QUIC_BIND: 0.0.0.0:1894        # native MQTT-over-QUIC (ADR 0036, UDP). QUIC mandates
+                                       # TLS 1.3 + mTLS — material from the quic-certs volume.
+  MQTTD_TLS_CERT: /certs/server.pem    # used by the QUIC listener (not a TCP TLS listener)
+  MQTTD_TLS_KEY: /certs/server.key
+  MQTTD_TLS_CLIENT_CA: /certs/ca.pem   # QUIC clients present a cert; identity = its CN
+  MQTTD_ALLOW_ANONYMOUS: "1"           # demo only — no auth configured; the broker is
+                                       # deny-by-default, so anonymous clients (the loadgen)
+                                       # must be explicitly permitted (ADR 0004)
+  MQTTD_HEALTH_BIND: 0.0.0.0:8080      # serves /livez, /readyz, /metrics
+  # Durable (on-disk, consensus-backed) sessions — the default (ADR 0029). Each broker
+  # persists its lease group and replicated session log to its own /data volume (mounted
+  # per service below), so the lease_* / durable_append_* panels populate with a real,
+  # stable leader. The lease group forms in ~90s and holds a flat term under load
+  # (ADR 0026 timing, ADR 0027 replica group-commit, ADR 0028 link-gated voter admission).
+  MQTTD_DATA_DIR: /data
+  MQTTD_OTLP_ENDPOINT: http://alloy:4318
+  MQTTD_OTLP_INTERVAL: "5"
+  MQTTD_READY_MIN_MEMBERS: "4"        # a node is /readyz once it sees a majority of the
+                                       # cluster (the durable-quorum floor); set by scale-cluster.py
+  RUST_LOG: info
+
+services:
+  mqttd-1:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    image: mqttd-demo
+    hostname: mqttd-1
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-1
+      MQTTD_PEER_BIND: mqttd-1:7001    # advertised to peers -> must be resolvable
+      MQTTD_SWIM_BIND: mqttd-1:7946    # founder: no SWIM seeds
+    # 8089 -> native MQTT-over-WS (playground); 8094/udp -> native MQTT-over-QUIC (ADR 0036).
+    ports: ["1883:1883", "8080:8080", "8089:1890", "8094:1894/udp"]
+    volumes: ["d1:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      alloy:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  # >>> generated: follower nodes mqttd-2..N — edit demo/scale-cluster.py, not here >>>
+  mqttd-2:
+    image: mqttd-demo
+    hostname: mqttd-2
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-2
+      MQTTD_PEER_BIND: mqttd-2:7001
+      MQTTD_SWIM_BIND: mqttd-2:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1884:1883", "8081:8080"]
+    volumes: ["d2:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-3:
+    image: mqttd-demo
+    hostname: mqttd-3
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-3
+      MQTTD_PEER_BIND: mqttd-3:7001
+      MQTTD_SWIM_BIND: mqttd-3:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1885:1883", "8082:8080"]
+    volumes: ["d3:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-4:
+    image: mqttd-demo
+    hostname: mqttd-4
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-4
+      MQTTD_PEER_BIND: mqttd-4:7001
+      MQTTD_SWIM_BIND: mqttd-4:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1887:1883", "8084:8080"]
+    volumes: ["d4:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-5:
+    image: mqttd-demo
+    hostname: mqttd-5
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-5
+      MQTTD_PEER_BIND: mqttd-5:7001
+      MQTTD_SWIM_BIND: mqttd-5:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1888:1883", "8085:8080"]
+    volumes: ["d5:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-6:
+    image: mqttd-demo
+    hostname: mqttd-6
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-6
+      MQTTD_PEER_BIND: mqttd-6:7001
+      MQTTD_SWIM_BIND: mqttd-6:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1889:1883", "8086:8080"]
+    volumes: ["d6:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  mqttd-7:
+    image: mqttd-demo
+    hostname: mqttd-7
+    environment:
+      <<: *broker-env
+      MQTTD_NODE_ID: mqttd-7
+      MQTTD_PEER_BIND: mqttd-7:7001
+      MQTTD_SWIM_BIND: mqttd-7:7946
+      MQTTD_SWIM_SEEDS: mqttd-1:7946
+    ports: ["1891:1883", "8087:8080"]
+    volumes: ["d7:/data", "quic-certs:/certs:ro"]
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+  # <<< generated: follower nodes <<<
+
+  alloy:
+    image: grafana/alloy:latest
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+    ports: ["12345:12345"]
+    depends_on: [prometheus]
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  loadgen:
+    image: eclipse-mosquitto:latest
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/loadgen.sh"]
+    volumes:
+      - ./loadgen/loadgen.sh:/loadgen.sh:ro
+    # >>> generated: loadgen node list — edit demo/scale-cluster.py, not here >>>
+    environment:
+      LOADGEN_NODES: "mqttd-1 mqttd-2 mqttd-3 mqttd-4 mqttd-5 mqttd-6 mqttd-7"
+    depends_on: [mqttd-1, mqttd-2, mqttd-3, mqttd-4, mqttd-5, mqttd-6, mqttd-7]
+    # <<< generated: loadgen node list <<<
+
+  # --- browser MQTT playground -------------------------------------------------------
+  # The page connects directly to mqttd's NATIVE MQTT-over-WebSocket listener (ADR 0035) on
+  # mqttd-1 (host port 8089) — so each browser tab is a real mqttd session (its own client-id,
+  # placement, durability, ACL, audit, metrics). nginx serves only the static page; there is
+  # no mosquitto gateway or bridge. Open http://localhost:8088 (or http://<host>:8088).
+  playground:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./playground/web:/usr/share/nginx/html:ro
+    ports: ["8088:80"]
+    depends_on: [mqttd-1]
+
+  # --- MQTT-over-QUIC showcase (ADR 0036) --------------------------------------------
+  # Browsers can't speak MQTT-over-QUIC, so a native QUIC client demonstrates it. First a
+  # one-shot generates a throwaway demo PKI (QUIC mandates TLS 1.3 + mTLS); then quic-demo
+  # connects to the cluster over QUIC and publishes across several QUIC DATA STREAMS
+  # (multi-stream). Those messages flow through the cluster, so the browser playground (over
+  # WebSocket) subscribed to `quic/demo/#` sees them, and Grafana's accepts-by-listener shows
+  # the `quic` connection.
+  quic-certs:
+    image: alpine:latest
+    command: ["sh", "-c", "apk add --no-cache openssl >/dev/null && sh /gen-certs.sh"]
+    environment:
+      CERT_DIR: /certs
+    volumes:
+      - ./quic/gen-certs.sh:/gen-certs.sh:ro
+      - quic-certs:/certs
+
+  quic-demo:
+    image: mqttd-demo
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/quic-demo"]
+    environment:
+      QUIC_TARGET: mqttd-1:1894
+      QUIC_SERVERNAME: mqttd-1
+      QUIC_CA: /certs/ca.pem
+      QUIC_CERT: /certs/client.pem
+      QUIC_KEY: /certs/client.key
+      QUIC_STREAMS: "3"
+      QUIC_INTERVAL_MS: "700"
+      # Every 10s, rebind the client socket to simulate a network path change. The broker logs the
+      # connection migration and mqttd_quic_path_migrations_total ticks (ADR 0036 §3b) while this
+      # same quic/demo/* feed keeps flowing — no reconnect. Set to 0 to disable.
+      QUIC_MIGRATE_MS: "10000"
+    volumes:
+      - quic-certs:/certs:ro
+    depends_on:
+      mqttd-1:
+        condition: service_started
+      quic-certs:
+        condition: service_completed_successfully
+
+  # --- boundary bridge (ADR 0025) ----------------------------------------------------
+  # A SEPARATE, isolated broker in a different "security zone" — a single standalone mqttd,
+  # NOT joined to the cluster (no SWIM seeds, its own data volume). It stands in for a
+  # partner / cloud / edge broker the cluster must not be merged with.
+  partner-broker:
+    image: mqttd-demo
+    hostname: partner-broker
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only — plaintext
+      MQTTD_ALLOW_ANONYMOUS: "1"           # demo only
+      MQTTD_HEALTH_BIND: 0.0.0.0:8080
+      RUST_LOG: info
+      # No MQTTD_DURABLE / no SWIM: a plain standalone broker, deliberately outside the mesh.
+      MQTTD_DURABLE_SESSIONS: "0"
+    ports: ["1886:1883", "8083:8080"]
+    depends_on: [mqttd-1]
+
+  # The bridge: an MQTT client to BOTH the cluster (mqttd-1) and the partner broker. It
+  # forwards `telemetry/#` one-way (cluster -> partner) and `shared/#` both ways, per
+  # demo/bridge/bridge.toml. Its failure domain is its own — a bridge fault cannot touch
+  # the cluster's consensus or membership.
+  bridge:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bridge
+    image: mqtt-bridge-demo
+    hostname: bridge
+    volumes:
+      - ./bridge/bridge.toml:/etc/bridge/bridge.toml:ro
+      - bridge-spool:/data
+    ports: ["8090:8090"]   # bridge Prometheus metrics
+    depends_on: [mqttd-1, partner-broker]
+
+# Per-node durable state (lease group + replicated session log); each broker gets its own.
+volumes:
+  # >>> generated: per-node data volumes d1..dN — edit demo/scale-cluster.py, not here >>>
+  d1:
+  d2:
+  d3:
+  d4:
+  d5:
+  d6:
+  d7:
+  # <<< generated: per-node data volumes <<<
+  bridge-spool:
+  quic-certs:   # throwaway demo PKI for the MQTT-over-QUIC listener (ADR 0036)

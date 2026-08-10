@@ -4,7 +4,7 @@
 //! also do not stand alone: `deploy-smoke.sh` reads two files from `deploy/`,
 //! `kind-smoke.sh` needs the whole Helm chart. So the parts that can travel do.
 //!
-//! **Embedded, not fetched.** The whole surface measured 161 KB compressed. That buys
+//! **Embedded, not fetched.** The whole surface measures 190 KB compressed. That buys
 //! offline operation, version-locking to the binary that was tested with it, and — the
 //! property that matters — **executing nothing that arrived over the network**. Fetching a
 //! branch tarball at runtime was rejected as a default: this project cosign-signs its
@@ -21,13 +21,18 @@
 use include_dir::{include_dir, Dir};
 use std::path::{Path, PathBuf};
 
-/// The example surface. Each directory is a whole, because these scripts read their
-/// siblings — shipping a script without the files it opens would be worse than not
-/// shipping it.
-static DEMO: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../demo");
-static DEPLOY: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../deploy");
-static MIGRATE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../scripts/migrate");
-static K8S: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../scripts/k8s");
+/// The example surface: `demo/`, `deploy/`, `scripts/migrate/` and `scripts/k8s/`, laid out
+/// exactly as they sit in the repository because `tasks.toml` addresses scripts by their
+/// repository path. Each directory travels whole — these scripts read their siblings, and
+/// shipping a script without the files it opens would be worse than not shipping it.
+///
+/// Read from `bundle/`, a **generated copy** maintained by
+/// `scripts/vendor-mqttui-examples.sh`, not from `../../` directly. `cargo package` includes
+/// only files beneath the package root, so pointing at the originals produces a crate that
+/// builds from a checkout and cannot compile once published — confirmed by
+/// `cargo publish --dry-run` before this was changed. CI runs the script's `--check` mode,
+/// so the copy cannot go stale unnoticed.
+static BUNDLE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/bundle");
 
 /// Why a task cannot run here.
 ///
@@ -109,10 +114,7 @@ pub fn unpack() -> Result<PathBuf, String> {
     }
     let _ = std::fs::remove_dir_all(&root);
 
-    write_dir(&DEMO, &root.join("demo"))?;
-    write_dir(&DEPLOY, &root.join("deploy"))?;
-    write_dir(&MIGRATE, &root.join("scripts").join("migrate"))?;
-    write_dir(&K8S, &root.join("scripts").join("k8s"))?;
+    write_dir(&BUNDLE, &root)?;
 
     // Only stamped once everything landed, so an interrupted unpack is redone rather than
     // trusted.
@@ -170,22 +172,19 @@ mod tests {
     /// examples really travelled.
     #[test]
     fn the_examples_are_actually_embedded() {
-        assert!(
-            DEMO.get_file("docker-compose.yml").is_some(),
-            "the demo stack must travel with the binary"
-        );
-        assert!(
-            DEPLOY.get_file("compose/compose.yaml").is_some(),
-            "the compose reference deployment must travel"
-        );
-        assert!(
-            DEPLOY.get_file("helm/mqttd/Chart.yaml").is_some(),
-            "the Kubernetes examples must travel"
-        );
-        assert!(
-            MIGRATE.get_file("from-mosquitto.py").is_some(),
-            "the migration converter must travel"
-        );
+        for path in [
+            "demo/docker-compose.yml",
+            "deploy/compose/compose.yaml",
+            "deploy/helm/mqttd/Chart.yaml",
+            "scripts/migrate/from-mosquitto.py",
+            "scripts/k8s/check-bridge-chart.sh",
+        ] {
+            assert!(
+                BUNDLE.get_file(path).is_some(),
+                "{path} must travel with the binary — if bundle/ went missing or stale, \
+                 `cargo install mqttui` ships a launcher with nothing to launch"
+            );
+        }
     }
 
     /// Unpacking produces real files, and a shell script comes out executable — otherwise

@@ -10,8 +10,17 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-description = "Run the mqttd demo, migration and test scripts from one place"
+description = "Terminal UI for the mqttd MQTT broker's demo, migration and operational scripts — examples included, no checkout needed"
 repository = "https://github.com/mbilling/fss-mqtt-broker"
+readme = "README.md"
+homepage = "https://github.com/mbilling/fss-mqtt-broker"
+keywords = ["mqtt", "tui", "broker", "migration", "kubernetes"]
+categories = ["command-line-utilities"]
+# `bundle/` is a GENERATED copy of the repository's demo/, deploy/ and scripts/ directories
+# (scripts/vendor-mqttui-examples.sh), and it must ship: `cargo package` includes only files
+# beneath the package root, so without it the published crate does not compile. Listed
+# explicitly so a future `exclude` cannot drop it by accident.
+include = ["src/**/*", "tests/**/*", "bundle/**/*", "tasks.toml", "README.md"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -21,7 +30,7 @@ toml = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
 # T7: the demo, Kubernetes and compose examples travel INSIDE the binary — measured at
-# 161 KB compressed for the whole surface, so this costs nothing worth discussing and buys
+# 190 KB compressed for the whole surface, so this costs nothing worth discussing and buys
 # offline operation, version-locking to the binary that was tested with it, and executing
 # nothing that arrived over the network.
 include_dir = "0.7"
