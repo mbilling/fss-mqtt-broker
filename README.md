@@ -34,7 +34,7 @@ scaling curve has not been measured.
 See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (56 ADRs, per-task status).
+record of exactly what is built (57 ADRs, per-task status).
 
 **Jump to:** [**Start here**](#start-here) ·
 [Try it in two minutes](#try-it-in-two-minutes) ·
