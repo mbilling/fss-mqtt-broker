@@ -397,6 +397,7 @@ pub async fn start_broker_with_policy(policy: Arc<ConnPolicy>) -> SocketAddr {
 
 /// A minimal MQTT client over the project framing + codec.
 /// Outcome of a bounded, non-panicking receive ([`Client::recv_bounded`]).
+#[derive(Debug)]
 pub enum Recv {
     /// A packet arrived.
     Packet(Packet),
