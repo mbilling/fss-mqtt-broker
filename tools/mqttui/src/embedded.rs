@@ -13,10 +13,10 @@
 //!
 //! ## What cannot travel
 //!
-//! Four tasks operate *on the repository* — `build-repro.sh` builds it,
-//! `render-parity.sh` diffs the chart against the operator, `gen-status.py` and
-//! `check-readme-facts.py` check its own documentation. No amount of embedding frees them,
-//! and the ADR says so rather than letting it be discovered.
+//! Nine tasks operate *on the repository* — building it, diffing its rendered output,
+//! checking its own documentation — and no amount of embedding frees them. They are
+//! declared with `needs_checkout = true` in `tasks.toml` rather than left to be
+//! discovered; the full list and the reasons live there.
 
 use include_dir::{include_dir, Dir};
 use std::path::{Path, PathBuf};
@@ -115,6 +115,17 @@ impl Source {
 /// # Errors
 /// If the cache directory cannot be created or written.
 pub fn unpack() -> Result<PathBuf, String> {
+    // Serialises unpacks within this process. The first version had no lock and wrote the
+    // tree IN PLACE after a remove_dir_all — so two callers that both missed the stamp
+    // (parallel test threads on a fresh machine) would each delete what the other had just
+    // finished writing. It never fired locally, because a stamp from any earlier run made
+    // every caller take the fast path; it fired on CI's fresh HOME, after the PR had
+    // already merged green twice.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK
+        .lock()
+        .map_err(|_| "an earlier unpack panicked".to_string())?;
+
     let base = cache_root()?;
     // Version-stamped, so upgrading the binary cannot leave an older example behind — the
     // examples are only trustworthy as the set the binary was tested with.
@@ -122,15 +133,37 @@ pub fn unpack() -> Result<PathBuf, String> {
     if root.join(".complete").is_file() {
         return Ok(root);
     }
-    let _ = std::fs::remove_dir_all(&root);
 
-    write_dir(&BUNDLE, &root)?;
-
-    // Only stamped once everything landed, so an interrupted unpack is redone rather than
-    // trusted.
-    std::fs::write(root.join(".complete"), env!("CARGO_PKG_VERSION"))
+    // Stage under a process-unique name, then rename into place. The rename is atomic, so
+    // no observer — including another mqttui PROCESS, which the mutex cannot see — can
+    // ever read a half-written tree at `root`: it is either absent, or complete.
+    let stage = base.join(format!(".stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    write_dir(&BUNDLE, &stage)?;
+    // Stamped before the rename, so the tree that appears at `root` is born complete.
+    std::fs::write(stage.join(".complete"), env!("CARGO_PKG_VERSION"))
         .map_err(|e| format!("could not finish unpacking examples: {e}"))?;
-    Ok(root)
+
+    match std::fs::rename(&stage, &root) {
+        Ok(()) => Ok(root),
+        // The rename fails if `root` appeared meanwhile. If it is a COMPLETE tree, another
+        // process won the race — use its work and discard ours. A complete tree is never
+        // deleted; only a stampless leftover (a crashed unpack under the old in-place
+        // scheme) is cleared, once, before one retry.
+        Err(_) if root.join(".complete").is_file() => {
+            let _ = std::fs::remove_dir_all(&stage);
+            Ok(root)
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&root);
+            let result = std::fs::rename(&stage, &root)
+                .map_err(|e| format!("could not move the unpacked examples into place: {e}"));
+            if result.is_err() {
+                let _ = std::fs::remove_dir_all(&stage);
+            }
+            result.map(|()| root)
+        }
+    }
 }
 
 fn write_dir(dir: &Dir<'_>, dest: &Path) -> Result<(), String> {
@@ -268,6 +301,40 @@ mod tests {
         // In a checkout everything is available, including the repo-only tasks.
         let checkout = Source::Checkout(PathBuf::from("/anywhere"));
         assert!(checkout.can_run(parity));
+    }
+
+    /// The CI failure of 2026-08-10 (run #491), as a test: several callers unpack
+    /// concurrently on a machine with no stamp — exactly what parallel test threads on a
+    /// fresh runner are — and every returned root must be complete. The in-place scheme
+    /// failed this because one caller's `remove_dir_all` could delete a tree another had
+    /// just finished; it passed locally purely because earlier runs had left a stamp.
+    #[test]
+    fn concurrent_unpacks_never_observe_a_half_written_tree() {
+        let base = cache_root().expect("cache root");
+        let _ =
+            std::fs::remove_dir_all(base.join(format!("examples-{}", env!("CARGO_PKG_VERSION"))));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let root = unpack().expect("unpack");
+                    for p in [
+                        "deploy/compose/compose.yaml",
+                        "demo/docker-compose.yml",
+                        ".complete",
+                    ] {
+                        assert!(
+                            root.join(p).is_file(),
+                            "{} missing from a returned root — a caller observed a torn tree",
+                            root.join(p).display()
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("a concurrent unpack caller panicked");
+        }
     }
 
     /// "Needs a clone" and "is not in this bundle" must not collapse into one answer:
