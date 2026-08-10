@@ -918,6 +918,43 @@ impl mqtt_storage::SessionStore for FlakyStore {
         self.inner.received(client).await
     }
 
+    async fn record_outbound(
+        &self,
+        client: &mqtt_core::ClientId,
+        packet_id: u16,
+        offset: mqtt_storage::Offset,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        // A WRITE like any other on the durable path (ADR 0057): while writes fail, the
+        // PUBLISH it gates must not go out, exactly as a failed enqueue withholds PUBACK.
+        self.check_write()?;
+        self.inner.record_outbound(client, packet_id, offset).await
+    }
+
+    async fn advance_outbound(
+        &self,
+        client: &mqtt_core::ClientId,
+        packet_id: u16,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.advance_outbound(client, packet_id).await
+    }
+
+    async fn clear_outbound(
+        &self,
+        client: &mqtt_core::ClientId,
+        packet_id: u16,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.clear_outbound(client, packet_id).await
+    }
+
+    async fn outbound(
+        &self,
+        client: &mqtt_core::ClientId,
+    ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+        self.inner.outbound(client).await
+    }
+
     async fn next_packet_id(
         &self,
         client: &mqtt_core::ClientId,

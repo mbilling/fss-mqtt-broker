@@ -5684,6 +5684,43 @@ mod tests {
             self.inner.received(client).await
         }
 
+        async fn record_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+            offset: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            // Gated like enqueue: recording the outbound id is part of the same
+            // fail-closed durable path (ADR 0057), so the fault seam covers it too.
+            if self.fail_enqueue_no_quorum {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
+            self.inner.record_outbound(client, packet_id, offset).await
+        }
+
+        async fn advance_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.advance_outbound(client, packet_id).await
+        }
+
+        async fn clear_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_outbound(client, packet_id).await
+        }
+
+        async fn outbound(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            self.inner.outbound(client).await
+        }
+
         async fn next_packet_id(
             &self,
             client: &ClientId,
