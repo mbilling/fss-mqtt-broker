@@ -1,0 +1,338 @@
+# Default values for the mqttd chart (ADR 0047). Every value is documented; the secure,
+# cluster-correct defaults are the ones that ship.
+
+image:
+  repository: ghcr.io/mbilling/fss-mqtt-broker
+  # Defaults to .Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# A small POSIX-shell image used only by the init container that renders the per-pod config
+# (the broker image itself is distroless and has no shell). Any busybox/alpine works.
+initImage:
+  repository: busybox
+  tag: "1.36"
+  pullPolicy: IfNotPresent
+
+# Cluster size. The StatefulSet's pod-0 is the gossip founder (no seeds); pods 1..N seed to it
+# and the mesh self-forms over the headless service (ADR 0016).
+#
+# USE AN ODD NUMBER >= 3. 1 is single-node (no fault tolerance) and is fine.
+#
+# **2 IS WORSE THAN 1.** A durable write needs a quorum, and a quorum of two IS two — so
+# with two nodes, losing either one blocks durable writes entirely, where a single node
+# would have kept serving. The instinct to "add a second node for HA" makes availability
+# worse, not better. Go from 1 to 3.
+replicaCount: 3
+
+# --- Broker configuration (ADR 0046) --------------------------------------------------------
+# This becomes the ConfigMap-mounted TOML. Four placeholders — __NODE_ID__, __SEEDS__,
+# __PEER_ADVERTISE__, and __READY_MIN__ — are filled per-pod by the render init container
+# (node id = pod name; seeds = the first two stable ordinals for joiners, empty for pod-0;
+# peer_advertise = this pod's routable per-pod FQDN so the mesh links over the headless service
+# rather than an unroutable 0.0.0.0; ready_min = 1 for the founder, a majority of replicaCount
+# for joiners — see [runtime] below). Everything else is verbatim. Keep secrets OUT of here —
+# reference them by the mounted paths under `secrets` below.
+config: |
+  [node]
+  id = "__NODE_ID__"
+  data_dir = "/var/lib/mqttd"
+
+  [listeners]
+  tls_bind = "0.0.0.0:8883"
+  health_bind = "0.0.0.0:8080"
+
+  [tls]
+  cert = "/etc/mqttd/tls/tls.crt"
+  key = "/etc/mqttd/tls/tls.key"
+
+  [security]
+  acl_file = "/etc/mqttd/acl/acl.toml"
+
+  [cluster]
+  peer_bind = "0.0.0.0:7001"
+  peer_advertise = "__PEER_ADVERTISE__"
+
+  [cluster.swim]
+  bind = "0.0.0.0:7946"
+  seeds = [__SEEDS__]
+
+  [durable]
+  enabled = true
+  lease_voters = 5
+
+  [runtime]
+  # Watch the mounted policy files (TLS cert/key/CA, ACL, CRLs — ADR 0033) and hot-reload
+  # through the validate-before-swap path when they change on disk. This is what makes a
+  # cert-manager renewal or an ACL ConfigMap edit reach RUNNING pods with no restart (the
+  # distroless image has no shell to signal by hand). 0 = signal-only.
+  config_watch_secs = 30
+  # Readiness floor, rendered per-pod: the founder (ordinal 0) keeps 1 so ordered bring-up
+  # can start, every joiner requires a MAJORITY of replicaCount live members before
+  # reporting ready — a minority pod stays out of Service rotation instead of serving a
+  # split view.
+  ready_min_members = __READY_MIN__
+
+# Secret material is referenced BY PATH (ADR 0046 T5) and mounted read-only from existing
+# Secrets/ConfigMaps you manage (e.g. cert-manager for TLS). Each entry, when its `secretName`
+# (or `configMapName`) is set, is mounted at `mountPath`; the paths above must match. Leave a
+# name empty to skip that mount.
+secrets:
+  # Server TLS keypair (kubernetes.io/tls Secret: keys tls.crt + tls.key).
+  tls:
+    secretName: ""
+    mountPath: /etc/mqttd/tls
+  # Topic ACL policy (a ConfigMap or Secret with key acl.toml).
+  acl:
+    configMapName: ""
+    mountPath: /etc/mqttd/acl
+  # Cluster-bus mTLS material (Secret with ca.crt/tls.crt/tls.key).
+  peerTls:
+    secretName: ""
+    mountPath: /etc/mqttd/cluster
+  # Gossip key file (Secret with key `swim-key`); set MQTTD_SWIM_KEY_FILE to <mountPath>/swim-key
+  # via extraEnv, or reference it in `config`.
+  gossipKey:
+    secretName: ""
+    mountPath: /etc/mqttd/gossip
+
+# Extra environment variables (the highest config layer — override any file setting per ADR 0046).
+extraEnv: []
+#  - name: MQTTD_SWIM_KEY_FILE
+#    value: /etc/mqttd/gossip/swim-key
+
+# --- Persistence (ADR 0018) -----------------------------------------------------------------
+# FOUNDER GUARD (ADR 0055 T9). Leave false for the FIRST install: ordinal 0 founds the
+# cluster precisely because it renders no seeds, and with this on nothing would ever
+# bootstrap. Turn it on once the cluster is formed:
+#
+#     helm upgrade <release> deploy/helm/mqttd --reuse-values --set clusterEstablished=true
+#
+# From then on ordinal 0 seeds to its peers like any joiner, so a pod-0 whose volume is
+# lost REJOINS and back-fills (ADR 0043) instead of founding a second cluster beside the
+# survivors. Ignored when replicaCount < 2 — a single-node cluster has no survivor to
+# split from and must still be able to found.
+#
+# The operator sets this for you: it latches status.bootstrapped the first time it
+# observes one cluster identity. Chart-only users flip it by hand, once.
+clusterEstablished: false
+
+# Each pod gets its OWN PersistentVolume (volumeClaimTemplate) for the redb data dir, so a
+# rescheduled pod reattaches its volume and recovers durable state — never the ephemeral trap.
+persistence:
+  enabled: true
+  size: 10Gi
+  # Empty = the cluster default StorageClass. ReadWriteOnce is required (per-pod volume).
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  # PVC lifecycle (StatefulSetAutoDeletePVC; honored on Kubernetes >= 1.27, inert before).
+  #
+  # BOTH default to Retain, because Kubernetes applies whenScaled uniformly and the
+  # argument for deleting only holds at some replica counts (issue #97).
+  #
+  # The argument: an ordinary shrink runs the ADR 0043 decommission drain first, so the
+  # departing node hands every held key to the SURVIVING replica set and its volume
+  # afterwards holds only stale, superseded state. Deleting it then also closes the
+  # stale-rejoin trap when a later scale-up reuses the ordinal.
+  #
+  # Where it fails: `--replicas=0`. There is no survivor to receive the drain, so the
+  # deletion stops reclaiming migrated data and erases the only copy — every session,
+  # every retained message, and the cluster identity, silently, from an operation that
+  # looks like an ordinary restart. Verified on kind: the identity came back different.
+  #
+  # So the default is safe-by-default and the orphan is visible and reversible. Set
+  # whenScaled: Delete if you shrink often, never scale to zero, and would rather not
+  # reclaim volumes by hand — and see the stale-rejoin note in docs/OPERATIONS.md.
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+# --- Scale-down / shutdown (ADR 0043 / 0019) ------------------------------------------------
+# preStop sends SIGUSR1 to begin a DECOMMISSION drain (hand every held key to its post-departure
+# replica set, verify, then leave gracefully). terminationGracePeriodSeconds must cover the drain
+# PLUS the graceful shutdown; a hard kill past it falls back to crash semantics survivors handle.
+terminationGracePeriodSeconds: 300
+
+# --- Rollout safety (ADR 0039) --------------------------------------------------------------
+# The StatefulSet rolls one pod at a time (OrderedReady + RollingUpdate). The PDB stops a node
+# drain / voluntary disruption from taking two brokers — and thus quorum — at once.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# --- Probes (ADR 0020) ----------------------------------------------------------------------
+# /readyz gates traffic on mesh + lease-group readiness; /livez reports hub liveness. Generous
+# startup allowance so a joining node that is catching up is not liveness-killed.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  periodSeconds: 5
+  failureThreshold: 3
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: health
+  periodSeconds: 10
+  failureThreshold: 6
+startupProbe:
+  httpGet:
+    path: /livez
+    port: health
+  periodSeconds: 5
+  failureThreshold: 60
+
+# Run `mqttd --check-config` as an init container so a bad config fails the pod before it serves.
+checkConfig:
+  enabled: true
+
+# --- Services ------------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Client-facing ports. mqtt = TLS listener (8883). Add plaintext/ws/quic here if enabled.
+  ports:
+    - name: mqtt-tls
+      port: 8883
+      targetPort: mqtt-tls
+  annotations: {}
+
+# Prometheus scrape. If you run the Prometheus Operator, enable serviceMonitor; otherwise the
+# pod carries prometheus.io/scrape annotations.
+metrics:
+  podAnnotations: true
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# --- Pod placement / resources -------------------------------------------------------------
+resources: {}
+#  requests:
+#    cpu: 500m
+#    memory: 512Mi
+#  limits:
+#    memory: 1Gi
+nodeSelector: {}
+tolerations: []
+# Spread brokers across nodes/zones so one node/zone loss can't take quorum.
+affinity: {}
+topologySpreadConstraints: []
+
+podAnnotations: {}
+podLabels: {}
+# Distroless runs as uid 65532 (nonroot); keep that and drop everything.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Boundary bridge (ADR 0025) — OFF by default.
+#
+# Deployed BESIDE the broker, never inside it: the bridge is an MQTT client to
+# both sides with its own identity, credentials and failure domain, and it
+# usually belongs in a different security zone from the cluster it bridges.
+# ---------------------------------------------------------------------------
+bridge:
+  enabled: false
+
+  image:
+    repository: ghcr.io/mbilling/fss-mqtt-broker-bridge
+    # Defaults to .Chart.appVersion when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # Run >=2 ONLY with a non-empty `share_group` in the config below: the replicas
+  # then take the local stream through a shared subscription, so adding one adds
+  # redundancy instead of duplicate deliveries.
+  replicaCount: 1
+
+  # The bridge's whole configuration (ADR 0025 §3), rendered to a ConfigMap.
+  #
+  # __POD_NAME__ is substituted with the pod's own name before the bridge starts.
+  # Use it in every client_id. MQTT client ids must be unique — replicas sharing
+  # one take over each other's session in a reconnect loop instead of running as
+  # an HA pair. An unset client_id is now generated per instance in MQTT's
+  # guaranteed-support shape (<=23 bytes, alphanumeric), so it is already per-pod;
+  # setting it here keeps the identity visible in the config rather than implied
+  # by the environment. Anything you set is used VERBATIM — keep it within 23
+  # alphanumeric bytes if an upstream is strict.
+  #
+  # Secrets are referenced BY PATH (password_file, TLS key files) and mounted via
+  # `extraVolumes`/`extraVolumeMounts` from a Secret — never inlined here.
+  config: |
+    hop_count_limit = 8
+    # Non-empty + replicaCount >= 2 = HA without duplicate forwarding.
+    share_group = ""
+    metrics_bind = "0.0.0.0:8090"
+
+    [local]
+    # The cluster's own client service; any node will do.
+    url = "mqttd:1883"
+    client_id = "bridge-__POD_NAME__"
+
+    [spool]
+    # Store-and-forward across an upstream outage. Set persistence.enabled to keep
+    # it across a restart.
+    dir = "/var/lib/mqtt-bridge"
+    max_messages = 10000
+
+    # Deny-by-default: nothing crosses until a rule says so.
+    # [[upstreams]]
+    # name = "partner"
+    # url = "partner.example:8883"
+    # client_id = "bridge-partner-__POD_NAME__"
+    # username = "bridge"
+    # password_file = "/etc/mqtt-bridge/secrets/partner-password"
+    # [upstreams.tls]
+    # ca = "/etc/mqtt-bridge/secrets/partner-ca.pem"
+    # [[upstreams.rules]]
+    # direction = "out"          # out | in | both — one-way is enforced in code
+    # filter = "telemetry/#"
+    # qos = 1
+
+  # Per-replica spool volume. Without it the spool is lost on restart, so anything
+  # buffered during an upstream outage is gone.
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+    # Both Retain, deliberately. A replica's spool can only be replayed by that
+    # replica, so a volume deleted on scale-down takes its unsent backlog with it.
+    retentionPolicy:
+      whenDeleted: Retain
+      whenScaled: Retain
+
+  # Extra mounts for credentials and TLS material (from Secrets).
+  extraVolumes: []
+  #  - name: bridge-secrets
+  #    secret:
+  #      secretName: bridge-credentials
+  extraVolumeMounts: []
+  #  - name: bridge-secrets
+  #    mountPath: /etc/mqtt-bridge/secrets
+  #    readOnly: true
+
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
