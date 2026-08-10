@@ -11,6 +11,7 @@ pub mod cluster;
 pub mod config_watch;
 pub mod conn;
 pub mod health;
+pub mod http_auth;
 pub mod hub;
 pub mod memory_watch;
 pub mod oidc;

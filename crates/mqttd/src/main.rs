@@ -866,19 +866,20 @@ fn client_policy(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             authorizer_from_config(&snap)?,
-            authenticator_from_config(&snap, oidc_auth.clone())?,
+            authenticator_from_config(&snap, oidc_auth.clone(), Some(&metrics))?,
         )
     };
     let build = {
         let live = live.clone();
         let oidc_auth = oidc_auth.clone();
+        let metrics = metrics.clone();
         move || -> reload::BuildResult {
             let snap = live
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let authz = authorizer_from_config(&snap).map_err(|e| e.to_string())?;
-            let auth =
-                authenticator_from_config(&snap, oidc_auth.clone()).map_err(|e| e.to_string())?;
+            let auth = authenticator_from_config(&snap, oidc_auth.clone(), Some(&metrics))
+                .map_err(|e| e.to_string())?;
             Ok((authz, auth))
         }
     };
@@ -1047,6 +1048,7 @@ fn spawn_config_watcher(
 fn authenticator_from_config(
     config: &Config,
     oidc: Option<Arc<mqtt_auth::oidc::OidcAuthenticator>>,
+    metrics: Option<&Arc<mqtt_observability::metrics::Metrics>>,
 ) -> Result<Arc<dyn Authenticator>, Box<dyn std::error::Error>> {
     let allow_anonymous = config.security.allow_anonymous;
     if allow_anonymous {
@@ -1082,6 +1084,26 @@ fn authenticator_from_config(
         let tok = mqtt_auth::token::TokenAuthenticator::rs256_pem(&pem, jwt_config(config))?;
         info!(%pem_path, "JWT RS256 verification enabled");
         members.push(Arc::new(tok));
+    }
+
+    // The remote hook (ADR 0004 T16) goes LAST among password verifiers: a local password
+    // file is cheaper and does not depend on a network, so a user present in both is
+    // answered without a round trip. The chain stops at the first real verdict, so a local
+    // file that REJECTS also stops here — which is why the hook is for users the file does
+    // not contain, not a fallback for ones it refuses.
+    if let Some(http_cfg) =
+        mqttd::http_auth::HttpAuthConfig::from_config(&config.security.http_auth)?
+    {
+        info!(
+            url = %http_cfg.url,
+            timeout_s = http_cfg.timeout.as_secs_f64(),
+            cache_s = http_cfg.cache_ttl.as_secs_f64(),
+            "HTTP authentication hook enabled — an unreachable hook DENIES (fail closed)"
+        );
+        members.push(Arc::new(mqttd::http_auth::HttpAuthenticator::new(
+            http_cfg,
+            metrics.cloned(),
+        )?));
     }
 
     if let Some(oidc) = oidc {

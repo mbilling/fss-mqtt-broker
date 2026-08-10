@@ -60,6 +60,22 @@ allow_anonymous = false
 # password_file = "/etc/mqttd/passwd"
 # TOML topic-ACL policy (deny by default). Without it, authorization is NOT enforced (logged).
 acl_file = "/etc/mqttd/acl.toml"
+
+# Remote HTTP authentication hook (ADR 0004 T16). The broker POSTs
+# {client_id, username, password, method} and reads the HTTP STATUS as the verdict:
+#   200 = allow (an optional {"groups":[...]} body enriches the identity)
+#   401/403 = deny
+#   anything else, a timeout, or an unreachable host = DENY (fail closed)
+# One hook reaches LDAP / OAuth2 / a bespoke user table with no broker integration per
+# backend. Tried AFTER the local password file, so a user in both costs no round trip.
+# [security.http_auth]
+# url = "https://auth.internal.example/mqtt"
+# timeout_secs = 5          # the ONLY bound on how long a CONNECT waits; expires closed
+# cache_secs = 0            # cache ACCEPTED credentials for N seconds (0 = off).
+#                           # Rejections are never cached: a fixed password takes effect
+#                           # at once, and caching denials outlasts the outage.
+# cache_max = 10000         # bounded — the cache is filled from a network-facing path
+# allow_http = false        # INSECURE: the password crosses this link
 # Per-round enhanced-auth reply timeout, seconds (default 10).
 # auth_timeout_secs = 10
 

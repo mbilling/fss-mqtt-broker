@@ -132,6 +132,8 @@ pub struct Security {
     pub jwt: Jwt,
     /// OIDC-mode token verification (ADR 0050).
     pub oidc: Oidc,
+    /// Remote HTTP authentication hook (ADR 0004 T16).
+    pub http_auth: HttpAuth,
     /// Seconds a client may take to authenticate before the connection is dropped
     /// (`MQTTD_AUTH_TIMEOUT`).
     pub auth_timeout_secs: Option<u64>,
@@ -149,6 +151,7 @@ impl Default for Security {
             acl_file: None,
             jwt: Jwt::default(),
             oidc: Oidc::default(),
+            http_auth: HttpAuth::default(),
             auth_timeout_secs: None,
             auth_penalty: AuthPenalty::default(),
         }
@@ -189,6 +192,34 @@ pub struct Oidc {
     pub allow_http: bool,
     /// Claim to read group memberships from (`MQTTD_OIDC_GROUPS_CLAIM`, default `groups`).
     pub groups_claim: Option<String>,
+}
+
+/// Remote HTTP authentication hook (`MQTTD_HTTP_AUTH_*`, ADR 0004 T16).
+///
+/// One hook reaches every backend the broker will never implement natively — LDAP,
+/// `OAuth2` introspection, a bespoke user table. The broker `POST`s the credential to `url`
+/// and reads the **HTTP status** as the verdict.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpAuth {
+    /// Endpoint to POST credentials to (`MQTTD_HTTP_AUTH_URL`); enables the hook.
+    /// Must be `https` unless [`allow_http`](Self::allow_http) is set.
+    pub url: Option<String>,
+    /// Per-request timeout in seconds (`MQTTD_HTTP_AUTH_TIMEOUT`, default 5).
+    ///
+    /// The broker applies no timeout of its own around an authenticator, so this is the
+    /// only bound on how long a CONNECT can wait. It expires **closed**.
+    pub timeout_secs: Option<u64>,
+    /// Seconds to cache an ACCEPTED credential (`MQTTD_HTTP_AUTH_CACHE_SECS`, default 0
+    /// = no caching). Rejections are never cached: a fixed password must take effect at
+    /// once, and caching denials would turn a hook outage into a lasting one.
+    pub cache_secs: Option<u64>,
+    /// Most accepted credentials to hold in the cache (`MQTTD_HTTP_AUTH_CACHE_MAX`,
+    /// default 10000). The cache sits on an attacker-reachable path, so it is bounded.
+    pub cache_max: Option<u64>,
+    /// Permit an `http://` hook URL (`MQTTD_HTTP_AUTH_ALLOW_HTTP` — INSECURE, loudly
+    /// logged; tests only). Credentials cross this link.
+    pub allow_http: bool,
 }
 
 /// Auth-failure penalty box (`MQTTD_AUTH_PENALTY_*`, ADR 0041 T2).
@@ -685,6 +716,23 @@ impl Config {
         on!("MQTTD_MAX_RETAINED_MESSAGES", v, {
             self.limits.max_retained_messages = Some(num("MQTTD_MAX_RETAINED_MESSAGES", &v)?);
         });
+        on!("MQTTD_HTTP_AUTH_URL", v, {
+            self.security.http_auth.url = Some(v);
+        });
+        on!("MQTTD_HTTP_AUTH_TIMEOUT", v, {
+            self.security.http_auth.timeout_secs = Some(num("MQTTD_HTTP_AUTH_TIMEOUT", &v)?);
+        });
+        on!("MQTTD_HTTP_AUTH_CACHE_SECS", v, {
+            self.security.http_auth.cache_secs = Some(num("MQTTD_HTTP_AUTH_CACHE_SECS", &v)?);
+        });
+        on!("MQTTD_HTTP_AUTH_CACHE_MAX", v, {
+            self.security.http_auth.cache_max = Some(num("MQTTD_HTTP_AUTH_CACHE_MAX", &v)?);
+        });
+        on!("MQTTD_HTTP_AUTH_ALLOW_HTTP", _v, {
+            // Presence = on, matching MQTTD_OIDC_ALLOW_HTTP and MQTTD_ALLOW_ANONYMOUS:
+            // a loudly-insecure toggle should not hinge on parsing "false".
+            self.security.http_auth.allow_http = true;
+        });
         on!("MQTTD_MEMORY_MAX_BYTES", v, {
             self.limits.memory_max_bytes = Some(num("MQTTD_MEMORY_MAX_BYTES", &v)?);
         });
@@ -894,6 +942,11 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TOPIC_ALIAS_MAX",
     "MQTTD_QUEUE_OVERFLOW",
     "MQTTD_MEMORY_MAX_BYTES",
+    "MQTTD_HTTP_AUTH_URL",
+    "MQTTD_HTTP_AUTH_TIMEOUT",
+    "MQTTD_HTTP_AUTH_CACHE_SECS",
+    "MQTTD_HTTP_AUTH_CACHE_MAX",
+    "MQTTD_HTTP_AUTH_ALLOW_HTTP",
     // observability
     "MQTTD_OTLP_ENDPOINT",
     "MQTTD_OTLP_INTERVAL",
@@ -1148,6 +1201,9 @@ mod tests {
             | "MQTTD_RECEIVE_MAXIMUM"
             | "MQTTD_TOPIC_ALIAS_MAX"
             | "MQTTD_MEMORY_MAX_BYTES"
+            | "MQTTD_HTTP_AUTH_TIMEOUT"
+            | "MQTTD_HTTP_AUTH_CACHE_SECS"
+            | "MQTTD_HTTP_AUTH_CACHE_MAX"
             | "MQTTD_OTLP_INTERVAL"
             | "MQTTD_SHUTDOWN_GRACE"
             | "MQTTD_READY_MIN_MEMBERS"
@@ -1235,7 +1291,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            67,
+            72,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
     }

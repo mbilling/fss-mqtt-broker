@@ -114,6 +114,7 @@ struct OtelInstruments {
     lease_leader: OtelGauge<i64>,
     lease_epoch: OtelGauge<i64>,
     durable_append_latency: OtelHistogram<f64>,
+    http_auth_latency: OtelHistogram<f64>,
     durable_append_failures: OtelCounter<u64>,
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
@@ -168,6 +169,7 @@ impl OtelInstruments {
             members: meter.i64_gauge("members").build(),
             lease_leader: meter.i64_gauge("lease_leader").build(),
             lease_epoch: meter.i64_gauge("lease_epoch").build(),
+            http_auth_latency: meter.f64_histogram("http_auth_latency_seconds").build(),
             durable_append_latency: meter
                 .f64_histogram("durable_append_latency_seconds")
                 .build(),
@@ -239,6 +241,12 @@ pub struct Metrics {
     lease_leader: Gauge,
     lease_epoch: Gauge,
     durable_append_latency_seconds: Histogram,
+    /// HTTP auth hook round-trip latency in seconds (ADR 0004 T16). On the CONNECT path,
+    /// so its tail IS connection-setup latency.
+    http_auth_latency_seconds: Histogram,
+    /// HTTP auth hook outcomes by result (`allow`, `deny`, `error`, `cache-hit`).
+    /// `error` is a denial — the hook failed closed.
+    http_auth_outcomes_total: Family<ReasonLabel, Counter>,
     durable_append_failures_total: Family<ReasonLabel, Counter>,
     /// Durable session *recovery* refusals (ADR 0049): a persistent attach that stayed
     /// unavailable past its deadline and got CONNACK 0x88. Distinct from an *append*
@@ -446,6 +454,18 @@ impl Metrics {
             "durable_append_latency_seconds",
             "Durable (quorum) append latency",
         );
+        let http_auth_latency_seconds = register_latency_histogram(
+            &mut registry,
+            "http_auth_latency_seconds",
+            "HTTP authentication hook round-trip latency (ADR 0004 T16). This sits on the \
+             CONNECT path, so its tail is connection-setup latency",
+        );
+        let http_auth_outcomes_total = register_family(
+            &mut registry,
+            "http_auth_outcomes",
+            "HTTP auth hook outcomes, by result (allow, deny, error, cache-hit). `error` \
+             is a DENIAL — the hook failed closed",
+        );
         let durable_append_failures_total = register_family(
             &mut registry,
             "durable_append_failures",
@@ -652,6 +672,8 @@ impl Metrics {
             lease_leader,
             lease_epoch,
             durable_append_latency_seconds,
+            http_auth_latency_seconds,
+            http_auth_outcomes_total,
             durable_append_failures_total,
             durable_recovery_failures_total,
             lease_quorum_ack_ms,
@@ -851,6 +873,23 @@ impl Metrics {
         self.lease_epoch.set(clamp_gauge_u64(epoch));
         self.otel.lease_leader.record(i64::from(is_leader), &[]);
         self.otel.lease_epoch.record(clamp_gauge_u64(epoch), &[]);
+    }
+
+    /// Observe an HTTP auth hook round trip in seconds (ADR 0004 T16).
+    pub fn observe_http_auth_latency(&self, seconds: f64) {
+        self.http_auth_latency_seconds.observe(seconds);
+        self.otel.http_auth_latency.record(seconds, &[]);
+    }
+
+    /// Record an HTTP auth hook outcome. `outcome` is a bounded class: `"allow"`,
+    /// `"deny"`, `"error"` (which is also a denial — the hook failed closed), or
+    /// `"cache-hit"`.
+    pub fn http_auth_outcome(&self, outcome: &str) {
+        self.http_auth_outcomes_total
+            .get_or_create(&ReasonLabel {
+                reason: outcome.to_string(),
+            })
+            .inc();
     }
 
     /// Observe a durable (quorum) append latency in seconds.
