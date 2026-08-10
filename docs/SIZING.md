@@ -7,9 +7,11 @@ disk budget, deciding which limits to set before exposing it to real load.
 success*. Authentication is deny-by-default, packets are capped at 1 MiB, and every
 quota refuses loudly at the edge (ADR 0041 — reason codes and backpressure, never
 silent drops). But connections, sessions, retained topics, and disk are all
-**uncapped until you cap them**, the per-session offline queue defaults to 100 000
-messages, and there is **no total-memory knob** — memory is bounded by arithmetic,
-not by a setting. This page is that arithmetic.
+**uncapped until you cap them**, and the per-session offline queue defaults to 100 000
+messages. Memory has a **watermark** (`MQTTD_MEMORY_MAX_BYTES`) but no hard ceiling:
+crossing it degrades the broker to read-mostly, it does not stop memory rising. So the
+arithmetic on this page is still what sizes the machine — the watermark is what tells you
+the arithmetic was wrong, before the OOM killer does.
 
 A ready-made preset with this page's numbers: [examples/bounded-node.toml](examples/bounded-node.toml).
 
@@ -34,7 +36,7 @@ backpressure — not a drop or disconnect).
 
 ## Memory: the formula
 
-There is no `memory_limit`. Size RSS from the caps you set:
+There is no `memory_limit` in the allocation-denial sense. Size RSS from the caps you set:
 
 ```
 RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection, measured dev-grade in bench/)
@@ -65,8 +67,37 @@ arithmetic can include them):
 Run the broker under a container memory limit sized to the formula plus slack. The
 durable design makes an OOM-kill recoverable (acked state is on disk/quorum and
 crash-recovery is continuously tested, ADR 0044), but recovery is not free — the
-point of the arithmetic is to not get there. A broker-side RSS watermark with
-brownout semantics is accepted work (ADR 0041 amendment T8).
+point of the arithmetic is to not get there.
+
+### The memory watermark (`MQTTD_MEMORY_MAX_BYTES`)
+
+Set it below the container limit — 75-85% is a reasonable start — and crossing it puts
+the broker into **brownout**: writes that *grow* state (new sessions, new retained
+topics, offline enqueues) are refused with the ordinary quota reason codes, while acks,
+reads, deletes, expiry and session resumes continue. Dropping back under restores growth.
+It is the same mechanism as the disk watermark, on a second axis; brownout is active
+while **either** is over.
+
+```
+memory_max_bytes = 2147483648      # 2 GiB watermark…
+                                   # …under a 2.5 GiB container limit
+```
+
+Three things it is not:
+
+- **Not a ceiling.** Nothing here can stop memory rising. A burst that outruns the 10 s
+  poll can still OOM. The container limit remains the hard bound; this buys you a metric,
+  a log line and a degraded mode *before* that, in the common case where pressure builds
+  over minutes.
+- **Not allocation denial.** Mosquitto's `memory_limit` fails allocations at a heap cap
+  and EMQX's `force_shutdown` kills the connection process. Both destroy standing state.
+  Brownout refuses new growth and keeps everything already promised.
+- **Not portable.** RSS is read from `/proc/self/status`. Released binaries are Linux-only;
+  elsewhere the broker logs — loudly, at WARN, if you configured a watermark — that it is
+  **not enforcing** one, rather than pretending.
+
+Watch it with `process_resident_bytes / memory_max_bytes`, and alert on
+`brownout{axis="memory"} == 1`.
 
 ## Disk: the formula
 
@@ -140,7 +171,7 @@ Printed here so nobody discovers it in production:
 
 | Axis | What bounds it today | Tracked by |
 |---|---|---|
-| Total process RSS | Nothing — container limits + this page | 0041-T8 |
+| Total process RSS **hard cap** | Watermark + brownout (`MQTTD_MEMORY_MAX_BYTES`, above); the container limit is still the ceiling | — by design |
 | Offline queue **bytes** | Message count only (`MQTTD_MAX_QUEUED_MESSAGES`) | 0041-T6 |
 | Bridge-spool **bytes** | Message count only (default 10 000) | 0041-T7 |
 | Per-store disk share | Aggregate watermark only | 0041-T9 |

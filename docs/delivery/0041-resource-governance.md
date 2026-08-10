@@ -36,7 +36,10 @@ tasks:
     status: planned
   - id: 0041-T8
     title: Process-memory watermark — MQTTD_MEMORY_MAX_BYTES, RSS poller + edge-triggered brownout reusing the T5 refusal paths; growth refused, maintenance continues, recovery restores; explicitly not allocation-denial or per-connection force-shutdown (2026-08-04 amendment)
-    status: planned
+    status: done
+    date: 2026-08-10
+    evidence: "crates/mqttd/src/memory_watch.rs — RSS from /proc/self/status (no new dependency, no libc call), edge-triggered SetBrownout on the Memory axis, gauges process_resident_bytes + memory_max_bytes. Brownout became PER-AXIS (hub::BrownoutAxis, Hub::set_brownout_axis): the effective state is the OR, so the disk poller reporting 'fine' cannot lift a brownout memory pressure is still asking for — one_axis_recovering_does_not_lift_another_axis_brownout is the test for exactly that, and a_single_axis_still_toggles_brownout_on_its_own proves the T5 contract is unchanged. Unit tests: vm_rss_is_parsed_in_bytes_from_the_right_line, a_similar_looking_line_is_not_mistaken_for_vm_rss (VmSize/VmHWM sit above VmRSS and are larger — picking either would brown out early), a_status_without_vm_rss_yields_none_not_zero, the_watcher_drives_brownout_on_watermark_transitions, without_a_watermark_nothing_is_ever_browned_out, an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero, the_real_sampler_reports_a_plausible_rss_on_linux. Integration (Linux-gated) tests/memory_watermark.rs against the REAL binary: a 1 KiB watermark browns out, exports brownout{axis=\"memory\"} 1 and a plausible RSS, and refuses a new v5 session with 0x97 — with an unset-watermark control so it cannot pass against a broker that refuses everything."
+    notes: "A watermark, NOT a ceiling, and said so everywhere it is documented: nothing here stops RSS rising, so a burst that outruns the 10s poll can still OOM and the container/cgroup limit remains the hard bound. RSS needs /proc, so on non-Linux the watcher logs at WARN that it is NOT enforcing (loudly, because the operator believes they have a bound) and exits, rather than sampling zero — a zero would sit under every watermark and never fire. Unreadable RSS is treated the same way. SIZING.md, COMPARISON.md and the README previously said 'there is no total-memory knob'; all three now say what is actually true, including what it cannot do."
   - id: 0041-T9
     title: Per-store disk bound — a share of MQTTD_STORE_MAX_BYTES per redb store (sessions/retained/replicas/lease) so one store cannot consume the whole watermark and brown out the others; same T4 refusal behaviors, counted per store (2026-08-07 amendment)
     status: planned
@@ -78,13 +81,31 @@ defaults, and a metric per cap.
 | 0041-T5 | ✅ done | 2026-07-10 | "Disk is the last ungoverned axis. VISIBILITY (new mqttd::store_watch module): with MQTTD_DATA_DIR set, a 10s poller stats each redb store file (sessions/retained/replicas/lease; absent = 0) and exports store_bytes{store} (Prometheus + OTel gauge family) — always on, watermark or not. WATERMARK (MQTTD_STORE_MAX_BYTES, positive integer else startup error, needs MQTTD_DATA_DIR): when the stores' total crosses it the watcher sends an edge-triggered HubCommand::SetBrownout (transitions only, logged loudly both ways). Under brownout, growth is refused with the T4 behaviors — a NEW retained topic 0x97/delivered-not-retained, a NEW session CONNACK 0x97/0x03 (quota_rejections_total{kind=brownout}), an offline enqueue skipped and counted (publish_dropped{brownout}) — while maintenance continues untouched: retained overwrite/clear, session resume, acks, deletes, expiry. Read-mostly, never the cliff where redb commits start failing mid-write; dropping back under the mark restores everything. Two warts found and fixed on the way: (1) a refused stranger's recovery had already run claim_session, CREATING the durable record the refusal then abandoned — the refusal path now reaps that just-created record off-loop and gates the QuotaExceeded reply on the reap, so a refused grant leaves no growth behind; (2) FAIL-CLOSED cross-node/offline enqueue — the deliver chain now reports durable success, and a failed offline enqueue (e.g. NoQuorum) withholds the publisher's ack (the done gate is dropped, the PUBACK/PUBREC never sent) so a QoS>=1 publisher retries instead of believing a lost message was stored, exactly like the local ack path. Tests: store_watch unit (scan sizes per store + total; the watcher is edge-triggered across cross/steady/recover), hub brownout_refuses_growth_and_recovery_restores_it (growth refused / maintenance continues / recovery restores / the browned-out enqueue never replays while the post-recovery one does), hub a_failed_offline_enqueue_withholds_the_publishers_ack (FlakyStore no-quorum enqueue -> no ack). README: MQTTD_STORE_MAX_BYTES row added; every MQTTD_* cap from this ADR is now in the config table. ADR 0041 flipped to Accepted. Workspace green (798 tests), clippy zero warnings." |
 | 0041-T6 | ⬜ planned | — |  |
 | 0041-T7 | ⬜ planned | — |  |
-| 0041-T8 | ⬜ planned | — |  |
+| 0041-T8 | ✅ done | 2026-08-10 | "crates/mqttd/src/memory_watch.rs — RSS from /proc/self/status (no new dependency, no libc call), edge-triggered SetBrownout on the Memory axis, gauges process_resident_bytes + memory_max_bytes. Brownout became PER-AXIS (hub::BrownoutAxis, Hub::set_brownout_axis): the effective state is the OR, so the disk poller reporting 'fine' cannot lift a brownout memory pressure is still asking for — one_axis_recovering_does_not_lift_another_axis_brownout is the test for exactly that, and a_single_axis_still_toggles_brownout_on_its_own proves the T5 contract is unchanged. Unit tests: vm_rss_is_parsed_in_bytes_from_the_right_line, a_similar_looking_line_is_not_mistaken_for_vm_rss (VmSize/VmHWM sit above VmRSS and are larger — picking either would brown out early), a_status_without_vm_rss_yields_none_not_zero, the_watcher_drives_brownout_on_watermark_transitions, without_a_watermark_nothing_is_ever_browned_out, an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero, the_real_sampler_reports_a_plausible_rss_on_linux. Integration (Linux-gated) tests/memory_watermark.rs against the REAL binary: a 1 KiB watermark browns out, exports brownout{axis=\"memory\"} 1 and a plausible RSS, and refuses a new v5 session with 0x97 — with an unset-watermark control so it cannot pass against a broker that refuses everything." |
 | 0041-T9 | ⬜ planned | — |  |
 | 0041-T10 | ⬜ planned | — |  |
 <!-- /status-table:0041 -->
 
 ## Changelog
 
+- **2026-08-10** — **T8 done: the memory watermark.** `MQTTD_MEMORY_MAX_BYTES` samples RSS
+  from `/proc/self/status` and drives brownout on a second axis, reusing T5's refusal
+  paths exactly. The load-bearing change is that **brownout is now per-axis**: with one
+  shared flag, the disk poller's routine "still fine" every 10 s would have silently
+  lifted a brownout that memory pressure was still asking for, and the broker would have
+  resumed accepting growth writes straight into an OOM. The effective state is the OR
+  across axes, and the test named for that case is why the state is a set.
+
+  Stated as plainly in the docs as in the code: it is a **watermark, not a ceiling**.
+  Nothing here stops RSS rising — a burst that outruns the poll can still OOM, and the
+  container limit remains the hard bound. What it buys is a metric, a log line and a
+  degraded mode in the common case where pressure builds over minutes. On a platform
+  without `/proc` it logs at WARN that it is **not enforcing** and exits, rather than
+  sampling zero; a zero would sit under every watermark and never fire, which is the
+  worst possible behaviour for a bound somebody is relying on.
+
+  `SIZING.md`, `COMPARISON.md` and the README all said "there is no total-memory knob".
+  All three now say what is true, including what it cannot do.
 - **2026-07-10** — T5 (disk watermark + closure) landed, **ADR accepted**: per-store
   redb sizes are exported as `store_bytes{store}`, and `MQTTD_STORE_MAX_BYTES` arms a
   soft high-water brownout — above it, growth writes (new retained topics, new

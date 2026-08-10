@@ -861,7 +861,10 @@ impl Stress {
         self.brownout[node] = on;
         let _ = self.nodes[node]
             .hub_tx
-            .send(mqttd::hub::HubCommand::SetBrownout(on));
+            .send(mqttd::hub::HubCommand::SetBrownout {
+                axis: mqttd::hub::BrownoutAxis::Disk,
+                on,
+            });
         self.note(format!(
             "BROWNOUT {} on {}",
             if on { "entered" } else { "lifted" },
@@ -1180,7 +1183,10 @@ async fn run_schedule(seed: u64) {
         if stress.brownout[i] {
             let _ = stress.nodes[i]
                 .hub_tx
-                .send(mqttd::hub::HubCommand::SetBrownout(false));
+                .send(mqttd::hub::HubCommand::SetBrownout {
+                    axis: mqttd::hub::BrownoutAxis::Disk,
+                    on: false,
+                });
             stress.brownout[i] = false;
         }
     }
