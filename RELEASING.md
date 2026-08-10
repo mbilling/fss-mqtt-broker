@@ -22,15 +22,22 @@ Every release publishes, for the tagged commit:
   multi-arch. The bridge is a **separate image**, not a second entrypoint into the
   broker's: it is a separate process with its own identity, credentials and failure
   domain, usually deployed where the broker is not.
+- **A reproducible `mqttui` binary** — both targets, checksummed and signed like the
+  others. It is a terminal UI for a human at a keyboard, so it ships as a binary and is
+  deliberately **not** added to the container images: nothing in a distroless image can use
+  a TUI, and putting one there would grow the runtime attack surface for no one. It is also
+  published to crates.io as its own crate (step 7 below), from its own workspace, so
+  `ratatui` never enters the broker's dependency graph.
 - **Keyless signatures** — every binary, checksum, and the SBOM is
   cosign-signed via GitHub OIDC (no long-lived key); the image is cosign-signed
   by digest. All signatures are recorded in the public Rekor transparency log.
 - **Build provenance** — SLSA build-provenance attestations for the binaries and
   the image (what commit, workflow, and inputs produced them).
-- **An SBOM per binary** — CycloneDX `sbom-X.Y.Z.cdx.json` and
-  `sbom-bridge-X.Y.Z.cdx.json`, each enumerating only *its* transitive graph, so the
-  bridge's dependencies are not implied to be in the broker image or vice versa.
-  Attached to the release and to the matching image.
+- **An SBOM per binary** — CycloneDX `sbom-X.Y.Z.cdx.json`, `sbom-bridge-X.Y.Z.cdx.json`
+  and `sbom-mqttui-X.Y.Z.cdx.json`, each enumerating only *its* transitive graph, so the
+  bridge's dependencies are not implied to be in the broker image or vice versa. `mqttui`'s
+  is cut from its own lockfile, which is the point of the separate workspace. Attached to
+  the release and to the matching image.
 
 The release commit must also pass the **supply-chain audit** (`cargo deny` +
 `cargo audit`) — it is the first gate in the pipeline.
@@ -52,7 +59,9 @@ Versions follow [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md):
 
 1. **Pick the version** and make sure `main` is green (CI, nightly tier).
 2. **Bump `version`** in the workspace `Cargo.toml` (`[workspace.package]`) to
-   `X.Y.Z`, commit, and merge to `main`.
+   `X.Y.Z`, commit, and merge to `main`. `mqttui` versions **independently** — it is a
+   separate workspace and a separate published crate (ADR 0056 §1), so bump
+   `tools/mqttui/Cargo.toml` only when `mqttui` itself changed.
 3. **Confirm the readiness checklist** in
    [ADR 0044](docs/adr/0044-release-readiness-assurance.md) is satisfied — the
    release is gated on it.
@@ -71,6 +80,21 @@ Versions follow [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md):
    created the GitHub Release with all assets attached.
 6. **Sanity-check** by running the [verify steps](#verifying-a-release) against
    the published release yourself.
+7. **Publish `mqttui` to crates.io** — a *manual* step, deliberately. It is the one part of
+   a release that cannot be undone: crates.io versions are permanent and cannot be
+   re-uploaded, so it is not automated behind a tag push. CI has already proven the crate
+   packs and builds from its own tarball on every PR (`cargo publish --dry-run`), so this
+   should be uneventful:
+
+   ```sh
+   scripts/vendor-mqttui-examples.sh --check     # the bundled examples match the repo
+   cargo publish --manifest-path tools/mqttui/Cargo.toml
+   ```
+
+   Skip it if `tools/mqttui/Cargo.toml`'s version is unchanged since the last publish —
+   crates.io will reject a duplicate, which is the correct outcome, not a failure to fix.
+   The signed musl `mqttui` binaries are attached to the GitHub Release by the pipeline
+   either way; crates.io is the secondary channel (ADR 0056 Decision C).
 
 If the workflow fails, fix forward on `main` and cut the next patch tag — a tag
 is immutable; never force-move a published one.

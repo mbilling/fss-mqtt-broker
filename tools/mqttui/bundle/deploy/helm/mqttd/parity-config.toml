@@ -1,0 +1,38 @@
+[node]
+id = "__NODE_ID__"
+data_dir = "/var/lib/mqttd"
+
+[listeners]
+tls_bind = "0.0.0.0:8883"
+health_bind = "0.0.0.0:8080"
+
+[tls]
+cert = "/etc/mqttd/tls/tls.crt"
+key = "/etc/mqttd/tls/tls.key"
+
+[security]
+acl_file = "/etc/mqttd/acl/acl.toml"
+
+[cluster]
+peer_bind = "0.0.0.0:7001"
+peer_advertise = "__PEER_ADVERTISE__"
+
+[cluster.swim]
+bind = "0.0.0.0:7946"
+seeds = [__SEEDS__]
+
+[durable]
+enabled = true
+lease_voters = 5
+
+[runtime]
+# Watch the mounted policy files (TLS cert/key/CA, ACL, CRLs — ADR 0033) and hot-reload
+# through the validate-before-swap path when they change on disk. This is what makes a
+# cert-manager renewal or an ACL ConfigMap edit reach RUNNING pods with no restart (the
+# distroless image has no shell to signal by hand). 0 = signal-only.
+config_watch_secs = 30
+# Readiness floor, rendered per-pod: the founder (ordinal 0) keeps 1 so ordered bring-up
+# can start, every joiner requires a MAJORITY of replicaCount live members before
+# reporting ready — a minority pod stays out of Service rotation instead of serving a
+# split view.
+ready_min_members = __READY_MIN__

@@ -63,7 +63,7 @@
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [7/11 done](0055-kubernetes-operator.md) | 4 open |
-| [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [8/10 done](0056-mqttui.md) | 2 open |
+| [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [9/10 done](0056-mqttui.md) | 1 open |
 
 ## Open and deferred work
 
@@ -165,4 +165,3 @@
 **0056 — `mqttui`: a terminal UI for running the demo, migration and test scripts**
 
 - `0056-T8` ⬜ planned: "`mqttui update` — fetch the examples bundle from a SIGNED release, verified before unpacking; CI publishes a rolling bundle on merges to main" — "This is the answer to 'can it fetch the latest from main': yes, by way of a signed artifact built from main, not by trusting the branch. Fetching a branch tarball at runtime was REJECTED as a default — release binaries are cosign-signed with SLSA provenance and an SBOM, builds are reproducible, and every dependency is audited on every push (ADR 0045/0053); downloading shell from a mutable branch and running it discards all of that with one command, and repeats it on every launch. An explicit `--channel main` remains available for maintainers testing unreleased examples: loudly marked unverified, never a default."
-- `0056-T9` ⬜ planned: Distribution — signed musl binaries through the ADR 0045 pipeline (primary) plus crates.io (`cargo install mqttui`) — "cargo install requires a Rust toolchain and compiles ~20 crates on the user's machine; the audience is somebody evaluating an MQTT broker who may have neither. The signed-binary pipeline already exists and is extended to a second artifact. Makes mqttui a published product with its own version, changelog, semver, signing and SBOM obligations — accepted knowingly. The name `mqttui` was verified free on crates.io on 2026-08-10 (HTTP 404 from the registry API, not inferred)."

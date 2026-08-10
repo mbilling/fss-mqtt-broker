@@ -127,6 +127,18 @@ jobs:
         run: cargo test --manifest-path tools/mqttui/Cargo.toml
       - name: The manifest covers every script
         run: cargo run --quiet --manifest-path tools/mqttui/Cargo.toml -- --check
+      # tools/mqttui/bundle/ is a GENERATED copy of demo/, deploy/, scripts/migrate/ and
+      # scripts/k8s/, and it is what a `cargo install mqttui` user actually gets. Shipping a
+      # stale copy would hand them a different demo from the one in this repository, so the
+      # copy is checked here rather than trusted.
+      - name: The vendored example bundle is current
+        run: scripts/vendor-mqttui-examples.sh --check
+      # ADR 0056 T9: mqttui is published to crates.io. `cargo package` includes only files
+      # beneath the package root, which is exactly how the first attempt produced a crate
+      # that built from a checkout and could not compile once published. This packs the
+      # crate and BUILDS it from the tarball, so that cannot reach the registry.
+      - name: The crate can actually be published
+        run: cargo publish --dry-run --manifest-path tools/mqttui/Cargo.toml
 
   supply-chain:
     name: supply-chain audit

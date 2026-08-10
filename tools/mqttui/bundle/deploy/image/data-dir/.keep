@@ -1,0 +1,3 @@
+This file exists so git can carry an otherwise-empty directory that the
+Dockerfile copies in as the broker's data directory, owned by the nonroot
+user the image runs as. See the COPY line in ./Dockerfile for why.
