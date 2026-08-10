@@ -81,6 +81,7 @@ Review the output, then validate it: `mqttd --check-config --config <out>`.
 """
 requires = ["python3"]
 duration = "~1s"
+args = ["${INPUT}"]
 [[task.env]]
 name = "INPUT"
 default = "/etc/mosquitto/mosquitto.conf"
@@ -91,6 +92,9 @@ id = "migrate-test"
 group = "Migration"
 name = "Prove the converter's output boots the real broker"
 script = "scripts/migrate/test-from-mosquitto.sh"
+# Boots the REAL broker from target/debug/mqttd and does not build it — standalone
+# there is no toolchain and no source to build from.
+needs_checkout = true
 about = """
 Converts a fixture Mosquitto deployment and then BOOTS mqttd on the result. A migration
 tool that emits plausible TOML the broker rejects burns the evaluation it exists to enable,
@@ -101,7 +105,7 @@ duration = "~10s"
 [[task.env]]
 name = "MQTTD_BIN"
 default = ""
-help = "Prebuilt broker to test against; empty builds one first"
+help = "Prebuilt broker to test against; this script does NOT build one, it exits 2"
 
 # ── Try it ───────────────────────────────────────────────────────────────────────────
 [[task]]
@@ -205,6 +209,8 @@ id = "k8s-kind-smoke"
 group = "Kubernetes"
 name = "Stand up, scale and roll the Helm chart on kind"
 script = "scripts/k8s/kind-smoke.sh"
+# Builds the broker image by mounting the repo into a cargo container.
+needs_checkout = true
 about = """
 The chart's runtime proof (ADR 0047 T5): a real cluster, a real StatefulSet, a scale and a
 rolling update, with zero acknowledged loss across all of it. Also proves both split-brain
@@ -227,6 +233,8 @@ id = "k8s-operator-e2e"
 group = "Kubernetes"
 name = "Run the operator end to end on kind"
 script = "scripts/k8s/operator-e2e.sh"
+# cargo build -p mqttd-operator: the operator is source, not an example.
+needs_checkout = true
 about = """
 The reconciler against a live API server (ADR 0055 T7): applies an MqttdCluster, watches
 the operator render and converge it, and checks the observed state it writes back.
@@ -253,6 +261,9 @@ id = "k8s-render-parity"
 group = "Kubernetes"
 name = "Diff the operator's rendering against the Helm chart"
 script = "scripts/k8s/render-parity.sh"
+# cargo run -p mqttd-operator --bin render_sample — the whole point is diffing the
+# chart against the operator's own rendering, so the operator must be buildable.
+needs_checkout = true
 about = """
 Two supported deployment paths that disagree are worse than one. This renders both for
 equivalent inputs, normalises only by-construction differences, and diffs the rest.
@@ -338,6 +349,8 @@ id = "release-build"
 group = "Release"
 name = "Build the shipped binaries reproducibly"
 script = "scripts/release/build-repro.sh"
+# Builds this repository, twice, and diffs the digests.
+needs_checkout = true
 about = """
 The reproducible musl build of mqttd and mqtt-bridge (ADR 0045 T2): rebuild a tag and get
 identical bytes. Operates on this repository — it needs a checkout.
@@ -351,6 +364,8 @@ id = "gen-status"
 group = "Internal"
 name = "Regenerate the delivery dashboard"
 script = "scripts/gen-status.py"
+# Reads and rewrites the repo's own ADR and delivery documents.
+needs_checkout = true
 about = "Regenerates docs/delivery/STATUS.md and each doc's progress table from frontmatter."
 requires = ["python3"]
 duration = "~1s"
@@ -361,6 +376,8 @@ id = "check-readme-facts"
 group = "Internal"
 name = "Check the README's derivable facts"
 script = "scripts/check-readme-facts.py"
+# Checks the repo's README against the repo.
+needs_checkout = true
 about = "Validates the ADR count, crate table and anchors against the repository."
 requires = ["python3"]
 duration = "~1s"
@@ -371,6 +388,8 @@ id = "gen-bridge-dashboard"
 group = "Internal"
 name = "Regenerate the bridge Grafana dashboard"
 script = "scripts/gen-bridge-dashboard.py"
+# Writes a dashboard into the repo's own observability assets.
+needs_checkout = true
 about = "Emits demo/grafana/dashboards/mqttd-bridge.json from the metric definitions."
 requires = ["python3"]
 duration = "~1s"
@@ -381,6 +400,8 @@ id = "render-parity-one"
 group = "Internal"
 name = "Render parity for a single founder-guard state"
 script = "scripts/k8s/render-parity-one.sh"
+# Same as k8s-render-parity, for one case.
+needs_checkout = true
 about = "Inner half of k8s-render-parity; run that instead."
 requires = ["helm", "cargo"]
 duration = "~20s"

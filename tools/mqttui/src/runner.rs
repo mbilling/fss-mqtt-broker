@@ -95,6 +95,7 @@ impl Run {
         } else {
             Command::new(&script)
         };
+        cmd.args(env::args(task, overrides));
         cmd.current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

@@ -216,9 +216,9 @@ not by preference:
 
 | | |
 |---|---|
-| **Standalone** — ships inside the binary | the demo stack, the Kubernetes examples (chart + CRDs), the compose reference deployment, quickstart, and the Mosquitto migration converter |
-| **Checkout-only, permanently** | `release/build-repro.sh` (builds the repo), `k8s/render-parity.sh` (diffs chart against operator), `gen-status.py`, `check-readme-facts.py` — these operate *on the repository* |
-| **Checkout-only for now** | `bench/run.sh` (embeddable later; its 12 MB is generated `results/`, the harness is ~50 KB) |
+| **Standalone** — ships inside the binary | the demo stack, the Kubernetes examples (chart + CRDs), the compose reference deployment, and the Mosquitto migration converter |
+| **Checkout-only, permanently** | anything that operates *on the repository*: `release/build-repro.sh` builds it, `k8s/render-parity.sh` and `render-parity-one.sh` diff the chart against the operator, `k8s/kind-smoke.sh` and `k8s/operator-e2e.sh` build images from source, `migrate/test-from-mosquitto.sh` boots a broker it does not build, and `gen-status.py` / `check-readme-facts.py` / `gen-bridge-dashboard.py` read and rewrite the repo's own documents — **nine in all** |
+| **Checkout-only for now** | `bench/run.sh` (embeddable later; its 12 MB is generated `results/`, the harness is ~50 KB), the interop suites, the OIDC fixture, and the smoke tests that `cargo build` a broker — including **`quickstart-smoke.sh`**, which an earlier draft of this table wrongly listed as standalone: it builds `mqttd` from source when `MQTTD_BIN` is unset, so it cannot run beside a binary with no toolchain and no source |
 
 `mqttui` **detects whether it is inside a checkout**: standalone it offers the embedded
 set and says plainly how many tasks are hidden and why; in a checkout it offers everything.
@@ -226,8 +226,22 @@ A tool that silently showed a subset would be the same defect as a manifest that
 went stale (§3).
 
 **"Everything possible" is not everything**, and this record says so rather than letting it
-be discovered. Four tasks operate on the repository itself and cannot be freed from it by
+be discovered. Nine tasks operate on the repository itself and cannot be freed from it by
 any amount of embedding.
+
+**Availability is declared, not inferred** — the same rule as §2, and for the same reason.
+Implementation first inferred it from whether the script had been embedded, which put
+`k8s-render-parity` in front of a standalone user, ran it, and produced
+`could not find Cargo.toml`: the script travels perfectly well, and what it needs is the
+operator crate. A file being present says nothing about whether it can work. `tasks.toml`
+therefore carries `needs_checkout`, and a test walks each bundled task's script **and the
+scripts it invokes** to catch the declaration going stale — `render-parity.sh` contains no
+`cargo` at all, it delegates.
+
+The two ways a task can be unavailable are also kept apart in what the user is told:
+*needs a clone* and *is not bundled* both currently end in "clone the repository", but only
+the second may change in a later release, and reporting them alike would send someone to do
+work that cannot help.
 
 ### Decision A — the examples are embedded, not fetched
 

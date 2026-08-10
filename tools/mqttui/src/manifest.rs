@@ -52,6 +52,25 @@ pub struct Task {
     /// CI plumbing: declared for completeness, never offered.
     #[serde(default)]
     pub hidden: bool,
+    /// This task operates ON the repository — building it, diffing its rendered output,
+    /// checking its own documentation — so it cannot run from the bundled examples however
+    /// much is embedded (ADR 0056 amendment).
+    ///
+    /// **Declared, not inferred.** Inferring it from whether a script happened to be
+    /// embedded is the same discovery mistake §2 rejects: `render-parity.sh` travels
+    /// perfectly well and still cannot run, because what it needs is the operator crate.
+    #[serde(default)]
+    pub needs_checkout: bool,
+    /// Command-line arguments, with `${VAR}` substituted from the resolved environment.
+    ///
+    /// Exists because a declared variable is not automatically an argument: `INPUT` for the
+    /// Mosquitto converter was documented as "passed as the first argument" while the
+    /// runner only ever exported it, so the task could not work as described. Arguments are
+    /// declared for the same reason everything else here is — the alternative is each task
+    /// growing its own special case in the runner.
+    #[serde(default)]
+    pub args: Vec<String>,
+
     /// Tuneable environment.
     #[serde(default, rename = "env")]
     pub env: Vec<EnvVar>,
@@ -90,7 +109,32 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// The manifest ships inside the binary, so a standalone `mqttui` offers the same task
+/// list as one in a checkout — what differs is which of them this machine can run.
+pub const EMBEDDED: &str = include_str!("../tasks.toml");
+
 impl Manifest {
+    /// Parse without touching the filesystem — the standalone path, where repo-only tasks
+    /// are legitimately absent and are reported as unavailable rather than rejected.
+    ///
+    /// # Errors
+    /// If the TOML is malformed or has duplicate ids.
+    pub fn parse(text: &str) -> Result<Self, Error> {
+        let manifest: Self = toml::from_str(text).map_err(|e| Error::Parse(e.to_string()))?;
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let dups: Vec<String> = manifest
+            .tasks
+            .iter()
+            .filter(|t| !seen.insert(&t.id))
+            .map(|t| format!("id '{}' is declared twice", t.id))
+            .collect();
+        if dups.is_empty() {
+            Ok(manifest)
+        } else {
+            Err(Error::Invalid(dups))
+        }
+    }
+
     /// Load and validate against `repo_root`.
     ///
     /// # Errors
@@ -119,6 +163,11 @@ impl Manifest {
         } else {
             Err(Error::Invalid(problems))
         }
+    }
+
+    /// Every task a user is offered, in declaration order.
+    pub fn visible(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|t| !t.hidden)
     }
 
     /// Tasks a user may pick, grouped, in manifest order within each group.
