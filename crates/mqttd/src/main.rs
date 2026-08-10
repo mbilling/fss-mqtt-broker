@@ -199,6 +199,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         check_config();
     }
 
+    // `--hash-password [<username>]` prints an Argon2id password-file line and exits.
+    // Before the broker configures anything: it is a local text utility, not a server mode.
+    if std::env::args().skip(1).any(|a| a == "--hash-password") {
+        hash_password_cli();
+    }
+
     // ADR 0047 T4: `--decommission` sends SIGUSR1 to the running broker (PID 1 in a distroless
     // container, which has no shell/`kill`) and waits for the drain + graceful shutdown to
     // complete — the Kubernetes `preStop` hook. Handled here so it never touches the network.
@@ -2422,6 +2428,60 @@ fn check_config() -> ! {
                 Some(p) => eprintln!("config INVALID ({}): {error}", p.display()),
                 None => eprintln!("config INVALID: {error}"),
             }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mqttd --hash-password [<username>]`: read a password from **stdin** and print the
+/// Argon2id PHC hash the broker verifies against — a whole `username:hash` password-file
+/// line when a username is given, the bare hash otherwise.
+///
+/// This exists because password authentication was documented but unreachable. The broker
+/// verifies Argon2id hashes and `MQTTD_PASSWORD_FILE` wants `username:hash` lines, yet
+/// nothing shipped could produce one, and `mosquitto_passwd` output is a different format
+/// entirely. Setting up the broker's own auth required writing an Argon2id hasher first.
+///
+/// Reads stdin rather than taking the password as an argument on purpose: an argument
+/// lands in the shell history, in `ps` output, and in any process-listing an unprivileged
+/// user on the box can read.
+fn hash_password_cli() -> ! {
+    use std::io::Read as _;
+
+    let mut args = std::env::args()
+        .skip(1)
+        .skip_while(|a| a != "--hash-password");
+    args.next(); // the flag itself
+    let username = args.next().filter(|a| !a.starts_with("--"));
+
+    let mut password = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut password) {
+        eprintln!("error: failed to read the password from stdin: {e}");
+        std::process::exit(2);
+    }
+    // One trailing newline is the shell adding it (`echo`, a heredoc, a pipe), not part of
+    // the password. Anything else is left alone — a password may legitimately contain
+    // spaces, and silently trimming them would make the hash fail to verify later.
+    let password = password.strip_suffix('\n').unwrap_or(&password);
+    let password = password.strip_suffix('\r').unwrap_or(password);
+    if password.is_empty() {
+        eprintln!(
+            "error: refusing to hash an empty password. Pipe one in, e.g.:\n  \
+             printf %s 'correct horse battery staple' | mqttd --hash-password alice"
+        );
+        std::process::exit(2);
+    }
+
+    match mqtt_auth::password::hash_password(password) {
+        Ok(hash) => {
+            match username {
+                Some(u) => println!("{u}:{hash}"),
+                None => println!("{hash}"),
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     }

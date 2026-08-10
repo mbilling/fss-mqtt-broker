@@ -67,6 +67,12 @@ tasks:
     title: Per-listener auth policies (each listener carrying its own authenticator/ACL)
     status: deferred
     notes: "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040."
+  - id: 0004-T14
+    title: Ship a way to PRODUCE a password-file line — `mqttd --hash-password [<username>]`
+    status: done
+    date: 2026-08-10
+    evidence: "mqtt_auth::password::hash_password (Argon2id, per-call random salt from the ADR 0053 provider aws-lc-rs, no new RNG crate) + the `--hash-password` front end reading stdin. Tests: password::a_generated_hash_authenticates_through_a_password_file (with a near-miss rejection, so it cannot pass against a broker that accepts anything), password::hashing_the_same_password_twice_gives_different_strings_that_both_verify (guards against a fixed salt shipping by accident), and password_cli.rs end to end against the REAL binary — hash with the CLI, write the file, boot the broker, CONNECT: accepted for the right password, 0x04 for a wrong one and for an unknown user; spaces and punctuation survive the round trip; an empty password exits 2."
+    notes: "T8 delivered password VERIFICATION in 2026-06. Nothing shipped could produce a hash to verify against, and mosquitto_passwd output is a different format, so `MQTTD_PASSWORD_FILE` was documented but unreachable without writing an Argon2id hasher first — the migration guide's own advice (\"re-hash them\") had no tool behind it. The password is read from stdin, never argv, so it stays out of shell history and `ps`."
 ---
 
 # Delivery — ADR 0004: Identity model: mTLS Common Name first, deny by default
@@ -93,6 +99,7 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | **0004-T11** SAN identity | An operator selects which verified-leaf field is the subject: `cn` (default, unchanged) or a SAN of a chosen kind. Fail closed — the selected source absent, empty, or present more than once yields *no* identity, never a guess. The safety rules the CN path already enforces travel with it. |
 | **0004-T12** `%c` substitution | ACL topic patterns substitute the connecting client id, so a policy can scope topics per session handle. The `Authorizer` trait carries the `ClientId` at every decision point (SUBSCRIBE, PUBLISH, will, and the ADR 0040 grant sweep — each session re-checked under its own handle). Client ids are client-chosen, so substitution fails closed on the same metacharacters as `%i`, per placeholder; and `%c` is refused in a `connect` rule's `clients` globs, where it would match the id against itself. Documented as a namespacing tool, not an isolation boundary. |
 | **0004-T13** Per-listener policies | Deferred — each listener carrying its own authenticator/ACL needs the listener config to become a list of named definitions (own record). |
+| **0004-T14** Password hashing | `mqttd --hash-password [<username>]` reads a password from stdin and prints the Argon2id line `MQTTD_PASSWORD_FILE` expects, so password auth is reachable without writing a hasher first. The generated line is proven to authenticate against the running broker, not merely to look Argon2id-shaped. |
 
 ## Progress
 
@@ -112,10 +119,21 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | 0004-T11 | ✅ done | 2026-07-27 | mtls::each_san_source_selects_its_own_field_of_one_certificate / the_default_source_is_the_common_name / a_missing_selected_source_yields_no_identity_and_never_falls_back / an_ambiguous_source_yields_no_identity / a_multi_common_name_subject_yields_no_identity / san_subjects_with_topic_wildcards_are_rejected / only_a_uri_san_may_carry_a_level_separator / a_uri_subject_can_never_be_substituted_into_a_topic_pattern; tls::a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn / a_san_configured_listener_refuses_a_cn_only_certificate; config::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted; mqttd::the_config_and_the_authenticator_agree_on_identity_source_spellings / changing_the_identity_source_requires_a_restart |
 | 0004-T12 | ✅ done | 2026-07-27 | acl::percent_c_scopes_topics_to_the_client_id / one_identity_two_client_ids_get_disjoint_grants / a_hostile_client_id_cannot_broaden_a_grant / an_unsubstitutable_client_id_makes_a_deny_refuse_outright / a_bad_client_id_does_not_disturb_rules_that_never_use_it / a_substituted_value_is_never_rescanned_for_placeholders / a_bare_percent_is_literal / percent_c_is_rejected_in_connect_client_globs / a_connect_rule_bounds_the_client_ids_percent_c_can_expand_to; acl(integration)::client_id_substitution_scopes_topics_within_one_identity / a_wildcard_client_id_cannot_broaden_a_percent_c_grant; reload_acl::the_grant_sweep_re_checks_percent_c_under_each_sessions_own_client_id |
 | 0004-T13 | 💤 deferred | — | "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040." |
+| 0004-T14 | ✅ done | 2026-08-10 | "mqtt_auth::password::hash_password (Argon2id, per-call random salt from the ADR 0053 provider aws-lc-rs, no new RNG crate) + the `--hash-password` front end reading stdin. Tests: password::a_generated_hash_authenticates_through_a_password_file (with a near-miss rejection, so it cannot pass against a broker that accepts anything), password::hashing_the_same_password_twice_gives_different_strings_that_both_verify (guards against a fixed salt shipping by accident), and password_cli.rs end to end against the REAL binary — hash with the CLI, write the file, boot the broker, CONNECT: accepted for the right password, 0x04 for a wrong one and for an unknown user; spaces and punctuation survive the round trip; an empty password exits 2." |
 <!-- /status-table:0004 -->
 
 ## Changelog
 
+- **2026-08-10** — **T14 done**: password authentication is *reachable*. T8 shipped the
+  verifier in June; nothing shipped could produce a hash for it to verify. The broker wants
+  `username:argon2id-hash` lines, `mosquitto_passwd` output is a different format, and the
+  migration guide's "re-hash them" had no tool behind it — so turning on the broker's own
+  password auth required writing an Argon2id hasher first. `mqttd --hash-password [<user>]`
+  now reads the password from **stdin** (never argv: argv is in shell history and `ps`) and
+  prints the line. The salt comes from `aws-lc-rs`, the ADR 0053 provider, rather than a
+  second RNG crate added for one call. Proven end to end against the real binary: hash,
+  write the file, boot, CONNECT — accepted for the right password, `0x04` for a wrong one.
+  A verifier without a hasher is a feature that only exists in the documentation.
 - **2026-07-27** — **T12 done**: ACL topic patterns substitute `%c` (the client id)
   alongside `%i`, and the `Authorizer` trait carries the `ClientId` at every decision
   point — SUBSCRIBE, PUBLISH, the will check at CONNECT, and ADR 0040's grant sweep,

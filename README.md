@@ -565,10 +565,11 @@ build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook
 docker run --rm ghcr.io/mbilling/fss-mqtt-broker:latest --check-config
 # → config OK: defaults + MQTTD_* env overlay validates (no config file set)
 #
-# Note: there is no `--version` flag. mqttd recognises only `--check-config` and
-# `--decommission`, and IGNORES anything else — so an unrecognised flag starts a
-# real broker instead of erroring (tracked as ADR 0046 T6). The running version
-# is logged at startup: `starting mqttd version="0.9.0"`.
+# Note: there is no `--version` flag. mqttd recognises only `--check-config`,
+# `--hash-password` and `--decommission`, and IGNORES anything else — so an
+# unrecognised flag starts a real broker instead of erroring (tracked as
+# ADR 0046 T6). The running version is logged at startup:
+# `starting mqttd version="0.9.0"`.
 
 # Verify the image signature before trusting it:
 cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0 \
@@ -730,6 +731,18 @@ redacted).
 - **Pre-flight check:** `mqttd --check-config [--config <path>]` validates the config the broker
   would boot with and exits **without binding any port** — the GitOps CI / pre-rollout gate.
   Exit `0` = OK, `1` = a clear located error.
+- **Password hashing:** `mqttd --hash-password [<username>]` reads a password from **stdin** and
+  prints the Argon2id line `MQTTD_PASSWORD_FILE` expects — with a username, the whole
+  `username:hash` line; without one, the bare hash. The password goes on stdin, never in argv,
+  so it stays out of shell history and `ps`:
+
+  ```sh
+  printf %s 'correct horse battery staple' | mqttd --hash-password alice >> /etc/mqttd/passwd
+  ```
+
+  `mosquitto_passwd` output is a different format and is **not** accepted — re-hash on migration.
+  An end-to-end test hashes with this command and then logs in against a running broker, so the
+  two can never drift apart (`crates/mqttd/tests/password_cli.rs`).
 - **Hot reload:** edit the file and send `SIGHUP` (or set `[runtime] config_watch_secs` /
   `MQTTD_CONFIG_WATCH` to watch it) to reload the whole config through the validate-before-swap
   path — a bad edit is rejected and the running config kept. Live-swappable settings (ACL/auth,
@@ -780,7 +793,7 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | Variable | Purpose |
 |---|---|
 | `MQTTD_ALLOW_ANONYMOUS` | **Insecure**: permit clients with no credentials |
-| `MQTTD_PASSWORD_FILE` | Argon2id `username:phc-hash` password file |
+| `MQTTD_PASSWORD_FILE` | Argon2id `username:phc-hash` password file. Generate lines with `mqttd --hash-password <user>` (below) — `mosquitto_passwd` hashes are a different format and are not accepted |
 | `MQTTD_JWT_HS256_SECRET_FILE` / `MQTTD_JWT_RS256_PEM` | Static JWT verification key, **by file** (ADR 0046 T5): the HS256 shared secret and the RS256 public key are both read from a path, so the key is mounted from a Secret, never inlined. A trailing newline in the HS256 file is trimmed |
 | `MQTTD_JWT_ISSUER` / `MQTTD_JWT_AUDIENCE` | Optional JWT `iss`/`aud` constraints (static-key mode) |
 | `MQTTD_OIDC_ISSUER` | **OIDC-mode token auth** (ADR 0050): the broker discovers the issuer's JWKS and follows key rotation live (no restart). Requires `MQTTD_OIDC_AUDIENCE`. Mutually exclusive with `MQTTD_JWT_*`. Asymmetric-only (RS256/ES256; a public JWKS never feeds an HMAC verify). Tokens ride in the CONNECT **password** field (EMQX convention). Proven against a real Keycloak, forced key rotation included (nightly `oidc` job) |

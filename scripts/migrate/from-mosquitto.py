@@ -60,8 +60,10 @@ DIRECT: dict[str, tuple[str, str, str]] = {
 NO_EQUIVALENT: dict[str, str] = {
     "acl_file": "translated separately into the ACL policy (see --out-acl)",
     "password_file": "mqttd uses Argon2id password files: set security.password_file "
-    "to a file of `username:argon2id-hash` lines (mosquitto_passwd hashes are NOT "
-    "compatible — re-hash them)",
+    "to a file of `username:argon2id-hash` lines. mosquitto_passwd hashes are NOT "
+    "compatible and cannot be converted (they are hashes — the passwords are not "
+    "recoverable), so each user must be re-hashed from their password: "
+    "`printf %s '<password>' | mqttd --hash-password <username> >> passwd`",
     "psk_file": "PSK ciphersuites are not implemented",
     "bridge": "bridging is a separate process in mqttd (mqtt-bridge) with its own "
     "config; see docs/BRIDGE.md",
