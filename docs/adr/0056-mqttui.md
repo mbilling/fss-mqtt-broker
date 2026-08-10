@@ -1,9 +1,9 @@
-# ADR 0056 — `mqttui`: a task runner for the repository's scripts, outside the broker's dependency graph
+# ADR 0056 — `mqttui`: a terminal UI for running the demo, migration and test scripts
 
 - **Status:** Proposed
 - **Date:** 2026-08-10
 - **Deciders:** project maintainers
-- **Delivery:** [docs/delivery/0056-repo-task-runner.md](../delivery/0056-repo-task-runner.md) — plan, progress, and changelog
+- **Delivery:** [docs/delivery/0056-mqttui.md](../delivery/0056-mqttui.md) — plan, progress, and changelog
 - **Related:** [ADR 0044](0044-release-readiness-assurance.md) (the assurance scripts this
   would front), [ADR 0045](0045-release-engineering-and-distribution.md) (what ships in a
   release, and therefore what must *not* enter its dependency graph),
@@ -11,7 +11,12 @@
   these scripts is the same reason they cannot evaluate the broker), issue #138.
 
 > This record states the decision only. How it is being built and how far along it is live
-> in the [delivery doc](../delivery/0056-repo-task-runner.md).
+> in the [delivery doc](../delivery/0056-mqttui.md).
+
+**`mqttui` is a terminal UI for running this repository's own scripts** — the demo stack,
+the Mosquitto migration converter, the smoke and conformance suites, the Kubernetes
+end-to-end runs, the benchmark harness. It is **not** part of the broker and does not talk
+MQTT: it finds, explains and runs the scripts that are already here.
 
 ## Context
 
@@ -34,13 +39,13 @@ without reading their source:
 Two of the five reviewers in the 2026-08-09 panel ([`docs/REVIEW-PANEL.md`](../REVIEW-PANEL.md))
 never found the demo stack at all.
 
-A terminal UI over these scripts is straightforward. The decisions worth recording are
-**where its dependencies live**, **how it avoids going stale**, and **who it is for** —
-each of which is expensive to reverse once chosen.
+Building the UI is straightforward and is not what this record is for. The decisions worth
+recording are **where its dependencies live**, **how it avoids going stale**, and **who it
+is for** — each expensive to reverse once chosen.
 
 ## Decision
 
-### 1. It is `mqttui`, and it lives in a separate workspace
+### 1. It is `mqttui`, and its dependencies stay out of the broker's
 
 The binary is **`mqttui`**. `tools/mqttui/` carries its **own `[workspace]` and its own
 `Cargo.lock`**, excluded from the root workspace.

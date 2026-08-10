@@ -1,6 +1,6 @@
 ---
 adr: "0056"
-title: "mqttui: a task runner for the repository's scripts, outside the broker's dependency graph"
+title: "mqttui: a terminal UI for running the demo, migration and test scripts"
 adr_status: Proposed
 tasks:
   - id: 0056-T1
@@ -21,9 +21,9 @@ tasks:
     notes: "OPEN QUESTION, not a build task. It changes ADR 0056 §1: a user-facing launcher ships in the release, which puts ratatui back into the audited dependency graph and makes the separate workspace pointless. This record covers the developer tool only; a user-facing launcher earns its own ADR. Listed as a task so the question is closed deliberately rather than drifted past."
 ---
 
-# Delivery — ADR 0056: `mqttui`, a task runner for the repository's scripts
+# Delivery — ADR 0056: `mqttui`, a terminal UI for the repository's scripts
 
-Decision: [docs/adr/0056-repo-task-runner.md](../adr/0056-repo-task-runner.md).
+Decision: [docs/adr/0056-mqttui.md](../adr/0056-mqttui.md).
 
 Origin: proposed 2026-08-10, tracked as issue
 [#138](https://github.com/mbilling/fss-mqtt-broker/issues/138). Not release-blocking —
