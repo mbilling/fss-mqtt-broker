@@ -1,0 +1,387 @@
+# Every runnable script in this repository, declared (ADR 0056 §2).
+#
+# Declared rather than discovered, because a directory walk cannot know a description,
+# cannot tell a user-facing script from CI plumbing, and cannot know what a script needs
+# before it runs. This file is also documentation of the operational surface that survives
+# the tool.
+#
+# `mqttui` fails its own test if an executable script under scripts/, demo/ or bench/ is
+# absent here (ADR 0056 §3) — a launcher that silently shows a subset becomes the list
+# people trust. Mark CI plumbing `hidden = true` rather than leaving it out.
+#
+# Fields:
+#   id        stable handle for `mqttui --run <id>`; never renamed once published
+#   group     the heading it appears under
+#   name      one line, imperative, what it does for you
+#   script    path from the repository root
+#   about     a paragraph — what it proves or produces, and anything surprising
+#   requires  tools that MUST be present; a missing one blocks the run
+#   optional  tools whose absence degrades the run; named so the gap is visible
+#   duration  rough wall-clock, so nobody starts a 15-minute job by accident
+#   caution   shown before running; for tasks that disturb the machine
+#   hidden    CI plumbing — declared for completeness, not offered
+#   env       tuneable environment variables with defaults and help
+
+# ── Demo ─────────────────────────────────────────────────────────────────────────────
+[[task]]
+id = "demo-quic-certs"
+group = "Demo"
+name = "Generate the demo QUIC certificates"
+script = "demo/quic/gen-certs.sh"
+about = """
+Mints a throwaway CA plus server and client certificates for the MQTT-over-QUIC listener
+(ADR 0036). QUIC mandates TLS 1.3 and this demo requires client certificates, so the stack
+will not start without these. Run once before `demo-stack`.
+"""
+requires = ["openssl"]
+duration = "~2s"
+
+[[task]]
+id = "demo-stack"
+group = "Demo"
+name = "Run the 7-node cluster with Grafana and Prometheus"
+script = "demo/loadgen/loadgen.sh"
+about = """
+The full observability demo: seven brokers forming one durable cluster, Prometheus
+scraping them, Alloy taking OTLP push, and Grafana with the mqttd dashboards. A load
+generator drives cross-node traffic so the panels are populated rather than flat.
+
+Grafana on :3000, Prometheus on :9090, MQTT on 1883-1891.
+"""
+requires = ["docker"]
+duration = "~3m to start, then runs until stopped"
+caution = "Starts 25 containers and binds ports 1883-1891, 3000, 9090, 12345."
+
+[[task]]
+id = "demo-scale"
+group = "Demo"
+name = "Resize the demo cluster"
+script = "demo/scale-cluster.py"
+about = """
+Rewrites the demo compose file for a different node count and fixes up the readiness floor
+so a resized cluster still gates on a majority. Use it to watch elastic resize (ADR 0043)
+rather than editing YAML by hand.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+# ── Migration ────────────────────────────────────────────────────────────────────────
+[[task]]
+id = "migrate-mosquitto"
+group = "Migration"
+name = "Convert a Mosquitto configuration to mqttd"
+script = "scripts/migrate/from-mosquitto.py"
+about = """
+Reads YOUR mosquitto.conf and its acl_file and emits an mqttd TOML config plus an ACL
+policy. Anything without an exact equivalent is emitted as a `# TODO(migrate):` comment at
+the point it belongs — a converter that silently dropped a setting would be worse than no
+converter, because you would deploy believing the policy came across.
+
+Review the output, then validate it: `mqttd --check-config --config <out>`.
+"""
+requires = ["python3"]
+duration = "~1s"
+[[task.env]]
+name = "INPUT"
+default = "/etc/mosquitto/mosquitto.conf"
+help = "The mosquitto.conf to read (passed as the first argument)"
+
+[[task]]
+id = "migrate-test"
+group = "Migration"
+name = "Prove the converter's output boots the real broker"
+script = "scripts/migrate/test-from-mosquitto.sh"
+about = """
+Converts a fixture Mosquitto deployment and then BOOTS mqttd on the result. A migration
+tool that emits plausible TOML the broker rejects burns the evaluation it exists to enable,
+so this asserts acceptance by the real binary rather than well-formedness (ADR 0051 T6).
+"""
+requires = ["python3"]
+duration = "~10s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker to test against; empty builds one first"
+
+# ── Try it ───────────────────────────────────────────────────────────────────────────
+[[task]]
+id = "quickstart"
+group = "Try it"
+name = "Run the README's own two-node cluster"
+script = "scripts/quickstart-smoke.sh"
+about = """
+Executes the README's quickstart verbatim — two nodes discovering each other over SWIM
+gossip with no static peer list, then a publish on one delivered to a subscriber on the
+other, then the secured variant with TLS, mTLS and an ACL.
+
+It exists so the documented getting-started path cannot silently rot: if the README stops
+working, this fails.
+"""
+requires = ["mosquitto_pub", "mosquitto_sub", "python3", "curl", "openssl"]
+duration = "~30s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+
+[[task]]
+id = "deploy-smoke"
+group = "Try it"
+name = "Boot the three-node compose/systemd reference deployment"
+script = "scripts/deploy-smoke.sh"
+about = """
+Brings up three real nodes using the values from the SHIPPED deploy/systemd/mqttd.env.example
+— it parses that file rather than restating it, so a setting renamed in the artifact fails
+here rather than on somebody's first install.
+
+Proves anonymous clients are refused, a generated password authenticates, the ACL confines
+a device to its own subtree, a publish on node 1 reaches a subscriber on node 3, an
+acknowledged QoS 1 message survives SIGKILL of the node that accepted it, and a minority
+node reports live-but-not-ready.
+"""
+requires = ["mosquitto_pub", "mosquitto_sub", "python3"]
+optional = ["docker", "systemd-analyze"]
+duration = "~60s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+
+[[task]]
+id = "image-smoke"
+group = "Try it"
+name = "Exercise the container image as a user runs it"
+script = "scripts/image-smoke.sh"
+about = """
+Runs the published image and checks the properties a hardened image claims: it runs as a
+non-root user, its data directory is writable by that user, durable state survives a
+restart, and it still works under `--read-only --cap-drop ALL`.
+"""
+requires = ["docker"]
+duration = "~40s"
+[[task.env]]
+name = "IMAGE"
+default = "ghcr.io/mbilling/fss-mqtt-broker:latest"
+help = "Image to exercise"
+
+# ── Conformance ──────────────────────────────────────────────────────────────────────
+[[task]]
+id = "interop-mosquitto"
+group = "Conformance"
+name = "Drive the broker with the Eclipse Mosquitto client"
+script = "scripts/interop/run.sh"
+about = """
+A foreign-client conformance oracle (ADR 0034): the real mqttd binary driven by a client
+nobody here wrote. An implementation that only ever talks to its own client proves very
+little.
+"""
+requires = ["mosquitto_pub", "mosquitto_sub"]
+duration = "~20s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+
+[[task]]
+id = "interop-paho"
+group = "Conformance"
+name = "Drive the broker with Eclipse Paho (v5 semantics)"
+script = "scripts/interop/paho_conformance.py"
+about = """
+The second independent oracle: Paho reaches the control-plane semantics the Mosquitto CLI
+cannot — v5 reason codes, SUBACK granted-QoS, CONNACK session-present, User Properties,
+retained-flag fidelity and session resume.
+"""
+requires = ["python3"]
+duration = "~15s"
+[[task.env]]
+name = "MQTT_PORT"
+default = ""
+help = "Port of an already-running broker; empty starts one"
+
+# ── Kubernetes ───────────────────────────────────────────────────────────────────────
+[[task]]
+id = "k8s-kind-smoke"
+group = "Kubernetes"
+name = "Stand up, scale and roll the Helm chart on kind"
+script = "scripts/k8s/kind-smoke.sh"
+about = """
+The chart's runtime proof (ADR 0047 T5): a real cluster, a real StatefulSet, a scale and a
+rolling update, with zero acknowledged loss across all of it. Also proves both split-brain
+mechanisms on the chart path — self-quarantine and the founder guard.
+"""
+requires = ["kind", "kubectl", "helm", "docker"]
+duration = "~6m"
+caution = "Creates a kind cluster and applies manifests to your CURRENT kubectl context."
+[[task.env]]
+name = "CLUSTER"
+default = "mqttd-smoke"
+help = "kind cluster name"
+[[task.env]]
+name = "READY_TIMEOUT"
+default = "180"
+help = "Seconds to wait for pods to become Ready"
+
+[[task]]
+id = "k8s-operator-e2e"
+group = "Kubernetes"
+name = "Run the operator end to end on kind"
+script = "scripts/k8s/operator-e2e.sh"
+about = """
+The reconciler against a live API server (ADR 0055 T7): applies an MqttdCluster, watches
+the operator render and converge it, and checks the observed state it writes back.
+"""
+requires = ["kind", "kubectl", "docker"]
+duration = "~5m"
+caution = "Creates a kind cluster and applies CRDs to your CURRENT kubectl context."
+
+[[task]]
+id = "k8s-bridge-chart"
+group = "Kubernetes"
+name = "Check the bridge chart gives every replica its own client id"
+script = "scripts/k8s/check-bridge-chart.sh"
+about = """
+Parses the rendered ConfigMap TOML and asserts every `client_id` carries `__POD_NAME__`.
+Replicas sharing one client id take over each other's MQTT session, turning an HA pair into
+a reconnect loop — 73 reconnects per replica in 30 seconds, measured.
+"""
+requires = ["helm"]
+duration = "~5s"
+
+[[task]]
+id = "k8s-render-parity"
+group = "Kubernetes"
+name = "Diff the operator's rendering against the Helm chart"
+script = "scripts/k8s/render-parity.sh"
+about = """
+Two supported deployment paths that disagree are worse than one. This renders both for
+equivalent inputs, normalises only by-construction differences, and diffs the rest.
+
+Operates on this repository — it needs a checkout.
+"""
+requires = ["helm", "cargo"]
+duration = "~40s"
+
+# ── Benchmark ────────────────────────────────────────────────────────────────────────
+[[task]]
+id = "bench-certs"
+group = "Benchmark"
+name = "Generate the benchmark TLS material"
+script = "bench/tls/gen-certs.sh"
+about = "Throwaway PKI for the benchmark's disclosed mTLS posture (ADR 0048 T2)."
+requires = ["openssl"]
+duration = "~2s"
+
+[[task]]
+id = "bench-run"
+group = "Benchmark"
+name = "Run the comparative benchmark"
+script = "bench/run.sh"
+about = """
+Drives the same emqtt-bench workload against mqttd, Mosquitto, EMQX, VerneMQ and NanoMQ,
+one broker at a time so they never contend. Versions are pinned and each broker gets its
+own documented, reasonable configuration — not ours tuned and theirs default.
+
+Read bench/README.md before publishing anything from it: the harness has honesty rules
+about what may be claimed from a single-host run.
+"""
+requires = ["docker"]
+duration = "~15m per broker"
+caution = "Pins the host. Nothing else should be running — results are not comparable otherwise."
+[[task.env]]
+name = "DURATION"
+default = "60"
+help = "Seconds per scenario"
+[[task.env]]
+name = "SIZE"
+default = "256"
+help = "Payload bytes"
+[[task.env]]
+name = "ONLY"
+default = ""
+help = "Run one broker only: mqttd|mosquitto|emqx|vernemq|nanomq"
+
+[[task]]
+id = "bench-summarize"
+group = "Benchmark"
+name = "Summarise benchmark results"
+script = "bench/summarize.py"
+about = "Turns a benchmark run's raw output into the comparison tables under docs/benchmarks/."
+requires = ["python3"]
+duration = "~2s"
+
+# ── Identity ─────────────────────────────────────────────────────────────────────────
+[[task]]
+id = "oidc"
+group = "Identity"
+name = "Verify OIDC against a real Keycloak"
+script = "scripts/oidc/run.sh"
+about = """
+Boots a real identity provider, mints tokens, and checks the broker's OIDC path against it
+— including a forced key rotation mid-run, because JWKS rotation is where token auth
+usually breaks (ADR 0050 T4).
+"""
+requires = ["docker", "curl", "python3"]
+duration = "~3m"
+[[task.env]]
+name = "KC_PORT"
+default = "8081"
+help = "Port to run Keycloak on"
+[[task.env]]
+name = "REALM"
+default = "mqttd"
+help = "Keycloak realm to create"
+
+# ── Release ──────────────────────────────────────────────────────────────────────────
+[[task]]
+id = "release-build"
+group = "Release"
+name = "Build the shipped binaries reproducibly"
+script = "scripts/release/build-repro.sh"
+about = """
+The reproducible musl build of mqttd and mqtt-bridge (ADR 0045 T2): rebuild a tag and get
+identical bytes. Operates on this repository — it needs a checkout.
+"""
+requires = ["cargo", "docker"]
+duration = "~10m"
+
+# ── CI plumbing — declared for completeness, never offered ───────────────────────────
+[[task]]
+id = "gen-status"
+group = "Internal"
+name = "Regenerate the delivery dashboard"
+script = "scripts/gen-status.py"
+about = "Regenerates docs/delivery/STATUS.md and each doc's progress table from frontmatter."
+requires = ["python3"]
+duration = "~1s"
+hidden = true
+
+[[task]]
+id = "check-readme-facts"
+group = "Internal"
+name = "Check the README's derivable facts"
+script = "scripts/check-readme-facts.py"
+about = "Validates the ADR count, crate table and anchors against the repository."
+requires = ["python3"]
+duration = "~1s"
+hidden = true
+
+[[task]]
+id = "gen-bridge-dashboard"
+group = "Internal"
+name = "Regenerate the bridge Grafana dashboard"
+script = "scripts/gen-bridge-dashboard.py"
+about = "Emits demo/grafana/dashboards/mqttd-bridge.json from the metric definitions."
+requires = ["python3"]
+duration = "~1s"
+hidden = true
+
+[[task]]
+id = "render-parity-one"
+group = "Internal"
+name = "Render parity for a single founder-guard state"
+script = "scripts/k8s/render-parity-one.sh"
+about = "Inner half of k8s-render-parity; run that instead."
+requires = ["helm", "cargo"]
+duration = "~20s"
+hidden = true

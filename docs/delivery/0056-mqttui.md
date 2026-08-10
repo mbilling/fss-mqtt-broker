@@ -5,8 +5,10 @@ adr_status: Proposed
 tasks:
   - id: 0056-T1
     title: The manifest + headless runner + the CI completeness guard — tasks.toml declaring every runnable script with its prerequisites and env surface, `mqttui --list` / `mqttui --run <id>`, and a test that fails when a script is missing from it
-    status: planned
-    notes: "Deliberately first, and useful with no UI at all: it proves the data model, and the manifest is machine-checked documentation of the operational surface on its own. The completeness guard is the load-bearing piece (ADR 0056 §3) — a launcher that silently shows 14 of 23 scripts becomes the list people trust. If phase 1 turns out to be sufficient, a justfile over the manifest is a legitimate place to stop; the manifest is where the value is, not the TUI."
+    status: done
+    date: 2026-08-10
+    evidence: "tools/mqttui/ — its OWN workspace with its OWN lockfile (18 packages against the broker's 429; `cargo metadata` on the root shows 11 members with mqttui absent, and the broker's Cargo.lock is untouched). tasks.toml declares all 23 scripts under scripts/, demo/ and bench/ — 19 offered, 4 CI plumbing marked hidden — each with about/requires/optional/duration/caution/env. `--list`, `--show <id>`, `--run <id>`, `--check`. Preflight blocks a run whose REQUIRED tools are missing and names them; absent OPTIONAL tools are reported and the run proceeds. 11 tests. CI job `mqttui (separate workspace)` runs fmt, clippy -D warnings, the tests, and `--check`."
+    notes: "The completeness guard is proven in BOTH directions, not just asserted: dropping an undeclared scripts/mqttui-guard-probe.sh made `--check` exit 1 and the test fail by name; removing it made both pass. A companion test asserts the walk finds >=15 scripts, so the guard cannot pass vacuously. FOUND WHILE BUILDING IT: the first walk required the executable bit, which made scripts/gen-status.py and scripts/gen-bridge-dashboard.py (mode 644, invoked as `python3 <file>`) invisible — a completeness guard with a blind spot, and a new script landing without chmod +x would have slipped past in silence. The walk now takes any .sh/.py; the count went 21 -> 23."
   - id: 0056-T2
     title: The terminal UI — collapsible group/task tree, detail pane that becomes the output pane while running, cancel by process group
     status: planned
@@ -80,7 +82,7 @@ nothing to run).
 <!-- status-table:0056 -->
 | Task | Status | When | Evidence / notes |
 |------|--------|------|------------------|
-| 0056-T1 | ⬜ planned | — | "Deliberately first, and useful with no UI at all: it proves the data model, and the manifest is machine-checked documentation of the operational surface on its own. The completeness guard is the load-bearing piece (ADR 0056 §3) — a launcher that silently shows 14 of 23 scripts becomes the list people trust. If phase 1 turns out to be sufficient, a justfile over the manifest is a legitimate place to stop; the manifest is where the value is, not the TUI." |
+| 0056-T1 | ✅ done | 2026-08-10 | "tools/mqttui/ — its OWN workspace with its OWN lockfile (18 packages against the broker's 429; `cargo metadata` on the root shows 11 members with mqttui absent, and the broker's Cargo.lock is untouched). tasks.toml declares all 23 scripts under scripts/, demo/ and bench/ — 19 offered, 4 CI plumbing marked hidden — each with about/requires/optional/duration/caution/env. `--list`, `--show <id>`, `--run <id>`, `--check`. Preflight blocks a run whose REQUIRED tools are missing and names them; absent OPTIONAL tools are reported and the run proceeds. 11 tests. CI job `mqttui (separate workspace)` runs fmt, clippy -D warnings, the tests, and `--check`." |
 | 0056-T2 | ⬜ planned | — | "LAYOUT SETTLED 2026-08-10. Two panes, not three: at 80x24 a third pane leaves ~6 lines of output, useless for a bench run — the right pane is Detail while browsing and Output while running, since you are either choosing or watching. Collapsible group tree (not a flat filtered list) because discoverability is the whole point and the set is expected to grow. Follow-mode auto-scrolls until the user scrolls up, then stops. A finished run leads with the verdict; a FAILED run jumps to the first FAIL/FATAL/error line rather than the tail. ONE RUN AT A TIME, enforced: these scripts bind fixed ports and start containers, and bench/run.sh explicitly requires an otherwise-idle host, so concurrency would produce failures that look like broker bugs." |
 | 0056-T3 | ⬜ planned | — | "The preflight block is the highest-value part of the UI: it turns 'run it and find out' into 'you are missing mosquitto-clients', named BEFORE the run rather than as a FATAL partway through. A task with missing required tools cannot be started at all, and the manifest carries an install hint per platform, because 'install kind' is where a newcomer stalls. Env editing is INLINE, not modal — a modal hides the description you are editing against. Manifest tasks may carry a `caution` string; bench/run.sh (pins the host, results invalid otherwise) and kind-smoke.sh genuinely need one. DECIDED 2026-08-10: no persisted last-run history — it is state that lies after a git pull, for little gain." |
 | 0056-T5 | ⬜ planned | — | "Requested 2026-08-10, and justified on the spot: probing this machine while designing it found TWENTY orphaned mqttd processes from the day's test runs, invisible until asked for. The kube CONTEXT is the safety feature — kind-smoke.sh and operator-e2e.sh run kubectl against whatever is current, so showing `kube: prod-eu-west` before the user presses enter is the difference between a smoke test and an incident. Measured probe costs decide the polling: docker ps 0.01s, kind get clusters 0.06s, kubectl current-context 0.22s (2s timer, off the UI thread, bounded so an unreachable context shows `unreachable` instead of freezing); docker compose ls 1.9s (on demand only, staleness shown). Probing is read-only and unconditional; cleanup is never automatic and always confirmed with the specific processes/clusters listed — a tool that kills things you did not ask it to kill is worse than one that only shows them." |
@@ -94,6 +96,21 @@ nothing to run).
 
 ## Changelog
 
+- **2026-08-10** — **T1 done: the manifest, the headless runner, and the guard.** `mqttui`
+  builds from its own workspace with its own lockfile — 18 packages against the broker's
+  429, and the broker's `Cargo.lock` is untouched, which is the whole point of ADR 0056 §1.
+  All 23 scripts are declared; `--list`, `--show`, `--run` and `--check` work; preflight
+  blocks a run whose required tools are missing and names them.
+
+  The guard is proven in both directions rather than asserted: an undeclared script makes
+  `--check` exit 1 and fails the test by name, and removing it makes both pass. A companion
+  test asserts the walk finds at least fifteen scripts, so it cannot pass vacuously.
+
+  Building it turned up a hole in the guard itself. The first walk required the executable
+  bit — which made `gen-status.py` and `gen-bridge-dashboard.py` (mode 644, run as
+  `python3 <file>`) invisible to it. A completeness guard with a blind spot is not a
+  completeness guard; a new script landing without `chmod +x` would have slipped past in
+  silence. Fixed, and the count went 21 → 23.
 - **2026-08-10** — **`mqttui` becomes an installed product, not a checkout tool** (ADR
   amendment; closes T4, adds T7–T10). A one-line install must give somebody the demo, the
   Kubernetes examples and the migration converter without cloning anything — which the

@@ -971,6 +971,27 @@ helm install mqttd deploy/helm/mqttd \
 Validate a rendered config without a cluster: `mqttd --check-config --config <file>`. See
 [`docs/mqttd.example.toml`](docs/mqttd.example.toml) for every setting.
 
+### Running the demo, migrations and test scripts
+
+There are 23 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
+conformance suites, the Kubernetes end-to-end runs, the benchmark harness. `mqttui` is the
+one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md)):
+
+```sh
+cargo run --manifest-path tools/mqttui/Cargo.toml -- --list
+cargo run --manifest-path tools/mqttui/Cargo.toml -- --show deploy-smoke
+cargo run --manifest-path tools/mqttui/Cargo.toml -- --run  deploy-smoke
+```
+
+It says what each task needs **before** you start it, rather than failing with
+`FATAL: 'kind' not found` five minutes in, and CI fails if a script in the tree is missing
+from its manifest — so the list cannot quietly go stale.
+
+It is a **separate workspace with its own lockfile**: nothing it depends on can reach the
+broker's dependency graph, which is what `cargo-deny`, `cargo-audit` and the SBOM are cut
+from. The terminal UI, and a standalone build that carries the examples with it, are the
+next tasks on that ADR.
+
 ### Without Kubernetes (Compose, systemd)
 
 Kubernetes is not required, and the non-Kubernetes path is a shipped artifact rather than

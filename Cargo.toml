@@ -13,6 +13,12 @@ members = [
     "crates/mqtt-bridge",
     "crates/mqttd-operator",
 ]
+# `tools/mqttui` is a SEPARATE workspace with its own lockfile (ADR 0056 §1). ratatui and
+# crossterm must never enter the broker's dependency graph: this workspace is audited by
+# cargo-deny and cargo-audit on every push and its lockfile is what the SBOM is cut from.
+# A feature flag would not achieve this — it removes a crate from the artifact, not from
+# Cargo.lock. The boundary has to be the lockfile.
+exclude = ["tools/mqttui"]
 
 [workspace.package]
 version = "0.9.0"
