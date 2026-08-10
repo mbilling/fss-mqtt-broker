@@ -12,10 +12,12 @@
 //! mqttui --run deploy-smoke     run it, from the repository root
 //! mqttui --check                the manifest covers every script in the tree
 //! mqttui                        the terminal UI (T2)
+//! mqttui migrate mosquitto …    convert a Mosquitto deployment, no Python needed
 //! ```
 
 mod env;
 mod manifest;
+mod migrate;
 mod preflight;
 mod runner;
 mod teardown;
@@ -32,6 +34,26 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         usage();
         return ExitCode::SUCCESS;
+    }
+
+    // `migrate` reads the USER's mosquitto.conf, not anything of ours, so it works with no
+    // checkout at all — which is the point of it being built in (ADR 0056 T10).
+    if args.first().is_some_and(|a| a == "migrate") {
+        let sub = args.get(1).map(String::as_str);
+        if sub != Some("mosquitto") {
+            eprintln!("mqttui: usage: mqttui migrate mosquitto <mosquitto.conf> [--out-config P] [--out-acl P]");
+            return ExitCode::from(2);
+        }
+        return match migrate::run(&args[2..]) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mqttui: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     // T7 will embed the examples so this works outside a checkout. Until then, say what is
@@ -181,7 +203,8 @@ fn usage() {
            mqttui --show <id>           what a task does, needs, and costs\n  \
            mqttui --run <id>            run it\n  \
            mqttui --check               the manifest covers every script in the tree\n  \
-           mqttui                       the terminal UI\n"
+           mqttui                       the terminal UI\n  \
+           mqttui migrate mosquitto <conf> [--out-config P] [--out-acl P]\n"
     );
 }
 
