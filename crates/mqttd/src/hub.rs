@@ -1722,7 +1722,7 @@ impl Hub {
                 }
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
-            HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid),
+            HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid).await,
             HubCommand::PubComp { client, pkid } => self.pub_comp(&client, pkid).await,
             HubCommand::Detach {
                 client,
@@ -2991,8 +2991,16 @@ impl Hub {
 
         // QoS > 0: respect the client's Receive Maximum (ADR 0012). If the quota is
         // full, hold the message until a PUBACK/PUBCOMP drains it; otherwise send now.
+        //
+        // A non-empty backlog ALSO diverts the message, even with quota free. Before
+        // ADR 0057 that case was unreachable (acks drain the backlog before the loop
+        // processes another publish, so backlog non-empty implied quota full); a
+        // deferred `QoS` 2 delivery (outbound-id write failed, requeued at the front)
+        // broke that invariant, and sending fresh traffic directly would let it OVERTAKE
+        // the deferred message — per-client ordering is part of the contract.
         let inf = self.inflight.entry(client.clone()).or_default();
-        if inf.quota_full() {
+        let must_queue = inf.quota_full() || !inf.backlog.is_empty();
+        if must_queue {
             // The backlog is bounded (ADR 0012); drop-oldest on overflow so a stalled
             // consumer cannot force unbounded memory.
             let evicted = inf.push_backlog(Backlog {
@@ -3014,8 +3022,19 @@ impl Hub {
                 // holds the truncation point back.
                 self.truncate_acked(client).await;
             }
+            // Quota free but the backlog holds a deferred delivery: retry the drain now,
+            // in order — traffic is the retry clock, so a store that recovered gets the
+            // deferred message out on the very next publish rather than at reconnect.
+            let quota_free = self
+                .inflight
+                .get(client)
+                .is_some_and(|inf| !inf.quota_full());
+            if quota_free {
+                self.drain_backlog(client).await;
+            }
         } else {
-            self.send_qos_publish(client, tx, message, retain, message_expiry, offset)
+            let _ = self
+                .send_qos_publish(client, tx, message, retain, message_expiry, offset)
                 .await;
         }
     }
@@ -3067,6 +3086,9 @@ impl Hub {
         }
     }
 
+    /// Returns whether the PUBLISH went on the wire. `false` means the delivery was
+    /// requeued (front of the backlog, so ordering holds) because its outbound id could
+    /// not be made durable — see below.
     async fn send_qos_publish(
         &mut self,
         client: &ClientId,
@@ -3075,8 +3097,41 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         offset: Option<Offset>,
-    ) {
+    ) -> bool {
         let pkid = self.alloc_pkid(client).await;
+        // ADR 0057: a `QoS` 2 delivery backed by a durable offset records its packet id
+        // BEFORE the packet reaches the wire — the same ordering as #124, because an id
+        // recorded after the send is an id a crash can orphan, and an orphaned id is how
+        // exactly-once quietly becomes at-least-once across a restart. `QoS` 1 is not
+        // recorded (a fresh-id DUP redelivery is what at-least-once means); a delivery
+        // with no offset has no durable message to resume, so an id would be pointless.
+        if message.qos == QoS::ExactlyOnce {
+            if let Some(off) = offset {
+                if let Err(e) = self.store.record_outbound(client, pkid, off).await {
+                    // Fail closed: the PUBLISH is withheld, not sent under an id that
+                    // would not survive. The message is already durable at `off`, so
+                    // nothing is lost — it goes back to the FRONT of the backlog
+                    // (ordering holds) and the next drain retries, by which time the
+                    // store has recovered or the same failure repeats harmlessly.
+                    warn!(client = %client.0, pkid, error = %e,
+                          "outbound QoS2 id could not be made durable; delivery deferred");
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("outbound-id-write-failed");
+                    }
+                    self.inflight
+                        .entry(client.clone())
+                        .or_default()
+                        .backlog
+                        .push_front(Backlog {
+                            message: message.clone(),
+                            retain,
+                            message_expiry,
+                            offset,
+                        });
+                    return false;
+                }
+            }
+        }
         let inf = self.inflight.entry(client.clone()).or_default();
         let state = if message.qos == QoS::AtLeastOnce {
             OutState::AwaitingPubAck
@@ -3101,6 +3156,7 @@ impl Hub {
             message_expiry,
             &message.app,
         ));
+        true
     }
 
     /// Drain backlogged `QoS` > 0 messages onto the wire while the client is online and
@@ -3117,15 +3173,21 @@ impl Hub {
             let Some(entry) = inf.backlog.pop_front() else {
                 break;
             };
-            self.send_qos_publish(
-                client,
-                &tx,
-                &entry.message,
-                entry.retain,
-                entry.message_expiry,
-                entry.offset,
-            )
-            .await;
+            if !self
+                .send_qos_publish(
+                    client,
+                    &tx,
+                    &entry.message,
+                    entry.retain,
+                    entry.message_expiry,
+                    entry.offset,
+                )
+                .await
+            {
+                // The entry went back to the backlog's front; retrying in this same
+                // loop would spin against a store that just refused.
+                break;
+            }
         }
     }
 
@@ -3174,7 +3236,26 @@ impl Hub {
     }
 
     /// PUBREC: advances a `QoS` 2 delivery to the release phase (send PUBREL).
-    fn pub_rec(&mut self, client: &ClientId, pkid: u16) {
+    async fn pub_rec(&mut self, client: &ClientId, pkid: u16) {
+        // Is this a durable-tracked delivery? (Only `QoS` 2 with an offset was recorded.)
+        let durable = self
+            .inflight
+            .get(client)
+            .and_then(|inf| inf.pending.get(&pkid))
+            .is_some_and(|p| p.state == OutState::AwaitingPubRec && p.offset.is_some());
+        if durable {
+            // ADR 0057: the phase advances durably BEFORE the PUBREL goes out. If this
+            // write fails the PUBREL is withheld and nothing moves — the subscriber
+            // re-sends PUBREC (it is waiting on us), which retries this write. Sending
+            // PUBREL on a failed write would mean a crash restores to `AwaitingPubRec`
+            // and re-PUBLISHes a message the subscriber already released — a duplicate
+            // manufactured by our own bookkeeping.
+            if let Err(e) = self.store.advance_outbound(client, pkid).await {
+                warn!(client = %client.0, pkid, error = %e,
+                      "outbound QoS2 phase advance failed; PUBREL withheld");
+                return;
+            }
+        }
         let advanced =
             self.inflight
                 .get_mut(client)
@@ -3197,6 +3278,14 @@ impl Hub {
     async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubComp);
         if completed {
+            // ADR 0057: the handshake is done; release the durable id. A failure here is
+            // logged and tolerated rather than retried: the worst a leftover entry can do
+            // is make a restore send one spurious PUBREL, which the subscriber answers
+            // with PUBCOMP (MQTT-4.3.3), and THAT PUBCOMP retries this clear.
+            if let Err(e) = self.store.clear_outbound(client, pkid).await {
+                warn!(client = %client.0, pkid, error = %e,
+                      "outbound QoS2 id clear failed; a restore may send one spurious PUBREL");
+            }
             self.truncate_acked(client).await;
             self.drain_backlog(client).await;
         }
@@ -5573,6 +5662,10 @@ mod tests {
         fail_remaining: std::sync::atomic::AtomicUsize,
         /// When set, every `enqueue_with_expiry` fails with `NoQuorum` (ADR 0020-T6).
         fail_enqueue_no_quorum: bool,
+        /// While true, `record_outbound`/`advance_outbound` fail with `NoQuorum` — a
+        /// SEPARATE lever from the enqueue one, because the append happens first and
+        /// failing it would mask the very path ADR 0057's tests exist to exercise.
+        fail_outbound: std::sync::atomic::AtomicBool,
     }
 
     impl FlakyStore {
@@ -5581,6 +5674,7 @@ mod tests {
                 inner: MemorySessionStore::new(),
                 fail_remaining: std::sync::atomic::AtomicUsize::new(fail_ensure),
                 fail_enqueue_no_quorum: false,
+                fail_outbound: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -5591,6 +5685,7 @@ mod tests {
                 inner: MemorySessionStore::new(),
                 fail_remaining: std::sync::atomic::AtomicUsize::new(0),
                 fail_enqueue_no_quorum: true,
+                fail_outbound: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -5690,9 +5785,12 @@ mod tests {
             packet_id: u16,
             offset: mqtt_storage::Offset,
         ) -> Result<(), mqtt_storage::StorageError> {
-            // Gated like enqueue: recording the outbound id is part of the same
-            // fail-closed durable path (ADR 0057), so the fault seam covers it too.
-            if self.fail_enqueue_no_quorum {
+            // Its own lever, not the enqueue one: the durable append runs FIRST, and
+            // failing both would mean the delivery never reaches this path at all.
+            if self
+                .fail_outbound
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return Err(mqtt_storage::StorageError::NoQuorum);
             }
             self.inner.record_outbound(client, packet_id, offset).await
@@ -5703,6 +5801,12 @@ mod tests {
             client: &ClientId,
             packet_id: u16,
         ) -> Result<(), mqtt_storage::StorageError> {
+            if self
+                .fail_outbound
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
             self.inner.advance_outbound(client, packet_id).await
         }
 
@@ -5974,6 +6078,36 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+        })
+        .unwrap();
+    }
+
+    fn publish_qos2(tx: &HubTx, topic: &str, payload: &'static [u8]) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+        })
+        .unwrap();
+    }
+
+    fn pub_rec(tx: &HubTx, client: &str, pkid: u16) {
+        tx.send(HubCommand::PubRec {
+            client: ClientId(client.into()),
+            pkid,
+        })
+        .unwrap();
+    }
+
+    fn pub_comp(tx: &HubTx, client: &str, pkid: u16) {
+        tx.send(HubCommand::PubComp {
+            client: ClientId(client.into()),
+            pkid,
         })
         .unwrap();
     }
@@ -7586,6 +7720,163 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a clean session owes no redelivery, so nothing is written"
+        );
+    }
+
+    /// ADR 0057: a live `QoS` 2 delivery records its packet id durably BEFORE the wire,
+    /// advances the record at PUBREC, and releases it at PUBCOMP. The id in the store must
+    /// BE the id on the wire — that identity is the whole point.
+    #[tokio::test]
+    async fn a_live_qos2_delivery_records_its_packet_id_until_pubcomp() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "t", b"exactly-once");
+        let delivered = recv_packet(&mut rx).await.unwrap();
+        let pkid = pkid_of(&delivered);
+
+        let c = ClientId("c".into());
+        let inflight = store.outbound(&c).await.unwrap();
+        assert_eq!(
+            inflight.len(),
+            1,
+            "the id is durable while the PUBLISH is in flight"
+        );
+        assert_eq!(inflight[0].packet_id, pkid, "the durable id IS the wire id");
+        assert!(!inflight[0].pubrec_seen, "phase: awaiting PUBREC");
+        let logged = store.pending(&c, 0, 16).await.unwrap();
+        assert_eq!(
+            inflight[0].offset, logged[0].offset,
+            "the id points at its message"
+        );
+
+        pub_rec(&tx, "c", pkid);
+        let rel = recv_packet(&mut rx).await.unwrap();
+        assert!(
+            matches!(&rel, Packet::PubRel(k) if k.pkid == pkid),
+            "{rel:?}"
+        );
+        let inflight = store.outbound(&c).await.unwrap();
+        assert!(inflight[0].pubrec_seen, "phase advanced durably at PUBREC");
+
+        pub_comp(&tx, "c", pkid);
+        // Round-trip through the hub loop so the reads below are ordered after it.
+        attach_full(&tx, "sync-probe", 9, true, 0, 8).await;
+        assert!(
+            store.outbound(&c).await.unwrap().is_empty(),
+            "PUBCOMP releases the durable id"
+        );
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "…and the message log entry (#124)"
+        );
+    }
+
+    /// ADR 0057, fail closed: if the outbound id cannot be made durable, the PUBLISH is
+    /// withheld — sent under an unsurvivable id, a crash would replay it under a fresh
+    /// one, which is exactly the #130 defect. The delivery defers (message stays durable)
+    /// and goes out IN ORDER once the store recovers, with traffic as the retry clock.
+    #[tokio::test]
+    async fn a_failed_outbound_id_write_defers_the_publish_in_order() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::ExactlyOnce);
+
+        store
+            .fail_outbound
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        publish_qos2(&tx, "t", b"first");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the PUBLISH must be withheld while its id cannot be made durable"
+        );
+        let c = ClientId("c".into());
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            1,
+            "the message itself is already durable (#124) — nothing is lost, only deferred"
+        );
+        assert!(store.outbound(&c).await.unwrap().is_empty());
+
+        // Store recovers; the NEXT publish must not overtake the deferred one.
+        store
+            .fail_outbound
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        publish_qos2(&tx, "t", b"second");
+        let a = recv_packet(&mut rx)
+            .await
+            .expect("deferred delivery drains first");
+        let b = recv_packet(&mut rx).await.expect("then the new one");
+        assert_eq!(
+            payload_of(&a),
+            b"first",
+            "per-client order holds across the deferral"
+        );
+        assert_eq!(payload_of(&b), b"second");
+        assert_eq!(
+            store.outbound(&c).await.unwrap().len(),
+            2,
+            "both deliveries recorded their ids once the store allowed it"
+        );
+    }
+
+    /// ADR 0057, fail closed at PUBREC: if the phase cannot advance durably, the PUBREL
+    /// is withheld — the subscriber re-sends PUBREC, and that retry is the write's retry.
+    /// A PUBREL sent on a failed write would restore into `AwaitingPubRec` and re-PUBLISH
+    /// a message the subscriber already released: a duplicate of our own making.
+    #[tokio::test]
+    async fn a_failed_phase_advance_withholds_the_pubrel() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "t", b"m");
+        let pkid = pkid_of(&recv_packet(&mut rx).await.unwrap());
+
+        store
+            .fail_outbound
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        pub_rec(&tx, "c", pkid);
+        assert!(recv_packet(&mut rx).await.is_none(), "PUBREL withheld");
+        let c = ClientId("c".into());
+        assert!(
+            !store.outbound(&c).await.unwrap()[0].pubrec_seen,
+            "the durable phase did not move either — memory and store agree"
+        );
+
+        store
+            .fail_outbound
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        pub_rec(&tx, "c", pkid);
+        let rel = recv_packet(&mut rx).await.unwrap();
+        assert!(matches!(&rel, Packet::PubRel(k) if k.pkid == pkid));
+        assert!(store.outbound(&c).await.unwrap()[0].pubrec_seen);
+    }
+
+    /// ADR 0057 excludes `QoS` 1 by design: a fresh-id DUP redelivery is what
+    /// at-least-once means, so persisting its id would buy nothing.
+    #[tokio::test]
+    async fn a_qos1_delivery_records_no_outbound_id() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "t", b"m");
+        recv_packet(&mut rx).await.unwrap();
+        let c = ClientId("c".into());
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            1,
+            "durable (#124)"
+        );
+        assert!(
+            store.outbound(&c).await.unwrap().is_empty(),
+            "no outbound id is recorded at `QoS` 1"
         );
     }
 
