@@ -234,3 +234,175 @@ async fn an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash() {
     }
     // `restarted` is killed by its Drop, on this path and on every panic above.
 }
+
+/// The #130 acceptance criterion, verbatim (ADR 0057): the subscriber PUBRECs a `QoS` 2
+/// delivery, the broker is `SIGKILL`ed, and on resume the subscriber receives **PUBREL
+/// for the packet id it already knows** — never a second PUBLISH under a fresh id.
+///
+/// This is the exactly-once half of what the `QoS` 1 test above proves for at-least-once.
+/// Before ADR 0057 the message survived (#124) but the id did not: the restart replayed
+/// the PUBLISH under a fresh id, the subscriber's dedup window (keyed on the id) could
+/// not fire, and the application saw the message twice. The README's Limitations section
+/// documented that narrowing; this test is what allows it to be deleted.
+#[tokio::test]
+async fn an_acked_qos2_past_pubrec_resumes_with_pubrel_under_the_same_id() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+
+    let mut broker = Broker::spawn(addr, data_dir.path(), "first");
+    broker.wait_until_listening(addr).await;
+
+    // 1. A PERSISTENT subscriber, online and subscribed at QoS 2.
+    let (mut sub, _present) = Client::connect_v311(addr, "q2-sub", false).await;
+    sub.subscribe(1, "q2/test", QoS::ExactlyOnce).await;
+
+    // 2. The publisher completes its OWN full QoS 2 exchange — the broker has taken
+    //    exactly-once responsibility for this message.
+    let mut pubr = Client::connect(addr, "q2-pub").await;
+    pubr.publish(
+        "q2/test",
+        b"exactly-once",
+        QoS::ExactlyOnce,
+        Some(1),
+        vec![],
+    )
+    .await;
+    match pubr.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::PubRec(k)) => assert_eq!(k.pkid, 1),
+        other => panic!("publisher expected PUBREC, got {other:?}"),
+    }
+    pubr.pubrel(1).await;
+    match pubr.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::PubComp(k)) => assert_eq!(k.pkid, 1),
+        other => panic!("publisher expected PUBCOMP, got {other:?}"),
+    }
+
+    // 3. The subscriber receives the PUBLISH and sends PUBREC — it now HOLDS the
+    //    message and owes only the release exchange, keyed on this packet id.
+    let delivered = match sub.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::Publish(p)) => p,
+        other => panic!("step 3: expected the live PUBLISH, got {other:?}"),
+    };
+    assert_eq!(&delivered.payload[..], b"exactly-once");
+    assert_eq!(delivered.qos, QoS::ExactlyOnce);
+    let pkid = delivered.pkid.expect("a QoS 2 publish carries a packet id");
+    sub.pubrec(pkid).await;
+    // The broker answers PUBREL — the handshake is mid-phrase when we kill it.
+    match sub.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::PubRel(k)) => assert_eq!(k.pkid, pkid),
+        other => panic!("step 3: expected PUBREL before the crash, got {other:?}"),
+    }
+    // The subscriber deliberately does NOT send PUBCOMP.
+
+    // 4. Kill the broker outright: no flush, no goodbye.
+    broker.kill();
+    drop(sub);
+    drop(pubr);
+
+    // 5. Restart on the same data directory and resume the session.
+    let mut restarted = Broker::spawn(addr, data_dir.path(), "restarted");
+    restarted.wait_until_listening(addr).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (mut resumed, session_present) = Client::connect_v311(addr, "q2-sub", false).await;
+    assert!(
+        session_present,
+        "the persistent session did not survive the restart"
+    );
+
+    match resumed.recv_bounded(Duration::from_secs(15)).await {
+        Recv::Packet(Packet::PubRel(k)) => assert_eq!(
+            k.pkid, pkid,
+            "PUBREL arrived under a DIFFERENT id — the subscriber cannot match it to \
+             the message it holds, which is the #130 defect under another name"
+        ),
+        Recv::Packet(Packet::Publish(p)) => panic!(
+            "the broker re-PUBLISHed (pkid {:?}, dup {}) instead of sending PUBREL — \
+             the subscriber already holds this message under id {pkid}, so its dedup \
+             window cannot fire on a fresh id and the application sees it twice. This \
+             is the #130 regression: the outbound in-flight table (ADR 0057) must \
+             restore the handshake mid-phrase.",
+            p.pkid, p.dup
+        ),
+        other => panic!("expected the resumed PUBREL, got {other:?}"),
+    }
+
+    // 6. Completing the handshake releases everything durably.
+    resumed.pubcomp(pkid).await;
+    // (Drop kills the restarted broker.)
+}
+
+/// The companion phase: the broker dies BEFORE the subscriber's PUBREC arrives. On
+/// resume the PUBLISH is re-sent with `DUP` under the **original** id — the subscriber
+/// may or may not have seen it, and its dedup window matches the id either way. Exactly
+/// one copy arrives.
+#[tokio::test]
+async fn an_acked_qos2_before_pubrec_republishes_dup_under_the_same_id() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+
+    let mut broker = Broker::spawn(addr, data_dir.path(), "first");
+    broker.wait_until_listening(addr).await;
+
+    let (mut sub, _present) = Client::connect_v311(addr, "q2b-sub", false).await;
+    sub.subscribe(1, "q2b/test", QoS::ExactlyOnce).await;
+
+    let mut pubr = Client::connect(addr, "q2b-pub").await;
+    pubr.publish("q2b/test", b"pre-rec", QoS::ExactlyOnce, Some(1), vec![])
+        .await;
+    match pubr.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::PubRec(k)) => assert_eq!(k.pkid, 1),
+        other => panic!("publisher expected PUBREC, got {other:?}"),
+    }
+    pubr.pubrel(1).await;
+    match pubr.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::PubComp(k)) => assert_eq!(k.pkid, 1),
+        other => panic!("publisher expected PUBCOMP, got {other:?}"),
+    }
+
+    // The subscriber sees the PUBLISH but the broker dies before any PUBREC.
+    let delivered = match sub.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::Publish(p)) => p,
+        other => panic!("expected the live PUBLISH, got {other:?}"),
+    };
+    let pkid = delivered.pkid.expect("packet id");
+
+    broker.kill();
+    drop(sub);
+    drop(pubr);
+
+    let mut restarted = Broker::spawn(addr, data_dir.path(), "restarted");
+    restarted.wait_until_listening(addr).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (mut resumed, session_present) = Client::connect_v311(addr, "q2b-sub", false).await;
+    assert!(
+        session_present,
+        "the persistent session did not survive the restart"
+    );
+
+    match resumed.recv_bounded(Duration::from_secs(15)).await {
+        Recv::Packet(Packet::Publish(p)) => {
+            assert_eq!(
+                p.pkid,
+                Some(pkid),
+                "re-sent under a fresh id: the subscriber's dedup window cannot fire (#130)"
+            );
+            assert!(p.dup, "a possible re-send carries DUP [MQTT-4.4.0-1]");
+            assert_eq!(&p.payload[..], b"pre-rec");
+        }
+        other => panic!("expected the re-published message, got {other:?}"),
+    }
+    match resumed.recv_bounded(Duration::from_secs(3)).await {
+        Recv::Quiet => {}
+        other => panic!("a second copy arrived: {other:?}"),
+    }
+
+    // The handshake completes under the original id.
+    resumed.pubrec(pkid).await;
+    match resumed.recv_bounded(Duration::from_secs(10)).await {
+        Recv::Packet(Packet::PubRel(k)) => assert_eq!(k.pkid, pkid),
+        other => panic!("expected PUBREL, got {other:?}"),
+    }
+    resumed.pubcomp(pkid).await;
+}

@@ -19,7 +19,11 @@ replacement without losing an acknowledged fact). That covers a QoS 1/2 message
 **already in flight to a connected subscriber**, not just one queued for a
 disconnected one — the durable record is written before the packet reaches the
 wire, so a crash in that window redelivers rather than loses it
-([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124)). Prometheus metrics, resource
+([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124)). At QoS 2 the
+packet id and handshake phase are persisted too, so the redelivery resumes
+**under the id the subscriber already knows** — exactly-once holds across a
+broker crash, not only a client reconnect
+([#130](https://github.com/mbilling/fss-mqtt-broker/issues/130)). Prometheus metrics, resource
 governance (connection caps, per-client quotas, publish-rate limits, bounded
 queues), and a continuous-assurance program (out-of-process fault/upgrade
 harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
@@ -502,15 +506,6 @@ be found. Each is tracked; none is a silent surprise.
   shared-nothing with no coordinator on the publish hot path, but measuring what
   that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
   as design intent.
-- **A redelivery after a broker crash is at-least-once, even at QoS 2.** An
-  acked QoS 1/2 message is durable from the moment the publisher is
-  acknowledged, in flight as well as queued (#124) — but the *packet id* it was
-  in flight under is not persisted. A subscriber resuming after the broker died
-  is redelivered the message under a **fresh** packet id, which it cannot match
-  against the one it already PUBRECed, so exactly-once degrades to at-least-once
-  across that specific window. Losing the message would be worse, and this is
-  the trade taken; tracked in
-  [#130](https://github.com/mbilling/fss-mqtt-broker/issues/130).
 - **Durability costs a write on the delivery path.** A QoS 1/2 message for a
   **persistent** subscriber is appended to that session's durable log before it
   goes on the wire — that is what makes the guarantee above hold. Clean sessions
