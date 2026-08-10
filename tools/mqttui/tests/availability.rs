@@ -140,8 +140,11 @@ fn tasks_offered_standalone_do_not_reach_for_the_repository() {
          checkout.\n",
         wrong.join("\n")
     );
+    // Down to 2 since demo-stack/demo-scale were declared checkout-only (the demo image is
+    // built from repository source via `build: context: ..` — which this walk cannot see,
+    // because it reads scripts, not compose files; the declaration is the authority).
     assert!(
-        checked >= 4,
+        checked >= 2,
         "only {checked} bundled tasks were examined — if the embedded set shrank, this test \
          is passing because it checked almost nothing"
     );

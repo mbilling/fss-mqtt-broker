@@ -65,6 +65,24 @@ def main() -> int:
             f"claims {match.group(1)} ADRs; docs/adr/ holds {len(adrs)}"
         )
 
+    # --- runnable-script count -------------------------------------------
+    # "There are N runnable scripts here" must match the mqttui manifest, which
+    # is itself CI-gated against the tree — so this chains the README to the
+    # same source of truth instead of trusting whoever last counted.
+    declared = (ROOT / "tools" / "mqttui" / "tasks.toml").read_text(encoding="utf-8")
+    task_count = declared.count("[[task]]")
+    match = re.search(r"There are (\d+) runnable scripts here", text)
+    if not match:
+        problems.append(
+            "the 'There are N runnable scripts here' phrase is gone — restore it "
+            "or update this script"
+        )
+    elif int(match.group(1)) != task_count:
+        problems.append(
+            f"claims {match.group(1)} runnable scripts; tools/mqttui/tasks.toml "
+            f"declares {task_count}"
+        )
+
     # --- crate table -----------------------------------------------------
     # Every workspace crate must appear in the Workspace layout table. A crate
     # nobody mentions is one nobody can evaluate.
@@ -96,7 +114,7 @@ def main() -> int:
 
     print(
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
-        f"{len(anchors)} anchors — all match."
+        f"{task_count} scripts, {len(anchors)} anchors — all match."
     )
     return 0
 

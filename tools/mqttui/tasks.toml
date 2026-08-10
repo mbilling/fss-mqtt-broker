@@ -50,6 +50,11 @@ id = "demo-stack"
 group = "Demo"
 name = "Run the 7-node cluster with Grafana and Prometheus"
 script = "demo/loadgen/loadgen.sh"
+# demo/docker-compose.yml declares `build: context: ..` — the broker image is built FROM
+# THE REPOSITORY SOURCE (it carries the quic-demo example binary, which the published
+# image does not). Same lesson as render-parity: the compose file travels fine, and what
+# it needs is the source tree.
+needs_checkout = true
 about = """
 The full observability demo: seven brokers forming one durable cluster, Prometheus
 scraping them, Alloy taking OTLP push, and Grafana with the mqttd dashboards. A load
@@ -66,6 +71,9 @@ id = "demo-scale"
 group = "Demo"
 name = "Resize the demo cluster"
 script = "demo/scale-cluster.py"
+# Rewrites the demo the stack runs; only meaningful beside demo-stack, which needs a
+# checkout — offering the resize without the thing it resizes would be a trap.
+needs_checkout = true
 about = """
 Rewrites the demo compose file for a different node count and fixes up the readiness floor
 so a resized cluster still gates on a majority. Use it to watch elastic resize (ADR 0043)
