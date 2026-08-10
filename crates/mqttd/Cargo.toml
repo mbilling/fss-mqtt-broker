@@ -14,7 +14,10 @@ path = "src/main.rs"
 # Config-checksum hashing for the /statusz convergence stamp (ADR 0054 T3); the
 # workspace crypto provider, already compiled in via rustls (ADR 0053).
 aws-lc-rs = { workspace = true }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+# The Authenticator trait is async (ADR 0004 T15) and the HTTP hook implements it here,
+# where the I/O lives — mqtt-auth stays I/O-free.
+async-trait = "0.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 mqtt-codec = { path = "../mqtt-codec", version = "0.9.0" }

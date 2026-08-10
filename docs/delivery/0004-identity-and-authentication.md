@@ -81,8 +81,10 @@ tasks:
     notes: "Enables T16 (HTTP hook) and, after it, LDAP/OAuth2/custom. The alternatives were blocking a runtime worker per CONNECT, spawn_blocking with a second HTTP stack, or a parallel authenticate_async method the trait would have to document as its own workaround — see the ADR amendment. mqtt-auth stays I/O-FREE: the trait can express I/O, no implementation in the crate performs any. The Authorizer trait is deliberately untouched — ACL evaluation is local, on the publish hot path, and has no reason to await. async-trait was already in the tree via mqtt-storage/mqtt-cluster/mqttd, so no new supply-chain crate."
   - id: 0004-T16
     title: HTTP authentication hook — a remote endpoint decides, with caching, a bounded timeout and fail-closed behaviour
-    status: planned
-    notes: "Lands in mqttd (not mqtt-auth, which stays I/O-free) on the reqwest already used for JWKS. Unlocks LDAP/OAuth2/custom for everyone via one hook rather than one integration per backend. Needs: response caching with a TTL, an explicit timeout owned by the implementation (the trait applies none), fail-closed on hook outage, and tests against a real HTTP server including the outage case."
+    status: done
+    date: 2026-08-10
+    evidence: "crates/mqttd/src/http_auth.rs (in mqttd, not mqtt-auth, which stays I/O-free) on the reqwest already used for JWKS — no new supply-chain crate. POSTs {client_id, username, password, method}; the HTTP STATUS is the verdict (200 allow with an optional {groups:[..]} body, 401/403 deny, everything else denies). Config MQTTD_HTTP_AUTH_URL / _TIMEOUT / _CACHE_SECS / _CACHE_MAX / _ALLOW_HTTP; metrics http_auth_latency_seconds and http_auth_outcomes{result}. Integration tests against a REAL HTTP server (tests/http_auth.rs, hand-rolled tokio listener — no test HTTP framework added): 200 admits AND the hook was actually called, 401 refuses, 500 denies, unreachable denies, a HANGING hook is cut off by the timeout and denies within the bound, caching off means every CONNECT asks, caching on spares the repeat. Unit tests: https required unless allow_http, cache key unambiguous across field boundaries and sensitive to every field, cache expiry + ceiling, caching off by default, a non-password credential ABSTAINS without calling the hook."
+    notes: "Status-only verdict, deliberately: EMQX also lets a 200 body say {result: deny}, and two verdict channels means a hook can accidentally ALLOW by returning 200 with a body the broker parsed differently than its author assumed. Fail-closed is the feature — the failure modes have a test each, because each is a way a broker could be talked into admitting a client that proved nothing. Rejections are never cached (a fixed password must take effect at once; caching denials turns a blip into an outage) and the cache key is a SHA-256 of the credential, length-prefixed per field so (ab,c) and (a,bc) cannot collide. password_subject_exists returns true (no opinion): answering would mean a network call per live session per policy reload, and a hook outage would then evict every session it could not vouch for. Ordered after the local password file so a user in both is answered without a round trip."
 ---
 
 # Delivery — ADR 0004: Identity model: mTLS Common Name first, deny by default
@@ -110,7 +112,7 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | **0004-T12** `%c` substitution | ACL topic patterns substitute the connecting client id, so a policy can scope topics per session handle. The `Authorizer` trait carries the `ClientId` at every decision point (SUBSCRIBE, PUBLISH, will, and the ADR 0040 grant sweep — each session re-checked under its own handle). Client ids are client-chosen, so substitution fails closed on the same metacharacters as `%i`, per placeholder; and `%c` is refused in a `connect` rule's `clients` globs, where it would match the id against itself. Documented as a namespacing tool, not an isolation boundary. |
 | **0004-T13** Per-listener policies | Deferred — each listener carrying its own authenticator/ACL needs the listener config to become a list of named definitions (own record). |
 | **0004-T15** Async authenticator | The trait can express I/O, so a remote authenticator is possible without blocking a runtime worker or bolting a second method onto the trait. Pure verifiers keep working unchanged apart from the keyword. |
-| **0004-T16** HTTP hook | A remote endpoint decides CONNECT, with caching, its own timeout, and fail-closed behaviour on an outage. |
+| **0004-T16** HTTP hook | A remote endpoint decides CONNECT, with caching, its own timeout, and fail-closed behaviour on an outage. One hook reaches LDAP / OAuth2 / a bespoke store without a broker integration per backend. |
 | **0004-T14** Password hashing | `mqttd --hash-password [<username>]` reads a password from stdin and prints the Argon2id line `MQTTD_PASSWORD_FILE` expects, so password auth is reachable without writing a hasher first. The generated line is proven to authenticate against the running broker, not merely to look Argon2id-shaped. |
 
 ## Progress
@@ -133,11 +135,26 @@ into these tasks. Each carries a stable id used by commits, tests, and the dashb
 | 0004-T13 | 💤 deferred | — | "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040." |
 | 0004-T14 | ✅ done | 2026-08-10 | "mqtt_auth::password::hash_password (Argon2id, per-call random salt from the ADR 0053 provider aws-lc-rs, no new RNG crate) + the `--hash-password` front end reading stdin. Tests: password::a_generated_hash_authenticates_through_a_password_file (with a near-miss rejection, so it cannot pass against a broker that accepts anything), password::hashing_the_same_password_twice_gives_different_strings_that_both_verify (guards against a fixed salt shipping by accident), and password_cli.rs end to end against the REAL binary — hash with the CLI, write the file, boot the broker, CONNECT: accepted for the right password, 0x04 for a wrong one and for an unknown user; spaces and punctuation survive the round trip; an empty password exits 2." |
 | 0004-T15 | ✅ done | 2026-08-10 | "mqtt_auth::Authenticator is #[async_trait] with `async fn authenticate`; the five shipped impls (basic, password, token, oidc, chain) gained `async` and only chain awaits — it awaits each member in turn. One production call site (conn.rs authenticate_connect) awaits it. 38 unit tests of pure verifiers became #[tokio::test]; tests that touch no authenticator (acl, mtls, signed_gossip) stayed synchronous. Whole workspace compiles, clippy -D warnings clean, mqtt-auth 122 tests + mqttd 167 lib tests + auth/acl/reload_auth/end_to_end/password_cli integration suites all green." |
-| 0004-T16 | ⬜ planned | — | "Lands in mqttd (not mqtt-auth, which stays I/O-free) on the reqwest already used for JWKS. Unlocks LDAP/OAuth2/custom for everyone via one hook rather than one integration per backend. Needs: response caching with a TTL, an explicit timeout owned by the implementation (the trait applies none), fail-closed on hook outage, and tests against a real HTTP server including the outage case." |
+| 0004-T16 | ✅ done | 2026-08-10 | "crates/mqttd/src/http_auth.rs (in mqttd, not mqtt-auth, which stays I/O-free) on the reqwest already used for JWKS — no new supply-chain crate. POSTs {client_id, username, password, method}; the HTTP STATUS is the verdict (200 allow with an optional {groups:[..]} body, 401/403 deny, everything else denies). Config MQTTD_HTTP_AUTH_URL / _TIMEOUT / _CACHE_SECS / _CACHE_MAX / _ALLOW_HTTP; metrics http_auth_latency_seconds and http_auth_outcomes{result}. Integration tests against a REAL HTTP server (tests/http_auth.rs, hand-rolled tokio listener — no test HTTP framework added): 200 admits AND the hook was actually called, 401 refuses, 500 denies, unreachable denies, a HANGING hook is cut off by the timeout and denies within the bound, caching off means every CONNECT asks, caching on spares the repeat. Unit tests: https required unless allow_http, cache key unambiguous across field boundaries and sensitive to every field, cache expiry + ceiling, caching off by default, a non-password credential ABSTAINS without calling the hook." |
 <!-- /status-table:0004 -->
 
 ## Changelog
 
+- **2026-08-10** — **T16 done: the HTTP authentication hook.** One endpoint reaches every
+  backend the broker will never implement natively. The broker POSTs the credential and
+  reads the **HTTP status** as the verdict — status-only, because EMQX's second channel (a
+  `200` whose body says `deny`) means a hook can accidentally *allow* by returning `200`
+  with a body the broker parsed differently than its author assumed.
+
+  **Fail-closed is the feature.** Anyone can write a hook that says yes; the question is
+  what happens when the far end is down, returns a 500, or hangs past the timeout. Each has
+  its own test against a real HTTP server, because each is a way a broker could be talked
+  into admitting a client that proved nothing. The cost is stated too: an outage denies
+  every *new* connection that depends on the hook.
+
+  Accepted credentials only are cached, keyed by a length-prefixed SHA-256 so two fields
+  cannot collide, bounded because the cache is filled from an attacker-reachable path.
+  Denials are never cached — a fixed password must take effect at once.
 - **2026-08-10** — **T15 done: the `Authenticator` trait is async.** Every authenticator
   that ships is pure computation, so the synchronous signature looked free. It was not —
   it made every *remote* authenticator impossible to add without a workaround: block a
