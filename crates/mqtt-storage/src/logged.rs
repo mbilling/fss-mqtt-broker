@@ -42,7 +42,8 @@
 
 use crate::repl::{ReplError, ReplicatedLog};
 use crate::{
-    Enqueued, QueueLimits, QueuedMessage, SessionClaim, SessionScan, SessionStore, StorageError,
+    Enqueued, OutboundInflight, QueueLimits, QueuedMessage, SessionClaim, SessionScan,
+    SessionStore, StorageError,
 };
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
@@ -292,6 +293,61 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             .unwrap_or_default())
     }
 
+    async fn record_outbound(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+        offset: u64,
+    ) -> Result<(), StorageError> {
+        let mut meta = self.load_meta(client).await?.unwrap_or_default();
+        meta.outbound_qos2.insert(packet_id, (offset, false));
+        // The durable write is what makes the id survivable; it gates the PUBLISH the
+        // same way the queue append gates the PUBACK (#124's ordering, ADR 0057).
+        self.store_meta(client, &meta).await
+    }
+
+    async fn advance_outbound(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+    ) -> Result<(), StorageError> {
+        if let Some(mut meta) = self.load_meta(client).await? {
+            if let Some(slot) = meta.outbound_qos2.get_mut(&packet_id) {
+                if !slot.1 {
+                    slot.1 = true;
+                    self.store_meta(client, &meta).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_outbound(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        if let Some(mut meta) = self.load_meta(client).await? {
+            if meta.outbound_qos2.remove(&packet_id).is_some() {
+                self.store_meta(client, &meta).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn outbound(&self, client: &ClientId) -> Result<Vec<OutboundInflight>, StorageError> {
+        Ok(self
+            .load_meta(client)
+            .await?
+            .map(|m| {
+                m.outbound_qos2
+                    .into_iter()
+                    .map(|(packet_id, (offset, pubrec_seen))| OutboundInflight {
+                        packet_id,
+                        offset,
+                        pubrec_seen,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn next_packet_id(&self, client: &ClientId) -> Result<u16, StorageError> {
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
         meta.last_packet_id = if meta.last_packet_id == u16::MAX {
@@ -417,6 +473,11 @@ struct SessionMeta {
     /// `None` for a record written before owner binding; the next claim adopts it. Travels
     /// with the snapshot, so the binding survives restart and cross-node takeover.
     owner: Option<String>,
+    /// Outbound QoS-2 in-flight (ADR 0057): packet id → (queue offset, PUBREC seen).
+    /// Snapshot-shaped like the inbound window above, because it is equally small and
+    /// low-churn — bounded by the client's receive maximum, mutated once per handshake
+    /// phase.
+    outbound_qos2: std::collections::BTreeMap<u16, (u64, bool)>,
 }
 
 fn qos_to_u8(q: QoS) -> u8 {
@@ -542,6 +603,15 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
             put_str(&mut out, subject);
         }
         None => out.push(0),
+    }
+    // Appended after the owner field (ADR 0057): an older record ends before this, so it
+    // decodes with an empty outbound window — exactly the pre-0057 behaviour.
+    let on = u32::try_from(m.outbound_qos2.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&on.to_be_bytes());
+    for (id, (offset, pubrec_seen)) in m.outbound_qos2.iter().take(on as usize) {
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.push(u8::from(*pubrec_seen));
     }
     out
 }
@@ -689,19 +759,32 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
     } else {
         None
     };
+    // Backward-compatible (ADR 0057): a record written before the outbound window ends
+    // here, decoding as empty — the pre-0057 behaviour.
+    let mut outbound_qos2 = std::collections::BTreeMap::new();
+    if !r.is_empty() {
+        let on = r.u32()? as usize;
+        for _ in 0..on {
+            let id = r.u16()?;
+            let offset = r.u64()?;
+            let pubrec_seen = r.u8()? != 0;
+            outbound_qos2.insert(id, (offset, pubrec_seen));
+        }
+    }
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
         last_packet_id,
         session_expiry_at,
         owner,
+        outbound_qos2,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{decode_session_meta, ReplicatedSessionStore};
-    use crate::repl::InMemoryReplicatedLog;
+    use crate::repl::{InMemoryReplicatedLog, ReplicatedLog};
     use crate::{Enqueued, Offset, OverflowPolicy, QueueLimits, SessionClaim, SessionStore};
     use mqtt_core::{ClientId, Message, QoS, Subscription};
     use std::sync::Arc;
@@ -1212,5 +1295,88 @@ mod tests {
         // Clearing on the reader is visible to the writer (one shared log).
         reader.clear_received(&c, 5).await.unwrap();
         assert!(writer.received(&c).await.unwrap().is_empty());
+    }
+
+    /// The outbound mirror of the test above (ADR 0057): a failover replica sharing only
+    /// the log sees the in-flight window — id, offset, and PHASE — because the phase is
+    /// what decides PUBLISH+DUP versus PUBREL on resume, and resuming in the wrong phase
+    /// either re-sends a message the subscriber holds or releases one it never got.
+    #[tokio::test]
+    async fn outbound_qos2_state_replicates_through_the_log() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let c = cid("c");
+
+        let writer = ReplicatedSessionStore::new(log.clone());
+        writer.record_outbound(&c, 7, 41).await.unwrap();
+        writer.record_outbound(&c, 8, 42).await.unwrap();
+        writer.advance_outbound(&c, 7).await.unwrap();
+
+        // A fresh store (the failover replica) sharing only the log.
+        let reader = ReplicatedSessionStore::new(log.clone());
+        let inflight = reader.outbound(&c).await.unwrap();
+        assert_eq!(
+            inflight,
+            vec![
+                crate::OutboundInflight {
+                    packet_id: 7,
+                    offset: 41,
+                    pubrec_seen: true
+                },
+                crate::OutboundInflight {
+                    packet_id: 8,
+                    offset: 42,
+                    pubrec_seen: false
+                },
+            ],
+            "id, offset and phase all survive: 7 resumes at PUBREL, 8 at PUBLISH+DUP"
+        );
+
+        // PUBCOMP on the replica clears it for everyone (one shared log).
+        reader.clear_outbound(&c, 7).await.unwrap();
+        let left = writer.outbound(&c).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].packet_id, 8);
+    }
+
+    /// A metadata record written BEFORE ADR 0057 ends at the owner field. It must decode
+    /// with an empty outbound window — the pre-0057 behaviour — not fail. This is the
+    /// same append-only-tail contract every prior field addition relied on, and the test
+    /// constructs the old bytes by truncating rather than by trusting the encoder to
+    /// remember what the old format was.
+    #[tokio::test]
+    async fn a_pre_0057_record_decodes_with_an_empty_outbound_window() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let c = cid("legacy");
+
+        // Write a full modern record, then rewrite its meta key with the tail cut off at
+        // the end of the owner field (1 byte for the None marker).
+        let store = ReplicatedSessionStore::new(log.clone());
+        store.record_received(&c, 3).await.unwrap();
+        store.record_outbound(&c, 9, 100).await.unwrap();
+
+        let key = ReplicatedSessionStore::<Arc<InMemoryReplicatedLog>>::meta_key(&c);
+        let latest = log
+            .read(&key, 0, usize::MAX)
+            .await
+            .unwrap()
+            .last()
+            .expect("a meta record exists")
+            .record
+            .clone();
+        // The outbound tail is: u32 count + one entry. Cut exactly that much off the end.
+        let entry_bytes = 2 + 8 + 1; // id + offset + phase
+        let old = latest[..latest.len() - 4 - entry_bytes].to_vec();
+        log.append(&key, old).await.unwrap();
+
+        let reborn = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            reborn.received(&c).await.unwrap(),
+            vec![3],
+            "everything before the new tail still decodes"
+        );
+        assert!(
+            reborn.outbound(&c).await.unwrap().is_empty(),
+            "the pre-0057 record reads as an empty outbound window, not an error"
+        );
     }
 }

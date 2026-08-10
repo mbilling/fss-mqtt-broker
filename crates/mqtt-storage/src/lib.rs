@@ -15,7 +15,7 @@
 
 use async_trait::async_trait;
 use mqtt_core::{topic_matches, ClientId, Message, Subscription};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
 pub mod app_props;
@@ -32,6 +32,16 @@ pub mod schema;
 /// Offsets are per-session. In a clustered backend the offset is assigned by the
 /// session's replicated log; here it is a simple counter.
 pub type Offset = u64;
+
+/// One outbound QoS-2 delivery in flight across a crash (ADR 0057): the packet id the
+/// subscriber knows it by, the durable offset of its message, and whether its PUBREC has
+/// been seen (which decides PUBLISH+DUP versus PUBREL on resume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundInflight {
+    pub packet_id: u16,
+    pub offset: Offset,
+    pub pubrec_seen: bool,
+}
 
 /// Errors from a storage backend.
 #[derive(Debug, thiserror::Error)]
@@ -269,6 +279,36 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// resume / takeover reconciliation.
     async fn received(&self, client: &ClientId) -> Result<Vec<u16>, StorageError>;
 
+    /// Record an OUTBOUND QoS-2 delivery going in flight under `packet_id`, carrying the
+    /// durable queue offset of its message (ADR 0057). Written when the id is allocated,
+    /// BEFORE the PUBLISH reaches the wire — the same write-before-send ordering as #124,
+    /// because state recorded after the send is state a crash can orphan.
+    ///
+    /// This is the outbound mirror of [`Self::record_received`]: without it the message
+    /// survives a broker crash (#124) but its packet id does not, the replay allocates a
+    /// fresh id, the subscriber's dedup window cannot match it, and exactly-once quietly
+    /// degrades to at-least-once across a restart. QoS 1 deliveries are deliberately NOT
+    /// recorded — a fresh-id `DUP` redelivery is what at-least-once means.
+    async fn record_outbound(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+        offset: Offset,
+    ) -> Result<(), StorageError>;
+
+    /// Advance `packet_id` to the released phase on PUBREC: the subscriber has the
+    /// message, only the PUBREL/PUBCOMP exchange remains. After a crash, an entry in this
+    /// phase resumes with PUBREL under the original id — never a second PUBLISH.
+    async fn advance_outbound(&self, client: &ClientId, packet_id: u16)
+        -> Result<(), StorageError>;
+
+    /// Clear `packet_id` once its PUBCOMP arrives — the exactly-once handshake is done.
+    async fn clear_outbound(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError>;
+
+    /// The outbound QoS-2 deliveries currently in flight, ascending by packet id — read
+    /// at session restore to resume each handshake mid-phrase.
+    async fn outbound(&self, client: &ClientId) -> Result<Vec<OutboundInflight>, StorageError>;
+
     /// Allocate the next outbound packet id (`1..=65535`, wrapping, never `0`),
     /// persisting the advance so ids do not collide with still-in-flight ones after
     /// a failover.
@@ -398,6 +438,8 @@ struct SessionEntry {
     next_offset: Offset,
     /// QoS-2 inbound packet ids received but not yet PUBREL-completed (dedup).
     received_qos2: BTreeSet<u16>,
+    /// Outbound QoS-2 in-flight: packet id → (queue offset, PUBREC seen). ADR 0057.
+    outbound_qos2: BTreeMap<u16, (Offset, bool)>,
     /// Last outbound packet id allocated (0 = none yet).
     last_packet_id: u16,
     /// Absolute expiry deadline (Unix epoch secs) for a disconnected session, or `None`
@@ -590,6 +632,57 @@ impl SessionStore for MemorySessionStore {
             .lock()
             .get(client)
             .map(|e| e.received_qos2.iter().copied().collect())
+            .unwrap_or_default())
+    }
+
+    async fn record_outbound(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+        offset: Offset,
+    ) -> Result<(), StorageError> {
+        self.lock()
+            .entry(client.clone())
+            .or_default()
+            .outbound_qos2
+            .insert(packet_id, (offset, false));
+        Ok(())
+    }
+
+    async fn advance_outbound(
+        &self,
+        client: &ClientId,
+        packet_id: u16,
+    ) -> Result<(), StorageError> {
+        if let Some(entry) = self.lock().get_mut(client) {
+            if let Some(slot) = entry.outbound_qos2.get_mut(&packet_id) {
+                slot.1 = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_outbound(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        if let Some(entry) = self.lock().get_mut(client) {
+            entry.outbound_qos2.remove(&packet_id);
+        }
+        Ok(())
+    }
+
+    async fn outbound(&self, client: &ClientId) -> Result<Vec<OutboundInflight>, StorageError> {
+        Ok(self
+            .lock()
+            .get(client)
+            .map(|e| {
+                e.outbound_qos2
+                    .iter()
+                    .map(|(&packet_id, &(offset, pubrec_seen))| OutboundInflight {
+                        packet_id,
+                        offset,
+                        pubrec_seen,
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
