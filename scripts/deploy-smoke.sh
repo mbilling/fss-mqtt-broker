@@ -239,12 +239,43 @@ kill -9 "$N1" 2>/dev/null || true
 sleep 5
 pass "node 1 was SIGKILLed"
 
+# Redelivery here waits on a TAKEOVER, not just a reconnect: SWIM has to notice node 1 is
+# gone, the lease group has to re-elect if node 1 held it, and a survivor has to promote
+# the session before it can replay. That runs on production timings and is load-sensitive,
+# so a single fixed window makes this assertion flaky — and a flaky assertion on the
+# headline durability claim is dangerous in both directions: it cries wolf on unrelated
+# changes, and a real regression gets dismissed as "the flaky one". (Seen for real: this
+# failed once on a PR touching only a config converter, then passed on re-run.)
+#
+# So: poll within a generous total budget, and report WHICH failure it was.
 RESUMED="$WORK/resumed.out"
-mosquitto_sub -h 127.0.0.1 -p "$P2" -t 'devices/device-b/down/#' -q 1 \
-  -u device-b -P "$DEVICE_B_PW" -i durable-sub -c -C 1 -W 25 > "$RESUMED" 2>/dev/null || true
-grep -q survives "$RESUMED" \
-  || fail "an ACKNOWLEDGED message was lost when its node died — the durability claim is false here"
-pass "the acknowledged message survived the loss of the node that accepted it"
+DURABLE_BUDGET=90
+durable_started=$SECONDS
+: > "$RESUMED"
+while (( SECONDS - durable_started < DURABLE_BUDGET )); do
+  mosquitto_sub -h 127.0.0.1 -p "$P2" -t 'devices/device-b/down/#' -q 1 \
+    -u device-b -P "$DEVICE_B_PW" -i durable-sub -c -C 1 -W 10 >> "$RESUMED" 2>/dev/null || true
+  grep -q survives "$RESUMED" && break
+done
+waited=$(( SECONDS - durable_started ))
+
+if ! grep -q survives "$RESUMED"; then
+  # Distinguish "the message is gone" from "the cluster never recovered enough to say".
+  # Without this the next occurrence costs another investigation from scratch.
+  echo "--- after ${waited}s, surviving nodes report:"
+  for hp in "$H2" "$H3"; do
+    if MQTTD_HEALTH_BIND="127.0.0.1:$hp" "$MQTTD_BIN" --probe /readyz >/dev/null 2>&1; then
+      echo "    health $hp: READY"
+    else
+      echo "    health $hp: NOT ready (takeover may still be in progress)"
+    fi
+  done
+  fail "an ACKNOWLEDGED message was not redelivered within ${waited}s of its node dying. \
+If the survivors are READY above, this is a genuine durability failure; if they are NOT, \
+the cluster had not finished taking over and the budget needs raising rather than the \
+claim doubting"
+fi
+pass "the acknowledged message survived the loss of the node that accepted it (${waited}s)"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # 6. The readiness floor does what the artifacts say. With node 1 already gone, kill
