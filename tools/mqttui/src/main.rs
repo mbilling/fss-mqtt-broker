@@ -23,6 +23,7 @@ mod preflight;
 mod runner;
 mod teardown;
 mod ui;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -61,40 +62,26 @@ fn main() -> ExitCode {
         };
     }
 
-    // In a checkout, everything is available from disk. Standalone, the embedded examples
-    // are unpacked and only what travelled can run (ADR 0056 T7) — and the difference is
-    // stated, never hidden behind a shorter list.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let source = match manifest::find_repo_root(&cwd) {
-        Some(root) => embedded::Source::Checkout(root),
-        None => match embedded::unpack() {
-            Ok(root) => embedded::Source::Embedded(root),
-            Err(e) => {
-                eprintln!("mqttui: could not unpack the bundled examples: {e}");
-                return ExitCode::from(2);
+    // `update` manages the examples themselves, so it runs before source detection — it
+    // must work from anywhere, including a machine that has never unpacked anything.
+    if args.first().is_some_and(|a| a == "update") {
+        return match update::run(&args[1..]) {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
             }
-        },
+            Err(e) => {
+                eprintln!("mqttui: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    let (source, manifest) = match resolve() {
+        Ok(pair) => pair,
+        Err(code) => return code,
     };
     let root = source.root().to_path_buf();
-
-    // The manifest ships with the binary, so it is the same list either way; what differs
-    // is which of its tasks this machine can actually run.
-    let loaded = match &source {
-        // In a checkout the on-disk manifest is authoritative and every script it names
-        // must exist — a manifest pointing at a missing script would fail at the worst
-        // possible moment.
-        embedded::Source::Checkout(_) => Manifest::load(&manifest_path(&root), &root),
-        // Standalone, repo-only tasks are legitimately absent; they are reported as
-        // unavailable, not treated as a broken manifest.
-        embedded::Source::Embedded(_) => Manifest::parse(manifest::EMBEDDED),
-    };
-    let manifest = match loaded {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("mqttui: {e}");
-            return ExitCode::from(2);
-        }
-    };
 
     if args.is_empty() {
         // The UI needs a terminal. Without one — a pipe, a CI step, an editor's output
@@ -111,7 +98,7 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        return match ui::App::new(&manifest, root).run() {
+        return match ui::App::new(&manifest, root, source.clone()).run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("mqttui: {e}");
@@ -141,6 +128,57 @@ fn main() -> ExitCode {
             eprintln!("mqttui: unknown option '{other}'\n");
             usage();
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Where the examples come from, and the task list that goes with them.
+///
+/// In a checkout, everything is available from disk and the on-disk manifest is
+/// authoritative — a manifest naming a missing script must fail here, not mid-run.
+/// Standalone: an installed `mqttui update` bundle takes precedence and carries its OWN
+/// manifest, so tasks declared after this binary shipped still appear (serde ignores
+/// fields this binary predates); else the embedded examples are unpacked and the embedded
+/// manifest is the list. In every case the difference is stated, never hidden behind a
+/// shorter list (ADR 0056 T7/T8).
+fn resolve() -> Result<(embedded::Source, Manifest), ExitCode> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let source = match manifest::find_repo_root(&cwd) {
+        Some(root) => embedded::Source::Checkout(root),
+        None => match update::installed_dir() {
+            Ok(dir) if dir.join("tasks.toml").is_file() => embedded::Source::Updated(dir),
+            _ => match embedded::unpack() {
+                Ok(root) => embedded::Source::Embedded(root),
+                Err(e) => {
+                    eprintln!("mqttui: could not unpack the bundled examples: {e}");
+                    return Err(ExitCode::from(2));
+                }
+            },
+        },
+    };
+    let root = source.root();
+    let loaded = match &source {
+        embedded::Source::Checkout(_) => Manifest::load(&manifest_path(root), root),
+        embedded::Source::Embedded(_) => Manifest::parse(manifest::EMBEDDED),
+        // If the update's manifest is broken, say so and name the way out — silently
+        // falling back to the embedded manifest would run updated scripts against a stale
+        // task list.
+        embedded::Source::Updated(dir) => match std::fs::read_to_string(dir.join("tasks.toml")) {
+            Ok(text) => Manifest::parse(&text),
+            Err(e) => {
+                eprintln!(
+                    "mqttui: the installed update's manifest is unreadable ({e}).\n\
+                     `mqttui update --clear` returns to the embedded examples."
+                );
+                return Err(ExitCode::from(2));
+            }
+        },
+    };
+    match loaded {
+        Ok(m) => Ok((source, m)),
+        Err(e) => {
+            eprintln!("mqttui: {e}");
+            Err(ExitCode::from(2))
         }
     }
 }
@@ -221,7 +259,10 @@ fn usage() {
            mqttui --run <id>            run it\n  \
            mqttui --check               the manifest covers every script in the tree\n  \
            mqttui                       the terminal UI\n  \
-           mqttui migrate mosquitto <conf> [--out-config P] [--out-acl P]\n"
+           mqttui migrate mosquitto <conf> [--out-config P] [--out-acl P]\n  \
+           mqttui update                fetch the latest examples as a SIGNED bundle\n  \
+           mqttui update --clear        back to the examples this binary shipped with\n  \
+           mqttui update --channel main raw main branch — UNVERIFIED, maintainers only\n"
     );
 }
 
@@ -247,6 +288,15 @@ fn unknown_task(id: Option<&String>, manifest: &Manifest) -> ExitCode {
 }
 
 fn list(manifest: &Manifest, all: bool, source: &embedded::Source) {
+    // Where the examples come from, FIRST — an installed update changes what every line
+    // below means, and an unverified one must be impossible to scroll past: a warning
+    // printed once at install time is a warning forgotten, so it repeats here every run.
+    if let embedded::Source::Updated(dir) = source {
+        println!(
+            "examples: installed update — {}",
+            update::provenance(dir).unwrap_or_else(|| "provenance file missing".into())
+        );
+    }
     let groups = manifest.visible_by_group();
     let mut hidden_count = 0;
     for (group, tasks) in groups {
@@ -281,7 +331,10 @@ fn list(manifest: &Manifest, all: bool, source: &embedded::Source) {
     println!(
         "`!` marks a task whose required tools are missing — `mqttui --show <id>` says which."
     );
-    if matches!(source, embedded::Source::Embedded(_)) {
+    if matches!(
+        source,
+        embedded::Source::Embedded(_) | embedded::Source::Updated(_)
+    ) {
         // Said plainly, because a shorter list with no explanation is the silent-subset
         // failure the manifest exists to prevent — the user must know something is absent
         // and why, not merely not see it.

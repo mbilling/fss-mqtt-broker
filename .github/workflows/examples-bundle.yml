@@ -1,0 +1,78 @@
+# The rolling examples bundle (ADR 0056 T8, Decision B).
+#
+# `mqttui update` must be able to reach "the latest examples from main" WITHOUT executing
+# anything that arrived over the network unverified. This publishes, on every merge to
+# main, a tarball of the example surface plus the manifest, cosign-signed keylessly — so
+# "latest" is reachable as a *signed artifact built from main*, never as a trust-the-branch
+# download. The binary's embedded copy remains the default; this is the explicit opt-in.
+#
+# Assets land on one rolling prerelease tagged `examples-main`, clobbered on each merge.
+# A rolling tag is mutable BY DESIGN here — what makes it safe to consume is the signature
+# and the recorded commit, not tag immutability (that property belongs to versioned
+# releases, which this deliberately is not).
+name: Examples bundle
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # create/update the rolling release
+  id-token: write # keyless cosign signing via GitHub OIDC
+
+jobs:
+  publish:
+    name: sign + publish the rolling examples bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The vendored copy is what ships; if a merge somehow landed with it stale (the PR
+      # gate should make that impossible), publishing it would distribute the drift.
+      - name: The vendored bundle matches the sources
+        run: scripts/vendor-mqttui-examples.sh --check
+
+      - name: Assemble the bundle
+        run: |
+          STAGE="$(mktemp -d)"
+          cp -a tools/mqttui/bundle/. "$STAGE/"
+          # The manifest travels WITH the examples: an updated bundle may declare tasks the
+          # binary's embedded manifest predates, and serde ignores fields it does not know,
+          # so an older binary reads a newer manifest safely.
+          cp tools/mqttui/tasks.toml "$STAGE/tasks.toml"
+          # Provenance the client can show: which commit, when. The signature proves who
+          # built it; this says what it is.
+          printf 'commit=%s\nbuilt=%s\n' "$GITHUB_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$STAGE/BUNDLE_PROVENANCE"
+          tar -C "$STAGE" -czf examples.tar.gz .
+          sha256sum examples.tar.gz > examples.tar.gz.sha256
+          ls -la examples.tar.gz
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the bundle (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob --yes examples.tar.gz \
+            --output-signature examples.tar.gz.sig \
+            --output-certificate examples.tar.gz.pem
+
+      - name: Publish to the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view examples-main >/dev/null 2>&1; then
+            gh release create examples-main \
+              --prerelease \
+              --title "Rolling examples bundle (main)" \
+              --notes "The example surface + task manifest from the latest merge to main, \
+          cosign-signed. Consumed by \`mqttui update\`; not a versioned release. \
+          Verify with: cosign verify-blob --certificate examples.tar.gz.pem \
+          --signature examples.tar.gz.sig \
+          --certificate-identity-regexp '^https://github.com/mbilling/fss-mqtt-broker/' \
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          examples.tar.gz"
+          fi
+          gh release upload examples-main --clobber \
+            examples.tar.gz examples.tar.gz.sha256 examples.tar.gz.sig examples.tar.gz.pem
