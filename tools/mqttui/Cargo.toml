@@ -14,11 +14,12 @@ description = "Run the mqttd demo, migration and test scripts from one place"
 repository = "https://github.com/mbilling/fss-mqtt-broker"
 
 [dependencies]
-# T1 is the manifest and a headless runner; ratatui arrives with T2. Keeping this list
-# near-empty is the point — the tool has to be worth installing before it is worth
-# decorating, and a manifest with no UI is already useful.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# T2: the terminal UI. These are the crates ADR 0056 §1 exists to keep out of the broker's
+# dependency graph — they live here, in this workspace's lockfile, and nowhere else.
+ratatui = "0.29"
+crossterm = "0.28"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -11,10 +11,15 @@
 //! mqttui --show deploy-smoke    what it does, what it needs, what it costs
 //! mqttui --run deploy-smoke     run it, from the repository root
 //! mqttui --check                the manifest covers every script in the tree
+//! mqttui                        the terminal UI (T2)
 //! ```
 
+mod env;
 mod manifest;
 mod preflight;
+mod runner;
+mod teardown;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -22,8 +27,9 @@ use std::process::{Command, ExitCode};
 use manifest::{Manifest, Task};
 
 fn main() -> ExitCode {
+    restore_sigpipe();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
         usage();
         return ExitCode::SUCCESS;
     }
@@ -50,6 +56,30 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if args.is_empty() {
+        // The UI needs a terminal. Without one — a pipe, a CI step, an editor's output
+        // pane — say so and point at the headless commands, rather than failing with
+        // "Device not configured" from deep inside the terminal library.
+        if !stdout_is_a_terminal() {
+            eprintln!(
+                "mqttui: the terminal UI needs a terminal (stdout is not a tty).\n\n\
+                 Use the headless commands instead:\n  \
+                   mqttui --list\n  \
+                   mqttui --show <id>\n  \
+                   mqttui --run <id>\n  \
+                   mqttui --check"
+            );
+            return ExitCode::from(2);
+        }
+        return match ui::App::new(&manifest, root).run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mqttui: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     match args[0].as_str() {
         "--list" => {
@@ -105,6 +135,40 @@ fn check_complete(manifest: &Manifest, root: &Path) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// Restore the default `SIGPIPE` behaviour.
+///
+/// Rust ignores `SIGPIPE`, which turns `mqttui --list | head` — an entirely ordinary thing
+/// to do — into a panic on a broken pipe instead of a quiet exit. Every other command-line
+/// tool exits silently there, so this one does too.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
+/// Is stdout a terminal? The UI is unusable without one.
+#[cfg(unix)]
+fn stdout_is_a_terminal() -> bool {
+    extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(1) == 1 }
+}
+
+#[cfg(not(unix))]
+fn stdout_is_a_terminal() -> bool {
+    true
+}
+
 fn manifest_path(root: &Path) -> PathBuf {
     root.join("tools").join("mqttui").join("tasks.toml")
 }
@@ -116,8 +180,8 @@ fn usage() {
            mqttui --list [--all]        list tasks ( --all includes CI plumbing )\n  \
            mqttui --show <id>           what a task does, needs, and costs\n  \
            mqttui --run <id>            run it\n  \
-           mqttui --check               the manifest covers every script in the tree\n\n\
-         The terminal UI is ADR 0056 T2; this build is the manifest and the runner."
+           mqttui --check               the manifest covers every script in the tree\n  \
+           mqttui                       the terminal UI\n"
     );
 }
 
