@@ -64,6 +64,7 @@
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [7/11 done](0055-kubernetes-operator.md) | 4 open |
 | [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
+| [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [0/6 done](0057-durable-outbound-inflight.md) | 6 open |
 
 ## Open and deferred work
 
@@ -161,3 +162,12 @@
 - `0055-T6` ⬜ planned: Drain-aware rolls — operator-set annotation via Downward API consulted by preStop (hook shipped identically in chart and operator paths); shrink = full drain, roll = rejoin-and-catch-up
 - `0055-T8` ⬜ planned: Packaging + docs — deploy/helm/mqttd-operator chart (Deployment + CRD + namespaced RBAC), operator image in the ADR 0045 release pipeline (signed/reproducible/SBOM), OPERATIONS.md operator mode, COMPARISON.md Kubernetes cell update
 - `0055-T10` ⬜ planned: ExpandPVC must also raise store_max_bytes through the config contract — expanding the volume without moving the watermark leaves the brownout it exists to clear still raised (ADR 0055 section 3.2, second half)
+
+**0057 — Durable outbound in-flight state: exactly-once across a broker crash**
+
+- `0057-T1` ⬜ planned: "`SessionStore` outbound in-flight table: record / advance / clear / read, replicated with the session"
+- `0057-T2` ⬜ planned: "Hub wiring: write at allocation and PUBREC, clear at PUBCOMP, fail closed with the ack withheld when the write fails"
+- `0057-T3` ⬜ planned: "Restore: rebuild `pending` from the table, resume at PUBLISH+DUP or PUBREL under the original id, seed the allocator past restored ids"
+- `0057-T4` ⬜ planned: "The SIGKILL acceptance test, both phases (PUBREL under the known id after PUBREC; PUBLISH+DUP under the original id before it)"
+- `0057-T5` ⬜ planned: "Measure the QoS 2 delta in the bench lane; record it; revisit the on-by-default decision if indefensible"
+- `0057-T6` ⬜ planned: "Remove the Limitations entry the fix retires — the README claim and the code change together"
