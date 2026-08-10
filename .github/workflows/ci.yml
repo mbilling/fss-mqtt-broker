@@ -139,6 +139,8 @@ jobs:
       # crate and BUILDS it from the tarball, so that cannot reach the registry.
       - name: The crate can actually be published
         run: cargo publish --dry-run --manifest-path tools/mqttui/Cargo.toml
+
+  supply-chain:
     name: supply-chain audit
     runs-on: ubuntu-latest
     steps:
