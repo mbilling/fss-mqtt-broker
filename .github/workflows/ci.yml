@@ -120,7 +120,10 @@ jobs:
       # ADR 0056 §3: the completeness guard. A launcher that silently shows a subset of the
       # scripts becomes the list people trust, so an executable — or merely present —
       # script that nobody declared fails the build here.
-      - name: Test (includes the manifest completeness guard)
+      # python3 is on the runner, so the differential test in tools/mqttui/tests/ actually
+      # compares the Rust converter against the Python one rather than skipping (ADR 0056
+      # T10: two converters that disagree are worse than one).
+      - name: Test (manifest completeness guard + the converter differential)
         run: cargo test --manifest-path tools/mqttui/Cargo.toml
       - name: The manifest covers every script
         run: cargo run --quiet --manifest-path tools/mqttui/Cargo.toml -- --check

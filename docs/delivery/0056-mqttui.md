@@ -53,8 +53,10 @@ tasks:
     notes: "cargo install requires a Rust toolchain and compiles ~20 crates on the user's machine; the audience is somebody evaluating an MQTT broker who may have neither. The signed-binary pipeline already exists and is extended to a second artifact. Makes mqttui a published product with its own version, changelog, semver, signing and SBOM obligations — accepted knowingly. The name `mqttui` was verified free on crates.io on 2026-08-10 (HTTP 404 from the registry API, not inferred)."
   - id: 0056-T10
     title: "`mqttui migrate mosquitto` — the converter reimplemented in Rust, with a differential test against the Python original"
-    status: planned
-    notes: "The one task that is MORE useful standalone than in a checkout: it reads the USER's mosquitto.conf, not ours. Today it needs python3 and a clone; built in it needs neither. Three of the five reviewers in the 2026-08-09 panel named missing migration tooling their single largest blocker. The Python script STAYS — CI already proves its output boots the real broker (0051-T6) — and the acceptance criterion is a DIFFERENTIAL test over the same fixtures: two converters that disagree are worse than one."
+    status: done
+    date: 2026-08-10
+    evidence: "tools/mqttui/src/migrate.rs — `mqttui migrate mosquitto <conf> [--out-config P] [--out-acl P]`, needing neither python3 nor a checkout: it reads the USER's mosquitto.conf. Runs BEFORE the checkout check in main, since it depends on nothing of ours. 8 unit tests over the semantics that silently change a policy if got wrong (a missing access word means readwrite; %u becomes %i; %c is carried but flagged as fail-closed; user blocks are positional; unmapped settings become visible TODOs; TLS material binds to the listener it follows). Plus tests/differential.rs: both converters over shared fixtures, compared BYTE FOR BYTE, wired into the mqttui CI job where python3 is present."
+    notes: "The differential test is the acceptance criterion ADR 0056 set, and it was verified to FAIL rather than assumed to work: injecting a plausible bug — treating a missing access word as read-only instead of readwrite — made it fail on exactly the affected rule (`denied/topic` narrowed from publish+subscribe to subscribe), which is a silent privilege change no eyeball would catch. It also asserts both sides produced real output, so equality cannot pass vacuously. One honesty fix on the way: the generated header credited `scripts/migrate/from-mosquitto.py` even when mqttui produced it — a script the user may not have. BOTH sides now say `the mqttd Mosquitto converter`, keeping byte-identity and making the attribution true either way."
 ---
 
 # Delivery — ADR 0056: `mqttui`, a terminal UI for the repository's scripts
@@ -99,11 +101,27 @@ nothing to run).
 | 0056-T7 | ⬜ planned | — | "MEASURED: the whole surface is 161 KB compressed (demo/ deploy/helm/ deploy/compose/ deploy/crds/ scripts/migrate/ scripts/k8s/), so include_dir! costs nothing worth discussing. Embedding buys offline operation, version-locking to the binary that was tested with it, and — the load-bearing property — executing nothing that arrived over the network. Standalone mode must state how many tasks are hidden and why; a tool that silently showed a subset would be the same defect as a manifest that silently went stale (ADR 0056 §3). Four tasks (release/build-repro.sh, k8s/render-parity.sh, gen-status.py, check-readme-facts.py) operate ON the repository and can never be freed from a checkout — the ADR says so rather than letting it be discovered." |
 | 0056-T8 | ⬜ planned | — | "This is the answer to 'can it fetch the latest from main': yes, by way of a signed artifact built from main, not by trusting the branch. Fetching a branch tarball at runtime was REJECTED as a default — release binaries are cosign-signed with SLSA provenance and an SBOM, builds are reproducible, and every dependency is audited on every push (ADR 0045/0053); downloading shell from a mutable branch and running it discards all of that with one command, and repeats it on every launch. An explicit `--channel main` remains available for maintainers testing unreleased examples: loudly marked unverified, never a default." |
 | 0056-T9 | ⬜ planned | — | "cargo install requires a Rust toolchain and compiles ~20 crates on the user's machine; the audience is somebody evaluating an MQTT broker who may have neither. The signed-binary pipeline already exists and is extended to a second artifact. Makes mqttui a published product with its own version, changelog, semver, signing and SBOM obligations — accepted knowingly. The name `mqttui` was verified free on crates.io on 2026-08-10 (HTTP 404 from the registry API, not inferred)." |
-| 0056-T10 | ⬜ planned | — | "The one task that is MORE useful standalone than in a checkout: it reads the USER's mosquitto.conf, not ours. Today it needs python3 and a clone; built in it needs neither. Three of the five reviewers in the 2026-08-09 panel named missing migration tooling their single largest blocker. The Python script STAYS — CI already proves its output boots the real broker (0051-T6) — and the acceptance criterion is a DIFFERENTIAL test over the same fixtures: two converters that disagree are worse than one." |
+| 0056-T10 | ✅ done | 2026-08-10 | "tools/mqttui/src/migrate.rs — `mqttui migrate mosquitto <conf> [--out-config P] [--out-acl P]`, needing neither python3 nor a checkout: it reads the USER's mosquitto.conf. Runs BEFORE the checkout check in main, since it depends on nothing of ours. 8 unit tests over the semantics that silently change a policy if got wrong (a missing access word means readwrite; %u becomes %i; %c is carried but flagged as fail-closed; user blocks are positional; unmapped settings become visible TODOs; TLS material binds to the listener it follows). Plus tests/differential.rs: both converters over shared fixtures, compared BYTE FOR BYTE, wired into the mqttui CI job where python3 is present." |
 <!-- /status-table:0056 -->
 
 ## Changelog
 
+- **2026-08-10** — **T10 done: the Mosquitto converter is built in.** `mqttui migrate
+  mosquitto <conf>` needs neither Python nor a checkout — it reads the *user's* config, not
+  ours, which is what makes it the one task more useful standalone. Three of the five
+  reviewers in the 2026-08-09 panel named missing migration tooling their single largest
+  blocker.
+
+  The Python script stays, because CI already proves *its* output boots the real broker
+  (0051-T6), and the two are held together by a **byte-for-byte differential test** over
+  shared fixtures. That test was verified to fail rather than assumed to work: injecting a
+  plausible bug — a missing access word read as `read` instead of `readwrite` — made it fail
+  on exactly the affected rule, a silent privilege narrowing no eyeball would catch.
+
+  One honesty fix along the way. The generated header credited
+  `scripts/migrate/from-mosquitto.py` even when `mqttui` produced it — a script the user may
+  not have. Both sides now say *the mqttd Mosquitto converter*, which keeps byte-identity
+  and is true whichever produced it.
 - **2026-08-10** — **T2, T3, T5 and T6 done: the terminal UI.** Two panes as specified, a
   collapsible group tree, one run at a time, follow-mode that stops when you scroll, and a
   finished run that leads with its verdict — jumping to the first failing line rather than

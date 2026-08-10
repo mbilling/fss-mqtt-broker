@@ -263,7 +263,8 @@ def parse_acl(text: str) -> tuple[list[dict], list[str]]:
 
 def render_acl(rules: list[dict], todos: list[str]) -> str:
     out = [
-        "# Translated from a Mosquitto acl_file by scripts/migrate/from-mosquitto.py.",
+        "# Translated from a Mosquitto acl_file by the mqttd Mosquitto converter",
+        "# (`mqttui migrate mosquitto`, or scripts/migrate/from-mosquitto.py).",
         "#",
         "# Mosquitto is positional (a `user` line opens a block); mqttd is a list of",
         "# explicit rules. Read this through before deploying it — a converted policy",
@@ -296,7 +297,8 @@ def render_acl(rules: list[dict], todos: list[str]) -> str:
 
 def render_config(conv: Conversion) -> str:
     out = [
-        "# Translated from mosquitto.conf by scripts/migrate/from-mosquitto.py.",
+        "# Translated from mosquitto.conf by the mqttd Mosquitto converter",
+        "# (`mqttui migrate mosquitto`, or scripts/migrate/from-mosquitto.py).",
         "#",
         "# Review every line, then validate before deploying:",
         "#     mqttd --check-config --config this-file.toml",
