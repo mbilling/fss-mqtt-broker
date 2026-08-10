@@ -28,6 +28,13 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 const V5: ProtocolVersion = ProtocolVersion::V5;
+
+// The registry is built with `Registry::with_prefix("mqttd")`, so every exported name
+// carries it. Naming them here rather than inline is what makes a prefix change fail
+// loudly in one place instead of silently matching nothing.
+const RSS_GAUGE: &str = "mqttd_process_resident_bytes";
+const MAX_GAUGE: &str = "mqttd_memory_max_bytes";
+const MEM_BROWNOUT_ON: &str = "mqttd_brownout{axis=\"memory\"} 1";
 /// MQTT 5.0 reason code 0x97 — the honest answer to "your session would exceed a quota".
 const QUOTA_EXCEEDED: u8 = 0x97;
 
@@ -137,22 +144,25 @@ async fn connack_code(addr: SocketAddr, client_id: &str) -> u8 {
 async fn an_rss_over_the_watermark_browns_out_and_refuses_new_sessions() {
     let (_broker, client, health, _dir) = start_broker(Some(1024)).await;
 
-    let body = metrics_until(health, |b| b.contains("brownout{axis=\"memory\"} 1")).await;
+    let body = metrics_until(health, |b| {
+        b.contains(MEM_BROWNOUT_ON) && gauge(b, RSS_GAUGE).is_some_and(|v| v > 0)
+    })
+    .await;
     assert!(
-        body.contains("brownout{axis=\"memory\"} 1"),
+        body.contains(MEM_BROWNOUT_ON),
         "the memory axis must report brownout when RSS exceeds the watermark; metrics were:\n{}",
         memory_lines(&body)
     );
 
     // RSS is exported, and is a plausible number rather than a zero standing in for
     // "could not read" — a zero would sit under every watermark and never fire.
-    let rss = gauge(&body, "process_resident_bytes").expect("process_resident_bytes exported");
+    let rss = gauge(&body, RSS_GAUGE).expect("the RSS gauge must be exported");
     assert!(
         rss > 1024 * 1024,
         "a running broker should hold more than 1 MiB; got {rss}"
     );
     assert_eq!(
-        gauge(&body, "memory_max_bytes"),
+        gauge(&body, MAX_GAUGE),
         Some(1024),
         "the configured watermark must be exported so headroom is computable"
     );
@@ -171,16 +181,18 @@ async fn an_rss_over_the_watermark_browns_out_and_refuses_new_sessions() {
 async fn without_a_watermark_the_same_broker_accepts_sessions() {
     let (_broker, client, health, _dir) = start_broker(None).await;
 
-    let body = metrics_until(health, |b| b.contains("process_resident_bytes")).await;
+    let body = metrics_until(health, |b| gauge(b, RSS_GAUGE).is_some_and(|v| v > 0)).await;
     assert!(
-        !body.contains("brownout{axis=\"memory\"} 1"),
+        !body.contains(MEM_BROWNOUT_ON),
         "no watermark configured must mean no memory brownout; metrics were:\n{}",
         memory_lines(&body)
     );
     assert_eq!(
-        gauge(&body, "memory_max_bytes").unwrap_or(0),
-        0,
-        "an unset watermark exports 0, so PromQL can tell 'off' from 'very small'"
+        gauge(&body, MAX_GAUGE),
+        Some(0),
+        "an unset watermark exports 0 — Some(0), not absent: `unwrap_or(0)` here would \
+         pass when the gauge could not be found at all, which is how the first version \
+         of this test passed against a metric name that did not exist"
     );
 
     assert_eq!(
