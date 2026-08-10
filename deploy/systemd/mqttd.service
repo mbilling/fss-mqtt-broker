@@ -6,6 +6,14 @@ RequiresMountsFor=/var/lib/mqttd
 After=network-online.target
 Wants=network-online.target
 
+# Do not fight a genuinely broken config: five failures in five minutes and we stop, so a
+# bad rollout is visible in `systemctl status` instead of hidden in a restart loop.
+# These live in [Unit], not [Service] — systemd SILENTLY IGNORES them in [Service], which
+# is how a unit ends up looking rate-limited without being. CI catches that
+# (scripts/deploy-smoke.sh runs `systemd-analyze verify`); it caught this one.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=exec
 User=mqttd
@@ -27,10 +35,6 @@ TimeoutStopSec=60
 
 Restart=on-failure
 RestartSec=5s
-# Do not fight a genuinely broken config: five failures in five minutes and we stop,
-# so a bad rollout is visible in `systemctl status` instead of hidden in a restart loop.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # ── Hardening ─────────────────────────────────────────────────────────────────────
 # The broker needs: its data dir, its config dir (read-only), and network. Nothing else.
