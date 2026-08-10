@@ -1,0 +1,49 @@
+# Topic authorization for the reference cluster (ADR 0004).
+#
+# Deny by default. Every grant below is deliberate, and the shape is the one worth
+# copying: devices are scoped to their OWN identity's subtree with `%i`, so adding a
+# device is adding a credential — never editing this file.
+#
+# Reloadable: edit and `docker compose kill -s HUP mqttd-1 mqttd-2 mqttd-3`. A tightened
+# grant reaches ALREADY-CONNECTED clients (ADR 0040), it does not wait for a reconnect.
+
+default = "deny"
+
+# ── devices ────────────────────────────────────────────────────────────────────────
+# `%i` substitutes the authenticated identity (the username from the password file), so
+# device-a can only ever touch devices/device-a/**. This is a namespacing tool: it is
+# only a boundary because the password file decides who may claim each username.
+[[rules]]
+identities = ["device-*"]
+actions = ["publish"]
+effect = "allow"
+topics = ["devices/%i/up/#"]
+
+[[rules]]
+identities = ["device-*"]
+actions = ["subscribe"]
+effect = "allow"
+topics = ["devices/%i/down/#"]
+
+# ── the application backend ────────────────────────────────────────────────────────
+# Reads every device's uplink, writes every device's downlink. Note it can NOT publish
+# to `up/`: a backend that could forge device telemetry makes the audit log meaningless.
+[[rules]]
+identities = ["backend"]
+actions = ["subscribe"]
+effect = "allow"
+topics = ["devices/+/up/#"]
+
+[[rules]]
+identities = ["backend"]
+actions = ["publish"]
+effect = "allow"
+topics = ["devices/+/down/#"]
+
+# ── health/smoke checks ────────────────────────────────────────────────────────────
+# A narrow topic for monitoring round-trips, so a prober needs no broad grant.
+[[rules]]
+identities = ["probe"]
+actions = ["publish", "subscribe"]
+effect = "allow"
+topics = ["probe/#"]

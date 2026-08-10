@@ -90,6 +90,14 @@ jobs:
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 
+      # ADR 0047 T9: the non-Kubernetes reference deployment, actually booted. Reads the
+      # values out of deploy/systemd/mqttd.env.example, so a renamed setting in the shipped
+      # artifact fails here instead of on somebody's first install. The runner has both
+      # `docker compose` and `systemd-analyze`, so the compose file and the unit are
+      # validated with their own tools in the same run.
+      - name: Deployment smoke (compose + systemd reference deployment)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/deploy-smoke.sh
+
   supply-chain:
     name: supply-chain audit
     runs-on: ubuntu-latest
