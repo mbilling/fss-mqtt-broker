@@ -64,7 +64,7 @@
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [7/11 done](0055-kubernetes-operator.md) | 4 open |
 | [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
-| [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [1/6 done](0057-durable-outbound-inflight.md) | 5 open |
+| [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [2/6 done](0057-durable-outbound-inflight.md) | 4 open |
 
 ## Open and deferred work
 
@@ -165,7 +165,6 @@
 
 **0057 — Durable outbound in-flight state: exactly-once across a broker crash**
 
-- `0057-T2` ⬜ planned: "Hub wiring: write at allocation and PUBREC, clear at PUBCOMP, fail closed with the ack withheld when the write fails"
 - `0057-T3` ⬜ planned: "Restore: rebuild `pending` from the table, resume at PUBLISH+DUP or PUBREL under the original id, seed the allocator past restored ids"
 - `0057-T4` ⬜ planned: "The SIGKILL acceptance test, both phases (PUBREL under the known id after PUBREC; PUBLISH+DUP under the original id before it)"
 - `0057-T5` ⬜ planned: "Measure the QoS 2 delta in the bench lane; record it; revisit the on-by-default decision if indefensible"
