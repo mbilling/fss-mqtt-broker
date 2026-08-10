@@ -161,7 +161,7 @@ duplicating command lines in `ci.yml`.
   someone runs it.
 - **It is a developer tool.** It does nothing for an operator running the released binary.
 
-## Open question — developer tool or user-facing?
+## Open question — developer tool or user-facing? *(answered by the 2026-08-10 amendment: both)*
 
 Recorded, not decided, because it changes the first decision.
 
@@ -173,6 +173,13 @@ separate workspace pointless.
 The two can coexist later (a shipped demo binary is not this tool), but building one while
 imagining the other is how the dependency boundary gets quietly abandoned. **This ADR
 covers the developer tool only.** A user-facing launcher earns its own record.
+
+> **Superseded by the 2026-08-10 amendment below.** It is both: one binary that detects
+> whether it is in a checkout. The dependency boundary was *not* abandoned — it survived
+> the change and now separates two published artifacts rather than one published and one
+> internal. The prediction that building one while imagining the other would erode the
+> boundary is worth keeping on the record; it did not happen, because the boundary was
+> written down first.
 
 ## Alternatives considered
 
@@ -188,3 +195,98 @@ covers the developer tool only.** A user-facing launcher earns its own record.
 - **Discovery by directory walk, no manifest.** Rejected under decision 2 — and it would
   make the CI completeness guard meaningless, since the walk and the guard would derive
   from the same source and could never disagree. A check that cannot fail.
+
+## Amendment (2026-08-10): `mqttui` is installed, not cloned — and carries its own examples
+
+This record originally scoped `mqttui` as a **developer tool** that runs *this repository's*
+scripts and assumes a checkout, and left the developer-vs-user-facing question open as
+`0056-T4`. **That question is now answered: it is both, and the user-facing half is the
+point.** A one-line install must give somebody the demo, the Kubernetes examples and the
+migration converter without cloning anything.
+
+### The constraint that shapes everything
+
+`cargo install mqttui` does not produce a checkout, and the scripts *are* the product. They
+also do not stand alone: `deploy-smoke.sh` reads `deploy/systemd/mqttd.env.example` and
+`deploy/compose/acl.toml`; `kind-smoke.sh` needs the whole Helm chart; `bench/run.sh` needs
+a compose file and five Dockerfiles.
+
+So the task set splits three ways, and the split is decided by what each task **reads**,
+not by preference:
+
+| | |
+|---|---|
+| **Standalone** — ships inside the binary | the demo stack, the Kubernetes examples (chart + CRDs), the compose reference deployment, quickstart, and the Mosquitto migration converter |
+| **Checkout-only, permanently** | `release/build-repro.sh` (builds the repo), `k8s/render-parity.sh` (diffs chart against operator), `gen-status.py`, `check-readme-facts.py` — these operate *on the repository* |
+| **Checkout-only for now** | `bench/run.sh` (embeddable later; its 12 MB is generated `results/`, the harness is ~50 KB) |
+
+`mqttui` **detects whether it is inside a checkout**: standalone it offers the embedded
+set and says plainly how many tasks are hidden and why; in a checkout it offers everything.
+A tool that silently showed a subset would be the same defect as a manifest that silently
+went stale (§3).
+
+**"Everything possible" is not everything**, and this record says so rather than letting it
+be discovered. Four tasks operate on the repository itself and cannot be freed from it by
+any amount of embedding.
+
+### Decision A — the examples are embedded, not fetched
+
+The full example surface — `demo/`, `deploy/helm/`, `deploy/compose/`, `deploy/crds/`,
+`scripts/migrate/`, `scripts/k8s/` — is **161 KB compressed** (measured). Embedding it with
+`include_dir!` costs nothing worth discussing and buys three things: it works offline, it
+is version-locked to the binary that was tested with it, and **it executes nothing that
+arrived over the network**.
+
+### Decision B — "latest" comes from a signed release, never from a branch
+
+The obvious way to keep examples current is to fetch them from `main` at runtime. It is
+rejected as a default, and the reason is this project's own posture: release binaries are
+cosign-signed with SLSA provenance and a CycloneDX SBOM, builds are reproducible, and every
+dependency is audited on every push (ADR 0045, ADR 0053). **A tool that downloads shell
+scripts from a mutable branch and runs them discards all of that with one command** — and
+worse than `curl | sh`, because it repeats on every launch.
+
+So:
+
+1. **Embedded is the default.** Always available, offline, matching the binary.
+2. **`mqttui update` fetches a signed examples bundle from a GitHub _release_**, verified
+   before it is unpacked. CI publishes a rolling bundle on merges to `main`, so "the latest
+   examples" *is* reachable — it is simply reachable as a signed artifact rather than as a
+   branch tarball. This is the answer to "can it fetch the latest from main": yes, by way
+   of a signed thing built from main, not by trusting the branch.
+3. **Fetching an unverified branch is possible but explicit** (`--channel main`), loudly
+   marked, never a default, and intended for maintainers testing unreleased examples.
+
+### Decision C — distribution is a signed binary first, crates.io second
+
+`cargo install mqttui` requires a Rust toolchain and compiles ~20 crates on the user's
+machine. The audience is somebody evaluating an MQTT broker, who may have neither. The
+project already builds signed, reproducible musl binaries, so the primary install is that
+pipeline extended to a second artifact; `cargo install` is offered for Rust users.
+
+This makes `mqttui` a **published product with its own obligations** — version, changelog,
+semver, and by this project's own standard (ADR 0045) signing and an SBOM. Accepted
+knowingly.
+
+Decision 1 is unaffected and is now doing more work than before: `mqttui` is published as
+its **own** crate from its **own** workspace, so `ratatui` never enters the broker's
+dependency graph even though both are now released artifacts.
+
+### Decision D — the migration converter is reimplemented in Rust
+
+`scripts/migrate/from-mosquitto.py` requires `python3` and, today, a checkout. It reads the
+**user's** `mosquitto.conf`, not ours, so it is the one task that is *more* useful
+standalone than in a checkout. As a built-in it becomes:
+
+```sh
+mqttui migrate mosquitto /etc/mosquitto/mosquitto.conf -o mqttd.toml
+```
+
+— no Python, no clone, no prerequisites. Three of the five reviewers in the 2026-08-09
+panel named missing migration tooling their single largest blocker, and this is the
+shortest path from "curious" to "it understands my configuration".
+
+The Python script stays: CI already proves its output boots the real broker
+(`scripts/migrate/test-from-mosquitto.sh`, ADR 0051 T6), and the two must agree. **A
+differential test over the same fixtures is the acceptance criterion** — two converters
+that disagree are worse than one.
