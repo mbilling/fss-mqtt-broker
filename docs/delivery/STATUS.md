@@ -63,7 +63,7 @@
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [7/11 done](0055-kubernetes-operator.md) | 4 open |
-| [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [9/10 done](0056-mqttui.md) | 1 open |
+| [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
 
 ## Open and deferred work
 
@@ -161,7 +161,3 @@
 - `0055-T6` ⬜ planned: Drain-aware rolls — operator-set annotation via Downward API consulted by preStop (hook shipped identically in chart and operator paths); shrink = full drain, roll = rejoin-and-catch-up
 - `0055-T8` ⬜ planned: Packaging + docs — deploy/helm/mqttd-operator chart (Deployment + CRD + namespaced RBAC), operator image in the ADR 0045 release pipeline (signed/reproducible/SBOM), OPERATIONS.md operator mode, COMPARISON.md Kubernetes cell update
 - `0055-T10` ⬜ planned: ExpandPVC must also raise store_max_bytes through the config contract — expanding the volume without moving the watermark leaves the brownout it exists to clear still raised (ADR 0055 section 3.2, second half)
-
-**0056 — `mqttui`: a terminal UI for running the demo, migration and test scripts**
-
-- `0056-T8` ⬜ planned: "`mqttui update` — fetch the examples bundle from a SIGNED release, verified before unpacking; CI publishes a rolling bundle on merges to main" — "This is the answer to 'can it fetch the latest from main': yes, by way of a signed artifact built from main, not by trusting the branch. Fetching a branch tarball at runtime was REJECTED as a default — release binaries are cosign-signed with SLSA provenance and an SBOM, builds are reproducible, and every dependency is audited on every push (ADR 0045/0053); downloading shell from a mutable branch and running it discards all of that with one command, and repeats it on every launch. An explicit `--channel main` remains available for maintainers testing unreleased examples: loudly marked unverified, never a default."

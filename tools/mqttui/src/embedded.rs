@@ -59,6 +59,10 @@ pub enum Source {
     Checkout(PathBuf),
     /// Standalone: only the embedded examples, unpacked to a cache directory.
     Embedded(PathBuf),
+    /// Standalone, with an installed `mqttui update` bundle taking precedence over the
+    /// embedded copy. Availability follows the same rules as [`Self::Embedded`]; what
+    /// differs is provenance, which the list's source line states on every run.
+    Updated(PathBuf),
 }
 
 impl Source {
@@ -66,7 +70,7 @@ impl Source {
     #[must_use]
     pub fn root(&self) -> &Path {
         match self {
-            Self::Checkout(p) | Self::Embedded(p) => p,
+            Self::Checkout(p) | Self::Embedded(p) | Self::Updated(p) => p,
         }
     }
 
@@ -84,9 +88,15 @@ impl Source {
     pub fn availability(&self, task: &crate::manifest::Task) -> Availability {
         match self {
             Self::Checkout(_) => Availability::Yes,
-            Self::Embedded(_) if task.needs_checkout => Availability::NeedsCheckout,
-            Self::Embedded(root) if root.join(&task.script).is_file() => Availability::Yes,
-            Self::Embedded(_) => Availability::NotBundled,
+            Self::Embedded(root) | Self::Updated(root) => {
+                if task.needs_checkout {
+                    Availability::NeedsCheckout
+                } else if root.join(&task.script).is_file() {
+                    Availability::Yes
+                } else {
+                    Availability::NotBundled
+                }
+            }
         }
     }
 
@@ -105,7 +115,7 @@ impl Source {
 /// # Errors
 /// If the cache directory cannot be created or written.
 pub fn unpack() -> Result<PathBuf, String> {
-    let base = cache_dir()?;
+    let base = cache_root()?;
     // Version-stamped, so upgrading the binary cannot leave an older example behind — the
     // examples are only trustworthy as the set the binary was tested with.
     let root = base.join(format!("examples-{}", env!("CARGO_PKG_VERSION")));
@@ -140,6 +150,22 @@ fn write_dir(dir: &Dir<'_>, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Walk `dir` and mark every `.sh` executable — an installed update goes through the same
+/// treatment as the embedded unpack, or its scripts fail at exec with a permission error.
+pub fn make_scripts_executable(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            make_scripts_executable(&path);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("sh") {
+            make_executable(&path);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -153,7 +179,9 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
-fn cache_dir() -> Result<PathBuf, String> {
+/// The mqttui cache root — the embedded unpacks and any installed update both live here,
+/// so `update --clear` and cache cleanup have one place to look.
+pub fn cache_root() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))

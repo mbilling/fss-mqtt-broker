@@ -64,11 +64,25 @@ pub struct App<'a> {
     status: String,
     environment: Option<teardown::Environment>,
     quit: bool,
+    /// Where the examples come from. The TUI must apply the same availability rules as
+    /// `--list`/`--run` — it is the third entry point, and the first version of it did
+    /// not, so a standalone user could pick a repo-only task and watch it die mid-run.
+    source: crate::embedded::Source,
 }
 
 impl<'a> App<'a> {
-    pub fn new(manifest: &'a Manifest, root: PathBuf) -> Self {
+    pub fn new(manifest: &'a Manifest, root: PathBuf, source: crate::embedded::Source) -> Self {
+        // An updated example set changes what every task in the tree means, and an
+        // unverified one must be visible without asking — so it opens in the status line.
+        let status = match &source {
+            crate::embedded::Source::Updated(dir) => format!(
+                "examples: installed update — {}",
+                crate::update::provenance(dir).unwrap_or_else(|| "provenance missing".into())
+            ),
+            _ => String::new(),
+        };
         Self {
+            source,
             manifest,
             root,
             collapsed: BTreeMap::new(),
@@ -81,7 +95,7 @@ impl<'a> App<'a> {
             env_buffer: String::new(),
             scroll: 0,
             follow: true,
-            status: String::new(),
+            status,
             environment: None,
             quit: false,
         }
@@ -336,6 +350,23 @@ impl<'a> App<'a> {
         let Some(task) = self.selected_task() else {
             return;
         };
+        match self.source.availability(task) {
+            crate::embedded::Availability::Yes => {}
+            crate::embedded::Availability::NeedsCheckout => {
+                self.status = format!(
+                    "{} operates on the repository itself — clone it and run from inside",
+                    task.id
+                );
+                return;
+            }
+            crate::embedded::Availability::NotBundled => {
+                self.status = format!(
+                    "{} is not in the bundled examples — it runs from a clone",
+                    task.id
+                );
+                return;
+            }
+        }
         let missing = preflight::missing_required(task);
         if !missing.is_empty() {
             self.status = format!("cannot run: missing {}", missing.join(", "));
@@ -387,15 +418,18 @@ impl<'a> App<'a> {
                     Style::default().add_modifier(Modifier::BOLD),
                 )])),
                 Row::Task(t) => {
+                    let unavailable = !self.source.can_run(t);
                     let blocked = !preflight::missing_required(t).is_empty();
                     let marker = if running_id.as_deref() == Some(t.id.as_str()) {
                         "●"
+                    } else if unavailable {
+                        "-"
                     } else if blocked {
                         "!"
                     } else {
                         " "
                     };
-                    let style = if blocked {
+                    let style = if unavailable || blocked {
                         Style::default().fg(Color::DarkGray)
                     } else {
                         Style::default()
