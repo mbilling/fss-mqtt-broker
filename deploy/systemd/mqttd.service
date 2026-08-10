@@ -1,0 +1,79 @@
+[Unit]
+Description=mqttd — clustered MQTT broker
+Documentation=https://github.com/mbilling/fss-mqtt-broker
+# Sessions are durable on disk; the data directory must be mounted before we start.
+RequiresMountsFor=/var/lib/mqttd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=mqttd
+Group=mqttd
+
+# All configuration is MQTTD_* environment. One file per host, holding this node's
+# identity and seed list — see mqttd.env.example.
+EnvironmentFile=/etc/mqttd/mqttd.env
+
+ExecStart=/usr/local/bin/mqttd
+# Reload the ACL / password file / TLS material in place, no restart, through the
+# validate-before-swap path (ADR 0032): a bad edit is rejected and the running config kept.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# SIGTERM starts the ADR 0019 graceful shutdown. Give it longer than
+# MQTTD_SHUTDOWN_GRACE so systemd never SIGKILLs a broker that is still draining.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+Restart=on-failure
+RestartSec=5s
+# Do not fight a genuinely broken config: five failures in five minutes and we stop,
+# so a bad rollout is visible in `systemctl status` instead of hidden in a restart loop.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# ── Hardening ─────────────────────────────────────────────────────────────────────
+# The broker needs: its data dir, its config dir (read-only), and network. Nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+# IPv4/IPv6 + unix only: no raw sockets, no exotic families.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# ProtectSystem=strict makes everything read-only; these two are the exceptions.
+StateDirectory=mqttd
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/mqttd
+# No listener below 1024 in the reference config (1883/8883), so no capabilities at all.
+# If you bind :443 for WSS, add: AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=
+
+# ── Resource bounds ───────────────────────────────────────────────────────────────
+# The broker has no total-memory knob yet (docs/SIZING.md is explicit about this), so
+# the cgroup limit IS the bound. Size it from SIZING.md; MemoryMax kills, MemoryHigh
+# throttles first so you get a warning rather than only an OOM.
+MemoryHigh=1500M
+MemoryMax=2G
+# One fd per connection plus store handles. Raise with max_connections.
+LimitNOFILE=65535
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
