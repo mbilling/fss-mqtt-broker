@@ -532,6 +532,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // Process-memory visibility + watermark brownout (ADR 0041 T8): sample RSS
+    // periodically, export process_resident_bytes, and drive the hub's brownout flag on
+    // the memory axis when MQTTD_MEMORY_MAX_BYTES is configured. Runs regardless of a
+    // data dir — memory pressure is not a durable-store concern.
+    let memory_max_bytes = match config.limits.memory_max_bytes {
+        // A configured zero would brown out immediately and never recover; reject it
+        // rather than accept an instruction that cannot have been meant.
+        Some(0) => return Err("memory_max_bytes must be a positive integer".into()),
+        other => other,
+    };
+    if let Some(max) = memory_max_bytes {
+        info!(
+            max,
+            "memory watermark active (ADR 0041 T8): brownout above it. This is a \
+             watermark, not a ceiling — keep the container/cgroup memory limit as the \
+             hard bound"
+        );
+    }
+    tokio::spawn(mqttd::memory_watch::watch(
+        memory_max_bytes,
+        hub_tx.clone(),
+        Some(metrics.clone()),
+        None,
+        None,
+    ));
+
     // Per-client and global state quotas (ADR 0041 T3/T4), configured once before
     // any listener accepts. Unset = uncapped; a non-positive or unparseable value
     // is a startup error. Live-swappable on config reload (ADR 0046 T4).

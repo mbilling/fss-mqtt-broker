@@ -48,7 +48,7 @@
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
-| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [5/10 done](0041-resource-governance.md) | 5 open |
+| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [6/10 done](0041-resource-governance.md) | 4 open |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [7/8 done](0044-release-readiness-assurance.md) | 1 open |
@@ -120,7 +120,6 @@
 
 - `0041-T6` ⬜ planned: Per-session byte bound on the offline queue — MQTTD_MAX_QUEUED_BYTES beside the count bound, first-reached wins, same queue_overflow semantics, counted; SIZING.md updated (2026-08-04 amendment)
 - `0041-T7` ⬜ planned: Bridge-spool byte bound — max_bytes joins max_messages in the mqtt-bridge spool, drop-oldest, counted (2026-08-04 amendment)
-- `0041-T8` ⬜ planned: Process-memory watermark — MQTTD_MEMORY_MAX_BYTES, RSS poller + edge-triggered brownout reusing the T5 refusal paths; growth refused, maintenance continues, recovery restores; explicitly not allocation-denial or per-connection force-shutdown (2026-08-04 amendment)
 - `0041-T9` ⬜ planned: Per-store disk bound — a share of MQTTD_STORE_MAX_BYTES per redb store (sessions/retained/replicas/lease) so one store cannot consume the whole watermark and brown out the others; same T4 refusal behaviors, counted per store (2026-08-07 amendment)
 - `0041-T10` ⬜ planned: Per-connection write-buffer bound — MAX_BACKLOG (hub.rs, 10 000 messages per stalled subscriber) becomes byte-aware and configurable; today it is a hard-coded count, so a slow consumer's backlog is bounded in messages but unbounded in bytes and cannot be tuned (2026-08-07 amendment)
 

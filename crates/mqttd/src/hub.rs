@@ -384,6 +384,30 @@ struct Backlog {
     offset: Option<Offset>,
 }
 
+/// A resource whose watermark can put the broker into brownout (ADR 0041).
+///
+/// Separate axes because they are independent watchers with independent watermarks, and
+/// the effective state is their OR. Collapsing them into one flag would let the disk
+/// watcher's "I am fine now" lift a brownout that memory pressure is still asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrownoutAxis {
+    /// On-disk store bytes over `MQTTD_STORE_MAX_BYTES` (T5).
+    Disk,
+    /// Process resident memory over `MQTTD_MEMORY_MAX_BYTES` (T8).
+    Memory,
+}
+
+impl BrownoutAxis {
+    /// The metric label — also the word used in logs and `/statusz`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disk => "disk",
+            Self::Memory => "memory",
+        }
+    }
+}
+
 /// The outcome of a durable append to a session's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Appended {
@@ -623,10 +647,20 @@ pub enum HubCommand {
     /// Set the per-client quotas (ADR 0041 T3). Sent once at startup, before any
     /// listener accepts.
     SetQuotas(Quotas),
-    /// Enter or leave disk **brownout** (ADR 0041 T5): sent by the store-size
-    /// watcher on watermark transitions. Under brownout, growth writes are
-    /// refused with the quota behaviors while maintenance continues.
-    SetBrownout(bool),
+    /// Enter or leave **brownout** on one axis (ADR 0041 T5 disk, T8 memory): sent by
+    /// the corresponding watcher on watermark transitions. Under brownout, growth
+    /// writes are refused with the quota behaviors while maintenance continues.
+    ///
+    /// Per-axis, because the axes are independent watchers. A single flag would let
+    /// whichever watcher polled last decide: disk dropping under its watermark would
+    /// lift a brownout that memory pressure is still asking for. The effective state is
+    /// the OR — brownout while ANY axis is over.
+    SetBrownout {
+        /// Which watermark moved (`"disk"`, `"memory"`).
+        axis: BrownoutAxis,
+        /// Whether that axis is now over its watermark.
+        on: bool,
+    },
     /// Remove subscriptions for a client.
     Unsubscribe {
         /// The unsubscribing client.
@@ -1048,12 +1082,18 @@ pub struct Hub {
     /// (no re-check) until [`HubCommand::AttachAuthorizer`] arrives — harnesses
     /// without a reloadable policy keep today's restore-as-persisted behavior.
     authz: Option<AuthzWatch>,
-    /// Disk brownout (ADR 0041 T5): set while the stores' on-disk size exceeds
-    /// `MQTTD_STORE_MAX_BYTES`. Growth writes (new retained topics, new sessions,
-    /// offline enqueues) are refused with the quota behaviors; acks, deletes,
-    /// expiry, and resumes continue — read-mostly, not read-only, and never the
-    /// disk-full cliff.
+    /// Brownout (ADR 0041 T5 disk, T8 memory): set while **any** watched resource is
+    /// over its watermark — the stores' on-disk size above `MQTTD_STORE_MAX_BYTES`, or
+    /// process RSS above `MQTTD_MEMORY_MAX_BYTES`. Growth writes (new retained topics,
+    /// new sessions, offline enqueues) are refused with the quota behaviors; acks,
+    /// deletes, expiry, and resumes continue — read-mostly, not read-only, and never
+    /// the disk-full cliff.
+    ///
+    /// This is the OR of [`Self::brownout_axes`]; the per-axis state is kept separately
+    /// so one watcher lifting its own pressure cannot clear another's.
     brownout: bool,
+    /// Which axes are currently over their watermark. Empty = no brownout.
+    brownout_axes: HashSet<BrownoutAxis>,
     /// Per-client quotas (ADR 0041 T3); default = uncapped.
     quotas: Quotas,
     /// The `(epoch, offset)` convergence token each cached retained topic was applied
@@ -1403,6 +1443,7 @@ impl Hub {
                 durable_retained: None,
                 authz: None,
                 brownout: false,
+                brownout_axes: HashSet::new(),
                 brownout_status: None,
                 quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
@@ -1480,6 +1521,54 @@ impl Hub {
     /// Attach the shared brownout status the `/statusz` body reads (ADR 0054).
     pub fn attach_brownout_status(&mut self, status: Arc<crate::health::BrownoutStatus>) {
         self.brownout_status = Some(status);
+    }
+
+    /// Record that `axis` is (or is no longer) over its watermark, and recompute the
+    /// effective brownout state as the OR across axes (ADR 0041 T5/T8).
+    ///
+    /// The per-axis gauge always follows its own axis, so an operator can see *which*
+    /// resource is under pressure. The aggregate — the flag that refuses growth writes,
+    /// and the `/statusz` state — flips only when the OR changes, so a second axis going
+    /// over while the first already has is not logged as a fresh brownout, and the first
+    /// recovering does not lift a brownout the second is still asking for.
+    fn set_brownout_axis(&mut self, axis: BrownoutAxis, on: bool) {
+        if on {
+            self.brownout_axes.insert(axis);
+        } else {
+            self.brownout_axes.remove(&axis);
+        }
+        // Per-axis visibility, regardless of whether the aggregate moved.
+        if let Some(m) = &self.metrics {
+            m.set_brownout(axis.as_str(), on);
+        }
+
+        let effective = !self.brownout_axes.is_empty();
+        if effective != self.brownout {
+            if effective {
+                warn!(
+                    axis = axis.as_str(),
+                    "watermark exceeded: BROWNOUT — growth writes refused (ADR 0041)"
+                );
+            } else {
+                info!(
+                    axis = axis.as_str(),
+                    "back under every watermark: brownout lifted (ADR 0041)"
+                );
+            }
+            // ADR 0054: brownout is a STATE, not just symptoms — flip the shared
+            // /statusz flag on every aggregate transition.
+            if let Some(s) = &self.brownout_status {
+                s.set(effective);
+            }
+        } else if on {
+            // Already browned out on another axis: worth a line, because the operator
+            // needs to fix BOTH before growth writes resume.
+            warn!(
+                axis = axis.as_str(),
+                "a second resource is over its watermark; brownout continues (ADR 0041)"
+            );
+        }
+        self.brownout = effective;
     }
 
     /// Replace the wall-clock source before [`run`](Self::run). Production uses the
@@ -1564,25 +1653,8 @@ impl Hub {
             HubCommand::SetQuotas(quotas) => {
                 self.quotas = quotas;
             }
-            HubCommand::SetBrownout(on) => {
-                if on != self.brownout {
-                    if on {
-                        warn!(
-                            "disk watermark exceeded: BROWNOUT — growth writes refused (ADR 0041)"
-                        );
-                    } else {
-                        info!("disk usage back under the watermark: brownout lifted (ADR 0041)");
-                    }
-                    // ADR 0054: brownout is a STATE, not just symptoms — export the
-                    // gauge and the shared /statusz flag on every transition.
-                    if let Some(m) = &self.metrics {
-                        m.set_brownout("disk", on);
-                    }
-                    if let Some(s) = &self.brownout_status {
-                        s.set(on);
-                    }
-                }
-                self.brownout = on;
+            HubCommand::SetBrownout { axis, on } => {
+                self.set_brownout_axis(axis, on);
             }
             HubCommand::Unsubscribe { client, filters } => {
                 self.unsubscribe(&client, &filters).await;
@@ -5284,9 +5356,9 @@ mod tests {
     }
 
     use super::{
-        Admission, AttachOutcome, AuthMethod, Backlog, Hub, HubCommand, Inflight, Outbound,
-        PeerOutbound, ProtocolVersion, RemoteSharedGroup, EXPIRY_RECONCILE_EVERY, MAX_BACKLOG,
-        MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+        Admission, AttachOutcome, AuthMethod, Backlog, BrownoutAxis, Hub, HubCommand, Inflight,
+        Outbound, PeerOutbound, ProtocolVersion, RemoteSharedGroup, EXPIRY_RECONCILE_EVERY,
+        MAX_BACKLOG, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
@@ -7064,7 +7136,11 @@ mod tests {
             super::PublishOutcome::Accepted
         );
 
-        tx.send(HubCommand::SetBrownout(true)).unwrap();
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
 
         // Growth refused: a NEW retained topic...
         assert_eq!(
@@ -7101,7 +7177,11 @@ mod tests {
         detach(&tx, "sleeper", 3);
 
         // Recovery below the mark restores growth.
-        tx.send(HubCommand::SetBrownout(false)).unwrap();
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: false,
+        })
+        .unwrap();
         assert_eq!(
             retained_publish("b/r2", b"now").await.unwrap(),
             super::PublishOutcome::Accepted
@@ -7124,6 +7204,82 @@ mod tests {
             recv_packet(&mut rx).await.is_none(),
             "the browned-out message must not have been queued"
         );
+    }
+
+    /// Brownout is the OR across axes (ADR 0041 T5 disk, T8 memory).
+    ///
+    /// The axes are independent pollers on independent watermarks. With one shared flag,
+    /// whichever polled last would decide — the disk watcher's routine "still fine" every
+    /// 10s would silently lift a brownout that memory pressure is still asking for, and
+    /// the broker would resume accepting growth writes straight into an OOM. This test is
+    /// the reason the state is a set and not a bool.
+    #[tokio::test]
+    async fn one_axis_recovering_does_not_lift_another_axis_brownout() {
+        let tx = start_hub();
+        attach_full(&tx, "sleeper", 1, false, u32::MAX, 8).await;
+        detach(&tx, "sleeper", 1);
+
+        let set = |axis, on| {
+            tx.send(HubCommand::SetBrownout { axis, on }).unwrap();
+        };
+        // A new session is refused under brownout and accepted otherwise, so it reads the
+        // aggregate flag without reaching into the hub's internals.
+        let new_session_refused = |tx: &HubTx, id: &'static str, conn: u64| {
+            let tx = tx.clone();
+            async move {
+                matches!(
+                    attach_outcome(&tx, id, conn).await,
+                    AttachOutcome::QuotaExceeded
+                )
+            }
+        };
+
+        set(BrownoutAxis::Disk, true);
+        set(BrownoutAxis::Memory, true);
+        assert!(
+            new_session_refused(&tx, "a", 10).await,
+            "both axes over: browned out"
+        );
+
+        // Disk recovers. Memory has NOT.
+        set(BrownoutAxis::Disk, false);
+        assert!(
+            new_session_refused(&tx, "b", 11).await,
+            "memory is still over its watermark — the disk axis recovering must not \
+             lift the brownout"
+        );
+
+        // Memory recovers too: only now does growth resume.
+        set(BrownoutAxis::Memory, false);
+        assert!(
+            !new_session_refused(&tx, "c", 12).await,
+            "with every axis back under its watermark, growth writes resume"
+        );
+    }
+
+    /// A single axis still behaves exactly as it did before axes existed — set, refused;
+    /// cleared, accepted — so the generalisation did not change the T5 disk contract.
+    #[tokio::test]
+    async fn a_single_axis_still_toggles_brownout_on_its_own() {
+        let tx = start_hub();
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Memory,
+            on: true,
+        })
+        .unwrap();
+        assert!(matches!(
+            attach_outcome(&tx, "x", 1).await,
+            AttachOutcome::QuotaExceeded
+        ));
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Memory,
+            on: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            attach_outcome(&tx, "x", 2).await,
+            AttachOutcome::Present(false)
+        ));
     }
 
     /// The append-failure reason classes are bounded and map each `StorageError`.

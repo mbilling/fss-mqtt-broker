@@ -129,6 +129,8 @@ struct OtelInstruments {
     retained_queue_dropped: OtelCounter<u64>,
     brownout: OtelGauge<i64>,
     store_max_bytes: OtelGauge<i64>,
+    process_resident_bytes: OtelGauge<i64>,
+    memory_max_bytes: OtelGauge<i64>,
     decommission_state: OtelGauge<i64>,
     decommission_pending: OtelGauge<i64>,
     voters: OtelGauge<i64>,
@@ -184,6 +186,8 @@ impl OtelInstruments {
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
             brownout: meter.i64_gauge("brownout").build(),
             store_max_bytes: meter.i64_gauge("store_max_bytes").build(),
+            process_resident_bytes: meter.i64_gauge("process_resident_bytes").build(),
+            memory_max_bytes: meter.i64_gauge("memory_max_bytes").build(),
             decommission_state: meter.i64_gauge("decommission_state").build(),
             decommission_pending: meter.i64_gauge("decommission_pending").build(),
             voters: meter.i64_gauge("voters").build(),
@@ -255,12 +259,18 @@ pub struct Metrics {
     retained_apply_failed_total: Counter,
     retained_queue_dropped_total: Counter,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
-    /// (`disk` today), 0 otherwise. The rejection counters record symptoms; this
+    /// (`disk`, `memory`), 0 otherwise. The rejection counters record symptoms; this
     /// gauge is the condition itself — an idle browned-out broker is visible.
     brownout: Family<AxisLabel, Gauge>,
     /// The configured disk high-water mark in bytes (0 = no watermark), so
     /// utilization is computable from `store_bytes / store_max_bytes` in `PromQL`.
     store_max_bytes: Gauge,
+    /// This process's resident set size in bytes (ADR 0041 T8). Absent on platforms
+    /// where RSS cannot be read, rather than reported as zero.
+    process_resident_bytes: Gauge,
+    /// The configured memory high-water mark in bytes (0 = no watermark), so headroom
+    /// is `process_resident_bytes / memory_max_bytes` in `PromQL`.
+    memory_max_bytes: Gauge,
     /// Decommission drain state (ADR 0054): 0 = none, 1 = draining, 2 = complete.
     decommission_state: Gauge,
     /// Hand-offs still pending in an active decommission drain.
@@ -518,12 +528,23 @@ impl Metrics {
             &mut registry,
             "brownout",
             "1 while growth writes are refused on this axis (ADR 0041 §5 / ADR 0054), \
-             by axis (disk); 0 otherwise — the state, not the rejection symptoms",
+             by axis (disk, memory); 0 otherwise — the state, not the rejection symptoms",
         );
         let store_max_bytes = register_gauge(
             &mut registry,
             "store_max_bytes",
             "The configured disk high-water mark in bytes (MQTTD_STORE_MAX_BYTES); \
+             0 = no watermark configured",
+        );
+        let process_resident_bytes = register_gauge(
+            &mut registry,
+            "process_resident_bytes",
+            "Resident set size of the broker process in bytes (ADR 0041 T8)",
+        );
+        let memory_max_bytes = register_gauge(
+            &mut registry,
+            "memory_max_bytes",
+            "The configured memory high-water mark in bytes (MQTTD_MEMORY_MAX_BYTES); \
              0 = no watermark configured",
         );
         let decommission_state = register_gauge(
@@ -646,6 +667,8 @@ impl Metrics {
             retained_queue_dropped_total,
             brownout,
             store_max_bytes,
+            process_resident_bytes,
+            memory_max_bytes,
             decommission_state,
             decommission_pending,
             voters,
@@ -950,6 +973,20 @@ impl Metrics {
         let v = i64::try_from(bytes).unwrap_or(i64::MAX);
         self.store_max_bytes.set(v);
         self.otel.store_max_bytes.record(v, &[]);
+    }
+
+    /// Record this process's resident set size in bytes (ADR 0041 T8).
+    pub fn set_process_resident_bytes(&self, bytes: u64) {
+        let v = i64::try_from(bytes).unwrap_or(i64::MAX);
+        self.process_resident_bytes.set(v);
+        self.otel.process_resident_bytes.record(v, &[]);
+    }
+
+    /// Record the configured memory high-water mark (0 = unset).
+    pub fn set_memory_max_bytes(&self, bytes: u64) {
+        let v = i64::try_from(bytes).unwrap_or(i64::MAX);
+        self.memory_max_bytes.set(v);
+        self.otel.memory_max_bytes.record(v, &[]);
     }
 
     /// Record decommission drain progress: `state` 0 = none, 1 = draining,

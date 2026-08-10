@@ -128,6 +128,13 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # max_packet_size = 1048576          # inbound ceiling, bytes (default 1 MiB, floor 1 KiB)
 # receive_maximum = 256              # v5 Receive Maximum (default 256, floor 1)
 # topic_alias_max = 16               # v5 Topic Alias Maximum (default 16; 0 disables)
+# Process-memory high-water mark, bytes (ADR 0041 T8). Above it the broker enters BROWNOUT:
+# growth writes (new sessions, new retained topics, offline enqueues) are refused while acks,
+# reads, deletes, expiry and resumes continue. Unset = off.
+# A watermark, NOT a ceiling: nothing here stops memory rising, so keep the container/cgroup
+# memory limit as the hard bound. This buys warning instead of an OOM kill.
+# Requires /proc (Linux); elsewhere the broker logs that it is not enforcing and carries on.
+# memory_max_bytes = 2147483648      # 2 GiB
 
 [observability]
 # OTLP/HTTP push export (ADR 0020). Unset = Prometheus /metrics endpoint only.

@@ -431,15 +431,18 @@ version:
 The gaps worth knowing before you evaluate this, stated here rather than left to
 be found. Each is tracked; none is a silent surprise.
 
-- **Memory is bounded by counts, not bytes.** There is no total-memory knob. A
-  subscriber that stops reading is bounded two ways, both by message count and
-  neither by bytes: QoS 1/2 by `MAX_BACKLOG` (10 000 messages, drop-oldest) and
-  QoS 0 by the outbound-queue cap (10 000 packets, shed and counted as
-  `publish_dropped{reason="outbound-full"}`). Both are hard-coded. At the 1 MiB
-  default packet size that is still ~10 GiB of worst-case headroom per
-  connection, so cap `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full
-  arithmetic and a bounded preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T8,
-  T10).
+- **Memory has a watermark, not a ceiling.** `MQTTD_MEMORY_MAX_BYTES` puts the
+  broker into brownout above it — growth writes refused, acks/reads/expiry/resumes
+  continue — but nothing can stop RSS rising, so a burst that outruns the 10-second
+  poll can still OOM, and the container limit remains the hard bound. It needs
+  `/proc` (Linux); elsewhere the broker logs that it is **not** enforcing rather than
+  pretending. Underneath, the per-subscriber queues are still bounded by message
+  count and not by bytes: QoS 1/2 by `MAX_BACKLOG` (10 000, drop-oldest) and QoS 0 by
+  the outbound-queue cap (10 000 packets, shed and counted as
+  `publish_dropped{reason="outbound-full"}`), both hard-coded. At the 1 MiB default
+  packet size that is ~10 GiB of worst-case headroom per connection, so cap
+  `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full arithmetic and a bounded
+  preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T10).
 - **Disk is bounded in aggregate, not per store.** One store can consume the whole
   `MQTTD_STORE_MAX_BYTES` watermark and brown out the others (ADR 0041 T9).
   Disk-full itself fails closed and is crash-tested mid-write.
@@ -773,6 +776,7 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | `MQTTD_MAX_SESSIONS` | Session cap (ADR 0041). A CONNECT creating a **new** session beyond it is refused (`0x97` v5, Server-unavailable v3.1.1); resuming an existing session is never refused — a full broker keeps serving its fleet and refuses only strangers. Unset = uncapped |
 | `MQTTD_MAX_PACKET_SIZE` | Inbound packet ceiling in bytes (default 1 MiB, floor 1 KiB), advertised to v5 clients as the MQTT 5 **Maximum Packet Size** — the transport cap and the advertised contract cannot drift apart. Outbound, a message larger than the *client's* advertised maximum is dropped for that subscriber only, per spec |
 | `MQTTD_STORE_MAX_BYTES` | Disk watermark over the node's on-disk stores, total bytes (ADR 0041; needs `MQTTD_DATA_DIR`). Above it the broker **browns out**: writes that *grow* durable state (new retained topics, new sessions, offline enqueues) are refused with the quota behaviors, while acks, deletes, expiry, and resumes continue — read-mostly, never the disk-full cliff; dropping back under restores writes. Per-store sizes are always exported as the `store_bytes{store}` gauge. Unset = no watermark |
+| `MQTTD_MEMORY_MAX_BYTES` | **Memory watermark** over this process's RSS, bytes (ADR 0041 T8). Above it the broker **browns out** exactly as the disk watermark does — growth writes refused, acks/reads/deletes/expiry/resumes continue — and dropping back under restores growth. Brownout is active while **either** axis is over; `brownout{axis="memory"}` and `process_resident_bytes` say which. A **watermark, not a ceiling**: nothing here stops RSS rising, so keep the container/cgroup limit as the hard bound. Needs `/proc` (Linux); elsewhere the broker logs at WARN that it is not enforcing, rather than pretending. Unset = off |
 | `MQTTD_AUTH_TIMEOUT` | Per-round enhanced-auth reply timeout, seconds (ADR 0013; default `10`) |
 | `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
 | `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); unset → in-memory |

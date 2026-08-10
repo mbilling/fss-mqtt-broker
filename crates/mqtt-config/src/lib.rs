@@ -339,6 +339,15 @@ pub struct Limits {
     pub topic_alias_max: Option<u16>,
     /// Offline-queue overflow policy (`MQTTD_QUEUE_OVERFLOW`): `drop-oldest` or `reject-newest`.
     pub queue_overflow: Option<String>,
+    /// Process-memory high-water mark in bytes (`MQTTD_MEMORY_MAX_BYTES`, ADR 0041 T8).
+    /// Above it the broker enters **brownout**: growth writes are refused while acks,
+    /// reads, deletes, expiry and resumes continue. Unset = off.
+    ///
+    /// A watermark, not a ceiling: nothing here can stop memory rising, so the container
+    /// or cgroup limit remains the hard bound. What it buys is that pressure building
+    /// over minutes degrades to read-mostly with a metric and a log line, instead of
+    /// arriving as an OOM kill.
+    pub memory_max_bytes: Option<u64>,
 }
 
 /// Metrics export (ADR 0020).
@@ -676,6 +685,9 @@ impl Config {
         on!("MQTTD_MAX_RETAINED_MESSAGES", v, {
             self.limits.max_retained_messages = Some(num("MQTTD_MAX_RETAINED_MESSAGES", &v)?);
         });
+        on!("MQTTD_MEMORY_MAX_BYTES", v, {
+            self.limits.memory_max_bytes = Some(num("MQTTD_MEMORY_MAX_BYTES", &v)?);
+        });
         on!("MQTTD_MAX_SESSIONS", v, {
             self.limits.max_sessions = Some(num("MQTTD_MAX_SESSIONS", &v)?);
         });
@@ -881,6 +893,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_RECEIVE_MAXIMUM",
     "MQTTD_TOPIC_ALIAS_MAX",
     "MQTTD_QUEUE_OVERFLOW",
+    "MQTTD_MEMORY_MAX_BYTES",
     // observability
     "MQTTD_OTLP_ENDPOINT",
     "MQTTD_OTLP_INTERVAL",
@@ -1134,6 +1147,7 @@ mod tests {
             | "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT"
             | "MQTTD_RECEIVE_MAXIMUM"
             | "MQTTD_TOPIC_ALIAS_MAX"
+            | "MQTTD_MEMORY_MAX_BYTES"
             | "MQTTD_OTLP_INTERVAL"
             | "MQTTD_SHUTDOWN_GRACE"
             | "MQTTD_READY_MIN_MEMBERS"
@@ -1221,7 +1235,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            66,
+            67,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
     }

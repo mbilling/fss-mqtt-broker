@@ -10,7 +10,7 @@
 //! approaching disk-full degrades to read-mostly instead of hitting the cliff
 //! where redb commits start failing mid-write.
 
-use crate::hub::HubCommand;
+use crate::hub::{BrownoutAxis, HubCommand};
 use mqtt_observability::metrics::Metrics;
 use std::path::Path;
 use std::sync::Arc;
@@ -107,7 +107,11 @@ pub async fn watch(
             let now_over = total > max;
             if now_over != brownout {
                 brownout = now_over;
-                if hub.send(HubCommand::SetBrownout(now_over)).is_err() {
+                let cmd = HubCommand::SetBrownout {
+                    axis: BrownoutAxis::Disk,
+                    on: now_over,
+                };
+                if hub.send(cmd).is_err() {
                     return; // hub gone: shutting down
                 }
             }
@@ -166,14 +170,20 @@ mod tests {
         // Cross it: exactly one SetBrownout(true).
         std::fs::write(dir.join("retained.redb"), vec![0u8; 200]).unwrap();
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-            Ok(Some(HubCommand::SetBrownout(true))) => {}
+            Ok(Some(HubCommand::SetBrownout {
+                axis: BrownoutAxis::Disk,
+                on: true,
+            })) => {}
             other => panic!("expected SetBrownout(true), got {other:?}"),
         }
 
         // Recover below it: exactly one SetBrownout(false).
         std::fs::remove_file(dir.join("retained.redb")).unwrap();
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-            Ok(Some(HubCommand::SetBrownout(false))) => {}
+            Ok(Some(HubCommand::SetBrownout {
+                axis: BrownoutAxis::Disk,
+                on: false,
+            })) => {}
             other => panic!("expected SetBrownout(false), got {other:?}"),
         }
         // The /statusz snapshot tracked the scans: watermark recorded, sessions
