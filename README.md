@@ -36,7 +36,8 @@ See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
 record of exactly what is built (56 ADRs, per-task status).
 
-**Jump to:** [**Try it in two minutes**](#try-it-in-two-minutes) ·
+**Jump to:** [**Start here**](#start-here) ·
+[Try it in two minutes](#try-it-in-two-minutes) ·
 [New to MQTT?](#new-to-mqtt) · [What works today](#what-works-today) ·
 [Security](#security) · [Clustering](#clustering) ·
 [Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
@@ -44,6 +45,54 @@ record of exactly what is built (56 ADRs, per-task status).
 [Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
 [Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
 [Performance](#performance) · [Contributing](#contributing)
+
+## Start here
+
+**`mqttui`** is the front door to everything runnable in this repository — the demo
+cluster, the Mosquitto migration converter, the secured quickstarts, the Kubernetes
+examples. It tells you what each task needs *before* it starts, instead of failing five
+minutes in ([ADR 0056](docs/adr/0056-mqttui.md)):
+
+```sh
+git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker
+cargo install --locked --path tools/mqttui
+mqttui            # the terminal UI — `mqttui --list` is the same thing, headless
+```
+
+**Migrating from a production broker, or evaluating one?**
+
+```sh
+mqttui migrate mosquitto /etc/mosquitto/mosquitto.conf
+```
+
+converts your config *and* your ACL file. Anything without an exact equivalent becomes a
+`# TODO(migrate):` comment at the point it belongs — never a silent drop, because a
+setting that quietly vanishes is how a migration ships the wrong policy. Then see it hold
+up: `mqttui --run deploy-smoke` boots the three-node reference deployment (password auth,
+deny-by-default ACL) and proves an **acknowledged QoS 1 message survives `SIGKILL`** of
+the node that accepted it, in about a minute. `mqttui --run quickstart` is the two-node
+version, including the TLS 1.3 + mTLS + ACL variant. What this broker does and does not
+do versus Mosquitto, EMQX, VerneMQ and NanoMQ — including every cell it loses — is
+[`docs/COMPARISON.md`](docs/COMPARISON.md); capacity planning is
+[`docs/SIZING.md`](docs/SIZING.md).
+
+The converter also works with **no clone at all** — the examples travel inside the
+binary, and updates arrive as a cosign-signed bundle (`mqttui update`), never a
+trust-the-branch download:
+
+```sh
+cargo install --locked --git https://github.com/mbilling/fss-mqtt-broker mqttui
+```
+
+**New to MQTT brokers?** Start with the
+[two-minute single node](#try-it-in-two-minutes), then the
+[five ideas the rest of this file assumes](#new-to-mqtt). When you want to see a real
+cluster, `mqttui --run demo-stack` starts seven nodes with Prometheus and Grafana
+dashboards on `localhost:3000` and a load generator so the panels move — it starts 25
+containers, and `mqttui` warns you before it does.
+
+Tasks that need this repository — building it, or the fixtures that will not fit in a
+binary — are marked `-` in the list with the reason, rather than left to fail.
 
 ## Principles
 
@@ -973,14 +1022,16 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 
 ### Running the demo, migrations and test scripts
 
-There are 23 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
+There are 24 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
 conformance suites, the Kubernetes end-to-end runs, the benchmark harness. `mqttui` is the
-one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md)):
+one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and
+[Start here](#start-here) for installing it):
 
 ```sh
-cargo run --manifest-path tools/mqttui/Cargo.toml -- --list
-cargo run --manifest-path tools/mqttui/Cargo.toml -- --show deploy-smoke
-cargo run --manifest-path tools/mqttui/Cargo.toml -- --run  deploy-smoke
+mqttui --list                 # every task, and what `-` / `!` mean
+mqttui --show deploy-smoke    # what it does, needs, and costs — before you run it
+mqttui --run  deploy-smoke
+mqttui                        # the same, as a terminal UI
 ```
 
 It says what each task needs **before** you start it, rather than failing with
@@ -989,8 +1040,9 @@ from its manifest — so the list cannot quietly go stale.
 
 It is a **separate workspace with its own lockfile**: nothing it depends on can reach the
 broker's dependency graph, which is what `cargo-deny`, `cargo-audit` and the SBOM are cut
-from. The terminal UI, and a standalone build that carries the examples with it, are the
-next tasks on that ADR.
+from. Installed standalone it carries the examples inside the binary, marks the tasks that
+need this repository rather than hiding them, and `mqttui update` fetches the latest
+examples as a **cosign-signed bundle** published from `main` — never as a branch download.
 
 ### Without Kubernetes (Compose, systemd)
 
