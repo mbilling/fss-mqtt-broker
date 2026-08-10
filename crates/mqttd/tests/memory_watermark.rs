@@ -148,12 +148,12 @@ async fn an_rss_over_the_watermark_browns_out_and_refuses_new_sessions() {
     // "could not read" — a zero would sit under every watermark and never fire.
     let rss = gauge(&body, "process_resident_bytes").expect("process_resident_bytes exported");
     assert!(
-        rss > 1024.0 * 1024.0,
+        rss > 1024 * 1024,
         "a running broker should hold more than 1 MiB; got {rss}"
     );
     assert_eq!(
         gauge(&body, "memory_max_bytes"),
-        Some(1024.0),
+        Some(1024),
         "the configured watermark must be exported so headroom is computable"
     );
 
@@ -178,8 +178,8 @@ async fn without_a_watermark_the_same_broker_accepts_sessions() {
         memory_lines(&body)
     );
     assert_eq!(
-        gauge(&body, "memory_max_bytes").unwrap_or(0.0),
-        0.0,
+        gauge(&body, "memory_max_bytes").unwrap_or(0),
+        0,
         "an unset watermark exports 0, so PromQL can tell 'off' from 'very small'"
     );
 
@@ -191,10 +191,14 @@ async fn without_a_watermark_the_same_broker_accepts_sessions() {
 }
 
 /// Read a bare (unlabelled) gauge value out of a Prometheus exposition body.
-fn gauge(body: &str, name: &str) -> Option<f64> {
+///
+/// Integer, not float: every gauge asserted here is a byte count exported from an `i64`,
+/// so a decimal point would mean the metric changed shape — and comparing floats for
+/// equality is the wrong tool for a byte count regardless.
+fn gauge(body: &str, name: &str) -> Option<i64> {
     body.lines()
         .filter(|l| !l.starts_with('#'))
-        .find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok())
+        .find_map(|l| l.strip_prefix(name)?.trim().parse::<i64>().ok())
 }
 
 /// Just the memory/brownout lines, for a readable assertion message.
