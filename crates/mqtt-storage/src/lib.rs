@@ -287,7 +287,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// This is the outbound mirror of [`Self::record_received`]: without it the message
     /// survives a broker crash (#124) but its packet id does not, the replay allocates a
     /// fresh id, the subscriber's dedup window cannot match it, and exactly-once quietly
-    /// degrades to at-least-once across a restart. QoS 1 deliveries are deliberately NOT
+    /// degrades to at-least-once across a restart. `QoS` 1 deliveries are deliberately NOT
     /// recorded — a fresh-id `DUP` redelivery is what at-least-once means.
     async fn record_outbound(
         &self,
