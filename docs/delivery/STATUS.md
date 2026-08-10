@@ -63,6 +63,7 @@
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [4/5 done](0053-single-crypto-provider.md) | 1 open |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [7/11 done](0055-kubernetes-operator.md) | 4 open |
+| [0056](../adr/0056-repo-task-runner.md) | `mqttui`: a task runner for the repository's scripts, outside the broker's dependency graph | Proposed | [0/4 done](0056-repo-task-runner.md) | 4 open |
 
 ## Open and deferred work
 
@@ -161,3 +162,10 @@
 - `0055-T6` ⬜ planned: Drain-aware rolls — operator-set annotation via Downward API consulted by preStop (hook shipped identically in chart and operator paths); shrink = full drain, roll = rejoin-and-catch-up
 - `0055-T8` ⬜ planned: Packaging + docs — deploy/helm/mqttd-operator chart (Deployment + CRD + namespaced RBAC), operator image in the ADR 0045 release pipeline (signed/reproducible/SBOM), OPERATIONS.md operator mode, COMPARISON.md Kubernetes cell update
 - `0055-T10` ⬜ planned: ExpandPVC must also raise store_max_bytes through the config contract — expanding the volume without moving the watermark leaves the brownout it exists to clear still raised (ADR 0055 section 3.2, second half)
+
+**0056 — `mqttui`: a task runner for the repository's scripts, outside the broker's dependency graph**
+
+- `0056-T1` ⬜ planned: The manifest + headless runner + the CI completeness guard — tasks.toml declaring every runnable script with its prerequisites and env surface, `mqttui --list` / `mqttui --run <id>`, and a test that fails when a script is missing from it — "Deliberately first, and useful with no UI at all: it proves the data model, and the manifest is machine-checked documentation of the operational surface on its own. The completeness guard is the load-bearing piece (ADR 0056 §3) — a launcher that silently shows 14 of 23 scripts becomes the list people trust. If phase 1 turns out to be sufficient, a justfile over the manifest is a legitimate place to stop; the manifest is where the value is, not the TUI."
+- `0056-T2` ⬜ planned: The terminal UI — group/task list, detail pane, run with streamed output, cancel by process group — "Cancellation signals the process GROUP, not the child (ADR 0056 §4): every script traps EXIT to clean up brokers and containers, and signalling only the wrapper orphans them. Not hypothetical — stray brokers from panicking tests actively poisoned later runs while issue #124's regression test was being written. Output goes to a bounded ring buffer with the full log on disk, so a long bench run cannot grow without limit."
+- `0056-T3` ⬜ planned: Preflight + env form + persisted last-used values — "The preflight row is the highest-value part of the UI: it turns 'run it and find out' into 'you are missing mosquitto-clients'. Most of these scripts currently fail with a bare FATAL after the user has already committed to the run."
+- `0056-T4` ⬜ planned: Decide developer-tool vs user-facing, and record it — "OPEN QUESTION, not a build task. It changes ADR 0056 §1: a user-facing launcher ships in the release, which puts ratatui back into the audited dependency graph and makes the separate workspace pointless. This record covers the developer tool only; a user-facing launcher earns its own ADR. Listed as a task so the question is closed deliberately rather than drifted past."
