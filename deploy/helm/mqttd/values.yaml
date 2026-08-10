@@ -16,8 +16,14 @@ initImage:
   pullPolicy: IfNotPresent
 
 # Cluster size. The StatefulSet's pod-0 is the gossip founder (no seeds); pods 1..N seed to it
-# and the mesh self-forms over the headless service (ADR 0016). For a durable quorum use an odd
-# number >= 3; 1 is single-node (no fault tolerance).
+# and the mesh self-forms over the headless service (ADR 0016).
+#
+# USE AN ODD NUMBER >= 3. 1 is single-node (no fault tolerance) and is fine.
+#
+# **2 IS WORSE THAN 1.** A durable write needs a quorum, and a quorum of two IS two — so
+# with two nodes, losing either one blocks durable writes entirely, where a single node
+# would have kept serving. The instinct to "add a second node for HA" makes availability
+# worse, not better. Go from 1 to 3.
 replicaCount: 3
 
 # --- Broker configuration (ADR 0046) --------------------------------------------------------

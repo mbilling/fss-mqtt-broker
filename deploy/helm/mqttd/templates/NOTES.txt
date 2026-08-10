@@ -21,6 +21,27 @@ WARNING: no TLS Secret is set (secrets.tls.secretName is empty). The config refe
 kubernetes.io/tls Secret, or the TLS listener will fail to start. Provision TLS (e.g. with
 cert-manager) before serving clients.
 {{- end }}
+{{- if not .Values.secrets.acl.configMapName }}
+
+WARNING: no ACL is set (secrets.acl.configMapName is empty). Topic authorization is then
+NOT ENFORCED: every authenticated client may publish and subscribe anywhere. The broker
+logs this at startup as an INSECURE mode. Provide a deny-by-default ACL ConfigMap before
+serving real clients.
+
+  (This warning exists because a missing TLS Secret fails loudly — the listener will not
+   start — while a missing ACL fails QUIETLY, in the permissive direction. The one that
+   fails open is the one worth warning about.)
+{{- end }}
+{{- if not .Values.clusterEstablished }}
+
+NOTE: clusterEstablished is false, which is correct for a FIRST install — pod-0 founds the
+cluster. Once the cluster is formed and healthy, set it to true and upgrade:
+
+  helm upgrade {{ .Release.Name }} <chart> --set clusterEstablished=true --reuse-values
+
+Leaving it false means a pod-0 that loses its volume will found a SECOND cluster beside the
+live one instead of rejoining it (ADR 0054).
+{{- end }}
 
 Safe operations:
   - Scale down (a lossless decommission drain, ADR 0043):

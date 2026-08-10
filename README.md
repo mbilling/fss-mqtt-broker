@@ -35,7 +35,8 @@ See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
 record of exactly what is built (55 ADRs, per-task status).
 
-**Jump to:** [What works today](#what-works-today) ·
+**Jump to:** [**Try it in two minutes**](#try-it-in-two-minutes) ·
+[New to MQTT?](#new-to-mqtt) · [What works today](#what-works-today) ·
 [Security](#security) · [Clustering](#clustering) ·
 [Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
 [**Limitations**](#limitations) · [Install](#install) ·
@@ -107,6 +108,54 @@ The full matrix — including every cell we lose — is
 
 Crossing into a **different** trust domain is a separate tool with its own
 process and credentials — see [Bridging](#bridging-to-other-security-zones).
+
+## Try it in two minutes
+
+```sh
+docker run -d --name mqttd -p 1883:1883 \
+  -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
+  ghcr.io/mbilling/fss-mqtt-broker:latest
+
+mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
+mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
+```
+
+That is **plaintext with anonymous clients** — a first look, never a deployment.
+The broker says so in its own logs, loudly, every time. When you are ready for
+something real, the [secured quickstart](#single-node-secured-tls-13--mtls--acl)
+stands up TLS 1.3, mutual TLS and a deny-by-default ACL in about the same number
+of commands, and CI runs those exact commands on every push.
+
+## New to MQTT?
+
+Skip this if you already run a broker. If you do not, these five ideas are what
+the rest of this file assumes, and nothing else here explains them.
+
+- **QoS 0 / 1 / 2** — how hard the broker tries to deliver. **0** is fire and
+  forget (fastest, may be lost). **1** is at-least-once (may arrive twice; the
+  usual choice). **2** is exactly-once (slowest, a four-packet handshake). You
+  pick per message, and the subscriber's subscription can only lower it.
+- **Retained message** — the broker keeps the *last* message on a topic and hands
+  it to anyone who subscribes later. "What is the current temperature?" without
+  waiting for the next reading. One per topic; publishing an empty payload clears
+  it.
+- **Session** — what the broker remembers about a client between connections: its
+  subscriptions and any messages queued while it was away. A *clean* session
+  forgets everything on disconnect; a *persistent* one does not, which is what
+  makes offline devices work.
+- **Last Will and Testament (LWT)** — a message the client registers at connect
+  time that the broker publishes **if the client dies without saying goodbye**.
+  How you detect a device dropping off, without polling.
+- **Shared subscription** (`$share/<group>/<topic>`) — several subscribers join a
+  named group and the broker gives each message to **exactly one** of them, so
+  work is split rather than duplicated. Ordinary subscriptions give *every*
+  subscriber a copy.
+
+Two things about this broker specifically that surprise people, both explained
+where they matter: a **two-node cluster is worse than one node** for write
+availability ([Resizing](#resizing-the-cluster)), and there is **no admin API or
+dashboard** — operations are signals and files, on purpose
+([Configuration](#configuration)).
 
 ## What works today
 
@@ -411,6 +460,17 @@ be found. Each is tracked; none is a silent surprise.
   tracked in [#124](https://github.com/mbilling/fss-mqtt-broker/issues/124); the
   reproduction ships as an ignored test
   (`crates/mqttd/tests/inflight_durability.rs`).
+- **Migration tooling covers Mosquitto only.**
+  `scripts/migrate/from-mosquitto.py` translates `mosquitto.conf` and its
+  `acl_file`, marking anything without an equivalent as `TODO(migrate)` in the
+  output rather than dropping it silently. EMQX and HiveMQ converters do not
+  exist yet.
+- **TLS 1.3 only.** There is no TLS 1.2 listener. Modern clients are unaffected,
+  but **older device firmware that cannot negotiate 1.3 will simply fail to
+  connect** — check your fleet before planning a migration, because the failure
+  looks like a network problem rather than a policy one. Opt-in TLS 1.2 is
+  planned; it stays off by default so the posture this README advertises remains
+  true.
 - **No production track record.** `v0.9.0` is released and verifiable, but nobody
   is running this in anger yet — there is no operational history behind it.
 
