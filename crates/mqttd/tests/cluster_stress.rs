@@ -2152,51 +2152,154 @@ async fn establish_offline_subscriber(nodes: &[&StressNode], sub_id: &str, topic
 
 /// Publish `payload` to `topic` on `addr` at `QoS` 1, retried (fresh connection
 /// each attempt) until its PUBACK arrives — an acked fact.
-async fn publish_until_acked(addr: SocketAddr, pub_id: &str, topic: &str, payload: &[u8]) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+///
+/// On failure this panics with the FULL attempt history and the cluster's own view of
+/// itself, because the bare "publish never acked" already cost one investigation (#106):
+/// a nightly-only, once-so-far failure gives exactly one shot at distinguishing "the 60s
+/// deadline is too tight for a loaded amd64 runner" from "an ack was genuinely lost", and
+/// the next occurrence must settle it without a reproduction.
+async fn publish_until_acked(
+    nodes: &[&StressNode],
+    addr: SocketAddr,
+    pub_id: &str,
+    topic: &str,
+    payload: &[u8],
+) {
+    publish_qos1_until_acked(nodes, addr, pub_id, topic, payload, false, 7, "publish").await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_qos1_until_acked(
+    nodes: &[&StressNode],
+    addr: SocketAddr,
+    pub_id: &str,
+    topic: &str,
+    payload: &[u8],
+    retain: bool,
+    pkid: u16,
+    what: &str,
+) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(60);
+    let mut attempts: u32 = 0;
+    let mut history: Vec<String> = Vec::new();
     'acked: loop {
-        if let Some((mut publisher, _)) =
-            common::Client::connect_v311_within(addr, pub_id, true, Duration::from_secs(20)).await
+        attempts += 1;
+        let t0 = Instant::now();
+        let stamp = |t: Instant| format!("+{:>5.1}s", t.duration_since(started).as_secs_f32());
+        match common::Client::connect_v311_within(addr, pub_id, true, Duration::from_secs(20)).await
         {
-            publisher
-                .publish(topic, payload, QoS::AtLeastOnce, Some(7), vec![])
-                .await;
-            let wait = Instant::now() + Duration::from_secs(15);
-            loop {
-                let left = wait.saturating_duration_since(Instant::now());
-                match publisher.recv_bounded(left).await {
-                    common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break 'acked,
-                    common::Recv::Packet(_) => {}
-                    common::Recv::Quiet | common::Recv::Closed => break,
+            None => history.push(format!(
+                "{} attempt {attempts}: no CONNACK from {addr} (gave up after {:.1}s — \
+                 instant means REFUSED, ~20s means the connect timed out)",
+                stamp(t0),
+                t0.elapsed().as_secs_f32()
+            )),
+            Some((mut publisher, session_present)) => {
+                publisher
+                    .publish_full(topic, payload, QoS::AtLeastOnce, retain, Some(pkid))
+                    .await;
+                let wait = Instant::now() + Duration::from_secs(15);
+                let mut others: Vec<String> = Vec::new();
+                loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match publisher.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubAck(k)) if k.pkid == pkid => break 'acked,
+                        common::Recv::Packet(pkt) => others.push(format!("{pkt:?}")),
+                        common::Recv::Quiet => {
+                            history.push(format!(
+                                "{} attempt {attempts}: connected (session_present={session_present}), \
+                                 published pkid {pkid}, then SILENCE for 15s — no PubAck{}",
+                                stamp(t0),
+                                if others.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (other packets: {})", others.join(", "))
+                                }
+                            ));
+                            break;
+                        }
+                        common::Recv::Closed => {
+                            history.push(format!(
+                                "{} attempt {attempts}: connected, published pkid {pkid}, broker \
+                                 CLOSED the connection {:.1}s after publish{}",
+                                stamp(t0),
+                                t0.elapsed().as_secs_f32(),
+                                if others.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (other packets: {})", others.join(", "))
+                                }
+                            ));
+                            break;
+                        }
+                    }
                 }
             }
         }
-        assert!(Instant::now() < deadline, "publish never acked");
+        // Cap what a pathological run can accumulate: an instantly-REFUSED port fails
+        // attempts in microseconds (a timeout at least paces itself), and an unbounded
+        // history would turn the panic below into megabytes. Found by pointing the
+        // throwaway verification run at a closed port — the diagnostic itself has to
+        // behave under the failure modes it reports.
+        if history.len() > 200 {
+            let dropped = history.len() - 200;
+            history.truncate(200);
+            history.push(format!("  … {dropped} further attempts elided"));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} never acked (#106): {attempts} attempts over {:.1}s to {addr}\n\
+             what each attempt saw:\n{}\n\
+             the cluster's own view at failure:\n{}\n\
+             Read this before rerunning: connect timeouts / a degraded voter set point at a \
+             loaded runner or an unready lease group (deadline problem); a connected+published+\
+             silent attempt against a healthy voter set is the ack path itself (correctness).",
+            started.elapsed().as_secs_f32(),
+            history.join("\n"),
+            cluster_view(nodes)
+        );
+        // Pace the retry. A refused connect returns instantly, and hammering a broker
+        // mid-decommission with a reconnect storm would distort the very system whose
+        // behaviour is being measured.
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
+/// Each node's own answer to "are you ready to ack?": SWIM membership size, the lease
+/// group's voter count, and the placement's voter set — the facts that decide whether a
+/// durable append can reach quorum.
+fn cluster_view(nodes: &[&StressNode]) -> String {
+    nodes
+        .iter()
+        .map(|n| {
+            let p = n.placement.read().unwrap();
+            format!(
+                "  {}: members={} plane_voters={} placement_voters={:?}",
+                n.node_id.0,
+                p.member_count(),
+                n.plane
+                    .as_ref()
+                    .map_or_else(|| "gone".to_string(), |pl| pl.voter_count().to_string()),
+                p.voter_ids()
+                    .iter()
+                    .map(|v| v.0.clone())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Publish an acked RETAINED value to `topic` on `addr`.
-async fn publish_retained_until_acked(addr: SocketAddr, pub_id: &str, topic: &str, payload: &[u8]) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    'acked: loop {
-        if let Some((mut publisher, _)) =
-            common::Client::connect_v311_within(addr, pub_id, true, Duration::from_secs(20)).await
-        {
-            publisher
-                .publish_full(topic, payload, QoS::AtLeastOnce, true, Some(9))
-                .await;
-            let wait = Instant::now() + Duration::from_secs(15);
-            loop {
-                let left = wait.saturating_duration_since(Instant::now());
-                match publisher.recv_bounded(left).await {
-                    common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 9 => break 'acked,
-                    common::Recv::Packet(_) => {}
-                    common::Recv::Quiet | common::Recv::Closed => break,
-                }
-            }
-        }
-        assert!(Instant::now() < deadline, "retained set never acked");
-    }
+async fn publish_retained_until_acked(
+    nodes: &[&StressNode],
+    addr: SocketAddr,
+    pub_id: &str,
+    topic: &str,
+    payload: &[u8],
+) {
+    publish_qos1_until_acked(nodes, addr, pub_id, topic, payload, true, 9, "retained set").await;
 }
 
 /// Resume `sub_id` on its placement owner among `survivors` (present = true)
@@ -2327,6 +2430,7 @@ async fn growing_three_to_five_zone_spread_survives_losing_two_originals() {
     establish_offline_subscriber(&[&a, &b, &c], sub_id, "z5/t").await;
     for (i, payload) in [b"z5-m1".as_slice(), b"z5-m2", b"z5-m3"].iter().enumerate() {
         publish_until_acked(
+            &[&a, &b, &c],
             [&a, &b, &c][i % 3].client_addr,
             &format!("z5-pub-{i}"),
             "z5/t",
@@ -2334,7 +2438,14 @@ async fn growing_three_to_five_zone_spread_survives_losing_two_originals() {
         )
         .await;
     }
-    publish_retained_until_acked(b.client_addr, "z5-rpub", "z5/r", b"z5-retained").await;
+    publish_retained_until_acked(
+        &[&a, &b, &c],
+        b.client_addr,
+        "z5-rpub",
+        "z5/r",
+        b"z5-retained",
+    )
+    .await;
 
     // Grow 3→5 into the existing zones.
     let d4 =
@@ -2423,6 +2534,7 @@ async fn cost_reduction_five_to_three_via_two_decommissions() {
         .enumerate()
     {
         publish_until_acked(
+            &[&a, &b, &c, &d4, &e5],
             [&a, &b, &c, &d4, &e5][i % 5].client_addr,
             &format!("c53-pub-{i}"),
             "c53/t",
@@ -2430,7 +2542,14 @@ async fn cost_reduction_five_to_three_via_two_decommissions() {
         )
         .await;
     }
-    publish_retained_until_acked(e5.client_addr, "c53-rpub", "c53/r", b"c53-retained").await;
+    publish_retained_until_acked(
+        &[&a, &b, &c, &d4, &e5],
+        e5.client_addr,
+        "c53-rpub",
+        "c53/r",
+        b"c53-retained",
+    )
+    .await;
 
     // Decommission e5, wait for its eviction to settle, then decommission d4.
     decommission_node(&mut e5).await;
@@ -2480,6 +2599,7 @@ async fn rolling_replacement_swaps_a_node_without_loss() {
     establish_offline_subscriber(&[&a, &b, &c], &sub_id, "rr/t").await;
     for (i, payload) in [b"rr-m1".as_slice(), b"rr-m2", b"rr-m3"].iter().enumerate() {
         publish_until_acked(
+            &[&a, &b, &c],
             [&a, &b, &c][i % 3].client_addr,
             &format!("rr-pub-{i}"),
             "rr/t",
@@ -2487,7 +2607,14 @@ async fn rolling_replacement_swaps_a_node_without_loss() {
         )
         .await;
     }
-    publish_retained_until_acked(b.client_addr, "rr-rpub", "rr/r", b"rr-retained").await;
+    publish_retained_until_acked(
+        &[&a, &b, &c],
+        b.client_addr,
+        "rr-rpub",
+        "rr/r",
+        b"rr-retained",
+    )
+    .await;
 
     // The replacement arrives first (grow to 4), then the old host drains out.
     let d = start_stress_node("rr-d", vec![b.swim_addr.clone()], &dir("d")).await;

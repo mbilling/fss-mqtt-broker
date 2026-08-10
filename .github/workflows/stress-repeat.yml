@@ -1,0 +1,55 @@
+# A rate-measuring instrument for intermittent stress failures (issue #106).
+#
+# `cost_reduction_five_to_three_via_two_decommissions` failed once, nightly-only, with
+# "publish never acked" — a violation of the acked-facts oracle if real, a too-tight
+# deadline on a loaded runner if not. One failure in one run is not a rate, and the
+# nightly is the wrong instrument for getting one: each dispatch drags the hour-long soak
+# and the full sweep along. This runs ONLY the test in question, N times, on the same
+# amd64 runner class the failure occurred on, and counts — it does not stop at the first
+# failure, because the whole point is the denominator.
+#
+# The assertion itself is now self-diagnosing (attempt history + the cluster's own view),
+# so any failure here carries the evidence that distinguishes the two explanations.
+name: Stress repeat (issue 106)
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "How many consecutive runs"
+        default: "10"
+        required: false
+      filter:
+        description: "Test filter passed to cargo test"
+        default: "cost_reduction_five_to_three_via_two_decommissions"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    name: repeat ${{ inputs.filter }} × ${{ inputs.iterations }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run repeatedly and count
+        run: |
+          N="${{ inputs.iterations }}"
+          FILTER="${{ inputs.filter }}"
+          fails=0
+          for i in $(seq 1 "$N"); do
+            echo "::group::iteration $i of $N"
+            if ! cargo test -p mqttd --test cluster_stress "$FILTER" -- --nocapture; then
+              fails=$((fails + 1))
+              echo "::warning title=stress-repeat::iteration $i FAILED (running total: $fails)"
+            fi
+            echo "::endgroup::"
+          done
+          echo "== $fails failures in $N runs of '$FILTER' =="
+          # Red if anything failed, so a recurrence is visible at a glance — but only
+          # after every iteration ran, because the denominator is the point.
+          [ "$fails" -eq 0 ]
