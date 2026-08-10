@@ -72,6 +72,15 @@ def parse_frontmatter(text: str, path: Path) -> dict:
             continue
         m = re.match(r"^    (\w+):\s*(.*)$", raw)
         if m and cur is not None:
+            # A repeated key is silently last-wins in YAML, so a stale line left behind by
+            # an edit quietly replaces the real one and the generated table shows the wrong
+            # text while every check passes. Seen for real: a 0056-T10 note that was
+            # actually the superseded 0056-T4 note. Refuse it.
+            if m.group(1) in cur:
+                raise DocError(
+                    f"{path.name}: task {cur.get('id', '?')} sets '{m.group(1)}' twice — "
+                    "a duplicate key is last-wins, so one of them is silently discarded"
+                )
             cur[m.group(1)] = m.group(2).strip()
             continue
         raise DocError(f"{path.name}: cannot parse frontmatter line: {raw!r}")
