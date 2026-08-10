@@ -622,20 +622,29 @@ impl Stress {
     /// Drain everything currently queued on subscriber `i`'s live connection
     /// (`PUBACK`ing each `QoS` 1 publish, as a well-behaved client would), until a
     /// short quiet window passes.
+    ///
+    /// A `QoS` 1 payload counts as **received** only once its PUBACK has been written.
+    /// Recording it on arrival made this oracle unable to fail on issue #124: the
+    /// subscriber does see the live PUBLISH, and a broker that dies before the
+    /// acknowledgement still owes a redelivery — but the payload was already counted.
+    /// `QoS` 0 has no ack, so arrival is all there is.
     async fn drain_subscriber(&mut self, i: usize) {
         loop {
             let Some(conn) = self.subs[i].conn.as_mut() else {
                 return;
             };
             match conn.recv_bounded(Duration::from_millis(700)).await {
-                common::Recv::Packet(Packet::Publish(p)) => {
-                    self.subs[i].received.insert(p.payload.to_vec());
-                    if let Some(pkid) = p.pkid {
+                common::Recv::Packet(Packet::Publish(p)) => match p.pkid {
+                    Some(pkid) => {
                         if let Some(c) = self.subs[i].conn.as_mut() {
                             c.puback(pkid).await;
+                            self.subs[i].received.insert(p.payload.to_vec());
                         }
                     }
-                }
+                    None => {
+                        self.subs[i].received.insert(p.payload.to_vec());
+                    }
+                },
                 common::Recv::Packet(_) => {}
                 common::Recv::Closed => {
                     // Connection died (e.g. its node was killed): back offline.

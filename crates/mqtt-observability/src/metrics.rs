@@ -376,7 +376,7 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (expired, queue-overflow, no-subscriber)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, pending-cap, brownout, too-large)",
         );
 
         let deliver_latency_seconds = register_latency_histogram(
@@ -745,8 +745,18 @@ impl Metrics {
             .add(1, &[KeyValue::new("qos", qos.to_string())]);
     }
 
-    /// A message was dropped (`reason` a bounded class: `"expired"`, `"queue-overflow"`,
-    /// `"no-subscriber"`).
+    /// A message was dropped. `reason` is a **bounded** class — the label set is fixed by
+    /// these call sites, never by anything a client controls:
+    ///
+    /// | reason | where |
+    /// |---|---|
+    /// | `no-subscriber` | nothing matched the topic |
+    /// | `queue-overflow` | the durable session queue hit its cap (ADR 0001 §6) |
+    /// | `backlog-overflow` | the flow-control backlog hit `MAX_BACKLOG` (ADR 0012) |
+    /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) |
+    /// | `pending-cap` | the pending-publish table hit `PENDING_PUBLISH_CAP`, so the oldest unacknowledged publish was dropped and its publisher's ack withheld (ADR 0042 T9) |
+    /// | `brownout` | the store is above its watermark and refused growth (ADR 0041 T5) |
+    /// | `too-large` | the encoded packet exceeded that subscriber's Maximum Packet Size |
     pub fn publish_dropped(&self, reason: &str) {
         self.publish_dropped_total
             .get_or_create(&ReasonLabel {

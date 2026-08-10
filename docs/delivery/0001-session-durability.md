@@ -57,6 +57,11 @@ tasks:
     title: Client-facing reconnect during promotion + spec-legal QoS-1 redelivery bounds (takeover hardening)
     status: deferred
     notes: takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass
+  - id: 0001-T12
+    title: The durable append covers ONLINE subscribers, not only the offline queue (issue #124)
+    status: done
+    date: 2026-08-10
+    evidence: "ADR 0001 amendment 2026-08-10. deliver_to_client appends via durable_append BEFORE the live send for QoS>0 to a persistent subscriber and carries the offset through PendingOut/Backlog; the log is truncated only through the contiguous acked prefix (Inflight::advance_ack) on PUBACK/PUBCOMP, never on send; finish_attach skips replaying offsets the in-flight table still owns so the DUP resume does not duplicate. Tests: inflight_durability.rs (against the real binary, SIGKILL mid-flight — was #[ignore]d as the reproduction, now green and unignored), the_log_truncates_only_through_the_contiguous_acked_prefix, a_dropped_replay_entry_does_not_pin_the_log, a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked, a_live_qos1_delivery_to_a_clean_session_writes_nothing, quota_backlog_spills_to_store_on_persistent_detach (extended: no duplicate). Not covered, tracked as #130: the outbound packet id and ack phase are still in memory, so a post-crash redelivery is at-least-once even at QoS 2."
 ---
 
 # Delivery — ADR 0001: Session durability in a horizontally-scalable cluster
@@ -89,6 +94,7 @@ tests, and the dashboard.
 | **0001-T9** Durable-by-default | Durable sessions are the shipping default rather than an opt-in. |
 | **0001-T10** Durable expiry | The session-expiry deadline survives takeover rather than restarting its timer. |
 | **0001-T11** Takeover reconnect | A client-facing MQTT reconnect during promotion is handled, with spec-legal QoS-1 redelivery bounds. |
+| **0001-T12** In-flight durability | The durable append happens before the wire send for a `QoS` > 0 delivery to a persistent subscriber, so §2's contract holds for a message in flight to an **online** subscriber and not only for one queued for a disconnected one. The log is truncated when that subscriber acknowledges, never on send. |
 
 ## Progress
 
@@ -106,6 +112,7 @@ tests, and the dashboard.
 | 0001-T9 | ✅ done | 2026-06-24 | "Done by ADR 0029 — MQTTD_DURABLE_SESSIONS is now default-on (opt-out), so the shipping default is the consensus-backed replicated store. Stability prerequisites landed first: ADR 0026 (timing), 0027 (replica group-commit), 0028 (link-gated voter admission). See docs/delivery/0029-durable-by-default.md." |
 | 0001-T10 | ✅ done | 2026-06-24 | "ADR 0009 phase 3. SessionMeta persists session_expiry_at (absolute epoch); the hub's expiring map + sweep use absolute wall-clock (Clock) so deadlines are portable; detach persists the deadline, attach (persistent only) clears it; the sweep reconciles store.expiring_sessions() for OWNED, offline, untracked sessions every EXPIRY_RECONCILE_EVERY ticks so a new owner inherits orphaned deadlines after a takeover and expires them at the original time. Tests inherited_session_expiry_is_swept_after_takeover, session_expiry_finite_retains_then_expires (clock-driven), session_expiry_persists_and_enumerates, decodes_pre_expiry_meta_records; full workspace green." |
 | 0001-T11 | 💤 deferred | — | takeover-serve is proven through the store (F-d); client-facing MQTT reconnect mid-promotion and redelivery bounds deferred to a later hardening pass |
+| 0001-T12 | ✅ done | 2026-08-10 | "ADR 0001 amendment 2026-08-10. deliver_to_client appends via durable_append BEFORE the live send for QoS>0 to a persistent subscriber and carries the offset through PendingOut/Backlog; the log is truncated only through the contiguous acked prefix (Inflight::advance_ack) on PUBACK/PUBCOMP, never on send; finish_attach skips replaying offsets the in-flight table still owns so the DUP resume does not duplicate. Tests: inflight_durability.rs (against the real binary, SIGKILL mid-flight — was #[ignore]d as the reproduction, now green and unignored), the_log_truncates_only_through_the_contiguous_acked_prefix, a_dropped_replay_entry_does_not_pin_the_log, a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked, a_live_qos1_delivery_to_a_clean_session_writes_nothing, quota_backlog_spills_to_store_on_persistent_detach (extended: no duplicate). Not covered, tracked as #130: the outbound packet id and ack phase are still in memory, so a post-crash redelivery is at-least-once even at QoS 2." |
 <!-- /status-table:0001 -->
 
 **Architectural note.** Single-node restart-durability of *session content* is not
@@ -116,6 +123,17 @@ three-node path (`enqueue_is_durable_across_a_three_node_cluster`) carries queue
 
 ## Changelog
 
+- **2026-08-10** — T12: §2's contract now holds on the online path too (issue #124). The
+  ADR always said a PUBACK means the message is durably enqueued for every matching
+  persistent session; `deliver_to_client` took the online branch first and left the
+  unacknowledged message in memory alone, so a crash between the publisher's PUBACK and
+  the subscriber's lost it with no trace. The append moved ahead of the wire send and the
+  truncation moved to the subscriber's acknowledgement. The reproduction that shipped
+  `#[ignore]`d with #127 is now the regression test, unignored and green. The cost — a
+  durable write per `QoS` > 0 delivery to a *persistent* subscriber — is stated in the
+  ADR amendment and in the README; clean sessions and `QoS` 0 do not pay it. Outbound
+  packet ids remain in memory, so a post-crash redelivery is at-least-once even at
+  `QoS` 2 (#130).
 - **2026-06-22** — All seven decisions are realized and the roadmap's "next" durable backend
   has landed: HRW ownership (T1), quorum-replicated enqueue (T2), lazy-ack + QoS-2 dedup
   (T3), openraft-scoped consensus (T4), takeover/handoff (T5), bounded queues + MQTT 5

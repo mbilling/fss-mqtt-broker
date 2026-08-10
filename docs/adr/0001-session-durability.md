@@ -156,3 +156,71 @@ trait surface today; they join the replicated state with the durable backend.
   performance, zero durability: a node crash loses every offline queue it held.
   Rejected for the default; may be offered as an explicit "ephemeral sessions"
   mode for workloads that don't need durability.
+
+## Amendment (2026-08-10): the durable append covers ONLINE subscribers too (issue #124)
+
+§2 states the contract without qualification: *a PUBACK means the message is durably
+enqueued for every matching persistent session.* The implementation was narrower than
+the ADR. `Hub::deliver_to_client` took the online branch first — send to the connected
+subscriber's channel, return `true`, publisher acked — and the unacknowledged message
+existed only in `Hub::inflight`, an in-memory map nothing wrote to the store. A crash
+between the publisher's PUBACK and the subscriber's lost a message that no operator
+could find afterwards, because there was nothing anywhere to find.
+
+An external reviewer inferred this from the *absence* of a counter-test rather than from
+reading the bug, which is a stronger signal than the finding itself: the claim was
+resting on an unstated precondition, and nothing in the test suite would have noticed if
+the precondition were false.
+
+Nothing *could* have. The acked-facts oracle — the harness this ADR's guarantee is
+verified by — recorded a `QoS` 1 payload as received the moment the subscriber's socket
+saw it, before the PUBACK was written. In this defect the subscriber does see the live
+PUBLISH; the broker then dies still owing the redelivery. The payload was already
+counted, so every fault schedule passed. Both oracles now record a `QoS` 1 payload only
+after its acknowledgement is written (`docs/delivery/0042-…`, `0044-…`). The lesson
+generalises past this bug: **a durability oracle must define "delivered" as the client
+defines it**, or it measures reachability rather than durability.
+
+**The append now happens before the wire send**, for a `QoS` > 0 delivery to a
+persistent subscriber, online or not. The wording of §2 is unchanged because it was
+already right; what changed is that it is now true.
+
+The mechanism reuses the log the offline path already writes, rather than adding a
+parallel one:
+
+- `deliver_to_client` appends first and carries the returned offset into the live send.
+- The offset travels with the message through the in-flight table and the flow-control
+  backlog (ADR 0012).
+- The log is truncated only through the **contiguous** acknowledged prefix — an
+  out-of-order PUBACK for a later message cannot discard an earlier one still in flight
+  behind it. `Inflight::advance_ack` is that arithmetic, unit-tested in isolation because
+  it is the part that would lose data silently if it were wrong.
+- Replay on resume skips offsets the in-flight table still holds, since the DUP resume
+  has already re-sent those. After a *broker* restart that table is empty, which is
+  exactly when the replay must carry them.
+
+**Durability follows the session, not the connection.** This is the rule that decides who
+pays:
+
+| | durable append | why |
+|---|---|---|
+| `QoS` > 0, persistent session | **yes** | redelivery is owed on resume |
+| `QoS` > 0, clean session | no | nothing to resume into |
+| `QoS` 0, any session | no | at-most-once owes no redelivery |
+| retained replay | no | the value is durable in the retained store; a crash loses the delivery, not the fact |
+| under disk brownout (ADR 0041 T5) | no — counted and logged | the durable copy is refused, not the live delivery |
+
+So the §2 latency cost listed under *Consequences* — "gating PUBACK on quorum-durable
+enqueue adds publish latency for `QoS` ≥ 1 to persistent subscribers" — now applies on
+the online path as well, where it previously did not. That is a real throughput cost and
+it is the price of the claim. The escape hatch is the session type, not a flag: a
+subscriber that does not need redelivery across a broker restart connects with
+`clean_session` (or a zero Session Expiry) and never pays.
+
+**What this does not fix.** The message is durable; the *packet id* it was in flight
+under is not, nor is its acknowledgement phase. A subscriber resuming after a broker
+crash is redelivered under a fresh id, so a `QoS` 2 message it had already PUBRECed
+cannot be matched and is seen twice — exactly-once degrades to at-least-once across that
+window. A duplicate is a better failure than a loss, and this is the trade taken
+knowingly; issue #130 tracks persisting the outbound in-flight table, which the inbound
+direction already has an equivalent of (`record_received` / `clear_received`).

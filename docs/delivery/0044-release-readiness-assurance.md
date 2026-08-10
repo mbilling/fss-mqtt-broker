@@ -85,6 +85,14 @@ P5/P6 parallel after P1, P7 last.
 
 ## Changelog
 
+- **2026-08-10** — The acked-facts oracle counted a `QoS` 1 payload as delivered when the
+  socket saw it, *before* writing the PUBACK. That made it structurally unable to fail on
+  issue #124 — a subscriber does receive the live PUBLISH, and the broker then dies still
+  owing the redelivery, so the payload was already in `received` and every schedule
+  passed. `drain_subscriber` now records a `QoS` 1 payload only after its PUBACK is
+  written (`QoS` 0 is unchanged: arrival is all there is at at-most-once). No new
+  schedule; every existing P1/P2/P3 run gets stricter. A test that cannot fail is worse
+  than no test, because it is counted as evidence.
 - **2026-07-17** — **0044-P7 done; ADR 0044 ACCEPTED — the assurance program is
   complete.** A second independent foreign-client oracle ships: `paho_conformance.py`
   drives Eclipse Paho to assert the control-plane semantics the Mosquitto CLI

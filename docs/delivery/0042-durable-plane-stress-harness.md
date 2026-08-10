@@ -117,6 +117,12 @@ Known load-dependent flakes in the durable plane, tracked as harness inputs (ADR
 
 ## Changelog
 
+- **2026-08-10** — The in-process oracle counted a `QoS` 1 payload as delivered when the
+  socket saw it, before writing the PUBACK — so it could not fail on issue #124, where
+  the subscriber *does* receive the live PUBLISH and the broker then dies still owing the
+  redelivery. `drain_subscriber` now records a `QoS` 1 payload only after its PUBACK is
+  written (`QoS` 0 unchanged). The same correction landed in `proc_common` for the
+  out-of-process schedules; see `docs/delivery/0044-release-readiness-assurance.md`.
 - **2026-07-13** — T5 (profiles + closure) landed; **ADR 0042 is Accepted**. CI runs
   the bounded profile on every push (1000 simulation seeds, one stress seed, the
   stop/start test); `MQTTD_SIM_SEEDS` / `MQTTD_STRESS_SEEDS` widen it into the soak.
