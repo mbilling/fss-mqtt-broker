@@ -85,13 +85,14 @@ impl PasswordAuthenticator {
     }
 }
 
+#[async_trait::async_trait]
 impl Authenticator for PasswordAuthenticator {
     fn password_subject_exists(&self, subject: &str) -> bool {
         // The subject of a password admission is the username (see `authenticate`).
         self.hashes.contains_key(subject)
     }
 
-    fn authenticate(
+    async fn authenticate(
         &self,
         _client: &ClientId,
         creds: &Credentials<'_>,
@@ -140,8 +141,8 @@ mod tests {
         PasswordAuthenticator::new(m)
     }
 
-    #[test]
-    fn correct_password_authenticates_with_username_as_subject() {
+    #[tokio::test]
+    async fn correct_password_authenticates_with_username_as_subject() {
         let auth = store("alice", b"correct horse");
         let id = auth
             .authenticate(
@@ -151,6 +152,7 @@ mod tests {
                     password: b"correct horse",
                 },
             )
+            .await
             .expect("correct password must authenticate");
         assert_eq!(
             id,
@@ -161,8 +163,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wrong_password_is_rejected() {
+    #[tokio::test]
+    async fn wrong_password_is_rejected() {
         let auth = store("alice", b"correct horse");
         assert!(matches!(
             auth.authenticate(
@@ -171,36 +173,41 @@ mod tests {
                     username: "alice",
                     password: b"wrong",
                 },
-            ),
+            )
+            .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn unknown_username_is_rejected_indistinguishably_from_wrong_password() {
+    #[tokio::test]
+    async fn unknown_username_is_rejected_indistinguishably_from_wrong_password() {
         let auth = store("alice", b"correct horse");
-        let unknown = auth.authenticate(
-            &client(),
-            &Credentials::Password {
-                username: "mallory",
-                password: b"whatever",
-            },
-        );
-        let wrong = auth.authenticate(
-            &client(),
-            &Credentials::Password {
-                username: "alice",
-                password: b"wrong",
-            },
-        );
+        let unknown = auth
+            .authenticate(
+                &client(),
+                &Credentials::Password {
+                    username: "mallory",
+                    password: b"whatever",
+                },
+            )
+            .await;
+        let wrong = auth
+            .authenticate(
+                &client(),
+                &Credentials::Password {
+                    username: "alice",
+                    password: b"wrong",
+                },
+            )
+            .await;
         // No username-enumeration oracle: both failures look identical.
         assert!(matches!(unknown, Err(AuthError::Rejected)));
         assert!(matches!(wrong, Err(AuthError::Rejected)));
         assert_eq!(format!("{unknown:?}"), format!("{wrong:?}"));
     }
 
-    #[test]
-    fn non_password_credentials_are_not_permitted() {
+    #[tokio::test]
+    async fn non_password_credentials_are_not_permitted() {
         let auth = store("alice", b"correct horse");
         for creds in [
             Credentials::Anonymous,
@@ -208,14 +215,14 @@ mod tests {
             Credentials::ClientCert { subject: "cn" },
         ] {
             assert!(matches!(
-                auth.authenticate(&client(), &creds),
+                auth.authenticate(&client(), &creds).await,
                 Err(AuthError::NotPermitted)
             ));
         }
     }
 
-    #[test]
-    fn file_parsing_handles_comments_and_blank_lines() {
+    #[tokio::test]
+    async fn file_parsing_handles_comments_and_blank_lines() {
         let alice = fixed_salt_hash(b"a-secret");
         let bob = fixed_salt_hash(b"b-secret");
         let text = format!("# users\n\nalice:{alice}\n\n# bob below\nbob:{bob}\n");
@@ -228,6 +235,7 @@ mod tests {
                     password: b"a-secret",
                 },
             )
+            .await
             .is_ok());
         assert!(auth
             .authenticate(
@@ -237,6 +245,7 @@ mod tests {
                     password: b"b-secret",
                 },
             )
+            .await
             .is_ok());
     }
 
@@ -262,8 +271,8 @@ mod tests {
     /// The point of shipping [`hash_password`]: what it produces must be a password
     /// file line the broker actually accepts. A hasher whose output the verifier
     /// rejects would be worse than none — it would look like it worked.
-    #[test]
-    fn a_generated_hash_authenticates_through_a_password_file() {
+    #[tokio::test]
+    async fn a_generated_hash_authenticates_through_a_password_file() {
         let hash = hash_password("correct horse battery staple").expect("hashing must succeed");
         let auth = PasswordAuthenticator::from_file_contents(&format!("alice:{hash}\n"))
             .expect("a generated hash must parse as a password file line");
@@ -276,6 +285,7 @@ mod tests {
                     password: b"correct horse battery staple",
                 },
             )
+            .await
             .expect("the password that was hashed must authenticate against it");
         assert_eq!(id.subject, "alice");
 
@@ -287,7 +297,8 @@ mod tests {
                         username: "alice",
                         password: b"correct horse battery stapl",
                     },
-                ),
+                )
+                .await,
                 Err(AuthError::Rejected)
             ),
             "a near-miss password must still be rejected — otherwise the test above \
@@ -298,8 +309,8 @@ mod tests {
     /// The salt is per call, so the same password never yields the same string twice.
     /// Equal hashes would mean a fixed salt shipped by accident, which makes the whole
     /// file rainbow-table-able.
-    #[test]
-    fn hashing_the_same_password_twice_gives_different_strings_that_both_verify() {
+    #[tokio::test]
+    async fn hashing_the_same_password_twice_gives_different_strings_that_both_verify() {
         let a = hash_password("same-password").expect("hash a");
         let b = hash_password("same-password").expect("hash b");
         assert_ne!(a, b, "each hash must carry its own random salt");
@@ -315,6 +326,7 @@ mod tests {
                         password: b"same-password",
                     },
                 )
+                .await
                 .is_ok(),
                 "both independently-salted hashes must verify"
             );

@@ -191,3 +191,53 @@ Two consequences follow, both implemented:
   one-directional in whichever order the passes run, which is exactly the kind of
   asymmetry that survives review. In the single pass a `%` inside a substituted value is
   an ordinary character.
+
+## Amendment (2026-08-10): the `Authenticator` trait is async (T15)
+
+`Authenticator::authenticate` was synchronous, and every authenticator that ships is pure
+computation — Argon2, a signature check, a certificate field — so nothing needed to
+suspend. That made the sync signature look free. It was not: it made every *remote*
+authenticator impossible to add without a workaround.
+
+An HTTP hook, LDAP, or remote token introspection is a network call per CONNECT. Behind a
+sync trait called from `async fn authenticate_connect`, the options were:
+
+- **block a runtime worker** on every connection attempt — a handful of slow auth calls
+  starve the executor that is also serving every other client;
+- **`spawn_blocking` + a blocking HTTP client** — a thread per CONNECT, and a second HTTP
+  stack in the dependency tree beside the one that already fetches JWKS;
+- **a second, parallel `authenticate_async` method** with a default that delegates — no
+  impl changes, but two methods that must not disagree, and a trait that documents its own
+  workaround.
+
+**The trait is now `async`.** The pure verifiers gained `async fn` and never await; the
+chain awaits each member in turn. That is the honest shape: authentication *is* I/O in the
+general case, and the type should say so rather than making the one implementation that
+needs it pay for the shape chosen for the others.
+
+### What it cost, stated rather than hidden
+
+Thirty-eight unit tests of pure verifiers now need `#[tokio::test]` — a runtime they never
+use. That is the price, it is visible in the diff, and it is smaller than either
+alternative's price. Tests that exercise no authenticator (ACL parsing, mTLS field
+extraction, gossip signatures) were left synchronous.
+
+`async-trait` joins `mqtt-auth`'s dependencies. It is already in the tree via
+`mqtt-storage`, `mqtt-cluster` and `mqttd`, so nothing new enters the supply chain.
+
+### What did NOT change
+
+`mqtt-auth` stays **I/O-free**. The trait can now express I/O; no implementation in this
+crate performs any. The HTTP hook (T16) lives in `mqttd`, beside the JWKS fetcher that
+already owns the `reqwest` dependency — the same split ADR 0050 uses, where the crate
+holds a pure verifier and the binary does the fetching.
+
+The `Authorizer` trait is untouched and stays synchronous: ACL evaluation is a local
+decision over already-loaded policy, on the publish hot path, and has no reason to await.
+
+### The contract an I/O-backed implementation takes on
+
+`authenticate` runs on the CONNECT path and **the broker applies no timeout of its own**.
+An implementation that performs I/O owns its own deadline, and must **fail closed** when it
+expires: a hook that is unreachable has not authenticated anybody. This is stated on the
+trait method, because it is the part a third-party implementer will otherwise get wrong.

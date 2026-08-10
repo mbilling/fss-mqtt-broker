@@ -1875,6 +1875,7 @@ name = "mqtt-auth"
 version = "0.9.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "aws-lc-rs",
  "jsonwebtoken",
  "mqtt-core",
@@ -1882,6 +1883,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "toml",
  "x509-parser",
 ]

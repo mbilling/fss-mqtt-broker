@@ -6215,8 +6215,9 @@ mod tests {
         }
         /// A credential store that no longer knows one subject.
         struct UserGone(&'static str);
+        #[async_trait::async_trait]
         impl Authenticator for UserGone {
-            fn authenticate(
+            async fn authenticate(
                 &self,
                 _: &ClientId,
                 _: &Credentials<'_>,

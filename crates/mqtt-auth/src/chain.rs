@@ -33,14 +33,15 @@ impl ChainAuthenticator {
     }
 }
 
+#[async_trait::async_trait]
 impl Authenticator for ChainAuthenticator {
-    fn authenticate(
+    async fn authenticate(
         &self,
         client: &ClientId,
         creds: &Credentials<'_>,
     ) -> Result<Identity, AuthError> {
         for member in &self.members {
-            match member.authenticate(client, creds) {
+            match member.authenticate(client, creds).await {
                 // First acceptance wins.
                 Ok(identity) => return Ok(identity),
                 // Member doesn't handle this credential kind: try the next.
@@ -79,8 +80,9 @@ mod tests {
 
     /// Always returns the same fixed result.
     struct Fixed(Result<Identity, AuthError>);
+    #[async_trait::async_trait]
     impl Authenticator for Fixed {
-        fn authenticate(
+        async fn authenticate(
             &self,
             _client: &ClientId,
             _creds: &Credentials<'_>,
@@ -111,8 +113,9 @@ mod tests {
 
     /// Panics if it is ever consulted — proves the chain stopped earlier.
     struct Explodes;
+    #[async_trait::async_trait]
     impl Authenticator for Explodes {
-        fn authenticate(
+        async fn authenticate(
             &self,
             _client: &ClientId,
             _creds: &Credentials<'_>,
@@ -121,51 +124,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn first_abstains_second_accepts_yields_ok() {
+    #[tokio::test]
+    async fn first_abstains_second_accepts_yields_ok() {
         let chain = ChainAuthenticator::new(vec![abstains(), accepts("alice")]);
         let id = chain
             .authenticate(&client(), &Credentials::Anonymous)
+            .await
             .expect("second member must accept");
         assert_eq!(id.subject, "alice");
     }
 
-    #[test]
-    fn first_rejection_is_final_and_short_circuits() {
+    #[tokio::test]
+    async fn first_rejection_is_final_and_short_circuits() {
         // The exploding member must never be consulted once a member rejects.
         let chain = ChainAuthenticator::new(vec![rejects(), Arc::new(Explodes)]);
         assert!(matches!(
-            chain.authenticate(&client(), &Credentials::Anonymous),
+            chain.authenticate(&client(), &Credentials::Anonymous).await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn first_backend_error_is_final_and_short_circuits() {
+    #[tokio::test]
+    async fn first_backend_error_is_final_and_short_circuits() {
         let chain = ChainAuthenticator::new(vec![
             Arc::new(Fixed(Err(AuthError::Backend("idp down".into())))),
             Arc::new(Explodes),
         ]);
         assert!(matches!(
-            chain.authenticate(&client(), &Credentials::Anonymous),
+            chain.authenticate(&client(), &Credentials::Anonymous).await,
             Err(AuthError::Backend(_))
         ));
     }
 
-    #[test]
-    fn all_abstain_yields_not_permitted() {
+    #[tokio::test]
+    async fn all_abstain_yields_not_permitted() {
         let chain = ChainAuthenticator::new(vec![abstains(), abstains()]);
         assert!(matches!(
-            chain.authenticate(&client(), &Credentials::Anonymous),
+            chain.authenticate(&client(), &Credentials::Anonymous).await,
             Err(AuthError::NotPermitted)
         ));
     }
 
-    #[test]
-    fn empty_chain_yields_not_permitted() {
+    #[tokio::test]
+    async fn empty_chain_yields_not_permitted() {
         let chain = ChainAuthenticator::new(vec![]);
         assert!(matches!(
-            chain.authenticate(&client(), &Credentials::Anonymous),
+            chain.authenticate(&client(), &Credentials::Anonymous).await,
             Err(AuthError::NotPermitted)
         ));
     }

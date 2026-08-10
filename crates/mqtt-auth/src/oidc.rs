@@ -206,8 +206,9 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<NamedKey>, AuthError> {
     Ok(out)
 }
 
+#[async_trait::async_trait]
 impl Authenticator for OidcAuthenticator {
-    fn authenticate(
+    async fn authenticate(
         &self,
         _client: &ClientId,
         creds: &Credentials<'_>,
@@ -331,29 +332,30 @@ mod tests {
                "groups": ["sensors"]})
     }
 
-    fn auth(a: &OidcAuthenticator, token: &str) -> Result<Identity, AuthError> {
+    async fn auth(a: &OidcAuthenticator, token: &str) -> Result<Identity, AuthError> {
         a.authenticate(&ClientId("c1".into()), &Credentials::Token(token))
+            .await
     }
 
-    #[test]
-    fn a_valid_token_authenticates_with_subject_and_groups() {
+    #[tokio::test]
+    async fn a_valid_token_authenticates_with_subject_and_groups() {
         let (a, _rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
-        let id = auth(&a, &mint("t1", &good_claims())).unwrap();
+        let id = auth(&a, &mint("t1", &good_claims())).await.unwrap();
         assert_eq!(id.subject, "device-7");
         assert_eq!(id.groups, vec!["sensors".to_string()]);
     }
 
-    #[test]
-    fn no_keys_installed_fails_closed_and_hints_refresh() {
+    #[tokio::test]
+    async fn no_keys_installed_fails_closed_and_hints_refresh() {
         let (a, rx) = authenticator();
-        let err = auth(&a, &mint("t1", &good_claims())).unwrap_err();
+        let err = auth(&a, &mint("t1", &good_claims())).await.unwrap_err();
         assert!(matches!(err, AuthError::Backend(_)));
         assert!(rx.try_recv().is_ok(), "startup miss must hint a refetch");
     }
 
-    #[test]
-    fn wrong_issuer_audience_and_expiry_are_rejected() {
+    #[tokio::test]
+    async fn wrong_issuer_audience_and_expiry_are_rejected() {
         let (a, _rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
         for claims in [
@@ -362,21 +364,23 @@ mod tests {
             json!({"sub":"d","iss":ISSUER,"aud":AUD,"exp": 1_000}),
         ] {
             assert!(matches!(
-                auth(&a, &mint("t1", &claims)).unwrap_err(),
+                auth(&a, &mint("t1", &claims)).await.unwrap_err(),
                 AuthError::Rejected
             ));
         }
     }
 
-    #[test]
-    fn an_unknown_kid_rejects_and_hints_exactly_one_refresh() {
+    #[tokio::test]
+    async fn an_unknown_kid_rejects_and_hints_exactly_one_refresh() {
         let (a, rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
         // Two misses in a row: both reject; the bounded(1) channel holds ONE hint —
         // the debounce is the channel capacity, not a timer.
         for _ in 0..2 {
             assert!(matches!(
-                auth(&a, &mint("rotated-away", &good_claims())).unwrap_err(),
+                auth(&a, &mint("rotated-away", &good_claims()))
+                    .await
+                    .unwrap_err(),
                 AuthError::Rejected
             ));
         }
@@ -384,8 +388,8 @@ mod tests {
         assert!(rx.try_recv().is_err(), "hint channel must debounce");
     }
 
-    #[test]
-    fn hs256_is_refused_even_if_it_matches_a_key() {
+    #[tokio::test]
+    async fn hs256_is_refused_even_if_it_matches_a_key() {
         let (a, _rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
         // An HS256 token signed with... anything: refused on the allow-list before
@@ -396,43 +400,46 @@ mod tests {
             &EncodingKey::from_secret(b"whatever"),
         )
         .unwrap();
-        assert!(matches!(auth(&a, &token).unwrap_err(), AuthError::Rejected));
+        assert!(matches!(
+            auth(&a, &token).await.unwrap_err(),
+            AuthError::Rejected
+        ));
     }
 
-    #[test]
-    fn staleness_beyond_the_window_fails_closed_then_reinstall_recovers() {
+    #[tokio::test]
+    async fn staleness_beyond_the_window_fails_closed_then_reinstall_recovers() {
         let (a, rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
         a.age_keys_for_test(Duration::from_secs(25 * 3600));
         assert!(a.is_stale());
-        let err = auth(&a, &mint("t1", &good_claims())).unwrap_err();
+        let err = auth(&a, &mint("t1", &good_claims())).await.unwrap_err();
         assert!(matches!(err, AuthError::Backend(_)));
         assert!(rx.try_recv().is_ok(), "staleness must hint a refetch");
         // A fresh install (the fetch loop recovering) restores service.
         a.install_jwks(JWKS).unwrap();
-        assert!(auth(&a, &mint("t1", &good_claims())).is_ok());
+        assert!(auth(&a, &mint("t1", &good_claims())).await.is_ok());
     }
 
-    #[test]
-    fn a_garbled_jwks_never_replaces_the_last_known_good_set() {
+    #[tokio::test]
+    async fn a_garbled_jwks_never_replaces_the_last_known_good_set() {
         let (a, _rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
         assert!(a.install_jwks(b"{ not json").is_err());
         assert!(a.install_jwks(br#"{"keys":[]}"#).is_err());
         // The original keys still serve (validate-before-swap).
-        assert!(auth(&a, &mint("t1", &good_claims())).is_ok());
+        assert!(auth(&a, &mint("t1", &good_claims())).await.is_ok());
     }
 
-    #[test]
-    fn non_token_credentials_chain_through() {
+    #[tokio::test]
+    async fn non_token_credentials_chain_through() {
         let (a, _rx) = authenticator();
         assert!(matches!(
-            auth_creds(&a, &Credentials::Anonymous).unwrap_err(),
+            auth_creds(&a, &Credentials::Anonymous).await.unwrap_err(),
             AuthError::NotPermitted
         ));
     }
 
-    fn auth_creds(a: &OidcAuthenticator, c: &Credentials<'_>) -> Result<Identity, AuthError> {
-        a.authenticate(&ClientId("c1".into()), c)
+    async fn auth_creds(a: &OidcAuthenticator, c: &Credentials<'_>) -> Result<Identity, AuthError> {
+        a.authenticate(&ClientId("c1".into()), c).await
     }
 }

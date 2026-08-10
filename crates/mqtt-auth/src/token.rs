@@ -99,8 +99,9 @@ impl TokenAuthenticator {
     }
 }
 
+#[async_trait::async_trait]
 impl Authenticator for TokenAuthenticator {
-    fn authenticate(
+    async fn authenticate(
         &self,
         _client: &ClientId,
         creds: &Credentials<'_>,
@@ -167,19 +168,20 @@ mod tests {
         .expect("encode")
     }
 
-    #[test]
-    fn valid_hs256_token_authenticates_with_sub_as_subject() {
+    #[tokio::test]
+    async fn valid_hs256_token_authenticates_with_sub_as_subject() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         let token = hs256_token(&json!({ "sub": "alice", "exp": now() + 3600 }));
         let id = auth
             .authenticate(&client(), &Credentials::Token(&token))
+            .await
             .expect("valid token must authenticate");
         assert_eq!(id.subject, "alice");
         assert!(id.groups.is_empty());
     }
 
-    #[test]
-    fn groups_are_parsed_from_the_default_claim() {
+    #[tokio::test]
+    async fn groups_are_parsed_from_the_default_claim() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         let token = hs256_token(&json!({
             "sub": "alice",
@@ -188,12 +190,13 @@ mod tests {
         }));
         let id = auth
             .authenticate(&client(), &Credentials::Token(&token))
+            .await
             .expect("valid token");
         assert_eq!(id.groups, vec!["admins".to_string(), "ops".to_string()]);
     }
 
-    #[test]
-    fn a_custom_groups_claim_name_is_honored() {
+    #[tokio::test]
+    async fn a_custom_groups_claim_name_is_honored() {
         let config = TokenConfig {
             groups_claim: "roles".to_string(),
             ..TokenConfig::default()
@@ -208,12 +211,13 @@ mod tests {
         }));
         let id = auth
             .authenticate(&client(), &Credentials::Token(&token))
+            .await
             .expect("valid token");
         assert_eq!(id.groups, vec!["reader".to_string()]);
     }
 
-    #[test]
-    fn tampered_or_wrong_secret_signature_is_rejected() {
+    #[tokio::test]
+    async fn tampered_or_wrong_secret_signature_is_rejected() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         let forged = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
@@ -222,24 +226,26 @@ mod tests {
         )
         .expect("encode");
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token(&forged)),
+            auth.authenticate(&client(), &Credentials::Token(&forged))
+                .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn expired_token_is_rejected() {
+    #[tokio::test]
+    async fn expired_token_is_rejected() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         // exp well beyond the library's default 60s leeway.
         let token = hs256_token(&json!({ "sub": "alice", "exp": now() - 3600 }));
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token(&token)),
+            auth.authenticate(&client(), &Credentials::Token(&token))
+                .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn wrong_issuer_is_rejected_when_issuer_is_configured() {
+    #[tokio::test]
+    async fn wrong_issuer_is_rejected_when_issuer_is_configured() {
         let config = TokenConfig {
             issuer: Some("https://issuer.example".to_string()),
             ..TokenConfig::default()
@@ -251,13 +257,14 @@ mod tests {
             "iss": "https://evil.example",
         }));
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token(&token)),
+            auth.authenticate(&client(), &Credentials::Token(&token))
+                .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn correct_issuer_is_accepted_when_issuer_is_configured() {
+    #[tokio::test]
+    async fn correct_issuer_is_accepted_when_issuer_is_configured() {
         let config = TokenConfig {
             issuer: Some("https://issuer.example".to_string()),
             ..TokenConfig::default()
@@ -270,11 +277,12 @@ mod tests {
         }));
         assert!(auth
             .authenticate(&client(), &Credentials::Token(&token))
+            .await
             .is_ok());
     }
 
-    #[test]
-    fn wrong_audience_is_rejected_when_audience_is_configured() {
+    #[tokio::test]
+    async fn wrong_audience_is_rejected_when_audience_is_configured() {
         let config = TokenConfig {
             audience: Some("broker".to_string()),
             ..TokenConfig::default()
@@ -286,13 +294,14 @@ mod tests {
             "aud": "someone-else",
         }));
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token(&token)),
+            auth.authenticate(&client(), &Credentials::Token(&token))
+                .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn correct_audience_is_accepted_when_audience_is_configured() {
+    #[tokio::test]
+    async fn correct_audience_is_accepted_when_audience_is_configured() {
         let config = TokenConfig {
             audience: Some("broker".to_string()),
             ..TokenConfig::default()
@@ -305,31 +314,34 @@ mod tests {
         }));
         assert!(auth
             .authenticate(&client(), &Credentials::Token(&token))
+            .await
             .is_ok());
     }
 
-    #[test]
-    fn missing_sub_is_rejected() {
+    #[tokio::test]
+    async fn missing_sub_is_rejected() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         let token = hs256_token(&json!({ "exp": now() + 3600 }));
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token(&token)),
+            auth.authenticate(&client(), &Credentials::Token(&token))
+                .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn empty_sub_is_rejected() {
+    #[tokio::test]
+    async fn empty_sub_is_rejected() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         let token = hs256_token(&json!({ "sub": "", "exp": now() + 3600 }));
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token(&token)),
+            auth.authenticate(&client(), &Credentials::Token(&token))
+                .await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn non_token_credentials_are_not_permitted() {
+    #[tokio::test]
+    async fn non_token_credentials_are_not_permitted() {
         let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
         for creds in [
             Credentials::Anonymous,
@@ -340,7 +352,7 @@ mod tests {
             Credentials::ClientCert { subject: "cn" },
         ] {
             assert!(matches!(
-                auth.authenticate(&client(), &creds),
+                auth.authenticate(&client(), &creds).await,
                 Err(AuthError::NotPermitted)
             ));
         }
@@ -368,8 +380,8 @@ mod tests {
         assert!(TokenAuthenticator::rs256_pem(TEST_RSA_PUBLIC_PEM, TokenConfig::default()).is_ok());
     }
 
-    #[test]
-    fn rs256_token_signed_by_matching_private_key_verifies() {
+    #[tokio::test]
+    async fn rs256_token_signed_by_matching_private_key_verifies() {
         let auth = TokenAuthenticator::rs256_pem(TEST_RSA_PUBLIC_PEM, TokenConfig::default())
             .expect("valid public PEM");
         let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM).expect("valid private PEM");
@@ -381,6 +393,7 @@ mod tests {
         .expect("encode");
         let id = auth
             .authenticate(&client(), &Credentials::Token(&token))
+            .await
             .expect("RS256 token signed by matching key must verify");
         assert_eq!(id.subject, "alice");
         assert_eq!(id.groups, vec!["ops".to_string()]);

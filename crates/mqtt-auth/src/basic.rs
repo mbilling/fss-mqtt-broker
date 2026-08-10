@@ -14,8 +14,9 @@ pub struct BasicAuthenticator {
     pub allow_anonymous: bool,
 }
 
+#[async_trait::async_trait]
 impl Authenticator for BasicAuthenticator {
-    fn authenticate(
+    async fn authenticate(
         &self,
         _client: &ClientId,
         creds: &Credentials<'_>,
@@ -47,8 +48,8 @@ mod tests {
         ClientId("c1".into())
     }
 
-    #[test]
-    fn client_cert_subject_is_accepted_verbatim() {
+    #[tokio::test]
+    async fn client_cert_subject_is_accepted_verbatim() {
         let auth = BasicAuthenticator {
             allow_anonymous: false,
         };
@@ -59,6 +60,7 @@ mod tests {
                     subject: "device-7",
                 },
             )
+            .await
             .expect("TLS-verified certificate subjects must be accepted");
         assert_eq!(
             id,
@@ -69,31 +71,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn anonymous_is_rejected_by_default() {
+    #[tokio::test]
+    async fn anonymous_is_rejected_by_default() {
         let auth = BasicAuthenticator {
             allow_anonymous: false,
         };
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Anonymous),
+            auth.authenticate(&client(), &Credentials::Anonymous).await,
             Err(AuthError::Rejected)
         ));
     }
 
-    #[test]
-    fn anonymous_is_accepted_when_opted_in() {
+    #[tokio::test]
+    async fn anonymous_is_accepted_when_opted_in() {
         let auth = BasicAuthenticator {
             allow_anonymous: true,
         };
         let id = auth
             .authenticate(&client(), &Credentials::Anonymous)
+            .await
             .expect("anonymous must be accepted when explicitly allowed");
         assert_eq!(id.subject, "anonymous");
         assert!(id.groups.is_empty());
     }
 
-    #[test]
-    fn password_is_not_permitted_without_a_verifier() {
+    #[tokio::test]
+    async fn password_is_not_permitted_without_a_verifier() {
         // Even with anonymous allowed: credentials we cannot verify must fail
         // closed rather than silently fall back to anonymous.
         let auth = BasicAuthenticator {
@@ -106,18 +109,20 @@ mod tests {
                     username: "alice",
                     password: b"secret",
                 },
-            ),
+            )
+            .await,
             Err(AuthError::NotPermitted)
         ));
     }
 
-    #[test]
-    fn token_is_not_permitted_without_a_verifier() {
+    #[tokio::test]
+    async fn token_is_not_permitted_without_a_verifier() {
         let auth = BasicAuthenticator {
             allow_anonymous: true,
         };
         assert!(matches!(
-            auth.authenticate(&client(), &Credentials::Token("ey.fake.jwt")),
+            auth.authenticate(&client(), &Credentials::Token("ey.fake.jwt"))
+                .await,
             Err(AuthError::NotPermitted)
         ));
     }
