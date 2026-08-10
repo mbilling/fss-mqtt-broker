@@ -11,7 +11,7 @@
 | [0001](../adr/0001-session-durability.md) | Session durability in a horizontally-scalable cluster | Accepted | [11/12 done](0001-session-durability.md) | 1 deferred |
 | [0002](../adr/0002-transport-security.md) | Transport security: TLS 1.3 everywhere, mTLS on the cluster bus | Accepted | [10/10 done](0002-transport-security.md) | — |
 | [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
-| [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [11/14 done](0004-identity-and-authentication.md) | 1 deferred |
+| [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [12/16 done](0004-identity-and-authentication.md) | 1 open, 1 deferred |
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [4/6 done](0005-session-affinity.md) | 2 deferred |
 | [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [11/11 done](0006-consensus-and-replication.md) | — |
 | [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [9/9 done](0007-durable-store-integration.md) | — |
@@ -73,6 +73,7 @@
 **0004 — Identity model: mTLS Common Name first, deny by default**
 
 - `0004-T13` 💤 deferred: Per-listener auth policies (each listener carrying its own authenticator/ACL) — "Needs the flat one-bind-per-transport Listeners struct (ADR 0046) to become a list of named listener definitions, each with its own policy and reload path — a config-model decision that earns its own record rather than an option bolted onto this one. The fourth item of the old bundled T11, hot ACL reload, was delivered by ADR 0032/0033 and reaches live state via ADR 0040."
+- `0004-T16` ⬜ planned: HTTP authentication hook — a remote endpoint decides, with caching, a bounded timeout and fail-closed behaviour — "Lands in mqttd (not mqtt-auth, which stays I/O-free) on the reqwest already used for JWKS. Unlocks LDAP/OAuth2/custom for everyone via one hook rather than one integration per backend. Needs: response caching with a TTL, an explicit timeout owned by the implementation (the trait applies none), fail-closed on hook outage, and tests against a real HTTP server including the outage case."
 
 **0005 — Session affinity: relocate persistent sessions to their owner**
 

@@ -18,9 +18,15 @@ argon2.workspace = true
 jsonwebtoken.workspace = true
 serde_json.workspace = true
 aws-lc-rs = { workspace = true }
+# The Authenticator trait is async (ADR 0004 amendment): authentication can be I/O —
+# an HTTP hook, LDAP, a remote token introspection endpoint. Already in the tree via
+# mqtt-storage / mqtt-cluster / mqttd; not a new supply-chain crate.
+async-trait = "0.1"
 
 [dev-dependencies]
 rcgen.workspace = true
+# The trait is async, so its tests need a runtime — even for verifiers that never await.
+tokio = { workspace = true }
 
 [lints]
 workspace = true

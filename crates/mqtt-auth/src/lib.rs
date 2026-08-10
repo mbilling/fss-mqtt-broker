@@ -70,12 +70,29 @@ pub enum Action {
 ///
 /// Implementations MUST be constant-time where they compare secrets and MUST NOT
 /// log credential material.
+///
+/// # Why this is async
+///
+/// Every authenticator that ships here is pure computation — Argon2, a signature check,
+/// a certificate field — and none of them await. The trait is async anyway, because
+/// authentication *in general* is I/O: an HTTP hook, LDAP, remote token introspection.
+/// With a synchronous trait, the only ways to add one are to block a runtime worker on
+/// every CONNECT, or to bolt a second parallel method onto the trait. Both are worse than
+/// an `async fn` that most implementations never suspend in.
+///
+/// The cost is real and paid here rather than hidden: the pure verifiers' unit tests now
+/// need a runtime they do not use.
+#[async_trait::async_trait]
 pub trait Authenticator: Send + Sync {
     /// Authenticate the given credentials for a client id.
     ///
+    /// **This runs on the CONNECT path.** An implementation that performs I/O must bound
+    /// it — the broker applies no timeout of its own here — and must fail closed, since a
+    /// hook that is merely unreachable is not a client that has proved anything.
+    ///
     /// # Errors
     /// Returns [`AuthError`] if the credentials are rejected or cannot be verified.
-    fn authenticate(
+    async fn authenticate(
         &self,
         client: &ClientId,
         creds: &Credentials<'_>,

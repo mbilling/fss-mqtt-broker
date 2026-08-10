@@ -1053,7 +1053,10 @@ where
         Credentials::Token(_) => "token",
         Credentials::Anonymous => "anonymous",
     };
-    match policy.authenticator().authenticate(client, &creds) {
+    // Awaited, not blocked on: an authenticator may be remote (HTTP hook, LDAP, token
+    // introspection). Nothing here bounds how long it takes — an I/O-backed
+    // implementation owns its own timeout, and must fail closed when it expires.
+    match policy.authenticator().authenticate(client, &creds).await {
         Ok(id) => {
             // For a relocated session, attribute it to the node that vouched (ADR
             // 0005); a direct client has no `via`.
