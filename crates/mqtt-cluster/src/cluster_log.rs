@@ -86,6 +86,14 @@ pub enum ReplOp {
 /// the gate (wipe-and-rejoin).
 const R_SCHEMA_VERSION: u32 = 1;
 
+/// In-place migrations for `replicas.redb` (ADR 0058). Empty by design at 1.0 — the first
+/// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
+/// test fails.
+const R_MIGRATIONS: &[mqtt_storage::schema::MigrationStep] = &[];
+/// Oldest `replicas.redb` version the contract migrates from (ADR 0058); pre-1.0 == current.
+#[cfg(test)]
+const R_MIGRATE_FLOOR: u32 = R_SCHEMA_VERSION;
+
 const R_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replica_entries");
 const R_META: TableDefinition<&str, u64> = TableDefinition::new("replica_meta");
 /// Per logical key, the highest truncation low-water this replica has applied (ADR 0018
@@ -250,7 +258,8 @@ impl ReplicaState {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
         let db = Database::create(path).map_err(rdb)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
-        mqtt_storage::schema::gate(&db, "replicas.redb", R_SCHEMA_VERSION).map_err(rdb)?;
+        mqtt_storage::schema::gate_or_migrate(&db, "replicas.redb", R_SCHEMA_VERSION, R_MIGRATIONS)
+            .map_err(rdb)?;
         let txn = db.begin_write().map_err(rdb)?;
         {
             let _ = txn.open_table(R_ENTRIES).map_err(rdb)?;
@@ -1326,6 +1335,18 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 0058 T2: the replicas.redb migration registry must cover the contract range, so a
+    /// future schema bump without its migration fails here, not at an operator's upgrade.
+    #[test]
+    fn the_migration_registry_covers_the_contract_range() {
+        mqtt_storage::schema::assert_migrations_cover(
+            super::R_MIGRATE_FLOOR,
+            super::R_SCHEMA_VERSION,
+            super::R_MIGRATIONS,
+        )
+        .expect("replicas.redb migration registry has a gap");
+    }
+
     use super::{
         merge_replica_logs, ClusterLog, ReplOp, ReplicaRead, ReplicaState, ReplicaTransport,
     };

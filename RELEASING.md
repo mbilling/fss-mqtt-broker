@@ -55,6 +55,27 @@ Versions follow [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md):
 - **Pre-release tags** (`vX.Y.Z-rc.1`, any tag with a hyphen) are published as
   GitHub pre-releases and do **not** move the `:latest` image tag.
 
+### The stability contract and its oracles (ADR 0058)
+
+From `1.0.0`, [ADR 0058](docs/adr/0058-one-dot-zero-stability-contract.md) promises
+**upgrade-in-place, never wipe-and-rejoin**. Two mechanisms enforce it, and a release is
+not cut unless both are green:
+
+- **Disk:** every store opens through `schema::gate_or_migrate` with a migration registry.
+  A schema bump that lands without its `MigrationStep` fails each store's
+  `the_migration_registry_covers_the_contract_range` test in CI — so the disk contract
+  cannot be broken by omission.
+- **Wire:** the nightly two-binary rolling-upgrade test (`cluster_upgrade.rs`,
+  `BASELINE_REF`) is the **wire oracle**. Pre-1.0 the baseline is bumped by hand with each
+  reshape (see the pre-commit checklist). **From `1.0.0`, `BASELINE_REF` pins to the
+  previous release and advances only along ADR 0039's skew policy** — the previous minor
+  within a major, the previous major's *gateway minor* across a major boundary. A reshape
+  that breaks the roll turns the nightly red before it can reach a tag.
+
+When cutting `1.0.0`: pin `BASELINE_REF` to the `1.0.0` commit, set each store's
+`MIGRATE_FLOOR` to its current `SCHEMA_VERSION`, and flip the wipe-and-rejoin language in
+this file and the README to the contract (0058-T5).
+
 ## Cutting a release
 
 1. **Pick the version** and make sure `main` is green (CI, nightly tier).

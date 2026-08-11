@@ -65,6 +65,7 @@
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [7/11 done](0055-kubernetes-operator.md) | 4 open |
 | [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [5/6 done](0057-durable-outbound-inflight.md) | 1 open |
+| [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [3/5 done](0058-one-dot-zero-stability-contract.md) | 2 open |
 
 ## Open and deferred work
 
@@ -166,3 +167,8 @@
 **0057 — Durable outbound in-flight state: exactly-once across a broker crash**
 
 - `0057-T3` ⬜ planned: "Restore: rebuild `pending` from the table, resume at PUBLISH+DUP or PUBREL under the original id, seed the allocator past restored ids"
+
+**0058 — The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin**
+
+- `0058-T4` ⬜ planned: "Config forward-compatibility decision: reconcile deny_unknown_fields with rollback within a major"
+- `0058-T5` ⬜ planned: "The freeze flip at the v1.0.0 tag: README/RELEASING language, final surface audit"
