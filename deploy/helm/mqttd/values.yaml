@@ -83,6 +83,12 @@ config: |
 # Secrets/ConfigMaps you manage (e.g. cert-manager for TLS). Each entry, when its `secretName`
 # (or `configMapName`) is set, is mounted at `mountPath`; the paths above must match. Leave a
 # name empty to skip that mount.
+#
+# NEW HERE? deploy/helm/mqttd/bootstrap.sh mints all of these (gossip key, server TLS,
+# cluster-bus mTLS, a starter ACL, optional password users) into a namespace and prints
+# the `helm install` flags that wire them — the Kubernetes equivalent of the compose
+# bootstrap. Run it once before the first install; replace the throwaway certs with real
+# ones (cert-manager) for production.
 secrets:
   # Server TLS keypair (kubernetes.io/tls Secret: keys tls.crt + tls.key).
   tls:

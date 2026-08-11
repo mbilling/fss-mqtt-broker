@@ -20,6 +20,10 @@ WARNING: no TLS Secret is set (secrets.tls.secretName is empty). The config refe
 {{ .Values.secrets.tls.mountPath }}/tls.crt — set secrets.tls.secretName to a
 kubernetes.io/tls Secret, or the TLS listener will fail to start. Provision TLS (e.g. with
 cert-manager) before serving clients.
+
+  First time? deploy/helm/mqttd/bootstrap.sh mints the gossip key, server TLS, cluster-bus
+  mTLS and a starter ACL into your namespace and prints the exact `helm install --set`
+  flags to wire them. Run it, then re-run helm with those flags.
 {{- end }}
 {{- if not .Values.secrets.acl.configMapName }}
 
