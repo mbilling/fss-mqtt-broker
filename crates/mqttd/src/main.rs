@@ -1249,6 +1249,32 @@ type HubHandle = (
     Option<tokio::task::JoinHandle<()>>,
 );
 
+/// Log the durability posture at startup (#166). Ephemeral durability — durable ON with
+/// no `MQTTD_DATA_DIR`, so the replicated state is only in RAM — is announced in the same
+/// loud register as the other degraded modes (plaintext, unauthenticated gossip), because
+/// logging it as a plain "DURABLE sessions enabled" line is a durability lie an operator
+/// reads and trusts.
+fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure_domains: usize) {
+    if config.durability_is_ephemeral() {
+        warn!(
+            founder,
+            voter_cap,
+            "EPHEMERAL durability: durable sessions are ON but no MQTTD_DATA_DIR is set — \
+             the replicated state lives only in MEMORY. A single node's loss is survived \
+             (peers hold it), but a correlated restart of a quorum LOSES acknowledged \
+             facts. Set MQTTD_DATA_DIR and mount a volume for real durability; this mode \
+             is for development and tests."
+        );
+    } else {
+        info!(
+            founder,
+            voter_cap,
+            failure_domains,
+            "DURABLE sessions enabled: consensus-backed replicated store (on disk)"
+        );
+    }
+}
+
 async fn start_hub(
     config: &Config,
     node_id: &NodeId,
@@ -1292,13 +1318,7 @@ async fn start_hub(
             .iter()
             .map(|(node, domain)| (NodeId(node.clone()), domain.clone()))
             .collect();
-        info!(
-            founder,
-            persistent = data_dir.is_some(),
-            voter_cap,
-            failure_domains = domains.len(),
-            "DURABLE sessions enabled: consensus-backed replicated store"
-        );
+        log_durability_mode(config, founder, voter_cap, domains.len());
         let (store, durable_retained, plane, driver) =
             mqtt_cluster::durable_node::build_durable_node(
                 node_id.clone(),
