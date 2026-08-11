@@ -663,6 +663,12 @@ docker run -d --name mqttd \
 > the env var and a volume. The image runs non-root under a read-only root
 > filesystem with every capability dropped.
 
+> ⚠️ **Durable-on with no `MQTTD_DATA_DIR` is in-memory durability.** It survives one
+> node's loss (peers still hold the state) but **a correlated restart of a quorum loses
+> acknowledged messages** — the replicated state was only in RAM. The broker logs an
+> `EPHEMERAL durability` warning on every start in this mode. For real durability set
+> `MQTTD_DATA_DIR` and mount a volume; the in-memory mode is for development and tests.
+
 > **What exists today: `v0.9.0`** — both musl binaries with signatures and
 > certificates, a signed CycloneDX SBOM, a multi-arch image, and SLSA provenance,
 > plus the same set for `mqtt-bridge`. Every one has been verified end to end

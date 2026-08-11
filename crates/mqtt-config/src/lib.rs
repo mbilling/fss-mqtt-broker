@@ -453,6 +453,17 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Whether durability is **ephemeral** (#166): durable sessions are ON but no
+    /// `data_dir` is set, so the consensus-backed replicated state lives only in memory.
+    /// It survives a single node's loss (peers still hold it) but not a correlated restart
+    /// of a quorum — acknowledged facts are then lost. The broker logs this loudly at
+    /// startup; exposed as a predicate so the decision has one testable home rather than
+    /// living only in a log-line condition.
+    #[must_use]
+    pub fn durability_is_ephemeral(&self) -> bool {
+        self.durable.enabled && self.node.data_dir.is_none()
+    }
+
     /// Parse a strict TOML document into a `Config` and [`validate`](Self::validate) it.
     /// Unknown keys, type mismatches, and out-of-range values all fail here with a located
     /// message — nothing is silently ignored.
@@ -1358,5 +1369,30 @@ mod tests {
         assert_eq!(c.limits.max_connections, Some(7));
         assert!(c.observability.otlp_endpoint.is_some());
         assert_eq!(c.runtime.ready_min_members, 7);
+    }
+
+    /// #166 — the ephemeral-durability predicate: durable ON + no `data_dir` is the one
+    /// dangerous combination (quorum-of-RAM), and only that one.
+    #[test]
+    fn ephemeral_durability_is_exactly_durable_on_without_a_data_dir() {
+        let mut c = Config::default(); // durable defaults ON, data_dir None
+        assert!(c.node.data_dir.is_none() && c.durable.enabled);
+        assert!(
+            c.durability_is_ephemeral(),
+            "durable ON + no data_dir = ephemeral"
+        );
+
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        assert!(
+            !c.durability_is_ephemeral(),
+            "a data_dir makes it real durability"
+        );
+
+        c.node.data_dir = None;
+        c.durable.enabled = false;
+        assert!(
+            !c.durability_is_ephemeral(),
+            "durable OFF is not ephemeral — it is in-memory by design"
+        );
     }
 }
