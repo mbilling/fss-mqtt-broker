@@ -1692,10 +1692,24 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             // sighting of this packet id; re-sent copies (DUP) before the
             // PUBREL release are acknowledged but not re-delivered. The dedup
             // window is the durable session store when present (so it survives a
-            // failover), else a per-connection set. A store error degrades to
-            // forwarding (at-least-once) rather than dropping the flow.
+            // failover), else a per-connection set.
+            //
+            // A store ERROR fails CLOSED (#165): we cannot tell first-sighting from
+            // duplicate, so forwarding-and-PUBRECing would silently degrade exactly-once
+            // to at-least-once for the duration of the incident — a duplicate delivered
+            // under a clean PUBREC. Instead withhold the PUBREC and drop the connection,
+            // exactly as a failed durable fan-out does below; the publisher reconnects
+            // and re-sends, and once the store recovers the dedup is correct. (An earlier
+            // version `unwrap_or(true)`'d the error into "first sighting" — the defect.)
             let first_sighting = match &policy.store {
-                Some(store) => store.record_received(client, id).await.unwrap_or(true),
+                Some(store) => match store.record_received(client, id).await {
+                    Ok(first) => first,
+                    Err(e) => {
+                        warn!(client = %client.0, id, error = %e,
+                              "QoS2 dedup store write failed; withholding PUBREC (fail closed)");
+                        return Ok(true);
+                    }
+                },
                 None => qos2_inbound.insert(id),
             };
             if first_sighting {
