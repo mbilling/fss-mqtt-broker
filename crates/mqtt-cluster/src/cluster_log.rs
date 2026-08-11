@@ -1045,7 +1045,47 @@ impl<T: ReplicaTransport + Clone + 'static> ClusterLog<T> {
     /// [`ReplError::NoQuorum`] if any recovered entry cannot reach the quorum.
     pub async fn recommit_key(&self, key: &str, entries: &[LogEntry]) -> Result<(), ReplError> {
         if entries.is_empty() {
-            return Ok(());
+            // #168: an empty recovered log is NOT a licence to serve without fencing.
+            // Re-committing entries is what advances the followers' group fences to this
+            // owner's epoch (each `apply` bumps the fence), which is what fences out a
+            // deposed-but-alive old owner. Skipping that on an empty log left the window
+            // the audit flagged: the old owner could still reach quorum on the key at its
+            // stale epoch, ack a publisher, and be overwritten by this owner's offset 1.
+            //
+            // So run a fence round even with nothing to re-commit: a `Truncate up_to = 0`
+            // is a data no-op on a 1-based log (it retains every offset `> 0`) but routes
+            // through `apply`, advancing each follower's fence to this epoch. It must reach
+            // the same write quorum a real re-commit would — an owner that cannot fence to
+            // quorum must not serve (ADR 0042 T6, ADR 0017).
+            let fence = ReplOp::Truncate {
+                key: key.to_string(),
+                up_to: 0,
+            };
+            let mut acks = usize::from(self.local_ack(self.lease.epoch, &fence));
+            let mut inflight = tokio::task::JoinSet::new();
+            for follower in &self.followers {
+                let transport = self.transport.clone();
+                let follower = follower.clone();
+                let epoch = self.lease.epoch;
+                let op = fence.clone();
+                inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
+            }
+            while let Some(res) = inflight.join_next().await {
+                if let Ok(true) = res {
+                    acks += 1;
+                }
+            }
+            return if acks >= self.quorum {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    key,
+                    epoch = self.lease.epoch,
+                    "takeover fence (empty recovered log) could not reach quorum; refusing \
+                     to serve the key (#168, ADR 0042 T6)"
+                );
+                Err(ReplError::NoQuorum)
+            };
         }
         // Fan every (entry, follower) delivery out concurrently — recovery-time,
         // one wave — and count per-entry acks, the owner's copy included (durable,
@@ -1716,6 +1756,15 @@ mod tests {
                 .map(|r| r.entries(key).into_iter().map(|e| e.offset).collect())
                 .unwrap_or_default()
         }
+
+        /// The fence a replica currently holds for `key`'s group (#168 tests).
+        fn fence(&self, node: &NodeId, key: &str) -> Epoch {
+            self.replicas
+                .lock()
+                .unwrap()
+                .get(node)
+                .map_or(0, |r| r.fence_for_key(key))
+        }
     }
 
     #[async_trait]
@@ -1918,6 +1967,58 @@ mod tests {
         assert_eq!(sim.entries(&followers[0], &k), vec![1, 2]);
         assert!(sim.entries(&followers[1], &k).is_empty());
         sim.assert_fencing_held();
+    }
+
+    /// #168 — an EMPTY recovered log must still fence the old owner. Re-committing
+    /// entries is what advances the followers' fences; skipping it on an empty log left a
+    /// deposed owner able to reach quorum on the untouched key at its stale epoch and ack
+    /// a write this owner then overwrites at offset 1. After the fix, `recommit_key` on an
+    /// empty base runs a fence round, so a stale-epoch write to a follower is REJECTED.
+    #[tokio::test]
+    async fn an_empty_recovered_log_still_fences_the_old_owner() {
+        // Owner at epoch 7; followers start with fence 0 for the key's group.
+        let (log, sim, followers) = group(7);
+        let k = "x".to_string();
+        assert_eq!(sim.fence(&followers[0], &k), 0, "precondition: unfenced");
+
+        // Recover an EMPTY log for the key and serve it. This must fence, not no-op.
+        log.recommit_key(&k, &[]).await.unwrap();
+        assert_eq!(
+            sim.fence(&followers[0], &k),
+            7,
+            "the empty-log recommit must advance the follower's fence to this epoch"
+        );
+
+        // The deposed old owner (epoch 6 < 7) now cannot get a write accepted — the
+        // lost-acked-write window is closed.
+        let stale = ReplOp::Append {
+            key: k.clone(),
+            offset: 1,
+            seq: 1,
+            record: b"stale-owner-write".to_vec(),
+        };
+        assert!(
+            !sim.deliver(&followers[0], 6, &stale).await,
+            "a stale-epoch write must be REJECTED after the empty-log fence (#168)"
+        );
+        sim.assert_fencing_held();
+    }
+
+    /// The fence round is held to the same write quorum a real re-commit is: an owner
+    /// that cannot fence to quorum on an empty recovered log must NOT serve it.
+    #[tokio::test]
+    async fn an_empty_recommit_still_requires_a_write_quorum() {
+        let (log, sim, followers) = group(7);
+        let k = "y".to_string();
+        sim.down(&followers[0]);
+        sim.down(&followers[1]);
+        assert!(
+            matches!(
+                log.recommit_key(&k, &[]).await,
+                Err(mqtt_storage::repl::ReplError::NoQuorum)
+            ),
+            "no quorum for the fence round => refuse to serve, even with nothing to recommit"
+        );
     }
 
     /// `live_range` reflects the committed watermarks: an uncommitted (below-quorum)
