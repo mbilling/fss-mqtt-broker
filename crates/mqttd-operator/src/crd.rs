@@ -111,8 +111,11 @@ pub struct Remediation {
     /// its PVC by label (never delete data), seed-override recovery.
     #[serde(default)]
     pub split_brain: SplitBrainAction,
-    /// Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — patch
-    /// PVC sizes up to `persistence.expansionMaxSize` and raise the watermark.
+    /// Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — grow PVC
+    /// sizes up to `persistence.expansionMaxSize`. NOTE: `ExpandPvc` does **not**
+    /// yet raise the broker's `store_max_bytes` watermark (that lives in the config
+    /// and is tracked by 0055-T10), so the broker may keep refusing writes on the
+    /// larger volume until the watermark is raised — a manual config roll for now.
     #[serde(default)]
     pub brownout: BrownoutAction,
 }
@@ -151,8 +154,9 @@ pub enum BrownoutAction {
     /// Conditions + Events only.
     #[default]
     Alert,
-    /// Expand PVCs (bounded by `persistence.expansionMaxSize`) and raise the
-    /// disk watermark through the config contract.
+    /// Grow PVCs (bounded by `persistence.expansionMaxSize`). Does **not** yet raise
+    /// the `store_max_bytes` watermark (0055-T10), so pair it with a config roll that
+    /// raises the watermark, or the broker keeps refusing writes on the larger volume.
     ExpandPvc,
 }
 
