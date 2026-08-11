@@ -246,6 +246,8 @@ mod tests {
         cfg(r#"
             hop_count_limit = 3
             share_group = ""
+            [spool]
+            allow_ephemeral_spool = true   # a qos1 rule below; this is a pure-logic fixture
             [local]
             url = "local:1883"
 

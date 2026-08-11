@@ -278,6 +278,22 @@ has panels for all three.
 
 ---
 
+## Durability of a QoS ≥ 1 rule
+
+The spool is **fsync-durable** on commit (ADR 0060 T3), and a QoS ≥ 1 rule **refuses to start**
+without a durable spool — set `[spool].dir`, or `[spool].allow_ephemeral_spool = true` to accept
+loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason), not just
+counted (T5), so a lost auditable crossing leaves a trail.
+
+**One residual, stated plainly.** The source acknowledgement is not yet fully gated on
+durability on the fast path: the bridge PUBACKs the source and forwards, without waiting for
+the destination's acknowledgement — so a crash in that narrow window can lose a message the
+source considered delivered. The full pending-ack model (ack only after spool-commit or a
+downstream ack) is the remaining ADR 0060 work (T1/T2). For the strongest guarantee today, keep
+a durable spool and treat the crossing as at-least-once with that caveat.
+
+---
+
 ## Encrypt the spool at rest — a deployment requirement
 
 The store-and-forward spool holds **cross-zone message payloads in the clear** while a

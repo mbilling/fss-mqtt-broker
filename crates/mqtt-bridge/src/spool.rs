@@ -13,7 +13,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
+use tracing::info;
 
 /// One spooled message (already transformed by the forwarding policy).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +120,11 @@ impl Spool {
                 Ok(())
             }
             Inner::Disk { db, next } => {
-                let wtx = db.begin_write().map_err(backend)?;
+                let mut wtx = db.begin_write().map_err(backend)?;
+                // Explicit fsync-on-commit (ADR 0060 T3): a QoS≥1 source ack is gated on this
+                // returning, so durability must not be left to a redb default. Mirrors the
+                // broker's own durable stores (ADR 0018).
+                wtx.set_durability(Durability::Immediate);
                 {
                     let mut t = wtx.open_table(SPOOL).map_err(backend)?;
                     let encoded = encode(msg);
@@ -129,7 +134,20 @@ impl Spool {
                     while usize::try_from(t.len().map_err(backend)?).unwrap_or(usize::MAX)
                         > self.cap
                     {
-                        let oldest = t.first().map_err(backend)?.map(|(k, _)| k.value());
+                        let oldest = t.first().map_err(backend)?.map(|(k, v)| {
+                            // Audit the loss (ADR 0060 T5): a spool-full drop is a lost
+                            // auditable-crossing message, so record WHAT was shed, not just a
+                            // counter. The dropped message was already forwarded-or-acked.
+                            if let Some(m) = decode(v.value()) {
+                                info!(
+                                    target: "bridge::audit",
+                                    topic = %m.topic,
+                                    reason = "spool-full",
+                                    "dropped a spooled message at the cap"
+                                );
+                            }
+                            k.value()
+                        });
                         if let Some(k) = oldest {
                             t.remove(k).map_err(backend)?;
                             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -157,7 +175,8 @@ impl Spool {
             Inner::Mem(q) => Ok(q.drain(..).collect()),
             Inner::Disk { db, .. } => {
                 let mut out = Vec::new();
-                let wtx = db.begin_write().map_err(backend)?;
+                let mut wtx = db.begin_write().map_err(backend)?;
+                wtx.set_durability(Durability::Immediate); // fsync the removal (ADR 0060 T3)
                 {
                     let mut t = wtx.open_table(SPOOL).map_err(backend)?;
                     let keys: Vec<u64> = t

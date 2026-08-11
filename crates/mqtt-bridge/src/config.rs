@@ -68,6 +68,12 @@ pub struct Spool {
     /// Per-side spool cap in messages (drop-oldest past it). Default 10000.
     #[serde(default = "default_spool_max")]
     pub max_messages: usize,
+    /// Permit running a QoS≥1 rule with no durable spool (ADR 0060 T4). Default `false`: a
+    /// QoS≥1 rule without a durable `dir` is refused, because the source's ack is meant to be
+    /// gated on durability and an in-memory spool loses acked messages on any restart. Set
+    /// `true` only for a best-effort deployment that accepts that loss (loudly logged).
+    #[serde(default)]
+    pub allow_ephemeral_spool: bool,
 }
 
 impl Default for Spool {
@@ -75,6 +81,7 @@ impl Default for Spool {
         Self {
             dir: None,
             max_messages: default_spool_max(),
+            allow_ephemeral_spool: false,
         }
     }
 }
@@ -261,6 +268,15 @@ impl BridgeConfig {
     ///
     /// # Errors
     /// [`ConfigError::Invalid`] describing the first problem found.
+    /// Whether any rule forwards at `QoS` ≥ 1, so a durable spool is required (ADR 0060 T4).
+    #[must_use]
+    pub fn requires_durable_spool(&self) -> bool {
+        self.upstreams
+            .iter()
+            .flat_map(|u| &u.rules)
+            .any(|r| r.qos >= 1)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.hop_count_limit == 0 {
             return Err(invalid("hop_count_limit must be >= 1"));
@@ -320,6 +336,18 @@ impl BridgeConfig {
                     )));
                 }
             }
+        }
+        // ADR 0060 T4: a QoS≥1 rule must have a durable spool (checked after per-rule
+        // validation so a qos-range error surfaces first). An in-memory spool loses acked
+        // messages on any restart, and the source ack is meant to be durability-gated.
+        if self.requires_durable_spool()
+            && self.spool.dir.is_none()
+            && !self.spool.allow_ephemeral_spool
+        {
+            return Err(invalid(
+                "a QoS>=1 rule requires a durable spool: set [spool].dir, or set \
+                 [spool].allow_ephemeral_spool = true to accept message loss on restart",
+            ));
         }
         Ok(())
     }
@@ -407,6 +435,9 @@ mod tests {
 
             [local]
             url = "cluster:1883"
+
+            [spool]
+            dir = "/var/lib/bridge"
 
             [[upstreams]]
             name = "partner"
@@ -575,6 +606,40 @@ mod tests {
                 .contains("`both` rule cannot carry a `remap`"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn a_qos1_rule_requires_a_durable_spool() {
+        // #188/ADR 0060 T4: a QoS>=1 rule with no durable spool loses acked messages on
+        // restart, so it is refused unless the operator explicitly opts into ephemeral.
+        let base = |extra: &str| {
+            format!(
+                r#"
+                [local]
+                url = "x:1883"
+                {extra}
+                [[upstreams]]
+                name = "u"
+                url = "a:1"
+                [[upstreams.rules]]
+                direction = "out"
+                filter = "t/#"
+                qos = 1
+                "#
+            )
+        };
+        let err = BridgeConfig::parse_toml(&base("")).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a durable spool"),
+            "got: {err}"
+        );
+        // A durable spool dir satisfies it.
+        BridgeConfig::parse_toml(&base("[spool]\ndir = \"/var/lib/bridge\"")).expect("durable ok");
+        // The explicit ephemeral opt-in satisfies it.
+        BridgeConfig::parse_toml(&base("[spool]\nallow_ephemeral_spool = true"))
+            .expect("ephemeral opt-in ok");
+        // A QoS 0 rule needs no spool.
+        BridgeConfig::parse_toml(&base("").replace("qos = 1", "qos = 0")).expect("qos0 needs none");
     }
 
     #[test]

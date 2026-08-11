@@ -67,7 +67,7 @@
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [5/6 done](0057-durable-outbound-inflight.md) | 1 open |
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [3/5 done](0058-one-dot-zero-stability-contract.md) | 2 open |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
-| [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [0/6 done](0060-bridge-durability-and-ack-contract.md) | 6 open |
+| [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [3/8 done](0060-bridge-durability-and-ack-contract.md) | 5 open |
 
 ## Open and deferred work
 
@@ -176,7 +176,6 @@
 
 - `0060-T1` ⬜ planned: "Red test: a crash/failure injected between the source PUBACK and the spool commit loses the acked message"
 - `0060-T2` ⬜ planned: "Ack-on-durable: pending-ack model — source PUBACK emitted by a completion callback only after spool fsync-commit or a downstream QoS>=1 ack"
-- `0060-T3` ⬜ planned: "Explicit fsync-on-commit spool durability, asserted in code and tested (not left to a redb default)"
-- `0060-T4` ⬜ planned: "Remove silent in-memory fallback: a QoS>=1 rule with no durable spool refuses to start, or runs under `allow_ephemeral_spool` with loud logging"
-- `0060-T5` ⬜ planned: "Audit record on spool drop (topic/direction/upstream/reason) into the ADR 0025 §8 stream; `overflow = drop-oldest | refuse` per-rule, default `refuse` for QoS>=1"
+- `0060-T1` ⬜ planned: "Test: a crash between the source PUBACK and the spool commit loses the acked message"
+- `0060-T2` ⬜ planned: "Ack-on-durable: pending-ack model — source PUBACK only after spool fsync-commit or a downstream ack (needs the store-and-forward queue redesign: spool-then-drain with per-message removal)"
 - `0060-T6` ⬜ planned: "Docs: ADR 0025 §7 Consequences amendment stating the durability contract and overflow behaviour"

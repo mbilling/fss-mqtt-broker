@@ -466,6 +466,8 @@ async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
         share_group = ""
         [local]
         url = "{local}"
+        [spool]
+        allow_ephemeral_spool = true   # this test uses the in-memory spool deliberately
         [[upstreams]]
         name = "down"
         url = "{upstream_addr}"
