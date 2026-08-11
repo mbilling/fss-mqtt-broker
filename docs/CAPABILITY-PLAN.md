@@ -161,5 +161,8 @@ This roadmap is no longer tracked here. Live, per-decision build status is the
 - Project name & branding
 - Default durable storage engine (embedded KV vs. external)
 - Consensus library choice for the small Raft-needing slice
-- Bridge/federation to other brokers
 - Multi-tenancy isolation model
+
+(Resolved and moved out of this list: the **boundary bridge to other brokers** — decided in
+[ADR 0025](adr/0025-boundary-bridge.md) (Accepted) and shipped as the `mqtt-bridge` binary.
+Live per-task status is on the [delivery dashboard](delivery/STATUS.md), not here — see §6.)
