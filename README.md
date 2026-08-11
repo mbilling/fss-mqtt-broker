@@ -567,6 +567,13 @@ be found. Each is tracked; none is a silent surprise.
   never spoken by the cluster bus or QUIC — and **hardened** (ECDHE+AEAD suites
   only, Extended Master Secret required), so opting into 1.2 does not opt into
   1.2's exploit classes.
+- **Some auth and revocation mechanisms are deferred, by choice.** The MQTT 5
+  enhanced-authentication (AUTH) framework is in place and an HMAC challenge
+  example ships, but **SCRAM is not yet implemented**. Certificate revocation is
+  by **CRL** — hot-reloadable, enforced on both the client listener and the
+  cluster bus — with **OCSP not yet supported**. **PSK cipher suites** for
+  constrained devices are not offered: X.509 or token (JWT/OIDC) authentication
+  is the path today. Each is a planned fast-follow, not a design limit.
 - **No production track record.** `v0.9.0` is released and verifiable, but nobody
   is running this in anger yet — there is no operational history behind it.
 
