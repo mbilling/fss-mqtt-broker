@@ -24,6 +24,8 @@ pub struct SpooledMessage {
     pub payload: Vec<u8>,
     /// Delivery `QoS` wire value.
     pub qos: u8,
+    /// Whether to forward with the RETAIN flag set (issue #189).
+    pub retain: bool,
     /// User Properties to forward (includes the incremented hop count).
     pub user_properties: Vec<(String, String)>,
 }
@@ -246,6 +248,7 @@ fn encode(m: &SpooledMessage) -> Vec<u8> {
     put_bytes(&mut out, m.topic.as_bytes());
     put_bytes(&mut out, &m.payload);
     out.push(m.qos);
+    out.push(u8::from(m.retain));
     let n = u32::try_from(m.user_properties.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&n.to_be_bytes());
     for (k, v) in m.user_properties.iter().take(n as usize) {
@@ -289,6 +292,7 @@ fn decode(buf: &[u8]) -> Option<SpooledMessage> {
     let topic = r.string()?;
     let payload = r.bytes()?.to_vec();
     let qos = r.u8()?;
+    let retain = r.u8()? != 0;
     let n = r.u32()?;
     let mut user_properties = Vec::new();
     for _ in 0..n {
@@ -300,6 +304,7 @@ fn decode(buf: &[u8]) -> Option<SpooledMessage> {
         topic,
         payload,
         qos,
+        retain,
         user_properties,
     })
 }
@@ -313,7 +318,26 @@ mod tests {
             topic: topic.to_string(),
             payload: payload.to_vec(),
             qos: 1,
+            retain: false,
             user_properties: vec![("fss-bridge-hop-count".into(), "1".into())],
+        }
+    }
+
+    #[test]
+    fn encode_decode_round_trips_the_retain_flag() {
+        // #189: a spooled forward must preserve the retain bit across encode/decode so a
+        // replay after reconnect still lands retained.
+        for retain in [false, true] {
+            let m = SpooledMessage {
+                topic: "t/x".to_string(),
+                payload: vec![1, 2, 3],
+                qos: 1,
+                retain,
+                user_properties: vec![("k".into(), "v".into())],
+            };
+            let round = decode(&encode(&m)).expect("decodes");
+            assert_eq!(round, m);
+            assert_eq!(round.retain, retain);
         }
     }
 

@@ -146,11 +146,32 @@ pub enum Command {
         payload: Bytes,
         /// Delivery `QoS`.
         qos: QoS,
+        /// Whether to forward with the RETAIN flag set (issue #189): the bridge preserves the
+        /// source message's retain bit so retained state crosses the boundary, subject to the
+        /// rule's `outgoing_retain` escape.
+        retain: bool,
         /// Packet id for `QoS` ≥ 1 (ignored for `QoS` 0).
         pkid: Option<u16>,
         /// MQTT 5 properties (e.g. the incremented hop-count user property).
         properties: Properties,
     },
+}
+
+/// The MQTT 5 subscription options every bridge subscription uses (issue #189).
+///
+/// The bridge is always a subscriber that re-forwards, so it needs **Retain As Published**:
+/// with RAP a live message forwarded because it matched the subscription keeps the RETAIN flag
+/// it was published with, instead of the broker clearing it for established-subscription
+/// delivery [MQTT-3.3.1-9]. That is what lets retained state cross the boundary. `retain_handling`
+/// stays `0` (send retained at subscribe) so a reconnect re-syncs retained state — with RAP on,
+/// that replay is an idempotent retained re-sync, not a fake-live storm (the Mosquitto model).
+/// `no_local` stays `false`: loop prevention is the hop counter + directionality (§6), not NL.
+fn bridge_subscription_options() -> mqtt_codec::packet::SubscriptionOptions {
+    mqtt_codec::packet::SubscriptionOptions {
+        no_local: false,
+        retain_as_published: true,
+        retain_handling: 0,
+    }
 }
 
 impl MqttClient {
@@ -225,7 +246,7 @@ impl MqttClient {
                 filters: vec![SubscribeFilter {
                     path: filter.to_string(),
                     qos,
-                    options: mqtt_codec::packet::SubscriptionOptions::default(),
+                    options: bridge_subscription_options(),
                 }],
             }))
             .await
@@ -242,6 +263,7 @@ impl MqttClient {
         topic: &str,
         payload: Bytes,
         qos: QoS,
+        retain: bool,
         pkid: Option<u16>,
         properties: Properties,
     ) -> Result<(), ClientError> {
@@ -249,7 +271,7 @@ impl MqttClient {
             .send(&Packet::Publish(Publish {
                 dup: false,
                 qos,
-                retain: false,
+                retain,
                 topic: topic.to_string(),
                 pkid: if qos == QoS::AtMostOnce { None } else { pkid },
                 properties,
@@ -371,14 +393,14 @@ impl MqttClient {
                             filters: vec![SubscribeFilter {
                                 path: filter,
                                 qos,
-                                options: mqtt_codec::packet::SubscriptionOptions::default(),
+                                options: bridge_subscription_options(),
                             }],
                         });
                         if writer.send(&pkt).await.is_err() {
                             return ClientError::Closed;
                         }
                     }
-                    Some(Command::Publish { topic, payload, qos, pkid, properties }) => {
+                    Some(Command::Publish { topic, payload, qos, retain, pkid, properties }) => {
                         let pkid = if qos == QoS::AtMostOnce {
                             None
                         } else {
@@ -390,7 +412,7 @@ impl MqttClient {
                         let pkt = Packet::Publish(Publish {
                             dup: false,
                             qos,
-                            retain: false,
+                            retain,
                             topic,
                             pkid,
                             properties,

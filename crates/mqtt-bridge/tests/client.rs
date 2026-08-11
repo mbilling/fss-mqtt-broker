@@ -75,6 +75,7 @@ async fn the_client_connects_subscribes_and_round_trips_a_publish() {
         "bridge/t/a",
         Bytes::from_static(b"hello"),
         QoS::AtLeastOnce,
+        false,
         Some(7),
         props,
     )
