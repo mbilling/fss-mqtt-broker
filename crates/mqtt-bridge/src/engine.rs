@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::client::{Command, ConnectOptions, MqttClient, Transport};
-use crate::config::{BridgeConfig, Endpoint};
-use crate::forward::{plan_forwards, read_hop_count, set_hop_count, Side};
+use crate::config::{BridgeConfig, Endpoint, HaMode};
+use crate::forward::{owns, plan_forwards, read_hop_count, set_hop_count, Side};
 use crate::metrics::{BridgeMetrics, CrossDirection};
 use crate::spool::{Spool, SpooledMessage};
 
@@ -221,6 +221,12 @@ fn spawn_router(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some((side, publish)) = inbound.recv().await {
+            // Partitioned HA (ADR 0059): every instance receives the full stream but forwards
+            // only the topics it owns, so inbound is delivered exactly once and per-topic order
+            // holds. Under `shared` (or a lone instance) this is always true.
+            if cfg.ha == HaMode::Partitioned && !owns(&publish.topic, cfg.total, cfg.instance) {
+                continue;
+            }
             let hop = read_hop_count(&publish.properties);
             let forwards = plan_forwards(&cfg, side, &publish.topic, hop);
             if forwards.is_empty() && hop >= cfg.hop_count_limit {

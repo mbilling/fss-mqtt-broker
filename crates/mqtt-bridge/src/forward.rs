@@ -18,7 +18,7 @@
 use mqtt_codec::properties::{Properties, Property};
 use mqtt_core::topic_matches;
 
-use crate::config::{BridgeConfig, Remap};
+use crate::config::{BridgeConfig, HaMode, Remap};
 
 /// The MQTT 5 user-property key carrying how many fss bridges a message has traversed.
 pub const HOP_COUNT_KEY: &str = "fss-bridge-hop-count";
@@ -108,6 +108,31 @@ pub fn apply_remap(remap: Option<&Remap>, topic: &str) -> String {
     }
 }
 
+/// Whether the instance `instance` of `total` owns `topic` under partitioned HA (ADR 0059).
+///
+/// `total <= 1` → always true (a lone instance owns everything). Otherwise ownership is a
+/// stable hash of the topic mod `total`, so **exactly one** instance forwards each topic —
+/// giving exactly-once inbound and per-topic ordering (one owner = one ordered stream) without
+/// any coordinator or shared state. Every instance still *subscribes* the full filter; this
+/// decides only whether to *forward*.
+#[must_use]
+pub fn owns(topic: &str, total: usize, instance: usize) -> bool {
+    if total <= 1 {
+        return true;
+    }
+    fnv1a(topic.as_bytes()) % total as u64 == instance as u64
+}
+
+/// FNV-1a, 64-bit — a stable, dependency-free, non-cryptographic hash for topic partitioning.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Decide where a message that arrived on `source` with topic `topic` and the given
 /// `hop_count` is forwarded. Empty = dropped (hop limit reached, or no rule matches).
 ///
@@ -166,20 +191,23 @@ pub fn plan_forwards(
 /// is paired with the `QoS` to subscribe at. A one-way `in` rule contributes nothing here —
 /// the closed direction is never subscribed (§4).
 ///
-/// When `share_group` is non-empty each filter is wrapped as `$share/<group>/<filter>` so
-/// ≥2 bridge instances load-balance the local stream with no duplicate forwarding (§5). The
-/// share wrapper affects only the *subscription*; inbound publishes still arrive on the real
-/// topic, which [`plan_forwards`] matches against the bare rule filter.
+/// Under `ha = "shared"` (only) each filter is wrapped as `$share/<group>/<filter>` so ≥2
+/// instances load-balance the local stream (ADR 0025 §5). Under the default `partitioned`
+/// mode the subscription is **plain** — dedup is by topic ownership ([`owns`]), not `$share`,
+/// which also lets retained state cross (a `$share` sub receives no retained messages). The
+/// share wrapper affects only the *subscription*; inbound publishes arrive on the real topic,
+/// which [`plan_forwards`] matches against the bare rule filter.
 #[must_use]
 pub fn local_subscriptions(cfg: &BridgeConfig) -> Vec<(String, u8)> {
+    let use_share = cfg.ha == HaMode::Shared && !cfg.share_group.is_empty();
     let mut subs = Vec::new();
     for up in &cfg.upstreams {
         for rule in &up.rules {
             if rule.direction.allows_out() {
-                let filter = if cfg.share_group.is_empty() {
-                    rule.filter.clone()
-                } else {
+                let filter = if use_share {
                     format!("$share/{}/{}", cfg.share_group, rule.filter)
+                } else {
+                    rule.filter.clone()
                 };
                 subs.push((filter, delivered_qos(rule.qos)));
             }
@@ -375,6 +403,37 @@ mod tests {
     }
 
     #[test]
+    fn ownership_partitions_every_topic_to_exactly_one_instance() {
+        // A lone instance owns everything.
+        assert!(owns("a/b/c", 1, 0));
+        assert!(owns("anything", 1, 0));
+
+        // With total=3, every topic is owned by exactly one of the three instances, and the
+        // decision is stable (same topic → same owner every call).
+        for i in 0..1000u32 {
+            let topic = format!("dev/{i}/state");
+            let owners: Vec<usize> = (0..3).filter(|k| owns(&topic, 3, *k)).collect();
+            assert_eq!(owners.len(), 1, "topic {topic} must have exactly one owner");
+            assert!(owns(&topic, 3, owners[0]), "ownership must be stable");
+        }
+    }
+
+    #[test]
+    fn ownership_spreads_load_across_instances() {
+        // Over many topics all instances get a non-trivial share (not everything on one).
+        let total = 4;
+        let mut counts = [0usize; 4];
+        for i in 0..4000u32 {
+            let topic = format!("dev/{i}/state");
+            let owner = (0..total).find(|k| owns(&topic, total, *k)).unwrap();
+            counts[owner] += 1;
+        }
+        for (k, c) in counts.iter().enumerate() {
+            assert!(*c > 500, "instance {k} owns too few topics: {c}");
+        }
+    }
+
+    #[test]
     fn the_hop_limit_drops_a_message_at_the_limit() {
         let c = sample(); // hop_count_limit = 3
                           // Below the limit: forwarded.
@@ -456,9 +515,10 @@ mod tests {
     }
 
     #[test]
-    fn local_subscriptions_wrap_in_the_share_group_for_ha() {
-        // With a share group, local subscriptions are shared so ≥2 instances load-balance.
+    fn local_subscriptions_wrap_in_share_only_under_shared_ha() {
+        // Under ha = "shared", local subscriptions wrap in $share so ≥2 instances load-balance.
         let c = cfg(r#"
+            ha = "shared"
             share_group = "edge-bridges"
             [local]
             url = "local:1883"
@@ -473,8 +533,11 @@ mod tests {
             local_subscriptions(&c),
             vec![("$share/edge-bridges/telemetry/#".to_string(), 0)]
         );
-        // The default group also wraps (HA on by default).
+        // Under the DEFAULT (partitioned) mode the subscription is PLAIN even with a
+        // share_group set — dedup is by topic ownership, and a plain sub is what lets retained
+        // state cross (a $share sub receives no retained messages).
         let d = cfg(r#"
+            share_group = "edge-bridges"
             [local]
             url = "local:1883"
             [[upstreams]]
@@ -484,9 +547,6 @@ mod tests {
             direction = "out"
             filter = "t/#"
         "#);
-        assert_eq!(
-            local_subscriptions(&d),
-            vec![("$share/fss-bridge/t/#".to_string(), 0)]
-        );
+        assert_eq!(local_subscriptions(&d), vec![("t/#".to_string(), 0)]);
     }
 }

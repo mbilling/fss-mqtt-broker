@@ -68,6 +68,46 @@ catches up, but a long outage or a lost pod is a gap.
 
 ## HA — two or more instances
 
+There are two HA topologies, selected by `ha` (ADR 0059). The default, **`partitioned`**, is
+the one to use.
+
+### Partitioned (the default)
+
+Each instance owns a disjoint hash-slice of the topic space (`hash(topic) mod total ==
+instance`). Every instance subscribes the **full** filter on **both** sides with a *plain*
+subscription, and forwards only the topics it owns. So each message crosses **exactly once**,
+and because one topic has exactly one owner, **per-topic order is preserved** — in **every**
+direction, including `in`/`both` rules. There is no `$share`, no coordinator, and no shared
+state; correctness depends only on each instance knowing its `instance` index and the `total`.
+
+```toml
+ha = "partitioned"   # the default — may be omitted
+[local]
+url = "mqttd:1883"
+client_id = "bridge-__POD_NAME__"     # still distinct per replica (separate sessions)
+```
+
+```sh
+helm upgrade --install mqttd deploy/helm/mqttd \
+  --set bridge.enabled=true --set bridge.replicaCount=2
+```
+
+The chart sets **`MQTTD_BRIDGE_TOTAL`** from `replicaCount`, and the bridge derives its
+**instance index from its pod-name ordinal** (`mqttd-bridge-0` → 0), so the same config ships
+to every replica. Getting `total` wrong is the one footgun: too low **duplicates** inbound,
+too high **strands** a slice — so wire it from the deployment (the chart does). A scale change
+re-derives ownership across the survivors; a dead instance's slice waits for the operator
+rebalance (or a returning ordinal), covered by each side's persistent session meanwhile.
+
+### Shared (`$share`) — opt-in, `out`-only
+
+`ha = "shared"` is the pre-ADR-0059 model: a cluster-side `$share` subscription load-balances
+the local (`out`) stream. It is correct **only for `out` rules** — an `in`/`both` rule at ≥2
+instances **double-delivers** inbound (the foreign broker has no `$share` for the bridge to
+share on), and `$share` load-balances per message so **per-topic order is not preserved**.
+Choose it only for `out`-only, ordering-insensitive deployments. It also **cannot cross
+retained state** (a `$share` subscription receives no retained messages, MQTT-3.8.4).
+
 ```
    ┌──────────────────────────────────────┐
    │  mqttd cluster                       │   The group is CLUSTER-WIDE
@@ -104,15 +144,11 @@ catches up, but a long outage or a lost pod is a gap.
 ```
 
 ```toml
+ha = "shared"                         # opt in to the $share model
 share_group = "edge-bridges"          # the group both replicas join
 [local]
 url = "mqttd:1883"
 client_id = "bridge-__POD_NAME__"     # the chart substitutes the pod name
-```
-
-```sh
-helm upgrade --install mqttd deploy/helm/mqttd \
-  --set bridge.enabled=true --set bridge.replicaCount=2
 ```
 
 ### The two "shared" things are different

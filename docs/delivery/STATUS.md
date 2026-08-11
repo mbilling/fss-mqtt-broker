@@ -66,7 +66,7 @@
 | [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [5/6 done](0057-durable-outbound-inflight.md) | 1 open |
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [3/5 done](0058-one-dot-zero-stability-contract.md) | 2 open |
-| [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [0/6 done](0059-bridge-ha-topology-and-ordering.md) | 6 open |
+| [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
 | [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [0/6 done](0060-bridge-durability-and-ack-contract.md) | 6 open |
 
 ## Open and deferred work
@@ -170,12 +170,7 @@
 
 **0059 — Bridge HA topology and message ordering**
 
-- `0059-T1` ⬜ planned: "Red tests: 2 instances + an `in` rule deliver each message twice; a single publisher's per-topic order is not preserved under `$share` HA"
-- `0059-T2` ⬜ planned: "Instance identity (`MQTTD_BRIDGE_INSTANCE`/`_TOTAL`) + pure `owns(topic, N, k)` ownership function with `partition_key` config"
-- `0059-T3` ⬜ planned: "Partitioned forwarding: every instance subscribes the full filter both sides, drops non-owned topics at the forward step; inbound delivered exactly once, per-topic order preserved (green)"
-- `0059-T4` ⬜ planned: "`ha = partitioned | shared | active-passive` per-rule/global; default `partitioned`; `shared` keeps the `$share` local optimisation with ordering explicitly forfeited"
 - `0059-T5` ⬜ planned: "Optional active/passive mode (liveness signal, whole-key-space takeover) for small fleets"
-- `0059-T6` ⬜ planned: "Docs: bridge HA/ordering guarantees per mode; ADR 0025 §5 Consequences amendment cross-link"
 
 **0060 — Bridge durability and acknowledgement contract**
 

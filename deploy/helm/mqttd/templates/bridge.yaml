@@ -113,6 +113,12 @@ spec:
           imagePullPolicy: {{ .Values.bridge.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Partitioned-HA identity (ADR 0059). TOTAL is the replica count; the bridge
+            # derives its own INSTANCE index from its pod-name ordinal (the StatefulSet
+            # hostname), so this needs no per-version downward-API pod-index label.
+            - name: MQTTD_BRIDGE_TOTAL
+              value: {{ .Values.bridge.replicaCount | quote }}
           args: ["/etc/mqtt-bridge/bridge.toml"]
           ports:
             - name: metrics

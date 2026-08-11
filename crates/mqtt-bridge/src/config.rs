@@ -25,10 +25,26 @@ pub struct BridgeConfig {
     /// this is dropped. Default 8; must be ≥ 1.
     #[serde(default = "default_hop_limit")]
     pub hop_count_limit: u32,
-    /// The cluster-side shared-subscription group for HA (§5): ≥2 bridge instances with the
-    /// same group load-balance the local stream (dedup for free). Default `fss-bridge`; set
-    /// empty to disable sharing (a single non-shared instance). Each instance still needs a
-    /// distinct `local.client_id` (a persistent session is per client).
+    /// High-availability topology across ≥2 bridge instances (ADR 0059). Default
+    /// `partitioned` — each instance owns a disjoint hash-slice of the topic space, so
+    /// inbound is delivered exactly once and per-topic order is preserved in **every**
+    /// direction. See [`HaMode`].
+    #[serde(default)]
+    pub ha: HaMode,
+    /// This instance's index in `0..total` (ADR 0059). Set from the orchestrator —
+    /// `MQTTD_BRIDGE_INSTANCE`, or a `StatefulSet` pod ordinal. Default 0 (a lone instance).
+    #[serde(default)]
+    pub instance: usize,
+    /// The total number of bridge instances sharing this rule set (ADR 0059). Set from the
+    /// orchestrator — `MQTTD_BRIDGE_TOTAL`, or the replica count. Default 1. Under
+    /// `ha = "partitioned"` a wrong value duplicates (too low) or strands (too high) inbound
+    /// traffic, so wire it from the deployment (the Helm chart does).
+    #[serde(default = "default_total")]
+    pub total: usize,
+    /// The `$share` group used **only** under `ha = "shared"` (ADR 0025 §5, superseded as the
+    /// default by ADR 0059). Under `partitioned` it is ignored — ownership handles dedup, and
+    /// a plain subscription is needed for retained crossing (a `$share` sub gets no retained
+    /// messages, MQTT-3.8.4). Default `fss-bridge`; empty disables sharing.
     #[serde(default = "default_share_group")]
     pub share_group: String,
     /// Store-and-forward spool settings (§7): bounded buffering for a momentarily-
@@ -73,6 +89,29 @@ fn default_hop_limit() -> u32 {
 
 fn default_share_group() -> String {
     "fss-bridge".to_string()
+}
+
+fn default_total() -> usize {
+    1
+}
+
+/// How ≥2 bridge instances divide the work for high availability (ADR 0059).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HaMode {
+    /// **Default.** Each instance owns a disjoint hash-slice of the topic space
+    /// (`hash(topic) mod total == instance`). Every instance subscribes the full filter on
+    /// both sides with a *plain* subscription and forwards only the topics it owns, so
+    /// inbound is delivered exactly once and per-topic order is preserved in every direction.
+    /// No `$share`, no coordinator, no shared state; a wrong `total` duplicates or strands.
+    #[default]
+    Partitioned,
+    /// The pre-ADR-0059 model: a cluster-side `$share` subscription load-balances the local
+    /// (`out`) stream. Correct and de-duplicated only for `out` rules — an `in`/`both` rule at
+    /// ≥2 instances **double-delivers** inbound (the foreign broker has no `$share` for the
+    /// bridge to share on), and `$share` load-balances per message so per-topic order is lost.
+    /// Kept as an opt-in optimisation for `out`-only, ordering-insensitive deployments.
+    Shared,
 }
 
 /// A connection to one broker (the local cluster, or an upstream).
@@ -225,6 +264,15 @@ impl BridgeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.hop_count_limit == 0 {
             return Err(invalid("hop_count_limit must be >= 1"));
+        }
+        if self.total == 0 {
+            return Err(invalid("total (bridge instance count) must be >= 1"));
+        }
+        if self.instance >= self.total {
+            return Err(invalid(format!(
+                "instance ({}) must be < total ({})",
+                self.instance, self.total
+            )));
         }
         validate_endpoint("local", &self.local)?;
         let mut seen = HashSet::new();
