@@ -330,36 +330,79 @@ def render_config(conv: Conversion) -> str:
         out.append("# --- Listeners ---")
         out.append("#")
         out.append("# mqttd binds one listener per protocol rather than repeating a")
-        out.append("# `listener` block. TLS is 1.3-only: a client that cannot negotiate")
-        out.append("# TLS 1.3 will fail to connect, so check your device fleet.")
+        out.append("# `listener` block. TLS is 1.3-only by default: a client that cannot")
+        out.append("# negotiate TLS 1.3 will fail to connect, so check your device fleet.")
+        # A TOML table may be declared once. The first listener of each protocol becomes
+        # the binding; the rest become TODOs — emitting `[listeners]` per listener
+        # produced output tomllib rejects ("Cannot declare ('listeners',) twice"), found
+        # by the 2026-08-11 review panel actually running this tool.
+        tls_listeners = [l for l in conv.listeners if l.tls.get("certfile")]
+        plain_listeners = [l for l in conv.listeners if not l.tls.get("certfile")]
         for i, lst in enumerate(conv.listeners):
             port = lst.port if lst.port is not None else 1883
             host = lst.bind or "0.0.0.0"
-            if lst.tls.get("certfile"):
-                out.append(f"#   listener {i}: TLS on {host}:{port}")
-                out.append("[listeners]")
-                out.append(f'tls_bind = "{host}:{port}"')
-                out.append("[tls]")
-                out.append(f'cert = "{lst.tls["certfile"]}"')
-                if lst.tls.get("keyfile"):
-                    out.append(f'key = "{lst.tls["keyfile"]}"')
-                if lst.tls.get("cafile"):
-                    out.append(f'client_ca = "{lst.tls["cafile"]}"')
-                if lst.tls.get("crlfile"):
-                    out.append(f'crl = "{lst.tls["crlfile"]}"')
-                if lst.tls.get("capath"):
-                    out.append(
-                        "# TODO(migrate): capath (a directory of CAs) is not supported; "
-                        "concatenate them into one PEM and set client_ca"
-                    )
-            else:
-                out.append(f"#   listener {i}: PLAINTEXT on {host}:{port}")
-                out.append("[listeners]")
-                out.append(f'plaintext_bind = "{host}:{port}"')
+            kind = "TLS" if lst.tls.get("certfile") else "PLAINTEXT"
+            out.append(f"#   listener {i}: {kind} on {host}:{port}")
+        out.append("[listeners]")
+        if plain_listeners:
+            first = plain_listeners[0]
+            port = first.port if first.port is not None else 1883
+            host = first.bind or "0.0.0.0"
+            out.append(f'plaintext_bind = "{host}:{port}"')
+            out.append(
+                "# WARNING: plaintext. mqttd logs this as an INSECURE mode on every start."
+            )
+            for extra in plain_listeners[1:]:
+                eport = extra.port if extra.port is not None else 1883
+                ehost = extra.bind or "0.0.0.0"
                 out.append(
-                    "# WARNING: plaintext. mqttd logs this as an INSECURE mode on every start."
+                    f"# TODO(migrate): additional plaintext listener {ehost}:{eport} — "
+                    "mqttd binds ONE listener per protocol; consolidate clients onto the "
+                    "bind above"
                 )
-            out.append("")
+        if tls_listeners:
+            first = tls_listeners[0]
+            port = first.port if first.port is not None else 1883
+            host = first.bind or "0.0.0.0"
+            out.append(f'tls_bind = "{host}:{port}"')
+            for extra in tls_listeners[1:]:
+                eport = extra.port if extra.port is not None else 1883
+                ehost = extra.bind or "0.0.0.0"
+                out.append(
+                    f"# TODO(migrate): additional TLS listener {ehost}:{eport} — "
+                    "mqttd binds ONE listener per protocol; consolidate clients onto the "
+                    "bind above"
+                )
+        if tls_listeners:
+            first = tls_listeners[0]
+            out.append("[tls]")
+            out.append(f'cert = "{first.tls["certfile"]}"')
+            if first.tls.get("keyfile"):
+                out.append(f'key = "{first.tls["keyfile"]}"')
+            if first.tls.get("cafile"):
+                # Mosquitto's cafile only VERIFIES certs that clients choose to present
+                # unless require_certificate is true. mqttd's client_ca MANDATES a client
+                # certificate. Mapping one to the other silently turned cert-optional
+                # listeners into mTLS — the exact silent behaviour change this tool
+                # promises never to make (found by the 2026-08-11 review panel).
+                if str(first.tls.get("require_certificate", "false")).lower() == "true":
+                    out.append(f'client_ca = "{first.tls["cafile"]}"')
+                else:
+                    out.append(
+                        "# TODO(migrate): cafile was set but require_certificate was NOT "
+                        "true. mqttd's client_ca MANDATES client certificates (mTLS) — "
+                        "there is no cert-optional mode. Uncomment to require certs "
+                        "fleet-wide, or leave commented for server-only TLS:"
+                    )
+                    out.append(f'# client_ca = "{first.tls["cafile"]}"')
+            if first.tls.get("crlfile"):
+                out.append(f'crl = "{first.tls["crlfile"]}"')
+            if first.tls.get("capath"):
+                out.append(
+                    "# TODO(migrate): capath (a directory of CAs) is not supported; "
+                    "concatenate them into one PEM and set client_ca"
+                )
+        out.append("")
     return "\n".join(out) + "\n"
 
 
