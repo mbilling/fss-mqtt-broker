@@ -249,6 +249,28 @@ impl BridgeConfig {
                         up.name, rule.qos
                     )));
                 }
+                // A rule must not target a reserved `$`-topic (issue #193). `$SYS/#` would
+                // leak broker internals across the boundary, and `$share/...` is the bridge's
+                // own HA construct (added per `share_group`) — a user rule filter that starts
+                // with `$` is a footgun, refused rather than left to the far broker's ACLs.
+                if rule.filter.starts_with('$') {
+                    return Err(invalid(format!(
+                        "upstream {:?}: rule filter {:?} targets a reserved $-topic; \
+                         $SYS/ and $share/ must not be bridged",
+                        up.name, rule.filter
+                    )));
+                }
+                // A `both` rule cannot carry a remap (issue #192): the same strip/prefix
+                // applied in both directions is asymmetric (the reverse leg double-prefixes).
+                // Split it into an `out` rule and an `in` rule, each with its explicit remap.
+                if rule.direction == Direction::Both && rule.remap.is_some() {
+                    return Err(invalid(format!(
+                        "upstream {:?}: a `both` rule cannot carry a `remap` (it would be \
+                         applied asymmetrically); split it into an `out` rule and an `in` \
+                         rule with explicit remaps",
+                        up.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -456,6 +478,54 @@ mod tests {
         let cfg = BridgeConfig::parse_toml(toml).expect("demo bridge.toml must be valid");
         assert_eq!(cfg.upstreams.len(), 1);
         assert_eq!(cfg.upstreams[0].rules.len(), 2);
+    }
+
+    #[test]
+    fn a_reserved_dollar_rule_filter_is_rejected() {
+        // #193: $SYS/# (leaks broker internals) and $share/... (the bridge's own HA
+        // construct) must not be usable as rule filters.
+        for bad in ["$SYS/#", "$share/g/telemetry/#"] {
+            let err = BridgeConfig::parse_toml(&format!(
+                r#"
+                [local]
+                url = "x:1883"
+                [[upstreams]]
+                name = "u"
+                url = "a:1"
+                [[upstreams.rules]]
+                direction = "out"
+                filter = "{bad}"
+                "#,
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("reserved $-topic"),
+                "{bad} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_both_rule_with_a_remap_is_rejected() {
+        // #192: the same remap applied both ways is asymmetric; force two one-way rules.
+        let err = BridgeConfig::parse_toml(
+            r#"
+            [local]
+            url = "x:1883"
+            [[upstreams]]
+            name = "u"
+            url = "a:1"
+            [[upstreams.rules]]
+            direction = "both"
+            filter = "a/#"
+            remap = { strip_prefix = "a/", prefix = "b/" }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("`both` rule cannot carry a `remap`"),
+            "got: {err}"
+        );
     }
 
     #[test]
