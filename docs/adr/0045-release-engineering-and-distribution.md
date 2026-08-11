@@ -1,6 +1,6 @@
 # ADR 0045 — Release engineering and distribution (signed, reproducible, SBOM-attested)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0045-release-engineering-and-distribution.md](../delivery/0045-release-engineering-and-distribution.md) — plan, progress, and changelog
