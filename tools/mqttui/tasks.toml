@@ -126,6 +126,27 @@ help = "Prebuilt broker to test against; this script does NOT build one, it exit
 
 # ── Try it ───────────────────────────────────────────────────────────────────────────
 [[task]]
+id = "cert-audit"
+group = "Migration"
+name = "Audit a fleet of client certificates for what mqttd requires"
+script = "scripts/migrate/cert-audit.sh"
+about = """
+Reads a directory of device certificates and flags every one that would be REJECTED by
+mqttd — most importantly a MISSING clientAuth EKU, which rustls refuses at the handshake
+even for an otherwise-valid cert issued by a trusted CA. OpenSSL-based brokers tolerated
+EKU-less device certs for years, so a migrating fleet discovers this by outage unless it
+is checked first. Also flags weak keys (RSA < 2048, EC < 256), MD5/SHA-1 signatures, and
+expired certs. Exit 1 if any cert is a blocker, so it gates a pre-migration check.
+"""
+requires = ["openssl"]
+duration = "~1s"
+args = ["${CERT_DIR}"]
+[[task.env]]
+name = "CERT_DIR"
+default = "/etc/mqttd/device-certs"
+help = "Directory of device certificates to audit (or pass files)"
+
+[[task]]
 id = "quickstart"
 group = "Try it"
 name = "Run the README's own two-node cluster"
