@@ -523,7 +523,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("`both` rule cannot carry a `remap`"),
+            err.to_string()
+                .contains("`both` rule cannot carry a `remap`"),
             "got: {err}"
         );
     }

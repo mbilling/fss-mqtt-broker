@@ -368,7 +368,10 @@ mod tests {
         "#);
         let f = plan_forwards(&c, Side::Local, "sensors/x", 0);
         assert_eq!(f.len(), 1);
-        assert!(!f[0].retain_ok, "outgoing_retain=false suppresses the retain flag");
+        assert!(
+            !f[0].retain_ok,
+            "outgoing_retain=false suppresses the retain flag"
+        );
     }
 
     #[test]
