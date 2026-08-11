@@ -1224,8 +1224,15 @@ async fn tls12_is_refused_by_default_and_admitted_only_by_opt_in() {
     );
 
     // Opted in: the same client completes the handshake, and the wire says 1.2.
-    let permissive =
-        mqtt_net::tls::server_acceptor_versions(&pki.cert, &pki.key, None, None, 64, true).unwrap();
+    let permissive = mqtt_net::tls::server_acceptor_versions(
+        &pki.cert,
+        &pki.key,
+        None,
+        None,
+        64,
+        mqtt_net::tls::Tls12::Hardened,
+    )
+    .unwrap();
     let addr = start_tls_node(permissive).await;
     let tcp = TcpStream::connect(addr).await.unwrap();
     let tls = TlsConnector::from(client12)

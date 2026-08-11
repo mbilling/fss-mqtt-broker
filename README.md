@@ -524,7 +524,9 @@ be found. Each is tracked; none is a silent surprise.
   For exactly that case, **TLS 1.2 is available as an explicit opt-in**
   (`MQTTD_TLS_ALLOW_TLS12` / `[tls].allow_tls12`) on the client-facing TLS
   listener only: off by default, loudly logged on every start while enabled,
-  and never spoken by the cluster bus or QUIC.
+  never spoken by the cluster bus or QUIC — and **hardened** (ECDHE+AEAD suites
+  only, Extended Master Secret required), so opting into 1.2 does not opt into
+  1.2's exploit classes.
 - **No production track record.** `v0.9.0` is released and verifiable, but nobody
   is running this in anger yet — there is no operational history behind it.
 
