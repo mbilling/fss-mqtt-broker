@@ -562,25 +562,35 @@ async fn a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit() {
     // Let both sides connect and subscribe (both directions of the `both` rule).
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
+    // A message that has ALREADY traversed the hop limit must be dropped at the crossing —
+    // the backstop for a multi-broker cycle (A→B→C→A) that No Local cannot catch. The trivial
+    // single-broker self-echo loop is now prevented at the source by No Local (#198: the broker
+    // does not echo the bridge's own forwards back to it), so the hop counter is exercised
+    // directly with a pre-stamped message rather than by spinning a real loop. Republish until
+    // the bridge's local subscription is live and the drop registers.
     let mut local_pub = client(local, "loop-pub").await;
-    local_pub
-        .publish(
-            "loop/x",
-            Bytes::from_static(b"echo"),
-            QoS::AtMostOnce,
-            false,
-            None,
-            Properties::new(),
-        )
-        .await
-        .unwrap();
-
-    // The loop must self-terminate: a copy reaches the hop limit and is dropped.
+    let at_limit = || {
+        Properties(vec![Property::UserProperty(
+            "fss-bridge-hop-count".into(),
+            "3".into(), // == hop_count_limit
+        )])
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while metrics.dropped_hop_limit_count() == 0 {
+        local_pub
+            .publish(
+                "loop/x",
+                Bytes::from_static(b"echo"),
+                QoS::AtMostOnce,
+                false,
+                None,
+                at_limit(),
+            )
+            .await
+            .unwrap();
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the no-remap both-rule loop never hit the hop limit (did it amplify unbounded?)"
+            "a message already at the hop limit was not dropped at the crossing"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
