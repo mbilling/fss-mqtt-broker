@@ -2577,6 +2577,9 @@ impl Hub {
         }
     }
 
+    // Quota check, per-filter grant/deny, retained replay and its two now-counted
+    // drop paths (#87 item 5) — one linear flow over the subscribe request.
+    #[allow(clippy::too_many_lines)]
     async fn subscribe(
         &mut self,
         client: &ClientId,
@@ -2644,13 +2647,26 @@ impl Hub {
             }
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
             self.table.subscribe(client.clone(), f.clone());
-            if let Ok(matching) = self.retained.matching(f).await {
-                for m in matching {
-                    retained_replay.push(Message {
-                        qos: min_qos(m.qos, *q),
-                        retain: true,
-                        ..m
-                    });
+            match self.retained.matching(f).await {
+                Ok(matching) => {
+                    for m in matching {
+                        retained_replay.push(Message {
+                            qos: min_qos(m.qos, *q),
+                            retain: true,
+                            ..m
+                        });
+                    }
+                }
+                // #87 item 5: a store error here silently dropped the retained replay — a
+                // new subscriber saw no retained value and had no way to know one existed.
+                // Count and log it (bounded reason) so the next such incident is visible
+                // rather than invisible.
+                Err(e) => {
+                    warn!(client = %client.0, filter = %f, error = %e,
+                          "retained replay skipped: the retained store could not be read");
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("retained-replay-read-failed");
+                    }
                 }
             }
         }
@@ -2693,6 +2709,17 @@ impl Hub {
                 // retained store, and a crash mid-delivery loses the delivery, not the
                 // fact — the value is still there and is replayed to the next subscribe.
                 self.send_to_client(client, &tx, &m, true, None, None).await;
+            }
+        } else if !retained_replay.is_empty() {
+            // #87 item 5: the subscription resolved retained values but the client is not
+            // online to receive them, so they are dropped here. This was invisible; count
+            // and log it. It is not a durability loss — the retained values are still in
+            // the store and replay on the next SUBSCRIBE — but a persistent gap between
+            // "subscribed" and "online" that keeps hitting this is worth seeing.
+            warn!(client = %client.0, dropped = retained_replay.len(),
+                  "retained replay dropped: client subscribed but is not online");
+            if let Some(m) = &self.metrics {
+                m.publish_dropped("retained-replay-client-offline");
             }
         }
     }
@@ -5342,6 +5369,18 @@ impl Hub {
             return;
         }
         self.retained_tokens.insert(topic.to_string(), token);
+
+        // #87 item 3 was proposed here — deliver a committed retained update to
+        // already-subscribed local clients from this apply path. It is deliberately NOT
+        // done: live delivery to an established remote subscriber is ALREADY handled by the
+        // interest-forward path (`forward_to_peers` forwards to any node whose advertised
+        // remote_interest matches, independent of `retain_broadcasts`), which reaches the
+        // subscriber's node and fans out through `deliver_local`. Delivering again here
+        // would DOUBLE-deliver every retained update to any subscriber whose interest the
+        // owner already knows — the steady state. The only residual is the sub-second
+        // window before a fresh subscription's interest reaches the owner; the value is
+        // still stored, served to later subscribers, and carried by the next update, so the
+        // miss is bounded with no permanent loss (tracked with item 4).
     }
 
     /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
