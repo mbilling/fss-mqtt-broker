@@ -64,6 +64,13 @@ cargo install --locked --path tools/mqttui
 mqttui            # the terminal UI — `mqttui --list` is the same thing, headless
 ```
 
+> **Prerequisites** (stated here because nothing is worse than a front door that
+> assumes them): a Rust toolchain for the `cargo install` above
+> ([rustup.rs](https://rustup.rs)); **Docker** for the demos and reference
+> deployments; and the Mosquitto client tools for every pub/sub snippet in this
+> file (`brew install mosquitto` / `apt install mosquitto-clients`). Signed
+> prebuilt `mqttui` binaries ship with releases after v0.9.0.
+
 **Migrating from a production broker, or evaluating one?**
 
 ```sh
