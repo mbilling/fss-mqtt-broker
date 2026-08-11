@@ -1,8 +1,10 @@
 # How mqttd compares — Mosquitto · EMQX · NanoMQ · VerneMQ
 
-**Dated 2026-08-03.** Versions compared: **mqttd** `0.9.0-rc` (unreleased, built from
-source) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines differ) ·
-**EMQX** 6.2.2 · **NanoMQ** 0.25.5 · **VerneMQ** 2.1.1.
+**Dated 2026-08-11.** Versions compared: **mqttd** `v0.9.0` (released — signed,
+reproducible, SBOM-attested) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
+differ) · **EMQX** 6.2.2 (documentation cells; the benchmark ran 5.8.6, the last
+Apache-licensed line — see `bench/results/results.md`) · **NanoMQ** 0.25.5 ·
+**VerneMQ** 2.1.1.
 
 This document obeys [ADR 0048](adr/0048-comparative-benchmarking.md)'s honesty rules,
 applied to prose: versions pinned, claims dated, **losing cells printed as prominently
@@ -56,7 +58,7 @@ All five serve MQTT 3.1.1 and 5.0. The differences are in the v5 details:
 | Enhanced auth (AUTH) | ⚠️ **built-in** challenge/response; server-initiated re-auth deferred (0013-T8) | ⚠️ plugin events only, no built-in | ✅ | ✖ documented unsupported | ⚠️ plugin-provided only, no built-in |
 | Will delay | ✅ | ✅ | ✅ | n/v (documented for bridges only) | ⚠️ lost across netsplit "window of uncertainty" (documented) |
 | Request/response forwarding | ✅ Response Topic + Correlation Data | ✅ | ✅ | ✅ | ✅ |
-| Assigned client id (empty-id clients) | **✖ refused, not assigned** | ✅ | ✅ | n/v | ✅ |
+| Assigned client id (empty-id clients) | ✅ for clean sessions (MQTT 5 `AssignedClientIdentifier` returned); **✖ refused for persistent ones** — a generated id has no session to resume (`crates/mqttd/src/conn.rs`) | ✅ | ✅ | n/v | ✅ |
 | Maximum packet size | ✅ advertised + enforced both ways | ✅ | ✅ | ✅ configurable | ⚠️ inbound yes; outbound enforcement unverified in source |
 
 Neither mqttd nor VerneMQ sends CONNACK Response Information or Server Keep Alive;
@@ -89,14 +91,14 @@ node clusters under kill/partition/upgrade/soak harnesses.
 
 | | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
 |---|---|---|---|---|---|
-| TLS stack | rustls, **TLS 1.3 only** | OpenSSL | OTP ssl | mbedTLS (1.3 n/v) | OTP ssl |
+| TLS stack | rustls on aws-lc-rs, **TLS 1.3 by default**; hardened 1.2 opt-in (ECDHE+AEAD allowlist, EMS required, loudly logged) | OpenSSL | OTP ssl | mbedTLS (1.3 n/v) | OTP ssl |
 | mTLS client certs | ✅ identity from CN/SAN, no-fallback (ADR 0004) | ✅ | ✅ | ✅ | ✅ |
 | Built-in authentication | mTLS + Argon2id passwords + JWT + **OIDC with live JWKS rotation** | password file + dynamic-security plugin | extensive built-ins (DB, JWT, HTTP, LDAP, …) | password file + HTTP auth | files/DB via plugins; no built-in OIDC |
 | Authorization | deny-by-default TOML ACLs, `%i`/`%c`, connect ACL | `acl_file` + dynsec | built-in authz sources | HOCON ACL | `vmq_acl` file / DB plugins |
 | Policy hot reload | ✅ validate-before-swap, **and the reload sweeps live state** — revoked cert/user/grant evicts running sessions and flows (ADR 0040) | ⚠️ SIGHUP reloads; live eviction not documented | n/v | ⚠️ HTTP `/reload`, subset | ⚠️ live reconfig via CLI; live eviction not documented |
 | Audit trail | ✅ hash-chained, tamper-evident | not documented | n/v | not documented | not documented |
 | Memory safety | Rust, `#![forbid(unsafe_code)]` | C | Erlang/BEAM | C | Erlang/BEAM |
-| Release integrity | reproducible builds, keyless cosign signatures, SLSA provenance, SBOM — pipeline in place (first tag pending) | — | n/v | — | — |
+| Release integrity | reproducible builds, keyless cosign signatures, SLSA provenance, SBOM — shipped with `v0.9.0` (15 signed assets) | — | n/v | — | — |
 
 Every mqttd insecure mode (plaintext, anonymous, unenforced ACL) is opt-in and loudly
 logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
@@ -126,7 +128,7 @@ Packet-size enforcement is compared in the Protocol table above.
 | | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
 |---|---|---|---|---|---|
 | Max connections | ✅ global + per-IP (`MQTTD_MAX_CONNECTIONS`, `_PER_IP`), refused at accept before TLS work | ✅ `max_connections` | ✅ per-listener | n/v | ✅ `listener.max_connections` (default 10 000) |
-| Queued/offline messages per session | ✅ count, default 100 000, overflow `drop-oldest` or `disconnect` (`MQTTD_MAX_QUEUED_MESSAGES`, `MQTTD_QUEUE_OVERFLOW`); ✖ **no byte-based cap** — accepted, tracked (ADR 0041 amendment T6) | ✅ count (`max_queued_messages`, default 1000) **and bytes** (`max_queued_bytes`) | ✅ `max_mqueue_len` (default 1000); byte variant n/v | ⚠️ `msq_len`; byte variant n/v | ✅ `max_online_messages` / `max_offline_messages` (1000/1000) |
+| Queued/offline messages per session | ✅ count, default 100 000, overflow `drop-oldest` or `reject-newest` (`MQTTD_MAX_QUEUED_MESSAGES`, `MQTTD_QUEUE_OVERFLOW`); ✖ **no byte-based cap** — accepted, tracked (ADR 0041 amendment T6) | ✅ count (`max_queued_messages`, default 1000) **and bytes** (`max_queued_bytes`) | ✅ `max_mqueue_len` (default 1000); byte variant n/v | ⚠️ `msq_len`; byte variant n/v | ✅ `max_online_messages` / `max_offline_messages` (1000/1000) |
 | Subscriptions per client | ✅ `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` (per-slot `0x97`) | n/v | ✅ | n/v | n/v |
 | Publish rate limiting | ✅ token bucket + TCP backpressure — pause, not drop (`MQTTD_MAX_PUBLISH_RATE`) | ✖ | ✅ rate limiters | n/v | n/v |
 | Retained-store bound | ✅ topic count (`MQTTD_MAX_RETAINED_MESSAGES`); overwrite/clear always allowed | ✖ | ✅ retainer limits | n/v | n/v |
@@ -141,7 +143,7 @@ Packet-size enforcement is compared in the Protocol table above.
 | | mqttd | Mosquitto | EMQX | NanoMQ | VerneMQ |
 |---|---|---|---|---|---|
 | License | **Apache-2.0, everything** | EPL-2.0 / EDL-1.0 | **BSL 1.1** since 5.9 (2025): single node free, production clustering commercial, each release converts to Apache-2.0 after 4 years; last Apache line (5.8) EOL 2026-02-28 | MIT | Apache-2.0 **source**; official binaries/images under EULA — paid for commercial production since 1.10 (2019) |
-| Binaries | signed (keyless cosign), reproducible, SBOM-attested, multi-arch, free — pipeline in place, first tag pending | free | free image; features licensed | free | EULA (free to test) |
+| Binaries | signed (keyless cosign), reproducible, SBOM-attested, multi-arch, free — shipped with `v0.9.0` | free | free image; features licensed | free | EULA (free to test) |
 | Paid tier | support/SLA only — no gated features (project principle) | none (foundation project) | license-gated production features | none | binary packages + support |
 
 ## The two names newcomers ask about: HiveMQ and AWS IoT Core
@@ -187,12 +189,19 @@ below are limited to each vendor's own published positioning; no benchmark numbe
 Competitor facts: official docs, changelogs, release notes, Docker Hub metadata, and
 source (researched 2026-07-29 → 2026-08-03; VerneMQ cluster behavior additionally from
 its documented netsplit semantics and public issue tracker). mqttd facts: this
-repository at `0.9.0-rc`. Cells marked n/v were not verified and are treated as unknown,
+repository at `v0.9.0`. Cells marked n/v were not verified and are treated as unknown,
 not as absent. This file is re-checked at every cross-broker benchmark re-run
 (per release, ADR 0048 §5); staleness beyond one release cycle is a defect.
 
 ## Changelog
 
+- 2026-08-11 — Corrections from the review-panel re-run, which found this file stale in
+  seven checkable places (all five reviewers hit at least one): release status
+  ("unreleased"/"first tag pending" — v0.9.0 shipped 2026-07-22), the date header, the
+  assigned-client-id cell (the code ASSIGNS for clean sessions and refuses only
+  persistent ones — the cell under-claimed against ourselves), the TLS cell (1.2
+  hardened opt-in shipped), the overflow modes (`reject-newest`, not `disconnect`), and
+  the EMQX version framing (docs cells 6.2.2, benchmark 5.8.6).
 - 2026-08-11 — Added the HiveMQ / AWS IoT Core section (the two names newcomers ask
   about were absent). Claims limited to vendor-published positioning; both are outside
   the ADR 0048 benchmark set (not self-hostable like-for-like).
