@@ -167,6 +167,17 @@ pub struct Rule {
     /// The `QoS` to forward at (`0..=2`; the engine downgrades 2→1, §7). Default 0.
     #[serde(default)]
     pub qos: u8,
+    /// Whether a forwarded message keeps its RETAIN flag (issue #189). Default `true` — the
+    /// bridge preserves retained state across the boundary. Set `false` for a far broker that
+    /// cannot handle retained messages (e.g. `AWS IoT Core`), which strips the flag on egress —
+    /// the Mosquitto `bridge_outgoing_retain` escape.
+    #[serde(default = "default_outgoing_retain")]
+    pub outgoing_retain: bool,
+}
+
+/// Retained state crosses the boundary by default (issue #189).
+fn default_outgoing_retain() -> bool {
+    true
 }
 
 /// A topic remap: strip `strip_prefix` from the source topic (if present), then prepend

@@ -391,6 +391,7 @@ mod tests {
             topic: topic.to_string(),
             payload: vec![1, 2, 3],
             qos: 0,
+            retain: false,
             user_properties: Vec::new(),
         }
     }

@@ -243,12 +243,15 @@ fn spawn_router(
                 );
                 // Forward the publisher's user properties, with the hop count incremented.
                 let properties = set_hop_count(&publish.properties, hop + 1);
+                // Preserve the source retain bit unless the rule opts out (issue #189).
+                let retain = publish.retain && f.retain_ok;
                 if connected[idx].load(Ordering::SeqCst) {
                     // Fast path: the destination is up — the run loop assigns the packet id.
                     let _ = cmd_tx[idx].send(Command::Publish {
                         topic: f.topic,
                         payload: publish.payload.clone(),
                         qos: qos_from_u8(f.qos),
+                        retain,
                         pkid: None,
                         properties,
                     });
@@ -268,6 +271,7 @@ fn spawn_router(
                         topic: f.topic,
                         payload: publish.payload.to_vec(),
                         qos: f.qos,
+                        retain,
                         user_properties,
                     };
                     if let Err(e) = spools[idx].push(&spooled) {
@@ -324,6 +328,7 @@ fn replay_spool(spool: &Spool, self_tx: &mpsc::UnboundedSender<Command>, side: S
                     topic: m.topic,
                     payload: Bytes::from(m.payload),
                     qos: qos_from_u8(m.qos),
+                    retain: m.retain,
                     pkid: None,
                     properties,
                 });

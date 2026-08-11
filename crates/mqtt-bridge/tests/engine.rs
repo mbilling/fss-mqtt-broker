@@ -109,6 +109,7 @@ async fn a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back() {
                 "telemetry/room/temp",
                 Bytes::from_static(b"21C"),
                 QoS::AtMostOnce,
+                false,
                 None,
                 Properties::new(),
             )
@@ -143,6 +144,7 @@ async fn a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back() {
                 "telemetry/leak/probe",
                 Bytes::from_static(b"LEAK-PROBE"),
                 QoS::AtMostOnce,
+                false,
                 None,
                 Properties::new(),
             )
@@ -164,6 +166,126 @@ async fn a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back() {
     let m = bridge.metrics();
     assert!(m.forwarded_out_count() >= 1, "the out forward was counted");
     assert_eq!(m.forwarded_in_count(), 0, "nothing was forwarded inbound");
+
+    bridge.shutdown();
+}
+
+/// #189 (bridge audit #1/#2): retained state must cross the boundary. A value that is already
+/// retained on the local side (published before the bridge connects) must be forwarded **with**
+/// the retain flag and land in the **upstream** broker's retained store — a *fresh* subscriber
+/// on the upstream then replays it with RETAIN set. Before the fix the bridge forwarded with
+/// `retain` hardcoded false, so the value crossed (if at all) as an ordinary message and never
+/// entered the upstream's retained store.
+///
+/// The bridge receives this existing retained value as a **retained replay at subscribe time**,
+/// which always carries retain=1 (independent of Retain As Published). RAP additionally matters
+/// for a value published *while the bridge is already subscribed* (live traffic); that path also
+/// needs the local broker to honour the RAP subscription option, tracked separately.
+///
+/// `share_group` is cleared here: a `$share` subscription receives **no** retained messages
+/// (MQTT-3.8.4), so retained state can only cross over a plain subscription. Under the default
+/// shared-subscription HA the retained replay never arrives — the convergence with the HA
+/// redesign in ADR 0059, whose partitioned *plain* subscriptions restore retained crossing.
+#[tokio::test]
+async fn a_retained_message_crosses_the_boundary_and_lands_retained() {
+    let local = start_broker().await;
+    let upstream = start_broker().await;
+
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+
+        [local]
+        url = "{local}"
+
+        [[upstreams]]
+        name = "partner"
+        url = "{upstream}"
+
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "sensors/#"
+        "#,
+    ))
+    .unwrap();
+
+    // Existing retained state on LOCAL, published BEFORE the bridge connects.
+    let mut local_pub = client(local, "ret-pub").await;
+    local_pub
+        .publish(
+            "sensors/room/temp",
+            Bytes::from_static(b"21C"),
+            QoS::AtMostOnce,
+            true, // retained
+            None,
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+
+    // Let the local broker store the retained value before the bridge subscribes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A live upstream subscriber, connected before the bridge, to confirm the value crosses
+    // at all (separate from whether it lands retained).
+    let mut up_live = client(upstream, "ret-live").await;
+    subscribe(&mut up_live, "sensors/#").await;
+
+    // The bridge subscribes to sensors/# on local, receives the retained value as a retained
+    // replay (retain=1), and must forward it to the upstream WITH the retain flag so it enters
+    // the upstream's retained store.
+    let bridge = Bridge::start(cfg);
+
+    // 1. It must cross at all.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), up_live.next_event()).await {
+            Ok(Ok(Event::Publish(p))) if p.topic == "sensors/room/temp" => {
+                assert_eq!(&p.payload[..], b"21C");
+                break;
+            }
+            Ok(Ok(_)) => {}
+            _ => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the retained value never crossed to the upstream at all"
+            ),
+        }
+    }
+
+    // 2. A FRESH upstream subscriber replays only what the upstream stored retained.
+    let mut n = 0;
+    let replayed = loop {
+        n += 1;
+        let mut fresh = client(upstream, &format!("ret-fresh-{n}")).await;
+        fresh
+            .subscribe(1, "sensors/#", QoS::AtMostOnce)
+            .await
+            .unwrap();
+        let mut found = None;
+        let inner = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < inner {
+            match tokio::time::timeout(Duration::from_millis(150), fresh.next_event()).await {
+                Ok(Ok(Event::Publish(p))) if p.topic == "sensors/room/temp" => {
+                    found = Some(p);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => {}
+            }
+        }
+        if let Some(p) = found {
+            break p;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the retained value never reached the upstream's retained store"
+        );
+    };
+    assert!(
+        replayed.retain,
+        "the crossed value must be stored RETAINED on the upstream (retain flag set on replay)"
+    );
+    assert_eq!(&replayed.payload[..], b"21C");
 
     bridge.shutdown();
 }
@@ -211,6 +333,7 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
                 "telemetry/x",
                 Bytes::from(format!("m{n}")),
                 QoS::AtMostOnce,
+                false,
                 None,
                 Properties::new(),
             )
@@ -280,6 +403,7 @@ async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
                 "t/x",
                 Bytes::from(format!("s{n}")),
                 QoS::AtLeastOnce,
+                false,
                 Some(n),
                 Properties::new(),
             )
@@ -356,6 +480,7 @@ async fn a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit() {
             "loop/x",
             Bytes::from_static(b"echo"),
             QoS::AtMostOnce,
+            false,
             None,
             Properties::new(),
         )
@@ -419,6 +544,7 @@ async fn a_local_message_fans_out_to_multiple_upstreams() {
                 "fan/x",
                 Bytes::from_static(b"fanout"),
                 QoS::AtMostOnce,
+                false,
                 None,
                 Properties::new(),
             )

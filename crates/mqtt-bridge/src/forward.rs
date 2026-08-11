@@ -74,6 +74,9 @@ pub struct Forward {
     pub topic: String,
     /// The delivery `QoS` wire value (`0` or `1`; a rule's `2` is downgraded, §7).
     pub qos: u8,
+    /// Whether this rule permits the RETAIN flag to cross (issue #189): the source retain bit
+    /// is forwarded only when the matching rule's `outgoing_retain` is set (the default).
+    pub retain_ok: bool,
 }
 
 /// Downgrade a rule `QoS` to what the bridge delivers: `2` becomes `1` (at-least-once across
@@ -133,6 +136,7 @@ pub fn plan_forwards(
                             dest: Side::Upstream(i),
                             topic: apply_remap(rule.remap.as_ref(), topic),
                             qos: delivered_qos(rule.qos),
+                            retain_ok: rule.outgoing_retain,
                         });
                     }
                 }
@@ -147,6 +151,7 @@ pub fn plan_forwards(
                             dest: Side::Local,
                             topic: apply_remap(rule.remap.as_ref(), topic),
                             qos: delivered_qos(rule.qos),
+                            retain_ok: rule.outgoing_retain,
                         });
                     }
                 }
@@ -269,6 +274,7 @@ mod tests {
                 dest: Side::Upstream(0),
                 topic: "org/telemetry/room/temp".into(),
                 qos: 1,
+                retain_ok: true,
             }]
         );
     }
@@ -298,6 +304,7 @@ mod tests {
                 dest: Side::Local,
                 topic: "commands/reboot".into(),
                 qos: 1,
+                retain_ok: true,
             }]
         );
     }
@@ -312,7 +319,8 @@ mod tests {
             vec![Forward {
                 dest: Side::Upstream(0),
                 topic: "shared/x".into(),
-                qos: 0
+                qos: 0,
+                retain_ok: true,
             }]
         );
         let inn = plan_forwards(&c, Side::Upstream(0), "shared/x", 0);
@@ -321,9 +329,46 @@ mod tests {
             vec![Forward {
                 dest: Side::Local,
                 topic: "shared/x".into(),
-                qos: 0
+                qos: 0,
+                retain_ok: true,
             }]
         );
+    }
+
+    #[test]
+    fn retain_crosses_by_default_and_the_escape_suppresses_it() {
+        // Default: outgoing_retain is true, so a forward permits the retain flag (#189).
+        let c = cfg(r#"
+            share_group = ""
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "sensors/#"
+        "#);
+        let f = plan_forwards(&c, Side::Local, "sensors/x", 0);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].retain_ok, "retain crosses by default");
+
+        // The escape: outgoing_retain = false strips the retain flag on egress.
+        let c = cfg(r#"
+            share_group = ""
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "sensors/#"
+            outgoing_retain = false
+        "#);
+        let f = plan_forwards(&c, Side::Local, "sensors/x", 0);
+        assert_eq!(f.len(), 1);
+        assert!(!f[0].retain_ok, "outgoing_retain=false suppresses the retain flag");
     }
 
     #[test]
