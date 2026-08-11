@@ -192,6 +192,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
+    // or config work (#169). `--version` in particular MUST exist — an operator typing it
+    // expecting a version once silently BOOTED A BROKER, because unrecognised flags fell
+    // through to startup (the reject-unknown-flags check below now closes that).
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!("mqttd {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    if std::env::args().skip(1).any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        std::process::exit(0);
+    }
+
+    // #169: a flag the broker does not recognise must be an ERROR, not a silent boot. Three
+    // reviewers independently hit `mqttd --version` (or a typo) quietly starting a real
+    // broker. Checked before any subcommand dispatch or resource acquisition, so a
+    // mistyped flag never reaches startup.
+    reject_unknown_flags();
+
     // ADR 0046 T3: `--check-config` validates the config the broker would boot with and exits,
     // without binding a port or starting the hub — the GitOps/pre-rollout gate. Handled here,
     // before any resource is acquired.
@@ -2524,6 +2546,63 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config::load(path.as_deref())?)
 }
 
+/// Every flag `mqttd` recognises (#169). A dash-prefixed argument not in this list is a
+/// mistake, not a silent boot. Values (a `--config` path, a `--hash-password` username, a
+/// `--probe` path) do not start with `-`, so they are never mistaken for flags.
+const KNOWN_FLAGS: &[&str] = &[
+    "--check-config",
+    "--config",
+    "--hash-password",
+    "--probe",
+    "--url",
+    "--decommission",
+    "--pid",
+    "--timeout",
+    "--version",
+    "-V",
+    "--help",
+    "-h",
+];
+
+/// The dash-prefixed arguments `mqttd` does not recognise. Pure over the argument list so
+/// it is unit-testable without spawning the binary (#169).
+fn unknown_flags<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    args.into_iter()
+        .filter(|a| a.starts_with('-') && !KNOWN_FLAGS.contains(&a.as_str()))
+        .collect()
+}
+
+/// Reject any unrecognised flag with a clear error and exit `2`, rather than falling
+/// through to boot a broker (#169 — the footgun three review reviewers hit with
+/// `mqttd --version`). Recognised subcommands are dispatched by the callers above.
+fn reject_unknown_flags() {
+    let unknown = unknown_flags(std::env::args().skip(1));
+    if !unknown.is_empty() {
+        eprintln!("mqttd: unrecognised argument(s): {}", unknown.join(", "));
+        eprintln!("Try 'mqttd --help' for the list of flags.");
+        std::process::exit(2);
+    }
+}
+
+/// One-screen usage for `--help`.
+fn print_usage() {
+    println!(
+        "mqttd {} — a security-first, cluster-native MQTT broker\n\n\
+         USAGE:\n  \
+           mqttd                     start the broker (configured by MQTTD_* env / --config)\n  \
+           mqttd --config <path>     start with a TOML config file (env still overlays)\n  \
+           mqttd --check-config      validate the effective config and exit (no ports bound)\n  \
+           mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
+           mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
+           mqttd --decommission      drain and gracefully stop the running broker\n  \
+           mqttd --version           print the version and exit\n  \
+           mqttd --help              print this help and exit\n\n\
+         Configuration is via MQTTD_* environment variables and/or a --config TOML file;\n\
+         see docs/mqttd.example.toml and the README.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 /// Validate the config the broker would boot with (file from `--config` / `MQTTD_CONFIG`,
 /// layered under the `MQTTD_*` env), then exit — **without binding any port or starting the
 /// hub** (ADR 0046 T3). For CI gates and pre-rollout operator checks: `mqttd --check-config`
@@ -3063,10 +3142,56 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::{
         identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
-        runtime_precheck, wire_limits_from_config,
+        runtime_precheck, unknown_flags, wire_limits_from_config,
     };
     use mqtt_config::Config;
     use mqtt_storage::OverflowPolicy;
+
+    /// #169 self-guard: every double-dash flag this source compares against must be in
+    /// `KNOWN_FLAGS`, or the strict-rejection check would refuse a flag the code accepts.
+    /// A new subcommand flag added without listing it here fails this test — which is
+    /// exactly how a missing `--pid`/`--timeout` was caught in CI the first time.
+    #[test]
+    fn every_flag_the_code_compares_is_in_the_known_set() {
+        let src = include_str!("main.rs");
+        let mut missing = Vec::new();
+        // Each occurrence of `== "` opens a compared string literal; keep the ones that
+        // start with `--` (the double-dash flags) and check membership.
+        for (i, _) in src.match_indices("== \"") {
+            let rest = &src[i + 4..];
+            let Some(end) = rest.find('"') else { continue };
+            let tok = &rest[..end];
+            if tok.starts_with("--")
+                && !super::KNOWN_FLAGS.contains(&tok)
+                && !missing.contains(&tok.to_string())
+            {
+                missing.push(tok.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these flags are compared in main.rs but absent from KNOWN_FLAGS, so the strict \
+             check would reject them: {missing:?}"
+        );
+    }
+
+    /// #169 — a mistyped or unrecognised flag is reported, not silently booted; known
+    /// flags and their (dash-less) values pass through clean.
+    #[test]
+    fn unknown_flags_are_caught_and_known_ones_pass() {
+        let v = |a: &[&str]| unknown_flags(a.iter().map(|s| (*s).to_string()));
+
+        assert_eq!(v(&["--verison"]), vec!["--verison"], "a typo is caught");
+        assert_eq!(v(&["--nope", "-x"]), vec!["--nope", "-x"], "both reported");
+        // Known flags and their values are clean — no false positives.
+        assert!(v(&["--config", "/etc/mqttd.toml"]).is_empty());
+        assert!(v(&["--check-config"]).is_empty());
+        assert!(v(&["--probe", "/readyz", "--url", "http://x:8080"]).is_empty());
+        assert!(v(&["--version"]).is_empty() && v(&["-V"]).is_empty());
+        assert!(v(&["--hash-password", "alice"]).is_empty());
+        // No flags at all (normal boot): nothing rejected.
+        assert!(v(&[]).is_empty());
+    }
 
     #[test]
     fn positive_cap_rejects_zero_and_converts() {

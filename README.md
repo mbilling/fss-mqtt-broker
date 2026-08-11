@@ -634,11 +634,8 @@ build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook
 docker run --rm ghcr.io/mbilling/fss-mqtt-broker:latest --check-config
 # → config OK: defaults + MQTTD_* env overlay validates (no config file set)
 #
-# Note: there is no `--version` flag. mqttd recognises only `--check-config`,
-# `--hash-password` and `--decommission`, and IGNORES anything else — so an
-# unrecognised flag starts a real broker instead of erroring (tracked as
-# ADR 0046 T6). The running version is logged at startup:
-# `starting mqttd version="0.9.0"`.
+# `mqttd --version` prints the version and exits; `mqttd --help` lists every flag.
+# An unrecognised flag is now an ERROR (exit 2), not a silent broker start.
 
 # Verify the image signature before trusting it:
 cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0 \
