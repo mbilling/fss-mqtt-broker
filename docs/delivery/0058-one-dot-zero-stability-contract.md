@@ -1,0 +1,43 @@
+---
+adr: "0058"
+title: "The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin"
+adr_status: Proposed
+tasks:
+  - id: 0058-T1
+    title: "`gate_or_migrate`: per-step transactional resumable migrations in `mqtt-storage::schema`, with crash-resume and refusal tests"
+    status: done
+    date: 2026-08-11
+    evidence: "crates/mqtt-storage/src/schema.rs — gate_or_migrate: per-step transactional migrations, each step committed with its own stamp bump so a crash resumes at the stamped step. Fail-closed on newer-than-expected and on a gap in the chain (sequential-majors refusal). 6 tests: happy chain with data movement WITNESSED (not just the stamp), a failed step leaves the stamp honest and a retry resumes, newer-refuses, gap-refuses. Plus assert_migrations_cover, the registry-coverage checker."
+  - id: 0058-T2
+    title: "Wire all four stores through `gate_or_migrate` with empty registries; per-store cross-version fixture tests that fail when a schema bump lands without its migration"
+    status: done
+    date: 2026-08-11
+    evidence: "All four gated stores (sessions/replicas/lease/retained .redb) open through gate_or_migrate with empty-by-design registries and a MIGRATE_FLOOR const (== SCHEMA_VERSION pre-1.0). Each store has a the_migration_registry_covers_the_contract_range test. MUTATION-TESTED: bumping sessions SCHEMA_VERSION to 3 with an empty registry fails the guard, naming the missing version [2]. Wired now so the 1.0 tag changes no open-path code."
+  - id: 0058-T3
+    title: "Name the nightly two-binary roll as the wire oracle: BASELINE_REF discipline documented in RELEASING.md, advancing per ADR 0039's skew policy from 1.0"
+    status: done
+    date: 2026-08-11
+    evidence: "RELEASING.md names the two oracles: the per-store coverage tests (disk contract, cannot be broken by omission) and the nightly two-binary cluster_upgrade.rs roll (wire oracle). Documents that from 1.0.0 BASELINE_REF pins to the previous release and advances only along ADR 0039's skew policy (previous minor; gateway minor across majors), and the 1.0-cut checklist: pin BASELINE_REF, set each MIGRATE_FLOOR to current SCHEMA_VERSION, flip the language (T5)."
+  - id: 0058-T4
+    title: "Config forward-compatibility decision: reconcile deny_unknown_fields with rollback within a major"
+    status: planned
+  - id: 0058-T5
+    title: "The freeze flip at the v1.0.0 tag: README/RELEASING language, final surface audit"
+    status: planned
+---
+
+# Delivery — ADR 0058
+
+The universal precondition every 2026-08-11 panel reviewer named. The decision text is
+[the ADR](../adr/0058-one-dot-zero-stability-contract.md); this file records what is
+built, task by task, with evidence.
+
+<!-- status-table:0058 -->
+| Task | Status | When | Evidence / notes |
+|------|--------|------|------------------|
+| 0058-T1 | ✅ done | 2026-08-11 | "crates/mqtt-storage/src/schema.rs — gate_or_migrate: per-step transactional migrations, each step committed with its own stamp bump so a crash resumes at the stamped step. Fail-closed on newer-than-expected and on a gap in the chain (sequential-majors refusal). 6 tests: happy chain with data movement WITNESSED (not just the stamp), a failed step leaves the stamp honest and a retry resumes, newer-refuses, gap-refuses. Plus assert_migrations_cover, the registry-coverage checker." |
+| 0058-T2 | ✅ done | 2026-08-11 | "All four gated stores (sessions/replicas/lease/retained .redb) open through gate_or_migrate with empty-by-design registries and a MIGRATE_FLOOR const (== SCHEMA_VERSION pre-1.0). Each store has a the_migration_registry_covers_the_contract_range test. MUTATION-TESTED: bumping sessions SCHEMA_VERSION to 3 with an empty registry fails the guard, naming the missing version [2]. Wired now so the 1.0 tag changes no open-path code." |
+| 0058-T3 | ✅ done | 2026-08-11 | "RELEASING.md names the two oracles: the per-store coverage tests (disk contract, cannot be broken by omission) and the nightly two-binary cluster_upgrade.rs roll (wire oracle). Documents that from 1.0.0 BASELINE_REF pins to the previous release and advances only along ADR 0039's skew policy (previous minor; gateway minor across majors), and the 1.0-cut checklist: pin BASELINE_REF, set each MIGRATE_FLOOR to current SCHEMA_VERSION, flip the language (T5)." |
+| 0058-T4 | ⬜ planned | — |  |
+| 0058-T5 | ⬜ planned | — |  |
+<!-- /status-table:0058 -->

@@ -47,6 +47,14 @@ type NodeId = u64;
 /// dirs; nothing is released, so no upgrade path is owed.
 const LEASE_SCHEMA_VERSION: u32 = 1;
 
+/// In-place migrations for `lease.redb` (ADR 0058). Empty by design at 1.0 — the first
+/// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
+/// test fails.
+const LEASE_MIGRATIONS: &[mqtt_storage::schema::MigrationStep] = &[];
+/// Oldest `lease.redb` version the contract migrates from (ADR 0058); pre-1.0 == current.
+#[cfg(test)]
+const LEASE_MIGRATE_FLOOR: u32 = LEASE_SCHEMA_VERSION;
+
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 
@@ -148,8 +156,13 @@ impl LeaseStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
         let db = Database::create(path).map_err(|e| io(pe(e)))?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
-        mqtt_storage::schema::gate(&db, "lease.redb", LEASE_SCHEMA_VERSION)
-            .map_err(|e| io(pe(e)))?;
+        mqtt_storage::schema::gate_or_migrate(
+            &db,
+            "lease.redb",
+            LEASE_SCHEMA_VERSION,
+            LEASE_MIGRATIONS,
+        )
+        .map_err(|e| io(pe(e)))?;
         // Create both tables so reads never race a missing table.
         let txn = db.begin_write().map_err(|e| io(pe(e)))?;
         {
@@ -537,6 +550,18 @@ impl RaftStorage<LeaseConfig> for LeaseStore {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 0058 T2: the lease.redb migration registry must cover the contract range, so a
+    /// future schema bump without its migration fails here, not at an operator's upgrade.
+    #[test]
+    fn the_migration_registry_covers_the_contract_range() {
+        mqtt_storage::schema::assert_migrations_cover(
+            super::LEASE_MIGRATE_FLOOR,
+            super::LEASE_SCHEMA_VERSION,
+            super::LEASE_MIGRATIONS,
+        )
+        .expect("lease.redb migration registry has a gap");
+    }
+
     use super::LeaseStore;
     use crate::lease_raft::{GroupId, LeaseRequest, RaftNodeId};
     use openraft::StorageError;

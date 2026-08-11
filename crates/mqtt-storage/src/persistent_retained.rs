@@ -36,6 +36,14 @@ use std::sync::{Arc, Mutex};
 /// fails closed at the gate (wipe-and-rejoin).
 const SCHEMA_VERSION: u32 = 1;
 
+/// In-place migrations for `retained.redb` (ADR 0058). Empty by design at 1.0 — the first
+/// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
+/// test fails.
+const RETAINED_MIGRATIONS: &[crate::schema::MigrationStep] = &[];
+/// Oldest `retained.redb` version the contract migrates from (ADR 0058); pre-1.0 == current.
+#[cfg(test)]
+const RETAINED_MIGRATE_FLOOR: u32 = SCHEMA_VERSION;
+
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 
 fn backend<E: Display>(e: E) -> StorageError {
@@ -87,7 +95,8 @@ impl PersistentRetainedStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let db = Database::create(path).map_err(backend)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
-        crate::schema::gate(&db, "retained.redb", SCHEMA_VERSION).map_err(backend)?;
+        crate::schema::gate_or_migrate(&db, "retained.redb", SCHEMA_VERSION, RETAINED_MIGRATIONS)
+            .map_err(backend)?;
         let txn = db.begin_write().map_err(backend)?;
         {
             let _ = txn.open_table(RETAINED).map_err(backend)?;
@@ -182,6 +191,18 @@ impl RetainedStore for PersistentRetainedStore {
 
 #[cfg(test)]
 mod tests {
+    /// ADR 0058 T2: the retained.redb migration registry must cover the contract range, so a
+    /// future schema bump without its migration fails here, not at an operator's upgrade.
+    #[test]
+    fn the_migration_registry_covers_the_contract_range() {
+        crate::schema::assert_migrations_cover(
+            super::RETAINED_MIGRATE_FLOOR,
+            super::SCHEMA_VERSION,
+            super::RETAINED_MIGRATIONS,
+        )
+        .expect("retained.redb migration registry has a gap");
+    }
+
     /// ADR 0038 T2: a retained store stamped by a foreign layout version refuses to
     /// open, naming both versions.
     #[test]

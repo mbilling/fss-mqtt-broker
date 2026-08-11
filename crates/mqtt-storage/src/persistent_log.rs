@@ -36,6 +36,12 @@ use std::sync::Arc;
 /// the row bytes' meaning changed, so a v1 file fails closed at the gate.
 const SCHEMA_VERSION: u32 = 2;
 
+/// In-place migrations for `sessions.redb` (ADR 0058). **Empty by design at 1.0**: the
+/// first post-1.0 schema bump must land its `MigrationStep` here in the same PR, or
+/// `a_schema_bump_without_its_migration_is_caught` fails. Wired now so the 1.0 tag
+/// changes no open-path code.
+const SESSION_MIGRATIONS: &[crate::schema::MigrationStep] = &[];
+
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const NEXT_OFFSET: TableDefinition<&str, u64> = TableDefinition::new("next_offset");
 
@@ -59,7 +65,8 @@ impl PersistentLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
         let db = Database::create(path).map_err(backend)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
-        crate::schema::gate(&db, "sessions.redb", SCHEMA_VERSION).map_err(backend)?;
+        crate::schema::gate_or_migrate(&db, "sessions.redb", SCHEMA_VERSION, SESSION_MIGRATIONS)
+            .map_err(backend)?;
         // Create both tables once so read transactions always find them.
         let txn = db.begin_write().map_err(backend)?;
         {
@@ -257,13 +264,33 @@ impl ReplicatedLog for PersistentLog {
     }
 }
 
+/// The oldest `sessions.redb` version the 1.0 stability contract migrates from (ADR
+/// 0058). Pre-1.0 this equals [`SCHEMA_VERSION`], so the covered range is empty and the
+/// empty [`SESSION_MIGRATIONS`] registry is correct. At the 1.0 tag this pins to the 1.0
+/// schema version, and from then on raising `SCHEMA_VERSION` without adding a
+/// `MigrationStep` fails the coverage test below.
+#[cfg(test)]
+const MIGRATE_FLOOR: u32 = SCHEMA_VERSION;
+
 #[cfg(test)]
 mod tests {
     use super::PersistentLog;
+    use super::{MIGRATE_FLOOR, SCHEMA_VERSION, SESSION_MIGRATIONS};
     use crate::repl::ReplicatedLog;
 
     fn rec(b: &[u8]) -> Vec<u8> {
         b.to_vec()
+    }
+
+    /// ADR 0058 T2: the sessions-store migration registry must cover every version from
+    /// the contract floor to the current layout. This is the guard that catches a schema
+    /// bump landing without its migration — today the range is empty (pre-1.0), but the
+    /// moment `MIGRATE_FLOOR` pins below `SCHEMA_VERSION` at 1.0, a version raise with no
+    /// matching step fails HERE rather than at some operator's upgrade.
+    #[test]
+    fn the_migration_registry_covers_the_contract_range() {
+        crate::schema::assert_migrations_cover(MIGRATE_FLOOR, SCHEMA_VERSION, SESSION_MIGRATIONS)
+            .expect("sessions.redb migration registry has a gap");
     }
 
     /// ADR 0038 T2: a session store stamped by a foreign layout version refuses to
