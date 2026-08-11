@@ -39,6 +39,26 @@ pub const DEFAULT_REPLICAS: usize = 3;
 /// of session count.
 pub const NUM_GROUPS: u64 = 256;
 
+/// A snapshot of cluster-wide replication health (#167): the configured replication
+/// factor and the smallest replica set any placement group currently has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationHealth {
+    /// The configured replication factor R.
+    pub desired: usize,
+    /// The smallest replica-set size across all groups right now — the worst-case
+    /// durability. `min_actual < desired` means at least one group commits with fewer
+    /// copies than configured.
+    pub min_actual: usize,
+}
+
+impl ReplicationHealth {
+    /// Whether any group is under-replicated (committing on fewer copies than configured).
+    #[must_use]
+    pub fn is_under_replicated(&self) -> bool {
+        self.min_actual < self.desired
+    }
+}
+
 /// The placement group a `client` belongs to — a deterministic, version-stable hash
 /// of its id modulo [`NUM_GROUPS`], identical on every node.
 #[must_use]
@@ -322,6 +342,38 @@ impl Placement {
     #[must_use]
     pub fn owns_group(&self, group: GroupId) -> bool {
         self.group_owner(group) == self.local
+    }
+
+    /// The configured replication factor R (`MQTTD_LEASE_VOTERS`-derived placement width).
+    #[must_use]
+    pub fn desired_replicas(&self) -> usize {
+        self.replicas
+    }
+
+    /// Replication health across every placement group (#167): the configured R and the
+    /// **smallest** replica set any group currently has. When a set truncates below R
+    /// because too few nodes are alive, a durable append commits on that group with a
+    /// smaller quorum than the operator configured — silently, before this. The smallest
+    /// set is the worst-case durability right now; `min_actual < desired` is the signal an
+    /// operator needs but was never given.
+    ///
+    /// Pure over the current membership snapshot, so it is unit-testable without a cluster
+    /// and cheap enough to poll from the reconcile loop.
+    #[must_use]
+    pub fn replication_health(&self) -> ReplicationHealth {
+        let desired = self.replicas;
+        let nodes = self.nodes();
+        let min_actual = (0..NUM_GROUPS)
+            .map(|g| {
+                self.owner_led_replica_set(g, &nodes, self.group_owner(g))
+                    .len()
+            })
+            .min()
+            .unwrap_or(0);
+        ReplicationHealth {
+            desired,
+            min_actual,
+        }
     }
 
     /// The replica set `group` will have once `leaving` departs (ADR 0043 P3):
@@ -849,5 +901,27 @@ mod tests {
         let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
         p.observe(&node("b"), MemberState::Alive, "b:7000", None);
         assert!(p.domains().is_empty());
+    }
+
+    /// #167 — replication health reflects when too few nodes are alive to hold R copies.
+    #[test]
+    fn replication_health_reports_under_replication_below_r() {
+        // A lone node with R=3: every group's replica set is just itself (1 < 3).
+        let p = Placement::new(node("a"), 3);
+        let h = p.replication_health();
+        assert_eq!(h.desired, 3);
+        assert_eq!(h.min_actual, 1, "a lone node holds one copy per group");
+        assert!(
+            h.is_under_replicated(),
+            "1 of 3 configured copies is under-replicated"
+        );
+
+        // Three alive nodes: every group can hold the full R, so not under-replicated.
+        let mut full = Placement::new(node("a"), 3);
+        full.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        full.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        let h = full.replication_health();
+        assert_eq!(h.min_actual, 3, "three nodes fill an R=3 set");
+        assert!(!h.is_under_replicated());
     }
 }

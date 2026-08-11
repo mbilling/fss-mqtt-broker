@@ -390,6 +390,37 @@ impl CatchUp {
     }
 }
 
+/// Edge-triggered under-replication reporting (#167). Warns when a group first drops
+/// below the configured replication factor and info-logs when it recovers — never every
+/// tick. `last` carries the previously-reported state across reconcile iterations.
+fn report_replication_health(placement: &Arc<RwLock<Placement>>, last: &mut Option<bool>) {
+    let health = placement
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replication_health();
+    let under = health.is_under_replicated();
+    if *last == Some(under) {
+        return;
+    }
+    if under {
+        tracing::warn!(
+            desired = health.desired,
+            min_actual = health.min_actual,
+            "UNDER-REPLICATED: at least one placement group holds fewer copies than the \
+             configured replication factor — durable appends there commit on a smaller \
+             quorum. Usually too few nodes are alive; restore capacity to return to the \
+             configured factor."
+        );
+    } else if last.is_some() {
+        tracing::info!(
+            desired = health.desired,
+            min_actual = health.min_actual,
+            "replication recovered: every group holds the configured factor"
+        );
+    }
+    *last = Some(under);
+}
+
 /// The lease-group control loop: on each tick, reconcile the voter set toward the
 /// live membership and (as leader) keep each group's lease on its placement owner.
 /// A membership change (and boot) also arms the replica catch-up sweep (ADR 0043
@@ -434,8 +465,15 @@ async fn run_driver(
     // by a momentarily-ungossiped voter — the exact skew that split ownership — remains
     // resolvable until the assigner moves it.
     let mut id_map: BTreeMap<RaftNodeId, NodeId> = BTreeMap::new();
+    // #167: the last-reported under-replication state, so the warning is EDGE-triggered —
+    // logged when a group first drops below the configured replication factor and again
+    // (at info) when it recovers, never every tick. Silence here was the defect: durable
+    // appends were committing on fewer copies than configured with no signal to the
+    // operator.
+    let mut last_repl_under: Option<bool> = None;
     loop {
         tokio::time::sleep(DRIVER_TICK).await;
+        report_replication_health(&placement, &mut last_repl_under);
 
         let view = raft_view(&raft);
 
