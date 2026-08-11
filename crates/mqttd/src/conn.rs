@@ -2014,7 +2014,6 @@ mod tests {
         packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},
         Packet, Properties, Property, ProtocolVersion, QoS,
     };
-    use mqtt_core::ClientId;
     use mqtt_net::{FrameReader, FrameWriter};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3048,11 +3047,11 @@ mod tests {
         assert_eq!(recv(&mut reader).await, None, "then the connection closes");
     }
 
-    /// #165 — a QoS 2 dedup store error FAILS CLOSED: the broker withholds the PUBREC and
-    /// closes, rather than forwarding-and-PUBRECing (which would silently degrade
-    /// exactly-once to at-least-once for the duration of the store incident). The first
-    /// publish succeeds to prove the path works; the second, under a now-failing store,
-    /// must get NO PUBREC and a closed connection.
+    /// `#165` — a `QoS` 2 dedup store error FAILS CLOSED: the broker withholds the `PUBREC`
+    /// and closes, rather than forwarding it (which would silently degrade exactly-once to
+    /// at-least-once for the duration of the store incident). The first publish succeeds to
+    /// prove the path works; the second, under a now-failing store, must get no `PUBREC`
+    /// and a closed connection.
     #[tokio::test]
     async fn v5_qos2_dedup_store_error_withholds_pubrec_and_closes() {
         let store = RecordReceivedFails::new();
