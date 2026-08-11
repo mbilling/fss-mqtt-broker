@@ -16,9 +16,12 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-/// The TLS versions this broker speaks. TLS 1.2 support is a deliberate
-/// non-feature until a deployment demands it (ADR 0002).
+/// The default TLS versions this broker speaks: 1.3 only. TLS 1.2 exists strictly as a
+/// per-listener opt-in (ADR 0002, amended 2026-08-11) for fleets whose device firmware
+/// cannot negotiate 1.3 — it is never the default, and the cluster bus never speaks it.
 static TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+static TLS_VERSIONS_WITH_12: &[&rustls::SupportedProtocolVersion] =
+    &[&rustls::version::TLS13, &rustls::version::TLS12];
 
 /// Default size of the TLS 1.3 session-resumption cache, per listener.
 ///
@@ -92,12 +95,28 @@ pub fn server_acceptor_full(
     crl: Option<&Path>,
     session_cache: usize,
 ) -> Result<TlsAcceptor, NetError> {
-    Ok(TlsAcceptor::from(Arc::new(server_config_full(
+    server_acceptor_versions(cert_chain, key, client_ca, crl, session_cache, false)
+}
+
+/// [`server_acceptor_full`] with the TLS 1.2 opt-in — see [`server_config_versions`].
+///
+/// # Errors
+/// As [`server_acceptor_full`].
+pub fn server_acceptor_versions(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+    session_cache: usize,
+    allow_tls12: bool,
+) -> Result<TlsAcceptor, NetError> {
+    Ok(TlsAcceptor::from(Arc::new(server_config_versions(
         cert_chain,
         key,
         client_ca,
         crl,
         session_cache,
+        allow_tls12,
     )?)))
 }
 
@@ -151,6 +170,25 @@ pub fn server_config_full(
     crl: Option<&Path>,
     session_cache: usize,
 ) -> Result<ServerConfig, NetError> {
+    server_config_versions(cert_chain, key, client_ca, crl, session_cache, false)
+}
+
+/// [`server_config_full`] plus the one degradation this module permits: `allow_tls12`
+/// admits TLS 1.2 clients on this listener (ADR 0002 amendment). Off everywhere by
+/// default; the caller that turns it on owes the operator a loud log line, and the
+/// cluster bus builders never call this with `true` — peer links are 1.3, not
+/// negotiable.
+///
+/// # Errors
+/// As [`server_config_full`].
+pub fn server_config_versions(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+    session_cache: usize,
+    allow_tls12: bool,
+) -> Result<ServerConfig, NetError> {
     // A CRL is only meaningful with mTLS; reject the meaningless (likely-mistaken) combination
     // up front rather than silently ignoring it.
     if client_ca.is_none() && crl.is_some() {
@@ -161,8 +199,13 @@ pub fn server_config_full(
     }
     let certs = load_certs(cert_chain)?;
     let key = load_key(key)?;
+    let versions = if allow_tls12 {
+        TLS_VERSIONS_WITH_12
+    } else {
+        TLS_VERSIONS
+    };
     let builder = ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(TLS_VERSIONS)
+        .with_protocol_versions(versions)
         .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?;
     let configured = if let Some(ca) = client_ca {
         let roots = load_roots(ca)?;

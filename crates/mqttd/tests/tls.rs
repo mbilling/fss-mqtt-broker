@@ -1187,3 +1187,55 @@ async fn a_reconnecting_client_resumes_its_tls_session() {
         "the reconnect did NOT resume — reconnecting fleets are paying full handshakes"
     );
 }
+
+/// The TLS 1.2 opt-in (ADR 0002 amendment), both directions. Default posture: a
+/// 1.2-only client is REFUSED — the README's "TLS 1.3 only" stays true out of the box.
+/// Opted in: the same client connects, and the negotiated version is 1.2 — the flag
+/// does what it says for the fleets that need it, on that listener only.
+#[tokio::test]
+async fn tls12_is_refused_by_default_and_admitted_only_by_opt_in() {
+    let (pki, _ca, _key) = mint_pki("tls12");
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(&pki.ca).unwrap() {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let client12 = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
+    let name = ServerName::try_from("127.0.0.1").unwrap();
+
+    // Default acceptor: the 1.2-only handshake must FAIL.
+    let strict = mqtt_net::tls::server_acceptor_full(&pki.cert, &pki.key, None, None, 64).unwrap();
+    let addr = start_tls_node(strict).await;
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        TlsConnector::from(client12.clone())
+            .connect(name.clone(), tcp)
+            .await
+            .is_err(),
+        "a TLS 1.2-only client connected WITHOUT the opt-in — the advertised 1.3-only \
+         posture is broken"
+    );
+
+    // Opted in: the same client completes the handshake, and the wire says 1.2.
+    let permissive =
+        mqtt_net::tls::server_acceptor_versions(&pki.cert, &pki.key, None, None, 64, true).unwrap();
+    let addr = start_tls_node(permissive).await;
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let tls = TlsConnector::from(client12)
+        .connect(name, tcp)
+        .await
+        .expect("the opted-in listener must admit the 1.2 client");
+    assert_eq!(
+        tls.get_ref().1.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
+    let mut c = Client::connect(tls, "tls12-probe").await;
+    c.subscribe("tls12/t").await;
+}

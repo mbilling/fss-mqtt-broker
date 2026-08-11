@@ -110,6 +110,11 @@ pub struct Tls {
     /// `None` uses the broker default (32k entries — rustls' own 256 is no resumption at
     /// fleet scale); `0` disables resumption so every connection is fully re-verified.
     pub session_cache: Option<usize>,
+    /// Admit TLS 1.2 clients on the client-facing TLS listener
+    /// (`MQTTD_TLS_ALLOW_TLS12`). **Off by default and loudly logged when on** — a
+    /// reduced posture for fleets whose device firmware cannot negotiate 1.3. Never
+    /// affects the cluster bus or QUIC (1.3 by protocol).
+    pub allow_tls12: bool,
 }
 
 /// Authentication + authorization policy. Secure by default: no anonymous access, mTLS
@@ -583,6 +588,9 @@ impl Config {
         on!("MQTTD_TLS_SESSION_CACHE", v, {
             self.tls.session_cache = v.parse().ok();
         });
+        if get("MQTTD_TLS_ALLOW_TLS12").is_some() {
+            self.tls.allow_tls12 = true;
+        }
 
         // -- security -- (MQTTD_ALLOW_ANONYMOUS: presence = on; require_client_cert is derived,
         // has no env var by design)

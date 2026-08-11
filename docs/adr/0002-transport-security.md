@@ -90,3 +90,24 @@ deliberately deferred.
 - **CRL / OCSP stapling, certificate rotation/reload** without dropping
   connections (pairs with hot-reloadable policy, Capability Plan §3).
 - **WebSocket-over-TLS** listener (Phase 4).
+
+## Amendment (2026-08-11): TLS 1.2 as a per-listener opt-in
+
+TLS 1.2 was a deliberate non-feature "until a deployment demands it". The demand arrived
+through the evaluation panel: real device fleets carry firmware that cannot negotiate 1.3,
+and for them "TLS 1.3 only" reads as a hard migration blocker whose failure mode looks
+like a network problem.
+
+The decision holds its shape while gaining an escape hatch:
+
+- **1.3 stays the only default.** Nothing changes for a broker that does not set the flag,
+  and the README continues to advertise the default posture truthfully.
+- **`MQTTD_TLS_ALLOW_TLS12` / `[tls].allow_tls12`** admits 1.2 clients on the
+  client-facing TLS listener only. It is logged in the same REDUCED-POSTURE register as
+  the other insecure modes, on every start, so it cannot be enabled and forgotten.
+- **The cluster bus and QUIC never speak 1.2.** The bus builders do not take the flag;
+  QUIC mandates 1.3 by protocol.
+- The `tls12` rustls feature is now compiled (this file's earlier note said it was not) —
+  compiled but unreachable without the flag, which is the honest new statement.
+- Tested in both directions: a 1.2-only client is refused by a default listener and
+  admitted (negotiating 1.2 on the wire) by an opted-in one.
