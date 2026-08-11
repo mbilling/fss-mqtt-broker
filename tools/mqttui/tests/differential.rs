@@ -136,6 +136,29 @@ fn the_rust_converter_agrees_with_the_python_one() {
         "the fixtures produced no config/rules, so an equality assertion proves nothing"
     );
 
+    // Byte-identical is not enough — both converters once agreed on INVALID TOML
+    // (`[listeners]` declared once per listener; tomllib rejects it). The fixture above
+    // deliberately has two listeners, so this parse assertion fails on that regression.
+    // Found by the 2026-08-11 review panel running the tool, not by this test.
+    toml::from_str::<toml::Value>(&rs_config).unwrap_or_else(|e| {
+        panic!("the converters agreed on config output that is not valid TOML: {e}")
+    });
+    toml::from_str::<toml::Value>(py_acl_text.as_str()).unwrap_or_else(|e| {
+        panic!("the converters agreed on ACL output that is not valid TOML: {e}")
+    });
+
+    // The cafile-without-require_certificate honesty contract: the fixture's TLS listener
+    // sets cafile but not require_certificate, so client_ca must be COMMENTED with the
+    // TODO — emitting it active silently turns a cert-optional listener into mTLS.
+    assert!(
+        rs_config.contains("# client_ca ="),
+        "client_ca was emitted ACTIVE for a listener that never required certificates"
+    );
+    assert!(
+        rs_config.contains("require_certificate was NOT"),
+        "the require_certificate TODO is missing — the drop went silent again"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

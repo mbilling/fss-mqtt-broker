@@ -373,6 +373,117 @@ pub fn render_acl(rules: &[Rule], todos: &[String]) -> String {
     out.join("\n") + "\n"
 }
 
+/// The listeners section of the rendered config — split out of [`render_config`] purely
+/// for size; the output bytes are pinned by the differential test against the Python
+/// original, so any behavioural drift here fails CI.
+fn render_listeners(conv: &Conversion, out: &mut Vec<String>) {
+    if !conv.listeners.is_empty() {
+        out.push("# --- Listeners ---".into());
+        out.push("#".into());
+        out.push("# mqttd binds one listener per protocol rather than repeating a".into());
+        out.push("# `listener` block. TLS is 1.3-only by default: a client that cannot".into());
+        out.push("# negotiate TLS 1.3 will fail to connect, so check your device fleet.".into());
+        // A TOML table may be declared once. The first listener of each protocol becomes
+        // the binding; the rest become TODOs — the per-listener emission this replaces
+        // produced output tomllib rejects, found by the 2026-08-11 review panel actually
+        // running the tool. The Python original is the reference; this stays
+        // byte-identical to it (the differential test enforces that).
+        let tls_listeners: Vec<&Listener> = conv
+            .listeners
+            .iter()
+            .filter(|l| l.tls.contains_key("certfile"))
+            .collect();
+        let plain_listeners: Vec<&Listener> = conv
+            .listeners
+            .iter()
+            .filter(|l| !l.tls.contains_key("certfile"))
+            .collect();
+        for (i, l) in conv.listeners.iter().enumerate() {
+            let port = l.port.unwrap_or(1883);
+            let host = l.bind.clone().unwrap_or_else(|| "0.0.0.0".into());
+            let kind = if l.tls.contains_key("certfile") {
+                "TLS"
+            } else {
+                "PLAINTEXT"
+            };
+            out.push(format!("#   listener {i}: {kind} on {host}:{port}"));
+        }
+        out.push("[listeners]".into());
+        if let Some(first) = plain_listeners.first() {
+            let port = first.port.unwrap_or(1883);
+            let host = first.bind.clone().unwrap_or_else(|| "0.0.0.0".into());
+            out.push(format!("plaintext_bind = \"{host}:{port}\""));
+            out.push(
+                "# WARNING: plaintext. mqttd logs this as an INSECURE mode on every start.".into(),
+            );
+            for extra in &plain_listeners[1..] {
+                let eport = extra.port.unwrap_or(1883);
+                let ehost = extra.bind.clone().unwrap_or_else(|| "0.0.0.0".into());
+                out.push(format!(
+                    "# TODO(migrate): additional plaintext listener {ehost}:{eport} — \
+                     mqttd binds ONE listener per protocol; consolidate clients onto the \
+                     bind above"
+                ));
+            }
+        }
+        if let Some(first) = tls_listeners.first() {
+            let port = first.port.unwrap_or(1883);
+            let host = first.bind.clone().unwrap_or_else(|| "0.0.0.0".into());
+            out.push(format!("tls_bind = \"{host}:{port}\""));
+            for extra in &tls_listeners[1..] {
+                let eport = extra.port.unwrap_or(1883);
+                let ehost = extra.bind.clone().unwrap_or_else(|| "0.0.0.0".into());
+                out.push(format!(
+                    "# TODO(migrate): additional TLS listener {ehost}:{eport} — \
+                     mqttd binds ONE listener per protocol; consolidate clients onto the \
+                     bind above"
+                ));
+            }
+        }
+        if let Some(first) = tls_listeners.first() {
+            out.push("[tls]".into());
+            let cert = &first.tls["certfile"];
+            out.push(format!("cert = \"{cert}\""));
+            if let Some(v) = first.tls.get("keyfile") {
+                out.push(format!("key = \"{v}\""));
+            }
+            if let Some(v) = first.tls.get("cafile") {
+                // Mosquitto's cafile only VERIFIES certs clients choose to present unless
+                // require_certificate is true; mqttd's client_ca MANDATES one. Emitting
+                // it unconditionally silently turned cert-optional listeners into mTLS —
+                // the silent behaviour change this tool promises never to make.
+                let required = first
+                    .tls
+                    .get("require_certificate")
+                    .is_some_and(|r| r.to_lowercase() == "true");
+                if required {
+                    out.push(format!("client_ca = \"{v}\""));
+                } else {
+                    out.push(
+                        "# TODO(migrate): cafile was set but require_certificate was NOT \
+                         true. mqttd's client_ca MANDATES client certificates (mTLS) — \
+                         there is no cert-optional mode. Uncomment to require certs \
+                         fleet-wide, or leave commented for server-only TLS:"
+                            .into(),
+                    );
+                    out.push(format!("# client_ca = \"{v}\""));
+                }
+            }
+            if let Some(v) = first.tls.get("crlfile") {
+                out.push(format!("crl = \"{v}\""));
+            }
+            if first.tls.contains_key("capath") {
+                out.push(
+                    "# TODO(migrate): capath (a directory of CAs) is not supported; \
+                     concatenate them into one PEM and set client_ca"
+                        .into(),
+                );
+            }
+        }
+        out.push(String::new());
+    }
+}
+
 /// Render the translated broker configuration.
 #[must_use]
 pub fn render_config(conv: &Conversion) -> String {
@@ -415,49 +526,7 @@ pub fn render_config(conv: &Conversion) -> String {
         out.push(String::new());
     }
 
-    if !conv.listeners.is_empty() {
-        out.push("# --- Listeners ---".into());
-        out.push("#".into());
-        out.push("# mqttd binds one listener per protocol rather than repeating a".into());
-        out.push("# `listener` block. TLS is 1.3-only: a client that cannot negotiate".into());
-        out.push("# TLS 1.3 will fail to connect, so check your device fleet.".into());
-        for (i, l) in conv.listeners.iter().enumerate() {
-            let port = l.port.unwrap_or(1883);
-            let host = l.bind.clone().unwrap_or_else(|| "0.0.0.0".into());
-            if let Some(cert) = l.tls.get("certfile") {
-                out.push(format!("#   listener {i}: TLS on {host}:{port}"));
-                out.push("[listeners]".into());
-                out.push(format!("tls_bind = \"{host}:{port}\""));
-                out.push("[tls]".into());
-                out.push(format!("cert = \"{cert}\""));
-                if let Some(v) = l.tls.get("keyfile") {
-                    out.push(format!("key = \"{v}\""));
-                }
-                if let Some(v) = l.tls.get("cafile") {
-                    out.push(format!("client_ca = \"{v}\""));
-                }
-                if let Some(v) = l.tls.get("crlfile") {
-                    out.push(format!("crl = \"{v}\""));
-                }
-                if l.tls.contains_key("capath") {
-                    out.push(
-                        "# TODO(migrate): capath (a directory of CAs) is not supported; \
-                         concatenate them into one PEM and set client_ca"
-                            .into(),
-                    );
-                }
-            } else {
-                out.push(format!("#   listener {i}: PLAINTEXT on {host}:{port}"));
-                out.push("[listeners]".into());
-                out.push(format!("plaintext_bind = \"{host}:{port}\""));
-                out.push(
-                    "# WARNING: plaintext. mqttd logs this as an INSECURE mode on every start."
-                        .into(),
-                );
-            }
-            out.push(String::new());
-        }
-    }
+    render_listeners(conv, &mut out);
     out.join("\n") + "\n"
 }
 

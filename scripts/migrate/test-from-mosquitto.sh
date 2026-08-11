@@ -45,6 +45,16 @@ python3 scripts/migrate/from-mosquitto.py "$WORK/mosquitto.conf" \
   --out-config "$WORK/mqttd.toml" --out-acl "$WORK/acl.toml" >/dev/null
 
 [[ -s "$WORK/acl.toml" ]] || { echo "  FAIL — no ACL produced"; exit 1; }
+# The converted CONFIG must be valid TOML. The fixture has two listeners on purpose:
+# the converter once emitted [listeners] per listener, which tomllib rejects — and this
+# harness never noticed, because the broker below is booted with env vars and the
+# converted ACL only. Found by the 2026-08-11 review panel.
+python3 - "$WORK/mqttd.toml" <<'PYEOF' || { echo "  FAIL — converted config is not valid TOML"; exit 1; }
+import sys, tomllib
+tomllib.load(open(sys.argv[1], "rb"))
+PYEOF
+echo "  ok   — converted config parses as TOML"
+
 grep -q 'default = "deny"' "$WORK/acl.toml" || { echo "  FAIL — translated ACL is not deny-by-default"; exit 1; }
 # %u must become mqttd's %i, or every pattern rule silently matches nothing.
 grep -q '%i' "$WORK/acl.toml" || { echo "  FAIL — mosquitto's %u was not translated to %i"; exit 1; }
