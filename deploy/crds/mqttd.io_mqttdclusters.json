@@ -110,7 +110,7 @@
                     "properties": {
                       "brownout": {
                         "default": "Alert",
-                        "description": "Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — patch\nPVC sizes up to `persistence.expansionMaxSize` and raise the watermark.",
+                        "description": "Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — grow PVC\nsizes up to `persistence.expansionMaxSize`. NOTE: `ExpandPvc` does **not**\nyet raise the broker's `store_max_bytes` watermark (that lives in the config\nand is tracked by 0055-T10), so the broker may keep refusing writes on the\nlarger volume until the watermark is raised — a manual config roll for now.",
                         "enum": [
                           "Alert",
                           "ExpandPvc"
