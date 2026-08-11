@@ -5,3 +5,4 @@
 *.tmpl.bak
 *.orig
 ci/
+bootstrap.sh
