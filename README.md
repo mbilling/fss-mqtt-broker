@@ -1042,7 +1042,7 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 
 ### Running the demo, migrations and test scripts
 
-There are 24 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
+There are 25 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
 conformance suites, the Kubernetes end-to-end runs, the benchmark harness. `mqttui` is the
 one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and
 [Start here](#start-here) for installing it):
