@@ -518,12 +518,15 @@ be found. Each is tracked; none is a silent surprise.
   `acl_file`, marking anything without an equivalent as `TODO(migrate)` in the
   output rather than dropping it silently. EMQX and HiveMQ converters do not
   exist yet.
-- **TLS 1.3 only.** There is no TLS 1.2 listener. Modern clients are unaffected,
-  but **older device firmware that cannot negotiate 1.3 will simply fail to
-  connect** — check your fleet before planning a migration, because the failure
-  looks like a network problem rather than a policy one. Opt-in TLS 1.2 is
-  planned; it stays off by default so the posture this README advertises remains
-  true.
+- **TLS 1.3 by default.** Older device firmware that cannot negotiate 1.3 will
+  fail to connect out of the box — and the failure looks like a network problem
+  rather than a policy one, so check your fleet before planning a migration.
+  For exactly that case, **TLS 1.2 is available as an explicit opt-in**
+  (`MQTTD_TLS_ALLOW_TLS12` / `[tls].allow_tls12`) on the client-facing TLS
+  listener only: off by default, loudly logged on every start while enabled,
+  never spoken by the cluster bus or QUIC — and **hardened** (ECDHE+AEAD suites
+  only, Extended Master Secret required), so opting into 1.2 does not opt into
+  1.2's exploit classes.
 - **No production track record.** `v0.9.0` is released and verifiable, but nobody
   is running this in anger yet — there is no operational history behind it.
 

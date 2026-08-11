@@ -16,9 +16,39 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-/// The TLS versions this broker speaks. TLS 1.2 support is a deliberate
-/// non-feature until a deployment demands it (ADR 0002).
+/// The default TLS versions this broker speaks: 1.3 only. TLS 1.2 exists strictly as a
+/// per-listener opt-in (ADR 0002, amended 2026-08-11) for fleets whose device firmware
+/// cannot negotiate 1.3 — it is never the default, and the cluster bus never speaks it.
 static TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+static TLS_VERSIONS_WITH_12: &[&rustls::SupportedProtocolVersion] =
+    &[&rustls::version::TLS13, &rustls::version::TLS12];
+
+/// The TLS 1.2 posture of a listener (ADR 0002 amendment).
+///
+/// TLS 1.2 through this module is structurally hardened by what rustls simply does not
+/// implement: every 1.2 suite the provider offers is ECDHE + AEAD (forward secrecy; no
+/// CBC, no RC4/3DES, no static-RSA key exchange — the POODLE/Lucky13/Sweet32/ROBOT
+/// classes have no surface), and there is no renegotiation, no compression, no export
+/// anything. A test pins the suite property so a provider change cannot quietly regress
+/// it.
+///
+/// The one hazard rustls leaves to the caller is **Extended Master Secret** (RFC 7627):
+/// without it a 1.2 session is subject to the triple-handshake family of attacks.
+/// [`Tls12::Hardened`] therefore REQUIRES EMS — a legacy client that cannot do EMS is
+/// refused. [`Tls12::UnsafeLegacyFeatures`] relaxes exactly that one requirement, exists
+/// only because some ancient firmware predates RFC 7627, and is loudly logged wherever it
+/// is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tls12 {
+    /// TLS 1.3 only — the default posture.
+    #[default]
+    Off,
+    /// Admit TLS 1.2, hardened: ECDHE+AEAD suites only (structural) and EMS required.
+    Hardened,
+    /// Admit TLS 1.2 without requiring EMS. The triple-handshake protection is gone for
+    /// clients that do not offer EMS; every client that does offer it still gets it.
+    UnsafeLegacyFeatures,
+}
 
 /// Default size of the TLS 1.3 session-resumption cache, per listener.
 ///
@@ -30,6 +60,62 @@ static TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::
 /// mid-sized fleet; `MQTTD_TLS_SESSION_CACHE` sizes it to yours, and `0` disables
 /// resumption entirely.
 pub const DEFAULT_SESSION_CACHE: usize = 32 * 1024;
+
+/// Ceiling on how long a cached session stays resumable — RFC 5246 §F.1.4's 24 hours.
+/// rustls' memory cache holds entries until capacity evicts them, which on a quiet
+/// broker means a resumption secret could stay redeemable for months; an entry past this
+/// age is refused and the client simply performs a full handshake.
+pub const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// [`rustls::server::StoresServerSessions`] wrapper that stamps every entry with its
+/// insertion time and refuses to return one older than `ttl`.
+///
+/// Values are stored as `8-byte BE unix-seconds ‖ payload`. A malformed or stale entry
+/// yields `None`, which to rustls means "no resumable session" — the failure mode is a
+/// full handshake, never an error.
+#[derive(Debug)]
+struct ExpiringSessionCache {
+    inner: Arc<dyn rustls::server::StoresServerSessions>,
+    ttl: std::time::Duration,
+}
+
+impl ExpiringSessionCache {
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    fn unwrap_fresh(&self, stored: &[u8], now: u64) -> Option<Vec<u8>> {
+        let (stamp, payload) = stored.split_at_checked(8)?;
+        let stored_at = u64::from_be_bytes(stamp.try_into().ok()?);
+        if now.saturating_sub(stored_at) > self.ttl.as_secs() {
+            return None;
+        }
+        Some(payload.to_vec())
+    }
+}
+
+impl rustls::server::StoresServerSessions for ExpiringSessionCache {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let mut stamped = Vec::with_capacity(8 + value.len());
+        stamped.extend_from_slice(&Self::now_secs().to_be_bytes());
+        stamped.extend_from_slice(&value);
+        self.inner.put(key, stamped)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.unwrap_fresh(&self.inner.get(key)?, Self::now_secs())
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.unwrap_fresh(&self.inner.take(key)?, Self::now_secs())
+    }
+
+    fn can_cache(&self) -> bool {
+        self.inner.can_cache()
+    }
+}
 
 /// This broker's rustls crypto provider — `aws-lc-rs`, selected **explicitly** rather
 /// than via rustls' process-default auto-detection (ADR 0053). It is the same provider
@@ -92,12 +178,28 @@ pub fn server_acceptor_full(
     crl: Option<&Path>,
     session_cache: usize,
 ) -> Result<TlsAcceptor, NetError> {
-    Ok(TlsAcceptor::from(Arc::new(server_config_full(
+    server_acceptor_versions(cert_chain, key, client_ca, crl, session_cache, Tls12::Off)
+}
+
+/// [`server_acceptor_full`] with the TLS 1.2 opt-in — see [`server_config_versions`].
+///
+/// # Errors
+/// As [`server_acceptor_full`].
+pub fn server_acceptor_versions(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+    session_cache: usize,
+    tls12: Tls12,
+) -> Result<TlsAcceptor, NetError> {
+    Ok(TlsAcceptor::from(Arc::new(server_config_versions(
         cert_chain,
         key,
         client_ca,
         crl,
         session_cache,
+        tls12,
     )?)))
 }
 
@@ -151,6 +253,25 @@ pub fn server_config_full(
     crl: Option<&Path>,
     session_cache: usize,
 ) -> Result<ServerConfig, NetError> {
+    server_config_versions(cert_chain, key, client_ca, crl, session_cache, Tls12::Off)
+}
+
+/// [`server_config_full`] plus the one degradation this module permits: `allow_tls12`
+/// admits TLS 1.2 clients on this listener (ADR 0002 amendment). Off everywhere by
+/// default; the caller that turns it on owes the operator a loud log line, and the
+/// cluster bus builders never call this with `true` — peer links are 1.3, not
+/// negotiable.
+///
+/// # Errors
+/// As [`server_config_full`].
+pub fn server_config_versions(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+    session_cache: usize,
+    tls12: Tls12,
+) -> Result<ServerConfig, NetError> {
     // A CRL is only meaningful with mTLS; reject the meaningless (likely-mistaken) combination
     // up front rather than silently ignoring it.
     if client_ca.is_none() && crl.is_some() {
@@ -161,8 +282,13 @@ pub fn server_config_full(
     }
     let certs = load_certs(cert_chain)?;
     let key = load_key(key)?;
+    let versions = if tls12 == Tls12::Off {
+        TLS_VERSIONS
+    } else {
+        TLS_VERSIONS_WITH_12
+    };
     let builder = ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(TLS_VERSIONS)
+        .with_protocol_versions(versions)
         .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?;
     let configured = if let Some(ca) = client_ca {
         let roots = load_roots(ca)?;
@@ -189,8 +315,20 @@ pub fn server_config_full(
     config.session_storage = if session_cache == 0 {
         Arc::new(rustls::server::NoServerSessionStorage {})
     } else {
-        rustls::server::ServerSessionMemoryCache::new(session_cache)
+        // Wrapped with the 24-hour ceiling (RFC 5246 §F.1.4): capacity alone is not an
+        // expiry policy, and a resumption secret must not stay redeemable for months on
+        // a quiet broker.
+        Arc::new(ExpiringSessionCache {
+            inner: rustls::server::ServerSessionMemoryCache::new(session_cache),
+            ttl: SESSION_TTL,
+        })
     };
+    // RFC 7627 Extended Master Secret: REQUIRED whenever TLS 1.2 is admitted, unless the
+    // operator explicitly opted into the legacy relaxation — rustls' own default on this
+    // provider is false, which would leave the triple-handshake surface open silently.
+    // (The field is meaningless for pure 1.3, where the property is built into the
+    // protocol.)
+    config.require_ems = tls12 == Tls12::Hardened;
     Ok(config)
 }
 
@@ -403,5 +541,148 @@ mod tests {
                 other => panic!("{addr:?} should parse as an IP server name, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tls12_hardening_tests {
+    use super::*;
+
+    /// The TLS 1.2 suite set is a STRICT ALLOWLIST, not a property check: exactly the six
+    /// ECDHE+AEAD suites, by name. A blocklist of known-bad suites is never complete; an
+    /// allowlist means a provider upgrade that adds ANY new 1.2 suite — CBC, `CCM_8`,
+    /// whatever — fails this test and forces a human decision.
+    #[test]
+    fn the_tls12_suites_are_exactly_the_allowlist() {
+        let mut tls12: Vec<String> = provider()
+            .cipher_suites
+            .iter()
+            .filter(|s| matches!(s, rustls::SupportedCipherSuite::Tls12(_)))
+            .map(|s| format!("{:?}", s.suite()))
+            .collect();
+        tls12.sort();
+        let mut expected = vec![
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            tls12, expected,
+            "the 1.2 suite set drifted from the allowlist — every entry must be ECDHE \
+             (forward secrecy; no static-RSA/ROBOT) and AEAD (no CBC padding oracles, no \
+             Sweet32, no RC4)"
+        );
+    }
+
+    /// The classical key-exchange groups are exactly x25519, secp256r1, secp384r1 — the
+    /// allowlist. (The ML-KEM hybrids in the provider are TLS 1.3-only `key_share` entries;
+    /// a 1.2 `ClientHello` cannot negotiate them.) No FFDHE means no Logjam/small-subgroup
+    /// surface; no binary/small curves by construction.
+    #[test]
+    fn classical_kx_groups_are_exactly_the_allowlist() {
+        let mut classical: Vec<String> = provider()
+            .kx_groups
+            .iter()
+            .map(|g| format!("{:?}", g.name()))
+            .filter(|n| !n.contains("MLKEM") && !n.contains("Unknown"))
+            .collect();
+        classical.sort();
+        assert_eq!(
+            classical,
+            vec!["X25519", "secp256r1", "secp384r1"],
+            "the classical group set drifted from the allowlist"
+        );
+    }
+
+    /// RFC 5077 session tickets stay OFF for TLS 1.2: an unrotated ticket key silently
+    /// destroys forward secrecy for every session it covers, and this broker has no
+    /// ticket-key rotation infrastructure — so the safe setting is the only setting.
+    #[test]
+    fn tls12_session_tickets_are_off() {
+        let dir = std::env::temp_dir().join(format!("mqttd-tick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (cp, kp) = (dir.join("c.pem"), dir.join("k.pem"));
+        std::fs::write(&cp, cert.pem()).unwrap();
+        std::fs::write(&kp, key.serialize_pem()).unwrap();
+        let cfg = server_config_versions(&cp, &kp, None, None, 64, Tls12::Hardened).unwrap();
+        assert!(
+            !cfg.ticketer.enabled(),
+            "a ticketer appeared — TLS 1.2 tickets without key rotation destroy forward secrecy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The resumption cache refuses entries older than 24 hours (RFC 5246 §F.1.4):
+    /// capacity eviction alone would let a resumption secret stay redeemable for months
+    /// on a quiet broker.
+    #[test]
+    fn cached_sessions_expire_at_the_rfc_ceiling() {
+        use rustls::server::StoresServerSessions as _;
+        let cache = ExpiringSessionCache {
+            inner: rustls::server::ServerSessionMemoryCache::new(8),
+            ttl: SESSION_TTL,
+        };
+        assert!(cache.put(b"k".to_vec(), b"secret".to_vec()));
+        assert_eq!(
+            cache.get(b"k").as_deref(),
+            Some(b"secret".as_slice()),
+            "fresh: served"
+        );
+
+        // The same entry, restamped as 25 hours old, must be refused.
+        let old = ExpiringSessionCache {
+            inner: rustls::server::ServerSessionMemoryCache::new(8),
+            ttl: SESSION_TTL,
+        };
+        let stale_stamp = (ExpiringSessionCache::now_secs() - 25 * 3600).to_be_bytes();
+        let mut stamped = stale_stamp.to_vec();
+        stamped.extend_from_slice(b"secret");
+        old.inner.put(b"k".to_vec(), stamped);
+        assert_eq!(old.get(b"k"), None, "a 25-hour-old session must not resume");
+        assert_eq!(old.take(b"k"), None, "take path honours the ceiling too");
+    }
+
+    /// The relaxable half: EMS (RFC 7627) is REQUIRED under the hardened posture and
+    /// relaxed only by the explicit unsafe opt-in — rustls' own default on this provider
+    /// is false, which would have left the triple-handshake surface open silently.
+    #[test]
+    fn ems_follows_the_declared_posture() {
+        let dir = std::env::temp_dir().join(format!("mqttd-ems-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+        let hardened =
+            server_config_versions(&cert_path, &key_path, None, None, 64, Tls12::Hardened).unwrap();
+        assert!(hardened.require_ems, "hardened 1.2 must require EMS");
+
+        let legacy = server_config_versions(
+            &cert_path,
+            &key_path,
+            None,
+            None,
+            64,
+            Tls12::UnsafeLegacyFeatures,
+        )
+        .unwrap();
+        assert!(!legacy.require_ems, "the unsafe opt-in relaxes exactly EMS");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

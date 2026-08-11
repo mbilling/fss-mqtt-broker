@@ -90,3 +90,72 @@ deliberately deferred.
 - **CRL / OCSP stapling, certificate rotation/reload** without dropping
   connections (pairs with hot-reloadable policy, Capability Plan §3).
 - **WebSocket-over-TLS** listener (Phase 4).
+
+## Amendment (2026-08-11): TLS 1.2 as a per-listener opt-in
+
+TLS 1.2 was a deliberate non-feature "until a deployment demands it". The demand arrived
+through the evaluation panel: real device fleets carry firmware that cannot negotiate 1.3,
+and for them "TLS 1.3 only" reads as a hard migration blocker whose failure mode looks
+like a network problem.
+
+The decision holds its shape while gaining an escape hatch:
+
+- **1.3 stays the only default.** Nothing changes for a broker that does not set the flag,
+  and the README continues to advertise the default posture truthfully.
+- **`MQTTD_TLS_ALLOW_TLS12` / `[tls].allow_tls12`** admits 1.2 clients on the
+  client-facing TLS listener only. It is logged in the same REDUCED-POSTURE register as
+  the other insecure modes, on every start, so it cannot be enabled and forgotten.
+- **The cluster bus and QUIC never speak 1.2.** The bus builders do not take the flag;
+  QUIC mandates 1.3 by protocol.
+- The `tls12` rustls feature is now compiled (this file's earlier note said it was not) —
+  compiled but unreachable without the flag, which is the honest new statement.
+- Tested in both directions: a 1.2-only client is refused by a default listener and
+  admitted (negotiating 1.2 on the wire) by an opted-in one.
+
+### Hardening: opting into 1.2 does not opt into 1.2's exploits
+
+What the opt-in admits is a **hardened** TLS 1.2, most of it structural to rustls and
+pinned by test so a provider upgrade cannot quietly regress it:
+
+- **ECDHE + AEAD suites only** — no CBC, no RC4/3DES, no static-RSA key exchange, so the
+  POODLE / Lucky13 / Sweet32 / ROBOT exploit classes have no surface, and every session
+  has forward secrecy. A test iterates the provider's 1.2 suites and fails if any
+  non-ECDHE or non-AEAD suite ever appears.
+- **No renegotiation, no compression, no export suites** — rustls does not implement
+  them; there is nothing to misconfigure.
+- **Extended Master Secret (RFC 7627) REQUIRED** — rustls' own default on this provider
+  is *not* to require it, which would leave the triple-handshake attack surface open
+  silently. The hardened posture refuses clients that cannot do EMS.
+
+The one escape hatch is **`MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES` /
+`[tls].allow_unsafe_tls12_features`** — off by default — which relaxes exactly the EMS
+requirement for legacy firmware that predates RFC 7627. It is loudly logged on every
+start while enabled, and it is a configuration **error** without `allow_tls12`: a
+relaxation of something that is off cannot mean anything, and half-ignored configuration
+is how postures rot.
+
+### TLS 1.2 hardening conformance (audited against rustls 0.23 + this configuration)
+
+Built as a **strict allowlist, tests enforcing exact sets** — a blocklist of known-bad
+suites is never complete. "Structural" means rustls does not implement the hazard at all;
+"pinned" means a test fails if a provider upgrade changes it.
+
+| Area | Status |
+|---|---|
+| SSLv2/v3, TLS 1.0/1.1 | Structural + pinned: only 1.3 (and, opted-in, 1.2) are ever offered |
+| Key exchange | Pinned allowlist: ECDHE only. No static RSA (ROBOT), no static DH, no anon, no export, no SRP/KRB5/PSK, **no FFDHE at all** (no Logjam/small-subgroup surface) |
+| Curves | Pinned allowlist: exactly `x25519`, `secp256r1`, `secp384r1` classical (ML-KEM hybrids are 1.3-only `key_share` entries a 1.2 hello cannot negotiate). No binary/small curves; on-curve validation is rustls/aws-lc internal |
+| Bulk ciphers | Pinned allowlist: exactly the six ECDHE AES-GCM / ChaCha20-Poly1305 suites. No CBC (Lucky13/POODLE class), no RC4, no 3DES (Sweet32), no NULL, no CCM_8 |
+| Signatures | Structural (webpki/aws-lc): no MD5, no SHA-1 (RFC 9155), no DSA; RSA ≥ 2048; PSS + PKCS1-SHA256+ and ECDSA/Ed25519 only |
+| Compression (CRIME) | Structural: not implemented |
+| Heartbeat (Heartbleed) | Structural: not implemented |
+| Renegotiation | Structural: not implemented at all — client-initiated renegotiation is rejected by construction, stronger than RFC 5746 |
+| Truncated HMAC / NPN | Structural: not implemented |
+| RFC 5077 session tickets (1.2) | **Off, pinned by test**: no ticket-key rotation infrastructure exists, and an unrotated ticket key silently destroys forward secrecy |
+| Session cache lifetime | **Enforced here**: entries are timestamped and refused past 24 h (RFC 5246 §F.1.4) — capacity eviction alone would let a resumption secret stay redeemable for months |
+| Extended Master Secret | **Enforced here**: required under the hardened posture; relaxed only by the explicit unsafe flag |
+| GCM nonce + rekey ceiling | Structural: RFC 5288 counter nonces; rustls refuses further AES-GCM records after 2²⁴ per connection, forcing a fresh handshake before nonce-safety margins erode |
+| Constant-time / record limits / zeroization | Delegated to rustls + aws-lc-rs by deliberate choice — the memory-safe-library route rather than hand-rolled record-layer code |
+| Certificate validation | Structural (webpki): SAN-only matching, wildcard rules, basicConstraints/EKU, validity windows |
+| **`TLS_FALLBACK_SCSV` (RFC 7507)** | **Deviation, accepted**: rustls does not implement server-side SCSV detection. Risk is bounded — the broker never initiates fallback, 1.2 exists only behind the opt-in, and modern clients no longer perform insecure fallback dances. Revisit if rustls grows support |
+| **OCSP stapling / Must-Staple** | **Deviation, deferred**: no OCSP infrastructure; CRL-based revocation (T8) covers the operational need today. Tracked with the existing OCSP backlog item on #125 |

@@ -714,23 +714,61 @@ async fn start_client_listeners(
             .tls
             .session_cache
             .unwrap_or(tls::DEFAULT_SESSION_CACHE);
-        let acceptor = tls::server_acceptor_full(
+        // A relaxation of a thing that is off cannot mean anything — refuse the
+        // combination rather than silently ignoring half of it (the CRL-without-CA rule).
+        if config.tls.allow_unsafe_tls12_features && !config.tls.allow_tls12 {
+            return Err(
+                "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES requires MQTTD_TLS_ALLOW_TLS12 — \
+                 there is no TLS 1.2 posture to relax while TLS 1.2 is off"
+                    .into(),
+            );
+        }
+        let tls12 = match (
+            config.tls.allow_tls12,
+            config.tls.allow_unsafe_tls12_features,
+        ) {
+            (false, _) => tls::Tls12::Off,
+            (true, false) => tls::Tls12::Hardened,
+            (true, true) => tls::Tls12::UnsafeLegacyFeatures,
+        };
+        if config.tls.allow_tls12 {
+            // The same register as the other posture reductions: impossible to miss in
+            // the log, stated at every start, never silent. The README advertises
+            // 1.3-only as the default posture, and this is the one sanctioned exception.
+            warn!(
+                "REDUCED TLS POSTURE: TLS 1.2 clients are admitted on the TLS listener \
+                 (MQTTD_TLS_ALLOW_TLS12) — hardened: ECDHE+AEAD suites only, Extended \
+                 Master Secret required. Intended only for device fleets that cannot \
+                 negotiate TLS 1.3. The cluster bus and QUIC remain 1.3-only."
+            );
+        }
+        if config.tls.allow_unsafe_tls12_features {
+            warn!(
+                "UNSAFE TLS 1.2 FEATURES ENABLED (MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES): \
+                 Extended Master Secret is no longer required, reopening the \
+                 triple-handshake surface for clients that do not offer it. Use only for \
+                 legacy firmware that predates RFC 7627, and plan its retirement."
+            );
+        }
+        let acceptor = tls::server_acceptor_versions(
             Path::new(&cert),
             Path::new(&key),
             client_ca.as_deref().map(Path::new),
             crl.as_deref().map(Path::new),
             session_cache,
+            tls12,
         )?;
         // Register the acceptor for SIGHUP reload (ADR 0032 T6): the closure re-reads the
         // same paths so a renewed cert/key/client-CA — and an updated CRL — is served on the
         // next handshake.
         Some(reloader.attach_tls(acceptor, move || {
-            tls::server_acceptor_full(
+            tls::server_acceptor_versions(
                 Path::new(&cert),
                 Path::new(&key),
                 client_ca.as_deref().map(Path::new),
                 crl.as_deref().map(Path::new),
                 session_cache,
+                tls12,
             )
             .map_err(|e| e.to_string())
         }))
