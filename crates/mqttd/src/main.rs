@@ -2556,6 +2556,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "--probe",
     "--url",
     "--decommission",
+    "--pid",
+    "--timeout",
     "--version",
     "-V",
     "--help",
@@ -3144,6 +3146,34 @@ mod tests {
     };
     use mqtt_config::Config;
     use mqtt_storage::OverflowPolicy;
+
+    /// #169 self-guard: every double-dash flag this source compares against must be in
+    /// `KNOWN_FLAGS`, or the strict-rejection check would refuse a flag the code accepts.
+    /// A new subcommand flag added without listing it here fails this test — which is
+    /// exactly how a missing `--pid`/`--timeout` was caught in CI the first time.
+    #[test]
+    fn every_flag_the_code_compares_is_in_the_known_set() {
+        let src = include_str!("main.rs");
+        let mut missing = Vec::new();
+        // Each occurrence of `== "` opens a compared string literal; keep the ones that
+        // start with `--` (the double-dash flags) and check membership.
+        for (i, _) in src.match_indices("== \"") {
+            let rest = &src[i + 4..];
+            let Some(end) = rest.find('"') else { continue };
+            let tok = &rest[..end];
+            if tok.starts_with("--")
+                && !super::KNOWN_FLAGS.contains(&tok)
+                && !missing.contains(&tok.to_string())
+            {
+                missing.push(tok.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these flags are compared in main.rs but absent from KNOWN_FLAGS, so the strict \
+             check would reject them: {missing:?}"
+        );
+    }
 
     /// #169 — a mistyped or unrecognised flag is reported, not silently booted; known
     /// flags and their (dash-less) values pass through clean.
