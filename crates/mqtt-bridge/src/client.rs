@@ -157,7 +157,7 @@ pub enum Command {
     },
 }
 
-/// The MQTT 5 subscription options every bridge subscription uses (issue #189).
+/// The MQTT 5 subscription options every bridge subscription uses (issues #189, #191).
 ///
 /// The bridge is always a subscriber that re-forwards, so it needs **Retain As Published**:
 /// with RAP a live message forwarded because it matched the subscription keeps the RETAIN flag
@@ -165,10 +165,18 @@ pub enum Command {
 /// delivery [MQTT-3.3.1-9]. That is what lets retained state cross the boundary. `retain_handling`
 /// stays `0` (send retained at subscribe) so a reconnect re-syncs retained state — with RAP on,
 /// that replay is an idempotent retained re-sync, not a fake-live storm (the Mosquitto model).
-/// `no_local` stays `false`: loop prevention is the hop counter + directionality (§6), not NL.
+///
+/// **No Local** (`no_local = true`) is the primary, *unforgeable* loop defence — the mechanism
+/// Mosquitto (`try_private`) and EMQX (`bridge_mode`, "equivalent to No Local = 1") both use: the
+/// broker never echoes back a message this connection itself published, so a `both`-direction
+/// rule cannot loop through its own forward. Unlike the `fss-bridge-hop-count` user property
+/// (which any publisher can set, #191), NL is a property of the *subscription*, so it cannot be
+/// forged by a publisher. The hop counter stays as the multi-broker-cycle backstop (A→B→C→A,
+/// which NL alone cannot catch), matching `HiveMQ`. NL needs the broker to honour the option;
+/// against a broker that ignores it the structural direction + remap defence (§6) still holds.
 fn bridge_subscription_options() -> mqtt_codec::packet::SubscriptionOptions {
     mqtt_codec::packet::SubscriptionOptions {
-        no_local: false,
+        no_local: true,
         retain_as_published: true,
         retain_handling: 0,
     }
@@ -439,4 +447,20 @@ impl MqttClient {
 #[must_use]
 pub fn ping_interval(keep_alive: u16) -> Duration {
     Duration::from_secs(u64::from(keep_alive).max(2) / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_subscription_options;
+
+    #[test]
+    fn bridge_subscriptions_set_no_local_and_retain_as_published() {
+        let o = bridge_subscription_options();
+        // No Local is the primary, unforgeable loop defence (#191) — Mosquitto/EMQX parity.
+        assert!(o.no_local, "bridge subscriptions must set No Local");
+        // Retain As Published lets retained state cross the boundary (#189).
+        assert!(o.retain_as_published, "bridge subscriptions must set RAP");
+        // Retain handling 0 = send retained at subscribe (idempotent re-sync with RAP on).
+        assert_eq!(o.retain_handling, 0);
+    }
 }

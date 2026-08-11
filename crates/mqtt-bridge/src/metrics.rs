@@ -198,8 +198,20 @@ impl BridgeMetrics {
     }
 
     /// Record one message dropped because it reached the hop-count limit (a bounded loop, §6).
-    pub fn dropped_hop_limit(&self) {
+    ///
+    /// Audited with the topic and hop value (#191): the `fss-bridge-hop-count` property is
+    /// publisher-settable, so a drop here can be a genuine loop **or** a publisher stamping the
+    /// limit to make its own messages vanish at the crossing. Either way it must be visible and
+    /// attributable, not a bare counter — an operator watching this rise can see *what* is being
+    /// dropped rather than only *that* something is.
+    pub fn dropped_hop_limit(&self, topic: &str, hop: u32) {
         self.dropped_hop_limit.fetch_add(1, Ordering::Relaxed);
+        info!(
+            target: "bridge::audit",
+            topic,
+            hop,
+            "dropped at the hop-count limit"
+        );
     }
 
     /// Record one (re)connection of the side at `side_index` (0 = local).

@@ -224,7 +224,7 @@ fn spawn_router(
             let hop = read_hop_count(&publish.properties);
             let forwards = plan_forwards(&cfg, side, &publish.topic, hop);
             if forwards.is_empty() && hop >= cfg.hop_count_limit {
-                metrics.dropped_hop_limit();
+                metrics.dropped_hop_limit(&publish.topic, hop);
                 debug!(?side, topic = %publish.topic, hop, "hop limit reached; dropped");
             }
             for f in forwards {
