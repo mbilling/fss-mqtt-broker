@@ -1692,10 +1692,24 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             // sighting of this packet id; re-sent copies (DUP) before the
             // PUBREL release are acknowledged but not re-delivered. The dedup
             // window is the durable session store when present (so it survives a
-            // failover), else a per-connection set. A store error degrades to
-            // forwarding (at-least-once) rather than dropping the flow.
+            // failover), else a per-connection set.
+            //
+            // A store ERROR fails CLOSED (#165): we cannot tell first-sighting from
+            // duplicate, so forwarding-and-PUBRECing would silently degrade exactly-once
+            // to at-least-once for the duration of the incident — a duplicate delivered
+            // under a clean PUBREC. Instead withhold the PUBREC and drop the connection,
+            // exactly as a failed durable fan-out does below; the publisher reconnects
+            // and re-sends, and once the store recovers the dedup is correct. (An earlier
+            // version `unwrap_or(true)`'d the error into "first sighting" — the defect.)
             let first_sighting = match &policy.store {
-                Some(store) => store.record_received(client, id).await.unwrap_or(true),
+                Some(store) => match store.record_received(client, id).await {
+                    Ok(first) => first,
+                    Err(e) => {
+                        warn!(client = %client.0, id, error = %e,
+                              "QoS2 dedup store write failed; withholding PUBREC (fail closed)");
+                        return Ok(true);
+                    }
+                },
                 None => qos2_inbound.insert(id),
             };
             if first_sighting {
@@ -2000,7 +2014,6 @@ mod tests {
         packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck, Subscribe, SubscribeFilter},
         Packet, Properties, Property, ProtocolVersion, QoS,
     };
-    use mqtt_core::ClientId;
     use mqtt_net::{FrameReader, FrameWriter};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -2042,6 +2055,195 @@ mod tests {
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
+    }
+
+    /// [`start_conn`] at v5 with a caller-supplied session store attached to the policy,
+    /// so a test can drive the QoS-2 dedup path against a failing store (#165).
+    fn start_conn_with_store(
+        store: Arc<dyn mqtt_storage::SessionStore>,
+    ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(ConnPolicy {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            node: None,
+            store: Some(store),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: None,
+        });
+        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (FrameReader::new(rh, V5), FrameWriter::new(wh, V5), hub_rx)
+    }
+
+    /// A `SessionStore` that delegates to an in-memory store but can be flipped to fail
+    /// every `record_received` — the fault seam for the #165 QoS-2 dedup test.
+    #[derive(Debug)]
+    struct RecordReceivedFails {
+        inner: mqtt_storage::MemorySessionStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordReceivedFails {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: mqtt_storage::MemorySessionStore::new(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn fail_from_now(&self) {
+            self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::SessionStore for RecordReceivedFails {
+        async fn ensure_session(
+            &self,
+            client: &mqtt_core::ClientId,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            self.inner.ensure_session(client).await
+        }
+        async fn claim_session(
+            &self,
+            client: &mqtt_core::ClientId,
+            owner: &str,
+        ) -> Result<mqtt_storage::SessionClaim, mqtt_storage::StorageError> {
+            self.inner.claim_session(client, owner).await
+        }
+        async fn set_subscriptions(
+            &self,
+            client: &mqtt_core::ClientId,
+            subscriptions: &[mqtt_core::Subscription],
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_subscriptions(client, subscriptions).await
+        }
+        async fn subscriptions(
+            &self,
+            client: &mqtt_core::ClientId,
+        ) -> Result<Vec<mqtt_core::Subscription>, mqtt_storage::StorageError> {
+            self.inner.subscriptions(client).await
+        }
+        async fn enqueue_with_expiry(
+            &self,
+            client: &mqtt_core::ClientId,
+            message: &mqtt_core::Message,
+            expiry_at: Option<u64>,
+        ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+            self.inner
+                .enqueue_with_expiry(client, message, expiry_at)
+                .await
+        }
+        async fn pending(
+            &self,
+            client: &mqtt_core::ClientId,
+            after: mqtt_storage::Offset,
+            limit: usize,
+        ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+            self.inner.pending(client, after, limit).await
+        }
+        async fn ack(
+            &self,
+            client: &mqtt_core::ClientId,
+            up_to: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack(client, up_to).await
+        }
+        async fn record_received(
+            &self,
+            client: &mqtt_core::ClientId,
+            packet_id: u16,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(mqtt_storage::StorageError::NoQuorum);
+            }
+            self.inner.record_received(client, packet_id).await
+        }
+        async fn clear_received(
+            &self,
+            client: &mqtt_core::ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_received(client, packet_id).await
+        }
+        async fn received(
+            &self,
+            client: &mqtt_core::ClientId,
+        ) -> Result<Vec<u16>, mqtt_storage::StorageError> {
+            self.inner.received(client).await
+        }
+        async fn record_outbound(
+            &self,
+            client: &mqtt_core::ClientId,
+            packet_id: u16,
+            offset: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.record_outbound(client, packet_id, offset).await
+        }
+        async fn advance_outbound(
+            &self,
+            client: &mqtt_core::ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.advance_outbound(client, packet_id).await
+        }
+        async fn clear_outbound(
+            &self,
+            client: &mqtt_core::ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_outbound(client, packet_id).await
+        }
+        async fn outbound(
+            &self,
+            client: &mqtt_core::ClientId,
+        ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            self.inner.outbound(client).await
+        }
+        async fn next_packet_id(
+            &self,
+            client: &mqtt_core::ClientId,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.next_packet_id(client).await
+        }
+        async fn reserve_packet_ids(
+            &self,
+            client: &mqtt_core::ClientId,
+            count: u16,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.reserve_packet_ids(client, count).await
+        }
+        async fn remove(
+            &self,
+            client: &mqtt_core::ClientId,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.remove(client).await
+        }
+        async fn set_session_expiry(
+            &self,
+            client: &mqtt_core::ClientId,
+            deadline: Option<u64>,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_session_expiry(client, deadline).await
+        }
+        async fn expiring_sessions(
+            &self,
+        ) -> Result<Vec<(mqtt_core::ClientId, u64)>, mqtt_storage::StorageError> {
+            self.inner.expiring_sessions().await
+        }
+        async fn all_sessions(
+            &self,
+        ) -> Result<mqtt_storage::SessionScan, mqtt_storage::StorageError> {
+            self.inner.all_sessions().await
+        }
     }
 
     /// Like [`start_conn`], but the policy carries a graceful-shutdown token (ADR 0019),
@@ -2845,6 +3047,62 @@ mod tests {
         assert_eq!(recv(&mut reader).await, None, "then the connection closes");
     }
 
+    /// `#165` — a `QoS` 2 dedup store error FAILS CLOSED: the broker withholds the `PUBREC`
+    /// and closes, rather than forwarding it (which would silently degrade exactly-once to
+    /// at-least-once for the duration of the store incident). The first publish succeeds to
+    /// prove the path works; the second, under a now-failing store, must get no `PUBREC`
+    /// and a closed connection.
+    #[tokio::test]
+    async fn v5_qos2_dedup_store_error_withholds_pubrec_and_closes() {
+        let store = RecordReceivedFails::new();
+        let (mut reader, mut writer, hub_rx) = start_conn_with_store(store.clone());
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        let qos2 = |id: u16| {
+            Packet::Publish(Publish {
+                properties: Properties(vec![]),
+                dup: false,
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                topic: "t".into(),
+                pkid: Some(id),
+                payload: Bytes::from_static(b"x"),
+            })
+        };
+
+        // Healthy store: the first QoS 2 publish is answered with PUBREC.
+        writer.send(&qos2(1)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => assert_eq!(a.pkid, 1),
+            other => panic!("expected PUBREC for the first publish, got {other:?}"),
+        }
+
+        // Store now fails every record_received. The next QoS 2 publish must NOT be
+        // PUBRECed — the connection closes instead (fail closed, #165).
+        store.fail_from_now();
+        writer.send(&qos2(2)).await.unwrap();
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "a QoS2 dedup store error must withhold the PUBREC and close, not ack a \
+             message whose dedup window does not exist"
+        );
+    }
+
+    fn qos2_publish(id: u16) -> Packet {
+        Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
+            dup: false,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            topic: "t".to_string(),
+            pkid: Some(id),
+            payload: bytes::Bytes::from_static(b"x"),
+        })
+    }
+
     /// A client must not have more unreleased `QoS` 2 publishes outstanding than the
     /// server's Receive Maximum; the publish that exceeds the window is answered with
     /// DISCONNECT 0x93 (Receive Maximum exceeded), ADR 0012 §3.
@@ -3211,73 +3469,5 @@ mod tests {
                 "a wildcard PUBLISH topic ({bad:?}) must close the connection"
             );
         }
-    }
-
-    /// Start a connection whose policy backs the QoS-2 dedup window with `store`.
-    fn start_conn_with_store(
-        store: Arc<dyn mqtt_storage::SessionStore>,
-    ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
-        let (client, server) = tokio::io::duplex(4096);
-        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
-        let policy = Arc::new(ConnPolicy {
-            auth: auth_handle(Arc::new(BasicAuthenticator {
-                allow_anonymous: true,
-            })),
-            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
-            identity_source: mqtt_auth::mtls::IdentitySource::default(),
-            audit: Arc::new(mqtt_observability::AuditLog::new()),
-            proxy: None,
-            node: None,
-            store: Some(store),
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            enhanced: None,
-            shutdown: None,
-            metrics: None,
-        });
-        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
-        let (rh, wh) = tokio::io::split(client);
-        (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
-    }
-
-    fn qos2_publish(id: u16) -> Packet {
-        Packet::Publish(Publish {
-            properties: mqtt_codec::Properties::new(),
-            dup: false,
-            qos: QoS::ExactlyOnce,
-            retain: false,
-            topic: "t".to_string(),
-            pkid: Some(id),
-            payload: bytes::Bytes::from_static(b"x"),
-        })
-    }
-
-    /// When the policy carries a session store, the QoS-2 inbound dedup window lives
-    /// in the **store** (not a per-connection set), so it is durable: the packet id
-    /// is recorded on PUBLISH (before PUBREC) and cleared on PUBREL.
-    #[tokio::test]
-    async fn qos2_dedup_window_is_backed_by_the_store() {
-        let store: Arc<dyn mqtt_storage::SessionStore> =
-            Arc::new(mqtt_storage::MemorySessionStore::new());
-        let (mut reader, mut writer, hub_rx) = start_conn_with_store(store.clone());
-        let _seen = stub_hub(hub_rx);
-
-        writer.send(&connect_packet("c1", false)).await.unwrap();
-        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
-        let client = ClientId("c1".to_string());
-
-        // First QoS-2 PUBLISH: recorded in the store before PUBREC.
-        writer.send(&qos2_publish(5)).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5.into())));
-        assert_eq!(store.received(&client).await.unwrap(), vec![5]);
-
-        // A duplicate (same id) is still acknowledged; the window is unchanged.
-        writer.send(&qos2_publish(5)).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(5.into())));
-        assert_eq!(store.received(&client).await.unwrap(), vec![5]);
-
-        // PUBREL completes the flow and clears the id from the (durable) window.
-        writer.send(&Packet::PubRel(5.into())).await.unwrap();
-        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(5.into())));
-        assert!(store.received(&client).await.unwrap().is_empty());
     }
 }

@@ -2036,12 +2036,17 @@ impl Hub {
         app: &AppProperties,
         gate: Option<u64>,
     ) -> bool {
-        let (durable_ok, _matched) = self
+        let (mut durable_ok, _matched) = self
             .deliver(topic, payload, qos, retain, message_expiry, app)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
-        // node (ADR 0015), so this runs only for locally-originated publishes.
-        self.deliver_shared(topic, payload, qos, message_expiry, app)
+        // node (ADR 0015), so this runs only for locally-originated publishes. Its
+        // durability gates the ack too (#164): a shared subscriber is a persistent
+        // subscriber, and a failed enqueue for the chosen member must withhold the
+        // publisher's ack exactly as an ordinary subscriber's would — otherwise the
+        // publisher is told a message survived that was never recorded.
+        durable_ok &= self
+            .deliver_shared(topic, payload, qos, message_expiry, app)
             .await;
         self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
@@ -2893,6 +2898,13 @@ impl Hub {
     /// deliver to it — locally, or via a targeted `SharedDeliver` to the member's
     /// node (ADR 0015). The originating node is the sole selector, so there is no
     /// double delivery.
+    /// Returns `false` when a chosen LOCAL member's durable enqueue failed — the same
+    /// contract as [`deliver_local`], and for the same reason: a shared subscriber is a
+    /// persistent subscriber owed redelivery, so an acked-but-unrecorded message is the
+    /// #124/#164 loss whether it arrived via an ordinary or a shared subscription. A
+    /// member chosen on a PEER is gated by that peer's own `deliver_to_client` there;
+    /// this node cannot observe its store and does not pretend to (the durability of a
+    /// cross-node shared delivery follows the owning node, ADR 0015).
     async fn deliver_shared(
         &mut self,
         topic: &str,
@@ -2900,7 +2912,8 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) {
+    ) -> bool {
+        let mut all_durable = true;
         for (key, candidates) in self.shared_candidates(topic) {
             let Some(chosen) = self.select_shared(&key, &candidates) else {
                 debug!(topic = %topic, "shared group has no reachable member");
@@ -2909,15 +2922,16 @@ impl Hub {
             let delivered_qos = min_qos(qos, chosen.qos);
             match chosen.node {
                 None => {
-                    self.deliver_to_client(
-                        &chosen.client,
-                        topic,
-                        payload,
-                        delivered_qos,
-                        message_expiry,
-                        app,
-                    )
-                    .await;
+                    all_durable &= self
+                        .deliver_to_client(
+                            &chosen.client,
+                            topic,
+                            payload,
+                            delivered_qos,
+                            message_expiry,
+                            app,
+                        )
+                        .await;
                 }
                 Some(node) => {
                     self.send_shared_to_peer(
@@ -2932,6 +2946,7 @@ impl Hub {
                 }
             }
         }
+        all_durable
     }
 
     /// The shared groups matching `topic`, each with its global candidate list:
@@ -7349,6 +7364,67 @@ mod tests {
         assert!(
             done_rx.await.is_err(),
             "the ack must be withheld when the durable enqueue fails"
+        );
+    }
+
+    /// #164 — the SHARED-subscription mirror of the test above. A shared subscriber is a
+    /// persistent subscriber, so a failed durable enqueue for the chosen member must
+    /// withhold the publisher's ack exactly as an ordinary subscriber's does. Before the
+    /// fix, `deliver_shared` discarded `deliver_to_client`'s result and the publisher was
+    /// acked for a message that was never recorded.
+    #[tokio::test]
+    async fn a_failed_shared_enqueue_withholds_the_publishers_ack() {
+        let (hub, tx) = Hub::with_config(NodeId("h".into()), FlakyStore::new_no_quorum_enqueue());
+        tokio::spawn(hub.run());
+
+        // The ONLY match is an offline, persistent SHARED-group member, so selection
+        // must choose it and its enqueue takes the failing durable path.
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "$share/g/fc/t");
+        detach(&tx, "p", 1);
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "fc/t".into(),
+            payload: Bytes::from_static(b"x"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(done_tx),
+            v5: false,
+        })
+        .unwrap();
+        assert!(
+            done_rx.await.is_err(),
+            "the ack must be withheld when a shared member's durable enqueue fails (#164)"
+        );
+    }
+
+    /// The other side of #164: when the shared enqueue SUCCEEDS, the publisher is acked
+    /// normally — the fix must gate on failure without breaking the happy path.
+    #[tokio::test]
+    async fn a_successful_shared_enqueue_still_acks() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe(&tx, "p", "$share/g/ok/t");
+        detach(&tx, "p", 1);
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "ok/t".into(),
+            payload: Bytes::from_static(b"x"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(done_tx),
+            v5: false,
+        })
+        .unwrap();
+        assert!(
+            done_rx.await.is_ok(),
+            "a shared delivery whose enqueue SUCCEEDED must still ack the publisher"
         );
     }
 
