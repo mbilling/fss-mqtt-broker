@@ -199,12 +199,24 @@ SEND_RETAIN_ALWAYS, plus `bridge_outgoing_retain`), EMQX (`retain_as_published` 
 HiveMQ (`preserve-retained`). Accepted residual: one duplicate *live* delivery of each retained
 value downstream per reconnect. Tracked as #189.
 
-### D. Spool is plaintext at rest, recorded here
+### D. Spool at rest — encrypt the volume, not the payload (deployment requirement), recorded here
 
-§8 mandates distinct mTLS identities and a hash-chained audit but the spool held cross-zone
-payloads in cleartext on the DMZ host. **Decision:** envelope-encrypt spool entries at rest
-(AEAD, per-entry nonce), key sourced from config (file/env/KMS reference) with documented
-rotation; the encryption is transparent to the spool's FIFO/replay contract. Tracked as #190.
+§8 mandates distinct mTLS identities and a hash-chained audit, but the store-and-forward spool
+(§7) holds cross-zone payloads in cleartext on the boundary host — a plaintext copy of everything
+crossing the boundary, on the most-exposed box in the topology.
+
+**Decision:** the spool relies on **volume/disk encryption at rest**, made an explicit
+**deployment requirement**, not application-level payload encryption. This is exactly how the
+field handles data-at-rest — Mosquitto (`mosquitto.db`), EMQX and HiveMQ (RocksDB/LMDB) all
+persist their message stores in the clear and require the underlying volume to be encrypted.
+App-level spool encryption was rejected as a non-standard deviation that is also *less* complete
+(it leaves logs, swap, temp files and core dumps, which carry the same payloads, exposed) and
+adds a key-management burden inside a security-boundary component. The requirement is stated
+where an operator provisions storage: the Helm chart `persistence.storageClassName` (point it at
+an encrypted StorageClass), the demo `docker-compose.yml` spool volume, and
+[docs/BRIDGE.md](../BRIDGE.md) ("Encrypt the spool at rest"). For callers who need the payload
+opaque to the bridge *itself*, end-to-end payload encryption by the publishers is the orthogonal
+answer — the spool then holds ciphertext for free. Tracked as #190.
 
 ### E. Loop-prevention hop counter is attacker-controlled (§6), recorded here
 

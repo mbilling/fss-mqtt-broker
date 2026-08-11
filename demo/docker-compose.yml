@@ -291,6 +291,9 @@ services:
     hostname: bridge
     volumes:
       - ./bridge/bridge.toml:/etc/bridge/bridge.toml:ro
+      # bridge-spool holds cross-zone payloads in the clear while a side is down. On a
+      # real boundary host this volume MUST be encrypted at rest (see the volume note
+      # below and docs/BRIDGE.md).
       - bridge-spool:/data
     ports: ["8090:8090"]   # bridge Prometheus metrics
     depends_on: [mqttd-1, partner-broker]
@@ -306,5 +309,14 @@ volumes:
   d6:
   d7:
   # <<< generated: per-node data volumes <<<
+  # Store-and-forward buffer for the boundary bridge. It holds cross-zone message
+  # payloads in the clear while a side is down, so on a real boundary host it MUST be
+  # encrypted at rest. Docker does not encrypt named volumes itself; do one of:
+  #   - put Docker's storage (/var/lib/docker) on an encrypted filesystem (LUKS/dm-crypt),
+  #     or run on a host/instance with full-disk / encrypted-EBS volumes; or
+  #   - replace this named volume with a bind mount onto an encrypted host path:
+  #       bridge:   volumes: [ /mnt/encrypted/bridge-spool:/data ]
+  # This mirrors how Mosquitto/EMQX/HiveMQ handle data-at-rest — the store is plaintext;
+  # the volume under it is encrypted. See docs/BRIDGE.md.
   bridge-spool:
   quic-certs:   # throwaway demo PKI for the MQTT-over-QUIC listener (ADR 0036)
