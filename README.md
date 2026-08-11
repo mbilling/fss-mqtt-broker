@@ -43,7 +43,7 @@ record of exactly what is built (58 ADRs, per-task status).
 
 **Jump to:** [**Start here**](#start-here) ·
 [Try it in two minutes](#try-it-in-two-minutes) ·
-[New to MQTT?](#new-to-mqtt) · [What works today](#what-works-today) ·
+[New to MQTT?](#new-to-mqtt) · [Glossary](docs/GLOSSARY.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [What works today](#what-works-today) ·
 [Security](#security) · [Clustering](#clustering) ·
 [Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
 [**Limitations**](#limitations) · [Install](#install) ·
@@ -497,6 +497,27 @@ version:
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
 | Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery yet — and **no production track record**: the matrix says so in as many words. |
+
+## Before production — a checklist
+
+The four things most likely to bite a first deployment, each of which is silent if you
+don't know to look. New to MQTT? Start with the [glossary](docs/GLOSSARY.md); hitting an
+error? the [troubleshooting guide](docs/TROUBLESHOOTING.md).
+
+- [ ] **Set `MQTTD_DATA_DIR` and mount a volume.** Durable sessions are on by default but
+  keep state *in memory* until a data dir is set — a correlated restart then loses
+  acknowledged messages. The broker logs an `EPHEMERAL durability` warning when you've
+  missed this.
+- [ ] **Configure an ACL (`MQTTD_ACL_FILE`).** With none, every authenticated client may
+  publish and subscribe anywhere (logged as INSECURE at startup). And note: **a denied
+  publish is still acknowledged** — the message is dropped after the ACK, so a
+  misconfigured ACL looks like "missing data", not an error. The audit log is where denials
+  are visible.
+- [ ] **Check your fleet's TLS and certificates.** TLS 1.3 is the default (1.2 is a
+  hardened opt-in), and client certificates **must** carry the `clientAuth` EKU or rustls
+  rejects them — a trap for fleets minted against OpenSSL brokers.
+- [ ] **Run ≥3 nodes for HA, never 2.** A two-node durable cluster has *worse* write
+  availability than one node (write quorum is 2-of-2). Go from 1 to 3.
 
 ## Limitations
 
