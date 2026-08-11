@@ -13,6 +13,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+/// The `StatefulSet` pod ordinal parsed from `HOSTNAME` (`<name>-<ordinal>`), or `None` when
+/// there is no trailing `-<number>` (a host with no ordinal form). The partitioned-HA instance
+/// index (ADR 0059) when `MQTTD_BRIDGE_INSTANCE` is not set explicitly.
+fn hostname_ordinal() -> Option<usize> {
+    std::env::var("HOSTNAME")
+        .ok()?
+        .rsplit_once('-')?
+        .1
+        .parse()
+        .ok()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -25,10 +37,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: mqtt-bridge <config.toml>")?;
     let toml = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-    let cfg = BridgeConfig::parse_toml(&toml)?;
+    let mut cfg = BridgeConfig::parse_toml(&toml)?;
+    // Partitioned-HA identity comes from the orchestrator (ADR 0059): env overrides the
+    // config so the same TOML ships to every replica while each gets its own index.
+    if let Some(n) = std::env::var("MQTTD_BRIDGE_TOTAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.total = n;
+    }
+    // Instance index: an explicit env wins; otherwise derive it from the pod-name ordinal
+    // (a StatefulSet sets HOSTNAME to `<name>-<ordinal>`), so a StatefulSet needs no
+    // per-version pod-index downward API. Falls back to the config value (default 0).
+    if let Some(n) = std::env::var("MQTTD_BRIDGE_INSTANCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(hostname_ordinal)
+    {
+        cfg.instance = n;
+    }
+    cfg.validate()?; // re-check instance < total after the env override
     info!(
         upstreams = cfg.upstreams.len(),
         hop_count_limit = cfg.hop_count_limit,
+        ha = ?cfg.ha,
+        instance = cfg.instance,
+        total = cfg.total,
         "starting mqtt-bridge"
     );
 

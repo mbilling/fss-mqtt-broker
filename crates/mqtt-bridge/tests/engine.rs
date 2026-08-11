@@ -300,6 +300,7 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
     let cfg = |client_id: &str| {
         BridgeConfig::parse_toml(&format!(
             r#"
+            ha = "shared"
             share_group = "ha"
             [local]
             url = "{local}"
@@ -355,6 +356,92 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
     assert!(
         !seen.is_empty(),
         "the HA pair forwarded nothing — the shared subscription never delivered"
+    );
+
+    b1.shutdown();
+    b2.shutdown();
+}
+
+/// #187 (ADR 0059): two PARTITIONED instances must deliver each **inbound** message exactly
+/// once — the case the `$share` HA model cannot cover (the subscription lives on the foreign
+/// broker, which has no `$share` for the bridge to share on). Each instance subscribes the
+/// full upstream filter and forwards only the topics it owns, so a local subscriber sees every
+/// message once — not twice (double-deliver, the bug) and not zero (a partition gap).
+#[tokio::test]
+async fn two_partitioned_instances_deliver_each_inbound_message_exactly_once() {
+    let local = start_broker().await;
+    let upstream = start_broker().await;
+
+    let cfg = |client_id: &str, instance: usize| {
+        BridgeConfig::parse_toml(&format!(
+            r#"
+            total = 2
+            instance = {instance}
+            [local]
+            url = "{local}"
+            client_id = "{client_id}"
+            [[upstreams]]
+            name = "partner"
+            url = "{upstream}"
+            # Distinct per instance — in production each pod's hostname differs; in one test
+            # process both would derive the same default and collide (MQTT takeover), leaving
+            # one instance's upstream subscription dead.
+            client_id = "up-{client_id}"
+            [[upstreams.rules]]
+            direction = "in"
+            filter = "cmd/#"
+            "#,
+        ))
+        .unwrap()
+    };
+    let b1 = Bridge::start(cfg("pbridge-a", 0));
+    let b2 = Bridge::start(cfg("pbridge-b", 1));
+
+    // A subscriber on LOCAL collects inbound-forwarded messages.
+    let mut local_sub = client(local, "part-local-sub").await;
+    subscribe(&mut local_sub, "cmd/#").await;
+
+    // Let both instances connect and subscribe on the upstream.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Publish on many DIFFERENT topics so ownership spreads across both instances.
+    let mut up_pub = client(upstream, "part-up-pub").await;
+    for n in 0..30u32 {
+        let topic = format!("cmd/{n}");
+        up_pub
+            .publish(
+                &topic,
+                Bytes::from(format!("c{n}")),
+                QoS::AtMostOnce,
+                false,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Every payload must arrive EXACTLY once — not twice (double-deliver) nor zero (a gap).
+    let mut seen: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    while let Ok(Ok(Event::Publish(p))) =
+        tokio::time::timeout(Duration::from_millis(500), local_sub.next_event()).await
+    {
+        *seen.entry(p.payload.to_vec()).or_default() += 1;
+    }
+    for (payload, count) in &seen {
+        assert_eq!(
+            *count,
+            1,
+            "payload {:?} delivered {count} times — partitioning failed",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        30,
+        "every one of the 30 messages must arrive exactly once (got {} distinct)",
+        seen.len()
     );
 
     b1.shutdown();
