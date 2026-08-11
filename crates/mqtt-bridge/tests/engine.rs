@@ -269,7 +269,6 @@ async fn a_retained_message_crosses_the_boundary_and_lands_retained() {
                     found = Some(p);
                     break;
                 }
-                Ok(Ok(_)) => {}
                 _ => {}
             }
         }
