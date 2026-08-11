@@ -1132,3 +1132,58 @@ async fn a_crl_reload_evicts_the_live_session_of_a_revoked_cert() {
         "the non-revoked session must keep flowing"
     );
 }
+
+/// TLS 1.3 session resumption works through the broker's own acceptor: the second
+/// connection from a client that cached the first connection's tickets completes an
+/// ABBREVIATED handshake. This is what keeps reconnecting battery-powered fleets cheap,
+/// and the first connection is asserted Full so the check cannot pass vacuously.
+#[tokio::test]
+async fn a_reconnecting_client_resumes_its_tls_session() {
+    let (pki, _ca, _key) = mint_pki("resume");
+    let acceptor =
+        mqtt_net::tls::server_acceptor_full(&pki.cert, &pki.key, None, None, 1024).unwrap();
+    let addr = start_tls_node(acceptor).await;
+
+    // One client config = one shared client-side session cache (rustls default: enabled).
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(&pki.ca).unwrap() {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let client_config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
+    let connector = TlsConnector::from(client_config);
+    let name = ServerName::try_from("127.0.0.1").unwrap();
+
+    let handshake = |connector: TlsConnector, name: ServerName<'static>| async move {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tls = connector.connect(name, tcp).await.unwrap();
+        let kind = tls.get_ref().1.handshake_kind();
+        // Drive one MQTT exchange so the connection is real, then let it drop. The
+        // session tickets arrive with/after the handshake; a full round-trip guarantees
+        // the client has read them before we reconnect.
+        let mut c = Client::connect(tls, "resume-probe").await;
+        c.subscribe("resume/t").await;
+        kind
+    };
+
+    let first = handshake(connector.clone(), name.clone()).await;
+    assert_eq!(
+        first,
+        Some(rustls::HandshakeKind::Full),
+        "the first connection must be a full handshake, or this test proves nothing"
+    );
+
+    let second = handshake(connector, name).await;
+    assert_eq!(
+        second,
+        Some(rustls::HandshakeKind::Resumed),
+        "the reconnect did NOT resume — reconnecting fleets are paying full handshakes"
+    );
+}

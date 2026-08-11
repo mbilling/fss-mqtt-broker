@@ -707,21 +707,30 @@ async fn start_client_listeners(
         // rejected at the TLS handshake. Reloadable on SIGHUP via the same closure below, so a
         // freshly-published CRL takes effect on the next handshake with no restart (ADR 0032 §5).
         let crl = config.tls.crl.clone();
-        let acceptor = tls::server_acceptor_with_crl(
+        // Resumption cache sized for the fleet (MQTTD_TLS_SESSION_CACHE; 0 disables) —
+        // rustls' own 256-entry default is no resumption at all once more devices than
+        // that reconnect, and battery-powered clients pay a full handshake every time.
+        let session_cache = config
+            .tls
+            .session_cache
+            .unwrap_or(tls::DEFAULT_SESSION_CACHE);
+        let acceptor = tls::server_acceptor_full(
             Path::new(&cert),
             Path::new(&key),
             client_ca.as_deref().map(Path::new),
             crl.as_deref().map(Path::new),
+            session_cache,
         )?;
         // Register the acceptor for SIGHUP reload (ADR 0032 T6): the closure re-reads the
         // same paths so a renewed cert/key/client-CA — and an updated CRL — is served on the
         // next handshake.
         Some(reloader.attach_tls(acceptor, move || {
-            tls::server_acceptor_with_crl(
+            tls::server_acceptor_full(
                 Path::new(&cert),
                 Path::new(&key),
                 client_ca.as_deref().map(Path::new),
                 crl.as_deref().map(Path::new),
+                session_cache,
             )
             .map_err(|e| e.to_string())
         }))
