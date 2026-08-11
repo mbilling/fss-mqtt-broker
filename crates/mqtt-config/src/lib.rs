@@ -106,6 +106,10 @@ pub struct Tls {
     pub client_ca: Option<String>,
     /// Client-certificate revocation list PEM (`MQTTD_TLS_CRL`); requires [`Tls::client_ca`].
     pub crl: Option<String>,
+    /// TLS 1.3 session-resumption cache size per listener (`MQTTD_TLS_SESSION_CACHE`).
+    /// `None` uses the broker default (32k entries — rustls' own 256 is no resumption at
+    /// fleet scale); `0` disables resumption so every connection is fully re-verified.
+    pub session_cache: Option<usize>,
 }
 
 /// Authentication + authorization policy. Secure by default: no anonymous access, mTLS
@@ -575,6 +579,9 @@ impl Config {
         });
         on!("MQTTD_TLS_CRL", v, {
             self.tls.crl = Some(v);
+        });
+        on!("MQTTD_TLS_SESSION_CACHE", v, {
+            self.tls.session_cache = v.parse().ok();
         });
 
         // -- security -- (MQTTD_ALLOW_ANONYMOUS: presence = on; require_client_cert is derived,

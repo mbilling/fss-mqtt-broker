@@ -20,6 +20,17 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// non-feature until a deployment demands it (ADR 0002).
 static TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
+/// Default size of the TLS 1.3 session-resumption cache, per listener.
+///
+/// rustls resumes statefully (two tickets per connection into an in-memory cache) and its
+/// own default cache holds 256 sessions — which for a device fleet is no resumption at
+/// all: 10k devices cycle the cache long before any of them reconnects, and every
+/// battery-powered client pays the full handshake every time. 32k entries is ~a few MB
+/// (an entry is a ticket plus resumption secrets, well under 100 bytes) and covers a
+/// mid-sized fleet; `MQTTD_TLS_SESSION_CACHE` sizes it to yours, and `0` disables
+/// resumption entirely.
+pub const DEFAULT_SESSION_CACHE: usize = 32 * 1024;
+
 /// This broker's rustls crypto provider — `aws-lc-rs`, selected **explicitly** rather
 /// than via rustls' process-default auto-detection (ADR 0053). It is the same provider
 /// the OTLP exporter's reqwest/rustls chain compiles in, so the whole build carries
@@ -66,8 +77,27 @@ pub fn server_acceptor_with_crl(
     client_ca: Option<&Path>,
     crl: Option<&Path>,
 ) -> Result<TlsAcceptor, NetError> {
-    Ok(TlsAcceptor::from(Arc::new(server_config_with_crl(
-        cert_chain, key, client_ca, crl,
+    server_acceptor_full(cert_chain, key, client_ca, crl, DEFAULT_SESSION_CACHE)
+}
+
+/// [`server_acceptor_with_crl`] with the session-resumption cache sized by the caller —
+/// the listener plumbs `MQTTD_TLS_SESSION_CACHE` through here.
+///
+/// # Errors
+/// As [`server_acceptor_with_crl`].
+pub fn server_acceptor_full(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+    session_cache: usize,
+) -> Result<TlsAcceptor, NetError> {
+    Ok(TlsAcceptor::from(Arc::new(server_config_full(
+        cert_chain,
+        key,
+        client_ca,
+        crl,
+        session_cache,
     )?)))
 }
 
@@ -105,6 +135,22 @@ pub fn server_config_with_crl(
     client_ca: Option<&Path>,
     crl: Option<&Path>,
 ) -> Result<ServerConfig, NetError> {
+    server_config_full(cert_chain, key, client_ca, crl, DEFAULT_SESSION_CACHE)
+}
+
+/// The full-surface builder every other `server_*` constructor delegates to: PEM material,
+/// optional mTLS + CRL, and the **session-resumption cache size** (`0` disables
+/// resumption). One function owns the `ServerConfig` so the audited path stays single.
+///
+/// # Errors
+/// As [`server_config_with_crl`].
+pub fn server_config_full(
+    cert_chain: &Path,
+    key: &Path,
+    client_ca: Option<&Path>,
+    crl: Option<&Path>,
+    session_cache: usize,
+) -> Result<ServerConfig, NetError> {
     // A CRL is only meaningful with mTLS; reject the meaningless (likely-mistaken) combination
     // up front rather than silently ignoring it.
     if client_ca.is_none() && crl.is_some() {
@@ -133,9 +179,18 @@ pub fn server_config_with_crl(
     } else {
         builder.with_no_client_auth()
     };
-    let config = configured
+    let mut config = configured
         .with_single_cert(certs, key)
         .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
+    // TLS 1.3 resumption is stateful in rustls (tickets into this cache). The rustls
+    // default of 256 entries is fleet-hostile — see [`DEFAULT_SESSION_CACHE`] — so the
+    // size is explicit here, and `0` turns resumption off for deployments that want
+    // every connection fully re-verified.
+    config.session_storage = if session_cache == 0 {
+        Arc::new(rustls::server::NoServerSessionStorage {})
+    } else {
+        rustls::server::ServerSessionMemoryCache::new(session_cache)
+    };
     Ok(config)
 }
 
