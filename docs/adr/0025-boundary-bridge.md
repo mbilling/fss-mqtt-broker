@@ -165,3 +165,67 @@ zone boundary it should **not** default to running next to cluster nodes.
 - **Bidirectional-only.** Rejected: unidirectional is a primary requirement and must be
   enforceable across config, code, credentials, and network — which only a separate,
   least-privilege component delivers.
+
+## Amendments (2026-08-11) — fidelity, durability & security gaps found in a code audit
+
+A code-level audit (epic #186) of the delivered `mqtt-bridge` against this record confirmed a
+set of fidelity/durability/security costs that the original decision did not state. Two are
+architectural and get their own records; the rest are recorded here with their fix.
+
+### A. HA covers only outbound; per-topic ordering forfeited → [ADR 0059](0059-bridge-ha-topology-and-ordering.md)
+
+§5's shared-subscription HA is correct only for `out` rules (the subscribing side is our
+cluster). For `in`/`both` rules the subscribing side is the foreign broker, so two instances
+**double-deliver** inbound, and `$share` load-balances per message so **per-topic ordering** is
+lost. §5 is superseded for the HA topology by ADR 0059 (hash-partitioned rule ownership; `$share`
+demoted to an opt-in local optimisation).
+
+### B. Ack ordering unspecified; at-least-once not actually held → [ADR 0060](0060-bridge-durability-and-ack-contract.md)
+
+§7 promised at-least-once but the bridge PUBACKs the source **before** the spool commit, silently
+falls back to an in-memory spool, and does not audit drops. ADR 0060 specifies ack-on-durable,
+explicit fsync, no-silent-non-durable, and audited overflow.
+
+### C. Retained state does not cross (RAP), recorded here
+
+A plain subscription clears the RETAIN flag `[MQTT-3.3.1-9]`, so retained state never entered the
+far broker's store, and the reconnect replay re-published the retained set as fake-live traffic.
+**Decision:** set **Retain As Published** (MQTT 5 §3.8.3.1) on the bridge's ingress subscriptions
+and copy the source retain bit onto the forwarded PUBLISH; keep **retain-handling = 0** so the
+reconnect replay is an idempotent retained re-sync (not a fake-live storm); add a per-rule
+**`outgoing_retain = false`** escape for far brokers that cannot handle retained (e.g. AWS IoT
+Core). This matches the settled cross-broker consensus — Mosquitto (RETAIN_AS_PUBLISHED +
+SEND_RETAIN_ALWAYS, plus `bridge_outgoing_retain`), EMQX (`retain_as_published` on ingress),
+HiveMQ (`preserve-retained`). Accepted residual: one duplicate *live* delivery of each retained
+value downstream per reconnect. Tracked as #189.
+
+### D. Spool is plaintext at rest, recorded here
+
+§8 mandates distinct mTLS identities and a hash-chained audit but the spool held cross-zone
+payloads in cleartext on the DMZ host. **Decision:** envelope-encrypt spool entries at rest
+(AEAD, per-entry nonce), key sourced from config (file/env/KMS reference) with documented
+rotation; the encryption is transparent to the spool's FIFO/replay contract. Tracked as #190.
+
+### E. Loop-prevention hop counter is attacker-controlled (§6), recorded here
+
+The `fss-bridge-hop-count` user property is trusted verbatim from any publisher, so an
+authenticated client can stamp it at the limit to self-censor across the boundary — a selective
+denial-of-crossing no topic ACL catches, dropped without an attributable audit record.
+**Decision:** on ingress from anything that is not an authenticated **bridge identity**, strip/
+reset the counter before it is trusted; only believe an inbound counter over a link whose peer is
+a known bridge account; and emit a labelled audit event on the hop-limit drop. Tracked as #191.
+
+### F. Honest limitations now stated (not implied)
+
+- **`both`-rule remap has no inverse** — the same strip/prefix is applied both ways, so a
+  remapped `both` rule mis-maps the reverse direction. Fix: inverse remap on the reverse leg, or
+  reject `both`+`remap` at validation (#192).
+- **Reserved filters accepted** — `$SYS/#` and `$share/...` pass config validation; they are now
+  refused (#193).
+- **No trusted internal federation.** This component is a *security boundary* by design (§1);
+  two of your **own** clusters bridged through it inherit its lossy semantics (QoS 2→1 downgrade,
+  hop/remap defences). A trusted in-process federation path remains an open question, not a
+  delivered capability.
+- **Foreign-broker capability dependence.** Retained crossing, `$share`, and MQTT 5 user
+  properties (the hop counter) all depend on what the far broker supports; where it does not, the
+  bridge falls back or strips, and logs it. AWS IoT Core is the recurring example.
