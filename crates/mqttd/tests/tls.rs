@@ -40,6 +40,10 @@ struct Pki {
 ///
 /// Every call gets its own directory: tests run concurrently in one process,
 /// and two PKIs sharing files would overwrite each other's CA mid-handshake.
+/// NOTE: `rcgen::KeyPair::generate()` produces **ECDSA P-256** keys, so every TLS test
+/// in this file — plain TLS, mTLS, CRL revocation, resumption, the 1.2 opt-in — runs
+/// ECDSA P-256 certificates end to end in CI. That is the documented, CI-tested curve;
+/// RSA ≥ 2048 is also accepted by the verifier (webpki).
 fn mint_pki(tag: &str) -> (Pki, rcgen::Certificate, rcgen::KeyPair) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UNIQUE: AtomicU64 = AtomicU64::new(0);

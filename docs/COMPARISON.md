@@ -144,6 +144,26 @@ Packet-size enforcement is compared in the Protocol table above.
 | Binaries | signed (keyless cosign), reproducible, SBOM-attested, multi-arch, free — pipeline in place, first tag pending | free | free image; features licensed | free | EULA (free to test) |
 | Paid tier | support/SLA only — no gated features (project principle) | none (foundation project) | license-gated production features | none | binary packages + support |
 
+## The two names newcomers ask about: HiveMQ and AWS IoT Core
+
+Neither is in the benchmark set (ADR 0048 compares self-hostable, like-for-like brokers),
+but they are the names most evaluations start from, so their shape belongs here. Claims
+below are limited to each vendor's own published positioning; no benchmark numbers.
+
+- **HiveMQ** is an enterprise MQTT platform: full MQTT 5, mature tooling, and clustering —
+  in the **commercial** edition. The Apache-2.0 HiveMQ Community Edition is single-node
+  (clustering, and most of the operational platform, are enterprise features). If the
+  comparison is "open-source clustered broker", HiveMQ CE is not in that category; the
+  commercial edition competes on maturity and support, which this project does not claim
+  to match.
+- **AWS IoT Core** is a managed MQTT-compatible service, not a broker you run: no cluster
+  to operate, per-message pricing, deep AWS integration — and a **protocol subset**. Most
+  notably it does not support QoS 2 (publishes at QoS 2 are rejected), and its retained
+  messages, session lifetimes and payload sizes are governed by service quotas rather than
+  configuration. If exactly-once delivery, self-hosting, data locality, or broker-level
+  control matter, it is a different product category; if "no broker to operate" is the
+  requirement, nothing self-hosted competes with it.
+
 ## Footprint & maturity — where we lose
 
 - **Footprint:** NanoMQ (sub-MB binary claims, ~4.6 MB image) and Mosquitto (a few-MB
@@ -173,6 +193,9 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-08-11 — Added the HiveMQ / AWS IoT Core section (the two names newcomers ask
+  about were absent). Claims limited to vendor-published positioning; both are outside
+  the ADR 0048 benchmark set (not self-hostable like-for-like).
 - 2026-08-04 — Kubernetes row: chart hardening (file-watch rotation, PVC lifecycle)
   and the recorded no-operator decision with reopen triggers (ADR 0047 amendment).
 - 2026-08-04 — Added "Operational limits & resource governance" (the ADR 0041 surface

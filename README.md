@@ -31,9 +31,10 @@ performance baselines, and two independent foreign-client conformance oracles)
 all ship. **v0.9.0 is released** — signed, reproducible, SBOM-attested — and the
 known gaps are listed
 in [**Limitations**](#limitations) rather than left to be discovered — the
-largest are that memory is not bounded in bytes (only by message counts), the
-Kubernetes operator is not packaged for installation, and the horizontal
-scaling curve has not been measured.
+largest are that the total-memory watermark is backpressure rather than a hard
+ceiling (the container limit remains the real bound), the Kubernetes operator
+is not packaged for installation, and the horizontal scaling curve has not been
+measured.
 
 See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
@@ -215,8 +216,10 @@ dashboard** — operations are signals and files, on purpose
 ### Protocol (MQTT 3.1.1)
 - CONNECT/CONNACK with full flag and client-id validation.
 - **QoS 0/1/2 end-to-end**: per-session in-flight tracking, `DUP` redelivery on
-  session resume, the QoS-2 four-way handshake, and inbound exactly-once
-  deduplication.
+  session resume, the QoS-2 four-way handshake, inbound exactly-once
+  deduplication — and the **outbound QoS 2 packet id and phase persisted with
+  the session**, so the handshake resumes under the same id across a broker
+  crash ([ADR 0057](docs/adr/0057-durable-outbound-inflight.md)).
 - SUBSCRIBE/UNSUBSCRIBE with `+`/`#` wildcard filters; per-filter QoS grant.
 - **Retained messages**: replayed (with the retain flag) on every new
   subscription, replaced by newer publishes, cleared by a zero-length payload.
@@ -249,8 +252,15 @@ Both protocol versions round-trip against two independent foreign clients
 (Mosquitto CLI + Eclipse Paho) in CI — see [Build & test](#build--test).
 
 ### Security
-- **TLS 1.3** client listener (`rustls` + `ring`), optional per-listener client
-  certificate mTLS — [ADR 0002](docs/adr/0002-transport-security.md). Also native
+- **TLS 1.3** client listener (`rustls` on `aws-lc-rs` — one crypto provider for
+  the whole build, [ADR 0053](docs/adr/0053-single-crypto-provider-aws-lc-rs.md)), optional
+  per-listener client-certificate mTLS, **fleet-sized session resumption**
+  (32k-entry cache by default, 24 h ceiling, `session_cache` to size or disable),
+  and a **hardened TLS 1.2 opt-in** for legacy fleets (strict ECDHE+AEAD
+  allowlist, Extended Master Secret required; see
+  [Limitations](#limitations)) — [ADR 0002](docs/adr/0002-transport-security.md).
+  Server and client certificates: **ECDSA P-256** (what the test suite runs end
+  to end, including mTLS and CRL revocation) and RSA ≥ 2048. Also native
   **MQTT-over-WebSocket** (`ws://` / `wss://`, the latter sharing the same TLS 1.3 + mTLS),
   so browsers are first-class clients — [ADR 0035](docs/adr/0035-websocket-transport.md) —
   and **MQTT-over-QUIC** (UDP; TLS 1.3 + mTLS; **multi-stream** — one session across many QUIC
@@ -262,8 +272,10 @@ Both protocol versions round-trip against two independent foreign clients
   HMAC-SHA256 tag under a cluster-shared key
   ([ADR 0003](docs/adr/0003-gossip-authentication.md)).
 - **Identity & authentication**: identity from the mTLS certificate CN; a
-  deny-by-default CONNECT gate; pluggable Argon2id password and JWT (HS256/RS256)
-  authenticators composed in a chain (cert → password → token).
+  deny-by-default CONNECT gate; pluggable Argon2id password, **remote HTTP
+  auth hook** (one webhook reaches LDAP / OAuth2 / a bespoke user table;
+  fail-closed — a hook error denies) and JWT (HS256/RS256) authenticators
+  composed in a chain (cert → password → token → hook).
 - **Authorization**: deny-by-default TOML topic ACLs with `%i` (identity) and `%c`
   (client id) substitution and asymmetric allow-covers / deny-overlaps semantics so a
   narrow grant can't widen and a broad subscription can't tunnel past a deny. Both

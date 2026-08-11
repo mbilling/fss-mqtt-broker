@@ -1,5 +1,10 @@
 # Default values for the mqttd chart (ADR 0047). Every value is documented; the secure,
 # cluster-correct defaults are the ones that ship.
+#
+# SIZING: before production, read docs/SIZING.md in this repository. It states what each
+# quota bounds, what nothing bounds yet (and what merely browns out rather than capping),
+# and the per-connection numbers the defaults assume. The quotas below are a starting
+# point, not a recommendation for your fleet.
 
 image:
   repository: ghcr.io/mbilling/fss-mqtt-broker
