@@ -242,6 +242,41 @@ has panels for all three.
 
 ---
 
+## Encrypt the spool at rest — a deployment requirement
+
+The store-and-forward spool holds **cross-zone message payloads in the clear** while a
+side is unreachable (a plain length-prefixed store, ADR 0025 §7). On a boundary host —
+by design a more-exposed box than a broker inside a trusted zone — that is a plaintext
+copy of everything crossing the boundary. Anyone who reads that disk (a stolen drive, a
+backup, a compromised host) reads the traffic.
+
+The bridge does **not** encrypt the spool itself, and deliberately so: that is not how the
+field handles data-at-rest. Mosquitto (`mosquitto.db`), EMQX and HiveMQ (RocksDB/LMDB)
+all persist their message stores in the clear and rely on the **volume** being encrypted.
+Encrypting inside the app would also be *less* complete — it leaves logs, swap, temp files
+and core dumps (which can carry the same payloads) exposed. So the requirement is:
+
+> **Put the spool directory on a volume that is encrypted at rest, on every boundary host.**
+
+- **Kubernetes:** set the bridge `persistence.storageClassName` to a StorageClass whose
+  provisioner encrypts the volume — e.g. an AWS EBS class with `encrypted: "true"`, a GCP
+  CMEK-backed class, or an Azure disk with encryption-at-host. Do not leave it unset unless
+  the cluster's default class is itself encrypted. The chart's
+  [`values.yaml`](../deploy/helm/mqttd/values.yaml) documents this at the `persistence` block.
+- **Docker / bare metal:** put Docker's storage (or the spool bind-mount) on an encrypted
+  filesystem — full-disk encryption (LUKS/dm-crypt), an encrypted cloud volume, or a
+  bind mount onto an encrypted path. The demo
+  [`docker-compose.yml`](../demo/docker-compose.yml) documents this on the `bridge-spool`
+  volume.
+
+If you need the payload to be opaque to the bridge **itself** (not just to the disk under
+it), that is **end-to-end payload encryption** — the publishers encrypt the payload before
+it ever reaches the bridge, so the spool holds ciphertext for free. That is an application
+choice, orthogonal to this requirement, and the standard way to keep a boundary crossing
+from ever seeing plaintext.
+
+---
+
 ## Choosing
 
 | | standalone | HA (2+) |

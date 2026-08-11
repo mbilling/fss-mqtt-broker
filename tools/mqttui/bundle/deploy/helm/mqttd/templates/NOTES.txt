@@ -50,6 +50,16 @@ cluster. Once the cluster is formed and healthy, set it to true and upgrade:
 Leaving it false means a pod-0 that loses its volume will found a SECOND cluster beside the
 live one instead of rejoining it (ADR 0054).
 {{- end }}
+{{- if .Values.bridge.enabled }}
+
+BOUNDARY BRIDGE: the store-and-forward spool holds cross-zone message payloads in the clear
+while a side is down. On a boundary host that is a plaintext copy of everything crossing the
+boundary, so its volume MUST be encrypted at rest. Set bridge.persistence.storageClassName to
+an ENCRYPTED StorageClass (e.g. AWS EBS encrypted: "true", GCP CMEK, Azure encryption-at-host);
+an unset value uses the cluster default class, which is safe only if that default is encrypted.
+This is the standard data-at-rest control — brokers do not encrypt their own spool either. See
+docs/BRIDGE.md ("Encrypt the spool at rest").
+{{- end }}
 
 Safe operations:
   - Scale down (a lossless decommission drain, ADR 0043):

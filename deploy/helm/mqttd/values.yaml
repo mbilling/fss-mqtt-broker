@@ -300,6 +300,12 @@ bridge:
     [spool]
     # Store-and-forward across an upstream outage. Set persistence.enabled to keep
     # it across a restart.
+    #
+    # SECURITY: this directory holds cross-zone message payloads in the clear while a
+    # side is down. On a boundary host that is a plaintext copy of everything crossing
+    # the boundary, so its volume MUST be encrypted at rest — see persistence.storageClassName
+    # below. (This is the standard data-at-rest control; brokers do not encrypt their own
+    # spool either — Mosquitto/EMQX/HiveMQ all rely on volume encryption.)
     dir = "/var/lib/mqtt-bridge"
     max_messages = 10000
 
@@ -322,6 +328,15 @@ bridge:
   persistence:
     enabled: true
     size: 1Gi
+    # ENCRYPT THIS VOLUME AT REST. The spool holds cross-zone payloads in the clear
+    # (see [spool] above), so on a boundary host it must sit on an encrypted volume —
+    # the same data-at-rest control Mosquitto/EMQX/HiveMQ rely on for their own stores.
+    # Point storageClassName at a StorageClass whose provisioner encrypts the volume, e.g.:
+    #   - AWS EBS:  a class with parameters.encrypted: "true" (optionally a KMS key)
+    #   - GCP PD:   a CMEK-backed class (disk-encryption-kms-key)
+    #   - Azure:    a class on an encryption-at-host / disk-encryption-set enabled disk
+    # An empty value uses the cluster default class — only safe if that default is itself
+    # encrypted. Do not leave this unset on a real boundary deployment.
     storageClassName: ""
     accessModes:
       - ReadWriteOnce
