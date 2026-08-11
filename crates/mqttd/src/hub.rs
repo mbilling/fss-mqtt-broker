@@ -638,6 +638,9 @@ pub enum HubCommand {
         client: ClientId,
         /// Topic filters being subscribed to, with their granted `QoS`.
         filters: Vec<(String, QoS)>,
+        /// The subset of `filters` subscribed with **No Local** set (#198), so the hub can
+        /// suppress echoing a client's own publish back to it on those filters.
+        no_local_filters: Vec<String>,
         /// When present, the hub answers with one flag per filter — `false` for a
         /// filter the subscription quota denied (ADR 0041 T3) — BEFORE any
         /// retained replay, so the connection's SUBACK precedes the replayed
@@ -693,6 +696,10 @@ pub enum HubCommand {
         /// `0x97`); v3.1.1 has no reason codes, so it is delivered live but not
         /// retained.
         v5: bool,
+        /// The publishing client (#198): a message is not echoed back to it on any of its
+        /// **No Local** subscriptions. `None` for internally-generated publishes (a Will, a
+        /// peer-forwarded message) — those have no local publisher to exclude.
+        publisher: Option<ClientId>,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -1053,6 +1060,10 @@ pub struct Hub {
     retained_antientropy_tick: u32,
     /// Per-client subscription filters with their granted `QoS`.
     subs_by_client: HashMap<ClientId, HashMap<String, QoS>>,
+    /// Filters each client subscribed with **No Local** set (MQTT 5 §3.8.3.1, #198): a
+    /// message is not delivered back to the connection that published it on such a filter —
+    /// the unforgeable loop-prevention primitive the boundary bridge relies on (ADR 0059/0025).
+    no_local: HashMap<ClientId, HashSet<String>>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
     /// Local shared-subscription groups (`$share/<group>/<filter>`) — this node's
@@ -1432,6 +1443,7 @@ impl Hub {
                 expiry_reconcile_tick: 0,
                 retained_antientropy_tick: 0,
                 subs_by_client: HashMap::new(),
+                no_local: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
                 remote_shared: HashMap::new(),
@@ -1646,9 +1658,11 @@ impl Hub {
             HubCommand::Subscribe {
                 client,
                 filters,
+                no_local_filters,
                 reply,
             } => {
-                self.subscribe(&client, filters, reply).await;
+                self.subscribe(&client, filters, no_local_filters, reply)
+                    .await;
             }
             HubCommand::SetQuotas(quotas) => {
                 self.quotas = quotas;
@@ -1668,6 +1682,7 @@ impl Hub {
                 app,
                 done,
                 v5,
+                publisher,
             } => {
                 if let Some(m) = &self.metrics {
                     m.publish_received(qos_num(qos));
@@ -1701,7 +1716,16 @@ impl Hub {
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
                 let durable_ok = self
-                    .publish(&topic, &payload, qos, retain, message_expiry, &app, gate)
+                    .publish(
+                        &topic,
+                        &payload,
+                        qos,
+                        retain,
+                        message_expiry,
+                        &app,
+                        gate,
+                        publisher.as_ref(),
+                    )
                     .await;
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
@@ -1787,7 +1811,7 @@ impl Hub {
                 // this, and "I found no one" is not yet a claim this node can stand
                 // behind — the refusal makes the publisher retry until it is.
                 let (durable_ok, matched) = self
-                    .deliver(&topic, &payload, qos, retain, message_expiry, &app)
+                    .deliver(&topic, &payload, qos, retain, message_expiry, &app, None)
                     .await;
                 let ok = durable_ok && !(matched == 0 && self.routing_unsettled());
                 if let Some(peer) = self.peers.get(&node) {
@@ -1811,7 +1835,7 @@ impl Hub {
                 // expiry is carried over the link (ADR 0014 T9), so a queued cross-node
                 // copy keeps the same deadline. User Properties ride along (ADR 0030).
                 let _ = self
-                    .deliver(&topic, &payload, qos, retain, message_expiry, &app)
+                    .deliver(&topic, &payload, qos, retain, message_expiry, &app, None)
                     .await;
             }
             HubCommand::PeerConnected {
@@ -2035,9 +2059,10 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         gate: Option<u64>,
+        publisher: Option<&ClientId>,
     ) -> bool {
         let (mut durable_ok, _matched) = self
-            .deliver(topic, payload, qos, retain, message_expiry, app)
+            .deliver(topic, payload, qos, retain, message_expiry, app, publisher)
             .await;
         // Shared subscriptions are selected once cluster-wide by the originating
         // node (ADR 0015), so this runs only for locally-originated publishes. Its
@@ -2065,8 +2090,10 @@ impl Hub {
     /// will's own application properties (ADR 0030); a will never sets a message-expiry.
     async fn publish_will(&mut self, w: &Message) {
         // No publisher waits on a will, so nothing gates on its durability.
-        self.publish(&w.topic, &w.payload, w.qos, w.retain, None, &w.app, None)
-            .await;
+        self.publish(
+            &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None,
+        )
+        .await;
     }
 
     /// Apply a message on this node: store/clear retained state and deliver to local
@@ -2079,6 +2106,7 @@ impl Hub {
     /// ordinary subscribers the topic found — a gated forward answered from a
     /// zero-match fan-out while the routing view is unsettled must refuse, not
     /// OK (0043-P4 exhibit ②).
+    #[allow(clippy::too_many_arguments)] // the delivery-path fields, plus the No Local publisher
     async fn deliver(
         &mut self,
         topic: &str,
@@ -2087,6 +2115,7 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         app: &AppProperties,
+        publisher: Option<&ClientId>,
     ) -> (bool, usize) {
         // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
         // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
@@ -2119,7 +2148,7 @@ impl Hub {
         // Live deliveries carry retain=0 [MQTT-3.3.1-9]. The retained-write outcome gates the
         // publisher's ack alongside the live-delivery durability.
         let (durable_ok, matched) = self
-            .deliver_local(topic, payload, qos, message_expiry, app)
+            .deliver_local(topic, payload, qos, message_expiry, app, publisher)
             .await;
         (durable_ok && retained_ok, matched)
     }
@@ -2598,8 +2627,27 @@ impl Hub {
         &mut self,
         client: &ClientId,
         filters: Vec<(String, QoS)>,
+        no_local_filters: Vec<String>,
         reply: Option<oneshot::Sender<Vec<bool>>>,
     ) {
+        // No Local (#198): record which filters this client subscribed with NL set, and clear
+        // it for any (re)subscribed filter that did not — a re-subscribe replaces the option.
+        // Only filters the ACL granted reach here; a `$share/...` filter with NL is harmless
+        // (No Local is applied on the ordinary-delivery path only).
+        {
+            let nl: std::collections::HashSet<&String> = no_local_filters.iter().collect();
+            let entry = self.no_local.entry(client.clone()).or_default();
+            for (f, _) in &filters {
+                if nl.contains(f) {
+                    entry.insert(f.clone());
+                } else {
+                    entry.remove(f);
+                }
+            }
+            if entry.is_empty() {
+                self.no_local.remove(client);
+            }
+        }
         // Subscription quota (ADR 0041 T3): count how many NEW filters the cap
         // admits — an already-held filter replaces (never consumes quota). The
         // SUBACK itself is answered only after the durable persist below
@@ -2743,6 +2791,12 @@ impl Hub {
             if let Some(map) = self.subs_by_client.get_mut(client) {
                 map.remove(f);
             }
+            if let Some(set) = self.no_local.get_mut(client) {
+                set.remove(f); // #198: drop the No Local flag with the subscription
+                if set.is_empty() {
+                    self.no_local.remove(client);
+                }
+            }
             if let Some((group, filter)) = parse_shared(f) {
                 self.shared.unsubscribe(client, group, filter);
             } else {
@@ -2772,6 +2826,22 @@ impl Hub {
     /// `min(qos, granted)` each. Shared subscriptions are routed separately by
     /// [`deliver_shared`](Self::deliver_shared) (ADR 0015).
     /// Returns `false` when any recipient's durable enqueue failed (ADR 0041 T5).
+    /// No Local (#198, MQTT 5 §3.8.3.1): whether delivery of `topic` to `client` must be
+    /// suppressed because `client` is the message's publisher and holds a No Local subscription
+    /// matching `topic`. The unforgeable loop-prevention primitive the boundary bridge uses.
+    fn suppressed_by_no_local(
+        &self,
+        client: &ClientId,
+        topic: &str,
+        publisher: Option<&ClientId>,
+    ) -> bool {
+        publisher == Some(client)
+            && self
+                .no_local
+                .get(client)
+                .is_some_and(|fs| fs.iter().any(|f| mqtt_core::topic_matches(f, topic)))
+    }
+
     async fn deliver_local(
         &mut self,
         topic: &str,
@@ -2779,11 +2849,13 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
+        publisher: Option<&ClientId>,
     ) -> (bool, usize) {
         let targets: Vec<(ClientId, QoS)> = self
             .table
             .matching_clients(topic)
             .into_iter()
+            .filter(|c| !self.suppressed_by_no_local(c, topic, publisher))
             .map(|c| {
                 let granted = self.granted_qos(&c, topic);
                 (c, granted)
@@ -4215,6 +4287,7 @@ impl Hub {
     /// Remove all of a client's subscriptions from the routing table.
     fn drop_subscriptions(&mut self, client: &ClientId) {
         self.subs_by_client.remove(client);
+        self.no_local.remove(client);
         self.table.remove_client(client);
         self.shared.remove_client(client);
     }
@@ -6062,6 +6135,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
             reply: None,
         })
         .unwrap();
@@ -6086,6 +6160,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
     }
@@ -6094,6 +6169,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), qos)],
+            no_local_filters: Vec::new(),
             reply: None,
         })
         .unwrap();
@@ -6224,6 +6300,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
     }
@@ -6238,6 +6315,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
     }
@@ -7412,6 +7490,7 @@ mod tests {
             app: mqtt_core::AppProperties::default(),
             done: Some(done_tx),
             v5: false,
+            publisher: None,
         })
         .unwrap();
         assert!(
@@ -7446,6 +7525,7 @@ mod tests {
             app: mqtt_core::AppProperties::default(),
             done: Some(done_tx),
             v5: false,
+            publisher: None,
         })
         .unwrap();
         assert!(
@@ -7481,6 +7561,7 @@ mod tests {
             app: mqtt_core::AppProperties::default(),
             done: Some(ok_tx),
             v5: false,
+            publisher: None,
         })
         .unwrap();
         assert!(
@@ -7500,11 +7581,93 @@ mod tests {
             app: mqtt_core::AppProperties::default(),
             done: Some(fail_tx),
             v5: false,
+            publisher: None,
         })
         .unwrap();
         assert!(
             fail_rx.await.is_err(),
             "a failed retained-store write must withhold the publisher's ack (#203)"
+        );
+    }
+
+    /// #198: **No Local** suppresses echoing a client's own publish back to it, while other
+    /// subscribers still receive it — the unforgeable loop-prevention primitive (Mosquitto
+    /// `try_private` / EMQX `bridge_mode`) the boundary bridge relies on (ADR 0059/0025).
+    #[tokio::test]
+    async fn no_local_suppresses_the_publishers_own_delivery() {
+        let tx = start_hub();
+        let (mut nl_rx, _) = attach(&tx, "pub-nl", 1, true).await;
+        let (mut other_rx, _) = attach(&tx, "other", 2, true).await;
+
+        // pub-nl subscribes to t/# WITH No Local; other subscribes without.
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("pub-nl".into()),
+            filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            no_local_filters: vec!["t/#".into()],
+            reply: None,
+        })
+        .unwrap();
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("other".into()),
+            filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
+            reply: None,
+        })
+        .unwrap();
+
+        // pub-nl publishes to t/x.
+        tx.send(HubCommand::Publish {
+            topic: "t/x".into(),
+            payload: Bytes::from_static(b"m"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: true,
+            publisher: Some(ClientId("pub-nl".into())),
+        })
+        .unwrap();
+
+        // The other subscriber receives it; the No Local publisher does NOT.
+        assert!(
+            matches!(recv_packet(&mut other_rx).await, Some(Packet::Publish(_))),
+            "the non-No-Local subscriber must receive the message"
+        );
+        assert!(
+            recv_packet(&mut nl_rx).await.is_none(),
+            "No Local must suppress delivery to the publisher's own subscription"
+        );
+    }
+
+    /// The control that makes the No Local test meaningful: WITHOUT No Local, a publisher that
+    /// also subscribes to the topic DOES receive its own message (the MQTT default).
+    #[tokio::test]
+    async fn without_no_local_a_publisher_receives_its_own_delivery() {
+        let tx = start_hub();
+        let (mut rx, _) = attach(&tx, "pub-plain", 1, true).await;
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("pub-plain".into()),
+            filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
+            reply: None,
+        })
+        .unwrap();
+        tx.send(HubCommand::Publish {
+            topic: "t/x".into(),
+            payload: Bytes::from_static(b"m"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: true,
+            publisher: Some(ClientId("pub-plain".into())),
+        })
+        .unwrap();
+        assert!(
+            matches!(recv_packet(&mut rx).await, Some(Packet::Publish(_))),
+            "without No Local the publisher must receive its own delivery"
         );
     }
 
@@ -7527,6 +7690,7 @@ mod tests {
             app: mqtt_core::AppProperties::default(),
             done: Some(done_tx),
             v5: false,
+            publisher: None,
         })
         .unwrap();
         assert!(
@@ -7560,6 +7724,7 @@ mod tests {
                 app: mqtt_core::AppProperties::default(),
                 done: Some(done_tx),
                 v5: true,
+                publisher: None,
             })
             .unwrap();
             done_rx
@@ -8266,6 +8431,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
     }
@@ -8385,6 +8551,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
 
@@ -8935,6 +9102,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
         tx.send(HubCommand::Publish {
@@ -8946,6 +9114,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
         // No local durable write for a foreign topic while queued.
@@ -9025,6 +9194,7 @@ mod tests {
                 app: AppProperties::default(),
                 done: None,
                 v5: false,
+                publisher: None,
             })
             .unwrap();
         }
@@ -9256,6 +9426,7 @@ mod tests {
                 app: AppProperties::default(),
                 done: None,
                 v5: false,
+                publisher: None,
             })
             .unwrap();
         }
@@ -9507,6 +9678,7 @@ mod tests {
             app: AppProperties::default(),
             done: None,
             v5: false,
+            publisher: None,
         })
         .unwrap();
     }

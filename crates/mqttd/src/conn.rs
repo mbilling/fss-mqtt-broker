@@ -1648,6 +1648,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 app,
                 done: Some(done_tx),
                 v5: is_v5,
+                publisher: Some(client.clone()), // #198: No Local excludes this publisher
             });
             Some(done_rx)
         } else {
@@ -1875,6 +1876,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             // 0x80 [MQTT-3.9.3] and never reach the hub; granted filters get
             // the requested QoS [MQTT-3.8.4-5/6].
             let mut granted: Vec<(String, QoS)> = Vec::new();
+            let mut no_local_filters: Vec<String> = Vec::new();
             let mut return_codes: Vec<u8> = Vec::with_capacity(s.filters.len());
             for f in &s.filters {
                 // A malformed `$share/...` filter (bad share name / empty filter) is
@@ -1887,6 +1889,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     .authorize_subscribe(principal, client, &f.path)
                 {
                     granted.push((f.path.clone(), f.qos));
+                    if f.options.no_local {
+                        no_local_filters.push(f.path.clone()); // #198
+                    }
                     return_codes.push(f.qos as u8);
                 } else {
                     debug!(client = %client.0, identity = %principal.subject, filter = %f.path,
@@ -1906,6 +1911,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 let _ = hub.send(HubCommand::Subscribe {
                     client: client.clone(),
                     filters: granted,
+                    no_local_filters,
                     reply: Some(reply_tx),
                 });
                 let Ok(verdicts) = reply_rx.await else {
