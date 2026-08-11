@@ -2091,6 +2091,7 @@ impl Hub {
         // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
         // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
         // untokened) flag here is exactly the everyday-race divergence the ADR removes.
+        let mut retained_ok = true;
         if retain && self.durable_retained.is_none() {
             // A zero-length retained payload clears the retained message
             // [MQTT-3.3.1-10]; `RetainedStore::set` implements both cases.
@@ -2102,12 +2103,25 @@ impl Hub {
                 app: app.clone(),
             };
             if let Err(e) = self.retained.set(&message).await {
+                // Fail closed (audit #203): a failed retained write must NOT be acked as
+                // durable. The store is write-through fsync'd, so a QoS≥1 publisher told its
+                // retained value was stored, when it was not, would lose it on the next
+                // subscriber's replay. This matches the sibling paths that already fail closed
+                // (the offline queue-enqueue and the QoS-2 dedup write); the publisher retries
+                // and the value is re-stored (at-least-once for the retained store).
                 warn!(topic = %topic, error = %e, "failed to update retained message");
+                if let Some(m) = &self.metrics {
+                    m.retained_apply_failed();
+                }
+                retained_ok = false;
             }
         }
-        // Live deliveries carry retain=0 [MQTT-3.3.1-9].
-        self.deliver_local(topic, payload, qos, message_expiry, app)
-            .await
+        // Live deliveries carry retain=0 [MQTT-3.3.1-9]. The retained-write outcome gates the
+        // publisher's ack alongside the live-delivery durability.
+        let (durable_ok, matched) = self
+            .deliver_local(topic, payload, qos, message_expiry, app)
+            .await;
+        (durable_ok && retained_ok, matched)
     }
 
     /// Log when a persistent session is served on a node that is not its
@@ -7437,6 +7451,60 @@ mod tests {
         assert!(
             done_rx.await.is_err(),
             "the ack must be withheld when a shared member's durable enqueue fails (#164)"
+        );
+    }
+
+    /// #203 (durable-store audit): a QoS≥1 **retained** publish whose retained-store write
+    /// FAILS must withhold the publisher's ack. The single-node retained path was fail-open —
+    /// it logged the store error and acked anyway, so a publisher was told its retained value
+    /// was stored when it was not (inconsistent with the offline-enqueue and QoS-2 paths, which
+    /// already fail closed).
+    #[tokio::test]
+    async fn a_failed_retained_store_write_withholds_the_publishers_ack() {
+        let store = FailingRetainedStore::new();
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            NodeId("h".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        hub.attach_retained_store(Box::new(store.clone()));
+        tokio::spawn(hub.run());
+
+        // Healthy: a retained publish is acked normally (the fix must not break the happy path).
+        let (ok_tx, ok_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "r/ok".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(ok_tx),
+            v5: false,
+        })
+        .unwrap();
+        assert!(
+            ok_rx.await.is_ok(),
+            "a healthy retained write must still ack"
+        );
+
+        // Failing: the ack is withheld.
+        store.fail_writes();
+        let (fail_tx, fail_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "r/fail".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(fail_tx),
+            v5: false,
+        })
+        .unwrap();
+        assert!(
+            fail_rx.await.is_err(),
+            "a failed retained-store write must withhold the publisher's ack (#203)"
         );
     }
 

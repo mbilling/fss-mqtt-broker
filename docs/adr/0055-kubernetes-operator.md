@@ -83,8 +83,10 @@ first page of any incident.
    therefore suppresses further fencing and the condition stays raised.
 2. **Brownout**: `mqttd_brownout == 1` or utilization past a threshold sets the
    condition + Event; with `ExpandPVC` and an expansion-capable StorageClass, patch
-   PVC sizes (bounded by `expansion.maxSize`) and raise `store_max_bytes`
-   accordingly through the config contract (a rolling config apply).
+   PVC sizes (bounded by `expansion.maxSize`). **As delivered, this grows the volume
+   only — it does not yet raise `store_max_bytes`** (that lives in the config and is
+   tracked by 0055-T10), so the broker can keep refusing writes on the larger volume
+   until the watermark is rolled. The config-roll half is planned, not shipped.
 3. **Key rotation, unattended**: drive the three `key_accept` phases as config/Secret
    rolls, gating each phase on the ADR 0054 verification signals
    (`swim_keys_accepted` returns to 1, checksums converge) before the next.
