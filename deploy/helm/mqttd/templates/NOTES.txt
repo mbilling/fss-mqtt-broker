@@ -32,6 +32,10 @@ serving real clients.
    start — while a missing ACL fails QUIETLY, in the permissive direction. The one that
    fails open is the one worth warning about.)
 {{- end }}
+
+Before sizing this for production, read docs/SIZING.md in the chart's repository — it
+states what each quota bounds, what nothing bounds yet, and the per-connection numbers
+the defaults assume. The values.yaml quotas are a starting point, not a recommendation.
 {{- if not .Values.clusterEstablished }}
 
 NOTE: clusterEstablished is false, which is correct for a FIRST install — pod-0 founds the
