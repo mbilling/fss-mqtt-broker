@@ -17,7 +17,7 @@ use mqtt_codec::packet::Publish;
 use mqtt_codec::{ProtocolVersion, QoS};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::client::{Command, ConnectOptions, MqttClient, Transport};
 use crate::config::{BridgeConfig, Endpoint, HaMode};
@@ -303,6 +303,18 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
             match Spool::on_disk(&path, cap) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
+                    // ADR 0060 T4: never silently fall back to a non-durable spool when a
+                    // QoS≥1 rule needs one — that loses acked messages on restart. Refuse to
+                    // start unless the operator opted into ephemeral operation.
+                    if cfg.requires_durable_spool() && !cfg.spool.allow_ephemeral_spool {
+                        error!(
+                            ?side, error = %e, path = %path.display(),
+                            "durable spool required for a QoS>=1 rule but the disk spool could \
+                             not be opened; refusing to start (set spool.allow_ephemeral_spool \
+                             to run non-durably and accept message loss)"
+                        );
+                        std::process::exit(1);
+                    }
                     warn!(?side, error = %e, "disk spool unavailable; using an in-memory spool");
                     Arc::new(Spool::in_memory(cap))
                 }
