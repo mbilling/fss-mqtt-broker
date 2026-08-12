@@ -1446,7 +1446,8 @@ mod tests {
                     &topic,
                     b"v1",
                     1,
-                    &mqtt_storage::app_props::AppProps::default()
+                    &mqtt_storage::app_props::AppProps::default(),
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -1459,7 +1460,8 @@ mod tests {
                     &topic,
                     b"v2",
                     1,
-                    &mqtt_storage::app_props::AppProps::default()
+                    &mqtt_storage::app_props::AppProps::default(),
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -1529,6 +1531,7 @@ mod tests {
                 b"x",
                 0,
                 &mqtt_storage::app_props::AppProps::default(),
+                None,
             )
             .await
             .unwrap_err();
@@ -1585,6 +1588,7 @@ mod tests {
                 b"stale",
                 0,
                 &mqtt_storage::app_props::AppProps::default(),
+                None,
             )
             .await
             .unwrap_err();
@@ -1638,6 +1642,7 @@ mod tests {
                 b"v1",
                 1,
                 &mqtt_storage::app_props::AppProps::default(),
+                None,
             )
             .await
             .unwrap();
@@ -1648,6 +1653,7 @@ mod tests {
                 b"v2",
                 1,
                 &mqtt_storage::app_props::AppProps::default(),
+                None,
             )
             .await
             .unwrap();
@@ -1678,6 +1684,7 @@ mod tests {
                 b"v3",
                 1,
                 &mqtt_storage::app_props::AppProps::default(),
+                None,
             )
             .await
             .unwrap();

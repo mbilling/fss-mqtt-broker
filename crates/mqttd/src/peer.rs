@@ -673,6 +673,7 @@ fn forward_inbound(
             qos,
             props,
             seq,
+            expires_at,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedCommit {
                 node: remote.clone(),
@@ -681,6 +682,7 @@ fn forward_inbound(
                 qos,
                 app: crate::hub::app_from_wire(props),
                 seq,
+                expires_at,
             });
         }
         PeerMessage::RetainedCommitAck { seq, token } => {
@@ -697,6 +699,7 @@ fn forward_inbound(
             epoch,
             offset,
             props,
+            expires_at,
         } => {
             let _ = hub.send(HubCommand::RemoteRetainedUpdate {
                 topic,
@@ -705,6 +708,7 @@ fn forward_inbound(
                 epoch,
                 offset,
                 app: crate::hub::app_from_wire(props),
+                expires_at,
             });
         }
         PeerMessage::Hello { .. } => {

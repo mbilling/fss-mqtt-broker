@@ -879,6 +879,8 @@ pub enum HubCommand {
         app: AppProperties,
         /// The sender's handoff sequence (echoed in the ack; dedup key).
         seq: u64,
+        /// Absolute expiry deadline (Unix epoch seconds; issue #227). `None` = never.
+        expires_at: Option<u64>,
     },
     /// The owner's commit-gated answer to a handoff this node sent (ADR 0037 T8):
     /// `Some(token)` = committed (drop the held mutation), `None` = the receiver no
@@ -916,6 +918,8 @@ pub enum HubCommand {
         /// The pending publish gated on this commit (ADR 0042 T9, exhibit ⑦), if
         /// the mutation originated from a gated local publish.
         publish: Option<u64>,
+        /// The absolute expiry deadline the commit carried (issue #227).
+        expires_at: Option<u64>,
     },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
@@ -933,6 +937,8 @@ pub enum HubCommand {
         offset: u64,
         /// The committed application properties (ADR 0038 T3).
         app: AppProperties,
+        /// The committed absolute expiry deadline (issue #227). `None` = never.
+        expires_at: Option<u64>,
     },
     /// A targeted shared-subscription delivery from a peer (ADR 0015 §1): deliver to
     /// exactly `client` (a local member), no further selection or re-forward.
@@ -1181,6 +1187,11 @@ pub struct Hub {
     /// through the window's ledger. Empty in the steady state, so the apply path's
     /// cost is one `is_empty()` check.
     retained_windows: HashMap<ClientId, RetainedWindow>,
+    /// Whether any retained value currently held MIGHT carry an expiry deadline
+    /// (issue #227) — flipped on when one lands, cleared by the reap scan finding
+    /// none. Keeps the per-tick reap pay-for-use: a broker with no expiring
+    /// retained values (every v3.1.1 deployment) never scans.
+    retained_may_expire: bool,
     /// Retained mutations awaiting their authority commit (ADR 0037 §5), in arrival
     /// order: every mutation passes through here, so commits are **serialized per
     /// node** (one in flight at a time — two rapid publishes to one topic can never
@@ -1350,6 +1361,9 @@ struct RetainedMutation {
     /// authority commit (ADR 0042 T9, exhibit ⑦). Survives re-queues and rides
     /// the handoff hold, so the gate holds however long the commit takes.
     publish: Option<u64>,
+    /// Absolute expiry deadline (Unix epoch seconds; issue #227), committed with
+    /// the value. `None` = never.
+    expires_at: Option<u64>,
 }
 
 /// The bound on publishes whose acknowledgement awaits cluster-wide durability
@@ -1543,6 +1557,7 @@ impl Hub {
                 quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
                 retained_windows: HashMap::new(),
+                retained_may_expire: false,
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
                 retained_handoff: None,
@@ -2011,12 +2026,13 @@ impl Hub {
                 qos,
                 app,
                 seq,
+                expires_at,
             } => {
                 // A peer routed a retained mutation here because this node owns the
                 // topic's group (ADR 0037 §1): dedup retransmissions, then run it
                 // through the same queue as local mutations — serialized commit
                 // order, retry-until-heal, and a NACK back if the lease moved (T8).
-                self.accept_routed_retained(node, topic, payload, qos, app, seq);
+                self.accept_routed_retained(node, topic, payload, qos, app, seq, expires_at);
             }
             HubCommand::RemoteRetainedCommitAck { node, seq, token } => {
                 // The commit-gated answer to our in-flight handoff (T8). A stale or
@@ -2053,6 +2069,7 @@ impl Hub {
                 token,
                 reply,
                 publish,
+                expires_at,
             } => {
                 self.retained_commit_inflight = false;
                 if let Some((epoch, offset)) = token {
@@ -2066,8 +2083,15 @@ impl Hub {
                     // converges via the P5 back-fill on the next link-up), and drive
                     // the next queued mutation. Application properties travel with
                     // the value everywhere (ADR 0038 T3).
-                    self.apply_retained_update(&topic, &payload, qos, &app, (epoch, offset))
-                        .await;
+                    self.apply_retained_update(
+                        &topic,
+                        &payload,
+                        qos,
+                        &app,
+                        (epoch, offset),
+                        expires_at,
+                    )
+                    .await;
                     for peer in self.peers.values() {
                         let _ = peer.tx.send(PeerMessage::RetainedUpdate {
                             topic: topic.clone(),
@@ -2076,6 +2100,7 @@ impl Hub {
                             epoch,
                             offset,
                             props: app_to_wire(&app),
+                            expires_at,
                         });
                     }
                     // A peer-routed mutation gets its commit-gated ack (T8); the
@@ -2103,6 +2128,7 @@ impl Hub {
                         app,
                         reply,
                         publish,
+                        expires_at,
                     });
                 }
             }
@@ -2113,9 +2139,17 @@ impl Hub {
                 epoch,
                 offset,
                 app,
+                expires_at,
             } => {
-                self.apply_retained_update(&topic, &payload, qos, &app, (epoch, offset))
-                    .await;
+                self.apply_retained_update(
+                    &topic,
+                    &payload,
+                    qos,
+                    &app,
+                    (epoch, offset),
+                    expires_at,
+                )
+                .await;
             }
             HubCommand::RemoteSharedDeliver {
                 client,
@@ -2176,7 +2210,11 @@ impl Hub {
         // publish is exactly one authority commit. The gated publish's ack now waits
         // for this commit too (ADR 0042 T9, exhibit ⑦).
         if retain {
-            self.route_retained_commit(topic, payload, qos_num(qos), app, gate);
+            // The absolute deadline commits WITH the value (issue #227), so every
+            // cache expires it at the same instant and a replay can send the
+            // remaining interval.
+            let expires_at = message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s));
+            self.route_retained_commit(topic, payload, qos_num(qos), app, gate, expires_at);
         }
         durable_ok
     }
@@ -2225,7 +2263,10 @@ impl Hub {
                 qos,
                 retain: true,
                 app: app.clone(),
+                // The absolute deadline persists with the copy (issue #227).
+                expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
             };
+            self.retained_may_expire |= message.expires_at.is_some();
             if let Err(e) = self.retained.set(&message).await {
                 // Fail closed (audit #203): a failed retained write must NOT be acked as
                 // durable. The store is write-through fsync'd, so a QoS≥1 publisher told its
@@ -2823,7 +2864,13 @@ impl Hub {
             }
             match self.retained.matching(f).await {
                 Ok(matching) => {
+                    let now = self.clock.now_epoch_secs();
                     for m in matching {
+                        // An expired retained copy is not replayed [MQTT-3.3.2-5];
+                        // the GC sweep reaps it (issue #227).
+                        if m.expires_at.is_some_and(|d| d <= now) {
+                            continue;
+                        }
                         window_seeds.push((
                             m.topic.clone(),
                             retained_value_id(
@@ -2911,7 +2958,17 @@ impl Hub {
                 // No session-log offset (#124): a retained value is durable in the
                 // retained store, and a crash mid-delivery loses the delivery, not the
                 // fact — the value is still there and is replayed to the next subscribe.
-                self.send_to_client(client, &tx, &m, true, None, None).await;
+                // The replay carries the REMAINING expiry interval [MQTT-3.3.2-6]; a
+                // value that expired between collection and send is dropped here
+                // (issue #227).
+                let now = self.clock.now_epoch_secs();
+                let remaining = match m.expires_at {
+                    Some(d) if d <= now => continue,
+                    Some(d) => Some(u32::try_from(d - now).unwrap_or(u32::MAX)),
+                    None => None,
+                };
+                self.send_to_client(client, &tx, &m, true, remaining, None)
+                    .await;
             }
         } else if !retained_replay.is_empty() {
             // #87 item 5: the subscription resolved retained values but the client is not
@@ -3078,6 +3135,7 @@ impl Hub {
             qos,
             retain,
             app: app.clone(),
+            expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
         };
         let persistent = self.is_persistent(client);
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
@@ -4045,6 +4103,9 @@ impl Hub {
             self.retained_windows.retain(|_, w| w.until > now);
         }
         self.retained_antientropy_tick = self.retained_antientropy_tick.wrapping_add(1);
+        if self.retained_may_expire {
+            self.reap_expired_retained().await;
+        }
         if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 {
             // Re-learn committed retained state this process no longer remembers
             // BEFORE offering the digest built from it (issue #183): a restart
@@ -4962,6 +5023,7 @@ impl Hub {
                     qos: m.qos as u8,
                     epoch,
                     offset,
+                    expires_at: m.expires_at,
                 },
                 None => match self.durable_retained_authority(&m.topic).await {
                     Some(authority) => {
@@ -4975,6 +5037,7 @@ impl Hub {
                             authority.qos,
                             &app,
                             authority.token(),
+                            authority.expires_at,
                         )
                         .await;
                         RetainedWireEntry {
@@ -4984,6 +5047,7 @@ impl Hub {
                             qos: authority.qos,
                             epoch: authority.epoch,
                             offset: authority.offset,
+                            expires_at: authority.expires_at,
                         }
                     }
                     // Never durably committed, or the authority is not readable
@@ -4995,6 +5059,7 @@ impl Hub {
                         qos: m.qos as u8,
                         epoch: 0,
                         offset: 0,
+                        expires_at: m.expires_at,
                     },
                 },
             };
@@ -5077,6 +5142,7 @@ impl Hub {
                 epoch,
                 offset,
                 props,
+                expires_at,
             } = entry;
             let payload = Bytes::from(payload);
             let held_value = have.get(&topic).copied();
@@ -5125,8 +5191,10 @@ impl Hub {
                 qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
                 retain: true,
                 app: props.into(),
+                expires_at,
             };
             let topic_key = message.topic.clone();
+            self.retained_may_expire |= message.expires_at.is_some();
             if self.retained.set(&message).await.is_ok() {
                 if let Some(token) = pending_token {
                     self.retained_tokens.insert(topic_key, token);
@@ -5142,34 +5210,39 @@ impl Hub {
         if filled > 0 {
             debug!(filled, "back-filled retained messages from a peer snapshot");
         }
-        if diverged > 0 {
-            // One warn per chunk, not per topic — the per-topic detail is at debug and
-            // the count is on the metric (bounded logging, ADR 0003-T6 style). The
-            // counts must say what actually happened: this line used to claim
-            // "converged to the higher-token committed value" unconditionally, while
-            // every repair in the chunk was being refused as stale — which is how a
-            // permanent divergence wore convergence's clothes for two CI runs (#214).
-            // A diverged entry whose store write failed appears in neither count; it
-            // has its own warn and `retained_apply_failed_total`.
-            if durable {
-                warn!(
-                    node = %node.0,
-                    topics = diverged,
-                    applied = applied_diverged,
-                    kept,
-                    "retained values DIVERGED from peer (same topic, different value) — \
-                     applied the incoming value where its committed token was strictly \
-                     newer; kept ours where the incoming entry was stale or untokened \
-                     (ADR 0037 P5)"
-                );
-            } else {
-                warn!(
-                    node = %node.0,
-                    topics = diverged,
-                    "retained values DIVERGE from peer (same topic, different value) — \
-                     best-effort replication kept each side's own value (ADR 0037 P1 detection)"
-                );
-            }
+        Self::warn_on_divergence(node, durable, diverged, applied_diverged, kept);
+    }
+
+    /// One warn per snapshot chunk, not per topic — the per-topic detail is at debug
+    /// and the count is on the metric (bounded logging, ADR 0003-T6 style). The counts
+    /// must say what actually happened: this line used to claim "converged to the
+    /// higher-token committed value" unconditionally, while every repair in the chunk
+    /// was being refused as stale — which is how a permanent divergence wore
+    /// convergence's clothes for two CI runs (#214). A diverged entry whose store
+    /// write failed appears in neither count; it has its own warn and
+    /// `retained_apply_failed_total`.
+    fn warn_on_divergence(node: &NodeId, durable: bool, diverged: u64, applied: u64, kept: u64) {
+        if diverged == 0 {
+            return;
+        }
+        if durable {
+            warn!(
+                node = %node.0,
+                topics = diverged,
+                applied,
+                kept,
+                "retained values DIVERGED from peer (same topic, different value) — \
+                 applied the incoming value where its committed token was strictly \
+                 newer; kept ours where the incoming entry was stale or untokened \
+                 (ADR 0037 P5)"
+            );
+        } else {
+            warn!(
+                node = %node.0,
+                topics = diverged,
+                "retained values DIVERGE from peer (same topic, different value) — \
+                 best-effort replication kept each side's own value (ADR 0037 P1 detection)"
+            );
         }
     }
 
@@ -5215,8 +5288,15 @@ impl Hub {
         if token < authority.token() {
             let repair = Bytes::from(authority.payload.clone());
             let app = AppProperties::from(authority.props.clone());
-            self.apply_retained_update(topic, &repair, authority.qos, &app, authority.token())
-                .await;
+            self.apply_retained_update(
+                topic,
+                &repair,
+                authority.qos,
+                &app,
+                authority.token(),
+                authority.expires_at,
+            )
+            .await;
             return false;
         }
         true
@@ -5436,6 +5516,7 @@ impl Hub {
         qos: u8,
         app: &AppProperties,
         gate: Option<u64>,
+        expires_at: Option<u64>,
     ) {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
@@ -5455,6 +5536,7 @@ impl Hub {
             app: app.clone(),
             reply: None,
             publish: gate,
+            expires_at,
         });
         self.kick_retained_queue();
     }
@@ -5493,6 +5575,7 @@ impl Hub {
     /// dedup retransmissions against the last committed handoff (re-ack, don't
     /// recommit) and against one still queued/committing, then run it through the
     /// same queue as local mutations.
+    #[allow(clippy::too_many_arguments)] // the mutation's fields, plus the handoff key
     fn accept_routed_retained(
         &mut self,
         node: NodeId,
@@ -5501,6 +5584,7 @@ impl Hub {
         qos: u8,
         app: AppProperties,
         seq: u64,
+        expires_at: Option<u64>,
     ) {
         if self.durable_retained.is_none() {
             return;
@@ -5525,6 +5609,7 @@ impl Hub {
             app,
             reply: Some((node, seq)),
             publish: None,
+            expires_at,
         });
         self.kick_retained_queue();
     }
@@ -5610,6 +5695,7 @@ impl Hub {
                 qos: mutation.qos,
                 props: app_to_wire(&mutation.app),
                 seq,
+                expires_at: mutation.expires_at,
             });
         }
     }
@@ -5647,13 +5733,14 @@ impl Hub {
             app,
             reply,
             publish,
+            expires_at,
         } = mutation;
         tokio::spawn(async move {
             let result = if payload.is_empty() {
                 durable.clear(&topic).await
             } else {
                 durable
-                    .set(&topic, &payload, qos, &AppProps::from(&app))
+                    .set(&topic, &payload, qos, &AppProps::from(&app), expires_at)
                     .await
             };
             let token = match result {
@@ -5681,6 +5768,7 @@ impl Hub {
                 token,
                 reply,
                 publish,
+                expires_at,
             });
         });
     }
@@ -5776,9 +5864,71 @@ impl Hub {
             };
             let payload = Bytes::from(entry.payload.clone());
             let app = AppProperties::from(entry.props.clone());
-            self.apply_retained_update(&topic, &payload, entry.qos, &app, entry.token())
-                .await;
+            self.apply_retained_update(
+                &topic,
+                &payload,
+                entry.qos,
+                &app,
+                entry.token(),
+                entry.expires_at,
+            )
+            .await;
         }
+    }
+
+    /// Reap retained values whose Message Expiry Interval has passed (issue #227) —
+    /// the spec deletes the retained copy at expiry, not merely hides it. Under
+    /// durable retained the reap is an ordinary owner-committed CLEAR, so every
+    /// cache converges by token exactly as for a client's zero-length publish —
+    /// never by comparing clocks across nodes (a non-owner leaves the row for the
+    /// owner's clear to fan out, and merely filters it from reads meanwhile).
+    /// Durable off deletes locally: each node is its own retained island there
+    /// (ADR 0014), and every island carries the same absolute deadline.
+    async fn reap_expired_retained(&mut self) {
+        let Ok(all) = self.retained.all().await else {
+            return;
+        };
+        let now = self.clock.now_epoch_secs();
+        let mut deadlines_remain = false;
+        for m in all {
+            if m.expires_at.is_none_or(|d| d > now) {
+                deadlines_remain |= m.expires_at.is_some();
+                continue;
+            }
+            if self.durable_retained.is_some() {
+                let owned = self.placement.as_ref().is_some_and(|p| {
+                    p.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .owner(&m.topic)
+                        == self.node_id
+                });
+                if owned {
+                    debug!(topic = %m.topic, "retained value expired; committing the reap as a clear");
+                    self.route_retained_commit(
+                        &m.topic,
+                        &Bytes::new(),
+                        0,
+                        &AppProperties::default(),
+                        None,
+                        None,
+                    );
+                } else {
+                    // Not ours to commit: keep watching until the owner's clear
+                    // fans out and removes the row.
+                    deadlines_remain = true;
+                }
+            } else {
+                debug!(topic = %m.topic, "retained value expired; deleted");
+                let clear = Message::new(m.topic.clone(), Bytes::new(), QoS::AtMostOnce, true);
+                if let Err(e) = self.retained.set(&clear).await {
+                    warn!(topic = %m.topic, error = %e, "failed to delete an expired retained value");
+                    deadlines_remain = true; // still there; retry next tick
+                }
+            }
+        }
+        // Under durable, an owner-committed reap lands back through the fan-out
+        // (which re-arms the flag if a deadline remains); locally nothing is left.
+        self.retained_may_expire = deadlines_remain;
     }
 
     /// An empty payload is a committed clear — the cache drops the topic, but the
@@ -5790,6 +5940,7 @@ impl Hub {
         qos: u8,
         app: &AppProperties,
         token: (u64, u64),
+        expires_at: Option<u64>,
     ) {
         if self.retained_is_stale(topic, token).await {
             debug!(topic = %topic, ?token, "stale/duplicate retained update skipped");
@@ -5801,6 +5952,7 @@ impl Hub {
             qos: QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce),
             retain: true,
             app: app.clone(),
+            expires_at,
         };
         // STORE FIRST, then record the token — and never the other way round (issue #87).
         //
@@ -5812,6 +5964,7 @@ impl Hub {
         // and `token > held` is false. One transient store error blackholed one topic on
         // one node permanently, while its peers served the value normally — with no metric
         // and no divergence signal, because a node with no value has nothing to compare.
+        self.retained_may_expire |= message.expires_at.is_some();
         if let Err(e) = self.retained.set(&message).await {
             // No token recorded: the next commit for this topic, and the next digest
             // repair, both still apply.
@@ -5830,7 +5983,7 @@ impl Hub {
         // delivery the forward structurally cannot make is to a subscription so
         // fresh that its interest had not reached the publish's landing node: for
         // exactly those (open windows, ledger-deduped), this apply IS the vehicle.
-        self.deliver_to_windowed_subscribers(topic, payload, qos, app)
+        self.deliver_to_windowed_subscribers(topic, payload, qos, app, expires_at)
             .await;
     }
 
@@ -5850,10 +6003,19 @@ impl Hub {
         payload: &Bytes,
         qos: u8,
         app: &AppProperties,
+        expires_at: Option<u64>,
     ) {
         if self.retained_windows.is_empty() {
             return;
         }
+        // An already-expired value is not delivered [MQTT-3.3.2-5]; the remaining
+        // interval rides the delivery (issue #227).
+        let epoch_now = self.clock.now_epoch_secs();
+        if expires_at.is_some_and(|d| d <= epoch_now) {
+            return;
+        }
+        let remaining =
+            expires_at.map(|d| u32::try_from(d.saturating_sub(epoch_now)).unwrap_or(u32::MAX));
         let now = Instant::now();
         let id = retained_value_id(topic, payload.as_ref(), qos, &AppProps::from(app).encode());
         let targets: Vec<(ClientId, QoS, bool)> = self
@@ -5878,7 +6040,7 @@ impl Hub {
             // A failed enqueue leaves the value in the cache for the next
             // subscribe's replay — the replay's own posture (#124).
             let _ = self
-                .deliver_to_client(&c, topic, payload, delivery_qos, None, app, retain)
+                .deliver_to_client(&c, topic, payload, delivery_qos, remaining, app, retain)
                 .await;
             if let Some(w) = self.retained_windows.get_mut(&c) {
                 w.seen.insert(topic.to_string(), id);
@@ -6089,6 +6251,7 @@ mod tests {
             epoch,
             offset,
             props: mqtt_cluster::peer::WireAppProps::default(),
+            expires_at: None,
         }
     }
     /// The canonical empty-props bytes folded into digest entries (ADR 0038 T3).
@@ -6973,6 +7136,7 @@ mod tests {
                 qos: QoS::AtMostOnce,
                 retain: false,
                 app: mqtt_core::AppProperties::default(),
+                expires_at: None,
             }),
             outbound: out_tx,
             reply: reply_tx,
@@ -8536,6 +8700,7 @@ mod tests {
                 qos: QoS::AtLeastOnce,
                 retain: false,
                 app: AppProperties::default(),
+                expires_at: None,
             },
             retain: false,
             message_expiry: None,
@@ -9020,6 +9185,46 @@ mod tests {
         );
     }
 
+    fn publish_retained_with_expiry(
+        tx: &HubTx,
+        topic: &str,
+        payload: &'static [u8],
+        message_expiry: Option<u32>,
+    ) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+        })
+        .unwrap();
+    }
+
+    /// A single-node durable-retained hub on a controllable wall clock (issue #227):
+    /// this node owns every group, so owner-side expiry reaping is exercised.
+    fn start_durable_hub_with_clock() -> (HubTx, TestDurableRetained, TestClock) {
+        let clock = TestClock::new(1_000_000);
+        let local = NodeId("hub-test".into());
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            local,
+            Arc::new(MemorySessionStore::new()),
+            Some(placement),
+        );
+        let handle = Arc::new(mqtt_storage::retained_log::ReplicatedRetained::new(
+            InMemoryReplicatedLog::new(),
+        ));
+        hub.attach_durable_retained(handle.clone());
+        hub.attach_clock(Arc::new(clock.clone()));
+        tokio::spawn(hub.run());
+        (tx, handle, clock)
+    }
+
     fn publish_retained(tx: &HubTx, topic: &str, payload: &'static [u8]) {
         tx.send(HubCommand::Publish {
             topic: topic.into(),
@@ -9195,6 +9400,7 @@ mod tests {
             qos: 1,
             seq: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |_| true).await;
@@ -9209,6 +9415,7 @@ mod tests {
             qos: 0,
             seq: 2,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         let e = wait_durable_retained(&durable, "dev/9/state", |e| e.tombstone).await;
@@ -9237,6 +9444,7 @@ mod tests {
                 epoch,
                 offset,
                 app: AppProperties::default(),
+                expires_at: None,
             })
             .unwrap();
         };
@@ -9273,6 +9481,7 @@ mod tests {
             epoch: 1,
             offset: 4,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
@@ -9285,6 +9494,7 @@ mod tests {
             epoch: 1,
             offset: 5,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         assert!(retained_replay(&tx, "c2", "t").await.is_none());
@@ -9297,6 +9507,7 @@ mod tests {
             epoch: 1,
             offset: 4,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         assert!(retained_replay(&tx, "c3", "t").await.is_none());
@@ -9380,6 +9591,7 @@ mod tests {
             epoch: 1,
             offset: 2,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
 
@@ -9414,6 +9626,7 @@ mod tests {
             epoch: 1,
             offset: 3,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         assert_eq!(retained_replay(&tx, "c1", "t").await.unwrap(), b"v");
@@ -9601,11 +9814,14 @@ mod tests {
 
     /// A durable retained authority that fails every commit until healed — the
     /// minority side of a partition (`NoQuorum`), from the hub's point of view.
+    /// One committed entry in [`FlakyRetained`]: `(topic, payload, tombstone, expires_at)`.
+    type FlakyCommit = (String, Vec<u8>, bool, Option<u64>);
+
     #[derive(Debug, Default)]
     struct FlakyRetained {
         healthy: std::sync::atomic::AtomicBool,
-        /// Every successful commit, in order: `(topic, payload, tombstone)`.
-        committed: std::sync::Mutex<Vec<(String, Vec<u8>, bool)>>,
+        /// Every successful commit, in order: `(topic, payload, tombstone, expires_at)`.
+        committed: std::sync::Mutex<Vec<FlakyCommit>>,
     }
 
     impl FlakyRetained {
@@ -9619,12 +9835,13 @@ mod tests {
             topic: &str,
             payload: &[u8],
             tombstone: bool,
+            expires_at: Option<u64>,
         ) -> Result<(u64, u64), mqtt_storage::StorageError> {
             if !self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(mqtt_storage::StorageError::NoQuorum);
             }
             let mut log = self.committed.lock().unwrap();
-            log.push((topic.to_string(), payload.to_vec(), tombstone));
+            log.push((topic.to_string(), payload.to_vec(), tombstone, expires_at));
             Ok((0, log.len() as u64))
         }
     }
@@ -9637,12 +9854,13 @@ mod tests {
             payload: &[u8],
             _qos: u8,
             _props: &AppProps,
+            expires_at: Option<u64>,
         ) -> Result<(u64, u64), mqtt_storage::StorageError> {
-            self.commit(topic, payload, false)
+            self.commit(topic, payload, false, expires_at)
         }
 
         async fn clear(&self, topic: &str) -> Result<(u64, u64), mqtt_storage::StorageError> {
-            self.commit(topic, &[], true)
+            self.commit(topic, &[], true, None)
         }
 
         /// Answer from the committed log, as a real durable keyspace does.
@@ -9663,24 +9881,25 @@ mod tests {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, (t, _, _))| t == topic)
-                .map(
-                    |(i, (_, payload, tombstone))| mqtt_storage::retained_log::RetainedEntry {
+                .find(|(_, (t, _, _, _))| t == topic)
+                .map(|(i, (_, payload, tombstone, expires_at))| {
+                    mqtt_storage::retained_log::RetainedEntry {
                         payload: payload.clone(),
                         qos: 0,
                         tombstone: *tombstone,
                         props: AppProps::default(),
                         epoch: 0,
                         offset: (i + 1) as u64,
-                    },
-                ))
+                        expires_at: *expires_at,
+                    }
+                }))
         }
 
         /// Enumerate committed topics, tombstones included — the issue #183 warm
         /// path reads back through here on a fresh process.
         async fn topics(&self) -> Result<Vec<String>, mqtt_storage::StorageError> {
             let log = self.committed.lock().unwrap();
-            let mut topics: Vec<String> = log.iter().map(|(t, _, _)| t.clone()).collect();
+            let mut topics: Vec<String> = log.iter().map(|(t, _, _, _)| t.clone()).collect();
             topics.sort();
             topics.dedup();
             Ok(topics)
@@ -9873,6 +10092,7 @@ mod tests {
                 epoch: 0,
                 offset: 0,
                 props: AppProps::default(),
+                expires_at: None,
             }],
         })
         .unwrap();
@@ -9900,7 +10120,7 @@ mod tests {
         ));
         for (topic, payload) in commits {
             durable
-                .set(topic, payload, 0, &AppProps::default())
+                .set(topic, payload, 0, &AppProps::default(), None)
                 .await
                 .expect("pre-crash commit");
         }
@@ -9918,6 +10138,7 @@ mod tests {
                         qos: QoS::AtMostOnce,
                         retain: true,
                         app: AppProperties::default(),
+                        expires_at: None,
                     })
                     .await
                     .expect("seed the reopened cache");
@@ -10028,6 +10249,7 @@ mod tests {
                 epoch: 0,
                 offset: 1,
                 app: AppProperties::default(),
+                expires_at: None,
             })
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -10110,6 +10332,7 @@ mod tests {
                     qos: QoS::AtMostOnce,
                     retain: true,
                     app: AppProperties::default(),
+                    expires_at: None,
                 })
                 .await
                 .unwrap();
@@ -10124,6 +10347,7 @@ mod tests {
                     epoch: 0,
                     offset: 0,
                     props: AppProps::default(),
+                    expires_at: None,
                 },
                 RetainedWireEntry {
                     topic: "rt/absent".into(),
@@ -10132,6 +10356,7 @@ mod tests {
                     epoch: 0,
                     offset: 0,
                     props: AppProps::default(),
+                    expires_at: None,
                 },
             ],
         })
@@ -10193,6 +10418,7 @@ mod tests {
                 epoch: 0,
                 offset: 1,
                 app: AppProperties::default(),
+                expires_at: None,
             })
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -10335,6 +10561,7 @@ mod tests {
             epoch: 1,
             offset: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         let p = recv_packet(&mut sub)
@@ -10376,6 +10603,7 @@ mod tests {
             epoch: 1,
             offset: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         assert!(
@@ -10403,6 +10631,7 @@ mod tests {
             epoch: 1,
             offset: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         assert!(
@@ -10428,6 +10657,7 @@ mod tests {
                 epoch: 1,
                 offset,
                 app: AppProperties::default(),
+                expires_at: None,
             })
             .unwrap();
         };
@@ -10469,6 +10699,7 @@ mod tests {
             epoch: 1,
             offset: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         let (mut resumed, present) = attach(&tx, "dur", 2, false).await;
@@ -10477,6 +10708,142 @@ mod tests {
             .await
             .expect("the queued windowed delivery replays on resume");
         assert_eq!(payload_of(&p), b"v1");
+    }
+
+    /// Issue #227 [MQTT-3.3.2-6]: a retained replay carries the REMAINING Message
+    /// Expiry Interval — the received value minus the time the copy sat in the
+    /// broker — never the original, and never silence.
+    #[tokio::test]
+    async fn a_retained_replay_carries_the_remaining_expiry_interval() {
+        let (tx, clock) = start_hub_with_clock();
+        publish_retained_with_expiry(&tx, "exp/t", b"v", Some(100));
+        // Round-trip before advancing: the deadline is stamped when the hub
+        // PROCESSES the publish, and the clock is not a hub command.
+        assert_eq!(retained_replay(&tx, "warm", "exp/t").await.unwrap(), b"v");
+        clock.advance(40);
+        let (mut sub, _) = attach(&tx, "late", 1, true).await;
+        subscribe(&tx, "late", "exp/t");
+        let p = recv_packet(&mut sub).await.expect("fresh value replays");
+        assert_eq!(payload_of(&p), b"v");
+        assert_eq!(
+            message_expiry_of(&p),
+            Some(60),
+            "the replay must carry the REMAINING interval [MQTT-3.3.2-6]"
+        );
+    }
+
+    /// Issue #227: an EXPIRED retained value is not replayed to a new subscriber,
+    /// and the reap deletes the dead row from the store (visible on the gauge) —
+    /// the spec deletes the retained copy at expiry, not merely hides it.
+    #[tokio::test]
+    async fn an_expired_retained_value_is_not_replayed_and_is_reaped() {
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
+        let clock = TestClock::new(1_000_000);
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_clock(Arc::new(clock.clone()));
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        publish_retained_with_expiry(&tx, "exp/t", b"v", Some(10));
+        assert_eq!(
+            retained_replay(&tx, "c1", "exp/t").await.unwrap(),
+            b"v",
+            "fresh: the value replays"
+        );
+        clock.advance(11);
+        assert!(
+            retained_replay(&tx, "c2", "exp/t").await.is_none(),
+            "expired: the value must not be replayed [MQTT-3.3.2-5]"
+        );
+        // The per-tick reap (armed by the deadline) deletes the dead row.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if metrics.render().contains("retained_messages 0") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the expired retained row must be REAPED from the store, not only \
+                 hidden from replay:\n{}",
+                metrics.render()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Issue #227 under durable retained: the committed record carries the absolute
+    /// deadline, and the OWNER reaps an expired value as an ordinary committed
+    /// CLEAR — every cache converges by token, exactly as for a client's
+    /// zero-length publish, never by comparing clocks across nodes.
+    #[tokio::test]
+    async fn an_owner_reaps_an_expired_retained_value_as_a_committed_clear() {
+        let (tx, durable, clock) = start_durable_hub_with_clock();
+        publish_retained_with_expiry(&tx, "exp/t", b"v", Some(10));
+        // The commit itself carries the deadline (start epoch 1_000_000 + 10).
+        let e = wait_durable_retained(&durable, "exp/t", |e| !e.tombstone).await;
+        assert_eq!(
+            e.expires_at,
+            Some(1_000_010),
+            "the committed record must carry the absolute deadline"
+        );
+        clock.advance(11);
+        // The reap lands as a committed tombstone through the ordinary queue.
+        let e = wait_durable_retained(&durable, "exp/t", |e| e.tombstone).await;
+        assert!(e.tombstone, "expiry reaps as a committed clear");
+    }
+
+    /// Issue #227: the post-commit fan-out and the anti-entropy snapshot both carry
+    /// the committed deadline, so every peer cache expires the value at the same
+    /// absolute instant.
+    #[tokio::test]
+    async fn the_fanout_and_snapshot_carry_the_deadline() {
+        let (tx, _durable, clock) = start_durable_hub_with_clock();
+        let _ = clock; // deadline fixed by the start epoch
+        let mut peer = connect_peer(&tx, "n", 1);
+        publish_retained_with_expiry(&tx, "exp/t", b"v", Some(100));
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedUpdate {
+                    topic, expires_at, ..
+                }) => {
+                    assert_eq!(topic, "exp/t");
+                    assert_eq!(
+                        expires_at,
+                        Some(1_000_100),
+                        "the fan-out must carry the committed deadline"
+                    );
+                    break;
+                }
+                Some(
+                    PeerMessage::Interest { .. }
+                    | PeerMessage::SharedInterest { .. }
+                    | PeerMessage::RetainedDigest { .. },
+                ) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        tx.send(HubCommand::RemoteRetainedRequest {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedSnapshot { messages }) => {
+                    let e = messages.iter().find(|e| e.topic == "exp/t").unwrap();
+                    assert_eq!(
+                        e.expires_at,
+                        Some(1_000_100),
+                        "the snapshot entry must carry the committed deadline"
+                    );
+                    break;
+                }
+                Some(PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
     }
 
     /// A store write that FAILS must not fence the topic forever (issue #87 item 2).
@@ -10512,6 +10879,7 @@ mod tests {
             epoch: 1,
             offset: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -10530,6 +10898,7 @@ mod tests {
             epoch: 1,
             offset: 1,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -10572,9 +10941,9 @@ mod tests {
         assert_eq!(
             committed,
             vec![
-                ("t".to_string(), b"v1".to_vec(), false),
-                ("t".to_string(), b"v2".to_vec(), false),
-                ("t".to_string(), Vec::new(), true),
+                ("t".to_string(), b"v1".to_vec(), false, None),
+                ("t".to_string(), b"v2".to_vec(), false, None),
+                ("t".to_string(), Vec::new(), true, None),
             ],
             "all queued mutations commit, in publish order"
         );
@@ -10713,6 +11082,7 @@ mod tests {
                 qos: 0,
                 app: AppProperties::default(),
                 seq,
+                expires_at: None,
             })
             .unwrap();
         };
@@ -10774,6 +11144,7 @@ mod tests {
             qos: 0,
             seq: 3,
             app: AppProperties::default(),
+            expires_at: None,
         })
         .unwrap();
         match recv_peer(&mut peer).await {

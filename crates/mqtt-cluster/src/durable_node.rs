@@ -687,6 +687,7 @@ mod tests {
                 b"open",
                 1,
                 &mqtt_storage::app_props::AppProps::default(),
+                None,
             )
             .await
             .unwrap();

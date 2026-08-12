@@ -1253,6 +1253,10 @@ fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
         qos: w.qos,
         retain: w.retain,
         app,
+        // A will's Message Expiry Interval counts from PUBLICATION, which has not
+        // happened yet — the publish path stamps the deadline then (issue #227
+        // keeps will semantics unchanged).
+        expires_at: None,
     }
 }
 
