@@ -1877,6 +1877,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             // the requested QoS [MQTT-3.8.4-5/6].
             let mut granted: Vec<(String, QoS)> = Vec::new();
             let mut no_local_filters: Vec<String> = Vec::new();
+            let mut rap_filters: Vec<String> = Vec::new();
+            let mut retain_handling: Vec<u8> = Vec::new();
             let mut return_codes: Vec<u8> = Vec::with_capacity(s.filters.len());
             for f in &s.filters {
                 // A malformed `$share/...` filter (bad share name / empty filter) is
@@ -1892,6 +1894,11 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     if f.options.no_local {
                         no_local_filters.push(f.path.clone()); // #198
                     }
+                    if f.options.retain_as_published {
+                        rap_filters.push(f.path.clone()); // #198
+                    }
+                    // Parallel to `granted` (#198): 0 send at subscribe, 1 only-if-new, 2 never.
+                    retain_handling.push(f.options.retain_handling);
                     return_codes.push(f.qos as u8);
                 } else {
                     debug!(client = %client.0, identity = %principal.subject, filter = %f.path,
@@ -1912,6 +1919,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     client: client.clone(),
                     filters: granted,
                     no_local_filters,
+                    rap_filters,
+                    retain_handling,
                     reply: Some(reply_tx),
                 });
                 let Ok(verdicts) = reply_rx.await else {

@@ -641,6 +641,14 @@ pub enum HubCommand {
         /// The subset of `filters` subscribed with **No Local** set (#198), so the hub can
         /// suppress echoing a client's own publish back to it on those filters.
         no_local_filters: Vec<String>,
+        /// The subset of `filters` subscribed with **Retain As Published** set (#198), so a
+        /// message matching them keeps the RETAIN flag it was published with.
+        rap_filters: Vec<String>,
+        /// Per-filter **Retain Handling** (#198, MQTT 5 §3.8.3.1), parallel to `filters`:
+        /// `0` send retained at subscribe (the default), `1` send only if the subscription did
+        /// not already exist, `2` never send retained at subscribe. Empty = all `0` (internal
+        /// callers and v3.1.1, which has no subscription options).
+        retain_handling: Vec<u8>,
         /// When present, the hub answers with one flag per filter — `false` for a
         /// filter the subscription quota denied (ADR 0041 T3) — BEFORE any
         /// retained replay, so the connection's SUBACK precedes the replayed
@@ -1022,6 +1030,30 @@ struct Peer {
     interest_synced: bool,
 }
 
+/// Record one MQTT 5 subscription option (#198) for `client` over the filters it just
+/// subscribed: `set` names the filters that carry the option; every other (re)subscribed
+/// filter has it CLEARED, because a re-subscribe replaces a subscription's options
+/// [MQTT-3.8.4-3]. The client's entry is dropped when no filter carries the option.
+fn record_sub_option(
+    map: &mut HashMap<ClientId, HashSet<String>>,
+    client: &ClientId,
+    filters: &[(String, QoS)],
+    set: &[String],
+) {
+    let on: HashSet<&String> = set.iter().collect();
+    let entry = map.entry(client.clone()).or_default();
+    for (f, _) in filters {
+        if on.contains(f) {
+            entry.insert(f.clone());
+        } else {
+            entry.remove(f);
+        }
+    }
+    if entry.is_empty() {
+        map.remove(client);
+    }
+}
+
 /// The smaller of two `QoS` levels (delivery downgrade rule [MQTT-3.8.4-6]).
 fn min_qos(a: QoS, b: QoS) -> QoS {
     if (a as u8) <= (b as u8) {
@@ -1064,6 +1096,11 @@ pub struct Hub {
     /// message is not delivered back to the connection that published it on such a filter —
     /// the unforgeable loop-prevention primitive the boundary bridge relies on (ADR 0059/0025).
     no_local: HashMap<ClientId, HashSet<String>>,
+    /// Filters each client subscribed with **Retain As Published** set (MQTT 5 §3.8.3.1,
+    /// #198): a message forwarded because it matched such a filter keeps the RETAIN flag it
+    /// was published with, instead of the flag being cleared [MQTT-3.3.1-9]. This is what lets
+    /// a re-forwarder (the boundary bridge) carry *live* retained state across (#189).
+    retain_as_published: HashMap<ClientId, HashSet<String>>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
     /// Local shared-subscription groups (`$share/<group>/<filter>`) — this node's
@@ -1444,6 +1481,7 @@ impl Hub {
                 retained_antientropy_tick: 0,
                 subs_by_client: HashMap::new(),
                 no_local: HashMap::new(),
+                retain_as_published: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
                 remote_shared: HashMap::new(),
@@ -1659,10 +1697,19 @@ impl Hub {
                 client,
                 filters,
                 no_local_filters,
+                rap_filters,
+                retain_handling,
                 reply,
             } => {
-                self.subscribe(&client, filters, no_local_filters, reply)
-                    .await;
+                self.subscribe(
+                    &client,
+                    filters,
+                    no_local_filters,
+                    rap_filters,
+                    retain_handling,
+                    reply,
+                )
+                .await;
             }
             HubCommand::SetQuotas(quotas) => {
                 self.quotas = quotas;
@@ -2036,7 +2083,9 @@ impl Hub {
                 // (ADR 0015), never re-selected or re-forwarded. The publisher's message
                 // expiry is carried over the link (ADR 0015 T7) so a queued copy keeps its
                 // deadline. Application properties ride along (ADR 0030).
-                self.deliver_to_client(&client, &topic, &payload, qos, message_expiry, &app)
+                // retain=false: a shared-subscription delivery clears the flag (RAP is applied
+                // on the ordinary-delivery path only, #198).
+                self.deliver_to_client(&client, &topic, &payload, qos, message_expiry, &app, false)
                     .await;
             }
             // Client/session commands are handled in `dispatch`; they never route here.
@@ -2148,7 +2197,7 @@ impl Hub {
         // Live deliveries carry retain=0 [MQTT-3.3.1-9]. The retained-write outcome gates the
         // publisher's ack alongside the live-delivery durability.
         let (durable_ok, matched) = self
-            .deliver_local(topic, payload, qos, message_expiry, app, publisher)
+            .deliver_local(topic, payload, qos, message_expiry, app, publisher, retain)
             .await;
         (durable_ok && retained_ok, matched)
     }
@@ -2628,26 +2677,28 @@ impl Hub {
         client: &ClientId,
         filters: Vec<(String, QoS)>,
         no_local_filters: Vec<String>,
+        rap_filters: Vec<String>,
+        retain_handling: Vec<u8>,
         reply: Option<oneshot::Sender<Vec<bool>>>,
     ) {
-        // No Local (#198): record which filters this client subscribed with NL set, and clear
-        // it for any (re)subscribed filter that did not — a re-subscribe replaces the option.
-        // Only filters the ACL granted reach here; a `$share/...` filter with NL is harmless
-        // (No Local is applied on the ordinary-delivery path only).
-        {
-            let nl: std::collections::HashSet<&String> = no_local_filters.iter().collect();
-            let entry = self.no_local.entry(client.clone()).or_default();
-            for (f, _) in &filters {
-                if nl.contains(f) {
-                    entry.insert(f.clone());
-                } else {
-                    entry.remove(f);
-                }
-            }
-            if entry.is_empty() {
-                self.no_local.remove(client);
-            }
-        }
+        // Retain Handling per requested filter (#198), keyed by filter so it survives the
+        // quota filtering below. Absent (v3.1.1 / internal callers) = 0, the default.
+        let handling: HashMap<String, u8> = filters
+            .iter()
+            .zip(retain_handling.iter().copied().chain(std::iter::repeat(0)))
+            .map(|((f, _), h)| (f.clone(), h))
+            .collect();
+        // MQTT 5 subscription options (#198): record which filters carry No Local / Retain As
+        // Published, and CLEAR the option for any (re)subscribed filter that did not set it —
+        // a re-subscribe replaces the options [MQTT-3.8.4-3]. Only ACL-granted filters reach
+        // here; both options are applied on the ordinary-delivery path.
+        record_sub_option(&mut self.no_local, client, &filters, &no_local_filters);
+        record_sub_option(
+            &mut self.retain_as_published,
+            client,
+            &filters,
+            &rap_filters,
+        );
         // Subscription quota (ADR 0041 T3): count how many NEW filters the cap
         // admits — an already-held filter replaces (never consumes quota). The
         // SUBACK itself is answered only after the durable persist below
@@ -2708,7 +2759,16 @@ impl Hub {
                 continue;
             }
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
+            let already_held = prior.as_ref().is_some_and(|m| m.contains_key(f));
             self.table.subscribe(client.clone(), f.clone());
+            // Retain Handling (#198, MQTT 5 §3.8.3.1): 0 = send retained at subscribe
+            // (default), 1 = send only if this subscription did not already exist, 2 = never.
+            // A re-forwarder (the bridge) uses 2 to avoid a replay storm on reconnect.
+            match handling.get(f).copied().unwrap_or(0) {
+                2 => continue,
+                1 if already_held => continue,
+                _ => {}
+            }
             match self.retained.matching(f).await {
                 Ok(matching) => {
                     for m in matching {
@@ -2791,10 +2851,13 @@ impl Hub {
             if let Some(map) = self.subs_by_client.get_mut(client) {
                 map.remove(f);
             }
-            if let Some(set) = self.no_local.get_mut(client) {
-                set.remove(f); // #198: drop the No Local flag with the subscription
-                if set.is_empty() {
-                    self.no_local.remove(client);
+            // #198: drop the subscription options with the subscription.
+            for map in [&mut self.no_local, &mut self.retain_as_published] {
+                if let Some(set) = map.get_mut(client) {
+                    set.remove(f);
+                    if set.is_empty() {
+                        map.remove(client);
+                    }
                 }
             }
             if let Some((group, filter)) = parse_shared(f) {
@@ -2826,9 +2889,6 @@ impl Hub {
     /// `min(qos, granted)` each. Shared subscriptions are routed separately by
     /// [`deliver_shared`](Self::deliver_shared) (ADR 0015).
     /// Returns `false` when any recipient's durable enqueue failed (ADR 0041 T5).
-    /// No Local (#198, MQTT 5 §3.8.3.1): whether delivery of `topic` to `client` must be
-    /// suppressed because `client` is the message's publisher and holds a No Local subscription
-    /// matching `topic`. The unforgeable loop-prevention primitive the boundary bridge uses.
     fn suppressed_by_no_local(
         &self,
         client: &ClientId,
@@ -2842,6 +2902,17 @@ impl Hub {
                 .is_some_and(|fs| fs.iter().any(|f| mqtt_core::topic_matches(f, topic)))
     }
 
+    /// Retain As Published (#198, MQTT 5 §3.8.3.1): whether `client` holds a RAP subscription
+    /// matching `topic`, so a message forwarded to it keeps the RETAIN flag it was published
+    /// with instead of the flag being cleared [MQTT-3.3.1-9]. This is what lets a re-forwarder
+    /// (the boundary bridge) carry *live* retained state across a boundary (#189).
+    fn keeps_retain_flag(&self, client: &ClientId, topic: &str) -> bool {
+        self.retain_as_published
+            .get(client)
+            .is_some_and(|fs| fs.iter().any(|f| mqtt_core::topic_matches(f, topic)))
+    }
+
+    #[allow(clippy::too_many_arguments)] // the delivery fields, plus the two subscription options
     async fn deliver_local(
         &mut self,
         topic: &str,
@@ -2850,21 +2921,25 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         publisher: Option<&ClientId>,
+        source_retain: bool,
     ) -> (bool, usize) {
-        let targets: Vec<(ClientId, QoS)> = self
+        // Per-subscriber: No Local suppresses the publisher's own copy; Retain As Published
+        // decides whether this subscriber keeps the source RETAIN flag (#198).
+        let targets: Vec<(ClientId, QoS, bool)> = self
             .table
             .matching_clients(topic)
             .into_iter()
             .filter(|c| !self.suppressed_by_no_local(c, topic, publisher))
             .map(|c| {
                 let granted = self.granted_qos(&c, topic);
-                (c, granted)
+                let retain = source_retain && self.keeps_retain_flag(&c, topic);
+                (c, granted, retain)
             })
             .collect();
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
         let matched = targets.len();
         let mut all_durable = true;
-        for (c, granted) in targets {
+        for (c, granted, retain) in targets {
             all_durable &= self
                 .deliver_to_client(
                     &c,
@@ -2873,6 +2948,7 @@ impl Hub {
                     min_qos(qos, granted),
                     message_expiry,
                     app,
+                    retain,
                 )
                 .await;
         }
@@ -2885,6 +2961,9 @@ impl Hub {
     /// already-downgraded delivery `QoS`.
     /// Returns `false` when a durable offline enqueue failed terminally — the
     /// caller withholds the publisher's ack so it retries (ADR 0041 T5).
+    /// `retain` is the flag to put on the wire — set only for a Retain As Published
+    /// subscriber on the ordinary path (#198); every other path clears it [MQTT-3.3.1-9].
+    #[allow(clippy::too_many_arguments)] // the delivery fields, plus the RAP retain flag
     async fn deliver_to_client(
         &mut self,
         client: &ClientId,
@@ -2893,12 +2972,13 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
+        retain: bool,
     ) -> bool {
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
             qos,
-            retain: false,
+            retain,
             app: app.clone(),
         };
         let persistent = self.is_persistent(client);
@@ -2919,7 +2999,7 @@ impl Hub {
                     Appended::Failed => return false,
                 }
             }
-            self.send_to_client(client, &tx, &message, false, message_expiry, offset)
+            self.send_to_client(client, &tx, &message, retain, message_expiry, offset)
                 .await;
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
@@ -3043,6 +3123,7 @@ impl Hub {
                             delivered_qos,
                             message_expiry,
                             app,
+                            false, // shared delivery clears RETAIN (#198)
                         )
                         .await;
                 }
@@ -4071,7 +4152,15 @@ impl Hub {
         let mut all_durable = true;
         for (c, granted) in targets {
             all_durable &= self
-                .deliver_to_client(&c, &topic, &payload, min_qos(qos, granted), expiry, &app)
+                .deliver_to_client(
+                    &c,
+                    &topic,
+                    &payload,
+                    min_qos(qos, granted),
+                    expiry,
+                    &app,
+                    false,
+                )
                 .await;
         }
         all_durable
@@ -4288,6 +4377,7 @@ impl Hub {
     fn drop_subscriptions(&mut self, client: &ClientId) {
         self.subs_by_client.remove(client);
         self.no_local.remove(client);
+        self.retain_as_published.remove(client);
         self.table.remove_client(client);
         self.shared.remove_client(client);
     }
@@ -6136,6 +6226,8 @@ mod tests {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), QoS::AtMostOnce)],
             no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
             reply: None,
         })
         .unwrap();
@@ -6170,6 +6262,8 @@ mod tests {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), qos)],
             no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
             reply: None,
         })
         .unwrap();
@@ -7604,6 +7698,8 @@ mod tests {
             client: ClientId("pub-nl".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
             no_local_filters: vec!["t/#".into()],
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
             reply: None,
         })
         .unwrap();
@@ -7611,6 +7707,8 @@ mod tests {
             client: ClientId("other".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
             no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
             reply: None,
         })
         .unwrap();
@@ -7640,6 +7738,162 @@ mod tests {
         );
     }
 
+    /// #198: **Retain As Published** — a subscriber that set RAP keeps the RETAIN flag the
+    /// message was published with, while a subscriber without it gets the flag cleared
+    /// [MQTT-3.3.1-9]. This is what lets a re-forwarder (the boundary bridge) carry *live*
+    /// retained state across a boundary (#189): before it, a live retained publish reached the
+    /// bridge with retain=0 and could not be re-published as retained.
+    #[tokio::test]
+    async fn retain_as_published_preserves_the_retain_flag_only_for_rap_subscribers() {
+        let tx = start_hub();
+        let (mut rap_rx, _) = attach(&tx, "rap-sub", 1, true).await;
+        let (mut plain_rx, _) = attach(&tx, "plain-sub", 2, true).await;
+
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("rap-sub".into()),
+            filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
+            rap_filters: vec!["t/#".into()],
+            retain_handling: Vec::new(),
+            reply: None,
+        })
+        .unwrap();
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("plain-sub".into()),
+            filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
+            reply: None,
+        })
+        .unwrap();
+
+        // A RETAINED publish, delivered live to both established subscriptions.
+        tx.send(HubCommand::Publish {
+            topic: "t/x".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: true,
+            publisher: Some(ClientId("someone-else".into())),
+        })
+        .unwrap();
+
+        match recv_packet(&mut rap_rx).await {
+            Some(Packet::Publish(p)) => assert!(
+                p.retain,
+                "a RAP subscriber must keep the published RETAIN flag (#198)"
+            ),
+            other => panic!("the RAP subscriber received {other:?}"),
+        }
+        match recv_packet(&mut plain_rx).await {
+            Some(Packet::Publish(p)) => assert!(
+                !p.retain,
+                "a non-RAP subscriber must have RETAIN cleared [MQTT-3.3.1-9]"
+            ),
+            other => panic!("the plain subscriber received {other:?}"),
+        }
+    }
+
+    /// #198: **Retain Handling** (MQTT 5 §3.8.3.1) — `2` never replays retained at subscribe,
+    /// `1` replays only for a NEW subscription, `0` (default) always replays. A re-forwarder
+    /// (the boundary bridge) uses `2` to avoid a retained replay storm on every reconnect.
+    #[tokio::test]
+    async fn retain_handling_controls_the_replay_at_subscribe() {
+        let tx = start_hub();
+        // Seed a retained value.
+        tx.send(HubCommand::Publish {
+            topic: "rh/x".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: true,
+            publisher: None,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sub = |client: &str, handling: u8| HubCommand::Subscribe {
+            client: ClientId(client.into()),
+            filters: vec![("rh/#".into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: vec![handling],
+            reply: None,
+        };
+
+        // handling 2: never replay.
+        let (mut never_rx, _) = attach(&tx, "rh-never", 1, true).await;
+        tx.send(sub("rh-never", 2)).unwrap();
+        assert!(
+            recv_packet(&mut never_rx).await.is_none(),
+            "retain handling 2 must not replay the retained message"
+        );
+
+        // handling 0: always replay.
+        let (mut always_rx, _) = attach(&tx, "rh-always", 2, true).await;
+        tx.send(sub("rh-always", 0)).unwrap();
+        assert!(
+            matches!(recv_packet(&mut always_rx).await, Some(Packet::Publish(p)) if p.retain),
+            "retain handling 0 must replay the retained message"
+        );
+
+        // handling 1: replays for a NEW subscription, but not on a re-subscribe.
+        let (mut new_rx, _) = attach(&tx, "rh-new", 3, true).await;
+        tx.send(sub("rh-new", 1)).unwrap();
+        assert!(
+            matches!(recv_packet(&mut new_rx).await, Some(Packet::Publish(_))),
+            "retain handling 1 must replay for a NEW subscription"
+        );
+        tx.send(sub("rh-new", 1)).unwrap(); // same filter again
+        assert!(
+            recv_packet(&mut new_rx).await.is_none(),
+            "retain handling 1 must NOT replay when the subscription already existed"
+        );
+    }
+
+    /// RAP only preserves a flag that was actually set: a NON-retained publish still delivers
+    /// with retain=0 to a RAP subscriber (RAP preserves, it does not invent).
+    #[tokio::test]
+    async fn rap_does_not_invent_a_retain_flag_for_a_plain_publish() {
+        let tx = start_hub();
+        let (mut rx, _) = attach(&tx, "rap-sub2", 1, true).await;
+        tx.send(HubCommand::Subscribe {
+            client: ClientId("rap-sub2".into()),
+            filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            no_local_filters: Vec::new(),
+            rap_filters: vec!["t/#".into()],
+            retain_handling: Vec::new(),
+            reply: None,
+        })
+        .unwrap();
+        tx.send(HubCommand::Publish {
+            topic: "t/x".into(),
+            payload: Bytes::from_static(b"v"),
+            qos: QoS::AtMostOnce,
+            retain: false, // NOT retained
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: true,
+            publisher: Some(ClientId("someone-else".into())),
+        })
+        .unwrap();
+        match recv_packet(&mut rx).await {
+            Some(Packet::Publish(p)) => assert!(
+                !p.retain,
+                "RAP must not set RETAIN on a message published without it"
+            ),
+            other => panic!("received {other:?}"),
+        }
+    }
+
     /// The control that makes the No Local test meaningful: WITHOUT No Local, a publisher that
     /// also subscribes to the topic DOES receive its own message (the MQTT default).
     #[tokio::test]
@@ -7650,6 +7904,8 @@ mod tests {
             client: ClientId("pub-plain".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
             no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
             reply: None,
         })
         .unwrap();
