@@ -97,6 +97,7 @@ spec:
               sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
                 -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
                 -e "s/__READY_MIN__/${READY_MIN}/g" \
+                -e "s/__STORE_MAX_BYTES__/${STORE_MAX_BYTES:-0}/g" \
                 "${TMPL_DIR:-/tmpl}/mqttd.toml.tmpl" > "${OUT_DIR:-/config}/mqttd.toml"
               # A short write — e.g. a full ephemeral-storage volume — leaves sed exit 0 with a
               # 0-byte file, and the broker then boots on pure DEFAULTS (no listeners, node id
@@ -122,6 +123,13 @@ spec:
             # Day-2 switch: the cluster exists, so ordinal 0 must never found again.
             - name: CLUSTER_ESTABLISHED
               value: "true"
+            {{- end }}
+            {{- if .Values.storeMaxBytes }}
+            # Feeds the config template's __STORE_MAX_BYTES__ placeholder (issue #228).
+            # The operator computes this from the observed PVC size instead; the chart
+            # takes a declared value.
+            - name: STORE_MAX_BYTES
+              value: {{ .Values.storeMaxBytes | quote }}
             {{- end }}
           volumeMounts:
             - name: config-tmpl

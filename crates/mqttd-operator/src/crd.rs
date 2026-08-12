@@ -95,6 +95,14 @@ pub struct Persistence {
     /// remediation requires a class with `allowVolumeExpansion`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
+    /// Renders `__STORE_MAX_BYTES__` in the config template as this percentage of
+    /// the LARGEST current data-PVC request (floored by `size`), so the broker's
+    /// disk watermark follows the volume it actually has — including after a
+    /// brownout-driven expansion (0055-T10, issue #228). Unset = the placeholder is
+    /// not fed (templates that do not use it are unaffected). Pair with
+    /// `store_max_bytes = __STORE_MAX_BYTES__` under `[durable]` in the template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_max_bytes_percent: Option<u8>,
     /// Upper bound for brownout-driven PVC expansion (ADR 0055 §3.2). Unset =
     /// expansion remediation refuses to act (alert only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,10 +120,11 @@ pub struct Remediation {
     #[serde(default)]
     pub split_brain: SplitBrainAction,
     /// Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — grow PVC
-    /// sizes up to `persistence.expansionMaxSize`. NOTE: `ExpandPvc` does **not**
-    /// yet raise the broker's `store_max_bytes` watermark (that lives in the config
-    /// and is tracked by 0055-T10), so the broker may keep refusing writes on the
-    /// larger volume until the watermark is raised — a manual config roll for now.
+    /// sizes up to `persistence.expansionMaxSize`. Pair with
+    /// `persistence.storeMaxBytesPercent` + a `__STORE_MAX_BYTES__` placeholder in
+    /// the config template so the broker's disk watermark rises WITH the volume
+    /// (0055-T10, issue #228) and the brownout actually clears; without them the
+    /// watermark stays where the template put it — a manual config roll.
     #[serde(default)]
     pub brownout: BrownoutAction,
 }
@@ -154,9 +163,12 @@ pub enum BrownoutAction {
     /// Conditions + Events only.
     #[default]
     Alert,
-    /// Grow PVCs (bounded by `persistence.expansionMaxSize`). Does **not** yet raise
-    /// the `store_max_bytes` watermark (0055-T10), so pair it with a config roll that
-    /// raises the watermark, or the broker keeps refusing writes on the larger volume.
+    /// Grow PVCs (bounded by `persistence.expansionMaxSize`). With
+    /// `persistence.storeMaxBytesPercent` set and a `__STORE_MAX_BYTES__`
+    /// placeholder in the config template, the broker's disk watermark rises with
+    /// the volume on the next reconcile's roll and the brownout clears end to end
+    /// (0055-T10, issue #228); without them the watermark stays where the template
+    /// put it and the broker keeps refusing writes on the larger volume.
     ExpandPvc,
 }
 

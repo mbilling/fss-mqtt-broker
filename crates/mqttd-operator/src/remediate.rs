@@ -338,6 +338,7 @@ mod tests {
             brownout,
         };
         cr.spec.persistence = Some(Persistence {
+            store_max_bytes_percent: None,
             size: Some("10Gi".into()),
             storage_class_name: None,
             expansion_max_size: Some("20Gi".into()),
@@ -508,6 +509,7 @@ mod tests {
         // At the ceiling: nothing further.
         let mut at_max = cr(SplitBrainAction::Alert, BrownoutAction::ExpandPvc);
         at_max.spec.persistence = Some(Persistence {
+            store_max_bytes_percent: None,
             size: Some("20Gi".into()),
             storage_class_name: None,
             expansion_max_size: Some("20Gi".into()),
@@ -520,6 +522,7 @@ mod tests {
         // No ceiling declared: never grow storage on a blank cheque.
         let mut unbounded = cr(SplitBrainAction::Alert, BrownoutAction::ExpandPvc);
         unbounded.spec.persistence = Some(Persistence {
+            store_max_bytes_percent: None,
             size: Some("10Gi".into()),
             storage_class_name: None,
             expansion_max_size: None,
@@ -574,6 +577,7 @@ mod tests {
     fn a_step_that_would_overshoot_is_clamped() {
         let mut c = cr(SplitBrainAction::Alert, BrownoutAction::ExpandPvc);
         c.spec.persistence = Some(Persistence {
+            store_max_bytes_percent: None,
             size: Some("10Gi".into()),
             storage_class_name: None,
             expansion_max_size: Some("12Gi".into()),
