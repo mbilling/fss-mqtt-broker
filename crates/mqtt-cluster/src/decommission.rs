@@ -140,8 +140,13 @@ impl Drain {
     /// watermark has reached ours (so a prefix we saw acked away can never be
     /// resurrected from a merge that no longer includes us), and every entry we
     /// hold is either at-or-below the successor's watermark (acked away there)
-    /// or present in its log. Keys this node does NOT store cannot lose
-    /// anything by this node leaving and are not this drain's business.
+    /// or present in its log **with the same record bytes** — offset presence
+    /// alone would bless a copy holding a different record at the same offset
+    /// (audit #203 hardening; the epoch fencing makes such divergence
+    /// quorum-improbable, but a drain about to DELETE the last local copy is
+    /// exactly where "improbable" is not a verification). Keys this node does
+    /// NOT store cannot lose anything by this node leaving and are not this
+    /// drain's business.
     pub async fn round(&self) -> usize {
         // A single-member "cluster" has nowhere to hand data to: a solo
         // decommission is just a shutdown, and holding it hostage would help
@@ -171,26 +176,26 @@ impl Drain {
                     p.group_owner(group),
                 )
             };
-            let (our_watermark, our_offsets) = {
+            let (our_watermark, our_entries) = {
                 let r = self.lock_replicas();
-                (
-                    r.watermark(&key),
-                    r.epoch_entries(&key)
-                        .into_iter()
-                        .map(|e| e.offset)
-                        .collect::<Vec<_>>(),
-                )
+                (r.watermark(&key), r.epoch_entries(&key))
             };
             for successor in &successors {
                 debug_assert_ne!(*successor, self.node);
                 let sufficient = match self.transport.read_replica(successor, &key).await {
                     Some(theirs) => {
-                        let their_offsets: std::collections::BTreeSet<u64> =
-                            theirs.entries.iter().map(|e| e.offset).collect();
+                        let their_records: std::collections::BTreeMap<u64, &[u8]> = theirs
+                            .entries
+                            .iter()
+                            .map(|e| (e.offset, e.record.as_slice()))
+                            .collect();
                         theirs.watermark >= our_watermark
-                            && our_offsets
-                                .iter()
-                                .all(|o| *o <= theirs.watermark || their_offsets.contains(o))
+                            && our_entries.iter().all(|e| {
+                                e.offset <= theirs.watermark
+                                    || their_records
+                                        .get(&e.offset)
+                                        .is_some_and(|r| *r == e.record.as_slice())
+                            })
                     }
                     // Unreachable (no link / timed out): not verified this round.
                     None => false,
@@ -413,6 +418,58 @@ mod tests {
         assert!(
             s.watermark(&qkey) >= 1,
             "the truncation watermark was handed off too (no resurrection)"
+        );
+    }
+
+    /// Audit #203 hardening: offset presence is not verification. A successor
+    /// holding a DIFFERENT record at the same offset used to pass the
+    /// sufficiency check — and the drain would then let the last GOOD copy
+    /// leave the cluster. Content must match byte-for-byte for an entry above
+    /// the successor's watermark to count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_successor_with_divergent_content_is_not_sufficient() {
+        let leaver = nid("leaver");
+        let succ = nid("succ");
+        let mut p = Placement::new(leaver.clone(), DEFAULT_REPLICAS);
+        p.observe(&succ, MemberState::Alive, "s:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+
+        // The leaver's copy: one entry, "good".
+        let qkey = "q/divergent-client".to_string();
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        assert!(replicas.lock().unwrap().apply(
+            1,
+            &ReplOp::Append {
+                key: qkey.clone(),
+                offset: 1,
+                seq: 1,
+                record: b"good".to_vec(),
+            }
+        ));
+
+        // The successor answers reads with the SAME offset and watermark but
+        // different bytes — the shape the epoch fencing makes improbable and a
+        // pre-deletion verification must nonetheless refuse to bless.
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let succ_state = Arc::new(Mutex::new(ReplicaState::new()));
+        assert!(succ_state.lock().unwrap().apply(
+            1,
+            &ReplOp::Append {
+                key: qkey.clone(),
+                offset: 1,
+                seq: 1,
+                record: b"evil".to_vec(),
+            }
+        ));
+        let (tx, rx) = mpsc::unbounded_channel();
+        transport.register(succ.clone(), tx);
+        spawn_successor(transport.clone(), succ_state.clone(), rx);
+
+        let drain = Drain::new(leaver, placement, transport, replicas, None);
+        assert!(
+            drain.round().await > 0,
+            "a successor with divergent content at a matching offset must be \
+             found INSUFFICIENT — offset presence alone blessed it before"
         );
     }
 }
