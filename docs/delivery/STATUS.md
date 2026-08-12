@@ -44,7 +44,7 @@
 | [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [7/7 done](0034-foreign-client-interop-conformance.md) | — |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
-| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [10/10 done](0037-durable-retained-messages.md) | — |
+| [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [11/11 done](0037-durable-retained-messages.md) | — |
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |

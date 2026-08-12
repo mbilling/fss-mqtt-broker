@@ -95,6 +95,32 @@ topic** instead of gap-filling only missing topics. Divergent caches therefore c
 deterministically on heal; the authoritative copy in the group log makes the outcome
 identical no matter which pairs of nodes exchange first.
 
+**As delivered — tokens across a restart (issues #214, #183).** The per-topic token map
+this section's decisions ride on is in-memory and dies with the process, while the cache
+(and the keyspace) do not — an asymmetry that produced two real bugs. A restarted node
+exported its cached values *untokened*, so peers holding the previous value's token fenced
+the repair out as stale, permanently (#214); and a **tombstone** leaves no cache entry at
+all, so a restarted node stopped advertising or exporting its clears entirely — a peer
+that missed the clear kept the deleted value until the topic's next write (#183):
+retraction was not durable in any exportable sense. The delivered rule: **the keyspace is
+the recovery source for the token map, not just the write-time authority.** On the
+anti-entropy cadence and before building any snapshot, a node re-adopts every committed
+record it can read (`topics()` scan; values *and* tombstones) whose token it no longer
+holds — re-arming fences, repairing a reopened cache that predates its own commits, and
+restoring the §4 export guarantee after a restart. Per-topic authority re-reads at export
+time cover the window before the first warm. No schema was added: the committed record
+already carried everything (0037-P10's finding, extended from read-through to
+enumeration).
+
+**Tombstone retention (the growth bound).** A clear is kept as the topic's single
+compacted record **indefinitely** — the same storage class as a value, one small record
+per ever-cleared topic. Reaping is deliberately not implemented: any time-based floor
+re-opens the resurrection this ADR exists to prevent (a node absent longer than the floor
+returns un-fenced), and a correct floor needs cluster-wide convergence tracking ("every
+live member has converged past token T") that today's machinery does not carry. If topic
+churn ever makes the residue material, that horizon-GC is the shape to build — until
+then, durable retraction is priced like durable state, because it is.
+
 ### 5. Partition semantics: queue-until-heal (CP, bounded)
 
 Single-owner is a CP choice: on the ownerless/minority side of a partition a retained write

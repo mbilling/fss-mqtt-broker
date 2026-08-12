@@ -3950,6 +3950,11 @@ impl Hub {
         // a digest at link-up. Peers in sync compare equal and transfer nothing.
         self.retained_antientropy_tick = self.retained_antientropy_tick.wrapping_add(1);
         if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 {
+            // Re-learn committed retained state this process no longer remembers
+            // BEFORE offering the digest built from it (issue #183): a restart
+            // empties the in-memory token map, and a tombstoned topic leaves no
+            // cache entry to rediscover the fence from either.
+            self.warm_retained_tokens_from_authority().await;
             self.broadcast_retained_digest().await;
         }
 
@@ -4751,7 +4756,10 @@ impl Hub {
     /// With no values AND no tombstone tokens we stay silent. A tombstone-only state
     /// still offers its digest: a peer holding a value for a topic we committed a
     /// clear for must see a difference and pull the tombstone (ADR 0037 P5) — going
-    /// silent would strand its stale value.
+    /// silent would strand its stale value. That held only within one process life
+    /// until issue #183: the tokens are in-memory, so a restarted tombstone-only
+    /// node went silent again — `warm_retained_tokens_from_authority` re-arms them
+    /// from the keyspace before the digest is offered.
     async fn local_retained_digest(&self) -> Option<(u64, u64, u64)> {
         let retained = self.retained.all().await.ok()?;
         if retained.is_empty() && self.retained_tokens.is_empty() {
@@ -4825,6 +4833,14 @@ impl Hub {
     /// under the receiver's gap-fill rule, so no ordering or completion marker is
     /// needed. A no-op when we have no retained messages or the peer link is gone.
     async fn send_retained_snapshot(&mut self, node: &NodeId) {
+        if !self.peers.contains_key(node) {
+            return;
+        }
+        // Snapshot entries for TOMBSTONED topics are built from `retained_tokens`
+        // alone — a cleared topic has no cache entry to rediscover the fence from —
+        // so re-learn committed state a restart forgot before building the export
+        // (issue #183). Values are additionally covered per-topic below.
+        self.warm_retained_tokens_from_authority().await;
         let Some(peer) = self.peers.get(node) else {
             return;
         };
@@ -5629,6 +5645,51 @@ impl Hub {
                 debug!(topic = %topic, error = %e, "durable retained authority lookup failed");
                 None
             }
+        }
+    }
+
+    /// Re-adopt every committed retained record this node can read but no longer
+    /// remembers — the restart-recovery seam for durable retraction (issue #183).
+    ///
+    /// `retained_tokens` is in-memory and empty after a restart. For a topic with a
+    /// live VALUE the persistent cache still names it, and the snapshot sender
+    /// re-reads its token per topic (#214). A **tombstone** leaves nothing behind at
+    /// all — no cache entry, no token — so a restarted node stopped advertising its
+    /// clears entirely: `local_retained_digest` saw nothing to offer, and snapshot
+    /// tombstone entries (built from the token map) omitted them. A peer that was
+    /// down for the clear then kept serving the deleted value until the topic's next
+    /// committed write — retraction was not durable in any exportable sense.
+    ///
+    /// Enumerate the keyspace and re-apply each readable committed record through
+    /// the ordinary idempotent apply: a value re-warms cache + token; a tombstone
+    /// re-arms the fence (and drops a stale pre-clear cache value the crash may have
+    /// stranded). `NotOwner`/read failures skip — that topic's owner exports it —
+    /// and are retried on the next call. Called on the anti-entropy cadence and
+    /// before building a snapshot, so the cost (one key enumeration + one authority
+    /// read per still-unknown topic) is off every hot path and quickly reaches a
+    /// fixed point: a topic with an in-memory token is never re-read.
+    async fn warm_retained_tokens_from_authority(&mut self) {
+        let Some(durable) = self.durable_retained.clone() else {
+            return;
+        };
+        let topics = match durable.topics().await {
+            Ok(topics) => topics,
+            Err(e) => {
+                debug!(error = %e, "retained keyspace enumeration failed; next cadence retries");
+                return;
+            }
+        };
+        for topic in topics {
+            if self.retained_tokens.contains_key(&topic) {
+                continue; // already known to this process — warm is a fixed point
+            }
+            let Some(entry) = self.durable_retained_authority(&topic).await else {
+                continue; // not readable here (NotOwner / transient): the owner exports it
+            };
+            let payload = Bytes::from(entry.payload.clone());
+            let app = AppProperties::from(entry.props.clone());
+            self.apply_retained_update(&topic, &payload, entry.qos, &app, entry.token())
+                .await;
         }
     }
 
@@ -9459,6 +9520,16 @@ mod tests {
                     },
                 ))
         }
+
+        /// Enumerate committed topics, tombstones included — the issue #183 warm
+        /// path reads back through here on a fresh process.
+        async fn topics(&self) -> Result<Vec<String>, mqtt_storage::StorageError> {
+            let log = self.committed.lock().unwrap();
+            let mut topics: Vec<String> = log.iter().map(|(t, _, _)| t.clone()).collect();
+            topics.sort();
+            topics.dedup();
+            Ok(topics)
+        }
     }
 
     /// ADR 0037 §5: a retained mutation whose group owner is unreachable **queues**
@@ -9660,11 +9731,13 @@ mod tests {
     }
 
     /// A hub modelling a node whose process restarted: the durable keyspace already
-    /// holds `commits` (committed before the crash), the persistent cache reopened
-    /// with `cached`, and `retained_tokens` is empty — it is in-memory and did not
-    /// survive. Returns the hub handle and the (observable) cache store.
+    /// holds `commits` then `cleared` clears (committed before the crash), the
+    /// persistent cache reopened with `cached`, and `retained_tokens` is empty — it
+    /// is in-memory and did not survive. Returns the hub handle and the (observable)
+    /// cache store.
     async fn start_restarted_owner(
         commits: &[(&str, &'static [u8])],
+        cleared: &[&str],
         cached: &[(&str, &'static [u8])],
     ) -> (HubTx, FailingRetainedStore) {
         let durable = Arc::new(mqtt_storage::retained_log::ReplicatedRetained::new(
@@ -9675,6 +9748,9 @@ mod tests {
                 .set(topic, payload, 0, &AppProps::default())
                 .await
                 .expect("pre-crash commit");
+        }
+        for topic in cleared {
+            durable.clear(topic).await.expect("pre-crash clear");
         }
         let store = FailingRetainedStore::new();
         {
@@ -9720,7 +9796,8 @@ mod tests {
         // v1 then v2 committed pre-crash (tokens (0,1), (0,2)); the reopened cache
         // still holds v1 — the crash beat the owner's own cache apply of v2.
         let (tx, store) =
-            start_restarted_owner(&[("rt/1", b"v1"), ("rt/1", b"v2")], &[("rt/1", b"v1")]).await;
+            start_restarted_owner(&[("rt/1", b"v1"), ("rt/1", b"v2")], &[], &[("rt/1", b"v1")])
+                .await;
         let mut peer = connect_peer(&tx, "n", 1);
         tx.send(HubCommand::RemoteRetainedRequest {
             node: NodeId("n".into()),
@@ -9771,7 +9848,8 @@ mod tests {
     async fn a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot() {
         // The restarted owner (sender): v1, v2 committed; cache reopened with v2.
         let (owner_tx, _owner_store) =
-            start_restarted_owner(&[("rt/1", b"v1"), ("rt/1", b"v2")], &[("rt/1", b"v2")]).await;
+            start_restarted_owner(&[("rt/1", b"v1"), ("rt/1", b"v2")], &[], &[("rt/1", b"v2")])
+                .await;
         let mut owner_peer = connect_peer(&owner_tx, "peer", 1);
 
         // The peer (receiver): durable mode on, nothing committed in ITS keyspace for
@@ -9920,6 +9998,167 @@ mod tests {
             &held[0].payload[..],
             b"ours",
             "an untokened entry must never overwrite a held value (ADR 0037 P5)"
+        );
+    }
+
+    /// Issue #183, the acceptance sequence: **a cleared retained topic stays cleared
+    /// across a survivor restart + stale-node return.** A clear leaves NOTHING for a
+    /// fresh process to rediscover the fence from — no cache entry, and the token map
+    /// died with the process — so a restarted node used to go digest-silent and its
+    /// snapshots omitted the tombstone entirely: a peer that was down for the clear
+    /// kept serving the deleted value until the topic's next committed write.
+    /// `warm_retained_tokens_from_authority` re-arms the fence from the keyspace
+    /// (the tombstone IS durably committed, ADR 0037 P2) before a digest or snapshot
+    /// is built, so retraction survives in an exportable form.
+    #[tokio::test]
+    async fn a_cleared_topic_stays_cleared_for_a_peer_that_missed_the_clear() {
+        // The restarted node: v committed then CLEARED pre-crash; the reopened cache
+        // is (correctly) empty; the token map is empty — tombstone-only state.
+        let (owner_tx, owner_store) =
+            start_restarted_owner(&[("rt/c", b"v")], &["rt/c"], &[]).await;
+        let mut owner_peer = connect_peer(&owner_tx, "peer", 1);
+
+        // The peer that missed the clear: it applied v's fan-out and still serves it.
+        let peer_durable = Arc::new(FlakyRetained::default());
+        peer_durable.heal();
+        let (mut hub, peer_tx) = Hub::with_config_and_placement(
+            NodeId("peer".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        let peer_store = FailingRetainedStore::new();
+        hub.attach_retained_store(Box::new(peer_store.clone()));
+        hub.attach_durable_retained(peer_durable);
+        tokio::spawn(hub.run());
+        peer_tx
+            .send(HubCommand::RemoteRetainedUpdate {
+                topic: "rt/c".into(),
+                payload: Bytes::from_static(b"v"),
+                qos: 0,
+                epoch: 0,
+                offset: 1,
+                app: AppProperties::default(),
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !peer_store.held("rt/c").await.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: the peer must hold the pre-clear value"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The peer pulls the restarted node's snapshot (the digest-difference path).
+        // The snapshot must CARRY the clear: an empty-payload entry under the
+        // tombstone's committed token — re-learned from the keyspace, since neither
+        // the cache nor the token map remembers it.
+        owner_tx
+            .send(HubCommand::RemoteRetainedRequest {
+                node: NodeId("peer".into()),
+            })
+            .unwrap();
+        loop {
+            match recv_peer(&mut owner_peer).await {
+                Some(PeerMessage::RetainedSnapshot { messages }) => {
+                    let e = messages
+                        .iter()
+                        .find(|e| e.topic == "rt/c")
+                        .expect("the tombstone must be exported after a restart");
+                    assert!(e.payload.is_empty(), "a clear rides as an empty payload");
+                    assert_eq!(
+                        (e.epoch, e.offset),
+                        (0, 2),
+                        "under the clear's committed token"
+                    );
+                    peer_tx
+                        .send(HubCommand::RemoteRetainedSnapshot {
+                            node: NodeId("restarted".into()),
+                            messages,
+                        })
+                        .unwrap();
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        // The deleted value goes, and stays gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if peer_store.held("rt/c").await.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer must drop the deleted value once the tombstone reaches it \
+                 — this is issue #183's resurrection, un-fixed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // And the restarted node is no longer digest-silent: a LATER link-up offers
+        // its (tombstone-only) digest, so peers that reconnect afterwards still
+        // learn there is something to compare against.
+        assert!(
+            owner_store.held("rt/c").await.is_empty(),
+            "the restarted node's own cache stays clear"
+        );
+        let mut late_peer = connect_peer(&owner_tx, "late", 2);
+        assert!(matches!(
+            recv_peer(&mut late_peer).await,
+            Some(PeerMessage::Interest { .. })
+        ));
+        assert!(
+            matches!(
+                recv_peer(&mut late_peer).await,
+                Some(PeerMessage::RetainedDigest { .. })
+            ),
+            "a tombstone-only RESTARTED node must offer its digest at link-up once \
+             the warm has re-armed its fences"
+        );
+    }
+
+    /// The harsher variant: the crash landed between the clear's commit and the
+    /// owner's own cache apply, so the reopened cache still SERVES the deleted value.
+    /// The committed tombstone must be re-adopted — dropping the value locally — and
+    /// the clear exported, not the stale cache entry. (Here the topic is still
+    /// discoverable FROM the cache, so the #214 per-topic authority read covers it
+    /// even without the warm; the warm is load-bearing for the tombstone-ONLY state
+    /// the previous test pins, where nothing names the topic anymore.)
+    #[tokio::test]
+    async fn a_reopened_cache_holding_a_value_the_cluster_cleared_drops_it() {
+        let (tx, store) =
+            start_restarted_owner(&[("rt/c", b"v")], &["rt/c"], &[("rt/c", b"v")]).await;
+        let mut peer = connect_peer(&tx, "n", 1);
+        tx.send(HubCommand::RemoteRetainedRequest {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedSnapshot { messages }) => {
+                    let e = messages
+                        .iter()
+                        .find(|e| e.topic == "rt/c")
+                        .expect("rt/c must appear in the snapshot");
+                    assert!(
+                        e.payload.is_empty(),
+                        "the committed CLEAR must be exported, not the stale pre-clear \
+                         cache value"
+                    );
+                    assert_eq!((e.epoch, e.offset), (0, 2));
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        assert!(
+            store.held("rt/c").await.is_empty(),
+            "re-adopting the tombstone must drop the deleted value from the reopened cache"
         );
     }
 
