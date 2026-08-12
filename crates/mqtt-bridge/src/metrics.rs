@@ -481,7 +481,7 @@ mod tests {
         // and returns Ok(()). Before this, that happened with no counter, no log and no
         // error — store-and-forward could be losing messages with nothing to show for it.
         let m = BridgeMetrics::new();
-        let spool = Arc::new(Spool::in_memory(3));
+        let spool = Arc::new(Spool::in_memory(3).with_overflow(crate::spool::Overflow::DropOldest));
         for i in 0..10 {
             spool.push(&msg(&format!("t/{i}"))).unwrap();
         }
