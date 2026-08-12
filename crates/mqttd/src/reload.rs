@@ -151,11 +151,7 @@ impl ConfigStamp {
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-    digest.as_ref().iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    mqtt_core::hex_lower(digest.as_ref())
 }
 
 /// Holds the swap channels + the file-rereading `build` closure for SIGHUP reload.
@@ -496,6 +492,18 @@ mod tests {
 
     fn audit() -> Arc<dyn AuditSink> {
         Arc::new(AuditLog::new())
+    }
+
+    /// Known-answer parity pin (NIST SHA-256 vector for "abc"): the operator's
+    /// `config_checksum` (`mqttd-operator/src/render.rs`) is a deliberate copy
+    /// of this function, pinned to the same vector there — the chart's
+    /// `checksum/config` annotation and the broker's config stamp must agree.
+    #[test]
+    fn checksum_is_sha256_lowercase_hex() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     /// ADR 0040 T4: a successful reload rebuilds and swaps the peer-bus

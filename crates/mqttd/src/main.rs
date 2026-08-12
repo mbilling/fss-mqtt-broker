@@ -1152,14 +1152,13 @@ fn authenticator_from_config(
 
     // Secrets by reference (ADR 0046 T5): the HS256 shared secret is read from the file at
     // `hs256_secret_file` (like the RS256 PEM), so the HMAC key is mounted from a Secret, never
-    // inlined in the config. A trailing newline (the common `echo secret > file` case) is
-    // trimmed so the on-disk file and an inline value agree.
+    // inlined in the config. Whitespace trimming follows the one shared rule in
+    // `mqtt_core::secrets` so the on-disk file and an inline value agree.
     if let Some(path) = &config.security.jwt.hs256_secret_file {
-        let secret = std::fs::read(path)?;
-        let secret = trim_trailing_newline(&secret);
+        let secret = mqtt_core::read_secret_file(path)?;
         info!(%path, "JWT HS256 verification enabled (secret from file)");
         members.push(Arc::new(mqtt_auth::token::TokenAuthenticator::hs256(
-            secret,
+            &secret,
             jwt_config(config),
         )));
     } else if let Some(pem_path) = &config.security.jwt.rs256_pem_file {
@@ -1258,14 +1257,6 @@ fn jwt_config(config: &Config) -> mqtt_auth::token::TokenConfig {
         audience: config.security.jwt.audience.clone(),
         ..Default::default()
     }
-}
-
-/// Trim a single trailing `\n` (or `\r\n`) from a secret read from a file — the ubiquitous
-/// `echo secret > file` / editor-newline case — so a file-mounted secret matches the literal
-/// value an operator typed (ADR 0046 T5).
-fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
-    let b = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    b.strip_suffix(b"\r").unwrap_or(b)
 }
 
 /// Per-session offline-queue bounds (ADR 0001 §6) from `MQTTD_MAX_QUEUED_MESSAGES`
@@ -1936,11 +1927,9 @@ async fn start_swim(
     let primary_key: Option<String> =
         match (&config.cluster.swim.key, &config.cluster.swim.key_file) {
             (Some(hex), _) => Some(hex.clone()),
-            (None, Some(path)) => Some(
-                String::from_utf8_lossy(trim_trailing_newline(&std::fs::read(path)?))
-                    .trim()
-                    .to_string(),
-            ),
+            (None, Some(path)) => {
+                Some(String::from_utf8_lossy(&mqtt_core::read_secret_file(path)?).to_string())
+            }
             (None, None) => None,
         };
     let auth = if let Some(hex) = &primary_key {
@@ -2065,6 +2054,68 @@ async fn start_swim(
     Ok(())
 }
 
+/// The shared accept loop behind every TCP-based client listener (TLS, plaintext,
+/// WS, WSS): shutdown-select accept (ADR 0019), the admission gate BEFORE any
+/// per-connection work (ADR 0041 T1), the accepted-connection metric under `label`,
+/// `TCP_NODELAY`, and a tracked spawn that holds the admission permit for the
+/// connection's lifetime. Everything protocol-specific — TLS/WebSocket handshakes,
+/// mTLS identity extraction, the MQTT engine — happens in `per_conn`, which runs
+/// inside the spawned task and returns `None` when the connection died before
+/// reaching the engine (it logs/counts its own handshake failures). Auth-failure
+/// bookkeeping happens HERE, once: an outcome with `auth_failed` feeds the gate's
+/// penalty box (ADR 0041 T2), so no listener variant can forget it. QUIC keeps its
+/// own loop below — quinn's accept/refuse handshake shape is not a `TcpListener` —
+/// and must uphold this same contract by hand.
+async fn serve_tcp_clients<F, Fut>(
+    gate: admission::AdmissionGate,
+    listener: TcpListener,
+    label: &'static str,
+    policy: Arc<conn::ConnPolicy>,
+    shutdown: tokio_util::sync::CancellationToken,
+    connections: tokio_util::task::TaskTracker,
+    per_conn: F,
+) where
+    F: Fn(tokio::net::TcpStream, std::net::SocketAddr) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Option<conn::ConnOutcome>> + Send + 'static,
+{
+    loop {
+        let (stream, peer) = tokio::select! {
+            // Graceful shutdown (ADR 0019): stop accepting; refuse new connections fast.
+            () = shutdown.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, listener = label, "listener accept failed");
+                    if let Some(m) = &policy.metrics {
+                        m.connection_error("accept");
+                    }
+                    return;
+                }
+            },
+        };
+        // Admission caps (ADR 0041 T1): refuse BEFORE any handshake or per-connection
+        // work; dropping the stream closes it. Counted + logged by the gate.
+        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
+            continue;
+        };
+        debug!(%peer, listener = label, "accepted connection");
+        if let Some(m) = &policy.metrics {
+            m.connection_accepted(label);
+        }
+        let _ = stream.set_nodelay(true);
+        let conn_fut = per_conn(stream, peer);
+        let gate = gate.clone();
+        connections.spawn(async move {
+            let _permit = permit; // slot freed when the connection task ends
+            if let Some(outcome) = conn_fut.await {
+                if outcome.auth_failed {
+                    gate.record_auth_failure(Some(peer.ip()));
+                }
+            }
+        });
+    }
+}
+
 /// Accept TLS clients forever: per-connection handshake (off the accept loop so
 /// a slow handshake cannot stall other clients), then normal MQTT handling.
 async fn serve_tls_clients(
@@ -2076,58 +2127,39 @@ async fn serve_tls_clients(
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
 ) {
-    loop {
-        let (stream, peer) = tokio::select! {
-            // Graceful shutdown (ADR 0019): stop accepting; refuse new connections fast.
-            () = shutdown.cancelled() => return,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    warn!(error = %e, "TLS listener accept failed");
-                    if let Some(m) = &policy.metrics {
-                        m.connection_error("accept");
+    let per_conn_policy = policy.clone();
+    serve_tcp_clients(
+        gate,
+        listener,
+        "tls",
+        policy,
+        shutdown,
+        connections,
+        move |stream, peer| {
+            // Read the *current* acceptor per accept, so a SIGHUP cert/key/CA reload is
+            // served on the next handshake (ADR 0032 T6); in-flight sessions are undisturbed.
+            let acceptor = acceptor_rx.borrow().clone();
+            let hub = hub_tx.clone();
+            let policy = per_conn_policy.clone();
+            async move {
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
+                        let cert = conn::tls_admission(&tls_stream, policy.identity_source);
+                        Some(conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await)
                     }
-                    return;
-                }
-            },
-        };
-        // Admission caps (ADR 0041 T1): refuse BEFORE any TLS handshake work;
-        // dropping the stream closes it. Counted + logged by the gate.
-        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
-            continue;
-        };
-        debug!(%peer, "accepted TLS connection");
-        if let Some(m) = &policy.metrics {
-            m.connection_accepted("tls");
-        }
-        // Read the *current* acceptor per accept, so a SIGHUP cert/key/CA reload is served
-        // on the next handshake (ADR 0032 T6); in-flight TLS sessions are undisturbed.
-        let acceptor = acceptor_rx.borrow().clone();
-        let hub = hub_tx.clone();
-        let policy = policy.clone();
-        let gate = gate.clone();
-        connections.spawn(async move {
-            let _permit = permit; // slot freed when the connection task ends
-            let _ = stream.set_nodelay(true);
-            match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
-                    // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial.
-                    let cert = conn::tls_admission(&tls_stream, policy.identity_source);
-                    let outcome =
-                        conn::handle_stream(tls_stream, Some(peer), cert, policy, hub).await;
-                    if outcome.auth_failed {
-                        gate.record_auth_failure(Some(peer.ip()));
-                    }
-                }
-                Err(e) => {
-                    debug!(%peer, error = %e, "TLS handshake failed");
-                    if let Some(m) = &policy.metrics {
-                        m.connection_error("tls");
+                    Err(e) => {
+                        debug!(%peer, error = %e, "TLS handshake failed");
+                        if let Some(m) = &policy.metrics {
+                            m.connection_error("tls");
+                        }
+                        None
                     }
                 }
             }
-        });
-    }
+        },
+    )
+    .await;
 }
 
 /// Accept plaintext clients forever (insecure; explicitly opted into).
@@ -2139,38 +2171,21 @@ async fn serve_plaintext_clients(
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
 ) {
-    loop {
-        let (stream, peer) = tokio::select! {
-            () = shutdown.cancelled() => return,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    warn!(error = %e, "plaintext listener accept failed");
-                    if let Some(m) = &policy.metrics {
-                        m.connection_error("accept");
-                    }
-                    return;
-                }
-            },
-        };
-        // Admission caps (ADR 0041 T1): refuse before spawning any per-connection work.
-        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
-            continue;
-        };
-        debug!(%peer, "accepted connection");
-        if let Some(m) = &policy.metrics {
-            m.connection_accepted("plaintext");
-        }
-        let _ = stream.set_nodelay(true);
-        let (policy, hub, gate) = (policy.clone(), hub_tx.clone(), gate.clone());
-        connections.spawn(async move {
-            let _permit = permit; // slot freed when the connection task ends
-            let outcome = conn::handle_stream(stream, Some(peer), None, policy, hub).await;
-            if outcome.auth_failed {
-                gate.record_auth_failure(Some(peer.ip()));
-            }
-        });
-    }
+    let per_conn_policy = policy.clone();
+    serve_tcp_clients(
+        gate,
+        listener,
+        "plaintext",
+        policy,
+        shutdown,
+        connections,
+        move |stream, peer| {
+            let hub = hub_tx.clone();
+            let policy = per_conn_policy.clone();
+            async move { Some(conn::handle_stream(stream, Some(peer), None, policy, hub).await) }
+        },
+    )
+    .await;
 }
 
 /// Accept MQTT-over-WebSocket clients over plaintext (insecure; explicitly opted into).
@@ -2184,48 +2199,32 @@ async fn serve_ws_clients(
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
 ) {
-    loop {
-        let (stream, peer) = tokio::select! {
-            () = shutdown.cancelled() => return,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    warn!(error = %e, "ws listener accept failed");
-                    if let Some(m) = &policy.metrics { m.connection_error("accept"); }
-                    return;
-                }
-            },
-        };
-        // Admission caps (ADR 0041 T1): refuse before the WebSocket handshake.
-        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
-            continue;
-        };
-        debug!(%peer, "accepted ws connection");
-        if let Some(m) = &policy.metrics {
-            m.connection_accepted("ws");
-        }
-        let hub = hub_tx.clone();
-        let policy = policy.clone();
-        let gate = gate.clone();
-        connections.spawn(async move {
-            let _permit = permit; // slot freed when the connection task ends
-            let _ = stream.set_nodelay(true);
-            match mqtt_net::ws::accept(stream).await {
-                Ok(ws) => {
-                    let outcome = conn::handle_stream(ws, Some(peer), None, policy, hub).await;
-                    if outcome.auth_failed {
-                        gate.record_auth_failure(Some(peer.ip()));
-                    }
-                }
-                Err(e) => {
-                    debug!(%peer, error = %e, "websocket handshake failed");
-                    if let Some(m) = &policy.metrics {
-                        m.connection_error("ws");
+    let per_conn_policy = policy.clone();
+    serve_tcp_clients(
+        gate,
+        listener,
+        "ws",
+        policy,
+        shutdown,
+        connections,
+        move |stream, peer| {
+            let hub = hub_tx.clone();
+            let policy = per_conn_policy.clone();
+            async move {
+                match mqtt_net::ws::accept(stream).await {
+                    Ok(ws) => Some(conn::handle_stream(ws, Some(peer), None, policy, hub).await),
+                    Err(e) => {
+                        debug!(%peer, error = %e, "websocket handshake failed");
+                        if let Some(m) = &policy.metrics {
+                            m.connection_error("ws");
+                        }
+                        None
                     }
                 }
             }
-        });
-    }
+        },
+    )
+    .await;
 }
 
 /// Accept MQTT-over-WebSocket clients over TLS (`wss://`, ADR 0035). TLS is done first with
@@ -2241,64 +2240,51 @@ async fn serve_wss_clients(
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
 ) {
-    loop {
-        let (stream, peer) = tokio::select! {
-            () = shutdown.cancelled() => return,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    warn!(error = %e, "wss listener accept failed");
-                    if let Some(m) = &policy.metrics { m.connection_error("accept"); }
-                    return;
-                }
-            },
-        };
-        // Admission caps (ADR 0041 T1): refuse BEFORE any TLS handshake work.
-        let Some(permit) = gate.try_admit(Some(peer.ip())) else {
-            continue;
-        };
-        debug!(%peer, "accepted wss connection");
-        if let Some(m) = &policy.metrics {
-            m.connection_accepted("wss");
-        }
-        // Read the current acceptor per accept so a SIGHUP cert reload is served next handshake.
-        let acceptor = acceptor_rx.borrow().clone();
-        let hub = hub_tx.clone();
-        let policy = policy.clone();
-        let gate = gate.clone();
-        connections.spawn(async move {
-            let _permit = permit; // slot freed when the connection task ends
-            let _ = stream.set_nodelay(true);
-            match acceptor.accept(stream).await {
-                Ok(tls) => {
-                    // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
-                    // read before the TLS stream is consumed by the WebSocket adapter.
-                    let cert = conn::tls_admission(&tls, policy.identity_source);
-                    match mqtt_net::ws::accept(tls).await {
-                        Ok(ws) => {
-                            let outcome =
-                                conn::handle_stream(ws, Some(peer), cert, policy, hub).await;
-                            if outcome.auth_failed {
-                                gate.record_auth_failure(Some(peer.ip()));
+    let per_conn_policy = policy.clone();
+    serve_tcp_clients(
+        gate,
+        listener,
+        "wss",
+        policy,
+        shutdown,
+        connections,
+        move |stream, peer| {
+            // Read the current acceptor per accept so a SIGHUP cert reload is served
+            // on the next handshake (ADR 0032 T6).
+            let acceptor = acceptor_rx.borrow().clone();
+            let hub = hub_tx.clone();
+            let policy = per_conn_policy.clone();
+            async move {
+                match acceptor.accept(stream).await {
+                    Ok(tls) => {
+                        // mTLS admission (ADR 0004/0040): the verified leaf cert's CN + serial —
+                        // read before the TLS stream is consumed by the WebSocket adapter.
+                        let cert = conn::tls_admission(&tls, policy.identity_source);
+                        match mqtt_net::ws::accept(tls).await {
+                            Ok(ws) => {
+                                Some(conn::handle_stream(ws, Some(peer), cert, policy, hub).await)
                             }
-                        }
-                        Err(e) => {
-                            debug!(%peer, error = %e, "websocket handshake failed");
-                            if let Some(m) = &policy.metrics {
-                                m.connection_error("ws");
+                            Err(e) => {
+                                debug!(%peer, error = %e, "websocket handshake failed");
+                                if let Some(m) = &policy.metrics {
+                                    m.connection_error("ws");
+                                }
+                                None
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    debug!(%peer, error = %e, "TLS handshake failed");
-                    if let Some(m) = &policy.metrics {
-                        m.connection_error("tls");
+                    Err(e) => {
+                        debug!(%peer, error = %e, "TLS handshake failed");
+                        if let Some(m) = &policy.metrics {
+                            m.connection_error("tls");
+                        }
+                        None
                     }
                 }
             }
-        });
-    }
+        },
+    )
+    .await;
 }
 
 /// Accept MQTT-over-QUIC clients (ADR 0036). QUIC mandates TLS 1.3, so the mTLS **identity** is

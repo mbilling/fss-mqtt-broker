@@ -256,7 +256,7 @@ impl ReplicaState {
     /// # Errors
     /// [`ReplError::Backend`] if the database cannot be opened or its contents decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
-        let db = Database::create(path).map_err(rdb)?;
+        let db = mqtt_storage::open::create_with_lock_retry(path).map_err(rdb)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
         mqtt_storage::schema::gate_or_migrate(&db, "replicas.redb", R_SCHEMA_VERSION, R_MIGRATIONS)
             .map_err(rdb)?;

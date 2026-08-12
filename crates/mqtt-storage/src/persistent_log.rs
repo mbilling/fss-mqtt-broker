@@ -63,7 +63,7 @@ impl PersistentLog {
     /// # Errors
     /// Returns [`ReplError::Backend`] if the database cannot be opened or initialised.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplError> {
-        let db = Database::create(path).map_err(backend)?;
+        let db = crate::open::create_with_lock_retry(path).map_err(backend)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
         crate::schema::gate_or_migrate(&db, "sessions.redb", SCHEMA_VERSION, SESSION_MIGRATIONS)
             .map_err(backend)?;

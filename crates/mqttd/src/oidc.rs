@@ -81,7 +81,7 @@ pub async fn run_fetch_loop(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = mqtt_core::Backoff::new(Duration::from_secs(1), RETRY_MAX);
     let jwks_uri = loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
@@ -90,8 +90,7 @@ pub async fn run_fetch_loop(
                 Err(e) => {
                     warn!(url = %discovery_url, error = %e,
                         "OIDC discovery failed; token auth fail-closed until it succeeds");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(RETRY_MAX);
+                    tokio::time::sleep(backoff.next_delay()).await;
                 }
             }
         }

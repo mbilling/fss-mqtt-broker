@@ -109,7 +109,7 @@ impl Spool {
     /// # Errors
     /// [`SpoolError::Backend`] if the database cannot be opened.
     pub fn on_disk(path: &Path, cap: usize) -> Result<Self, SpoolError> {
-        let db = Database::create(path).map_err(backend)?;
+        let db = mqtt_storage::open::create_with_lock_retry(path).map_err(backend)?;
         // Find the highest existing key so new pushes continue past it.
         let next = {
             let tx = db.begin_read().map_err(backend)?;

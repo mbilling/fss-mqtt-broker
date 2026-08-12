@@ -4234,19 +4234,7 @@ impl Hub {
     /// partitioned owner never received). Withholding under partition is the
     /// same CP posture the durable attach path already takes.
     fn mesh_whole(&self) -> bool {
-        let Some(placement) = &self.placement else {
-            return true;
-        };
-        let members: Vec<NodeId> = {
-            let p = placement
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.members()
-        };
-        members
-            .iter()
-            .filter(|m| **m != self.node_id)
-            .all(|m| self.peers.contains_key(m))
+        self.peers_all(|_| true)
     }
 
     /// Whether this node's ROUTING VIEW is still settling (ADR 0042 T9 /
@@ -4273,6 +4261,17 @@ impl Hub {
     /// cannot tell "it routes nothing" from "it has not finished recovering
     /// what it routes", and no gated ack may conclude "nobody is owed this".
     fn mesh_settled(&self) -> bool {
+        self.peers_all(|p| p.interest_synced)
+    }
+
+    /// The single definition of "every membership-alive peer's link satisfies
+    /// `pred`" that both honesty gates above resolve through. Membership and the
+    /// self-exclusion live HERE, once: any change to *which members count*
+    /// (decommissioning nodes, learners, suspect handling) lands in one place, or
+    /// [`mesh_whole`](Self::mesh_whole) and [`mesh_settled`](Self::mesh_settled)
+    /// would silently disagree about the mesh they are judging. No placement ⇒
+    /// standalone ⇒ trivially true.
+    fn peers_all(&self, pred: impl Fn(&Peer) -> bool) -> bool {
         let Some(placement) = &self.placement else {
             return true;
         };
@@ -4285,7 +4284,7 @@ impl Hub {
         members
             .iter()
             .filter(|m| **m != self.node_id)
-            .all(|m| self.peers.get(m).is_some_and(|p| p.interest_synced))
+            .all(|m| self.peers.get(m).is_some_and(&pred))
     }
 
     /// Whether this node is part of a cluster: peer networking is CONFIGURED
@@ -4502,15 +4501,7 @@ impl Hub {
         p.awaiting.insert(seq, node.clone());
         self.forward_index.insert(seq, id);
         debug!(publish = id, seq, target = %node.0, topic = %p.topic, "acked forward recorded");
-        let frame = PeerMessage::PublishAcked {
-            seq,
-            topic: p.topic.clone(),
-            payload: p.payload.to_vec(),
-            qos: p.qos as u8,
-            retain: p.retain,
-            message_expiry: p.message_expiry,
-            app: app_to_wire(&p.app),
-        };
+        let frame = publish_acked_frame(p, seq);
         if let Some(peer) = self.peers.get(node) {
             let _ = peer.tx.send(frame);
         }
@@ -4670,15 +4661,11 @@ impl Hub {
                 let Some(p) = self.pending_publishes.get(&id) else {
                     continue;
                 };
-                let _ = peer.tx.send(PeerMessage::PublishAcked {
-                    seq: *seq,
-                    topic: p.topic.clone(),
-                    payload: p.payload.to_vec(),
-                    qos: p.qos as u8,
-                    retain: p.retain,
-                    message_expiry: p.message_expiry,
-                    app: app_to_wire(&p.app),
-                });
+                // The SAME frame the original forward sent (only the seq is the
+                // outstanding one, so the receiver dedups): built by the shared
+                // constructor so a retransmitted copy can never drift semantically
+                // from the first send.
+                let _ = peer.tx.send(publish_acked_frame(p, *seq));
             }
             // Re-route after a target death (grace engaged by peer_dead).
             let Some(p) = self.pending_publishes.get(&id) else {
@@ -5778,6 +5765,23 @@ impl Hub {
     }
 }
 
+/// The `PublishAcked` peer frame for a pending gated publish (ADR 0042 T9), under
+/// `seq`. The ONLY constructor of this frame: the original forward and the sweep's
+/// retransmission both build here, so a change to what the frame carries (an expiry
+/// decrement, a RAP flag, a new field's semantics) applies to first sends and
+/// retransmits identically — the two paths can never drift.
+fn publish_acked_frame(p: &PendingPublish, seq: u64) -> PeerMessage {
+    PeerMessage::PublishAcked {
+        seq,
+        topic: p.topic.clone(),
+        payload: p.payload.to_vec(),
+        qos: p.qos as u8,
+        retain: p.retain,
+        message_expiry: p.message_expiry,
+        app: app_to_wire(&p.app),
+    }
+}
+
 /// Convert in-memory application properties to their cross-node wire form (ADR 0030).
 pub(crate) fn app_to_wire(a: &AppProperties) -> mqtt_cluster::peer::WireAppProps {
     mqtt_cluster::peer::WireAppProps {
@@ -5887,7 +5891,8 @@ async fn recover_until_ready(
     owner: &str,
 ) -> SessionRecovery {
     let deadline = Instant::now() + ATTACH_RECOVERY_TIMEOUT;
-    let mut backoff = ATTACH_RECOVERY_BACKOFF_START;
+    let mut backoff =
+        mqtt_core::Backoff::new(ATTACH_RECOVERY_BACKOFF_START, ATTACH_RECOVERY_BACKOFF_MAX);
     loop {
         match recover_once(store, client, owner).await {
             Ok(ready) => return ready,
@@ -5896,8 +5901,7 @@ async fn recover_until_ready(
             // Terminal failure, or the deadline passed: reject (never downgrade).
             Err(_) => return SessionRecovery::Unavailable,
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(ATTACH_RECOVERY_BACKOFF_MAX);
+        tokio::time::sleep(backoff.next_delay()).await;
     }
 }
 
