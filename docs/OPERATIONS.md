@@ -23,6 +23,14 @@ stops its flow).
 audit-logged. A malformed file is rejected and the running policy kept — fix the file
 and the watcher retries on the next poll.
 
+**Trust note (audit #203):** because revocation sweeps live state, *write access to the
+mounted CRL file is the power to evict any mTLS client* — an attacker (or a bad
+automation) who can modify that file can force-disconnect healthy sessions
+cluster-wide, a denial of service through the security machinery doing its job.
+Protect the policy volume (Secret RBAC, no wide ConfigMap write grants) to the same
+standard as the credentials it revokes; the audit log records each reload with its
+trigger, which is the forensic trail if it happens.
+
 ## SWIM gossip key rotation — three config rolls (manual by design)
 
 The broker supports a dual-key window (`[cluster.swim] key_accept`,

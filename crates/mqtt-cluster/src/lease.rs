@@ -70,6 +70,16 @@ pub enum LeaseError {
 /// Tracks, per replica, the highest epoch it has acknowledged. The two operations
 /// model the only epoch-sensitive steps the broker performs on top of the engine:
 /// granting a lease (election) and replicating an append (the durability write).
+///
+/// **This is the REFERENCE MODEL, not the production fencing path** (audit #203
+/// clarification): it exists so the safety property above is pinned by pure,
+/// sans-I/O tests. The path a live broker's appends actually take is
+/// [`ClusterLog`](crate::cluster_log) + [`ReplicaState`](crate::cluster_log)'s
+/// per-group persisted fences, with epochs minted by the openraft lease plane
+/// ([`lease_raft`](crate::lease_raft) / [`lease_store`](crate::lease_store)) —
+/// the same rule, enforced there. A change to fencing semantics must land in
+/// BOTH, and this model's tests are the specification the production path is
+/// judged against.
 #[derive(Debug, Clone)]
 pub struct LeaseGroup {
     /// node -> highest epoch acknowledged (monotonic).

@@ -87,6 +87,40 @@ async fn quarantined_pvcs(client: &Client, ns: &str) -> Result<Vec<String>, Erro
     Ok(claims.into_iter().map(|c| c.name_any()).collect())
 }
 
+/// The largest current storage REQUEST across the named data PVCs — the baseline
+/// brownout expansion steps from (audit #203: stepping from the static spec meant
+/// a PVC could take exactly one step and never reach `expansionMaxSize`). `None`
+/// when nothing is observed or nothing parses; the planner then falls back to the
+/// spec size, which is never a shrink.
+async fn data_pvc_max_request(
+    client: &Client,
+    ns: &str,
+    names: &[String],
+) -> Result<Option<u64>, Error> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
+    let mut max = None;
+    for claim in api.list(&ListParams::default()).await? {
+        if !names.iter().any(|n| *n == claim.name_any()) {
+            continue;
+        }
+        let Some(bytes) = claim
+            .spec
+            .as_ref()
+            .and_then(|s| s.resources.as_ref())
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|m| m.get("storage"))
+            .and_then(|q| crate::remediate::parse_quantity(&q.0))
+        else {
+            continue;
+        };
+        max = Some(max.map_or(bytes, |m: u64| m.max(bytes)));
+    }
+    Ok(max)
+}
+
 /// The owner reference that ties every rendered object to its CR: deleting the
 /// `MqttdCluster` garbage-collects the whole cluster, and no object the operator
 /// owns can outlive its spec.
@@ -218,7 +252,11 @@ pub async fn reconcile(obj: Arc<MqttdCluster>, ctx: Arc<Context>) -> Result<Acti
     // spec this returns nothing at all.
     let pvc_names: Vec<String> = pods.iter().map(|(pod, _)| format!("data-{pod}")).collect();
     let quarantined = quarantined_pvcs(&ctx.client, &ns).await?;
-    let planned = crate::remediate::plan(&obj, &probes, &pvc_names, &quarantined);
+    // The largest storage request the data PVCs currently carry — the expansion
+    // step's baseline (audit #203: stepping from the static spec made the declared
+    // ceiling unreachable after the first step).
+    let observed_pvc_max = data_pvc_max_request(&ctx.client, &ns, &pvc_names).await?;
+    let planned = crate::remediate::plan(&obj, &probes, &pvc_names, &quarantined, observed_pvc_max);
     for action in &planned {
         let (reason, note) = crate::remediate::describe(action);
         match crate::remediate::execute(&ctx.client, &ns, action).await {

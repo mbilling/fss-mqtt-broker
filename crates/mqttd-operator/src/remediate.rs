@@ -65,6 +65,7 @@ pub fn plan(
     probes: &[PodProbe],
     pvcs: &[String],
     quarantined: &[String],
+    observed_pvc_max: Option<u64>,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     if let Some(fence) = plan_fence(cr, probes, quarantined) {
@@ -72,7 +73,7 @@ pub fn plan(
         // an expansion decision would rest on.
         return vec![fence];
     }
-    if let Some(expand) = plan_expansion(cr, probes, pvcs) {
+    if let Some(expand) = plan_expansion(cr, probes, pvcs, observed_pvc_max) {
         actions.push(expand);
     }
     actions
@@ -154,7 +155,14 @@ fn plan_fence(cr: &MqttdCluster, probes: &[PodProbe], quarantined: &[String]) ->
 }
 
 /// Brownout-driven PVC expansion, bounded by the CR's declared ceiling.
-fn plan_expansion(cr: &MqttdCluster, probes: &[PodProbe], pvcs: &[String]) -> Option<Action> {
+/// `observed_pvc_max` is the largest storage request the data PVCs currently
+/// carry, read from the cluster by the caller.
+fn plan_expansion(
+    cr: &MqttdCluster,
+    probes: &[PodProbe],
+    pvcs: &[String],
+    observed_pvc_max: Option<u64>,
+) -> Option<Action> {
     if cr.spec.remediation.brownout != BrownoutAction::ExpandPvc {
         return None; // opt-in; the default is Alert
     }
@@ -169,7 +177,15 @@ fn plan_expansion(cr: &MqttdCluster, probes: &[PodProbe], pvcs: &[String]) -> Op
     // No declared ceiling = no automatic growth. An unbounded expander is a
     // blank cheque against the cluster's storage budget.
     let max = parse_quantity(persistence.expansion_max_size.as_deref()?)?;
-    let current = parse_quantity(persistence.size.as_deref()?)?;
+    let spec_size = parse_quantity(persistence.size.as_deref()?)?;
+    // The step baseline is what the PVCs currently REQUEST, not the static spec
+    // (audit #203): stepping from the spec meant every reconcile recomputed the
+    // same spec*1.5 target, so a PVC could take exactly one step and the declared
+    // expansionMaxSize above it was unreachable. The observed request also makes
+    // an operator's manual grow the new baseline instead of fighting it. PVCs not
+    // yet observed (or in quantity forms we refuse to parse) fall back to the
+    // spec — conservative, and k8s rejects shrinks anyway.
+    let current = observed_pvc_max.map_or(spec_size, |o| o.max(spec_size));
     let stepped = current.saturating_add(current * EXPANSION_STEP_PERCENT / 100);
     let target = stepped.min(max);
     if target <= current {
@@ -367,6 +383,7 @@ mod tests {
             &probes,
             &pvcs(),
             &[],
+            None,
         );
         assert!(actions.is_empty(), "alert-only defaults must not act");
     }
@@ -385,6 +402,7 @@ mod tests {
             &probes,
             &pvcs(),
             &[],
+            None,
         );
         assert_eq!(
             actions,
@@ -415,10 +433,10 @@ mod tests {
         ];
         let cr = cr(SplitBrainAction::Fence, BrownoutAction::Alert);
         // First pass: containment fires.
-        assert_eq!(plan(&cr, &probes, &pvcs(), &[]).len(), 1);
+        assert_eq!(plan(&cr, &probes, &pvcs(), &[], None).len(), 1);
         // Second pass, same divergence, PVC already labelled: nothing at all.
         assert!(
-            plan(&cr, &probes, &pvcs(), &["data-mqttd-2".to_string()]).is_empty(),
+            plan(&cr, &probes, &pvcs(), &["data-mqttd-2".to_string()], None).is_empty(),
             "a quarantined node must not be re-fenced; the incident stays visible \
              until the documented manual wipe"
         );
@@ -432,7 +450,8 @@ mod tests {
             &cr(SplitBrainAction::Fence, BrownoutAction::Alert),
             &probes,
             &pvcs(),
-            &[]
+            &[],
+            None
         )
         .is_empty());
     }
@@ -457,7 +476,8 @@ mod tests {
                 &cr(SplitBrainAction::Fence, BrownoutAction::Alert),
                 &probes,
                 &pvcs(),
-                &[]
+                &[],
+                None
             )
             .is_empty(),
             "2 unreachable could join the minority and out-vote the majority"
@@ -474,6 +494,7 @@ mod tests {
             &probes,
             &pvcs(),
             &[],
+            None,
         );
         assert_eq!(
             actions,
@@ -492,7 +513,7 @@ mod tests {
             expansion_max_size: Some("20Gi".into()),
         });
         assert!(
-            plan(&at_max, &probes, &pvcs(), &[]).is_empty(),
+            plan(&at_max, &probes, &pvcs(), &[], None).is_empty(),
             "ceiling reached"
         );
 
@@ -504,8 +525,47 @@ mod tests {
             expansion_max_size: None,
         });
         assert!(
-            plan(&unbounded, &probes, &pvcs(), &[]).is_empty(),
+            plan(&unbounded, &probes, &pvcs(), &[], None).is_empty(),
             "no ceiling, no growth"
+        );
+    }
+
+    /// Audit #203: the step baseline is the OBSERVED PVC request, not the static
+    /// spec. Stepping from the spec meant every reconcile recomputed the same
+    /// spec×1.5 target — one step ever, `expansionMaxSize` unreachable. From the
+    /// observed size the steps ladder up to the ceiling, stop exactly there, and
+    /// an operator's manual grow becomes the new baseline instead of a fight.
+    #[test]
+    fn expansion_steps_from_the_observed_size_up_to_the_ceiling() {
+        let probes = vec![browned("mqttd-0")];
+        let c = cr(SplitBrainAction::Alert, BrownoutAction::ExpandPvc);
+        // spec 10Gi, ceiling 20Gi (the fixture). After the first step the PVCs
+        // request 15Gi: the next step must go to 20Gi, not re-plan 15Gi forever.
+        let gi = 1024 * 1024 * 1024;
+        let actions = plan(&c, &probes, &pvcs(), &[], Some(15 * gi));
+        assert_eq!(
+            actions,
+            vec![Action::ExpandPvcs {
+                pvcs: pvcs(),
+                to: "20Gi".into(),
+            }],
+            "15Gi observed + 50% = 22.5Gi, clamped to the 20Gi ceiling"
+        );
+        // At the ceiling: done — no perpetual re-patching.
+        assert!(
+            plan(&c, &probes, &pvcs(), &[], Some(20 * gi)).is_empty(),
+            "the observed size reached the ceiling; nothing further"
+        );
+        // An observed size below the spec (fresh/foreign PVC): the spec floors
+        // the baseline — the plan is never a shrink.
+        let actions = plan(&c, &probes, &pvcs(), &[], Some(5 * gi));
+        assert_eq!(
+            actions,
+            vec![Action::ExpandPvcs {
+                pvcs: pvcs(),
+                to: "15Gi".into(),
+            }],
+            "the spec size floors the baseline"
         );
     }
 
@@ -518,7 +578,7 @@ mod tests {
             storage_class_name: None,
             expansion_max_size: Some("12Gi".into()),
         });
-        let actions = plan(&c, &[browned("mqttd-0")], &pvcs(), &[]);
+        let actions = plan(&c, &[browned("mqttd-0")], &pvcs(), &[], None);
         assert_eq!(
             actions,
             vec![Action::ExpandPvcs {
@@ -545,6 +605,7 @@ mod tests {
             &probes,
             &pvcs(),
             &[],
+            None,
         );
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::Fence { .. }));
