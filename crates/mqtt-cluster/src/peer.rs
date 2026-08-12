@@ -114,6 +114,8 @@ pub struct RetainedWireEntry {
     pub offset: u64,
     /// The publisher's forwardable MQTT 5 application properties.
     pub props: WireAppProps,
+    /// Absolute expiry deadline (Unix epoch seconds; issue #227). `None` = never.
+    pub expires_at: Option<u64>,
 }
 
 /// One stored log entry in a [`ReplicaReadReply`](PeerMessage::ReplicaReadReply)
@@ -358,6 +360,9 @@ pub enum PeerMessage {
         props: WireAppProps,
         /// Per-sender monotonic handoff sequence (dedup key for retransmissions).
         seq: u64,
+        /// Absolute expiry deadline (Unix epoch seconds; issue #227), committed with
+        /// the value. `None` = never.
+        expires_at: Option<u64>,
     },
     /// The post-commit retained fan-out (ADR 0037 §3): the topic's group owner
     /// broadcasts every **committed** retained value with its `(epoch, offset)`
@@ -381,6 +386,8 @@ pub enum PeerMessage {
         /// The committed application properties (ADR 0038 T3), applied to the cache
         /// with the value so a replay from any node carries them.
         props: WireAppProps,
+        /// The committed absolute expiry deadline (issue #227). `None` = never.
+        expires_at: Option<u64>,
     },
     /// The owner's **commit-gated** answer to a
     /// [`RetainedCommit`](PeerMessage::RetainedCommit) (ADR 0037 T8). Sent only once
@@ -760,6 +767,7 @@ mod tests {
                     qos: 1,
                     epoch: 7,
                     offset: 42,
+                    expires_at: Some(1_755_000_000),
                     props: WireAppProps {
                         content_type: Some("application/cbor".into()),
                         user_properties: vec![("origin".into(), "n1".into())],
@@ -848,6 +856,7 @@ mod tests {
                 ..Default::default()
             },
             seq: 9,
+            expires_at: Some(1_755_000_000),
         });
         roundtrip(&PeerMessage::RetainedCommit {
             topic: "dev/1/state".into(),
@@ -855,6 +864,7 @@ mod tests {
             qos: 0,
             props: WireAppProps::default(),
             seq: 10,
+            expires_at: None,
         });
         roundtrip(&PeerMessage::RetainedCommitAck {
             seq: 9,
@@ -875,6 +885,7 @@ mod tests {
                 correlation_data: Some(vec![1, 2]),
                 ..Default::default()
             },
+            expires_at: Some(1_755_000_000),
         });
         roundtrip(&PeerMessage::RetainedUpdate {
             topic: "dev/1/state".into(),
@@ -883,6 +894,7 @@ mod tests {
             epoch: 7,
             offset: 43,
             props: WireAppProps::default(),
+            expires_at: None,
         });
     }
 

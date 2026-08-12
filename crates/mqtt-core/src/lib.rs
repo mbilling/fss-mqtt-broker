@@ -99,6 +99,13 @@ pub struct Message {
     pub retain: bool,
     /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
     pub app: AppProperties,
+    /// Absolute expiry deadline (Unix epoch seconds), from the publisher's MQTT 5
+    /// Message Expiry Interval (issue #227). `None` = never expires (every v3.1.1
+    /// publish). Stored with a retained copy so the value is deleted — cluster-wide,
+    /// by the same absolute instant — once the interval passes, and so a replay can
+    /// send the REMAINING interval as [MQTT-3.3.2-6] requires. Stores persist it;
+    /// judging it against a clock is the broker's job, not the store's.
+    pub expires_at: Option<u64>,
 }
 
 impl Message {
@@ -112,7 +119,15 @@ impl Message {
             qos,
             retain,
             app: AppProperties::default(),
+            expires_at: None,
         }
+    }
+
+    /// The same message carrying an absolute expiry deadline (issue #227).
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: Option<u64>) -> Self {
+        self.expires_at = expires_at;
+        self
     }
 }
 

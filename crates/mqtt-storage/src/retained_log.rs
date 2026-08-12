@@ -38,6 +38,9 @@ pub struct RetainedEntry {
     pub epoch: u64,
     /// The record's committed log offset — strictly increasing per topic.
     pub offset: Offset,
+    /// Absolute expiry deadline (Unix epoch seconds; issue #227), committed with the
+    /// value so every cache expires it at the same instant. `None` = never.
+    pub expires_at: Option<u64>,
 }
 
 impl RetainedEntry {
@@ -85,8 +88,10 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedRetained<L> {
         payload: &[u8],
         qos: u8,
         props: &AppProps,
+        expires_at: Option<u64>,
     ) -> Result<(u64, Offset), StorageError> {
-        self.write(topic, payload, qos, props, false).await
+        self.write(topic, payload, qos, props, false, expires_at)
+            .await
     }
 
     /// Commit a **versioned tombstone** for `topic` (a zero-length retained publish
@@ -96,7 +101,8 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedRetained<L> {
     /// # Errors
     /// As for [`set`](Self::set).
     pub async fn clear(&self, topic: &str) -> Result<(u64, Offset), StorageError> {
-        self.write(topic, &[], 0, &AppProps::default(), true).await
+        self.write(topic, &[], 0, &AppProps::default(), true, None)
+            .await
     }
 
     async fn write(
@@ -106,10 +112,11 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedRetained<L> {
         qos: u8,
         props: &AppProps,
         tombstone: bool,
+        expires_at: Option<u64>,
     ) -> Result<(u64, Offset), StorageError> {
         let key = retained_key(topic);
         let epoch = self.log.epoch_for(&key).await?;
-        let record = encode_retained(payload, qos, props, tombstone, epoch);
+        let record = encode_retained(payload, qos, props, tombstone, epoch, expires_at);
         let offset = self.log.append(&key, record).await?;
         // Last-value compaction: exactly one live record per topic. Local-first/lazy
         // (like every truncate); a reader between append and truncate still takes the
@@ -173,6 +180,7 @@ pub trait DurableRetained: Send + Sync + std::fmt::Debug {
         payload: &[u8],
         qos: u8,
         props: &AppProps,
+        expires_at: Option<u64>,
     ) -> Result<(u64, Offset), StorageError>;
 
     /// Commit a versioned tombstone for `topic`; returns its token.
@@ -203,8 +211,9 @@ impl<L: ReplicatedLog<Key = String>> DurableRetained for ReplicatedRetained<L> {
         payload: &[u8],
         qos: u8,
         props: &AppProps,
+        expires_at: Option<u64>,
     ) -> Result<(u64, Offset), StorageError> {
-        Self::set(self, topic, payload, qos, props).await
+        Self::set(self, topic, payload, qos, props, expires_at).await
     }
 
     async fn clear(&self, topic: &str) -> Result<(u64, Offset), StorageError> {
@@ -220,24 +229,36 @@ impl<L: ReplicatedLog<Key = String>> DurableRetained for ReplicatedRetained<L> {
     }
 }
 
-/// Record layout: `[epoch u64][qos u8][tombstone u8][props_len u32][props][payload …]`
-/// (big-endian). The properties block is [`AppProps::encode`]'s output,
-/// length-prefixed; the payload runs to the end of the record — no payload length
-/// field to disagree with reality. Layout v2 (ADR 0038 T3): the stores holding these
-/// records bumped their schema stamps, so a pre-props file fails closed at the gate
-/// instead of silently decoding garbage.
+/// Record layout, self-versioned by the FIRST byte (issue #227):
+///
+/// * `2` — current: `[ver=2][epoch u64][qos u8][tombstone u8][expires u64]`
+///   `[props_len u32][props][payload …]` (big-endian; `expires` is Unix epoch
+///   seconds, `0` = never).
+/// * `0` — the legacy un-versioned layout, `[epoch u64][qos u8][tombstone u8]`
+///   `[props_len u32][props][payload …]`: its first byte is the epoch's MSB,
+///   which is `0` for any epoch below 2^56 — a number no pre-1.0 cluster can
+///   have minted — so the two layouts cannot be confused. Version bytes start
+///   at 2 to keep that disambiguation permanent.
+///
+/// The properties block is [`AppProps::encode`]'s output, length-prefixed; the
+/// payload runs to the end of the record — no payload length field to disagree
+/// with reality. A short or malformed record decodes to `None` (absent,
+/// fail-closed), exactly as before.
 fn encode_retained(
     payload: &[u8],
     qos: u8,
     props: &AppProps,
     tombstone: bool,
     epoch: u64,
+    expires_at: Option<u64>,
 ) -> Vec<u8> {
     let props = props.encode();
-    let mut out = Vec::with_capacity(14 + props.len() + payload.len());
+    let mut out = Vec::with_capacity(23 + props.len() + payload.len());
+    out.push(2);
     out.extend_from_slice(&epoch.to_be_bytes());
     out.push(qos);
     out.push(u8::from(tombstone));
+    out.extend_from_slice(&expires_at.unwrap_or(0).to_be_bytes());
     out.extend_from_slice(&u32::try_from(props.len()).unwrap_or(u32::MAX).to_be_bytes());
     out.extend_from_slice(&props);
     out.extend_from_slice(payload);
@@ -245,25 +266,54 @@ fn encode_retained(
 }
 
 /// Decode a retained record; `None` (treated as absent, fail-closed) on a short or
-/// malformed record.
+/// malformed record. Reads both the current and the legacy layout (see
+/// [`encode_retained`]).
 fn decode_retained(record: &[u8], offset: Offset) -> Option<RetainedEntry> {
-    let epoch = u64::from_be_bytes(record.get(0..8)?.try_into().ok()?);
-    let qos = *record.get(8)?;
-    let tombstone = match record.get(9)? {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let props_len = u32::from_be_bytes(record.get(10..14)?.try_into().ok()?) as usize;
-    let props = AppProps::decode(record.get(14..14 + props_len)?)?;
-    Some(RetainedEntry {
-        payload: record.get(14 + props_len..)?.to_vec(),
-        qos,
-        tombstone,
-        props,
-        epoch,
-        offset,
-    })
+    match record.first()? {
+        2 => {
+            let epoch = u64::from_be_bytes(record.get(1..9)?.try_into().ok()?);
+            let qos = *record.get(9)?;
+            let tombstone = match record.get(10)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let expires = u64::from_be_bytes(record.get(11..19)?.try_into().ok()?);
+            let props_len = u32::from_be_bytes(record.get(19..23)?.try_into().ok()?) as usize;
+            let props = AppProps::decode(record.get(23..23 + props_len)?)?;
+            Some(RetainedEntry {
+                payload: record.get(23 + props_len..)?.to_vec(),
+                qos,
+                tombstone,
+                props,
+                epoch,
+                offset,
+                expires_at: (expires > 0).then_some(expires),
+            })
+        }
+        0 => {
+            // Legacy: the epoch's MSB — a pre-#227 record with no expiry.
+            let epoch = u64::from_be_bytes(record.get(0..8)?.try_into().ok()?);
+            let qos = *record.get(8)?;
+            let tombstone = match record.get(9)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let props_len = u32::from_be_bytes(record.get(10..14)?.try_into().ok()?) as usize;
+            let props = AppProps::decode(record.get(14..14 + props_len)?)?;
+            Some(RetainedEntry {
+                payload: record.get(14 + props_len..)?.to_vec(),
+                qos,
+                tombstone,
+                props,
+                epoch,
+                offset,
+                expires_at: None,
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -283,14 +333,14 @@ mod tests {
             user_properties: vec![("trace".into(), "abc".into())],
             ..AppProps::default()
         };
-        let rec = encode_retained(b"state", 1, &props, false, 7);
+        let rec = encode_retained(b"state", 1, &props, false, 7, None);
         let e = decode_retained(&rec, 3).unwrap();
         assert_eq!(
             (e.payload.as_slice(), e.qos, e.tombstone, e.epoch, e.offset),
             (b"state".as_ref(), 1, false, 7, 3)
         );
         assert_eq!(e.props, props, "application properties survive the codec");
-        let tomb = encode_retained(b"", 0, &AppProps::default(), true, 9);
+        let tomb = encode_retained(b"", 0, &AppProps::default(), true, 9, None);
         let t = decode_retained(&tomb, 4).unwrap();
         assert!(t.tombstone && t.payload.is_empty() && t.props.is_empty());
         // Short/malformed records are absent, not garbage.
@@ -309,7 +359,7 @@ mod tests {
     async fn set_then_get_returns_the_value_with_its_token() {
         let r = store();
         let (epoch, offset) = r
-            .set("dev/1", b"open", 1, &AppProps::default())
+            .set("dev/1", b"open", 1, &AppProps::default(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -327,8 +377,13 @@ mod tests {
     #[tokio::test]
     async fn a_second_set_compacts_the_key_to_the_last_value() {
         let r = store();
-        r.set("t", b"v1", 0, &AppProps::default()).await.unwrap();
-        let (_, off2) = r.set("t", b"v2", 0, &AppProps::default()).await.unwrap();
+        r.set("t", b"v1", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
+        let (_, off2) = r
+            .set("t", b"v2", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
         assert_eq!(off2, 2, "offsets strictly increase per topic");
         let e = r.get("t").await.unwrap().unwrap();
         assert_eq!(e.payload, b"v2");
@@ -341,7 +396,9 @@ mod tests {
     #[tokio::test]
     async fn a_clear_is_a_versioned_tombstone_not_an_absence() {
         let r = store();
-        r.set("t", b"v", 0, &AppProps::default()).await.unwrap();
+        r.set("t", b"v", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
         let (_, off) = r.clear("t").await.unwrap();
         assert_eq!(off, 2, "the clear takes the next offset like any write");
         let e = r.get("t").await.unwrap().unwrap();
@@ -361,8 +418,12 @@ mod tests {
     #[tokio::test]
     async fn topics_are_independent_keys() {
         let r = store();
-        r.set("a", b"1", 0, &AppProps::default()).await.unwrap();
-        r.set("b", b"2", 0, &AppProps::default()).await.unwrap();
+        r.set("a", b"1", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
+        r.set("b", b"2", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
         r.clear("a").await.unwrap();
         assert!(r.get("a").await.unwrap().unwrap().tombstone);
         assert_eq!(r.get("b").await.unwrap().unwrap().payload, b"2");
@@ -382,8 +443,10 @@ mod tests {
         };
         {
             let r = ReplicatedRetained::new(PersistentLog::open(&path).unwrap());
-            r.set("t", b"v1", 1, &AppProps::default()).await.unwrap();
-            assert_eq!(r.set("t", b"v2", 1, &props).await.unwrap(), (0, 2));
+            r.set("t", b"v1", 1, &AppProps::default(), None)
+                .await
+                .unwrap();
+            assert_eq!(r.set("t", b"v2", 1, &props, None).await.unwrap(), (0, 2));
         }
         // Reopen: the compacted last value, its token, and its application
         // properties (ADR 0038 T3) survived the restart.
@@ -394,7 +457,9 @@ mod tests {
         assert_eq!(e.props, props);
         // Writes continue after the recovered high-water — no offset reuse.
         assert_eq!(
-            r.set("t", b"v3", 1, &AppProps::default()).await.unwrap(),
+            r.set("t", b"v3", 1, &AppProps::default(), None)
+                .await
+                .unwrap(),
             (0, 3)
         );
     }
@@ -406,8 +471,12 @@ mod tests {
     #[tokio::test]
     async fn topics_lists_values_and_tombstones_but_not_foreign_keys() {
         let r = store();
-        r.set("dev/1", b"v", 0, &AppProps::default()).await.unwrap();
-        r.set("dev/2", b"v", 0, &AppProps::default()).await.unwrap();
+        r.set("dev/1", b"v", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
+        r.set("dev/2", b"v", 0, &AppProps::default(), None)
+            .await
+            .unwrap();
         r.clear("dev/2").await.unwrap(); // tombstone, not absence
         r.log
             .append(&"q/session-1".to_string(), vec![1])
@@ -418,13 +487,43 @@ mod tests {
         assert_eq!(topics, ["dev/1", "dev/2"]);
     }
 
+    /// Issue #227: the deadline rides the committed record, and the codec still
+    /// reads the LEGACY un-versioned layout (first byte = the epoch's MSB = 0) as
+    /// expiry-free — records written before the bump stay decodable.
+    #[tokio::test]
+    async fn the_record_codec_carries_expiry_and_reads_the_legacy_layout() {
+        let r = store();
+        r.set("t", b"v", 1, &AppProps::default(), Some(1_755_000_000))
+            .await
+            .unwrap();
+        let e = r.get("t").await.unwrap().unwrap();
+        assert_eq!(e.expires_at, Some(1_755_000_000));
+
+        // A legacy record, byte for byte: [epoch][qos][tomb][props_len][props][payload].
+        let props = AppProps::default().encode();
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&7u64.to_be_bytes());
+        legacy.push(1);
+        legacy.push(0);
+        legacy.extend_from_slice(&u32::try_from(props.len()).unwrap().to_be_bytes());
+        legacy.extend_from_slice(&props);
+        legacy.extend_from_slice(b"old");
+        let e = decode_retained(&legacy, 3).expect("the legacy layout must decode");
+        assert_eq!(
+            (e.payload.as_slice(), e.qos, e.epoch, e.offset, e.expires_at),
+            (b"old".as_ref(), 1, 7, 3, None)
+        );
+    }
+
     #[tokio::test]
     async fn tokens_strictly_increase_across_sets_and_clears() {
         let r = store();
         let mut last = (0, 0);
         for i in 0..5u8 {
             let tok = if i % 2 == 0 {
-                r.set("t", &[i], 0, &AppProps::default()).await.unwrap()
+                r.set("t", &[i], 0, &AppProps::default(), None)
+                    .await
+                    .unwrap()
             } else {
                 r.clear("t").await.unwrap()
             };

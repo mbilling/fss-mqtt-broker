@@ -29,12 +29,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// The retained store's on-disk layout version (ADR 0038 T2). Reset to 1 with the
-/// postcard codec succession (ADR 0052): nothing is released, so the pre-release
-/// version history (v1 no props, v2 bincode props) was retired rather than extended
-/// — v1 now means "postcard-encoded properties in the value" and the incremental
-/// bump history starts at 1.0.0. A file stamped with a retired pre-release version
-/// fails closed at the gate (wipe-and-rejoin).
-const SCHEMA_VERSION: u32 = 1;
+/// postcard codec succession (ADR 0052; the retired pre-release history fails closed
+/// at the gate — wipe-and-rejoin). Bumped to 2 for the absolute expiry deadline in
+/// the value (issue #227, MQTT 5 Message Expiry on retained copies) — pre-1.0, so
+/// the bump is another fail-closed reshape, no migration (ADR 0039/0058).
+const SCHEMA_VERSION: u32 = 2;
 
 /// In-place migrations for `retained.redb` (ADR 0058). Empty by design at 1.0 — the first
 /// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
@@ -50,13 +49,15 @@ fn backend<E: Display>(e: E) -> StorageError {
     StorageError::Backend(e.to_string())
 }
 
-/// Encode a retained message's value: `qos ++ retain ++ props_len ++ props ++ payload`
-/// (the topic is the key).
+/// Encode a retained message's value:
+/// `qos ++ retain ++ expires_at ++ props_len ++ props ++ payload` (the topic is the
+/// key; `expires_at` is Unix epoch seconds, `0` = never — issue #227).
 fn encode(m: &Message) -> Vec<u8> {
     let props = AppProps::from(&m.app).encode();
-    let mut out = Vec::with_capacity(6 + props.len() + m.payload.len());
+    let mut out = Vec::with_capacity(14 + props.len() + m.payload.len());
     out.push(m.qos as u8);
     out.push(u8::from(m.retain));
+    out.extend_from_slice(&m.expires_at.unwrap_or(0).to_be_bytes());
     out.extend_from_slice(&u32::try_from(props.len()).unwrap_or(u32::MAX).to_be_bytes());
     out.extend_from_slice(&props);
     out.extend_from_slice(&m.payload);
@@ -68,14 +69,16 @@ fn encode(m: &Message) -> Vec<u8> {
 fn decode(topic: &str, bytes: &[u8]) -> Option<Message> {
     let qos = QoS::from_u8(*bytes.first()?)?;
     let retain = *bytes.get(1)? != 0;
-    let props_len = u32::from_be_bytes(bytes.get(2..6)?.try_into().ok()?) as usize;
-    let props = AppProps::decode(bytes.get(6..6 + props_len)?)?;
+    let expires = u64::from_be_bytes(bytes.get(2..10)?.try_into().ok()?);
+    let props_len = u32::from_be_bytes(bytes.get(10..14)?.try_into().ok()?) as usize;
+    let props = AppProps::decode(bytes.get(14..14 + props_len)?)?;
     Some(Message {
         topic: topic.to_string(),
-        payload: Bytes::copy_from_slice(bytes.get(6 + props_len..)?),
+        payload: Bytes::copy_from_slice(bytes.get(14 + props_len..)?),
         qos,
         retain,
         app: props.into(),
+        expires_at: (expires > 0).then_some(expires),
     })
 }
 
@@ -209,7 +212,7 @@ mod tests {
     fn a_foreign_schema_version_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retained.redb");
-        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped v1
+        drop(super::PersistentRetainedStore::open(&path).unwrap()); // stamped current
         {
             let db = redb::Database::create(&path).unwrap();
             crate::schema::force_version(&db, 999).unwrap();
@@ -217,7 +220,7 @@ mod tests {
         let err = super::PersistentRetainedStore::open(&path)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+        assert!(err.contains("v999") && err.contains("expects v2"), "{err}");
     }
 
     use super::PersistentRetainedStore;
