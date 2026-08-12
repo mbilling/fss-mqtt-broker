@@ -4338,6 +4338,11 @@ impl Hub {
         if let Some(placement) = &self.placement {
             if let Ok(p) = placement.read() {
                 m.set_cluster_members(p.member_count());
+                // Replication health (issue #167): the silent min(R, members)
+                // degradation, surfaced. min_actual < desired = at least one group
+                // commits on fewer copies than the operator configured.
+                let health = p.replication_health();
+                m.set_replication_health(health.desired, health.min_actual);
             }
         }
         // Lease-group role/epoch, read from the durable plane's raft metrics (durable mode).

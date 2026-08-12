@@ -60,6 +60,19 @@ pub enum ReplError {
     /// producer's QoS≥1 PUBACK must **not** be released.
     #[error("replication quorum not reached")]
     NoQuorum,
+    /// The key's replica set has shrunk below the operator's configured
+    /// min-replicas write floor (issue #167): committing now would promise less
+    /// durability than the operator consented to, so the write is REFUSED instead
+    /// — transient and self-healing exactly like [`Self::NoQuorum`] (capacity
+    /// returning lifts it), and the producer's QoS≥1 PUBACK must **not** be
+    /// released. Only the cluster backend with a floor above 1 produces it.
+    #[error("replica set holds {actual} of the configured floor of {floor} copies")]
+    UnderReplicated {
+        /// The replica-set size the key's group currently has.
+        actual: usize,
+        /// The configured min-replicas write floor.
+        floor: usize,
+    },
     /// A backend-specific failure (I/O, engine error, serialization, ...).
     #[error("replicated-log backend error: {0}")]
     Backend(String),

@@ -415,6 +415,29 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
     type Key = String;
 
     async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
+        // The min-replicas write floor (issue #167): replica sets truncate to
+        // min(R, members), so a shrinking cluster silently commits new durability
+        // promises on fewer copies than the operator configured — down to
+        // quorum-of-1. Below the operator's floor, REFUSE the append instead:
+        // transient like NoQuorum (capacity returning lifts it), and gating only
+        // NEW promises — reads, acked-driven truncation and removal stay served, so
+        // the node degrades to serving what it already promised rather than dying.
+        // Default floor 1 = no refusal: a lone node stays healthy when alone.
+        {
+            let placement = self
+                .placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let floor = placement.min_replicas();
+            if floor > 1 {
+                // The same set `log_for_key` will replicate over — the floor judges
+                // exactly the durability this append would get.
+                let actual = placement.group_replica_set(group_of_key(key)).len();
+                if actual < floor {
+                    return Err(ReplError::UnderReplicated { actual, floor });
+                }
+            }
+        }
         self.log_for_key(key).await?.append(key, record).await
     }
 
@@ -639,6 +662,81 @@ mod tests {
         );
         // The owner can read its own committed queue back.
         assert_eq!(store.pending(&client, 0, 100).await.unwrap().len(), 1);
+    }
+
+    /// Issue #167: replica sets truncate to `min(R, members)`, so a lone node with
+    /// R=3 acks durable writes with ONE copy while the operator believes three —
+    /// silently. With the min-replicas write floor set, a group below the floor
+    /// REFUSES the append (transient, exactly like `NoQuorum`); reads stay served
+    /// (the node degrades to serving what it already promised, not to dying); and
+    /// the same append commits once capacity returns. The default floor of 1 keeps
+    /// the standing lone-node-stays-healthy behaviour — which every other test in
+    /// this module exercises implicitly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn appends_below_the_min_replicas_floor_are_refused_until_capacity_returns() {
+        use mqtt_storage::repl::ReplError;
+
+        let owner = nid("owner");
+        // Alone with R=3 and a floor of 2: every group's set is min(3, 1) = 1 < 2.
+        let p = Placement::new(owner.clone(), DEFAULT_REPLICAS).with_min_replicas(2);
+        let placement = Arc::new(RwLock::new(p));
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(1),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        );
+
+        let key = "q/floor-client".to_string();
+        let err = log.append(&key, vec![1]).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReplError::UnderReplicated {
+                    actual: 1,
+                    floor: 2
+                }
+            ),
+            "a lone node with floor 2 must refuse the durable append, got {err:?}"
+        );
+
+        // Capacity returns: one follower brings the set to the floor; the append
+        // commits (and needs the follower's quorum ack — 2 of 2 — to do so).
+        let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), tx);
+        spawn_follower(transport.clone(), f1_state.clone(), rx);
+        placement
+            .write()
+            .unwrap()
+            .observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        log.append(&key, vec![1])
+            .await
+            .expect("at the floor, the append commits");
+        assert_eq!(
+            log.read(&key, 0, usize::MAX).await.unwrap().len(),
+            1,
+            "the committed entry reads back"
+        );
+
+        // The cluster shrinks again: NEW promises refuse. (Only `append` carries the
+        // gate — reads, truncation and removal are structurally untouched, so the
+        // node degrades to serving what it already promised, not to dying. Serving
+        // reads across the shrink itself is the ADR 0043 P1 catch-up machinery's
+        // job, driven by the reconcile loop this unit harness does not run.)
+        placement
+            .write()
+            .unwrap()
+            .observe(&nid("f1"), MemberState::Dead, "f1:7000", None);
+        assert!(
+            matches!(
+                log.append(&key, vec![2]).await,
+                Err(ReplError::UnderReplicated { .. })
+            ),
+            "below the floor again, the next append must refuse"
+        );
     }
 
     /// `LocalLeaseSource` reads a lease the (leader-driven) consensus group assigned

@@ -348,6 +348,14 @@ pub struct Durable {
     pub lease_voters: u32,
     /// Disk high-water byte cap for the durable store (`MQTTD_STORE_MAX_BYTES`, ADR 0041 T5).
     pub store_max_bytes: Option<u64>,
+    /// Min-replicas write floor (`MQTTD_MIN_REPLICAS`, issue #167): a placement group
+    /// whose replica set has shrunk below this many copies REFUSES durable writes
+    /// (QoS>=1 acks withheld, retained mutations queue) instead of silently promising
+    /// less durability than configured — down to quorum-of-1 without this. Default 1
+    /// (no floor): a lone node stays fully operational when alone. Raising it is an
+    /// explicit durability-over-availability choice; it cannot exceed the replication
+    /// factor (checked at startup).
+    pub min_replicas: u32,
 }
 
 impl Default for Durable {
@@ -356,6 +364,7 @@ impl Default for Durable {
             enabled: true,
             lease_voters: 5,
             store_max_bytes: None,
+            min_replicas: 1,
         }
     }
 }
@@ -733,6 +742,9 @@ impl Config {
         on!("MQTTD_STORE_MAX_BYTES", v, {
             self.durable.store_max_bytes = Some(num("MQTTD_STORE_MAX_BYTES", &v)?);
         });
+        on!("MQTTD_MIN_REPLICAS", v, {
+            self.durable.min_replicas = num("MQTTD_MIN_REPLICAS", &v)?;
+        });
 
         // -- limits --
         on!("MQTTD_MAX_CONNECTIONS", v, {
@@ -831,6 +843,14 @@ impl Config {
         if self.runtime.ready_min_members == 0 {
             return Err(ConfigError::Invalid(
                 "runtime.ready_min_members must be >= 1".to_string(),
+            ));
+        }
+        // 0 would refuse every durable write unconditionally; the meaningful "no floor"
+        // is 1 (its default). The upper bound (<= replication factor) is checked at
+        // assembly, where the factor is known.
+        if self.durable.min_replicas == 0 {
+            return Err(ConfigError::Invalid(
+                "durable.min_replicas must be >= 1 (1 = no floor)".to_string(),
             ));
         }
         if self.observability.otlp_interval_secs == 0 {
@@ -1067,8 +1087,23 @@ mod tests {
     fn out_of_range_values_are_rejected() {
         assert!(Config::from_toml("[durable]\nlease_voters = 0\n").is_err());
         assert!(Config::from_toml("[runtime]\nready_min_members = 0\n").is_err());
+        // 0 would refuse every durable write unconditionally; "no floor" is 1 (#167).
+        assert!(Config::from_toml("[durable]\nmin_replicas = 0\n").is_err());
         // shutdown_grace_secs = 0 is *valid* (drain immediately) — not out of range.
         assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_ok());
+    }
+
+    /// #167 — the min-replicas write floor: defaults to 1 (no floor; a lone node
+    /// stays fully operational), settable from TOML and env like any durable knob.
+    #[test]
+    fn min_replicas_floor_defaults_off_and_is_settable() {
+        assert_eq!(Config::default().durable.min_replicas, 1);
+        let c = Config::from_toml("[durable]\nmin_replicas = 2\n").unwrap();
+        assert_eq!(c.durable.min_replicas, 2);
+        let mut c = Config::default();
+        c.overlay_from(|k| (k == "MQTTD_MIN_REPLICAS").then(|| "3".to_string()))
+            .unwrap();
+        assert_eq!(c.durable.min_replicas, 3);
     }
 
     #[test]

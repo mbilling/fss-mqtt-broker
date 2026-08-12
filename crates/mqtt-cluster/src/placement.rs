@@ -119,6 +119,13 @@ pub struct Placement {
     /// (ADR 0016 T5). Populated from membership observations so the lease-voter
     /// selection topology assembles itself instead of a static cluster-uniform map.
     domains: BTreeMap<NodeId, String>,
+    /// The smallest replica set a durable append may commit on (issue #167). Replica
+    /// sets truncate to `min(R, members)`, so a shrinking cluster silently trades the
+    /// configured durability for availability — down to quorum-of-1. Groups below
+    /// this floor REFUSE durable writes instead. Default 1: a lone node stays
+    /// healthy when alone (the standing requirement); raising it is the operator's
+    /// explicit durability-over-availability choice.
+    min_replicas: usize,
 }
 
 impl Placement {
@@ -137,6 +144,7 @@ impl Placement {
             addrs: BTreeMap::new(),
             local_domain: None,
             domains: BTreeMap::new(),
+            min_replicas: 1,
         }
     }
 
@@ -147,6 +155,20 @@ impl Placement {
     pub fn with_local_domain(mut self, domain: Option<String>) -> Self {
         self.local_domain = domain;
         self
+    }
+
+    /// Set the min-replicas write floor (issue #167), clamped to at least 1.
+    /// Builder-style, set once at startup from the operator's configuration.
+    #[must_use]
+    pub fn with_min_replicas(mut self, floor: usize) -> Self {
+        self.min_replicas = floor.max(1);
+        self
+    }
+
+    /// The configured min-replicas write floor (1 = no floor).
+    #[must_use]
+    pub fn min_replicas(&self) -> usize {
+        self.min_replicas
     }
 
     /// Apply an observed membership state. A non-`Dead` peer becomes eligible

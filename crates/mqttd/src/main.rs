@@ -270,11 +270,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Session-placement ring (ADR 0005), kept in step with SWIM membership and
     // read by the hub to identify each persistent session's owner node.
+    // The min-replicas write floor (issue #167): checked against the replication
+    // factor HERE, where the factor is known — a floor above R can never be met and
+    // would refuse every durable write forever, so it fails fast like any other
+    // invalid configuration.
+    let min_replicas = config.durable.min_replicas as usize;
+    if min_replicas > placement::DEFAULT_REPLICAS {
+        return Err(format!(
+            "durable.min_replicas ({min_replicas}) exceeds the replication factor \
+             ({}) — no group can ever satisfy that floor",
+            placement::DEFAULT_REPLICAS
+        )
+        .into());
+    }
     let placement = Arc::new(RwLock::new(
         Placement::new(node_id.clone(), placement::DEFAULT_REPLICAS)
             // This node's own failure-domain label (ADR 0016 T5), so placement reports it
             // in the topology map without waiting for gossip to round-trip.
-            .with_local_domain(config.node.failure_domain.clone()),
+            .with_local_domain(config.node.failure_domain.clone())
+            .with_min_replicas(min_replicas),
     ));
 
     // Graceful-shutdown plumbing (ADR 0019): a cancellation token that stops the accept
@@ -1292,7 +1306,16 @@ fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure
             founder,
             voter_cap,
             failure_domains,
+            min_replicas = config.durable.min_replicas,
             "DURABLE sessions enabled: consensus-backed replicated store (on disk)"
+        );
+    }
+    if config.durable.min_replicas > 1 {
+        info!(
+            floor = config.durable.min_replicas,
+            "min-replicas write floor active (issue #167): a placement group whose \
+             replica set shrinks below the floor REFUSES durable writes (QoS>=1 acks \
+             withheld, retained mutations queue) until capacity returns"
         );
     }
 }
