@@ -129,6 +129,15 @@ extraEnv: []
 # observes one cluster identity. Chart-only users flip it by hand, once.
 clusterEstablished: false
 
+# Feeds the config template's __STORE_MAX_BYTES__ placeholder (issue #228): write
+# `store_max_bytes = __STORE_MAX_BYTES__` under [durable] in `config` above and set the
+# byte value here so the broker's disk watermark is declared next to the PVC size it
+# guards. Unset = the placeholder (if present) renders as 0. The OPERATOR computes this
+# from the observed PVC size instead (persistence.storeMaxBytesPercent), so the
+# watermark rises automatically after a brownout-driven expansion.
+# storeMaxBytes: "8589934592"
+
+
 # Each pod gets its OWN PersistentVolume (volumeClaimTemplate) for the redb data dir, so a
 # rescheduled pod reattaches its volume and recovers durable state — never the ephemeral trap.
 persistence:

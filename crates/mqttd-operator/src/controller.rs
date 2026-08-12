@@ -87,23 +87,20 @@ async fn quarantined_pvcs(client: &Client, ns: &str) -> Result<Vec<String>, Erro
     Ok(claims.into_iter().map(|c| c.name_any()).collect())
 }
 
-/// The largest current storage REQUEST across the named data PVCs — the baseline
-/// brownout expansion steps from (audit #203: stepping from the static spec meant
-/// a PVC could take exactly one step and never reach `expansionMaxSize`). `None`
-/// when nothing is observed or nothing parses; the planner then falls back to the
-/// spec size, which is never a shrink.
+/// The largest current storage REQUEST across this cluster's data PVCs (by the
+/// `data-<sts>-` name prefix) — the baseline brownout expansion steps from (audit
+/// #203) and the base the `__STORE_MAX_BYTES__` watermark render follows (issue
+/// #228). `None` when nothing is observed or nothing parses; consumers then fall
+/// back to the spec size, which is never a shrink.
 async fn data_pvc_max_request(
     client: &Client,
     ns: &str,
-    names: &[String],
+    prefix: &str,
 ) -> Result<Option<u64>, Error> {
-    if names.is_empty() {
-        return Ok(None);
-    }
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
     let mut max = None;
     for claim in api.list(&ListParams::default()).await? {
-        if !names.iter().any(|n| *n == claim.name_any()) {
+        if !claim.name_any().starts_with(prefix) {
             continue;
         }
         let Some(bytes) = claim
@@ -154,8 +151,13 @@ fn gvk_for(kind: &str) -> Option<GroupVersionKind> {
 /// Apply (not create) so a reconcile is idempotent and an operator restart
 /// converges rather than conflicts; the rendered shape is the one the chart
 /// produces, held there by the CI render-parity gate.
-async fn apply_owned(client: &Client, cr: &MqttdCluster, ns: &str) -> Result<usize, Error> {
-    let rendered = crate::render::render(cr);
+async fn apply_owned(
+    client: &Client,
+    cr: &MqttdCluster,
+    ns: &str,
+    observed_pvc_max: Option<u64>,
+) -> Result<usize, Error> {
+    let rendered = crate::render::render(cr, observed_pvc_max);
     let owner = owner_reference(cr);
     let params = PatchParams::apply(MANAGER);
     let mut applied = 0;
@@ -195,7 +197,12 @@ pub async fn reconcile(obj: Arc<MqttdCluster>, ctx: Arc<Context>) -> Result<Acti
 
     // Own the objects first: the cluster this CR describes must exist before
     // there is anything to observe.
-    let applied = apply_owned(&ctx.client, &obj, &ns).await?;
+    // Observed BEFORE the render: the `__STORE_MAX_BYTES__` watermark follows the
+    // largest data-PVC request (issue #228), so an expansion raises it on the very
+    // next reconcile's roll.
+    let data_pvc_prefix = format!("data-{}-", obj.name_any());
+    let observed_pvc_max = data_pvc_max_request(&ctx.client, &ns, &data_pvc_prefix).await?;
+    let applied = apply_owned(&ctx.client, &obj, &ns, observed_pvc_max).await?;
 
     let pods = cluster_pods(&ctx.client, &obj).await?;
     let probes = probe_all(&ctx.http, &pods).await;
@@ -252,10 +259,8 @@ pub async fn reconcile(obj: Arc<MqttdCluster>, ctx: Arc<Context>) -> Result<Acti
     // spec this returns nothing at all.
     let pvc_names: Vec<String> = pods.iter().map(|(pod, _)| format!("data-{pod}")).collect();
     let quarantined = quarantined_pvcs(&ctx.client, &ns).await?;
-    // The largest storage request the data PVCs currently carry — the expansion
-    // step's baseline (audit #203: stepping from the static spec made the declared
-    // ceiling unreachable after the first step).
-    let observed_pvc_max = data_pvc_max_request(&ctx.client, &ns, &pvc_names).await?;
+    // The expansion baseline (audit #203) is the same observation the watermark
+    // render used above.
     let planned = crate::remediate::plan(&obj, &probes, &pvc_names, &quarantined, observed_pvc_max);
     for action in &planned {
         let (reason, note) = crate::remediate::describe(action);
@@ -379,7 +384,7 @@ mod tests {
     /// someone adds an object to the render without teaching the applier about it.
     #[test]
     fn every_rendered_kind_has_a_gvk() {
-        let rendered = crate::render::render(&cr("abc-123"));
+        let rendered = crate::render::render(&cr("abc-123"), None);
         for object in rendered.all() {
             let kind = object["kind"]
                 .as_str()

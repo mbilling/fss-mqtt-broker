@@ -97,6 +97,14 @@
                         "description": "`StorageClass`; empty = the cluster default. Brownout `ExpandPvc`\nremediation requires a class with `allowVolumeExpansion`.",
                         "nullable": true,
                         "type": "string"
+                      },
+                      "storeMaxBytesPercent": {
+                        "description": "Renders `__STORE_MAX_BYTES__` in the config template as this percentage of\nthe LARGEST current data-PVC request (floored by `size`), so the broker's\ndisk watermark follows the volume it actually has — including after a\nbrownout-driven expansion (0055-T10, issue #228). Unset = the placeholder is\nnot fed (templates that do not use it are unaffected). Pair with\n`store_max_bytes = __STORE_MAX_BYTES__` under `[durable]` in the template.",
+                        "format": "uint8",
+                        "maximum": 255.0,
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
                       }
                     },
                     "type": "object"
@@ -110,7 +118,7 @@
                     "properties": {
                       "brownout": {
                         "default": "Alert",
-                        "description": "Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — grow PVC\nsizes up to `persistence.expansionMaxSize`. NOTE: `ExpandPvc` does **not**\nyet raise the broker's `store_max_bytes` watermark (that lives in the config\nand is tracked by 0055-T10), so the broker may keep refusing writes on the\nlarger volume until the watermark is raised — a manual config roll for now.",
+                        "description": "Disk brownout (ADR 0041 §5): `Alert` (default) or `ExpandPvc` — grow PVC\nsizes up to `persistence.expansionMaxSize`. Pair with\n`persistence.storeMaxBytesPercent` + a `__STORE_MAX_BYTES__` placeholder in\nthe config template so the broker's disk watermark rises WITH the volume\n(0055-T10, issue #228) and the brownout actually clears; without them the\nwatermark stays where the template put it — a manual config roll.",
                         "enum": [
                           "Alert",
                           "ExpandPvc"

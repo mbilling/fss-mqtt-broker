@@ -75,6 +75,7 @@ PEER_ADVERTISE="${POD_NAME}.${HEADLESS_DOMAIN}:7001"
 sed -e "s/__NODE_ID__/${POD_NAME}/g" -e "s|__SEEDS__|${SEEDS}|g" \
   -e "s|__PEER_ADVERTISE__|${PEER_ADVERTISE}|g" \
   -e "s/__READY_MIN__/${READY_MIN}/g" \
+  -e "s/__STORE_MAX_BYTES__/${STORE_MAX_BYTES:-0}/g" \
   "${TMPL_DIR:-/tmpl}/mqttd.toml.tmpl" > "${OUT_DIR:-/config}/mqttd.toml"
 # A short write — e.g. a full ephemeral-storage volume — leaves sed exit 0 with a
 # 0-byte file, and the broker then boots on pure DEFAULTS (no listeners, node id
@@ -180,14 +181,14 @@ fn labels(names: &Names) -> Value {
 
 /// Render every object for `cr`.
 #[must_use]
-pub fn render(cr: &MqttdCluster) -> Rendered {
+pub fn render(cr: &MqttdCluster, observed_pvc_max: Option<u64>) -> Rendered {
     let names = Names::of(cr);
     Rendered {
         serviceaccount: serviceaccount(&names),
         configmap: configmap(cr, &names),
         services: vec![headless_service(&names), client_service(&names)],
         pdb: pdb(&names),
-        statefulset: statefulset(cr, &names),
+        statefulset: statefulset(cr, &names, observed_pvc_max),
     }
 }
 
@@ -316,7 +317,24 @@ fn secret_wiring(cr: &MqttdCluster) -> (Vec<Value>, Vec<Value>) {
 }
 
 #[allow(clippy::too_many_lines)] // one flat manifest mirroring the chart template
-fn statefulset(cr: &MqttdCluster, names: &Names) -> Value {
+/// The watermark the config template's `__STORE_MAX_BYTES__` renders to (issue #228):
+/// `storeMaxBytesPercent` of the LARGEST current data-PVC request, floored by the
+/// declared `persistence.size` — so the watermark follows the volume the broker
+/// actually has, including after a brownout-driven expansion, and a fresh cluster
+/// (nothing observed yet) starts from the spec. `None` = the knob is unset and the
+/// placeholder is not fed (templates that do not use it are unaffected).
+fn store_max_bytes(cr: &MqttdCluster, observed_pvc_max: Option<u64>) -> Option<u64> {
+    let persistence = cr.spec.persistence.as_ref()?;
+    let percent = u64::from(persistence.store_max_bytes_percent?.clamp(1, 100));
+    let spec = crate::remediate::parse_quantity(persistence.size.as_deref()?)?;
+    let base = observed_pvc_max.map_or(spec, |o| o.max(spec));
+    Some(base * percent / 100)
+}
+
+// One flat JSON object literal mirroring the chart's StatefulSet — long by field
+// count, not complexity (the configmap/service renders keep the same shape).
+#[allow(clippy::too_many_lines)]
+fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) -> Value {
     let image = cr
         .spec
         .image
@@ -331,6 +349,13 @@ fn statefulset(cr: &MqttdCluster, names: &Names) -> Value {
         json!({ "name": "REPLICAS", "value": cr.spec.replicas.to_string() }),
         json!({ "name": "HEADLESS_DOMAIN", "value": headless_domain }),
     ];
+    // Issue #228 (0055-T10): the watermark follows the volume. An env change rolls
+    // the StatefulSet, the init container re-renders the config, and the broker
+    // starts with the raised watermark — the brownout the expansion existed to
+    // clear actually clears.
+    if let Some(bytes) = store_max_bytes(cr, observed_pvc_max) {
+        init_env.push(json!({ "name": "STORE_MAX_BYTES", "value": bytes.to_string() }));
+    }
     if founding_disarmed(cr) {
         init_env.push(json!({ "name": "CLUSTER_ESTABLISHED", "value": "true" }));
     }
@@ -485,6 +510,51 @@ fn probe(path: &str, period: i64, failure_threshold: i64) -> Value {
 mod tests {
     use super::{render, Rendered, RENDER_SCRIPT};
     use crate::crd::{BootstrapPolicy, MqttdCluster};
+
+    /// Issue #228 (0055-T10): the `__STORE_MAX_BYTES__` watermark env follows the
+    /// volume — the declared percent of the LARGEST observed data-PVC request,
+    /// floored by the spec size (a fresh cluster starts from the spec; k8s never
+    /// shrinks a PVC, so the value never regresses). Knob unset = no env, so
+    /// templates that do not use the placeholder are unaffected.
+    #[test]
+    fn the_watermark_env_follows_the_observed_pvc_size() {
+        fn env_of(r: &Rendered) -> String {
+            r.statefulset["spec"]["template"]["spec"]["initContainers"][0]["env"].to_string()
+        }
+        const GI: u64 = 1024 * 1024 * 1024;
+        let mut cr = sample();
+        cr.spec.persistence = Some(crate::crd::Persistence {
+            store_max_bytes_percent: Some(80),
+            size: Some("10Gi".into()),
+            storage_class_name: None,
+            expansion_max_size: Some("20Gi".into()),
+        });
+        // Nothing observed yet: the spec size is the base — 80% of 10Gi.
+        assert!(
+            env_of(&render(&cr, None)).contains(&(8 * GI).to_string()),
+            "fresh cluster: watermark from the spec size"
+        );
+        // Observed 20Gi (after a brownout expansion): the watermark rises with it.
+        assert!(
+            env_of(&render(&cr, Some(20 * GI))).contains(&(16 * GI).to_string()),
+            "expanded: watermark follows the observed size"
+        );
+        // An observed value below the spec never lowers the watermark.
+        assert!(
+            env_of(&render(&cr, Some(5 * GI))).contains(&(8 * GI).to_string()),
+            "the spec size floors the base"
+        );
+        // Knob unset: the env is absent and the template is untouched.
+        cr.spec
+            .persistence
+            .as_mut()
+            .expect("persistence set above")
+            .store_max_bytes_percent = None;
+        assert!(
+            !env_of(&render(&cr, Some(20 * GI))).contains("STORE_MAX_BYTES"),
+            "no knob, no env"
+        );
+    }
 
     /// Known-answer parity pin (NIST SHA-256 vector for "abc"): the operator's
     /// `config_checksum` is a deliberate copy of `mqttd::reload::sha256_hex`
@@ -677,7 +747,7 @@ mod tests {
         }
         let fresh = sample();
         assert!(
-            !env_of(&render(&fresh)).contains("CLUSTER_ESTABLISHED"),
+            !env_of(&render(&fresh, None)).contains("CLUSTER_ESTABLISHED"),
             "a CR with no status must render the bootstrap-capable form"
         );
 
@@ -687,7 +757,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            env_of(&render(&latched)).contains("CLUSTER_ESTABLISHED"),
+            env_of(&render(&latched, None)).contains("CLUSTER_ESTABLISHED"),
             "once an identity has been observed, ordinal 0 must not found again"
         );
 
@@ -696,7 +766,7 @@ mod tests {
         let mut broken_glass = latched.clone();
         broken_glass.spec.bootstrap_policy = BootstrapPolicy::AllowRebootstrap;
         assert!(
-            !env_of(&render(&broken_glass)).contains("CLUSTER_ESTABLISHED"),
+            !env_of(&render(&broken_glass, None)).contains("CLUSTER_ESTABLISHED"),
             "AllowRebootstrap must re-permit founding"
         );
     }
@@ -704,7 +774,7 @@ mod tests {
     /// The rendered set is the chart's object set, named the chart's way.
     #[test]
     fn renders_the_chart_object_set() {
-        let r = render(&sample());
+        let r = render(&sample(), None);
         assert_eq!(
             r.all().len(),
             6,
@@ -729,7 +799,7 @@ mod tests {
     /// the decommission preStop, PVC retention, and the per-pod render env.
     #[test]
     fn preserves_the_operational_contracts() {
-        let r = render(&sample());
+        let r = render(&sample(), None);
         let spec = &r.statefulset["spec"];
         assert_eq!(spec["podManagementPolicy"], "OrderedReady");
         assert_eq!(
@@ -759,7 +829,7 @@ mod tests {
     /// Secret references are mounted by PATH only, and absent ones add nothing.
     #[test]
     fn secret_references_mount_by_path_and_are_optional() {
-        let bare = render(&sample());
+        let bare = render(&sample(), None);
         let vols = bare.statefulset["spec"]["template"]["spec"]["volumes"]
             .as_array()
             .unwrap();
@@ -772,7 +842,7 @@ mod tests {
             peer_tls: None,
             gossip_key: Some("swim-key".into()),
         });
-        let wired = render(&cr);
+        let wired = render(&cr, None);
         let pod = &wired.statefulset["spec"]["template"]["spec"];
         let names: Vec<_> = pod["volumes"]
             .as_array()

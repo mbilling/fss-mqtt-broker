@@ -30,7 +30,7 @@ fn main() {
         "status": status,
     }))
     .expect("sample CR");
-    let rendered = mqttd_operator::render::render(&cr);
+    let rendered = mqttd_operator::render::render(&cr, None);
     let all: Vec<_> = rendered.all().into_iter().cloned().collect();
     println!(
         "{}",
