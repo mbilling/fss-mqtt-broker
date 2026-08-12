@@ -77,6 +77,25 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    appends at a superseded epoch, so it cannot reach quorum and cannot diverge
    the log.
 
+   **As delivered — degradation is visible, and gating it is the operator's
+   choice (issue #167).** "R=3, quorum=2" holds only while three nodes are
+   placement-eligible: replica sets truncate to `min(R, members)`, so a
+   shrinking cluster keeps acking durable writes on smaller sets — down to
+   quorum-of-1 on a lone node — which is availability silently spending the
+   configured durability. Delivered in two parts. *Visibility*: cluster-wide
+   replication health (configured R vs the smallest replica set any group
+   holds) is exported as the `replication_desired` / `replication_min_actual`
+   gauges, in the `/statusz` `replication` block, and as an edge-triggered
+   WARN/recovery log from the reconcile driver. *Gating* (`durable.min_replicas`,
+   default 1 = off): a group whose replica set is below the operator's floor
+   REFUSES `append` — transient like `NoQuorum`, so QoS≥1 acks are withheld
+   (sources redeliver) and retained mutations queue until capacity returns;
+   reads, acked-driven truncation and removal stay served, degrading the node
+   to serving what it already promised rather than dying. The default keeps
+   the standing requirement that a lone node is fully operational when alone;
+   a floor above the replication factor is rejected at startup as
+   unsatisfiable.
+
 ## Consequences
 
 - Durable, split-brain-safe sessions become buildable (workstream E), and

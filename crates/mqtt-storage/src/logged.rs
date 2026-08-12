@@ -60,6 +60,12 @@ impl From<ReplError> for StorageError {
             // appends this still (correctly) gates the PUBACK exactly as a drop would.
             ReplError::NotOwner => StorageError::NotOwner,
             ReplError::NoQuorum => StorageError::NoQuorum,
+            // The floor refusal (issue #167) is transient in the same sense: capacity
+            // returning lifts it. `Unavailable` keeps every retry/queue path behaving
+            // exactly as for NoQuorum while the message carries the distinct cause —
+            // the alert signal itself is the under-replication gauge + reconcile-driver
+            // warn, which fire on the same condition that refuses here.
+            e @ ReplError::UnderReplicated { .. } => StorageError::Unavailable(e.to_string()),
             ReplError::Backend(m) => StorageError::Backend(m),
         }
     }

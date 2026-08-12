@@ -142,6 +142,14 @@ lease_voters = 5
 # Disk high-water cap over the on-disk stores, bytes (needs [node] data_dir). Above it the broker
 # browns out growth-writes while acks/deletes/resumes continue. Unset = no watermark.
 # store_max_bytes = 10737418240
+# Min-replicas write floor (issue #167). Replica sets shrink with membership — min(R, alive) — so
+# a shrinking cluster silently trades the configured durability for availability, down to
+# quorum-of-1. A floor above 1 makes a group below it REFUSE durable writes instead (QoS>=1 acks
+# withheld so sources redeliver; retained mutations queue until capacity returns; reads and QoS 0
+# keep serving). Default 1 = no floor: a lone node stays fully operational. Cannot exceed the
+# replication factor (3). Watch it via the replication_min_actual/replication_desired gauges and
+# the /statusz "replication" block.
+# min_replicas = 2
 
 [limits]
 # Resource governance (ADR 0041). Unset generally = uncapped. A configured 0 where a positive

@@ -415,10 +415,14 @@ impl HealthState {
         }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
-            let members = p
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .members_snapshot();
+            let (members, health, floor) = {
+                let p = p.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    p.members_snapshot(),
+                    p.replication_health(),
+                    p.min_replicas(),
+                )
+            };
             s.push_str(",\"members\":[");
             for (i, (id, addr, domain)) in members.iter().enumerate() {
                 if i > 0 {
@@ -434,6 +438,19 @@ impl HealthState {
                 s.push('}');
             }
             s.push(']');
+            // Replication health (issue #167): the silent min(R, members) degradation,
+            // stated where an operator looks. `under_replicated: true` means at least
+            // one placement group is committing durable writes on fewer copies than
+            // configured; with a write floor above 1, groups below the floor REFUSE
+            // durable writes instead.
+            let _ = write!(
+                s,
+                ",\"replication\":{{\"desired\":{},\"min_actual\":{},\
+                 \"under_replicated\":{},\"write_floor\":{floor}}}",
+                health.desired,
+                health.min_actual,
+                health.is_under_replicated(),
+            );
         }
         // Lease group (durable mode): role, epoch, voter identities, readiness.
         if let Some(plane) = &self.durable {
@@ -915,6 +932,16 @@ mod tests {
         );
         assert!(body.contains("\"members\":["), "{body}");
         assert!(body.contains("\"id\":\"peer-1\""), "{body}");
+        // Replication health (issue #167): 2 members under R=3 → every group holds 2
+        // of the 3 configured copies, and the operator can SEE that here. The floor
+        // is the default 1 (no gating).
+        assert!(
+            body.contains(
+                "\"replication\":{\"desired\":3,\"min_actual\":2,\
+                 \"under_replicated\":true,\"write_floor\":1}"
+            ),
+            "{body}"
+        );
         assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");
         // Rotation + convergence blocks (ADR 0054 T3).
         assert!(
