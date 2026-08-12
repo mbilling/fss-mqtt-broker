@@ -278,6 +278,27 @@ has panels for all three.
 
 ---
 
+## Retained messages across the boundary
+
+Retained state **crosses**, in both the cases that matter: a value already retained when the
+bridge connects, and a value published *while the bridge is already subscribed*. The bridge
+subscribes with **Retain As Published** and copies the source retain bit onto the forwarded
+message, so the far broker stores it retained (issue #189). Per-rule `outgoing_retain = false`
+strips the flag for a far broker that cannot handle retained messages (the Mosquitto
+`bridge_outgoing_retain` escape).
+
+Two things to know:
+
+- **The far broker must honour RAP for the live case.** Against mqttd it does (#198). Against a
+  broker that ignores RAP, only *existing* retained state crosses — a value published while the
+  bridge is connected arrives with the flag cleared and is forwarded as an ordinary message.
+- **`ha = "shared"` cannot cross retained state at all.** A `$share` subscription receives no
+  retained messages ([MQTT-3.8.4]), so the replay never reaches the bridge. The default
+  `partitioned` HA uses plain subscriptions and does not have this problem — one more reason it
+  is the default (ADR 0059).
+
+---
+
 ## Durability of a QoS ≥ 1 rule
 
 The spool is **fsync-durable** on commit (ADR 0060 T3), and a QoS ≥ 1 rule **refuses to start**

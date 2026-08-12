@@ -178,9 +178,10 @@ async fn a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back() {
 /// entered the upstream's retained store.
 ///
 /// The bridge receives this existing retained value as a **retained replay at subscribe time**,
-/// which always carries retain=1 (independent of Retain As Published). RAP additionally matters
-/// for a value published *while the bridge is already subscribed* (live traffic); that path also
-/// needs the local broker to honour the RAP subscription option, tracked separately.
+/// which always carries retain=1 (independent of Retain As Published). The *live* case — a
+/// value published while the bridge is already subscribed — is covered by
+/// [`a_live_retained_publish_crosses_the_boundary_retained`], and needs the broker to honour
+/// RAP (#198, now implemented).
 ///
 /// `share_group` is cleared here: a `$share` subscription receives **no** retained messages
 /// (MQTT-3.8.4), so retained state can only cross over a plain subscription. Under the default
@@ -285,6 +286,113 @@ async fn a_retained_message_crosses_the_boundary_and_lands_retained() {
         "the crossed value must be stored RETAINED on the upstream (retain flag set on replay)"
     );
     assert_eq!(&replayed.payload[..], b"21C");
+
+    bridge.shutdown();
+}
+
+/// #189 residual, closed by #198: a retained value published **while the bridge is already
+/// subscribed** (live traffic, not a subscribe-time replay) must also cross retained.
+///
+/// This is the case Retain As Published exists for. A plain subscription has RETAIN cleared on
+/// an established-subscription delivery [MQTT-3.3.1-9], so before the broker honoured RAP the
+/// bridge saw `retain=0` for live traffic and could not re-publish it as retained — only
+/// *existing* retained state crossed (via the replay at subscribe). With RAP set on the
+/// bridge's subscriptions (#191) and honoured by the broker (#198), the live value crosses too.
+#[tokio::test]
+async fn a_live_retained_publish_crosses_the_boundary_retained() {
+    let local = start_broker().await;
+    let upstream = start_broker().await;
+
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+
+        [[upstreams]]
+        name = "partner"
+        url = "{upstream}"
+
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "live/#"
+        "#,
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+
+    // A live upstream subscriber, used to detect when the bridge's local subscription is up —
+    // so the retained publish below is genuinely LIVE traffic, not a subscribe-time replay.
+    let mut up_live = client(upstream, "live-ret-probe").await;
+    subscribe(&mut up_live, "live/#").await;
+
+    let mut local_pub = client(local, "live-ret-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        local_pub
+            .publish(
+                "live/warmup",
+                Bytes::from_static(b"w"),
+                QoS::AtMostOnce,
+                false,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_millis(200), up_live.next_event()).await {
+            Ok(Ok(Event::Publish(p))) if p.topic == "live/warmup" => break,
+            _ => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bridge's local subscription never went live"
+            ),
+        }
+    }
+
+    // Now publish a RETAINED value as live traffic and assert it lands retained upstream.
+    let mut n = 0;
+    let replayed = loop {
+        n += 1;
+        local_pub
+            .publish(
+                "live/room/temp",
+                Bytes::from_static(b"22C"),
+                QoS::AtMostOnce,
+                true, // retained, published while the bridge is already subscribed
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A FRESH upstream subscriber replays only what the upstream stored retained.
+        let mut fresh = client(upstream, &format!("live-fresh-{n}")).await;
+        fresh.subscribe(1, "live/#", QoS::AtMostOnce).await.unwrap();
+        let mut found = None;
+        let inner = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < inner {
+            match tokio::time::timeout(Duration::from_millis(150), fresh.next_event()).await {
+                Ok(Ok(Event::Publish(p))) if p.topic == "live/room/temp" => {
+                    found = Some(p);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = found {
+            break p;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a LIVE retained publish never reached the upstream's retained store (RAP path)"
+        );
+    };
+    assert!(
+        replayed.retain,
+        "the live-crossed value must be stored RETAINED on the upstream"
+    );
+    assert_eq!(&replayed.payload[..], b"22C");
 
     bridge.shutdown();
 }
