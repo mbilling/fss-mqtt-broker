@@ -122,6 +122,27 @@ bridge is, in effect, "an offline client" to whichever side is down; persistent 
 both brokers cover the rest. Delivery is **at-least-once** for QoS≥1 rules; exactly-once
 across two independent brokers is not promised.
 
+**As delivered — the durability contract ([ADR 0060](0060-bridge-durability-and-ack-contract.md)).**
+This section originally left *when* the bridge acknowledges the source unspecified, and the
+implementation acked on arrival — which made the at-least-once promise above untrue, because the
+source dropped its copy before the bridge had done anything durable with the message. The
+contract is now explicit:
+
+- **Acknowledge only after durable acceptance.** The source PUBACK is sent once the message is
+  spooled (fsync'd on commit) or dispatched to a live destination — never on arrival. A
+  destination that cannot accept it withholds the ack entirely, so the source keeps its copy and
+  redelivers. *Residual:* on the fast path the ack fires at dispatch, not on the destination's
+  own PUBACK; closing that window is ADR 0060 T8.
+- **Overflow: refuse, do not shed.** At the cap a `QoS`≥1 spool **refuses the newest** message
+  rather than dropping the oldest, because everything already spooled was acknowledged to the
+  source — shedding it would lose a message the source believes was delivered. A `QoS`-0-only
+  bridge still drops the oldest (`QoS` 0 promises nothing, and a stalled crossing is worse).
+- **Never silently non-durable.** A `QoS`≥1 rule with no durable spool is refused at startup
+  unless the operator explicitly opts into ephemeral operation; the old silent in-memory
+  fallback is gone.
+- **Losses are audited.** A shed message emits an audit record (topic + reason), not just a
+  counter — a lost auditable crossing must leave a trail.
+
 ### 8. Security posture and observability
 
 Each upstream gets a **distinct mTLS identity** (ADR 0002); secrets arrive by file/env, never

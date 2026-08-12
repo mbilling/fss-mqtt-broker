@@ -67,7 +67,7 @@
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [5/6 done](0057-durable-outbound-inflight.md) | 1 open |
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [3/5 done](0058-one-dot-zero-stability-contract.md) | 2 open |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
-| [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [6/8 done](0060-bridge-durability-and-ack-contract.md) | 2 open |
+| [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/8 done](0060-bridge-durability-and-ack-contract.md) | 1 open |
 
 ## Open and deferred work
 
@@ -174,5 +174,4 @@
 
 **0060 — Bridge durability and acknowledgement contract**
 
-- `0060-T6` ⬜ planned: "Docs: ADR 0025 §7 Consequences amendment stating the durability contract and overflow behaviour"
 - `0060-T8` ⬜ planned: "Fast path waits for the downstream PUBACK: correlate the destination's pkid back to the source obligation, closing the dispatch->ack window (ADR 0060 §5.1-5.2)"
