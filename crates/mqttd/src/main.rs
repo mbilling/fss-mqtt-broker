@@ -2864,8 +2864,8 @@ fn run_decommission() -> ! {
 
 /// Has the broker process exited (drain complete)? On Linux we read `/proc/<pid>/stat` and treat
 /// a **zombie** (`Z`) or dead (`X`) state — or a missing entry — as exited; a bare `kill(pid, 0)`
-/// would call a not-yet-reaped zombie "alive" and never return. Off-Linux there is no `/proc`, so
-/// fall back to the signal-0 probe.
+/// would call a not-yet-reaped zombie "alive" and never return. macOS answers the same question
+/// through `sysctl(KERN_PROC_PID)` (issue #217); the remaining unixes keep the signal-0 probe.
 #[cfg(target_os = "linux")]
 fn broker_exited(pid: i32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -2879,10 +2879,32 @@ fn broker_exited(pid: i32) -> bool {
     }
 }
 
+/// No `/proc` off Linux. A bare `kill(pid, 0)` calls a not-yet-reaped ZOMBIE
+/// "alive", so `--decommission` timed out AFTER the drain had actually completed
+/// whenever the supervisor was slow to reap (issue #217; `preStop`-shaped
+/// supervisors reap on their own schedule). Ask `ps` for the process state and
+/// treat `Z…` (exited, awaiting reap) — or no row at all — as exited. The
+/// workspace forbids `unsafe`, which rules the `sysctl(KERN_PROC_PID)` answer
+/// out; this path is dev-box only (production containers are Linux and use the
+/// `/proc` check above) and polls twice a second from a CLI tool, so a `ps`
+/// spawn is proportionate. If `ps` itself cannot run, fall back to the signal-0
+/// probe rather than inventing an exit.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn broker_exited(pid: i32) -> bool {
     use rustix::process::{test_kill_process, Pid};
-    Pid::from_raw(pid).is_none_or(|p| test_kill_process(p).is_err())
+    match std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            stat.is_empty() || stat.starts_with('Z')
+        }
+        // `ps` ran and found no such process: reaped / gone.
+        Ok(_) => true,
+        Err(_) => Pid::from_raw(pid).is_none_or(|p| test_kill_process(p).is_err()),
+    }
 }
 
 #[cfg(not(unix))]
