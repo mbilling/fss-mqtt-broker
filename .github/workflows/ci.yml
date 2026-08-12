@@ -37,7 +37,13 @@ jobs:
           if [ "$code" -ne 0 ]; then
             grep -E '^test .+ \.\.\. FAILED' test-output.txt | sort -u \
               | sed 's/^/::error title=Test failed::/' || true
-            grep -E 'panicked at .+' test-output.txt | sort -u | head -n 20 \
+            # A Rust panic prints the LOCATION on one line and the MESSAGE on the
+            # next, so grepping 'panicked at' alone annotates where it blew up and
+            # silently drops why — which is the half that makes a flake diagnosable
+            # (our harnesses put the failure reason, the repro seed and the schedule
+            # trace in the message). Join the two.
+            awk '/panicked at /{loc=$0; if ((getline msg) > 0) print loc " " msg; else print loc}' \
+              test-output.txt | sort -u | head -n 20 \
               | sed 's/^/::error title=Panic::/' || true
           fi
           exit "$code"
