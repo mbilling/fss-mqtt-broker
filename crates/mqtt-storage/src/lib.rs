@@ -21,6 +21,7 @@ use std::sync::Mutex;
 pub mod app_props;
 pub mod data_dir;
 pub mod logged;
+pub mod open;
 pub mod persistent_log;
 pub mod persistent_retained;
 pub mod repl;

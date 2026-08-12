@@ -19,6 +19,9 @@ mqtt-codec = { path = "../mqtt-codec", version = "0.9.0" }
 mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
 mqtt-net = { path = "../mqtt-net", version = "0.9.0" }
 mqtt-observability = { path = "../mqtt-observability", version = "0.9.0" }
+# The spool opens its redb file through the shared lock-retry helper so a fast
+# bridge restart does not spuriously fail on the previous process's file lock.
+mqtt-storage = { path = "../mqtt-storage", version = "0.9.0" }
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true
@@ -32,7 +35,6 @@ redb = "2"
 
 [dev-dependencies]
 mqttd = { path = "../mqttd", version = "0.9.0" }
-mqtt-storage = { path = "../mqtt-storage", version = "0.9.0" }
 tempfile = "3"
 criterion = { workspace = true }
 

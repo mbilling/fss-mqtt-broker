@@ -154,7 +154,7 @@ impl LeaseStore {
     /// # Errors
     /// Returns a `StorageError` if the database cannot be opened or its contents decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
-        let db = Database::create(path).map_err(|e| io(pe(e)))?;
+        let db = mqtt_storage::open::create_with_lock_retry(path).map_err(|e| io(pe(e)))?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
         mqtt_storage::schema::gate_or_migrate(
             &db,

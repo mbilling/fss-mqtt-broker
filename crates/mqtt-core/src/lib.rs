@@ -13,6 +13,27 @@ pub use subscriptions::SubscriptionTable;
 pub mod shared;
 pub use shared::{is_shared_filter, parse_shared, SharedGroup, SharedSubscriptionTable};
 
+pub mod secrets;
+pub use secrets::read_secret_file;
+
+pub mod retry;
+pub use retry::Backoff;
+
+/// Lowercase hex encoding of `bytes` (std-only; the workspace has no `hex` crate
+/// by design). The shared formatter under every digest/fingerprint rendered as
+/// hex — the hashing itself stays with the caller so this crate takes no crypto
+/// dependency.
+#[must_use]
+pub fn hex_lower(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// A normalized topic name (no wildcards) as published.
 pub type TopicName = String;
 

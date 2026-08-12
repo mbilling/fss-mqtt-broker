@@ -93,7 +93,7 @@ impl PersistentRetainedStore {
     /// # Errors
     /// [`StorageError::Backend`] if the database cannot be opened or decoded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let db = Database::create(path).map_err(backend)?;
+        let db = crate::open::create_with_lock_retry(path).map_err(backend)?;
         // Layout version gate (ADR 0038 T2): stamp fresh, fail closed on foreign.
         crate::schema::gate_or_migrate(&db, "retained.redb", SCHEMA_VERSION, RETAINED_MIGRATIONS)
             .map_err(backend)?;

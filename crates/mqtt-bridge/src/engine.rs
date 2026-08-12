@@ -170,7 +170,7 @@ fn spawn_supervisor(
         // The local side uses a **persistent** session (§5): a brief bridge restart resumes
         // its shared subscription and buffered messages. Upstreams stay clean.
         let persistent = matches!(side, Side::Local);
-        let mut backoff = BACKOFF_START;
+        let mut backoff = mqtt_core::Backoff::new(BACKOFF_START, BACKOFF_MAX);
         loop {
             let opts = match connect_options(endpoint, &default_id, persistent) {
                 Ok(o) => o,
@@ -181,7 +181,7 @@ fn spawn_supervisor(
             };
             match MqttClient::connect(&opts).await {
                 Ok(client) => {
-                    backoff = BACKOFF_START;
+                    backoff.reset();
                     metrics.reconnect(side_index(side));
                     info!(?side, addr = %opts.addr, subs = subs.len(), "bridge side connected");
                     // (Re)subscribe for this side's open direction(s) only.
@@ -204,8 +204,7 @@ fn spawn_supervisor(
                 }
                 Err(e) => warn!(?side, addr = %opts.addr, error = %e, "bridge connect failed"),
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(BACKOFF_MAX);
+            tokio::time::sleep(backoff.next_delay()).await;
         }
     })
 }
@@ -655,9 +654,9 @@ fn connect_options(
     let password = match (&ep.password, &ep.password_file) {
         (Some(p), _) => Some(Bytes::from(p.clone())),
         (None, Some(path)) => {
-            let raw = std::fs::read_to_string(path)
+            let secret = mqtt_core::read_secret_file(path)
                 .map_err(|e| format!("read password_file {path:?}: {e}"))?;
-            Some(Bytes::from(raw.trim().to_string()))
+            Some(Bytes::from(secret))
         }
         (None, None) => None,
     };

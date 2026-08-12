@@ -22,6 +22,10 @@ use serde_json::{json, Value};
 /// edit roll the `StatefulSet` (the chart's `checksum/config`). Without it a
 /// changed `ConfigMap` would be projected into running pods with no restart, which is only
 /// correct for the file-watched policy paths, not for restart-only settings.
+///
+/// Deliberate local copy of `mqttd::reload::sha256_hex`: the operator carries no
+/// `mqtt-*` dependencies. Both are pinned to the same NIST vector — see
+/// `checksum_is_sha256_lowercase_hex` here and in `mqttd/src/reload.rs`.
 fn config_checksum(config: &str) -> String {
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, config.as_bytes());
     digest.as_ref().iter().fold(String::new(), |mut s, b| {
@@ -481,6 +485,20 @@ fn probe(path: &str, period: i64, failure_threshold: i64) -> Value {
 mod tests {
     use super::{render, Rendered, RENDER_SCRIPT};
     use crate::crd::{BootstrapPolicy, MqttdCluster};
+
+    /// Known-answer parity pin (NIST SHA-256 vector for "abc"): the operator's
+    /// `config_checksum` is a deliberate copy of `mqttd::reload::sha256_hex`
+    /// (the operator carries no `mqtt-*` deps). The same vector is pinned in
+    /// `mqttd/src/reload.rs`, so the two cannot silently diverge in algorithm
+    /// or hex case — the chart's `checksum/config` annotation and the broker's
+    /// config stamp must agree.
+    #[test]
+    fn checksum_is_sha256_lowercase_hex() {
+        assert_eq!(
+            super::config_checksum("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn sample() -> MqttdCluster {
         serde_json::from_value(serde_json::json!({

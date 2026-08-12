@@ -72,30 +72,6 @@ const CATCH_UP_SWEEP_EVERY: u32 = 5;
 /// key whose only remaining copies are stale leftovers the owner has superseded.
 const CATCH_UP_SWEEP_BUDGET: u32 = 24;
 
-/// Open a persistent store, briefly retrying transient file-lock contention.
-///
-/// On a fast restart over the same data dir, the previous holder's `redb` lock (for
-/// instance the replica-writer's copy of `replicas.redb`, ADR 0027, or a prior process
-/// during a rolling restart) may not be released for a few milliseconds. Retry the open
-/// over a bounded window so the restart does not spuriously fail; a genuinely unusable
-/// store still panics, after the window.
-async fn open_retrying<T, E: std::fmt::Display>(
-    mut open: impl FnMut() -> Result<T, E>,
-    what: &str,
-) -> T {
-    let mut last = String::new();
-    for _ in 0..30 {
-        match open() {
-            Ok(v) => return v,
-            Err(e) => {
-                last = e.to_string();
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-    panic!("{what}: still locked after retrying: {last}");
-}
-
 /// Build a node's durable session store, durable retained keyspace, lease-group
 /// endpoint, and background driver. Returns the store and retained handle (for the
 /// hub) and the [`DurablePlane`] (to attach to the hub so it routes peer
@@ -132,14 +108,12 @@ pub async fn build_durable_node(
     // On-disk persistence when a data dir is given (ADR 0018): the lease store (phase 2 —
     // restoring Raft safety via the persisted vote) and the follower replica copy (phase
     // 3 — clustered sessions survive a full-cluster restart); otherwise both in-memory.
+    // Fast-restart lock contention is retried inside the open itself
+    // (`mqtt_storage::open::create_with_lock_retry`); a store still unusable
+    // after that window cannot be worked around — fail startup loudly.
     let lease_store = match data_dir {
-        Some(dir) => {
-            open_retrying(
-                || LeaseStore::open(dir.join("lease.redb")).map_err(|e| e.to_string()),
-                "open the lease store",
-            )
-            .await
-        }
+        Some(dir) => LeaseStore::open(dir.join("lease.redb"))
+            .unwrap_or_else(|e| panic!("open the lease store: {e}")),
         None => LeaseStore::new(),
     }
     .with_commit_delay(commit_delay);
@@ -159,13 +133,8 @@ pub async fn build_durable_node(
     // Persistent (ADR 0018 phase 3) when a data dir is given, so the committed copy
     // survives a restart.
     let replicas = Arc::new(Mutex::new(match data_dir {
-        Some(dir) => {
-            open_retrying(
-                || ReplicaState::open(dir.join("replicas.redb")).map_err(|e| e.to_string()),
-                "open the replica store",
-            )
-            .await
-        }
+        Some(dir) => ReplicaState::open(dir.join("replicas.redb"))
+            .unwrap_or_else(|e| panic!("open the replica store: {e}")),
         None => ReplicaState::new(),
     }));
     let plane = DurablePlane::new(

@@ -47,11 +47,7 @@ const CERT_CACHE_CAP: usize = 128;
 /// Short SHA-256 fingerprint (first 8 bytes, hex) of a gossip key (ADR 0054 T3).
 fn key_fingerprint(key: &[u8]) -> String {
     let digest = digest::digest(&digest::SHA256, key);
-    digest.as_ref()[..8].iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    mqtt_core::hex_lower(&digest.as_ref()[..8])
 }
 
 /// SHA-256 fingerprint of a certificate's DER bytes (0022-T6).
