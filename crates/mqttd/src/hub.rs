@@ -93,6 +93,21 @@ const RETAINED_ANTIENTROPY_EVERY: u32 = 30;
 /// it runs at a coarse cadence rather than every second.
 const EXPIRY_RECONCILE_EVERY: u32 = 30;
 
+/// How long a fresh subscription's retained-delivery window stays open (issue #219).
+///
+/// A retained update is delivered live by its landing node's interest-forward, which
+/// needs that node to have SEEN this node's interest advertisement — a fresh
+/// SUBSCRIBE's interest takes one gossip hop (sub-second) to reach every peer, and a
+/// commit inside that gap was stored but never delivered to the one subscriber whose
+/// interest was still in flight. While the window is open, the owner's post-commit
+/// fan-out (which reaches every node regardless of interest) doubles as the delivery
+/// vehicle for matching LOCAL subscribers, deduped against what the live path already
+/// delivered. Three seconds covers the advertisement plus the forward hop under load
+/// with margin; after it, the steady-state rule (interest-forward delivers, the apply
+/// path never does — the #87 item 3 decision) is back in force, so a window that
+/// closes early merely reverts to today's behaviour for the tail of the gap.
+const RETAINED_INTEREST_WINDOW: Duration = Duration::from_secs(3);
+
 /// How many outbound packet ids are durably reserved per block (ADR 0007 T9). One durable
 /// write covers this many `QoS` > 0 sends to a session, so the per-message path stays
 /// write-free; a takeover wastes at most this many ids (negligible against the 65535 space,
@@ -1159,6 +1174,13 @@ pub struct Hub {
     /// resurrect it. Only populated under durable retained; bounded by topic count
     /// (like the cache itself).
     retained_tokens: HashMap<String, (u64, u64)>,
+    /// Fresh-subscription retained-delivery windows (issue #219), per client. Opened
+    /// (or refreshed) by an ordinary SUBSCRIBE and swept after
+    /// [`RETAINED_INTEREST_WINDOW`]: while open, a committed retained fan-out is
+    /// delivered to this client's matching subscriptions by the apply path, deduped
+    /// through the window's ledger. Empty in the steady state, so the apply path's
+    /// cost is one `is_empty()` check.
+    retained_windows: HashMap<ClientId, RetainedWindow>,
     /// Retained mutations awaiting their authority commit (ADR 0037 §5), in arrival
     /// order: every mutation passes through here, so commits are **serialized per
     /// node** (one in flight at a time — two rapid publishes to one topic can never
@@ -1293,6 +1315,21 @@ const RETAINED_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// divergence. Count-bounded (like the session queue cap): retained values are
 /// last-value device state, typically small and infrequent.
 const RETAINED_QUEUE_CAP: usize = 1024;
+
+/// One client's fresh-subscription retained-delivery window (issue #219).
+#[derive(Debug)]
+struct RetainedWindow {
+    /// When the window closes (pruned by the sweep). The interest-forward path is
+    /// authoritative from then on.
+    until: Instant,
+    /// Per topic, the [`retained_value_id`] of the value this client last saw while
+    /// the window was open — seeded by the subscribe-time replay, updated by live
+    /// deliveries and by the apply path itself. Consulted ONLY by the apply path:
+    /// the live path records here but is never suppressed, so a racy double stays
+    /// within `QoS` 1's at-least-once while a wrongly swallowed live publish cannot
+    /// happen.
+    seen: HashMap<String, u64>,
+}
 
 /// A retained mutation awaiting its authority commit (ADR 0037 §5/T8).
 #[derive(Debug, Clone)]
@@ -1505,6 +1542,7 @@ impl Hub {
                 brownout_status: None,
                 quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
+                retained_windows: HashMap::new(),
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
                 retained_handoff: None,
@@ -2754,6 +2792,11 @@ impl Hub {
         // Retained messages are replayed only for ordinary subscriptions; a new
         // shared subscription does not receive them (ADR 0010 §3, [MQTT-3.8.4]).
         let mut retained_replay: Vec<Message> = Vec::new();
+        // #219: what the replay is about to show this client, keyed by topic — the
+        // seed of its retained-delivery window's ledger (recorded with the STORE
+        // message's qos/props, the identity the fan-out will present).
+        let mut window_seeds: Vec<(String, u64)> = Vec::new();
+        let mut ordinary_granted = false;
         for (f, q) in &filters {
             // Keep the full filter string (including any `$share/` prefix) so it is
             // persisted; `$share/...` never matches a concrete topic in `granted_qos`.
@@ -2767,6 +2810,7 @@ impl Hub {
                 continue;
             }
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
+            ordinary_granted = true;
             let already_held = prior.as_ref().is_some_and(|m| m.contains_key(f));
             self.table.subscribe(client.clone(), f.clone());
             // Retain Handling (#198, MQTT 5 §3.8.3.1): 0 = send retained at subscribe
@@ -2780,6 +2824,15 @@ impl Hub {
             match self.retained.matching(f).await {
                 Ok(matching) => {
                     for m in matching {
+                        window_seeds.push((
+                            m.topic.clone(),
+                            retained_value_id(
+                                &m.topic,
+                                m.payload.as_ref(),
+                                m.qos as u8,
+                                &AppProps::from(&m.app).encode(),
+                            ),
+                        ));
                         retained_replay.push(Message {
                             qos: min_qos(m.qos, *q),
                             retain: true,
@@ -2832,6 +2885,26 @@ impl Hub {
             let _ = tx.send(verdicts);
         }
         self.gossip_interest();
+
+        // #219: the advertisement above takes a hop to reach every peer, and a
+        // retained commit landing elsewhere inside that hop is stored but never
+        // forwarded to THIS fresh subscription. Open (or refresh) the client's
+        // retained-delivery window: while it is open, the commit fan-out delivers to
+        // it from the apply path, deduped against the replay below and any live
+        // copies through the ledger. Swept after RETAINED_INTEREST_WINDOW.
+        if ordinary_granted {
+            let window = self
+                .retained_windows
+                .entry(client.clone())
+                .or_insert_with(|| RetainedWindow {
+                    until: Instant::now(),
+                    seen: HashMap::new(),
+                });
+            window.until = Instant::now() + RETAINED_INTEREST_WINDOW;
+            for (topic, id) in window_seeds {
+                window.seen.insert(topic, id);
+            }
+        }
 
         if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
             for m in retained_replay {
@@ -2946,8 +3019,25 @@ impl Hub {
             .collect();
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
         let matched = targets.len();
+        // #219: a delivery made here is one the apply path must not repeat — record
+        // the value identity into any open retained-delivery window. Recording only;
+        // the live path is never suppressed (a wrongly swallowed publish would break
+        // QoS 1, a rare extra copy does not). Computed only while windows exist.
+        let window_id = (!self.retained_windows.is_empty()).then(|| {
+            retained_value_id(
+                topic,
+                payload.as_ref(),
+                qos as u8,
+                &AppProps::from(app).encode(),
+            )
+        });
         let mut all_durable = true;
         for (c, granted, retain) in targets {
+            if let Some(id) = window_id {
+                if let Some(w) = self.retained_windows.get_mut(&c) {
+                    w.seen.insert(topic.to_string(), id);
+                }
+            }
             all_durable &= self
                 .deliver_to_client(
                     &c,
@@ -3877,6 +3967,7 @@ impl Hub {
         self.inflight.remove(client);
         self.session_expiry.remove(client);
         self.expiring.remove(client);
+        self.retained_windows.remove(client);
     }
 
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
@@ -3948,6 +4039,11 @@ impl Hub {
         // dropped as oversized/unencodable — or lost with the link still up — left
         // that peer permanently divergent, because the only other reconciliation was
         // a digest at link-up. Peers in sync compare equal and transfer nothing.
+        // #219: fresh-subscription retained-delivery windows expire on the sweep.
+        if !self.retained_windows.is_empty() {
+            let now = Instant::now();
+            self.retained_windows.retain(|_, w| w.until > now);
+        }
         self.retained_antientropy_tick = self.retained_antientropy_tick.wrapping_add(1);
         if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 {
             // Re-learn committed retained state this process no longer remembers
@@ -5727,17 +5823,67 @@ impl Hub {
         }
         self.retained_tokens.insert(topic.to_string(), token);
 
-        // #87 item 3 was proposed here — deliver a committed retained update to
-        // already-subscribed local clients from this apply path. It is deliberately NOT
-        // done: live delivery to an established remote subscriber is ALREADY handled by the
-        // interest-forward path (`forward_to_peers` forwards to any node whose advertised
-        // remote_interest matches, independent of `retain_broadcasts`), which reaches the
-        // subscriber's node and fans out through `deliver_local`. Delivering again here
-        // would DOUBLE-deliver every retained update to any subscriber whose interest the
-        // owner already knows — the steady state. The only residual is the sub-second
-        // window before a fresh subscription's interest reaches the owner; the value is
-        // still stored, served to later subscribers, and carried by the next update, so the
-        // miss is bounded with no permanent loss (tracked with item 4).
+        // #87 item 3, delivered WINDOW-SCOPED (#219). Live delivery to an established
+        // subscriber is the interest-forward path's job (`forward_to_peers` →
+        // `deliver_local`), and delivering from here as well would double every
+        // retained update in the steady state — that rejection stands. The one
+        // delivery the forward structurally cannot make is to a subscription so
+        // fresh that its interest had not reached the publish's landing node: for
+        // exactly those (open windows, ledger-deduped), this apply IS the vehicle.
+        self.deliver_to_windowed_subscribers(topic, payload, qos, app)
+            .await;
+    }
+
+    /// Deliver a just-applied committed retained value to local subscribers whose
+    /// subscription is younger than the interest-propagation horizon (issue #219) —
+    /// the delivery the interest-forward path structurally cannot make. Deduped per
+    /// (client, topic) through the window's ledger, so a copy the live path (or the
+    /// subscribe replay) already delivered is not repeated; the reverse race (this
+    /// path first, a forwarded copy second) is deliberately NOT suppressed and stays
+    /// within `QoS` 1's at-least-once. A clear (empty payload) is delivered like any
+    /// zero-length publish [MQTT-3.3.1-10]. An offline persistent subscriber gets
+    /// the queue semantics `deliver_to_client` always applies, closing the same
+    /// window for the resume replay. No-op in the steady state (no open windows).
+    async fn deliver_to_windowed_subscribers(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: u8,
+        app: &AppProperties,
+    ) {
+        if self.retained_windows.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let id = retained_value_id(topic, payload.as_ref(), qos, &AppProps::from(app).encode());
+        let targets: Vec<(ClientId, QoS, bool)> = self
+            .table
+            .matching_clients(topic)
+            .into_iter()
+            .filter(|c| {
+                self.retained_windows
+                    .get(c)
+                    .is_some_and(|w| w.until > now && w.seen.get(topic) != Some(&id))
+            })
+            .map(|c| {
+                let granted = self.granted_qos(&c, topic);
+                // Retained-originated: RAP subscribers keep the flag, everyone else
+                // gets 0 — the live path's rule (#198).
+                let retain = self.keeps_retain_flag(&c, topic);
+                (c, granted, retain)
+            })
+            .collect();
+        for (c, granted, retain) in targets {
+            let delivery_qos = min_qos(QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce), granted);
+            // A failed enqueue leaves the value in the cache for the next
+            // subscribe's replay — the replay's own posture (#124).
+            let _ = self
+                .deliver_to_client(&c, topic, payload, delivery_qos, None, app, retain)
+                .await;
+            if let Some(w) = self.retained_windows.get_mut(&c) {
+                w.seen.insert(topic.to_string(), id);
+            }
+        }
     }
 
     /// Send a targeted shared delivery to a member on `node` (ADR 0015 §1).
@@ -10169,6 +10315,168 @@ mod tests {
             store.held("rt/c").await.is_empty(),
             "re-adopting the tombstone must drop the deleted value from the reopened cache"
         );
+    }
+
+    /// Issue #219 acceptance, case 1: a retained value committed while a fresh
+    /// subscription's interest was still propagating never got a live forward (the
+    /// landing node did not know the subscriber) — the owner's fan-out, which
+    /// reaches every node regardless of interest, must deliver it to the windowed
+    /// subscriber. Exactly once.
+    #[tokio::test]
+    async fn a_retained_commit_in_the_interest_window_reaches_the_fresh_subscriber() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (mut sub, _) = attach(&tx, "fresh", 1, true).await;
+        subscribe(&tx, "fresh", "iw/t");
+        // The committed fan-out lands; no live copy ever arrived here.
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "iw/t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: 0,
+            epoch: 1,
+            offset: 1,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        let p = recv_packet(&mut sub)
+            .await
+            .expect("the windowed apply path must deliver the missed commit");
+        assert_eq!(payload_of(&p), b"v1");
+        assert!(
+            recv_packet(&mut sub).await.is_none(),
+            "exactly once — nothing further is owed"
+        );
+    }
+
+    /// Issue #219 acceptance, case 2: the landing node DID know the fresh
+    /// subscriber (interest arrived in time) and forwarded the live copy — the
+    /// fan-out applying afterwards must not deliver the same value again. The
+    /// live path records into the window's ledger; only the apply path defers.
+    #[tokio::test]
+    async fn the_windowed_apply_defers_to_a_live_copy_already_delivered() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (mut sub, _) = attach(&tx, "fresh", 1, true).await;
+        subscribe(&tx, "fresh", "iw/t");
+        // The interest-forwarded live copy (retain flag as published, cache cold
+        // under durable — ADR 0037 P4) arrives first…
+        tx.send(HubCommand::RemotePublish {
+            topic: "iw/t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        assert_eq!(payload_of(&recv_packet(&mut sub).await.unwrap()), b"v1");
+        // …then the owner's fan-out of that same committed value.
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "iw/t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: 0,
+            epoch: 1,
+            offset: 1,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        assert!(
+            recv_packet(&mut sub).await.is_none(),
+            "the apply path must not repeat what the live path delivered (#87 item 3)"
+        );
+    }
+
+    /// Issue #219, the steady-state regression the #87 item 3 rejection protects:
+    /// once the window has closed, the apply path never delivers — the
+    /// interest-forward path is the only vehicle, so established subscribers see
+    /// each retained update exactly once. The value still applies to the cache.
+    #[tokio::test]
+    async fn the_apply_path_stays_silent_once_the_window_has_closed() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (mut sub, _) = attach(&tx, "settled", 1, true).await;
+        subscribe(&tx, "settled", "iw/t");
+        // Let the window lapse (RETAINED_INTEREST_WINDOW; the apply checks the
+        // deadline itself, so no sweep tick is needed).
+        tokio::time::sleep(super::RETAINED_INTEREST_WINDOW + Duration::from_millis(200)).await;
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "iw/t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: 0,
+            epoch: 1,
+            offset: 1,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        assert!(
+            recv_packet(&mut sub).await.is_none(),
+            "steady state: the interest-forward path alone delivers (#87 item 3)"
+        );
+        // The commit still warmed the cache — a later subscriber replays it.
+        assert_eq!(retained_replay(&tx, "later", "iw/t").await.unwrap(), b"v1");
+    }
+
+    /// Issue #219: the subscribe-time replay seeds the window's ledger, so a
+    /// re-commit of the SAME value (higher token, identical content) inside the
+    /// window is not repeated to the subscriber who just replayed it — while a
+    /// genuinely newer value still is.
+    #[tokio::test]
+    async fn the_subscribe_replay_seeds_the_windows_ledger() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let update = |payload: &'static [u8], offset: u64| {
+            tx.send(HubCommand::RemoteRetainedUpdate {
+                topic: "iw/t".into(),
+                payload: Bytes::from_static(payload),
+                qos: 0,
+                epoch: 1,
+                offset,
+                app: AppProperties::default(),
+            })
+            .unwrap();
+        };
+        update(b"v1", 1); // in the cache before the subscriber arrives
+        let (mut sub, _) = attach(&tx, "fresh", 1, true).await;
+        subscribe(&tx, "fresh", "iw/t");
+        assert_eq!(
+            payload_of(&recv_packet(&mut sub).await.unwrap()),
+            b"v1",
+            "the subscribe replay shows the current value"
+        );
+        // The same value re-committed at a higher token: applied to the cache,
+        // but the subscriber already saw exactly this value.
+        update(b"v1", 2);
+        assert!(
+            recv_packet(&mut sub).await.is_none(),
+            "a re-commit of the replayed value must not repeat"
+        );
+        // A genuinely newer value delivers.
+        update(b"v2", 3);
+        assert_eq!(payload_of(&recv_packet(&mut sub).await.unwrap()), b"v2");
+    }
+
+    /// Issue #219: an OFFLINE durable subscriber inside its window gets the missed
+    /// commit through the ordinary queue semantics of `deliver_to_client`, so the
+    /// resume replays it — the window closes the same gap for the queued path.
+    #[tokio::test]
+    async fn a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume() {
+        let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
+        let (_sub, _) = attach(&tx, "dur", 1, false).await;
+        subscribe(&tx, "dur", "iw/t");
+        detach(&tx, "dur", 1);
+        // Committed elsewhere while the fresh subscription's interest was still
+        // propagating — and its holder already offline.
+        tx.send(HubCommand::RemoteRetainedUpdate {
+            topic: "iw/t".into(),
+            payload: Bytes::from_static(b"v1"),
+            qos: 1,
+            epoch: 1,
+            offset: 1,
+            app: AppProperties::default(),
+        })
+        .unwrap();
+        let (mut resumed, present) = attach(&tx, "dur", 2, false).await;
+        assert!(present, "the durable session resumes");
+        let p = recv_packet(&mut resumed)
+            .await
+            .expect("the queued windowed delivery replays on resume");
+        assert_eq!(payload_of(&p), b"v1");
     }
 
     /// A store write that FAILS must not fence the topic forever (issue #87 item 2).
