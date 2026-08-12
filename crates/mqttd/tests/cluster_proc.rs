@@ -55,6 +55,20 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// sweep for the nightly tier (ADR 0044 P4).
 const DEFAULT_SEEDS: u64 = 1;
 
+/// The retained anti-entropy cadence: every node offers its digest each
+/// `RETAINED_ANTIENTROPY_EVERY` (30) sweep ticks of ~1s (`hub.rs`). A divergence
+/// left by a fan-out frame that died with its sender can legitimately persist for
+/// one full period before the repair even STARTS — any convergence deadline must
+/// sit OUTSIDE this, and the failure verdict is judged against it.
+const ANTIENTROPY_PERIOD: Duration = Duration::from_secs(30);
+
+/// How long the retained-convergence oracle polls before declaring failure: the
+/// anti-entropy period plus margin for the exchange itself. The old 20s deadline
+/// sat INSIDE the repair period and could not tell "converging slowly" from
+/// "never converging" (issue #214) — widened only together with the diagnostic
+/// that says which side of that line a failure landed on, per the issue's rule.
+const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(45);
+
 fn seeds() -> Vec<u64> {
     if let Some(s) = REPRO_SEED {
         return vec![s];
@@ -138,8 +152,14 @@ async fn run_schedule(seed: u64) {
         };
         let candidates: Vec<&Vec<u8>> = history[last_acked..].iter().map(|r| &r.payload).collect();
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let (converged, last_seen) = loop {
+        let started = Instant::now();
+        let deadline = started + CONVERGENCE_DEADLINE;
+        // Every poll round is recorded as `(elapsed, per-node observation)`; the
+        // failure report prints the rounds where the picture CHANGED, so a reader
+        // sees at a glance whether convergence was in motion (deadline too tight
+        // on a loaded runner) or dead in the water (the repair path is broken).
+        let mut rounds: Vec<(Duration, String)> = Vec::new();
+        let converged = loop {
             let mut values: Vec<(String, Option<Vec<u8>>)> = Vec::new();
             for i in proc.alive_nodes() {
                 probe += 1;
@@ -155,27 +175,82 @@ async fn run_schedule(seed: u64) {
                 .iter()
                 .all(|(_, v)| v.as_ref().is_some_and(|value| candidates.contains(&value)))
                 && values.windows(2).all(|w| w[0].1 == w[1].1);
+            let picture = values
+                .iter()
+                .map(|(node, v)| {
+                    format!(
+                        "{node}={}",
+                        v.as_ref()
+                            .map_or("<none>".into(), |p| String::from_utf8_lossy(p).into_owned())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            rounds.push((started.elapsed(), picture));
             if all_good {
-                break (true, values);
+                break true;
             }
             if Instant::now() >= deadline {
-                break (false, values);
+                break false;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
         if !converged {
-            let detail: Vec<String> = last_seen
+            // WHAT was awaited: any common value at or beyond the last acked set.
+            let awaited = candidates
                 .iter()
-                .map(|(node, v)| {
-                    format!(
-                        "{node}: {:?}",
-                        v.as_ref().map(|p| String::from_utf8_lossy(p).into_owned())
-                    )
-                })
-                .collect();
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            // WHAT was observed, compressed to the rounds where anything changed.
+            let mut timeline = Vec::new();
+            let mut last_change_at = Duration::ZERO;
+            for (i, (t, picture)) in rounds.iter().enumerate() {
+                if i == 0 || *picture != rounds[i - 1].1 {
+                    timeline.push(format!("t+{:>5.1}s  {picture}", t.as_secs_f64()));
+                    last_change_at = *t;
+                }
+            }
+            let (final_t, final_picture) = rounds.last().expect("at least one round ran");
+            let stable_for = final_t.saturating_sub(last_change_at);
+            // THE VERDICT the two CI flakes could not deliver: was convergence
+            // still in motion when the deadline hit, or provably not coming?
+            let verdict = if stable_for >= ANTIENTROPY_PERIOD {
+                format!(
+                    "STABLE divergence: the picture did not change for the final \
+                     {:.1}s — at least one full anti-entropy period (~{}s) passed \
+                     with every repair round leaving the nodes as they were. More \
+                     deadline would not have converged this; suspect the retained \
+                     repair path, not the runner.",
+                    stable_for.as_secs_f64(),
+                    ANTIENTROPY_PERIOD.as_secs()
+                )
+            } else {
+                format!(
+                    "the picture last changed {:.1}s before the deadline (under one \
+                     anti-entropy period of ~{}s) — convergence may still have been \
+                     in motion; a loaded runner stretching the exchange is plausible.",
+                    stable_for.as_secs_f64(),
+                    ANTIENTROPY_PERIOD.as_secs()
+                )
+            };
+            // The operator-visible state of every node at failure time.
+            let mut readyz = Vec::new();
+            for i in proc.alive_nodes() {
+                let r = proc.nodes[i].readyz().await;
+                readyz.push(format!("{}: {}", proc.nodes[i].id, describe_readyz(r)));
+            }
             proc.fail(&format!(
-                "retained convergence violated for {topic}: nodes never converged \
-                 on a value at or beyond the last acked set: {detail:?}"
+                "retained convergence violated for {topic}\n\
+                 awaited: any common value in [{awaited}] (the last acked set onward)\n\
+                 final:   {final_picture} (after {:.1}s, {} poll rounds)\n\
+                 verdict: {verdict}\n\
+                 observation timeline (rounds where the picture changed):\n  {}\n\
+                 /readyz at failure:\n  {}",
+                final_t.as_secs_f64(),
+                rounds.len(),
+                timeline.join("\n  "),
+                readyz.join("\n  ")
             ));
         }
     }

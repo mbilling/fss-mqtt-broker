@@ -359,12 +359,41 @@ impl ProcNode {
     }
 }
 
-/// The last ~4KB of a spawned node's log — printed on failure so a CI report
+/// The last ~8KB of a spawned node's log — printed on failure so a CI report
 /// is self-diagnosing (the temp dirs, logs included, vanish with the unwind).
 pub fn log_tail(path: &std::path::Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>"));
-    let start = text.len().saturating_sub(4096);
+    let start = text.len().saturating_sub(8192);
     text[start..].to_string()
+}
+
+/// The NOTABLE lines of a spawned node's whole log — warnings, errors, peer-link
+/// events, divergence reports — bounded to the last `limit`.
+///
+/// The tail alone was not enough for issue #214: the oracle's own probe clients
+/// write ~6 lines per second per node, so by the time the failure printed, every
+/// line that explained it (the retained-divergence warns, repeating for a minute)
+/// had scrolled out of the tail window. A failure report that omits the one line
+/// naming the cause is why both CI flakes were shrugged off as runner noise.
+pub fn log_notables(path: &std::path::Path, limit: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let notable: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            // No leading space on ERROR: tracing right-pads levels to five
+            // columns, so " WARN" has one and "ERROR" has none.
+            l.contains(" WARN") || l.contains("ERROR") || l.contains("panic") ||
+            // The peer-bus lifecycle frames convergence stories (link up/down
+            // brackets every anti-entropy exchange).
+            l.contains("peer link")
+        })
+        .collect();
+    let start = notable.len().saturating_sub(limit);
+    if notable.is_empty() {
+        "<none>".to_string()
+    } else {
+        notable[start..].join("\n")
+    }
 }
 
 /// Minimal HTTP GET (status line ignored beyond receipt; body returned) — the
@@ -483,15 +512,42 @@ impl Proc {
         self.trace.push(event);
     }
 
-    pub fn fail(&self, what: &str) -> ! {
+    /// Panic with everything a reader needs to diagnose the failure WITHOUT a
+    /// re-run (issue #214): per-node log tails and notable lines (warns/errors —
+    /// the tail alone drowns in the oracle's own probe noise), each spawned
+    /// process's state (running, exited-with-status, or killed by the schedule —
+    /// a dead node is a different fact from a slow one), the schedule trace, and
+    /// the seed to reproduce with.
+    pub fn fail(&mut self, what: &str) -> ! {
         for n in &self.nodes {
             eprintln!("---- log tail of {} ----\n{}", n.id, log_tail(&n.log_path));
+            eprintln!(
+                "---- notable log lines of {} (warns/errors/link events) ----\n{}",
+                n.id,
+                log_notables(&n.log_path, 40)
+            );
         }
+        let processes: Vec<String> = (0..self.nodes.len())
+            .map(|i| {
+                let id = self.nodes[i].id.clone();
+                if !self.alive[i] {
+                    return format!("{id}: down (killed by the schedule, not restarted)");
+                }
+                match self.nodes[i].exited() {
+                    Some(status) => {
+                        format!("{id}: EXITED ({status}) — died without the schedule killing it")
+                    }
+                    None => format!("{id}: running"),
+                }
+            })
+            .collect();
         panic!(
             "seed {}: {what} (re-run with REPRO_SEED = Some({}); log tails above)\n\
+             processes:\n  {}\n\
              schedule trace:\n  {}",
             self.seed,
             self.seed,
+            processes.join("\n  "),
             self.trace.join("\n  ")
         );
     }
@@ -520,7 +576,8 @@ impl Proc {
         // Generous: production SWIM timings mean a resume inside a takeover
         // window waits out seconds-scale death confirmation plus re-election
         // and first-touch recovery.
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(90);
         let mut round = 0usize;
         loop {
             let alive = self.alive_nodes();
@@ -562,7 +619,12 @@ impl Proc {
             }
             if Instant::now() >= deadline {
                 if must {
-                    self.fail("subscriber could not (re)connect within the deadline");
+                    let id = self.subs[i].id.clone();
+                    self.fail(&format!(
+                        "subscriber {id} could not (re)connect within {:?} \
+                         ({round} attempts, rotating through every alive node)",
+                        started.elapsed()
+                    ));
                 }
                 let id = self.subs[i].id.clone();
                 self.note(format!(
@@ -885,11 +947,14 @@ impl Proc {
     /// lease group on `/readyz` — the operator's own convergence signal.
     pub async fn quiesce(&mut self) {
         let expect = self.alive_nodes().len();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
         loop {
             let mut all = true;
+            let mut observed = Vec::new();
             for i in self.alive_nodes() {
-                match self.nodes[i].readyz().await {
+                let r = self.nodes[i].readyz().await;
+                match r {
                     Some((_, members, lease)) => {
                         if members != expect || !lease {
                             all = false;
@@ -897,16 +962,37 @@ impl Proc {
                     }
                     None => all = false,
                 }
+                observed.push(format!("{}: {}", self.nodes[i].id, describe_readyz(r)));
             }
             if all {
                 self.note(format!("quiesced: {expect} members, lease group ready"));
                 return;
             }
             if Instant::now() >= deadline {
-                self.fail("survivors never quiesced on /readyz (membership + lease group)");
+                // Not just "never quiesced": say what each node's /readyz showed
+                // at the deadline, so the reader sees WHICH signal was missing
+                // (membership vs lease group vs an unreachable endpoint) without
+                // a re-run (issue #214).
+                self.fail(&format!(
+                    "survivors never quiesced on /readyz within {:?} (want {expect} \
+                     members + lease group ready on every alive node); final \
+                     observation:\n  {}",
+                    started.elapsed(),
+                    observed.join("\n  ")
+                ));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+}
+
+/// One node's `/readyz` snapshot as a human-readable fact.
+pub fn describe_readyz(r: Option<(bool, usize, bool)>) -> String {
+    match r {
+        Some((ready, members, lease)) => {
+            format!("ready={ready} members={members} lease_group_ready={lease}")
+        }
+        None => "/readyz unreachable".to_string(),
     }
 }
 
