@@ -81,6 +81,51 @@ own queue absorb) is decided per-rule via `overflow = "drop-oldest" | "refuse"`,
 **`refuse`** for QoS≥1 rules (a stalled crossing is safer than silent loss on a boundary) and
 `drop-oldest` for QoS-0.
 
+### 5. How the pending-ack model stays fast (the hot-path design)
+
+Decision 1 sits on the bridge's hot path, so *how* it is built decides whether the bridge stays
+usable. The naive reading — "fsync every QoS≥1 message before acking" — would be a serious
+regression: today the fast path touches **no disk at all** (the spool is used only while a side
+is *down*), so that reading adds an fsync per message and caps throughput at disk-commit rate.
+The rule is deliberately "spool-commit **or** a downstream ack"; the "or" is where the
+performance comes from. The implementation therefore:
+
+1. **Satisfies the rule with the network on the fast path.** When the destination is connected
+   the bridge does **not** spool: it forwards and waits for the destination's PUBACK, which is
+   itself proof the message survived beyond this process. The source ack fires on that, with
+   **zero added disk I/O** — the fast path costs what it costs today; only the *timing* of our
+   ack changes.
+2. **Never blocks the read loop.** The ack becomes an event, not a return value: the read loop
+   hands the message off and immediately reads the next packet, while a pending-ack table
+   (`source pkid → outstanding obligations`) releases the PUBACK on completion. This preserves
+   **pipelining** — many messages in flight rather than one round trip at a time. The broker
+   already uses this shape for its own gated publishes (`pending_publishes`/`awaiting`, ADR 0042
+   T9), so it is a proven pattern here, not a new invention.
+3. **Group-commits when it does spool.** While a side is down, messages must reach disk; instead
+   of fsync-per-message they accumulate into **one write transaction** over a small window (~1 ms
+   or N messages), committed once, releasing that batch's acks together. One fsync amortised over
+   many messages — the standard group-commit trade — so the degraded path stays fast too.
+4. **Bounds the in-flight window with the protocol's own flow control.** A pending-ack table
+   needs a ceiling or it is unbounded memory. The bridge advertises a **Receive Maximum** on
+   CONNECT so the *source broker* limits outstanding unacked messages; when the window is full
+   the bridge stops reading, applying natural TCP backpressure. No bespoke queue.
+5. **Handles fan-out and failure by the same counter.** A message matching several rules carries
+   several obligations and is acked when the last completes. If a link drops mid-flight the
+   message rolls into the spool and the ack follows that commit; if the spool write **fails**,
+   no ack is sent at all and the source retries — fail closed, which is the point of the ADR.
+
+`QoS` 0 is untouched: no ack, no promise, no added cost.
+
+**The trade, stated plainly:** this costs **latency per message**, not throughput, and only for
+`QoS`≥1 — the traffic that asked for a durability guarantee. Fast path: no extra disk I/O, added
+latency ≈ one round trip to the destination, hidden by pipelining. Degraded path: one fsync per
+batch. Memory: bounded by the receive-maximum window.
+
+**Measured, not asserted.** The change lands with a bridge throughput/latency benchmark and a
+regression floor in the `bench/` harness (ADR 0048), captured before and after, because a
+performance claim about a hot path is exactly the kind of claim this project requires evidence
+for.
+
 ## Consequences
 
 - **Good:** at-least-once actually holds across a bridge crash; durability is explicit and

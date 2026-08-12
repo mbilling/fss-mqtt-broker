@@ -97,6 +97,13 @@ def parse_frontmatter(text: str, path: Path) -> dict:
             raise DocError(f"{path.name}: done task {t['id']} needs 'evidence'")
         if t["status"] in ("blocked", "deferred") and not t.get("notes"):
             raise DocError(f"{path.name}: {t['status']} task {t['id']} needs 'notes'")
+    # A duplicated task id renders the same row twice and lets two different statuses
+    # claim one id — the dashboard then says two contradictory things about one task.
+    # (Caught in the wild: 0060 carried T1/T2 twice after an edit re-added them.)
+    ids = [t["id"] for t in meta["tasks"]]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise DocError(f"{path.name}: duplicate task id(s): {', '.join(dupes)}")
     return meta
 
 
