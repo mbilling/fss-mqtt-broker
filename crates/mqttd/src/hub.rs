@@ -4824,34 +4824,78 @@ impl Hub {
     /// back-fill would then re-kill it on every reconnect. Chunks are independent
     /// under the receiver's gap-fill rule, so no ordering or completion marker is
     /// needed. A no-op when we have no retained messages or the peer link is gone.
-    async fn send_retained_snapshot(&self, node: &NodeId) {
+    async fn send_retained_snapshot(&mut self, node: &NodeId) {
         let Some(peer) = self.peers.get(node) else {
             return;
         };
+        let peer_tx = peer.tx.clone(); // the token repair below needs `&mut self`
         let Ok(retained) = self.retained.all().await else {
             return;
         };
         // Cached values carry their commit token (ADR 0037 P5); `(0, 0)` marks an
         // uncommitted (durable-off / pre-migration) value, which the receiver only
         // ever gap-fills with.
-        let mut entries: Vec<RetainedWireEntry> = retained
-            .into_iter()
-            .map(|m| {
-                let (epoch, offset) = self
-                    .retained_tokens
-                    .get(&m.topic)
-                    .copied()
-                    .unwrap_or((0, 0));
-                RetainedWireEntry {
+        //
+        // `retained_tokens` is in-memory and empty after a restart, but the cache is
+        // persistent — so a restarted node knows committed VALUES without their
+        // tokens. It must not export them untokened: a peer that applied an older
+        // fan-out still holds that older token and fences an untokened repair out as
+        // stale — permanently, re-detected and re-refused on every anti-entropy round
+        // (issue #214: the acked-facts proc tier caught exactly this, twice). For a
+        // cache topic missing its token, re-read the AUTHORITY — the durable keyspace,
+        // readable on the topic's group owner — and export the committed record under
+        // its committed token, re-adopting it locally first: the record may also be
+        // NEWER than the reopened cache (a crash between the commit and the owner's
+        // own cache apply), and re-adopting keeps cache, fence and export agreeing.
+        let mut entries: Vec<RetainedWireEntry> = Vec::new();
+        for m in retained {
+            let held = self.retained_tokens.get(&m.topic).copied();
+            let entry = match held {
+                Some((epoch, offset)) => RetainedWireEntry {
                     props: AppProps::from(&m.app),
                     topic: m.topic,
                     payload: m.payload.to_vec(),
                     qos: m.qos as u8,
                     epoch,
                     offset,
-                }
-            })
-            .collect();
+                },
+                None => match self.durable_retained_authority(&m.topic).await {
+                    Some(authority) => {
+                        // The same idempotent apply as a fan-out: store first,
+                        // token after (an empty payload is the committed clear).
+                        let payload = Bytes::from(authority.payload.clone());
+                        let app = AppProperties::from(authority.props.clone());
+                        self.apply_retained_update(
+                            &m.topic,
+                            &payload,
+                            authority.qos,
+                            &app,
+                            authority.token(),
+                        )
+                        .await;
+                        RetainedWireEntry {
+                            props: authority.props,
+                            topic: m.topic,
+                            payload: authority.payload,
+                            qos: authority.qos,
+                            epoch: authority.epoch,
+                            offset: authority.offset,
+                        }
+                    }
+                    // Never durably committed, or the authority is not readable
+                    // from this node: the uncommitted-value contract, as before.
+                    None => RetainedWireEntry {
+                        props: AppProps::from(&m.app),
+                        topic: m.topic,
+                        payload: m.payload.to_vec(),
+                        qos: m.qos as u8,
+                        epoch: 0,
+                        offset: 0,
+                    },
+                },
+            };
+            entries.push(entry);
+        }
         // Committed clears back-fill too: a token held for a topic no longer cached
         // is a tombstone, sent as an empty-payload entry so a peer that missed the
         // clear drops the topic instead of keeping it forever (ADR 0037 P5).
@@ -4872,7 +4916,7 @@ impl Hub {
             return;
         }
         for messages in chunk_retained(entries.into_iter()) {
-            let _ = peer.tx.send(PeerMessage::RetainedSnapshot { messages });
+            let _ = peer_tx.send(PeerMessage::RetainedSnapshot { messages });
         }
     }
 
@@ -4884,14 +4928,25 @@ impl Hub {
     /// the committed value on link-up. An empty payload is a committed clear
     /// (tombstone): it drops the topic and its token fences staler values. An
     /// **untokened** entry (`(0, 0)`, from an uncommitted cache) only gap-fills an
-    /// absent topic — it never overwrites anything.
+    /// absent topic — it never overwrites anything. That rule is ENFORCED here, not
+    /// just stated: applying an untokened entry over a held value let two nodes with
+    /// different uncommitted values swap them on every anti-entropy round, forever.
+    ///
+    /// When an entry is refused as stale against the durable AUTHORITY (readable only
+    /// where the topic's group is owned), the refusal doubles as a repair trigger: a
+    /// fresh process whose fence is ahead of its reopened cache re-adopts the
+    /// authority's record, so the next digest exports the committed value instead of
+    /// re-detecting the same divergence (issue #214).
     ///
     /// **Durable off** keeps the ADR 0014 §3 gap-fill rule verbatim: set a topic only
     /// if we do not already retain it, never clobbering our own value.
     ///
     /// Divergence detection (ADR 0037 P1) runs in both modes: a topic both sides hold
     /// differently is counted (`retained_divergence_total`) and surfaced with one
-    /// `warn!` per snapshot chunk — under durable the same pass now also *resolves* it.
+    /// `warn!` per snapshot chunk — under durable the same pass also resolves it in
+    /// whichever direction the tokens order, and the warn reports what actually
+    /// happened (applied vs kept), never a blanket "converged": claiming convergence
+    /// while every repair was being refused is how issue #214 stayed invisible.
     async fn apply_retained_snapshot(&mut self, node: &NodeId, messages: Vec<RetainedWireEntry>) {
         let have: HashMap<String, u64> = match self.retained.all().await {
             Ok(all) => all
@@ -4909,8 +4964,7 @@ impl Hub {
             Err(_) => return,
         };
         let durable = self.durable_retained.is_some();
-        let mut filled = 0;
-        let mut diverged = 0u64;
+        let (mut filled, mut diverged, mut applied_diverged, mut kept) = (0u64, 0u64, 0u64, 0u64);
         for entry in messages {
             let RetainedWireEntry {
                 topic,
@@ -4921,15 +4975,16 @@ impl Hub {
                 props,
             } = entry;
             let payload = Bytes::from(payload);
-            let held_value = have.get(&topic);
+            let held_value = have.get(&topic).copied();
             // Detection (P1): both sides hold the topic, with different values (an
             // incoming committed clear against our value counts too; differing
             // application properties on an equal payload count as well — ADR 0038 T3).
-            if held_value.is_some_and(|ours| {
-                *ours != retained_value_id(&topic, payload.as_ref(), qos, &props.encode())
-            }) {
+            let value_differs = held_value.is_some_and(|ours| {
+                ours != retained_value_id(&topic, payload.as_ref(), qos, &props.encode())
+            });
+            if value_differs {
                 diverged += 1;
-                debug!(node = %node.0, %topic, "retained value diverges from peer");
+                debug!(node = %node.0, %topic, ?epoch, ?offset, "retained value diverges from peer");
                 if let Some(m) = &self.metrics {
                     m.retained_divergence();
                 }
@@ -4938,21 +4993,14 @@ impl Hub {
             // after the store accepts it.
             let mut pending_token: Option<(u64, u64)> = None;
             if durable {
-                // Token rule (P5): strictly-higher wins; an untokened local value
-                // (no held token) loses to any committed token but an untokened
-                // entry only gap-fills an absent topic.
                 let token = (epoch, offset);
-                // The DURABLE fence, not just the in-memory cache: this is the path that
-                // resurrects a deleted retained message when the survivors have restarted
-                // and lost their tombstones (issue #87 item 4).
-                let apply = if self.retained_tokens.contains_key(&topic)
-                    || self.durable_retained.is_some()
+                if !self
+                    .snapshot_entry_applies(&topic, token, held_value.is_some(), payload.is_empty())
+                    .await
                 {
-                    !self.retained_is_stale(&topic, token).await
-                } else {
-                    token > (0, 0) || held_value.is_none()
-                };
-                if !apply {
+                    if value_differs {
+                        kept += 1;
+                    }
                     continue;
                 }
                 // Deliberately NOT recorded here — see below. The token is written only
@@ -4980,6 +5028,9 @@ impl Hub {
                     self.retained_tokens.insert(topic_key, token);
                 }
                 filled += 1;
+                if value_differs {
+                    applied_diverged += 1;
+                }
             } else if let Some(m) = &self.metrics {
                 m.retained_apply_failed();
             }
@@ -4989,13 +5040,23 @@ impl Hub {
         }
         if diverged > 0 {
             // One warn per chunk, not per topic — the per-topic detail is at debug and
-            // the count is on the metric (bounded logging, ADR 0003-T6 style).
+            // the count is on the metric (bounded logging, ADR 0003-T6 style). The
+            // counts must say what actually happened: this line used to claim
+            // "converged to the higher-token committed value" unconditionally, while
+            // every repair in the chunk was being refused as stale — which is how a
+            // permanent divergence wore convergence's clothes for two CI runs (#214).
+            // A diverged entry whose store write failed appears in neither count; it
+            // has its own warn and `retained_apply_failed_total`.
             if durable {
                 warn!(
                     node = %node.0,
                     topics = diverged,
+                    applied = applied_diverged,
+                    kept,
                     "retained values DIVERGED from peer (same topic, different value) — \
-                     converged to the higher-token committed value (ADR 0037 P5)"
+                     applied the incoming value where its committed token was strictly \
+                     newer; kept ours where the incoming entry was stale or untokened \
+                     (ADR 0037 P5)"
                 );
             } else {
                 warn!(
@@ -5006,6 +5067,55 @@ impl Hub {
                 );
             }
         }
+    }
+
+    /// Whether an incoming snapshot entry for `topic` applies under durable retained
+    /// — the ADR 0037 P5 token rule, decided against the strongest fence available:
+    ///
+    /// * **untokened** (`(0, 0)`, an uncommitted / durable-off cache): gap-fill an
+    ///   ABSENT topic only — never overwrite, a tombstone has nothing to fill — and
+    ///   only where no committed record fences the absence (a committed clear stays
+    ///   cleared, issue #87 item 4);
+    /// * a token this process **already applied** must be strictly beaten — an equal
+    ///   one is a duplicate;
+    /// * against the durable AUTHORITY (no in-memory token — a fresh process) an
+    ///   EQUAL token is this very commit — the owner applying its own write, or
+    ///   repairing one whose store write failed — so only strictly older is stale
+    ///   (issue #87 item 4). A stale entry also means the reopened cache may predate
+    ///   the committed record (the crash landed between the commit and the owner's
+    ///   own cache apply): the refusal re-adopts the authority's record, so this node
+    ///   serves the committed value and the next digest exports it instead of
+    ///   re-detecting the same divergence (issue #214);
+    /// * **no fence readable here** (never committed, or the authority lives on
+    ///   another node): a committed token beats nothing. Treating unreadable as
+    ///   repairable keeps the topic healable — the same principle as not recording a
+    ///   token on a failed write.
+    async fn snapshot_entry_applies(
+        &mut self,
+        topic: &str,
+        token: (u64, u64),
+        value_held: bool,
+        payload_is_empty: bool,
+    ) -> bool {
+        if token == (0, 0) {
+            return !value_held
+                && !payload_is_empty
+                && self.durable_retained_authority(topic).await.is_none();
+        }
+        if let Some(applied) = self.retained_tokens.get(topic).copied() {
+            return token > applied;
+        }
+        let Some(authority) = self.durable_retained_authority(topic).await else {
+            return true;
+        };
+        if token < authority.token() {
+            let repair = Bytes::from(authority.payload.clone());
+            let app = AppProperties::from(authority.props.clone());
+            self.apply_retained_update(topic, &repair, authority.qos, &app, authority.token())
+                .await;
+            return false;
+        }
+        true
     }
 
     fn peer_connected(
@@ -5497,18 +5607,27 @@ impl Hub {
         if let Some(held) = self.retained_tokens.get(topic) {
             return token <= *held;
         }
-        let Some(durable) = self.durable_retained.as_ref() else {
-            return false;
-        };
-        match durable.get(topic).await {
-            Ok(Some(entry)) => token < (entry.epoch, entry.offset),
-            Ok(None) => false,
-            // A read failure must not invent a fence: treating it as "not stale" keeps the
-            // topic repairable, the same principle as not recording a token on a failed
-            // write.
+        match self.durable_retained_authority(topic).await {
+            Some(entry) => token < entry.token(),
+            None => false,
+        }
+    }
+
+    /// The durable authority's committed record for `topic`, when it is readable from
+    /// this node. The keyspace routes per key to the topic's group owner, so a
+    /// non-owner — like a routing/quorum error, or durable off — gets `None` and the
+    /// caller falls back to what it holds. A read failure must not invent a fence:
+    /// answering `None` keeps the topic repairable, the same principle as not
+    /// recording a token on a failed write.
+    async fn durable_retained_authority(
+        &self,
+        topic: &str,
+    ) -> Option<mqtt_storage::retained_log::RetainedEntry> {
+        match self.durable_retained.as_ref()?.get(topic).await {
+            Ok(entry) => entry,
             Err(e) => {
-                debug!(topic = %topic, error = %e, "durable retained fence lookup failed");
-                false
+                debug!(topic = %topic, error = %e, "durable retained authority lookup failed");
+                None
             }
         }
     }
@@ -9537,6 +9656,270 @@ mod tests {
             store.held("t").await.is_empty(),
             "a deleted retained message was RESURRECTED by a peer snapshot after a restart \
              — the tombstone fence must survive the process that recorded it"
+        );
+    }
+
+    /// A hub modelling a node whose process restarted: the durable keyspace already
+    /// holds `commits` (committed before the crash), the persistent cache reopened
+    /// with `cached`, and `retained_tokens` is empty — it is in-memory and did not
+    /// survive. Returns the hub handle and the (observable) cache store.
+    async fn start_restarted_owner(
+        commits: &[(&str, &'static [u8])],
+        cached: &[(&str, &'static [u8])],
+    ) -> (HubTx, FailingRetainedStore) {
+        let durable = Arc::new(mqtt_storage::retained_log::ReplicatedRetained::new(
+            InMemoryReplicatedLog::new(),
+        ));
+        for (topic, payload) in commits {
+            durable
+                .set(topic, payload, 0, &AppProps::default())
+                .await
+                .expect("pre-crash commit");
+        }
+        let store = FailingRetainedStore::new();
+        {
+            use mqtt_storage::RetainedStore as _;
+            for (topic, payload) in cached {
+                store
+                    .set(&mqtt_core::Message {
+                        topic: (*topic).to_string(),
+                        payload: Bytes::from_static(payload),
+                        qos: QoS::AtMostOnce,
+                        retain: true,
+                        app: AppProperties::default(),
+                    })
+                    .await
+                    .expect("seed the reopened cache");
+            }
+        }
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            NodeId("restarted".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_durable_retained(durable);
+        tokio::spawn(hub.run());
+        (tx, store)
+    }
+
+    /// Issue #214 (the acked-facts proc tier's identical seed-0 double flake): a node
+    /// committed a retained value, was `SIGKILL`ed before its fan-out reached anyone,
+    /// and restarted. Its persistent cache serves the committed value — but
+    /// `retained_tokens` is in-memory, so the anti-entropy snapshot used to export the
+    /// value UNTOKENED (`(0, 0)`), and a peer that had applied the PREVIOUS value's
+    /// fan-out still held that older token and fenced the untokened repair out as
+    /// stale. Permanently: every digest round re-detected the divergence, re-refused
+    /// the repair, and logged "converged". The snapshot must export the committed
+    /// record under its COMMITTED token, re-read from the durable authority — and
+    /// where the reopened cache itself predates the authority (the crash landed
+    /// between the commit and the owner's own cache apply), re-adopt the committed
+    /// record rather than exporting the stale cache value under the new token.
+    #[tokio::test]
+    async fn a_restarted_owners_snapshot_exports_committed_tokens_and_readopts_the_record() {
+        // v1 then v2 committed pre-crash (tokens (0,1), (0,2)); the reopened cache
+        // still holds v1 — the crash beat the owner's own cache apply of v2.
+        let (tx, store) =
+            start_restarted_owner(&[("rt/1", b"v1"), ("rt/1", b"v2")], &[("rt/1", b"v1")]).await;
+        let mut peer = connect_peer(&tx, "n", 1);
+        tx.send(HubCommand::RemoteRetainedRequest {
+            node: NodeId("n".into()),
+        })
+        .unwrap();
+        loop {
+            match recv_peer(&mut peer).await {
+                Some(PeerMessage::RetainedSnapshot { messages }) => {
+                    let e = messages
+                        .iter()
+                        .find(|e| e.topic == "rt/1")
+                        .expect("rt/1 exported");
+                    assert_eq!(
+                        (e.epoch, e.offset),
+                        (0, 2),
+                        "the snapshot must carry the COMMITTED token, not (0,0): an \
+                         untokened export is refused by every peer holding an older \
+                         applied token, and the divergence never heals"
+                    );
+                    assert_eq!(
+                        e.payload, b"v2",
+                        "the snapshot must carry the committed RECORD, not the \
+                         pre-crash cache value"
+                    );
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        // The export re-adopted the authority's record locally: this node now serves
+        // what it acked before the crash.
+        let held = store.held("rt/1").await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            &held[0].payload[..],
+            b"v2",
+            "re-reading the authority must repair the reopened cache too"
+        );
+    }
+
+    /// The receiving half of the issue #214 replay, end to end: the peer applied the
+    /// last fan-out it ever saw (v1, token (0,1)); the restarted owner's snapshot —
+    /// as the FIXED sender builds it — must move the peer to the committed v2. With
+    /// the old untokened export this peer kept v1 forever while both sides logged
+    /// convergence.
+    #[tokio::test]
+    async fn a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot() {
+        // The restarted owner (sender): v1, v2 committed; cache reopened with v2.
+        let (owner_tx, _owner_store) =
+            start_restarted_owner(&[("rt/1", b"v1"), ("rt/1", b"v2")], &[("rt/1", b"v2")]).await;
+        let mut owner_peer = connect_peer(&owner_tx, "peer", 1);
+
+        // The peer (receiver): durable mode on, nothing committed in ITS keyspace for
+        // the topic (a non-owner cannot read the authority); it applied v1's fan-out.
+        let durable = Arc::new(FlakyRetained::default());
+        durable.heal();
+        let (mut hub, peer_tx) = Hub::with_config_and_placement(
+            NodeId("peer".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        let peer_store = FailingRetainedStore::new();
+        hub.attach_retained_store(Box::new(peer_store.clone()));
+        hub.attach_durable_retained(durable);
+        tokio::spawn(hub.run());
+        peer_tx
+            .send(HubCommand::RemoteRetainedUpdate {
+                topic: "rt/1".into(),
+                payload: Bytes::from_static(b"v1"),
+                qos: 0,
+                epoch: 0,
+                offset: 1,
+                app: AppProperties::default(),
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let held = peer_store.held("rt/1").await;
+            if held.len() == 1 && &held[0].payload[..] == b"v1" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: the v1 fan-out must apply"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Pipe the owner's actual snapshot frames into the peer, verbatim.
+        owner_tx
+            .send(HubCommand::RemoteRetainedRequest {
+                node: NodeId("peer".into()),
+            })
+            .unwrap();
+        loop {
+            match recv_peer(&mut owner_peer).await {
+                Some(PeerMessage::RetainedSnapshot { messages }) => {
+                    peer_tx
+                        .send(HubCommand::RemoteRetainedSnapshot {
+                            node: NodeId("restarted".into()),
+                            messages,
+                        })
+                        .unwrap();
+                    break;
+                }
+                Some(PeerMessage::Interest { .. } | PeerMessage::RetainedDigest { .. }) => {}
+                other => panic!("unexpected peer frame {other:?}"),
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let held = peer_store.held("rt/1").await;
+            if held.len() == 1 && &held[0].payload[..] == b"v2" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer must converge to the committed v2 from the restarted \
+                 owner's snapshot — keeping v1 is issue #214's permanent divergence"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The untokened rule across a RESTART: `an_untokened_snapshot_entry_gap_fills_but_
+    /// never_overwrites` holds within one process because the applied `(0,0)` is
+    /// recorded in `retained_tokens` and fences the next untokened entry — but that map
+    /// is in-memory. A fresh process holding the same value (reopened persistent cache,
+    /// no tokens) used to let an incoming untokened entry OVERWRITE it: two restarted
+    /// nodes holding different uncommitted values would swap them. The gap-fill-only
+    /// rule must hold from the VALUES, not from a fence that dies with the process.
+    #[tokio::test]
+    async fn an_untokened_snapshot_entry_never_overwrites_across_a_restart() {
+        let durable = Arc::new(FlakyRetained::default());
+        durable.heal();
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            NodeId("hub-test".into()),
+            Arc::new(MemorySessionStore::new()),
+            None,
+        );
+        let store = FailingRetainedStore::new();
+        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_durable_retained(durable);
+        tokio::spawn(hub.run());
+
+        // Hold an (uncommitted) value for rt/held; rt/absent has nothing.
+        {
+            use mqtt_storage::RetainedStore as _;
+            store
+                .set(&mqtt_core::Message {
+                    topic: "rt/held".into(),
+                    payload: Bytes::from_static(b"ours"),
+                    qos: QoS::AtMostOnce,
+                    retain: true,
+                    app: AppProperties::default(),
+                })
+                .await
+                .unwrap();
+        }
+        tx.send(HubCommand::RemoteRetainedSnapshot {
+            node: NodeId("n".into()),
+            messages: vec![
+                RetainedWireEntry {
+                    topic: "rt/held".into(),
+                    payload: b"theirs".to_vec(),
+                    qos: 0,
+                    epoch: 0,
+                    offset: 0,
+                    props: AppProps::default(),
+                },
+                RetainedWireEntry {
+                    topic: "rt/absent".into(),
+                    payload: b"fill".to_vec(),
+                    qos: 0,
+                    epoch: 0,
+                    offset: 0,
+                    props: AppProps::default(),
+                },
+            ],
+        })
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !store.held("rt/absent").await.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "an untokened entry must still gap-fill an absent topic"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let held = store.held("rt/held").await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            &held[0].payload[..],
+            b"ours",
+            "an untokened entry must never overwrite a held value (ADR 0037 P5)"
         );
     }
 
