@@ -214,6 +214,20 @@ async fn connect_from(
 async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
     use argon2::password_hash::{PasswordHasher, SaltString};
     use argon2::Argon2;
+    // Per-SOURCE-ADDRESS isolation is the point, and that needs a second loopback
+    // address. Linux has all of 127/8 on lo by default; stock macOS has only
+    // 127.0.0.1 (issue #217) — probe, and SKIP with a note rather than fail on an
+    // environmental impossibility. CI is Linux, so coverage there is unconditional;
+    // `sudo ifconfig lo0 alias 127.0.0.2 up` runs it on a Mac.
+    if std::net::TcpListener::bind(("127.0.0.2", 0)).is_err() {
+        eprintln!(
+            "SKIPPED repeated_auth_failures_penalize_the_source_address_then_decay: \
+             127.0.0.2 is not bindable on this host (stock macOS loopback carries \
+             only 127.0.0.1 — issue #217; `sudo ifconfig lo0 alias 127.0.0.2 up` \
+             enables the test locally)"
+        );
+        return;
+    }
     let salt = SaltString::encode_b64(b"penalty-salt-b").unwrap();
     let phc = Argon2::default()
         .hash_password(b"right-pw", &salt)
