@@ -53,6 +53,43 @@ Re-baselined 2026-08-04 under the postcard codec (ADR 0052; previously bincode:
 encode ~284 ns / decode ~418 ns). Encode pays ~150 ns for varint packing; decode
 got faster. Both remain far below the per-message budget of the delivery path.
 
+## Bridge (`cargo bench -p mqtt-bridge`)
+
+The boundary bridge's per-message paths (ADR 0060 T7). Recorded as the **baseline for ADR
+0060 T8** — the pending-ack model adds an obligation insert/lookup beside the routing
+decision, and [ADR 0060 §5](../adr/0060-bridge-durability-and-ack-contract.md) claims that
+costs latency, not throughput. That claim gets a before/after number rather than a paragraph.
+
+> **Different machine.** Unlike the sections above, these were captured on a development
+> machine (Apple Silicon, `--release`), not the Xeon reference box, so do **not** compare them
+> across sections. What they establish is this suite's own shape and order of magnitude; the
+> nightly `bench` job prints reference-machine numbers.
+
+| Operation | Case | Time (median) |
+|---|---|---|
+| route (`plan_forwards`) | matching `out` rule + remap | ~170 ns |
+| route (`plan_forwards`) | no rule matches (deny-by-default) | ~28 ns |
+| stamp hop count | publisher sent 0 user properties | ~110 ns |
+| stamp hop count | publisher sent 4 user properties | ~597 ns |
+| partitioned ownership (`owns`) | 4 instances | ~0.37 ns |
+| spool push (mem) | below the cap | ~8.9 ns |
+| spool push (mem) | at the cap, `Refuse` (QoS≥1 default) | ~9.0 ns |
+| spool push (mem) | at the cap, `DropOldest` (QoS 0) | ~214 ns |
+
+Two things worth reading off this table:
+
+- **Partitioned HA is free.** `owns` is a sub-nanosecond FNV hash, so making it the default
+  (ADR 0059) costs nothing per message — the correctness win had no throughput price.
+- **Refusing is ~24× cheaper than shedding.** At the cap, `Refuse` returns without touching
+  the queue (~9 ns) while `DropOldest` evicts and audits the shed message (~214 ns). The
+  safer default (ADR 0060 T2/T5 — never drop a message already acked to the source) is also
+  the faster one.
+
+The most expensive per-message step is rebuilding the property set when the publisher sent
+several user properties (~597 ns at four) — a known allocation-per-property cost, and the
+obvious optimisation target if the bridge ever needs one. It is not on the critical path for
+T8.
+
 ## The regression gate
 
 Two layers watch these numbers:
@@ -74,5 +111,6 @@ Two layers watch these numbers:
 ```sh
 cargo bench -p mqtt-codec        # codec hot path
 cargo bench -p mqtt-cluster      # durable-plane hot path
+cargo bench -p mqtt-bridge       # bridge per-message hot paths
 cargo test  -p mqtt-codec --test perf_gate   # the per-PR floor
 ```
