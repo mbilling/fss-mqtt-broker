@@ -130,6 +130,28 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedRetained<L> {
         let last = self.log.read(&key, 0, usize::MAX).await?.into_iter().last();
         Ok(last.and_then(|e| decode_retained(&e.record, e.offset)))
     }
+
+    /// Every topic with a committed retained record — values **and** tombstones —
+    /// that this node can enumerate (its own replicas, unioned with reachable peers'
+    /// key sets on a clustered backend, per [`ReplicatedLog::keys`]).
+    ///
+    /// This is the restart-recovery seam (issue #183): the broker's in-memory
+    /// convergence-token map dies with the process, and a **tombstone** leaves no
+    /// cache entry to rediscover the topic from — enumeration is the only way a
+    /// fresh process learns which clears it must keep fencing and exporting. Not on
+    /// any hot path (anti-entropy cadence).
+    ///
+    /// # Errors
+    /// Storage/routing errors as for any durable read.
+    pub async fn topics(&self) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .log
+            .keys()
+            .await?
+            .into_iter()
+            .filter_map(|k| k.strip_prefix("r/").map(str::to_string))
+            .collect())
+    }
 }
 
 /// Object-safe handle to the durable retained keyspace (ADR 0037), so the broker can
@@ -164,6 +186,13 @@ pub trait DurableRetained: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// As [`ReplicatedRetained::get`].
     async fn get(&self, topic: &str) -> Result<Option<RetainedEntry>, StorageError>;
+
+    /// Every topic with a committed retained record this node can enumerate,
+    /// tombstones included (issue #183: the restart-recovery seam).
+    ///
+    /// # Errors
+    /// As [`ReplicatedRetained::topics`].
+    async fn topics(&self) -> Result<Vec<String>, StorageError>;
 }
 
 #[async_trait]
@@ -184,6 +213,10 @@ impl<L: ReplicatedLog<Key = String>> DurableRetained for ReplicatedRetained<L> {
 
     async fn get(&self, topic: &str) -> Result<Option<RetainedEntry>, StorageError> {
         Self::get(self, topic).await
+    }
+
+    async fn topics(&self) -> Result<Vec<String>, StorageError> {
+        Self::topics(self).await
     }
 }
 
@@ -364,6 +397,25 @@ mod tests {
             r.set("t", b"v3", 1, &AppProps::default()).await.unwrap(),
             (0, 3)
         );
+    }
+
+    /// `topics()` enumerates committed retained state — the tombstone as much as the
+    /// value (issue #183: a fresh process must be able to rediscover its clears) —
+    /// and only retained state: the backing log is SHARED with the `q/`/`m/` session
+    /// keyspaces on a durable node, so the `r/` filter is load-bearing.
+    #[tokio::test]
+    async fn topics_lists_values_and_tombstones_but_not_foreign_keys() {
+        let r = store();
+        r.set("dev/1", b"v", 0, &AppProps::default()).await.unwrap();
+        r.set("dev/2", b"v", 0, &AppProps::default()).await.unwrap();
+        r.clear("dev/2").await.unwrap(); // tombstone, not absence
+        r.log
+            .append(&"q/session-1".to_string(), vec![1])
+            .await
+            .unwrap(); // a session key sharing the log
+        let mut topics = r.topics().await.unwrap();
+        topics.sort();
+        assert_eq!(topics, ["dev/1", "dev/2"]);
     }
 
     #[tokio::test]
