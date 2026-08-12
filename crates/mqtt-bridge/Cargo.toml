@@ -34,6 +34,11 @@ redb = "2"
 mqttd = { path = "../mqttd", version = "0.9.0" }
 mqtt-storage = { path = "../mqtt-storage", version = "0.9.0" }
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "hotpaths"
+harness = false
 
 [lints]
 workspace = true

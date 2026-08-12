@@ -1893,6 +1893,7 @@ name = "mqtt-bridge"
 version = "0.9.0"
 dependencies = [
  "bytes",
+ "criterion",
  "mqtt-codec",
  "mqtt-core",
  "mqtt-net",

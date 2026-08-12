@@ -76,10 +76,11 @@ jobs:
       # docs/benchmarks/BASELINE.md. A meaningful shift is investigated and the
       # baseline updated with the commit that moved it (the per-PR perf_gate
       # test is the automatic floor; this is the human-read record).
-      - name: codec + durable-plane benches
+      - name: codec + durable-plane + bridge benches
         run: |
           cargo bench -p mqtt-codec --bench codec
           cargo bench -p mqtt-cluster --bench durable_hotpaths
+          cargo bench -p mqtt-bridge --bench hotpaths
 
   fuzz:
     name: fuzz every attacker-reachable parser (ADR 0044 P5)
