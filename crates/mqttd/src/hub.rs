@@ -416,7 +416,15 @@ enum Appended {
     At(Offset),
     /// Deliberately not recorded — disk brownout, or the queue cap rejected it. Both are
     /// counted and logged, and the publisher is still acknowledged: the message was
-    /// refused under a stated policy, not lost.
+    /// refused under a stated policy, not lost (ADR 0041 §5 — brownout refuses growth
+    /// writes while "acks, deletes, reads, expiry, and resumes … continue").
+    ///
+    /// The honest caveat (#203): for an **offline** persistent subscriber there is no live
+    /// delivery either, so that subscriber never receives this message even though the
+    /// publisher was acked. The refusal is counted (`publish_dropped{reason}`), the
+    /// watermark is off by default, and the README states it beside the durability claim —
+    /// but acking is only defensible because v3.1.1 has no way to say "received, not
+    /// accepted". Answering a **v5** publisher `0x97` instead is tracked as 0041-T11.
     Skipped,
     /// The write failed. The publisher's acknowledgement must be withheld so it retries
     /// (ADR 0041 T5).
