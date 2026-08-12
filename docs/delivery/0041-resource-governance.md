@@ -43,6 +43,9 @@ tasks:
   - id: 0041-T9
     title: Per-store disk bound — a share of MQTTD_STORE_MAX_BYTES per redb store (sessions/retained/replicas/lease) so one store cannot consume the whole watermark and brown out the others; same T4 refusal behaviors, counted per store (2026-08-07 amendment)
     status: planned
+  - id: 0041-T11
+    title: "Answer a v5 publisher 0x97 when a growth refusal (brownout / queue cap) means an OFFLINE persistent subscriber will never receive the message — today it is acked as a stated-policy refusal, which is honest only because v3.1.1 has no way to say otherwise (2026-08-12, from the #203 storage audit)"
+    status: planned
   - id: 0041-T10
     title: Per-connection write-buffer bound — MAX_BACKLOG (hub.rs, 10 000 messages per stalled subscriber) becomes byte-aware and configurable; today it is a hard-coded count, so a slow consumer's backlog is bounded in messages but unbounded in bytes and cannot be tuned (2026-08-07 amendment)
     status: planned
@@ -83,6 +86,7 @@ defaults, and a metric per cap.
 | 0041-T7 | ⬜ planned | — |  |
 | 0041-T8 | ✅ done | 2026-08-10 | "crates/mqttd/src/memory_watch.rs — RSS from /proc/self/status (no new dependency, no libc call), edge-triggered SetBrownout on the Memory axis, gauges process_resident_bytes + memory_max_bytes. Brownout became PER-AXIS (hub::BrownoutAxis, Hub::set_brownout_axis): the effective state is the OR, so the disk poller reporting 'fine' cannot lift a brownout memory pressure is still asking for — one_axis_recovering_does_not_lift_another_axis_brownout is the test for exactly that, and a_single_axis_still_toggles_brownout_on_its_own proves the T5 contract is unchanged. Unit tests: vm_rss_is_parsed_in_bytes_from_the_right_line, a_similar_looking_line_is_not_mistaken_for_vm_rss (VmSize/VmHWM sit above VmRSS and are larger — picking either would brown out early), a_status_without_vm_rss_yields_none_not_zero, the_watcher_drives_brownout_on_watermark_transitions, without_a_watermark_nothing_is_ever_browned_out, an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero, the_real_sampler_reports_a_plausible_rss_on_linux. Integration (Linux-gated) tests/memory_watermark.rs against the REAL binary: a 1 KiB watermark browns out, exports brownout{axis=\"memory\"} 1 and a plausible RSS, and refuses a new v5 session with 0x97 — with an unset-watermark control so it cannot pass against a broker that refuses everything." |
 | 0041-T9 | ⬜ planned | — |  |
+| 0041-T11 | ⬜ planned | — |  |
 | 0041-T10 | ⬜ planned | — |  |
 <!-- /status-table:0041 -->
 
