@@ -559,6 +559,90 @@ async fn two_partitioned_instances_deliver_each_inbound_message_exactly_once() {
 /// ADR 0025-T7: messages destined for a **down** upstream are spooled (not lost) and
 /// replayed when it comes back.
 #[tokio::test]
+async fn a_full_spool_must_not_shed_a_message_the_bridge_already_accepted() {
+    // ADR 0060 T1/T2 + T5: a spooled message was already acknowledged to the source, so the
+    // source has dropped its copy. Shedding it to make room for a NEWER message loses a message
+    // the source believes was delivered — the newer one must be refused instead (and left
+    // unacked, so the source keeps it). Before the fix, drop-oldest quietly evicted the older,
+    // already-acked message.
+    let local = start_broker().await;
+    let upstream_addr = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    // A QoS-1 rule (so the spool refuses at the cap) with room for exactly ONE message.
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        [spool]
+        max_messages = 1
+        allow_ephemeral_spool = true
+        [[upstreams]]
+        name = "down"
+        url = "{upstream_addr}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "t/#"
+        qos = 1
+        "#,
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    tokio::time::sleep(Duration::from_secs(1)).await; // local connects; upstream stays down
+
+    // FIRST is accepted into the one-slot spool; SECOND arrives with the spool full.
+    let mut local_pub = client(local, "shed-pub").await;
+    for (n, payload) in [(1u16, &b"FIRST"[..]), (2, &b"SECOND"[..])] {
+        local_pub
+            .publish(
+                "t/x",
+                Bytes::copy_from_slice(payload),
+                QoS::AtLeastOnce,
+                false,
+                Some(n),
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Bring the upstream up; the spool replays on reconnect.
+    let listener = TcpListener::bind(upstream_addr).await.unwrap();
+    serve_broker(listener);
+    let mut up_sub = client(upstream_addr, "shed-up-sub").await;
+    subscribe(&mut up_sub, "t/#").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let replayed = loop {
+        if let Ok(Ok(Event::Publish(p))) =
+            tokio::time::timeout(Duration::from_millis(300), up_sub.next_event()).await
+        {
+            if let Some(id) = p.pkid {
+                up_sub.puback(id).await.unwrap();
+            }
+            break p.payload.to_vec();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "nothing replayed after the upstream came back — the accepted message was lost"
+        );
+    };
+    assert_eq!(
+        replayed,
+        b"FIRST".to_vec(),
+        "the spool shed a message it had already accepted (and acked) to make room for a newer \
+         one; the newer message must be refused instead"
+    );
+
+    bridge.shutdown();
+}
+
+#[tokio::test]
 async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
     let local = start_broker().await;
     // Reserve an upstream address, then free it so the bridge's connects are refused (the

@@ -306,12 +306,24 @@ without a durable spool — set `[spool].dir`, or `[spool].allow_ephemeral_spool
 loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason), not just
 counted (T5), so a lost auditable crossing leaves a trail.
 
-**One residual, stated plainly.** The source acknowledgement is not yet fully gated on
-durability on the fast path: the bridge PUBACKs the source and forwards, without waiting for
-the destination's acknowledgement — so a crash in that narrow window can lose a message the
-source considered delivered. The full pending-ack model (ack only after spool-commit or a
-downstream ack) is the remaining ADR 0060 work (T1/T2). For the strongest guarantee today, keep
-a durable spool and treat the crossing as at-least-once with that caveat.
+**The acknowledgement is no longer sent on arrival.** The bridge used to PUBACK a `QoS`≥1
+message the moment it read it — before doing anything durable with it — so the source dropped
+its copy while the bridge might still lose it. Now the engine acknowledges only after the
+message has been **durably accepted**: spooled (fsync'd) when the destination is down, or
+dispatched when it is up. A spool that cannot accept the message withholds the ack entirely, so
+the source keeps it and redelivers.
+
+That is also why a **full spool refuses** the newest message for a `QoS`≥1 rule instead of
+shedding the oldest: everything already spooled was acknowledged to the source, so dropping it
+would lose a message the source believes was delivered. A `QoS`-0-only bridge still drops the
+oldest — `QoS` 0 promises nothing, and a stalled crossing would be worse.
+
+**One residual, stated plainly.** On the fast path the ack fires when the message is dispatched
+to a connected destination, not when that destination *acknowledges* it — so a crash in that
+narrow window can still lose a message the source considered delivered. Closing it means
+correlating the destination's packet id back to the source (ADR 0060 T8, designed in
+[§5](adr/0060-bridge-durability-and-ack-contract.md)). For the strongest guarantee
+today, keep a durable spool and treat the crossing as at-least-once with that caveat.
 
 ---
 

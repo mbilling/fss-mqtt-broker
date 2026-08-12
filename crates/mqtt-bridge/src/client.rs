@@ -138,6 +138,12 @@ pub enum Command {
         /// Requested maximum `QoS`.
         qos: QoS,
     },
+    /// Acknowledge an inbound `QoS` 1 delivery on this side (ADR 0060 T2). Sent by the engine
+    /// once the message has been durably accepted for forwarding — never on arrival.
+    Ack {
+        /// The inbound PUBLISH's packet id.
+        pkid: u16,
+    },
     /// Publish a message (already transformed by the engine).
     Publish {
         /// Destination topic.
@@ -375,15 +381,11 @@ impl MqttClient {
             tokio::select! {
                 packet = reader.next_packet() => match packet {
                     Ok(Some(Packet::Publish(p))) => {
-                        // Acknowledge a QoS 1 delivery so the source broker releases it
-                        // (at-least-once; the cross-broker spool is ADR 0025 T7).
-                        if p.qos == QoS::AtLeastOnce {
-                            if let Some(id) = p.pkid {
-                                if writer.send(&Packet::PubAck(Ack::new(id))).await.is_err() {
-                                    return ClientError::Closed;
-                                }
-                            }
-                        }
+                        // ADR 0060 T2: the QoS-1 acknowledgement is NOT sent here. Acking on
+                        // arrival releases the source's copy before this bridge has done
+                        // anything durable with the message, so a failure in between loses a
+                        // message the source believes was delivered. The engine decides when
+                        // the message is durably accepted and sends `Command::Ack`.
                         if inbound.send(p).is_err() {
                             return ClientError::Closed; // the engine is gone
                         }
@@ -394,6 +396,11 @@ impl MqttClient {
                     Err(e) => return ClientError::Protocol(e.to_string()),
                 },
                 cmd = commands.recv() => match cmd {
+                    Some(Command::Ack { pkid }) => {
+                        if writer.send(&Packet::PubAck(Ack::new(pkid))).await.is_err() {
+                            return ClientError::Closed;
+                        }
+                    }
                     Some(Command::Subscribe { pkid, filter, qos }) => {
                         let pkt = Packet::Subscribe(Subscribe {
                             properties: Properties::new(),

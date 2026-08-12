@@ -23,7 +23,7 @@ use crate::client::{Command, ConnectOptions, MqttClient, Transport};
 use crate::config::{BridgeConfig, Endpoint, HaMode};
 use crate::forward::{owns, plan_forwards, read_hop_count, set_hop_count, Side};
 use crate::metrics::{BridgeMetrics, CrossDirection};
-use crate::spool::{Spool, SpooledMessage};
+use crate::spool::{Overflow, Spool, SpooledMessage};
 
 /// A fixed keepalive (seconds) for every bridge connection; the client pings at half this.
 const KEEP_ALIVE: u16 = 30;
@@ -227,6 +227,16 @@ fn spawn_router(
             if cfg.ha == HaMode::Partitioned && !owns(&publish.topic, cfg.total, cfg.instance) {
                 continue;
             }
+            // ADR 0060 T2: this message owes the source an acknowledgement, and it is sent only
+            // once every destination has durably accepted the message (spooled) or taken it on
+            // the live path. A destination that refuses (spool full / disk error) withholds the
+            // ack entirely, so the source keeps its copy and redelivers — fail closed.
+            let owed_ack = if publish.qos == QoS::AtLeastOnce {
+                publish.pkid
+            } else {
+                None
+            };
+            let mut durably_accepted = true;
             let hop = read_hop_count(&publish.properties);
             let forwards = plan_forwards(&cfg, side, &publish.topic, hop);
             if forwards.is_empty() && hop >= cfg.hop_count_limit {
@@ -281,9 +291,18 @@ fn spawn_router(
                         user_properties,
                     };
                     if let Err(e) = spools[idx].push(&spooled) {
+                        // Not durably accepted: withhold the source ack (ADR 0060 T2) so the
+                        // source redelivers, rather than acking a message we just lost.
                         warn!(dest = idx, error = %e, "failed to spool a message for a down side");
+                        durably_accepted = false;
                     }
                 }
+            }
+            // Acknowledge the source only now. A message with no matching rule (or one dropped
+            // at the hop limit) owes nothing and is acked immediately — withholding it would
+            // stall the source's in-flight window for a message deliberately not forwarded.
+            if let Some(pkid) = owed_ack.filter(|_| durably_accepted) {
+                let _ = cmd_tx[side_index(side)].send(Command::Ack { pkid });
             }
         }
     })
@@ -293,6 +312,14 @@ fn spawn_router(
 /// bridge restart), else in-memory — both bounded to `spool.max_messages` (§7).
 fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
     let cap = cfg.spool.max_messages;
+    // ADR 0060 T5: a QoS≥1 rule refuses at the cap (everything spooled was already acked to the
+    // source, so shedding it loses a message the source believes was delivered); a QoS-0-only
+    // bridge drops the oldest, since QoS 0 promises nothing and a stalled crossing is worse.
+    let overflow = if cfg.requires_durable_spool() {
+        Overflow::Refuse
+    } else {
+        Overflow::DropOldest
+    };
     match &cfg.spool.dir {
         Some(dir) => {
             let file = match side {
@@ -301,7 +328,7 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
             };
             let path = std::path::Path::new(dir).join(file);
             match Spool::on_disk(&path, cap) {
-                Ok(s) => Arc::new(s),
+                Ok(s) => Arc::new(s.with_overflow(overflow)),
                 Err(e) => {
                     // ADR 0060 T4: never silently fall back to a non-durable spool when a
                     // QoS≥1 rule needs one — that loses acked messages on restart. Refuse to
@@ -316,11 +343,11 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
                         std::process::exit(1);
                     }
                     warn!(?side, error = %e, "disk spool unavailable; using an in-memory spool");
-                    Arc::new(Spool::in_memory(cap))
+                    Arc::new(Spool::in_memory(cap).with_overflow(overflow))
                 }
             }
         }
-        None => Arc::new(Spool::in_memory(cap)),
+        None => Arc::new(Spool::in_memory(cap).with_overflow(overflow)),
     }
 }
 
