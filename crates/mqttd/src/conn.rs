@@ -82,6 +82,24 @@ const DISCONNECT_SERVER_SHUTTING_DOWN: u8 = reason::SERVER_SHUTTING_DOWN;
 const DISCONNECT_TOPIC_ALIAS_INVALID: u8 = reason::TOPIC_ALIAS_INVALID;
 /// DISCONNECT reason (v5): the client exceeded the server's Receive Maximum (ADR 0012 §3).
 const DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED: u8 = reason::RECEIVE_MAXIMUM_EXCEEDED;
+/// DISCONNECT reason (v5): the client used Subscription Identifiers, which this server does
+/// not support (MQTT 5.0 §3.2.2.3.12, `[MQTT-4.13.1-1]`). `0xA1` — **not** `0xA2`, which is
+/// Wildcard Subscriptions not supported.
+const DISCONNECT_SUBSCRIPTION_IDS_NOT_SUPPORTED: u8 =
+    reason::SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED;
+
+/// Whether this server supports MQTT 5 Subscription Identifiers (issue #245).
+///
+/// MQTT 5.0 §3.2.2.3.12, verbatim: "If not present, then Subscription Identifiers are
+/// supported." An absent CONNACK property `0x29` is therefore an affirmative claim of
+/// support, so a server that does not deliver identifiers must say `0` on the wire —
+/// silence is a lie a client cannot detect.
+///
+/// Both halves of the posture read this one constant so they cannot drift: the CONNACK
+/// advertisement in [`negotiate_v5_properties`] and the SUBSCRIBE refusal in [`serve`].
+/// Flipping it to `true` is step 1 of actually delivering identifiers (see the follow-up
+/// issue), and will turn the two guard tests red on purpose.
+const SUB_IDS_SUPPORTED: bool = false;
 /// Server-advertised MQTT 5.0 wire limits, configurable at startup (ADR 0011/0012/0013).
 /// These are genuinely server-wide (the same maxima are advertised to every connection),
 /// so they live in one process-wide value set once from config rather than per-connection.
@@ -1264,6 +1282,10 @@ fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
 /// Payload Format Indicator, Content Type, Response Topic, Correlation Data, and User
 /// Properties (in wire order). Connection/subscription-scoped properties (Topic Alias,
 /// Subscription Identifier) and Message Expiry (handled separately) are not included.
+///
+/// Since issue #245 an inbound Subscription Identifier never reaches here to be dropped:
+/// `handle_publish` refuses the packet outright per `[MQTT-3.3.4-6]`, so the `_ => {}` arm
+/// below is no longer load-bearing for `0x0B`.
 fn app_properties(props: &mqtt_codec::Properties) -> AppProperties {
     use mqtt_codec::Property;
     let mut app = AppProperties::default();
@@ -1389,9 +1411,15 @@ fn client_receive_maximum(protocol: ProtocolVersion, properties: &mqtt_codec::Pr
     }
 }
 
-/// Build the v5 CONNACK property block — Topic Alias Maximum (ADR 0011) and Receive
-/// Maximum (ADR 0012) — and the per-connection topic-alias maps. v3.1.1 has neither
-/// feature, so the maps come out disabled and the property block empty.
+/// Build the v5 CONNACK property block and the per-connection topic-alias maps.
+///
+/// The block is exactly four properties, and no others: Receive Maximum (ADR 0012),
+/// Maximum Packet Size (ADR 0041 T4), Topic Alias Maximum when non-zero (ADR 0011), and
+/// Subscription Identifiers Available (issue #245). Adding a fifth must also update
+/// `v5_connack_advertises_exactly_the_four_negotiated_properties`, which pins the set.
+///
+/// v3.1.1 has none of these features, so the maps come out disabled and the property
+/// block empty.
 fn negotiate_v5_properties(
     protocol: ProtocolVersion,
     properties: &mqtt_codec::Properties,
@@ -1415,6 +1443,14 @@ fn negotiate_v5_properties(
         props.0.push(mqtt_codec::Property::MaximumPacketSize(
             limits.max_packet_size,
         ));
+        // §3.2.2.3.12: omitting 0x29 MEANS "Subscription Identifiers are supported", so
+        // state the truth explicitly (issue #245). Inside `if is_v5` is what keeps a
+        // v3.1.1 CONNACK byte-identical.
+        props
+            .0
+            .push(mqtt_codec::Property::SubscriptionIdentifierAvailable(
+                u8::from(SUB_IDS_SUPPORTED),
+            ));
     }
     if server_alias_max > 0 {
         props
@@ -1597,6 +1633,20 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // Response Topic, Correlation Data, Payload Format), forwarded unaltered to subscribers
     // (MQTT-3.3.2-17, ADR 0030). Empty for v3.1.1 / a publish without any.
     let app = app_properties(&publish.properties);
+    // [MQTT-3.3.4-6], verbatim: "A PUBLISH packet sent from a Client to a Server MUST NOT
+    // contain a Subscription Identifier." Until issue #245 this property was silently
+    // swallowed by `app_properties` and the publish was acked.
+    //
+    // 0x82 (Protocol Error) and not 0xA1: §4.13.1 says use 0x81/0x82 "unless a more
+    // specific Reason Code has been defined", and 0xA1 means "I do not support the
+    // feature", which is not this client's mistake. Unconditional on SUB_IDS_SUPPORTED —
+    // this stays a Protocol Error even once the server delivers identifiers.
+    if is_v5 && publish.properties.has_subscription_identifier() {
+        warn!(client = %client.0,
+              "client PUBLISH carries a Subscription Identifier [MQTT-3.3.4-6]; DISCONNECT 0x82");
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        return Ok(true);
+    }
     // Resolve any topic alias to the full topic name before anything else sees it
     // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
     let alias = publish.properties.topic_alias();
@@ -1876,6 +1926,28 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             });
         }
         Packet::Subscribe(s) => {
+            // MQTT 5.0 §3.2.2.3.12: "If the Server receives a SUBSCRIBE packet containing
+            // Subscription Identifier and it does not support Subscription Identifiers,
+            // this is a Protocol Error. The Server uses DISCONNECT with Reason Code of
+            // 0xA1 (Subscription Identifiers not supported)." Note DISCONNECT, not a
+            // SUBACK: SUBACK 0xA1 is for a server that supports the feature and declines
+            // one filter. Closing is the MUST ([MQTT-4.13.1-1]); the DISCONNECT packet
+            // carrying the reason is the SHOULD, and we send it (issue #245).
+            //
+            // Deliberately BEFORE the ACL loop: a Protocol Error precedes authorization,
+            // so the client gets one 0xA1 rather than a mix of per-filter 0x80s — which
+            // also means an identifier-bearing SUBSCRIBE to a forbidden topic records no
+            // `acl.deny.subscribe` audit entry.
+            //
+            // `is_v5 &&` is belt-and-braces: `decode_subscribe` only decodes properties
+            // for v5, so a v4 SUBSCRIBE can never carry one — but DISCONNECT is a v5-only
+            // packet, so the gate stays explicit.
+            if is_v5 && !SUB_IDS_SUPPORTED && s.properties.has_subscription_identifier() {
+                warn!(client = %client.0,
+                      "SUBSCRIBE carries a Subscription Identifier, which this server does not support; DISCONNECT 0xA1");
+                disconnect(writer, DISCONNECT_SUBSCRIPTION_IDS_NOT_SUPPORTED).await?;
+                return Ok(true);
+            }
             // ACL gate per filter (ADR 0004 step 3): denied filters answer
             // 0x80 [MQTT-3.9.3] and never reach the hub; granted filters get
             // the requested QoS [MQTT-3.8.4-5/6].
@@ -2873,8 +2945,13 @@ mod tests {
     }
 
     /// An MQTT 5.0 client connects, the broker answers a v5 CONNACK, a v5 SUBSCRIBE
-    /// (with options + a subscription identifier) is answered with a v5 SUBACK, and a
-    /// v5 DISCONNECT closes the session — the whole v5 path negotiated end to end.
+    /// (with subscription options) is answered with a v5 SUBACK, and a v5 DISCONNECT
+    /// closes the session — the whole v5 path negotiated end to end.
+    ///
+    /// This test used to send `SubscriptionIdentifier(5)` here and assert a granted
+    /// SUBACK, which pinned the issue #245 defect. The identifier moved to its own
+    /// refusal test (`v5_subscribe_with_a_subscription_identifier_disconnects_instead_of_subacking`);
+    /// what stays here is the handshake coverage, unchanged.
     #[tokio::test]
     async fn v5_client_connects_subscribes_and_disconnects() {
         let (client, server) = tokio::io::duplex(4096);
@@ -2918,7 +2995,16 @@ mod tests {
                         ..Default::default()
                     },
                 }],
-                properties: Properties(vec![Property::SubscriptionIdentifier(5)]),
+                // A NON-EMPTY property block, deliberately: this is the only accepted-SUBSCRIBE
+                // test in the tree whose properties are populated, so it is what pins the
+                // `0xA1` guard's NARROWNESS. Broaden the guard from
+                // `has_subscription_identifier()` to "any properties present" and this test
+                // goes red instead of the refusal silently swallowing every v5 SUBSCRIBE that
+                // carries a User Property.
+                properties: Properties(vec![Property::UserProperty(
+                    "tenant".into(),
+                    "acme".into(),
+                )]),
             }))
             .await
             .unwrap();
@@ -2940,6 +3026,120 @@ mod tests {
             recv(&mut reader).await,
             None,
             "DISCONNECT closes the session"
+        );
+    }
+
+    // ---- subscription-identifier wire posture (issue #245) ----
+    //
+    // MQTT 5.0 §3.2.2.3.12, verbatim: "If not present, then Subscription Identifiers are
+    // supported." Omitting CONNACK property 0x29 is therefore an affirmative claim of
+    // support, not a silence — so a server that does not deliver them must say 0.
+
+    /// The v5 CONNACK carries `Subscription Identifiers Available = 0` (§3.2.2.3.12).
+    /// Asserted on the literal 0, not on `u8::from(SUB_IDS_SUPPORTED)`, so this is a fact
+    /// about the wire rather than a tautology about the constant.
+    #[tokio::test]
+    async fn v5_connack_advertises_subscription_identifiers_unavailable() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => assert!(
+                a.properties
+                    .0
+                    .contains(&Property::SubscriptionIdentifierAvailable(0)),
+                "v5 CONNACK must advertise 0x29 = 0, got {:?}",
+                a.properties.0
+            ),
+            other => panic!("expected v5 CONNACK, got {other:?}"),
+        }
+    }
+
+    /// The v5 CONNACK's property-id multiset is exactly the four properties
+    /// `negotiate_v5_properties` is allowed to emit. Order is not contractual, so the ids
+    /// are sorted before comparison. This is the "must not start advertising anything else
+    /// by accident" guard: the other CONNACK tests use typed accessors and would not
+    /// notice a fifth property appearing.
+    #[tokio::test]
+    async fn v5_connack_advertises_exactly_the_four_negotiated_properties() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => {
+                let mut ids: Vec<u8> = a.properties.0.iter().map(Property::id).collect();
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    vec![
+                        0x21, // Receive Maximum (ADR 0012)
+                        0x22, // Topic Alias Maximum (ADR 0011)
+                        0x27, // Maximum Packet Size (ADR 0041 T4)
+                        0x29, // Subscription Identifiers Available (issue #245)
+                    ],
+                    "the v5 CONNACK property set is contractual"
+                );
+            }
+            other => panic!("expected v5 CONNACK, got {other:?}"),
+        }
+    }
+
+    /// Guard (passes today, must keep passing): a v3.1.1 CONNACK carries no properties at
+    /// all. It fails the moment the `SubscriptionIdentifierAvailable` push is moved
+    /// outside `negotiate_v5_properties`'s `if is_v5` block. Not red-first evidence.
+    #[tokio::test]
+    async fn v311_connack_carries_no_properties() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_packet("c", true)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => assert!(
+                a.properties.0.is_empty(),
+                "v3.1.1 has no properties, got {:?}",
+                a.properties.0
+            ),
+            other => panic!("expected CONNACK, got {other:?}"),
+        }
+    }
+
+    /// A v5 SUBSCRIBE carrying a Subscription Identifier is a Protocol Error for a server
+    /// that does not support them: §3.2.2.3.12 prescribes DISCONNECT with reason 0xA1
+    /// (Subscription Identifiers not supported), and `[MQTT-4.13.1-1]` makes closing the
+    /// connection the MUST. The next packet read must BE the DISCONNECT — no SUBACK may
+    /// precede it, since the guard runs before the ACL loop.
+    #[tokio::test]
+    async fn v5_subscribe_with_a_subscription_identifier_disconnects_instead_of_subacking() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let _seen = stub_hub(hub_rx);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::ConnAck(a)) => assert_eq!(a.code, 0),
+            other => panic!("expected v5 CONNACK, got {other:?}"),
+        }
+
+        writer
+            .send(&Packet::Subscribe(Subscribe {
+                pkid: 1,
+                filters: vec![SubscribeFilter {
+                    path: "a/b".into(),
+                    qos: QoS::AtLeastOnce,
+                    options: mqtt_codec::SubscriptionOptions::default(),
+                }],
+                properties: Properties(vec![Property::SubscriptionIdentifier(5)]),
+            }))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::Disconnect(d)) => assert_eq!(
+                d.reason, 0xA1,
+                "0xA1, not the 0xA2 that means Wildcard Subscriptions not supported"
+            ),
+            other => panic!("expected DISCONNECT 0xa1, got {other:?}"),
+        }
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "[MQTT-4.13.1-1]: the connection must close"
         );
     }
 

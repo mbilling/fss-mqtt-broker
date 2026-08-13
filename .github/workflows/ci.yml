@@ -79,7 +79,7 @@ jobs:
         run: cargo build --quiet -p mqttd
       - name: Interop conformance (mosquitto)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/interop/run.sh
-      - name: Interop conformance (paho — reason codes, properties, session)
+      - name: Interop conformance (paho — reason codes, properties, session, capability advertisement)
         run: |
           PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
           HPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")

@@ -54,6 +54,73 @@ Properties into one `AppProperties` value carried on `Message`. Topic Alias and 
 Identifier are deliberately **not** forwarded: they are hop-by-hop / per-subscription, not
 part of the application message.
 
+**As delivered — not forwarding is right, but silence about it was a false claim on the wire
+(issue #245).** The sentence above is correct and stays: a publisher's Subscription
+Identifier must never reach a subscriber. What it left unsaid is the other half — an
+identifier is also never *attached* per-subscriber at delivery, so the feature is not
+implemented at all. That would be a plain gap, except MQTT 5.0 §3.2.2.3.12 says, verbatim:
+"*If not present, then Subscription Identifiers are supported.*" An absent CONNACK property
+`0x29` is therefore an **affirmative claim of support**, not a silence — so a client library
+that keys its callbacks on identifiers was being told it could, then quietly losing its
+demux. The prose in `docs/COMPARISON.md` disclosed the gap; the wire denied it, and the
+wire is what clients read.
+
+The delivered rule: **the wire states the posture in all three directions.** Two of the
+three are driven by one constant; the third is unconditional (see below).
+
+- v5 CONNACK carries `Subscription Identifiers Available = 0` (`0x29`).
+- A v5 SUBSCRIBE carrying `0x0B` is a Protocol Error: DISCONNECT `0xA1` (Subscription
+  Identifiers not supported) then close — §3.2.2.3.12 prescribes exactly this, and
+  `[MQTT-4.13.1-1]` makes the close the MUST (the DISCONNECT packet is the SHOULD). Note
+  `0xA1`, **not** `0xA2`, which is Wildcard Subscriptions not supported.
+- A client→server PUBLISH carrying `0x0B` is a Protocol Error: DISCONNECT `0x82`, per the
+  labelled `[MQTT-3.3.4-6]` ("*A PUBLISH packet sent from a Client to a Server MUST NOT
+  contain a Subscription Identifier*") — previously accepted, silently stripped, and acked.
+- `SubscriptionIdentifier(0)` is rejected at the codec boundary (§3.8.2.1.2, §3.3.2.3.8);
+  see [ADR 0008](0008-mqtt-5-codec.md).
+
+`mqttd::conn::SUB_IDS_SUPPORTED` is the flip point for the two halves that must not drift —
+the CONNACK advertisement and the SUBSCRIBE refusal — and setting it `true` turns the guard
+tests red on purpose. The client→server PUBLISH guard is deliberately **not** gated on it:
+`[MQTT-3.3.4-6]` forbids that property in that direction whether or not the server supports
+identifiers, so gating it would reintroduce the violation the moment the constant flips.
+This is a **behaviour break** for a client that ignores `0x29` and sends an identifier
+anyway: it is now disconnected where it previously got a working-but-silently-degraded
+subscription. That is the spec-mandated
+outcome and the point of the change, and it is stated as a break in README Limitations.
+
+Three things a later reader would otherwise re-litigate:
+
+1. [ADR 0058](0058-one-dot-zero-stability-contract.md) §D **does** cover this surface — its
+   enumeration is "the peer-bus frame protocol …, the SWIM datagram format …, the four store
+   schemas above, **the client-visible MQTT behaviour matrix (COMPARISON.md's own cells)**,
+   and the config surface". An earlier draft of this note claimed the client-facing wire was
+   *not* on that list; that was wrong. What actually follows: pre-1.0 both this change and
+   the later flip are permitted outright; after the 1.0 tag the flip is a change to a frozen
+   surface and must be justified under the contract as a **growth** change — `0x29` moving
+   `0` → `1`/absent only widens what a client may ask for and breaks no conforming client,
+   which the contract permits, but it is not outside the contract's scope and must not be
+   argued as such.
+2. The `0x29` `0` → `1`/absent flip is compatible in the growth direction: it only widens
+   what a client may ask for, and the one major client that reads the byte re-reads it on
+   every CONNACK.
+3. Delivering identifiers needs **no durable-schema reshape**. The session record's
+   tail-append, EOF-default discipline in `encode_session_meta`/`decode_session_meta`
+   absorbs per-subscription ids without touching `SCHEMA_VERSION` — three precedents
+   (`session_expiry_at`, `owner`, `outbound_qos2`) did exactly that. So the schema freeze
+   imposes no deadline on the follow-up.
+
+`Residual:` delivery itself is not implemented — no identifier is ever attached to an
+outbound PUBLISH. Tracked by issue #266 (deliver subscription identifiers) (per-subscription attribution:
+`[MQTT-3.3.4-3/4/5]`, retained replay, offline replay, DUP repeats, session-state survival)
+and by `0010-T7` for the shared-subscription case. Separately, a codec-level protocol error
+(a `0x0B` of 0, a duplicated `0x0B`) closes with **no** DISCONNECT packet, satisfying
+`[MQTT-4.13.1-1]`'s MUST but not its SHOULD — pre-existing and repo-wide for every
+frame-decode error, not specific to this feature. And both refusals here close the connection
+by a path the hub currently records as a *graceful* client DISCONNECT, so a refused client's
+Will is suppressed: that is issue #265, pre-existing at four other sites on `main` and fixed
+centrally there rather than patched per-path here.
+
 ### 2. Ingestion and delivery
 
 On ingest, the connection/hub copies the inbound PUBLISH's User Properties into the
@@ -84,6 +151,10 @@ tighter bound it lowers the maximum packet size.
 - **Good:** conformance with MQTT-3.3.2-17; User Properties (request/response metadata,
   tracing tags, and the bridge's hop counter) now reach subscribers and survive cross-node,
   shared, and offline-queue delivery. ADR 0025-T5 becomes implementable end to end.
+  Property-level conformance is **partial, and now says so on the wire**: Subscription
+  Identifiers are not delivered, and since issue #245 the CONNACK advertises `0x29 = 0` and
+  both directions of use are refused, so a client fails fast instead of losing its demux
+  silently (see the "As delivered" note in §1).
 - **Cost:** a new field on `Message` and on two peer-wire variants, an extended (still
   backward-compatible) durable codec, and the ingestion/delivery plumbing — a cross-cutting
   but mechanical change, built test-first.

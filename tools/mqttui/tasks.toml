@@ -232,7 +232,9 @@ script = "scripts/interop/paho_conformance.py"
 about = """
 The second independent oracle: Paho reaches the control-plane semantics the Mosquitto CLI
 cannot — v5 reason codes, SUBACK granted-QoS, CONNACK session-present, User Properties,
-retained-flag fidelity and session resume.
+retained-flag fidelity and session resume. It also pins the broker's capability
+advertisement: the CONNACK says Subscription Identifiers Available = 0, and a SUBSCRIBE
+that uses one is refused with DISCONNECT 0xA1 rather than silently degraded (issue #245).
 """
 requires = ["python3"]
 duration = "~15s"

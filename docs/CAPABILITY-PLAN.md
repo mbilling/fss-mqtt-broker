@@ -47,7 +47,9 @@ support, SLAs, certified builds, and managed hosting — never from gated featur
 - Request/Response pattern (response topic, correlation data)
 - Server-side disconnect with reason code
 - Enhanced authentication (AUTH packet, SASL-style challenge/response)
-- Subscription identifiers
+- Subscription identifiers — codec + an honest CONNACK advertisement only (`0x29 = 0`,
+  with a SUBSCRIBE that uses one refused per §3.2.2.3.12); **delivery is not implemented**
+  and is tracked as its own issue
 - Will delay interval
 
 ---

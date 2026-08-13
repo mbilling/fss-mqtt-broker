@@ -103,7 +103,13 @@ delivery per node that has a member**, not one cluster-wide.
   unchanged; pure, unit-testable group logic in `mqtt-core`.
 - **Cost / limits:** cross-node delivery is per-node, not cluster-wide (§5); `rotations`
   clones the matching groups' member lists per publish (small in practice; an indexed
-  selection is a later optimization); no Subscription-Identifier handling yet.
+  selection is a later optimization); no Subscription-Identifier handling yet — still
+  accurate, and since issue #245 the CONNACK says so (`0x29 = 0`) instead of implying
+  support. Delivery is tracked by issue #266 (deliver subscription identifiers) and by `0010-T7`. One design
+  fact to record before someone gets it wrong: the **peer wire does not need to grow**. Per
+  §3.3.4 only the *receiving* client's own identifiers may ever appear on a shared delivery,
+  so `RemoteSharedDeliver` resolves them locally on the target node — `SharedMemberWire` and
+  `WireAppProps` stay unchanged.
 
 ## Alternatives considered
 

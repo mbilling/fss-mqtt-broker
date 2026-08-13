@@ -93,6 +93,23 @@ This ADR's scope is the codec — a faithful v5 wire that round-trips every pack
 aliases, shared subscriptions, flow control) are **not** the codec's job; the codec
 unblocks, but does not itself implement, that broker-level work.
 
+**As delivered — one value-level rule does belong here (issue #245).** A Subscription
+Identifier of 0 is a **Protocol Error** by both §3.8.2.1.2 (SUBSCRIBE) and §3.3.2.3.8
+(PUBLISH), stated identically: "*The Subscription Identifier can have the value of 1 to
+268,435,455. It is a Protocol Error if the Subscription Identifier has a value of 0.*" That
+is a property-value fact, not a semantic one, so `validate_for` rejects it — reached from
+`decode_for`, i.e. at the wire boundary, in every context. It is load-bearing rather than
+shadowed by the broker's own SUBSCRIBE refusal, because `mqtt-bridge` is a *client*: it
+decodes genuine server→client PUBLISHes from remote brokers under `PropContext::Publish`,
+where a `0x0B` of 0 was previously accepted. The upper bound needs no check — it is the
+varint 4-byte maximum, already enforced by `varint::decode`.
+
+The **encode** path is deliberately untouched, and `PropContext::Publish` keeps allowing
+`0x0B` in both directions with `repeatable()` keeping it repeatable there. The codec stays
+ready to emit identifiers; the decision *not to deliver* them, and the CONNACK/DISCONNECT
+behaviour that discloses it, are broker-level and live in
+[ADR 0030](0030-user-property-forwarding.md) — exactly the split this section describes.
+
 ## Consequences
 
 - The fuzzing surface grows; property decoding (attacker-controlled identifiers,
