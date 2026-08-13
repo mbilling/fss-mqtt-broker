@@ -4513,8 +4513,11 @@ impl Hub {
                 // Replication health (issue #167): the silent min(R, members)
                 // degradation, surfaced. min_actual < desired = at least one group
                 // commits on fewer copies than the operator configured.
+                // The resolved write floor rides along (issue #239): min_actual below it
+                // means durable writes are being REFUSED, which is a different (pageable)
+                // condition from merely under-replicated. Read from the same guard.
                 let health = p.replication_health();
-                m.set_replication_health(health.desired, health.min_actual);
+                m.set_replication_health(health.desired, health.min_actual, p.min_replicas());
                 // Held retained tombstones (issue #229): growth here means a
                 // chronically absent roster member or chronic divergence — both
                 // alert-worthy on their own.

@@ -127,13 +127,39 @@ pub struct Placement {
     /// roster, never on live gossip membership, exactly because gossip forgets
     /// the absent.
     durable_roster: Option<(BTreeSet<NodeId>, usize)>,
-    /// The smallest replica set a durable append may commit on (issue #167). Replica
-    /// sets truncate to `min(R, members)`, so a shrinking cluster silently trades the
-    /// configured durability for availability — down to quorum-of-1. Groups below
-    /// this floor REFUSE durable writes instead. Default 1: a lone node stays
-    /// healthy when alone (the standing requirement); raising it is the operator's
-    /// explicit durability-over-availability choice.
-    min_replicas: usize,
+    /// The policy behind the smallest replica set a durable append may commit on
+    /// (issue #167, defaulted ON in issue #239). Replica sets truncate to
+    /// `min(R, members)`, so a shrinking cluster silently trades the configured
+    /// durability for availability — down to quorum-of-1. Groups below the resolved
+    /// floor REFUSE durable writes instead. `Fixed(1)` (this type's constructor
+    /// default) keeps the pre-#167 behaviour: a lone node stays healthy when alone.
+    floor: WriteFloor,
+    /// High-water mark of `eligible.len()` — the largest membership this node has ever
+    /// observed. The *fallback* witness for the derived floor, used only until the
+    /// durable roster is first pushed. A high-water mark, not a live count, precisely
+    /// because a liveness-following witness would disarm the floor during the very
+    /// outage it exists to refuse.
+    peak_members: usize,
+}
+
+/// The min-replicas write-floor policy (issues #167, #239) — what
+/// [`Placement::min_replicas`] resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteFloor {
+    /// #167's absolute floor: exactly this many copies, whatever the topology says.
+    /// `1` means no refusal (single-copy acks accepted) — the documented opt-out.
+    Fixed(usize),
+    /// The derived default: a majority of the members this node *knows* about, capped at
+    /// the replication factor. `declared` is the operator's `runtime.ready_min_members`,
+    /// folded in as a floor on the witness so the policy is armed on a node's very first
+    /// write — before any gossip observation or roster push.
+    Majority { declared: usize },
+    /// There is no durable plane at all (`durable.enabled = false`), so no write can be
+    /// refused for want of replicas. Gates identically to `Fixed(1)`; it exists as its own
+    /// variant so `/statusz` can say *why* the floor is 1 instead of mislabelling it as an
+    /// operator-chosen floor (issue #239) — an operator running the default
+    /// `min_replicas = "majority"` never "configured" a floor of 1.
+    DurableOff,
 }
 
 impl Placement {
@@ -152,7 +178,12 @@ impl Placement {
             addrs: BTreeMap::new(),
             local_domain: None,
             domains: BTreeMap::new(),
-            min_replicas: 1,
+            // The constructor keeps the pre-#167 posture (no refusal); the operator's
+            // policy is injected at assembly via `with_write_floor` /
+            // `with_min_replicas`, so every direct constructor — every unit harness
+            // included — keeps its existing meaning.
+            floor: WriteFloor::Fixed(1),
+            peak_members: 1,
             durable_roster: None,
         }
     }
@@ -166,18 +197,103 @@ impl Placement {
         self
     }
 
-    /// Set the min-replicas write floor (issue #167), clamped to at least 1.
+    /// Set an ABSOLUTE min-replicas write floor (issue #167), clamped to at least 1.
     /// Builder-style, set once at startup from the operator's configuration.
     #[must_use]
     pub fn with_min_replicas(mut self, floor: usize) -> Self {
-        self.min_replicas = floor.max(1);
+        self.floor = WriteFloor::Fixed(floor.max(1));
         self
     }
 
-    /// The configured min-replicas write floor (1 = no floor).
+    /// Set the min-replicas write-floor POLICY (issue #239) — the general form of
+    /// [`with_min_replicas`](Self::with_min_replicas), used at assembly to install the
+    /// derived-majority default. Builder-style, set once at startup.
+    #[must_use]
+    pub fn with_write_floor(mut self, floor: WriteFloor) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// The RESOLVED min-replicas write floor: the smallest replica set a durable append
+    /// may commit on right now (1 = no refusal). The single resolution point the data
+    /// path's gate reads.
+    ///
+    /// For [`WriteFloor::Majority`] the floor is `min(R, witness) / 2 + 1`, where the
+    /// witness is, in order of authority:
+    ///
+    /// 1. the **durable raft roster** (issue #229), when it has been pushed *and is
+    ///    non-empty*. This is the authority for a reason: it is *quorum-committed*, so it
+    ///    cannot shrink while a majority is down — the floor therefore cannot self-disarm
+    ///    during the very outage it guards — it survives restart via the on-disk lease
+    ///    state (so a node that cold-boots alone out of a three-member group still
+    ///    refuses), and it *does* shrink on a consented decommission, so a deliberate
+    ///    resize needs no operator edit. An **empty** roster is not a membership signal at
+    ///    all (a group cannot have zero members; the reconcile driver pushes one while the
+    ///    raft group is still uninitialised), so it is ignored rather than allowed to
+    ///    disarm the floor and discard the fallback witness below;
+    /// 2. otherwise the high-water observed membership ([`peak_members`](Self::peak_members)
+    ///    — pre-roster fallback only);
+    ///
+    /// with `declared` (`runtime.ready_min_members`) as a lower bound on either, closing
+    /// the boot window before the first observation or roster push.
+    ///
+    /// Capping the witness at `R` is what makes the derived floor always satisfiable: a
+    /// majority of R=3 is 2, and the write quorum is already `len/2 + 1`, so at 2 or 3
+    /// live members this floor refuses nothing a one-at-a-time roll did not already
+    /// require. A witness of 1 resolves to `1/2 + 1 = 1`: the lone, never-peered node
+    /// keeps acking.
+    ///
+    /// What this returns is a bound on the replica-set **size** the append gate demands,
+    /// not on the number of copies the commit itself waits for (`ClusterLog`'s write
+    /// quorum is `replica_set.len() / 2 + 1`). For the derived floor the two coincide at
+    /// every satisfiable size (a set of 2 or 3 needs 2 acks, and the floor is 2), which is
+    /// why the default promise — "no group acks a durable write on a single copy once this
+    /// node knows it has peers" — is exactly what the gate enforces.
+    ///
+    /// A pure function of the fields — both callers already hold the placement lock.
     #[must_use]
     pub fn min_replicas(&self) -> usize {
-        self.min_replicas
+        match self.floor {
+            WriteFloor::Fixed(n) => n,
+            WriteFloor::Majority { declared } => {
+                let witness = self
+                    .durable_roster
+                    .as_ref()
+                    .map(|(known, unknown)| known.len() + unknown)
+                    // An empty roster is an uninitialised raft group, not a one-member
+                    // cluster: fall through to the gossip high-water witness.
+                    .filter(|&members| members > 0)
+                    .unwrap_or(self.peak_members)
+                    .max(declared)
+                    .min(self.replicas);
+                witness / 2 + 1
+            }
+            // No durable plane: nothing can be refused for want of replicas.
+            WriteFloor::DurableOff => 1,
+        }
+    }
+
+    /// How the write floor in [`Self::min_replicas`] came to be, for `/statusz` (issue #239).
+    ///
+    /// Three-valued on purpose: a floor of `1` means something different in each case, and
+    /// reporting `configured` for a node that never configured anything is the mislabel this
+    /// replaced — `durable-off` says the floor is 1 because there is no durable plane, not
+    /// because an operator asked for single-copy acks.
+    #[must_use]
+    pub fn write_floor_source(&self) -> &'static str {
+        match self.floor {
+            WriteFloor::Majority { .. } => "derived",
+            WriteFloor::Fixed(_) => "configured",
+            WriteFloor::DurableOff => "durable-off",
+        }
+    }
+
+    /// Whether the resolved floor is DERIVED from known membership (the default) rather
+    /// than an explicit operator integer. Reported on `/statusz` so a floor of 1 reads
+    /// unambiguously: "this node is alone" versus "someone disabled the floor".
+    #[must_use]
+    pub fn write_floor_is_derived(&self) -> bool {
+        matches!(self.floor, WriteFloor::Majority { .. })
     }
 
     /// Push the durable raft membership roster (issue #229): `known` are the
@@ -222,6 +338,10 @@ impl Placement {
                 }
             }
         }
+        // The high-water witness for the derived write floor (issue #239): once this node
+        // has seen it belongs to an N-member cluster, burying those peers must not
+        // un-know it. Only a quorum-committed roster shrink (or an explicit floor) does.
+        self.peak_members = self.peak_members.max(self.eligible.len());
     }
 
     /// A snapshot of the placement-eligible membership for the `/statusz` body
@@ -389,7 +509,9 @@ impl Placement {
         self.group_owner(group) == self.local
     }
 
-    /// The configured replication factor R (`MQTTD_LEASE_VOTERS`-derived placement width).
+    /// The configured replication factor R — the placement width, [`DEFAULT_REPLICAS`]
+    /// at assembly. (Independent of the lease-voter cap: ADR 0021 keeps replication
+    /// width and the voter set separate.)
     #[must_use]
     pub fn desired_replicas(&self) -> usize {
         self.replicas
@@ -968,5 +1090,162 @@ mod tests {
         let h = full.replication_health();
         assert_eq!(h.min_actual, 3, "three nodes fill an R=3 set");
         assert!(!h.is_under_replicated());
+    }
+
+    // --- Issue #239: the DERIVED write floor (the shipped default) ---
+
+    /// The default posture: 1 while this node has never known a peer (a fresh single
+    /// node stays fully operational — the standing requirement), 2 the moment it knows
+    /// it is part of a cluster of two or more. It never exceeds the majority of R, and
+    /// the witness never follows liveness *down*: a node that saw two peers and then
+    /// buried them still knows it belongs to a three-member cluster, which is exactly
+    /// the state the floor exists to refuse.
+    #[test]
+    fn the_derived_write_floor_is_one_alone_and_two_once_the_cluster_is_known() {
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        assert_eq!(p.min_replicas(), 1, "alone and never peered: no floor");
+        assert!(p.write_floor_is_derived());
+
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert_eq!(p.min_replicas(), 2, "a two-member cluster needs two copies");
+
+        p.observe(&node("b"), MemberState::Dead, "b:7000", None);
+        assert_eq!(
+            p.min_replicas(),
+            2,
+            "the witness must not self-disarm when the peer it witnessed dies"
+        );
+
+        let mut three = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        three.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        three.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        assert_eq!(
+            three.min_replicas(),
+            2,
+            "majority of R=3 is 2 — the floor is never the full R"
+        );
+    }
+
+    /// The quorum-committed durable roster (#229) is the authority: it arms the floor
+    /// even on a node that boots alone and has observed nobody (the cold-restart hole a
+    /// gossip-only latch leaves open), and — because shrinking it needs a lease quorum —
+    /// a consented decommission down to one member disarms it with no operator edit.
+    #[test]
+    fn the_durable_roster_is_the_authority_for_the_derived_floor() {
+        use std::collections::BTreeSet;
+        let roster = |ids: &[&str]| ids.iter().map(|i| node(i)).collect::<BTreeSet<_>>();
+
+        // Booted alone, gossip shows only self — but the roster says three.
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        p.set_durable_roster(roster(&["a", "b", "c"]), 0);
+        assert_eq!(
+            p.min_replicas(),
+            2,
+            "the roster arms the restart-alone case"
+        );
+
+        // A deliberate shrink to one member: the roster is committed, so it overrides
+        // the (higher) observed high-water mark.
+        let mut shrunk = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        shrunk.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        shrunk.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        assert_eq!(shrunk.min_replicas(), 2);
+        shrunk.set_durable_roster(roster(&["a"]), 0);
+        assert_eq!(
+            shrunk.min_replicas(),
+            1,
+            "a quorum-committed shrink to one member disarms the floor by itself"
+        );
+
+        // An unmappable roster member still counts as a member.
+        let mut unknown = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        unknown.set_durable_roster(roster(&["a"]), 1);
+        assert_eq!(unknown.min_replicas(), 2);
+    }
+
+    /// The operator-declared readiness member count is folded in as a `max()`, so the
+    /// floor is armed on a bare-metal node's very first write — before any gossip
+    /// observation or roster push. It is still capped at the majority of R.
+    #[test]
+    fn a_declared_member_count_arms_the_write_floor_before_gossip_or_the_roster() {
+        let p = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 2 });
+        assert_eq!(
+            p.min_replicas(),
+            2,
+            "a node that declares it expects two members must not ack on one copy"
+        );
+
+        let wide = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 4 });
+        assert_eq!(
+            wide.min_replicas(),
+            2,
+            "the witness is capped at R, so the floor is never unsatisfiable"
+        );
+    }
+
+    /// An explicit integer keeps #167's absolute meaning in BOTH directions: `1` is the
+    /// documented opt-out even with a three-member roster, and `3` is a hard floor even
+    /// on a lone node. The derived path must never shadow an explicit choice.
+    #[test]
+    fn an_explicit_floor_overrides_the_derived_one_in_both_directions() {
+        use std::collections::BTreeSet;
+        let mut off = Placement::new(node("a"), DEFAULT_REPLICAS).with_min_replicas(1);
+        off.set_durable_roster(
+            ["a", "b", "c"]
+                .iter()
+                .map(|i| node(i))
+                .collect::<BTreeSet<_>>(),
+            0,
+        );
+        off.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert_eq!(
+            off.min_replicas(),
+            1,
+            "the opt-out survives a known cluster"
+        );
+        assert!(!off.write_floor_is_derived());
+
+        let hard = Placement::new(node("a"), DEFAULT_REPLICAS).with_min_replicas(3);
+        assert_eq!(hard.min_replicas(), 3, "an absolute floor stays absolute");
+        assert!(!hard.write_floor_is_derived());
+    }
+
+    /// An EMPTY durable roster is not a membership signal — a raft group cannot have zero
+    /// members, and the reconcile driver pushes exactly that while the group is still
+    /// uninitialised or this node is unadmitted. It must neither disarm the floor nor
+    /// throw away the gossip high-water witness the latch exists to preserve. Non-vacuous
+    /// against the `.filter(|&members| members > 0)` in `min_replicas`: without it the
+    /// witness collapses to `declared` (1) and both assertions below read 1.
+    #[test]
+    fn an_empty_durable_roster_is_not_a_membership_witness() {
+        use std::collections::BTreeSet;
+
+        // Two peers observed, then an uninitialised-group roster push.
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        p.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        assert_eq!(p.min_replicas(), 2);
+        p.set_durable_roster(BTreeSet::new(), 0);
+        assert_eq!(
+            p.min_replicas(),
+            2,
+            "an empty roster must not disarm the floor or discard the peak witness"
+        );
+
+        // And with nothing else to fall back on it is simply inert: the never-peered
+        // node still resolves to 1 (the standing lone-node requirement), from
+        // `peak_members`, not from a roster that claims a zero-member cluster.
+        let mut alone = Placement::new(node("a"), DEFAULT_REPLICAS)
+            .with_write_floor(super::WriteFloor::Majority { declared: 1 });
+        alone.set_durable_roster(BTreeSet::new(), 0);
+        assert_eq!(alone.min_replicas(), 1);
     }
 }

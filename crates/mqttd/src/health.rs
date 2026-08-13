@@ -415,12 +415,13 @@ impl HealthState {
         }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
-            let (members, health, floor) = {
+            let (members, health, floor, floor_source) = {
                 let p = p.read().unwrap_or_else(std::sync::PoisonError::into_inner);
                 (
                     p.members_snapshot(),
                     p.replication_health(),
                     p.min_replicas(),
+                    p.write_floor_source(),
                 )
             };
             s.push_str(",\"members\":[");
@@ -441,15 +442,20 @@ impl HealthState {
             // Replication health (issue #167): the silent min(R, members) degradation,
             // stated where an operator looks. `under_replicated: true` means at least
             // one placement group is committing durable writes on fewer copies than
-            // configured; with a write floor above 1, groups below the floor REFUSE
-            // durable writes instead.
+            // configured; `min_actual < write_floor` means groups below the floor are
+            // REFUSING durable writes instead. `write_floor_source` (issue #239)
+            // disambiguates a floor of 1 three ways: `derived` = this node knows of no
+            // peers yet, `configured` = the operator set an explicit floor (1 = disabled),
+            // `durable-off` = there is no durable plane, so nothing can be refused.
             let _ = write!(
                 s,
                 ",\"replication\":{{\"desired\":{},\"min_actual\":{},\
-                 \"under_replicated\":{},\"write_floor\":{floor}}}",
+                 \"under_replicated\":{},\"write_floor\":{floor},\
+                 \"write_floor_source\":\"{}\"}}",
                 health.desired,
                 health.min_actual,
                 health.is_under_replicated(),
+                floor_source,
             );
         }
         // Lease group (durable mode): role, epoch, voter identities, readiness.
@@ -933,12 +939,14 @@ mod tests {
         assert!(body.contains("\"members\":["), "{body}");
         assert!(body.contains("\"id\":\"peer-1\""), "{body}");
         // Replication health (issue #167): 2 members under R=3 → every group holds 2
-        // of the 3 configured copies, and the operator can SEE that here. The floor
-        // is the default 1 (no gating).
+        // of the 3 configured copies, and the operator can SEE that here. This
+        // placement comes from `Placement::new`, i.e. an explicit `Fixed(1)` floor —
+        // so the source reads `configured` (issue #239).
         assert!(
             body.contains(
                 "\"replication\":{\"desired\":3,\"min_actual\":2,\
-                 \"under_replicated\":true,\"write_floor\":1}"
+                 \"under_replicated\":true,\"write_floor\":1,\
+                 \"write_floor_source\":\"configured\"}"
             ),
             "{body}"
         );
@@ -976,6 +984,57 @@ mod tests {
         brownout.set(false);
         let (_, body, _) = super::route(&state, "/statusz").await;
         assert!(body.contains("\"brownout\":{\"disk\":false}"), "{body}");
+    }
+
+    /// Issue #239: `/statusz` reports the RESOLVED write floor and where it came from,
+    /// so an operator can tell "floor 1 because this node is alone" from "floor 1
+    /// because someone disabled it" — and can see, on the degraded node itself, that
+    /// `min_actual < write_floor` (durable writes are being refused).
+    #[tokio::test]
+    async fn statusz_reports_the_derived_write_floor_and_its_source() {
+        use mqtt_cluster::placement::WriteFloor;
+        use std::collections::BTreeSet;
+
+        // Two live members of a three-member durable roster, default posture.
+        let mut p = Placement::new(NodeId("self".into()), DEFAULT_REPLICAS)
+            .with_write_floor(WriteFloor::Majority { declared: 1 });
+        p.observe(
+            &NodeId("peer-1".into()),
+            mqtt_cluster::swim::MemberState::Alive,
+            "peer-1:7000",
+            None,
+        );
+        p.set_durable_roster(
+            ["self", "peer-1", "peer-2"]
+                .iter()
+                .map(|i| NodeId((*i).to_string()))
+                .collect::<BTreeSet<_>>(),
+            0,
+        );
+        // `/statusz` only exists once the identity block is installed (ADR 0054).
+        let state = HealthState::new(spawn_live_hub(), Some(Arc::new(RwLock::new(p))), None, 1)
+            .with_status(
+                "self".into(),
+                Arc::new(
+                    mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None)
+                        .unwrap(),
+                ),
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            );
+
+        let (status, body, _) = super::route(&state, "/statusz").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains(
+                "\"replication\":{\"desired\":3,\"min_actual\":2,\
+                 \"under_replicated\":true,\"write_floor\":2,\
+                 \"write_floor_source\":\"derived\"}"
+            ),
+            "{body}"
+        );
     }
 
     /// Operator-supplied strings (node ids) are JSON-escaped in the body.

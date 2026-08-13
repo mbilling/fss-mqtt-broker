@@ -112,6 +112,7 @@ struct OtelInstruments {
     peer_links: OtelGauge<i64>,
     replication_desired: OtelGauge<i64>,
     replication_min_actual: OtelGauge<i64>,
+    replication_write_floor: OtelGauge<i64>,
     retained_tombstones: OtelGauge<i64>,
     members: OtelGauge<i64>,
     lease_leader: OtelGauge<i64>,
@@ -171,6 +172,7 @@ impl OtelInstruments {
             peer_links: meter.i64_gauge("peer_links").build(),
             replication_desired: meter.i64_gauge("replication_desired").build(),
             replication_min_actual: meter.i64_gauge("replication_min_actual").build(),
+            replication_write_floor: meter.i64_gauge("replication_write_floor").build(),
             retained_tombstones: meter.i64_gauge("retained_tombstones").build(),
             members: meter.i64_gauge("members").build(),
             lease_leader: meter.i64_gauge("lease_leader").build(),
@@ -244,6 +246,7 @@ pub struct Metrics {
     cluster_members: Gauge,
     replication_desired: Gauge,
     replication_min_actual: Gauge,
+    replication_write_floor: Gauge,
     retained_tombstones: Gauge,
     peer_links: Gauge,
     members_by_state: Family<StateLabel, Gauge>,
@@ -403,7 +406,7 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, pending-cap, brownout, too-large)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
         );
 
         let deliver_latency_seconds = register_latency_histogram(
@@ -453,6 +456,14 @@ impl Metrics {
             "Smallest replica-set size any placement group currently has — the \
              worst-case durability; below replication_desired means at least one \
              group is under-replicated (issue #167)",
+        );
+        let replication_write_floor = register_gauge(
+            &mut registry,
+            "replication_write_floor",
+            "Smallest replica set a durable append may commit on (issue #239); \
+             replication_min_actual < replication_write_floor means durable writes \
+             are being REFUSED — QoS>=1 publishers get no ack and redeliver, \
+             retained mutations queue",
         );
         let retained_tombstones = register_gauge(
             &mut registry,
@@ -698,6 +709,7 @@ impl Metrics {
             peer_links,
             replication_desired,
             replication_min_actual,
+            replication_write_floor,
             retained_tombstones,
             members_by_state,
             lease_leader,
@@ -886,19 +898,29 @@ impl Metrics {
         self.otel.peer_links.record(clamp_gauge(n), &[]);
     }
 
-    /// Set cluster-wide replication health (issue #167): the configured replication
-    /// factor and the smallest replica set any placement group currently has.
-    /// `replication_min_actual < replication_desired` is the under-replication alert
-    /// condition — at least one group is committing on fewer copies than configured.
-    pub fn set_replication_health(&self, desired: usize, min_actual: usize) {
+    /// Set cluster-wide replication health (issues #167, #239): the configured
+    /// replication factor, the smallest replica set any placement group currently has,
+    /// and the resolved write floor.
+    ///
+    /// Two distinct operator conditions, which is why all three gauges exist:
+    /// `min_actual < desired` is **warn** (a group holds fewer copies than configured —
+    /// restore the node), and `min_actual < write_floor` is **page** (durable writes are
+    /// being REFUSED: QoS>=1 publishers get no ack and redeliver, retained mutations
+    /// queue). The floor is uniform across groups and `min_actual` is the minimum over
+    /// groups, so the second condition is exactly "some group is refusing".
+    pub fn set_replication_health(&self, desired: usize, min_actual: usize, write_floor: usize) {
         self.replication_desired.set(clamp_gauge(desired));
         self.replication_min_actual.set(clamp_gauge(min_actual));
+        self.replication_write_floor.set(clamp_gauge(write_floor));
         self.otel
             .replication_desired
             .record(clamp_gauge(desired), &[]);
         self.otel
             .replication_min_actual
             .record(clamp_gauge(min_actual), &[]);
+        self.otel
+            .replication_write_floor
+            .record(clamp_gauge(write_floor), &[]);
     }
 
     /// Set the count of retained tombstone fences held awaiting cluster-wide
@@ -1403,6 +1425,11 @@ mod tests {
         m.observe_durable_append_latency(0.002);
         m.durable_append_failed("no-quorum");
         m.gossip_rejected("replay");
+        // Issue #239: the three replication gauges move together, from one setter. The
+        // write floor is the alertable one — docs/OPERATIONS.md makes
+        // `min_actual < write_floor` the PAGE rule — so its NAME and the fact that it is
+        // populated at all are pinned here, where a rename or a dropped `.set()` fails.
+        m.set_replication_health(3, 1, 2);
         let out = m.render();
 
         assert!(out.contains("mqttd_connections_active 1"), "{out}");
@@ -1450,6 +1477,9 @@ mod tests {
             out.contains("mqttd_gossip_rejected_total{reason=\"replay\"} 1"),
             "{out}"
         );
+        assert!(out.contains("mqttd_replication_desired 3"), "{out}");
+        assert!(out.contains("mqttd_replication_min_actual 1"), "{out}");
+        assert!(out.contains("mqttd_replication_write_floor 2"), "{out}");
     }
 
     /// Cardinality guard (ADR 0020 §3): label *keys* are only ever from the fixed set; no

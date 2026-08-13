@@ -358,14 +358,27 @@ pub struct Durable {
     pub lease_voters: u32,
     /// Disk high-water byte cap for the durable store (`MQTTD_STORE_MAX_BYTES`, ADR 0041 T5).
     pub store_max_bytes: Option<u64>,
-    /// Min-replicas write floor (`MQTTD_MIN_REPLICAS`, issue #167): a placement group
-    /// whose replica set has shrunk below this many copies REFUSES durable writes
-    /// (QoS>=1 acks withheld, retained mutations queue) instead of silently promising
-    /// less durability than configured — down to quorum-of-1 without this. Default 1
-    /// (no floor): a lone node stays fully operational when alone. Raising it is an
-    /// explicit durability-over-availability choice; it cannot exceed the replication
-    /// factor (checked at startup).
-    pub min_replicas: u32,
+    /// Min-replicas write floor (`MQTTD_MIN_REPLICAS`, issue #167; on by default
+    /// since issue #239): a placement group whose replica set has shrunk below the
+    /// floor REFUSES durable writes (QoS>=1 acks withheld, retained mutations queue)
+    /// instead of silently promising less durability than configured — down to
+    /// quorum-of-1 without this.
+    ///
+    /// Default [`MinReplicas::Majority`]: the floor is **derived** from the membership
+    /// this node knows — `min(R, witness) / 2 + 1`, where the witness is the
+    /// quorum-committed durable roster (or, before it is first pushed, the high-water
+    /// observed membership and `runtime.ready_min_members`). Capped at the replication
+    /// factor, so it is **1** while the node has never known a peer (a fresh single node
+    /// stays fully operational) and **2** once it knows it belongs to a cluster of two or
+    /// more — which is what the write quorum (`len/2+1`) already needs, so it costs no
+    /// availability. The cap also means it stays 2 in a wider topology: on 5 or 7 nodes a
+    /// group down to 2 copies still commits.
+    ///
+    /// An explicit integer keeps #167's absolute-floor meaning; `1` is the documented
+    /// opt-out (accept single-copy acks). A floor above the replication factor is
+    /// rejected at startup as unsatisfiable. With `enabled = false` there is no durable
+    /// plane and no floor at all.
+    pub min_replicas: MinReplicas,
 }
 
 impl Default for Durable {
@@ -374,7 +387,96 @@ impl Default for Durable {
             enabled: true,
             lease_voters: 5,
             store_max_bytes: None,
-            min_replicas: 1,
+            min_replicas: MinReplicas::Majority,
+        }
+    }
+}
+
+/// The min-replicas write-floor posture (`durable.min_replicas`, issue #239): either an
+/// absolute copy count or the derived majority-of-known-membership floor.
+///
+/// Spelled in TOML/env as an integer (`min_replicas = 2`) or the word `"majority"`
+/// (the default). The two are not interchangeable: an integer is a promise the operator
+/// makes about the topology, the word is a promise the *node* derives from the topology
+/// it can actually witness — which is why the word, not a number, is the safe default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MinReplicasRaw", into = "MinReplicasRaw")]
+pub enum MinReplicas {
+    /// An absolute floor on the replica-set SIZE an append replicates over: `n` members,
+    /// whatever the topology says. `1` disables the refusal (single-copy acks are
+    /// accepted); it can never exceed the replication factor.
+    ///
+    /// It bounds the set, not the acks: `ClusterLog`'s write quorum is `len/2 + 1`, so
+    /// `Count(3)` over a 3-member set still commits once 2 of the 3 copies hold the
+    /// record. For the derived floor below the two coincide at every satisfiable size
+    /// (a set of 2 or 3 needs 2 acks and the floor is 2), which is why the default
+    /// promise — no single-copy durable acks once the node knows it has peers — is
+    /// exactly what the gate enforces.
+    Count(u32),
+    /// The derived floor: a majority of the members this node knows about, capped at the
+    /// replication factor. Resolved per node at write time, not at parse time.
+    Majority,
+}
+
+/// The wire shape of [`MinReplicas`]: TOML/JSON sees an integer or a string, and the
+/// curated `TryFrom` below is the only door in — an unrecognised word is a loud error,
+/// never a silent posture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum MinReplicasRaw {
+    Count(u32),
+    Word(String),
+}
+
+impl TryFrom<MinReplicasRaw> for MinReplicas {
+    type Error = String;
+
+    fn try_from(raw: MinReplicasRaw) -> Result<Self, Self::Error> {
+        match raw {
+            MinReplicasRaw::Count(0) => {
+                Err("durable.min_replicas must be >= 1 (1 = no floor) or \"majority\"".to_string())
+            }
+            MinReplicasRaw::Count(n) => Ok(Self::Count(n)),
+            MinReplicasRaw::Word(w) if w.eq_ignore_ascii_case("majority") => Ok(Self::Majority),
+            MinReplicasRaw::Word(w) => Err(format!(
+                "durable.min_replicas must be an integer >= 1 or \"majority\", got {w:?}"
+            )),
+        }
+    }
+}
+
+impl From<MinReplicas> for MinReplicasRaw {
+    fn from(v: MinReplicas) -> Self {
+        match v {
+            MinReplicas::Count(n) => Self::Count(n),
+            MinReplicas::Majority => Self::Word("majority".to_string()),
+        }
+    }
+}
+
+impl MinReplicas {
+    /// Parse the env spelling (`MQTTD_MIN_REPLICAS`): `majority` (any case) or an
+    /// integer >= 1. Anything else is an error — the same curated door as the file.
+    pub fn parse(v: &str) -> Result<Self, String> {
+        let v = v.trim();
+        if v.eq_ignore_ascii_case("majority") {
+            return Ok(Self::Majority);
+        }
+        let n: u32 = v
+            .parse()
+            .map_err(|_| format!("expected an integer >= 1 or \"majority\", got {v:?}"))?;
+        if n == 0 {
+            return Err("must be >= 1 (1 = no floor) or \"majority\"".to_string());
+        }
+        Ok(Self::Count(n))
+    }
+}
+
+impl std::fmt::Display for MinReplicas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Count(n) => write!(f, "{n}"),
+            Self::Majority => f.write_str("majority"),
         }
     }
 }
@@ -833,7 +935,8 @@ impl Config {
             self.durable.store_max_bytes = Some(num("MQTTD_STORE_MAX_BYTES", &v)?);
         });
         on!("MQTTD_MIN_REPLICAS", v, {
-            self.durable.min_replicas = num("MQTTD_MIN_REPLICAS", &v)?;
+            self.durable.min_replicas = MinReplicas::parse(&v)
+                .map_err(|e| ConfigError::Invalid(format!("MQTTD_MIN_REPLICAS: {e}")))?;
         });
 
         // -- limits --
@@ -939,11 +1042,12 @@ impl Config {
             ));
         }
         // 0 would refuse every durable write unconditionally; the meaningful "no floor"
-        // is 1 (its default). The upper bound (<= replication factor) is checked at
-        // assembly, where the factor is known.
-        if self.durable.min_replicas == 0 {
+        // is 1. The default is the derived `majority` posture (#239), which is always
+        // satisfiable. The upper bound (<= replication factor) is checked at assembly,
+        // where the factor is known.
+        if self.durable.min_replicas == MinReplicas::Count(0) {
             return Err(ConfigError::Invalid(
-                "durable.min_replicas must be >= 1 (1 = no floor)".to_string(),
+                "durable.min_replicas must be >= 1 (1 = no floor) or \"majority\"".to_string(),
             ));
         }
         if self.observability.otlp_interval_secs == 0 {
@@ -1078,6 +1182,7 @@ pub const ENV_VARS: &[&str] = &[
     // durable
     "MQTTD_DURABLE_SESSIONS",
     "MQTTD_LEASE_VOTERS",
+    "MQTTD_MIN_REPLICAS",
     "MQTTD_STORE_MAX_BYTES",
     // limits
     "MQTTD_MAX_CONNECTIONS",
@@ -1227,21 +1332,45 @@ mod tests {
         assert!(Config::from_toml("[runtime]\nready_min_members = 0\n").is_err());
         // 0 would refuse every durable write unconditionally; "no floor" is 1 (#167).
         assert!(Config::from_toml("[durable]\nmin_replicas = 0\n").is_err());
+        // Only the exact word `majority` is a valid non-numeric floor (issue #239) —
+        // a plausible-sounding synonym must not silently become some other posture.
+        assert!(Config::from_toml("[durable]\nmin_replicas = \"quorum\"\n").is_err());
         // shutdown_grace_secs = 0 is *valid* (drain immediately) — not out of range.
         assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_ok());
     }
 
-    /// #167 — the min-replicas write floor: defaults to 1 (no floor; a lone node
-    /// stays fully operational), settable from TOML and env like any durable knob.
+    /// Issue #239 — the min-replicas write floor is ON by default, as the *derived*
+    /// majority posture (`"majority"`), and an explicit integer still sets #167's
+    /// absolute floor. Both spellings come from TOML and from the env.
     #[test]
-    fn min_replicas_floor_defaults_off_and_is_settable() {
-        assert_eq!(Config::default().durable.min_replicas, 1);
+    fn min_replicas_defaults_to_the_derived_majority_floor_and_accepts_explicit_floors() {
+        assert_eq!(
+            Config::default().durable.min_replicas,
+            super::MinReplicas::Majority,
+            "the shipped default must be the derived majority floor, not 1"
+        );
         let c = Config::from_toml("[durable]\nmin_replicas = 2\n").unwrap();
-        assert_eq!(c.durable.min_replicas, 2);
-        let mut c = Config::default();
-        c.overlay_from(|k| (k == "MQTTD_MIN_REPLICAS").then(|| "3".to_string()))
-            .unwrap();
-        assert_eq!(c.durable.min_replicas, 3);
+        assert_eq!(c.durable.min_replicas, super::MinReplicas::Count(2));
+        let c = Config::from_toml("[durable]\nmin_replicas = \"majority\"\n").unwrap();
+        assert_eq!(c.durable.min_replicas, super::MinReplicas::Majority);
+        // The opt-out is still spelled 1.
+        let c = Config::from_toml("[durable]\nmin_replicas = 1\n").unwrap();
+        assert_eq!(c.durable.min_replicas, super::MinReplicas::Count(1));
+
+        let env = |v: &'static str| {
+            let mut c = Config::default();
+            c.overlay_from(|k| (k == "MQTTD_MIN_REPLICAS").then(|| v.to_string()))
+                .map(|()| c.durable.min_replicas)
+        };
+        assert_eq!(env("3").unwrap(), super::MinReplicas::Count(3));
+        assert_eq!(env("majority").unwrap(), super::MinReplicas::Majority);
+        assert_eq!(env("MAJORITY").unwrap(), super::MinReplicas::Majority);
+        assert!(env("sometimes").is_err(), "a bad env word must be loud");
+        assert!(env("0").is_err(), "0 is not a floor");
+
+        // Display round-trips into logs and error text.
+        assert_eq!(super::MinReplicas::Majority.to_string(), "majority");
+        assert_eq!(super::MinReplicas::Count(2).to_string(), "2");
     }
 
     #[test]
@@ -1392,6 +1521,9 @@ mod tests {
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
             "MQTTD_MTLS_IDENTITY_SOURCE" => "san-dns",
+            // The default is the derived `majority` posture (#239), so only an
+            // explicit integer *changes* it.
+            "MQTTD_MIN_REPLICAS" => "2",
             // The node=domain map needs a well-formed entry.
             "MQTTD_FAILURE_DOMAINS" => "n1=rack-a",
             // Numerics (all widths parse "7").
@@ -1501,9 +1633,12 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            72,
+            73,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
+        // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
+        // inventoried here, so the totality sweep below never touched it.
+        assert!(seen.contains("MQTTD_MIN_REPLICAS"));
     }
 
     #[test]

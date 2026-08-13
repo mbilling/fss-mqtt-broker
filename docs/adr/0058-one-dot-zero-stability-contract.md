@@ -94,6 +94,18 @@ window only. Blanket leniency (HiveMQ-style ignore-always) was rejected for the 
 hole; blanket strictness (EMQX-style) for the rollback hole — the knob takes the safe
 half of each.
 
+*Known instance of the residual hole (2026-08-13, issue #239).* The rule above covers a
+NEW key; it does not cover an existing key whose **value shape** widens, because that is a
+type mismatch and type mismatches always fail — `config_unknown_keys = "warn"` cannot
+rescue them. `durable.min_replicas` widened from integer to integer-or-`"majority"`, and
+`docs/mqttd.example.toml` ships the word form, so a config carrying the word cannot be read
+by the previous release. Pre-1.0 this is allowed; it is recorded here and in
+[ADR 0006](0006-consensus-and-replication.md) §4 so it is a decision rather than a
+crash-loop someone discovers during a rollback, and the remedy for a roll-back-safe config
+is named in both places (spell the floor as an integer, or omit the key and take the
+default). Post-1.0 a value-shape widening needs the same treatment a key rename does:
+accept both spellings across the skew window.
+
 ## Tasks
 
 | id | title |

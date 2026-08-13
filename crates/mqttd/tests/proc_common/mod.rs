@@ -357,6 +357,77 @@ impl ProcNode {
         let lease = body.contains("\"lease_group_ready\":true");
         Some((ready, members, lease))
     }
+
+    /// This node's `/statusz` replication view (issue #167/#239):
+    /// `(placement members, min_actual, write_floor, floor_is_derived)`, or `None`
+    /// while unreachable/unparseable. Same naive field scan as `readyz` — the shape
+    /// is ours (`health.rs`), and this is the operator's own surface, so a test that
+    /// judges the write floor through it judges what an operator would see.
+    pub async fn statusz_replication(&self) -> Option<(usize, usize, usize, bool)> {
+        let body = http_get(self.health_addr, "/statusz").await?;
+        // The `members` array here is the placement view: one `{"id":...}` per member.
+        let members = body
+            .split("\"members\":[")
+            .nth(1)?
+            .split(']')
+            .next()?
+            .matches("\"id\":\"")
+            .count();
+        let repl = body.split("\"replication\":{").nth(1)?.split('}').next()?;
+        let field = |name: &str| -> Option<usize> {
+            repl.split(&format!("\"{name}\":"))
+                .nth(1)?
+                .split([',', '}'])
+                .next()?
+                .parse()
+                .ok()
+        };
+        Some((
+            members,
+            field("min_actual")?,
+            field("write_floor")?,
+            repl.contains("\"write_floor_source\":\"derived\""),
+        ))
+    }
+
+    /// This node's `/statusz` `replica_groups` view: `(current, tracked)` — how many of
+    /// the groups it holds a replica copy of are stamped current for their **present**
+    /// replica set (ADR 0043 P1). `current == tracked > 0` is the operator-visible signal
+    /// that the catch-up sweep has re-stamped after a membership change; before it, a
+    /// durable *read* (and therefore `enqueue_with_expiry`, which does `live_range` before
+    /// `append`) still fails with `NoQuorum`, so any test judging the write floor must
+    /// wait for this or it will observe the wrong refusal.
+    pub async fn statusz_replica_groups(&self) -> Option<(usize, usize)> {
+        let body = http_get(self.health_addr, "/statusz").await?;
+        let frag = body
+            .split("\"replica_groups\":{")
+            .nth(1)?
+            .split('}')
+            .next()?;
+        let field = |name: &str| -> Option<usize> {
+            frag.split(&format!("\"{name}\":"))
+                .nth(1)?
+                .split([',', '}'])
+                .next()?
+                .parse()
+                .ok()
+        };
+        Some((field("current")?, field("tracked")?))
+    }
+
+    /// One Prometheus sample from this node's `/metrics`, by its full rendered series
+    /// name (e.g. `mqttd_replication_write_floor`, or
+    /// `mqttd_durable_append_failures_total{reason="unavailable"}`). `None` when the
+    /// series is absent — which for a `_total` counter means zero so far, since the
+    /// registry only renders label sets that have been touched.
+    pub async fn metric(&self, series: &str) -> Option<u64> {
+        let body = http_get(self.health_addr, "/metrics").await?;
+        body.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.rsplit_once(' '))
+            .find(|(name, _)| name.trim() == series)
+            .and_then(|(_, value)| value.trim().parse().ok())
+    }
 }
 
 /// The last ~8KB of a spawned node's log — printed on failure so a CI report
