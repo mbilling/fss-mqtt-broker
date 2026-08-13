@@ -189,3 +189,10 @@ ready_min_members = 1
 # Filesystem config-watch poll interval, seconds (default 0 = signal-only). Set it to auto-reload
 # this file (and the referenced policy files) on change — the Kubernetes ConfigMap case.
 # config_watch_secs = 5
+# Unknown-config-key policy (ADR 0058 T4). Default "refuse": a key this broker version does not
+# know fails the load, every unknown key listed — the typo net. Set "warn" (or
+# MQTTD_CONFIG_UNKNOWN_KEYS=warn) so a config written for a NEWER broker still boots this one —
+# the rollback / mixed-version-fleet window — with each ignored key logged loudly. While "warn"
+# is set, typos are ignored too: prefer setting it only for the skew window, and keep the
+# check-config gate strict.
+# config_unknown_keys = "refuse"

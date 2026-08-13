@@ -76,6 +76,24 @@ the peer-bus frame protocol (negotiated range, ADR 0038), the SWIM datagram form
 (HMAC-tagged, ADR 0003), the four store schemas above, the client-visible MQTT behaviour
 matrix (COMPARISON.md's own cells), and the config surface (keys + semantics).
 
+### E. Config forward-compatibility (T4, as delivered — issue #230)
+
+`deny_unknown_fields` on every table made rollback within a major a lie: the moment an
+X.(Y+1) minor adds a config key, the shared rendered config bricks an X.Y binary (the
+crash-loop is the REVERSE of the upgrade the contract promises to survive). Delivered
+rule: the schema stays **strict by default** — unknown keys fail the load, now with the
+COMPLETE list and the escape hatch named in the error, replacing seventeen per-table
+attributes that stopped at the first unknown key. The escape hatch is
+`runtime.config_unknown_keys = "warn"` / `MQTTD_CONFIG_UNKNOWN_KEYS=warn` (the env layer
+wins for this knob, since the file may be the very thing an older binary cannot read
+strictly): the broker boots, each ignored key is warn-logged at boot AND on every hot
+reload, and type mismatches still always fail. The posture deliberately trades the typo
+net for rollback safety, which is why it is not the default, why the chart's
+`--check-config` gate stays strict, and why the recommendation is to set it for the skew
+window only. Blanket leniency (HiveMQ-style ignore-always) was rejected for the typo
+hole; blanket strictness (EMQX-style) for the rollback hole — the knob takes the safe
+half of each.
+
 ## Tasks
 
 | id | title |

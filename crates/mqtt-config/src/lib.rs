@@ -2,10 +2,14 @@
 //!
 //! This is the strict TOML schema for `mqttd`: one struct per concern, mirroring the
 //! `MQTTD_*` environment surface documented in `mqttd`'s `main.rs`. It is
-//! **deserialize-strict** — every table rejects unknown keys (`deny_unknown_fields`) so a
-//! typo fails the load instead of being silently ignored — and every default encodes the
-//! project's security posture (TLS-only, anonymous off, deny-by-default authz, mTLS on).
-//! Insecure options exist but must be turned on deliberately.
+//! **deserialize-strict by default** — unknown keys fail the load, ALL of them listed
+//! at once, so a typo fails loudly instead of being silently ignored — with one
+//! deliberate escape hatch (`runtime.config_unknown_keys = "warn"`, issue #230 /
+//! ADR 0058 T4): a config written for a NEWER broker must be able to boot an older
+//! binary during a rollback or mixed-version window, unknown keys ignored LOUDLY
+//! instead of crash-looping the fleet. Every default encodes the project's security
+//! posture (TLS-only, anonymous off, deny-by-default authz, mTLS on). Insecure
+//! options exist but must be turned on deliberately.
 //!
 //! The schema is the *shape*; how a file layers under env vars and flags
 //! (defaults < file < env < flags) is ADR 0046 T2. Secret material is referenced **by path
@@ -17,7 +21,7 @@ use std::collections::BTreeMap;
 /// Top-level broker configuration. Every section defaults to a secure, minimal posture;
 /// `#[serde(default)]` lets a file set only what it overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Node identity and on-disk location.
     pub node: Node,
@@ -37,11 +41,17 @@ pub struct Config {
     pub observability: Observability,
     /// Runtime behaviour (shutdown, readiness, reload).
     pub runtime: Runtime,
+    /// The unknown key paths the last parse IGNORED under
+    /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
+    /// log them loudly without a signature change. Never serialized; empty under
+    /// `refuse` (the load fails instead).
+    #[serde(skip)]
+    pub ignored_keys: Vec<String>,
 }
 
 /// Node identity and data directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Node {
     /// Stable node id (`MQTTD_NODE_ID`). Default `node-local`.
     pub id: String,
@@ -75,7 +85,7 @@ impl Default for Node {
 /// not served. TLS is the intended default; plaintext/WS are for local testing or a fronted
 /// deployment and are loudly logged as insecure when enabled.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Listeners {
     /// TLS client listener (`MQTTD_TLS_BIND`), e.g. `0.0.0.0:8883`. Needs [`Tls::cert`]/[`Tls::key`].
     pub tls_bind: Option<String>,
@@ -95,7 +105,7 @@ pub struct Listeners {
 
 /// TLS material for the client listeners. Paths, never inlined key bytes (ADR 0046 T5).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Tls {
     /// Server certificate chain PEM (`MQTTD_TLS_CERT`).
     pub cert: Option<String>,
@@ -128,7 +138,7 @@ pub struct Tls {
 /// Authentication + authorization policy. Secure by default: no anonymous access, mTLS
 /// required, deny-by-default authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Security {
     /// Permit clients presenting no credentials (`MQTTD_ALLOW_ANONYMOUS`). Default `false`.
     pub allow_anonymous: bool,
@@ -177,7 +187,7 @@ impl Default for Security {
 
 /// JWT verification key + optional claim constraints (`MQTTD_JWT_*`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Jwt {
     /// Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046
     /// T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined.
@@ -194,7 +204,7 @@ pub struct Jwt {
 /// JWKS rotation followed live. Distinct from the static-key `Jwt` section — the two
 /// are separate authenticators and are not mixed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Oidc {
     /// Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless
     /// `allow_http` (testing) is set. Also the required `iss` claim value.
@@ -217,7 +227,7 @@ pub struct Oidc {
 /// `OAuth2` introspection, a bespoke user table. The broker `POST`s the credential to `url`
 /// and reads the **HTTP status** as the verdict.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct HttpAuth {
     /// Endpoint to POST credentials to (`MQTTD_HTTP_AUTH_URL`); enables the hook.
     /// Must be `https` unless [`allow_http`](Self::allow_http) is set.
@@ -241,7 +251,7 @@ pub struct HttpAuth {
 
 /// Auth-failure penalty box (`MQTTD_AUTH_PENALTY_*`, ADR 0041 T2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AuthPenalty {
     /// Failures from one IP before it is penalty-boxed (`MQTTD_AUTH_PENALTY_THRESHOLD`).
     pub threshold: Option<u32>,
@@ -251,7 +261,7 @@ pub struct AuthPenalty {
 
 /// Cluster transport (peer links) and SWIM membership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Cluster {
     /// Inter-node listener bind (`MQTTD_PEER_BIND`).
     pub peer_bind: Option<String>,
@@ -301,7 +311,7 @@ impl Default for Cluster {
 
 /// Cluster-bus (peer link) mTLS material (`MQTTD_PEER_TLS_*`). Paths only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct PeerTls {
     /// Cluster CA bundle PEM (`MQTTD_PEER_TLS_CA`).
     pub ca: Option<String>,
@@ -315,7 +325,7 @@ pub struct PeerTls {
 
 /// SWIM gossip membership (`MQTTD_SWIM_*`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Swim {
     /// Gossip UDP bind (`MQTTD_SWIM_BIND`); requires [`Cluster::peer_bind`].
     pub bind: Option<String>,
@@ -339,7 +349,7 @@ pub struct Swim {
 
 /// Durable (consensus-backed) session storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Durable {
     /// Whether durable sessions are enabled (`MQTTD_DURABLE_SESSIONS`). Default `true`
     /// (ADR 0029): durable is the secure, data-safe default.
@@ -372,7 +382,7 @@ impl Default for Durable {
 /// Resource-governance caps + quotas (ADR 0041). `None`/`0` generally means unbounded,
 /// matching the env behaviour.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Limits {
     /// Global connection cap (`MQTTD_MAX_CONNECTIONS`).
     pub max_connections: Option<u64>,
@@ -409,7 +419,7 @@ pub struct Limits {
 
 /// Metrics export (ADR 0020).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Observability {
     /// OTLP/HTTP collector base URL (`MQTTD_OTLP_ENDPOINT`); enables OTLP push export.
     pub otlp_endpoint: Option<String>,
@@ -426,9 +436,26 @@ impl Default for Observability {
     }
 }
 
+/// What to do with config keys this binary does not know (issue #230, ADR 0058 T4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownConfigKeys {
+    /// Fail the load, listing every unknown key (the typo net; the default).
+    #[default]
+    Refuse,
+    /// Boot anyway; the loader reports each ignored key for the caller to log
+    /// loudly. For the window where a config written for a NEWER broker reaches an
+    /// older binary — a rollback within a major (the ADR 0039 promise), or a
+    /// mixed-version fleet sharing one rendered config. Typos are ignored too while
+    /// this is set: the posture deliberately trades the typo net for rollback
+    /// safety, which is why it is NOT the default and why the chart's
+    /// `--check-config` gate (strict) still fails a pod before it serves.
+    Warn,
+}
+
 /// Runtime behaviour: shutdown, readiness gating, config auto-reload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Runtime {
     /// Graceful-shutdown drain window, seconds (`MQTTD_SHUTDOWN_GRACE`, ADR 0019). Default 30;
     /// `0` drains immediately (no wait for in-flight connections).
@@ -438,6 +465,12 @@ pub struct Runtime {
     /// Filesystem config-watch poll interval, seconds (`MQTTD_CONFIG_WATCH`, ADR 0033).
     /// `0`/unset = signal-only (SIGHUP), the default.
     pub config_watch_secs: u64,
+    /// Unknown-config-key policy (`MQTTD_CONFIG_UNKNOWN_KEYS`, issue #230 /
+    /// ADR 0058 T4): `refuse` (default — typos fail the load, all listed) or
+    /// `warn` (boot anyway, ignored keys logged — the rollback / mixed-version
+    /// posture). The env var wins over the file for THIS knob, since the file
+    /// carrying an unknown-to-this-binary key is the very situation it governs.
+    pub config_unknown_keys: UnknownConfigKeys,
 }
 
 impl Default for Runtime {
@@ -446,7 +479,19 @@ impl Default for Runtime {
             shutdown_grace_secs: 30,
             ready_min_members: 1,
             config_watch_secs: 0,
+            config_unknown_keys: UnknownConfigKeys::default(),
         }
+    }
+}
+
+/// Parse `MQTTD_CONFIG_UNKNOWN_KEYS` (issue #230): `refuse` or `warn`.
+fn parse_unknown_keys_policy(v: &str) -> Result<UnknownConfigKeys, ConfigError> {
+    match v.to_ascii_lowercase().as_str() {
+        "refuse" => Ok(UnknownConfigKeys::Refuse),
+        "warn" => Ok(UnknownConfigKeys::Warn),
+        other => Err(ConfigError::Invalid(format!(
+            "MQTTD_CONFIG_UNKNOWN_KEYS must be \"refuse\" or \"warn\", got {other:?}"
+        ))),
     }
 }
 
@@ -480,9 +525,44 @@ impl Config {
     /// # Errors
     /// [`ConfigError::Parse`] on a TOML/shape error, [`ConfigError::Invalid`] on a semantic one.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
-        let cfg: Config = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let cfg = Self::parse_toml(s, None)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Parse TOML with the unknown-key policy applied (issue #230, ADR 0058 T4).
+    ///
+    /// One tolerant pass collects the path of EVERY key the schema does not know;
+    /// the policy — `env_policy` if given (the `MQTTD_CONFIG_UNKNOWN_KEYS` layer,
+    /// which must beat a file that may itself be unreadable-strictly), else the
+    /// file's own `runtime.config_unknown_keys`, else `refuse` — then decides:
+    /// `refuse` fails listing all of them (the typo net, now with the complete
+    /// list instead of first-error), `warn` returns the config with
+    /// [`Config::ignored_keys`] filled for the caller to log. Type mismatches and
+    /// malformed TOML always fail regardless of policy.
+    fn parse_toml(s: &str, env_policy: Option<UnknownConfigKeys>) -> Result<Self, ConfigError> {
+        let mut unknown: Vec<String> = Vec::new();
+        let de = toml::de::Deserializer::new(s);
+        let mut cfg: Config = serde_ignored::deserialize(de, |path| {
+            unknown.push(path.to_string());
+        })
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        if unknown.is_empty() {
+            return Ok(cfg);
+        }
+        match env_policy.unwrap_or(cfg.runtime.config_unknown_keys) {
+            UnknownConfigKeys::Refuse => Err(ConfigError::Parse(format!(
+                "unknown config key(s): {} — a typo, or a config written for a NEWER \
+                 broker version; set runtime.config_unknown_keys = \"warn\" (or \
+                 MQTTD_CONFIG_UNKNOWN_KEYS=warn) to boot anyway during a rollback or \
+                 mixed-version window, ignored keys logged (ADR 0058 T4)",
+                unknown.join(", ")
+            ))),
+            UnknownConfigKeys::Warn => {
+                cfg.ignored_keys = unknown;
+                Ok(cfg)
+            }
+        }
     }
 
     /// Load the layered configuration in ADR 0046 precedence order:
@@ -494,11 +574,21 @@ impl Config {
     /// [`ConfigError::Parse`] if the file is unreadable or malformed; [`ConfigError::Invalid`]
     /// if an env value is unparseable or the result fails validation.
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
+        // The unknown-key policy from the ENV layer is peeked before the file
+        // parse: env beats file everywhere else, and for THIS knob the file may be
+        // exactly the thing that cannot be read strictly (issue #230).
+        let env_policy = match std::env::var("MQTTD_CONFIG_UNKNOWN_KEYS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            None => None,
+            Some(v) => Some(parse_unknown_keys_policy(&v)?),
+        };
         let mut cfg = match path {
             Some(p) => {
                 let s = std::fs::read_to_string(p)
                     .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", p.display())))?;
-                toml::from_str(&s).map_err(|e| ConfigError::Parse(e.to_string()))?
+                Config::parse_toml(&s, env_policy)?
             }
             None => Config::default(),
         };
@@ -817,6 +907,9 @@ impl Config {
         on!("MQTTD_READY_MIN_MEMBERS", v, {
             self.runtime.ready_min_members = num("MQTTD_READY_MIN_MEMBERS", &v)?;
         });
+        on!("MQTTD_CONFIG_UNKNOWN_KEYS", v, {
+            self.runtime.config_unknown_keys = parse_unknown_keys_policy(&v)?;
+        });
         on!("MQTTD_CONFIG_WATCH", v, {
             self.runtime.config_watch_secs = num("MQTTD_CONFIG_WATCH", &v)?;
         });
@@ -1064,10 +1157,55 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_rejected() {
-        // A typo must fail the load, not be silently ignored.
+        // A typo must fail the load, not be silently ignored — and the error must
+        // NAME the key and the escape hatch (issue #230).
         let err = Config::from_toml("[security]\nallow_anonymus = true\n")
             .expect_err("unknown key must be rejected");
-        assert!(matches!(err, super::ConfigError::Parse(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("security.allow_anonymus"), "{msg}");
+        assert!(msg.contains("config_unknown_keys"), "{msg}");
+    }
+
+    /// Issue #230 / ADR 0058 T4: the refusal lists EVERY unknown key at once —
+    /// first-error-only made fixing a rolled-back fleet's config a guess loop.
+    #[test]
+    fn the_refusal_lists_all_unknown_keys() {
+        let err = Config::from_toml("[security]\nallow_anonymus = true\nfuture_knob = 1\n")
+            .expect_err("unknown keys must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("security.allow_anonymus") && msg.contains("security.future_knob"),
+            "{msg}"
+        );
+    }
+
+    /// Issue #230 / ADR 0058 T4, the rollback shape: a config written for a NEWER
+    /// broker (a key this binary has never heard of) boots an OLDER binary when the
+    /// warn posture is set — in the file itself, or by the env layer — with the
+    /// ignored keys reported for loud logging. Type mismatches still always fail.
+    #[test]
+    fn warn_mode_boots_a_newer_config_and_reports_the_ignored_keys() {
+        // The knob in the file: the newer config ships its own skew posture.
+        let c = Config::from_toml(
+            "[runtime]\nconfig_unknown_keys = \"warn\"\n[durable]\nknob_from_the_future = 7\n",
+        )
+        .expect("warn mode must boot a newer config");
+        assert_eq!(c.ignored_keys, vec!["durable.knob_from_the_future"]);
+        // The env layer wins even when the file says nothing.
+        let c = Config::parse_toml(
+            "[durable]\nknob_from_the_future = 7\n",
+            Some(super::UnknownConfigKeys::Warn),
+        )
+        .expect("the env policy must apply to the file parse");
+        assert_eq!(c.ignored_keys, vec!["durable.knob_from_the_future"]);
+        // A type mismatch is never ignorable — it is not an unknown key.
+        assert!(Config::parse_toml(
+            "[durable]\nlease_voters = \"three\"\n",
+            Some(super::UnknownConfigKeys::Warn)
+        )
+        .is_err());
+        // And a bad env value is a loud error, not a silent default.
+        assert!(super::parse_unknown_keys_policy("wran").is_err());
     }
 
     #[test]

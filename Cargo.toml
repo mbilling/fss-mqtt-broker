@@ -66,6 +66,12 @@ aws-lc-rs = "1"
 x509-parser = "0.16"
 # ACL policy files (ADR 0004 step 3)
 toml = "0.8"
+# Collects the PATHS of config keys the strict structs do not know (issue #230 /
+# ADR 0058 T4): one tolerant pass reports every unknown key at once, and the
+# refuse/warn policy is applied to the complete list — replacing the 17 per-struct
+# deny_unknown_fields attributes that errored on the FIRST unknown key and made a
+# newer config brick an older binary on rollback. dtolnay crate, no transitive deps.
+serde_ignored = "0.1"
 # Cluster wire + store codec (ADR 0052): succeeded bincode 1.x (RUSTSEC-2025-0141,
 # archived upstream). Canonical, deterministic encoding; decode allocations are
 # bounded by the input slice, so the frame/datagram caps bound the decoder.
