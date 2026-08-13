@@ -200,13 +200,19 @@ volume mounted into that broker, and anything that can read the CA key can mint 
 is the only boundary between three brokers that share a uid"
   done
 done
+# openssl's -subject printing differs per build — LibreSSL: "subject= /CN=x",
+# OpenSSL 3 (Homebrew): "subject=CN=x", OpenSSL 3 (Ubuntu): "subject=CN = x" — so a literal
+# substring match on "CN=x" passes on macOS and fails on the CI runner (found by exactly
+# that). Compare the extracted CN VALUE instead of a spelling.
+cert_cn() { openssl x509 -in "$1" -noout -subject | sed 's/.*CN *= *//; s/[ ,\/].*//'; }
+
 # The binding the cluster bus enforces, asserted on the artifact's OUTPUT rather than
 # inferred from a passing mesh: a shared leaf would form no cluster at all, and the
 # failure would read as a routing bug.
 for n in mqttd-1 mqttd-2 mqttd-3; do
-  subject="$(openssl x509 -in "$PKI/$n/$n.pem" -noout -subject)"
-  [[ "$subject" == *"CN=$n" ]] \
-    || fail "$n.pem has subject '$subject'; the cluster bus requires CN=$n (the node id)"
+  got_cn="$(cert_cn "$PKI/$n/$n.pem")"
+  [[ "$got_cn" == "$n" ]] \
+    || fail "$n.pem has CN '$got_cn'; the cluster bus requires CN=$n (the node id)"
   ext="$(openssl x509 -in "$PKI/$n/$n.pem" -noout -text)"
   [[ "$ext" == *"TLS Web Server Authentication"* && "$ext" == *"TLS Web Client Authentication"* ]] \
     || fail "$n.pem lacks serverAuth+clientAuth; every node both dials and is dialed"
@@ -261,9 +267,9 @@ to a broker host, and anything that can read the CA key can claim any node's ide
   for f in peer-ca.pem peer.pem peer.key server.pem server.key; do
     [[ -s "$SYSPKI/$n/$f" ]] || fail "$GEN_CERTS did not produce $n/$f"
   done
-  subject="$(openssl x509 -in "$SYSPKI/$n/peer.pem" -noout -subject)"
-  [[ "$subject" == *"CN=$n" ]] \
-    || fail "$n/peer.pem has subject '$subject'; the cluster bus requires CN=$n (the node id)"
+  got_cn="$(cert_cn "$SYSPKI/$n/peer.pem")"
+  [[ "$got_cn" == "$n" ]] \
+    || fail "$n/peer.pem has CN '$got_cn'; the cluster bus requires CN=$n (the node id)"
   # ECDSA, not RSA: this key doubles as the gossip signing key (ADR 0022) and that signer
   # takes nothing else. Asserted on the key as well as via the boot below, so the reason a
   # regression fails is named rather than inferred from a cluster that never forms.

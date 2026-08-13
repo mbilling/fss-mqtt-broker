@@ -127,7 +127,9 @@ BAD=''
 bad() { BAD="$BAD  - $1
 "; }
 cert_text() { openssl x509 -in "$1" -noout -text 2>/dev/null || true; }
-cert_cn() { openssl x509 -in "$1" -noout -subject 2>/dev/null | sed 's/.*CN *= *//; s/,.*//'; }
+# openssl's -subject printing differs per build (LibreSSL "subject= /CN=x", OpenSSL 3
+# "subject=CN=x" or "subject=CN = x"), so extract the VALUE rather than matching a spelling.
+cert_cn() { openssl x509 -in "$1" -noout -subject 2>/dev/null | sed 's/.*CN *= *//; s/[ ,/].*//'; }
 
 check_key() { # <key>
   head -n 1 "$1" 2>/dev/null | grep -q -- '-----BEGIN PRIVATE KEY-----' \
