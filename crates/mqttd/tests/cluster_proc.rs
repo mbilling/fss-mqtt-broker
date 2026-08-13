@@ -169,6 +169,15 @@ async fn run_schedule(seed: u64) {
                     &topic,
                 )
                 .await;
+                let ev = history_check::Event::RetainedProbe {
+                    at_ms: proc.at_ms(),
+                    node: proc.nodes[i].id.clone(),
+                    topic: topic.clone(),
+                    payload: observed
+                        .as_ref()
+                        .map(|p| String::from_utf8_lossy(p).into_owned()),
+                };
+                proc.record(ev);
                 values.push((proc.nodes[i].id.clone(), observed));
             }
             let all_good = values
@@ -254,6 +263,46 @@ async fn run_schedule(seed: u64) {
             ));
         }
     }
+
+    // ---- The INDEPENDENT verdict (issue #231, ADR 0044) ----
+    //
+    // Everything above was judged by this harness; the recorded client-visible
+    // history is now re-judged by `history-check`, a crate that shares nothing
+    // with the broker or this file's oracles. Every CI run of every seed passes
+    // through it; MQTTD_PROC_HISTORY_DIR additionally persists the JSONL so the
+    // nightly job archives what was checked (and the checker binary can re-run
+    // it standalone).
+    let violations = history_check::check(&proc.history);
+    if let Ok(dir) = std::env::var("MQTTD_PROC_HISTORY_DIR") {
+        let _ = std::fs::create_dir_all(&dir);
+        let path = std::path::Path::new(&dir).join(format!("seed-{seed}.jsonl"));
+        let jsonl: String = proc
+            .history
+            .iter()
+            .map(|e| serde_json::to_string(e).expect("history events serialize") + "\n")
+            .collect();
+        if let Err(e) = std::fs::write(&path, jsonl) {
+            eprintln!(
+                "cluster_proc: could not persist the history to {}: {e}",
+                path.display()
+            );
+        } else {
+            eprintln!("cluster_proc: history persisted to {}", path.display());
+        }
+    }
+    if !violations.is_empty() {
+        let detail: Vec<String> = violations.iter().map(ToString::to_string).collect();
+        proc.fail(&format!(
+            "the INDEPENDENT history check found {} violation(s) the in-harness \
+             oracles did not:\n  {}",
+            violations.len(),
+            detail.join("\n  ")
+        ));
+    }
+    eprintln!(
+        "cluster_proc: seed {seed}: independent history check OK ({} events)",
+        proc.history.len()
+    );
 
     // Tear the cluster down (SIGKILL — the dirs are temp).
     for node in &mut proc.nodes {

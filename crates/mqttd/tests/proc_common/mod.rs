@@ -493,6 +493,12 @@ pub struct Proc {
     pub seed: u64,
     pub rng: Rng,
     pub trace: Vec<String>,
+    /// The client-visible history (issue #231): every fact a client saw, recorded
+    /// as it happened and verified at the end by the INDEPENDENT `history-check`
+    /// crate — code that shares nothing with the broker. `started` anchors the
+    /// relative timestamps.
+    pub history: Vec<history_check::Event>,
+    pub started: Instant,
     pub nodes: Vec<ProcNode>,
     pub alive: Vec<bool>,
     pub subs: Vec<Subscriber>,
@@ -510,6 +516,15 @@ pub struct Proc {
 impl Proc {
     pub fn note(&mut self, event: String) {
         self.trace.push(event);
+    }
+
+    /// Milliseconds since the schedule started — the history's clock.
+    pub fn at_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub fn record(&mut self, ev: history_check::Event) {
+        self.history.push(ev);
     }
 
     /// Panic with everything a reader needs to diagnose the failure WITHOUT a
@@ -608,6 +623,12 @@ impl Proc {
                 self.subs[i].conn = Some(client);
                 self.subs[i].via_node = via;
                 self.subs[i].established = true;
+                self.record(history_check::Event::Connect {
+                    at_ms: self.at_ms(),
+                    client: self.subs[i].id.clone(),
+                    via_node: self.nodes[via].id.clone(),
+                    session_present: present,
+                });
                 self.note(format!(
                     "subscriber {} online via {} (present={present})",
                     self.subs[i].id, self.nodes[via].id
@@ -655,11 +676,27 @@ impl Proc {
                     Some(pkid) => {
                         if let Some(c) = self.subs[i].conn.as_mut() {
                             c.puback(pkid).await;
-                            self.subs[i].received.insert(p.payload.to_vec());
+                            if self.subs[i].received.insert(p.payload.to_vec()) {
+                                let ev = history_check::Event::Deliver {
+                                    at_ms: self.at_ms(),
+                                    client: self.subs[i].id.clone(),
+                                    topic: p.topic.clone(),
+                                    payload: String::from_utf8_lossy(&p.payload).into_owned(),
+                                };
+                                self.record(ev);
+                            }
                         }
                     }
                     None => {
-                        self.subs[i].received.insert(p.payload.to_vec());
+                        if self.subs[i].received.insert(p.payload.to_vec()) {
+                            let ev = history_check::Event::Deliver {
+                                at_ms: self.at_ms(),
+                                client: self.subs[i].id.clone(),
+                                topic: p.topic.clone(),
+                                payload: String::from_utf8_lossy(&p.payload).into_owned(),
+                            };
+                            self.record(ev);
+                        }
                     }
                 },
                 common::Recv::Packet(_) => {}
@@ -705,6 +742,14 @@ impl Proc {
         .await
         .is_some();
 
+        self.record(history_check::Event::Publish {
+            at_ms: self.at_ms(),
+            publisher: pub_id.clone(),
+            topic: topic.clone(),
+            payload: String::from_utf8_lossy(&payload).into_owned(),
+            acked,
+            seq: self.payload_counter,
+        });
         if acked {
             self.acked.entry(topic.clone()).or_default().push(payload);
             self.note(format!(
@@ -750,6 +795,12 @@ impl Proc {
         .await
         .is_some();
 
+        self.record(history_check::Event::RetainedSet {
+            at_ms: self.at_ms(),
+            topic: topic.clone(),
+            payload: String::from_utf8_lossy(&payload).into_owned(),
+            acked,
+        });
         self.retained
             .entry(topic.clone())
             .or_default()
@@ -849,6 +900,21 @@ impl Proc {
         let acked = burst.await.unwrap_or_default();
         let owed = acked.len();
         let topic = self.subs[s].topic.clone();
+        // The burst's acked prefix, as the publisher saw it: seqs base..base+owed.
+        for (k, payload) in acked.iter().enumerate() {
+            self.record(history_check::Event::Publish {
+                at_ms: self.at_ms(),
+                publisher: format!("burst-{}-{base}", self.seed),
+                topic: topic.clone(),
+                payload: String::from_utf8_lossy(payload).into_owned(),
+                acked: true,
+                seq: base + k as u64,
+            });
+        }
+        self.record(history_check::Event::Nemesis {
+            at_ms: self.at_ms(),
+            what: format!("SIGKILL {id} at {delay_ms}ms into an acked burst"),
+        });
         self.acked.entry(topic.clone()).or_default().extend(acked);
         self.note(format!(
             "SIGKILLED {id} at {delay_ms}ms into a burst to {topic} ({owed}/8 acked → owed)"
@@ -922,6 +988,10 @@ impl Proc {
             );
         }
         self.alive[dead] = true;
+        self.record(history_check::Event::Nemesis {
+            at_ms: self.at_ms(),
+            what: format!("RESTART {id} over its surviving data dir"),
+        });
         self.note(format!("RESTARTED {id} over its surviving data dir"));
     }
 
@@ -1059,6 +1129,8 @@ pub fn proc_over(seed: u64, nodes: Vec<ProcNode>) -> Proc {
         seed,
         rng: Rng::new(seed),
         trace: Vec::new(),
+        history: Vec::new(),
+        started: Instant::now(),
         alive: vec![true; nodes.len()],
         nodes,
         subs: Vec::new(),
@@ -1093,6 +1165,12 @@ pub async fn establish_subscribers(proc: &mut Proc, n: usize) {
             let sub = proc.subs[i].conn.as_mut().unwrap();
             let ack = sub.subscribe(1, &topic, QoS::AtLeastOnce).await;
             if ack.return_codes.iter().all(|c| *c != 0x80) {
+                let ev = history_check::Event::Subscribe {
+                    at_ms: proc.at_ms(),
+                    client: proc.subs[i].id.clone(),
+                    topic: topic.clone(),
+                };
+                proc.record(ev);
                 break;
             }
             assert!(

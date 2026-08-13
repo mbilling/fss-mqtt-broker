@@ -1,0 +1,18 @@
+[package]
+name = "history-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Independent checker for recorded client-visible histories (issue #231)"
+
+# INDEPENDENCE IS THE POINT (ADR 0044 / issue #231): this crate must never depend on
+# mqtt-core / mqtt-cluster / mqttd — a checker that shares the implementation's types
+# and helpers inherits its blind spots. Events are re-derived from serialized facts.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

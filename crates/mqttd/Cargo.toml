@@ -47,6 +47,10 @@ rustix = { version = "1", features = ["process"] }
 
 
 [dev-dependencies]
+# The independent history checker (issue #231): the out-of-process harness records
+# client-visible events and verifies them in-test through code that shares nothing
+# with the broker; the same JSONL feeds the nightly `history-check` binary.
+history-check = { path = "../history-check" }
 jsonwebtoken.workspace = true
 # fault-injecting SessionStore double for the durable-attach readiness tests (ADR 0017)
 async-trait = "0.1"

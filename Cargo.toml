@@ -12,6 +12,7 @@ members = [
     "crates/mqttd",
     "crates/mqtt-bridge",
     "crates/mqttd-operator",
+    "crates/history-check",
 ]
 # `tools/mqttui` is a SEPARATE workspace with its own lockfile (ADR 0056 §1). ratatui and
 # crossterm must never enter the broker's dependency graph: this workspace is audited by

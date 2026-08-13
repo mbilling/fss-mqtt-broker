@@ -26,7 +26,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # 8 seeds ≈ 8 full spawn/kill/restart schedules (serialized by design).
       - name: cluster_proc sweep
-        run: MQTTD_PROC_SEEDS=8 cargo test -p mqttd --test cluster_proc -- --nocapture
+        run: MQTTD_PROC_SEEDS=8 MQTTD_PROC_HISTORY_DIR=$PWD/target/proc-histories cargo test -p mqttd --test cluster_proc -- --nocapture
+      # The independent verdict, standalone (issue #231): the same histories every
+      # seed already passed in-test, re-checked by the checker BINARY — proving the
+      # artifact chain works and archiving what was verified.
+      - name: Re-check the recorded histories independently
+        run: cargo run -p history-check -- target/proc-histories/*.jsonl
+      - name: Archive the checked histories
+        uses: actions/upload-artifact@v4
+        with:
+          name: proc-histories
+          path: target/proc-histories/
+          retention-days: 14
 
   stress-sweep:
     name: in-process stress sweep
