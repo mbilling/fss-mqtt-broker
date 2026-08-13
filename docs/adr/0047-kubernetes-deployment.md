@@ -207,10 +207,109 @@ reviewer read it the same way, and it is not what the broker actually requires: 
 single static binary configured entirely by environment.
 
 **`deploy/compose/` and `deploy/systemd/` now ship**, configured identically to the chart
-(`MQTTD_*` environment, secrets by path) and secure by default: authentication on,
-deny-by-default topic ACLs, an authenticated gossip mesh, majority-aware readiness, and a
-memory bound — because the broker still has no total-memory knob, so the cgroup limit is
-the bound (ADR 0041 T8 remains open, and `docs/SIZING.md` says so).
+(`MQTTD_*` environment, secrets by path): TLS 1.3 on the client listener with no plaintext
+listener, a mutually authenticated cluster bus (which also makes gossip per-node signed,
+ADR 0022), authentication on, deny-by-default topic ACLs, an authenticated gossip mesh,
+majority-aware readiness, and a memory bound — because the broker still has no total-memory
+knob, so the cgroup limit is the bound (ADR 0041 T8 remains open, and `docs/SIZING.md` says
+so). The TLS half of that list arrived later than the rest; see the note below.
+
+**As delivered — the non-Kubernetes reference deployments are TLS by default, not plaintext
+(issue #254).** As first shipped, T9's artifacts were *not* what this amendment claimed.
+`deploy/compose/compose.yaml` set `MQTTD_PLAINTEXT_BIND` and published `1883` to the host,
+`deploy/systemd/mqttd.env.example` did the same with the TLS lines commented out, and
+neither set `MQTTD_PEER_TLS_*` — so Argon2id-backed passwords crossed the wire in cleartext
+and the cluster bus was plaintext, while the README called both "secure by default". The
+warning existed, in `deploy/compose/README.md`, one file away from the claim. That is the
+shape of failure this record cares about most: the artifact was correct about everything a
+reviewer would check and wrong about the one thing a novice would ship.
+
+The exit chosen was to make the artifact true rather than to soften the claim. Compose now
+runs a root one-shot (`deploy/compose/init.sh`) *inside* `docker compose up`, gated by
+`depends_on: service_completed_successfully`, which mints a throwaway starter CA and **one
+leaf per node** and stages the bootstrap secrets into a volume it chowns to uid 65532. Both
+of those details are forced rather than stylistic: the cluster bus requires the peer
+certificate's Subject CN to equal `MQTTD_NODE_ID` and its SAN to cover the host part of
+`MQTTD_PEER_ADVERTISE`, so a single shared leaf forms no mesh; and a bind-mounted 0700
+`./secrets` cannot be traversed by uid 65532 on a native-Linux docker host at all, which
+Docker Desktop's uid mapping had been hiding. `MQTTD_SWIM_SIGNED` is set explicitly to
+`require`, so a later deletion of the peer-TLS lines is a startup error instead of a silent
+downgrade to shared-key gossip. The reader still runs two commands.
+
+Plaintext survives as an explicitly named second file — `docker compose -f compose.yaml -f
+compose.plaintext.yaml up -d` — deliberately *not* called `compose.override.yaml`, because
+Compose loads that name automatically and a stray copy would downgrade a cluster with
+nothing in the output saying so. The systemd env file is flipped the same way: TLS and the
+cluster-bus trio uncommented, plaintext commented and labelled at the point of use, so an
+unedited install fails closed rather than serving cleartext — with
+`cannot read MQTTD_PEER_TLS_CA (/etc/mqttd/tls/peer-ca.pem): No such file or directory (os
+error 2)`, a message this change added to the broker so that the *documented* symptom is the
+one the binary prints. TLS material is now checked for readability with its variable's name
+attached before it reaches rustls, because one acceptor is built from up to four paths and
+the operator has just been told to edit five marked lines.
+
+Its PKI is a **script**, `deploy/systemd/gen-certs.sh`, not openssl commands in a comment.
+The comment version did not run — an undefined `$PEER_HOST` produced an empty SAN and openssl
+refused to sign — and nothing executed it, which is the same defect class as the one this note
+exists to record. The script mints **one CA for the cluster** (the per-host CA it replaces
+gives every node a different trust root, so no peer handshake and no gossip verification
+succeeds and all three brokers start, log `SIGNED per-node` and never become ready), keeps the
+**CA private key off broker hosts** and out of every per-node directory, and prints per-file
+`install` commands rather than a `chmod /etc/mqttd/tls/*.key` glob that would hand the mqttd
+service account whatever else is in that directory. `scripts/deploy-smoke.sh` runs it and boots
+two nodes from its output on every PR.
+
+Two test lanes, because the gap that let this ship was a testing gap as much as a
+configuration one. `scripts/deploy-smoke.sh` (per PR) now runs entirely over TLS with a
+mutually authenticated bus, minting its PKI by *calling* both shipped recipes rather than
+restating either — `init.sh` for the three-node cluster, `gen-certs.sh` for two more nodes
+that must route to each other — and asserts that neither artifact ships a plaintext listener,
+that no node logs `INSECURE`, that every node logs signed per-node gossip, that a cleartext
+client is refused, and that the rendered default compose config contains no `1883` while the
+overlay does. `scripts/compose-smoke.sh` (nightly, on the image lane) brings the actual
+compose file up in containers — which is also what makes `compose.yaml`'s long-standing
+"tested by `scripts/compose-smoke.sh`" comment true, rather than a comment naming a script
+that did not exist.
+
+The bound on that second lane is the **image**, and it is stated in the file rather than left
+to be discovered: `compose-smoke.sh` exports `MQTTD_IMAGE` before `./bootstrap.sh` and every
+compose call, so the `${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}` default is
+never exercised — and cannot be until the tag moves, because the published `:latest` is still
+v0.9.0, which predates both `mqttd --hash-password` (bootstrap.sh) and the `--probe` early
+exit (the healthcheck). Issue #263 tracks it; `compose.yaml`, `deploy/README.md`,
+`deploy/compose/README.md` and the script's own output all say plainly what is and is not
+covered, so an adopter who hits three permanently `unhealthy` containers finds the cause
+rather than a claim it works.
+
+Two custody properties of the compose reference are structural, and checked as such. Each
+broker mounts **only its own** `mqttd-tls-N` volume, and the CA private key lives in
+`mqttd-ca`, which only the `init` one-shot mounts: all three containers run as uid 65532, so
+file modes cannot separate them and the mount list is the only boundary available.
+`deploy-smoke.sh` asserts that against the rendered config on every PR, and `compose-smoke.sh`
+lists each volume in the running stack. The founder's readiness floor is the other: `mqttd-1`
+renders `1` so ordered bring-up can start at all, which exempts it from the majority rule
+until the documented "arm the founder" step raises it — that step now sets
+`MQTTD_1_READY_MIN_MEMBERS=2` alongside the seeds, and both renderings are asserted.
+
+The one-shot's image is **pinned** (`alpine/openssl:3.5.7`), matching how this repo pins every
+other third-party image. It shipped floating on `:latest` first, which made the cluster's trust
+root depend on what Docker Hub served that day inside the file this record calls a real
+deployment, and put an unpinned pull in the nightly lane. `MQTTD_CERTGEN_IMAGE` remains as a
+mirror/air-gap override, not as the default.
+
+The regression this carries is upgrade-only and documented, not coded around: **there is no
+rolling upgrade from a plaintext cluster, and `deploy/compose/README.md` says so and gives one
+route — `down` then `up`.** None of the three things that change has a mixed mode. Signed
+gossip has none. The peer bus has none either: a node with `MQTTD_PEER_TLS_*` starts a TLS peer
+acceptor and only that one, with no sniffing and no plaintext fallback
+(`crates/mqttd/src/peer.rs::serve_listener` takes the plaintext branch only when its TLS
+context is `None`), so a rolled node forms no bus link with an un-rolled one. And the client
+listener has none, because the roll removes `1883`. `MQTTD_SWIM_SIGNED=off` therefore does not
+buy a no-downtime roll — it keeps the gossip half whole and relocates the split onto the peer
+bus, where the minority half loses `lease_group_ready` while still accepting clients. An
+earlier draft of this note advertised that as a second "safe route" with no outage; it was
+neither, and the correction is recorded rather than quietly edited because the promise is the
+kind an operator plans a maintenance window around.
 
 ### What Kubernetes was doing for us that these cannot
 

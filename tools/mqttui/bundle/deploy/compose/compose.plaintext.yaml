@@ -1,0 +1,37 @@
+# INSECURE, OPT-IN. This re-adds the plaintext MQTT listener that compose.yaml
+# deliberately does not have.
+#
+# What you are choosing: the password file is Argon2id-hashed at rest, but with this
+# overlay the PASSWORDS THEMSELVES cross the wire in cleartext, as does every message.
+# Every broker logs `INSECURE: starting PLAINTEXT MQTT listener` on each start, and
+# will keep doing so. A trusted local machine only — never a shared network.
+#
+#   docker compose -f compose.yaml -f compose.plaintext.yaml up -d
+#
+# The TLS listener on 8883/8884/8885 stays up alongside it; this only ADDS a way in.
+#
+# WHY THIS IS NOT NAMED compose.override.yaml: Compose loads that filename automatically,
+# with no flag and no output saying so, so a stray copy left in the directory would
+# downgrade a whole cluster invisibly — which is exactly the failure this file's existence
+# is meant to prevent. The `-f … -f …` form shows up in shell history, in CI logs, and in
+# the bug report somebody eventually files.
+
+name: mqttd
+
+# Published on 127.0.0.1 even here: opting into cleartext on your own machine is a
+# different decision from exposing it to the network. Change these deliberately.
+services:
+  mqttd-1:
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883
+    ports: ["127.0.0.1:1883:1883"]
+
+  mqttd-2:
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883
+    ports: ["127.0.0.1:1884:1883"]
+
+  mqttd-3:
+    environment:
+      MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883
+    ports: ["127.0.0.1:1885:1883"]

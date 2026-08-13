@@ -1071,7 +1071,7 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 
 ### Running the demo, migrations and test scripts
 
-There are 25 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
+There are 26 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
 conformance suites, the Kubernetes end-to-end runs, the benchmark harness. `mqttui` is the
 one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and
 [Start here](#start-here) for installing it):
@@ -1104,15 +1104,35 @@ cd deploy/compose && ./bootstrap.sh && docker compose up -d   # three nodes, one
 ```
 
 ```sh
+deploy/systemd/gen-certs.sh ca                                 # ONCE, on an admin box
+deploy/systemd/gen-certs.sh node mqttd-1 mqttd-1.example.com   # ...then once per node
 sudo install -m 0644 deploy/systemd/mqttd.service /etc/systemd/system/
 sudo install -m 0640 deploy/systemd/mqttd.env.example /etc/mqttd/mqttd.env
+sudo $EDITOR /etc/mqttd/mqttd.env                              # five marked lines
 sudo systemctl enable --now mqttd                              # bare metal / VMs
 ```
 
-Both are configured exactly as the chart is (`MQTTD_*`, secrets by path) and are secure by
-default: authentication on, deny-by-default ACLs, an authenticated gossip mesh,
-majority-aware readiness, a memory bound. The systemd unit is hardened
-(`ProtectSystem=strict`, empty `CapabilityBoundingSet`, `SystemCallFilter=@system-service`).
+Both are configured exactly as the chart is (`MQTTD_*`, secrets by path), and what they
+default to is: **TLS 1.3 on the client listener (`8883`) with no plaintext listener at
+all**, a **mutually authenticated cluster bus** — which is also what makes gossip per-node
+signed ([ADR 0022](docs/adr/0022-signed-gossip.md)) rather than shared-key only —
+authentication on, deny-by-default ACLs, majority-aware readiness, and a memory bound. The
+systemd unit is hardened (`ProtectSystem=strict`, empty `CapabilityBoundingSet`,
+`SystemCallFilter=@system-service`).
+
+Neither ships a keypair, because a keypair in a git repository is not a keypair. Compose
+mints a **throwaway starter CA** in a one-shot before the brokers start, so `up -d` stays
+one command and is TLS on the first run; systemd ships the TLS lines uncommented and a
+[`gen-certs.sh`](deploy/systemd/gen-certs.sh) that mints the material — one CA for the
+cluster, one leaf set per node, run from an admin machine so the CA private key never
+reaches a broker host — so an unedited install fails closed at startup, naming the setting
+and the path it could not read, rather than serving cleartext. Both are self-signed starter
+PKIs to replace before production.
+
+Plaintext is still available and is now an explicit, named opt-in:
+`docker compose -f compose.yaml -f compose.plaintext.yaml up -d` (or uncommenting one
+labelled line in the systemd env file). Either way every broker logs `INSECURE: starting
+PLAINTEXT MQTT listener` on every start, for as long as it is on.
 
 Two things Kubernetes was doing for you become yours:
 
@@ -1124,9 +1144,17 @@ Two things Kubernetes was doing for you become yours:
   Compose/systemd health is a *command*, not an HTTP GET. `/livez` passing while `/readyz`
   fails is a minority node: pull it from the load balancer, do not restart it.
 
-`scripts/deploy-smoke.sh` boots three real nodes from the shipped env file on every CI run
-and proves the security posture, cross-node routing, an acked QoS 1 message surviving
-`SIGKILL` of the node that accepted it, and the readiness floor.
+`scripts/deploy-smoke.sh` boots three real nodes from the shipped env file on every CI run —
+over TLS, with a mutually authenticated bus, using a PKI minted by the shipped
+`deploy/compose/init.sh`, and two more from `deploy/systemd/gen-certs.sh` so neither shipped
+recipe can rot — and proves the security posture (including that no node logs
+`INSECURE`, that a cleartext client is refused, and that plaintext comes back *only* with
+the overlay), cross-node routing, an acked QoS 1 message surviving `SIGKILL` of the node
+that accepted it, and the readiness floor. `scripts/compose-smoke.sh` then brings the
+actual `compose.yaml` up in containers on the nightly image lane, because a per-PR job that
+never runs `docker compose up` cannot tell you the file works — always against an image built
+from this repository, so `compose.yaml`'s published-`:latest` default is the one input those
+lanes do not cover (issue #263).
 
 ## Resizing the cluster
 

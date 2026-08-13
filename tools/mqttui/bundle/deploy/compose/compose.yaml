@@ -1,22 +1,38 @@
 # A THREE-NODE mqttd cluster, shaped for a real deployment rather than a demo.
 #
 #   cd deploy/compose
-#   ./bootstrap.sh          # mints the gossip key + a password file, writes .env
-#   docker compose up -d
-#   docker compose ps       # all three healthy in ~30s
+#   ./bootstrap.sh          # mints the gossip key + a password file into secrets/
+#   docker compose up -d    # a one-shot mints the cluster PKI, then the brokers start
+#   docker compose ps       # all three healthy in ~60s
 #
 # Differences from demo/docker-compose.yml, which is a Grafana playground and says so:
+#   - TLS 1.3 on 8883, and NO plaintext listener anywhere in this file;
+#   - the cluster bus is mutually authenticated, with a per-node certificate whose CN is
+#     that node's id — so gossip is also signed per-node (ADR 0022), not just shared-key;
 #   - authentication is ON (no MQTTD_ALLOW_ANONYMOUS anywhere in this file);
 #   - the gossip mesh is authenticated with a key you generate, not a fixed test key;
 #   - each broker gets its own named volume — durable sessions have somewhere to live;
-#   - readiness requires a MAJORITY of the cluster, so a partitioned node leaves rotation;
+#   - each broker gets its own TLS volume too, holding ONLY its own key, and the CA private
+#     key is in a volume no broker mounts (see the `init` block);
+#   - readiness requires a MAJORITY of the cluster once the founder is armed (the founder
+#     starts at 1 so ordered bring-up can begin — README.md, "arm the founder");
 #   - resource limits are set, because an unbounded broker is how you lose the host.
 #
 # Everything here is also what deploy/systemd/ configures, in the other packaging. The
 # two are the same broker with the same environment; pick whichever your fleet runs.
 #
-# Tested, not merely written: scripts/compose-smoke.sh brings this exact file up, proves
-# cross-node routing and that a killed node loses no acknowledged message, and runs in CI.
+# WHAT IS ACTUALLY TESTED, and what is not:
+#   - `scripts/compose-smoke.sh` brings THIS file up in real containers — but always with
+#     MQTTD_IMAGE pointing at an image built from this repository's working tree. The
+#     `${MQTTD_IMAGE:-ghcr.io/...:latest}` DEFAULT below is therefore NOT exercised by any
+#     gate, and the currently published `:latest` (v0.9.0) predates both `--probe` and
+#     `--hash-password`, so `./bootstrap.sh` and the healthcheck below do not work against
+#     it. Tracked in issue #263; see deploy/compose/README.md, "If your containers never
+#     go healthy".
+#   - Every PR runs `scripts/deploy-smoke.sh`: three real nodes with TLS + peer mTLS built
+#     from the values in these shipped files, the PKI minted by the shipped init.sh, and
+#     `docker compose config` assertions on this file — including that each broker mounts
+#     only its own TLS volume and that the CA-key volume goes to `init` alone.
 
 name: mqttd
 
@@ -44,6 +60,11 @@ x-broker: &broker
     # anything but 200, so a wedged or minority broker actually reports unhealthy.
     # (The image is distroless — no shell, no curl — so the binary does it.)
     #
+    # NEEDS A BROKER NEWER THAN v0.9.0. In v0.9.0 — which is what the published `:latest`
+    # tag still points at — `--probe` boots a second broker instead of making one HTTP
+    # request, so with the default image below every container stays `unhealthy` forever.
+    # Issue #263 tracks the tag; deploy/compose/README.md says what to do meanwhile.
+    #
     # /readyz, not /livez, on purpose: readiness is majority-aware, so a node that
     # cannot see a quorum drops out of rotation rather than serving clients from a
     # store it cannot write.
@@ -54,7 +75,31 @@ x-broker: &broker
     start_period: 60s      # the lease group takes ~30-90s to form on first boot
 
 x-broker-env: &broker-env
-  MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883
+  # TLS 1.3 only, by design. There is deliberately NO MQTTD_PLAINTEXT_BIND in this file:
+  # the password file below is Argon2id-hashed at rest, and a plaintext listener would put
+  # the passwords themselves on the wire. Plaintext is opt-in, insecure, and lives in its
+  # own named file so choosing it is visible in shell history and CI logs:
+  #
+  #   docker compose -f compose.yaml -f compose.plaintext.yaml up -d
+  #
+  # The certificate and key are per-node and set per service below. Omitting them is not a
+  # silent fallback to cleartext — MQTTD_TLS_BIND without them is a hard startup error.
+  MQTTD_TLS_BIND: 0.0.0.0:8883
+  # For client mTLS, add the client CA — the session identity then becomes the client
+  # certificate's CN. Left commented so the copy-paste password flow in README.md works.
+  #
+  # IT MUST BE A DIFFERENT CA FROM MQTTD_PEER_TLS_CA BELOW, and the path below is not a
+  # file this packaging creates — you bring it. Why it must differ: the cluster bus trusts
+  # every leaf under its own CA as a mesh member. A peer that completes the bus handshake
+  # can send `PeerMessage::ProxyHello { identity, .. }` and crates/mqttd/src/peer.rs serves
+  # the identity it names ("the sender is a verified mesh member"), and a `Hello` whose CN
+  # equals a node id joins the mesh as that node. So a client certificate issued by the BUS
+  # CA is a cluster credential: point this at the bus CA and one device certificate can
+  # authenticate as any MQTT user with no password, or join the cluster outright. Client
+  # identities get their own CA, which signs nothing the bus trusts.
+  # Uncommenting it without mounting that file is a startup error, not a fallback:
+  #   Error: "cannot read MQTTD_TLS_CLIENT_CA (/etc/mqttd/tls/client-ca.pem): No such file or directory (os error 2)"
+  #MQTTD_TLS_CLIENT_CA: /etc/mqttd/tls/client-ca.pem   # YOUR client CA — never the bus CA
   MQTTD_HEALTH_BIND: 0.0.0.0:8080        # /livez, /readyz, /metrics
   MQTTD_PEER_BIND: 0.0.0.0:7001          # cluster bus
   MQTTD_SWIM_BIND: 0.0.0.0:7946          # gossip
@@ -67,13 +112,79 @@ x-broker-env: &broker-env
   # The gossip mesh is authenticated (ADR 0003). Without this, anything that can reach
   # the gossip port can join the cluster and be handed sessions.
   MQTTD_SWIM_KEY_FILE: /run/secrets/mqttd-swim-key
+  # The cluster bus is mutually authenticated (the CA here; the leaf per service below).
+  # Without it, anything that can reach :7001 can speak to the bus. Every leaf under this
+  # CA is a mesh credential — which is why MQTTD_TLS_CLIENT_CA above must be a different
+  # one. Each broker reads it out of its OWN mqttd-tls-N volume.
+  MQTTD_PEER_TLS_CA: /etc/mqttd/tls/ca.pem
+  # Stated EXPLICITLY, though `require` is also what the key + peer-TLS material would
+  # imply (ADR 0022): with it spelled out, deleting the peer-TLS lines below becomes a
+  # startup error instead of a silent downgrade to shared-key-only gossip.
+  # Interpolated so that choosing the shared-key gossip posture is one `.env` line rather
+  # than an edit to this file. It does NOT buy a rolling upgrade from a plaintext cluster:
+  # the peer bus has no mixed mode either — a node with MQTTD_PEER_TLS_* accepts only mTLS
+  # links, with no sniffing and no plaintext fallback — so a rolled node forms no bus link
+  # with an un-rolled one whatever this is set to, and a rolled node no longer serves the
+  # 1883 its clients are on. There is one honest route: down, then up. See README.md,
+  # "Upgrading an existing plaintext cluster".
+  MQTTD_SWIM_SIGNED: ${MQTTD_SWIM_SIGNED:-require}
   # A node is Ready only when it can see a majority (2 of 3). A minority node stays out
-  # of rotation instead of serving clients from a store it cannot write.
+  # of rotation instead of serving clients from a store it cannot write. mqttd-1 overrides
+  # this to 1 for its FIRST bring-up only — see that service, and README.md's "arm the
+  # founder", which raises it back to 2 in the same step that gives it seeds.
   MQTTD_READY_MIN_MEMBERS: "2"
   MQTTD_SHUTDOWN_GRACE: "30"
   RUST_LOG: ${MQTTD_LOG:-info}
 
 services:
+  # ── the PKI + secret staging one-shot ───────────────────────────────────────────
+  # Runs to completion before any broker starts, as root, and is the ONLY non-mqttd
+  # image in this file. It mints a THROWAWAY starter CA and one leaf per node (see
+  # init.sh for why the CN must equal the node id), stages the bootstrap secrets into a
+  # volume the brokers' uid 65532 can read, and drops secrets/ca.pem for host clients.
+  #
+  # KEY CUSTODY IS THE MOUNT LIST. This is the only service that mounts `mqttd-ca` — the
+  # volume holding the CA private key — and the only one that mounts more than one node's
+  # certificates. Each broker below mounts exactly one `mqttd-tls-N`, holding its own key
+  # and the CA CERTIFICATE only. All three brokers run as the same uid, so modes cannot
+  # separate them; separate volumes can. deploy/README.md states the rule, and
+  # scripts/deploy-smoke.sh asserts it against the rendered config on every PR.
+  #
+  # PINNED, like every other third-party image in this repo (busybox:1.36 in
+  # demo/docker-compose.yml and bench/, initImage "1.36" in deploy/helm/mqttd/values.yaml).
+  # A floating `:latest` would mean the cluster's trust root is minted by whatever Docker Hub
+  # serves that day, in the one file this repo bills as shaped for a real deployment — and it
+  # would put an unpinned pull in the nightly compose lane. To pin harder, replace the tag
+  # with the digest this tag resolves to:
+  #   alpine/openssl@sha256:7ca28a8cfa05375bc0139b580654c7eec45ea322c066a5189a50f8be457f22b0
+  #
+  # Air-gapped or mirrored registry? Point MQTTD_CERTGEN_IMAGE at your copy — any
+  # alpine-ish image with `openssl` and `sh` works. That variable is an override, not the
+  # default. Nothing else here needs the internet.
+  init:
+    image: ${MQTTD_CERTGEN_IMAGE:-alpine/openssl:3.5.7}
+    restart: "no"
+    entrypoint: ["sh", "/init.sh"]
+    environment:
+      CERT_DIR: /certs          # one SUBDIRECTORY per node, each a volume of its own
+      CA_DIR: /ca               # the CA private key — this service's mount and nobody else's
+      SECRETS_SRC: /in
+      SECRETS_OUT: /secrets
+      # THE SECOND EDIT POINT WHEN YOU RESIZE. This list decides how many leaves get minted;
+      # a service block added below without a matching entry here gets no certificate and
+      # fails closed on the missing file. The THIRD is the per-node volume below — init.sh
+      # fails loudly, naming it, rather than minting into a directory that vanishes.
+      # README.md, "Adding a node", has the procedure.
+      MQTTD_NODES: mqttd-1 mqttd-2 mqttd-3
+    volumes:
+      - ./init.sh:/init.sh:ro
+      - ./secrets:/in                    # rw: it writes ca.pem back for host clients
+      - mqttd-ca:/ca                     # CA cert + PRIVATE KEY; mounted here ONLY
+      - mqttd-tls-1:/certs/mqttd-1       # each node's leaf lands in its own volume …
+      - mqttd-tls-2:/certs/mqttd-2
+      - mqttd-tls-3:/certs/mqttd-3
+      - mqttd-secrets:/secrets
+
   # ── node 1: the FOUNDER ─────────────────────────────────────────────────────────
   # It renders no seeds, and that is precisely what makes it found the lease group.
   # Read deploy/compose/README.md ("After the first bring-up") before you restart it
@@ -83,49 +194,93 @@ services:
   mqttd-1:
     <<: *broker
     hostname: mqttd-1
+    depends_on:
+      init: {condition: service_completed_successfully}
     environment:
       <<: *broker-env
       MQTTD_NODE_ID: mqttd-1
+      # This node's leaf. Its CN is `mqttd-1` — the same string as MQTTD_NODE_ID, which
+      # the cluster bus enforces — and its SAN covers the MQTTD_PEER_ADVERTISE host below
+      # (plus localhost/127.0.0.1, so a client on the Docker host can verify it too).
+      MQTTD_TLS_CERT: /etc/mqttd/tls/mqttd-1.pem
+      MQTTD_TLS_KEY: /etc/mqttd/tls/mqttd-1.key
+      MQTTD_PEER_TLS_CERT: /etc/mqttd/tls/mqttd-1.pem
+      MQTTD_PEER_TLS_KEY: /etc/mqttd/tls/mqttd-1.key
       MQTTD_PEER_ADVERTISE: mqttd-1:7001   # peers dial THIS, never the 0.0.0.0 bind
       MQTTD_SWIM_SEEDS: ${MQTTD_1_SEEDS:-}
-      # The founder must be able to come Ready alone, or ordered bring-up never starts.
-      MQTTD_READY_MIN_MEMBERS: "1"
-    ports: ["1883:1883", "8080:8080"]
+      # The founder must be able to come Ready alone, or ordered bring-up never starts —
+      # so it starts at 1, and that is an EXEMPTION FROM THE MAJORITY RULE, not the rule.
+      # Left at 1, node 1 keeps reporting ready to Docker and to your load balancer when it
+      # is alone in a partition, and QoS 1 publishes routed to it hang. Raise it in the same
+      # step that gives it seeds (README.md, "After the first bring-up: arm the founder"):
+      #   printf 'MQTTD_1_SEEDS=mqttd-2:7946,mqttd-3:7946\nMQTTD_1_READY_MIN_MEMBERS=2\n' >> .env
+      #   docker compose up -d mqttd-1
+      # Interpolated for exactly that, and scripts/deploy-smoke.sh asserts both renderings
+      # (1 by default, 2 once armed) so the documented step keeps working.
+      MQTTD_READY_MIN_MEMBERS: ${MQTTD_1_READY_MIN_MEMBERS:-1}
+    # Health/metrics on LOOPBACK only: /metrics is unauthenticated, and this matches
+    # deploy/systemd/mqttd.env.example. Reach it with `docker compose exec` or an SSH
+    # tunnel, or put an authenticating proxy in front of it.
+    ports: ["8883:8883", "127.0.0.1:8080:8080"]
     volumes:
       - mqttd-1-data:/var/lib/mqttd
       - ./acl.toml:/etc/mqttd/acl.toml:ro
-      - ./secrets:/run/secrets:ro
+      - mqttd-secrets:/run/secrets:ro
+      # … and ONLY its own: this holds mqttd-1.key, mqttd-1.pem and the CA CERTIFICATE.
+      # Not the other nodes' keys (all three brokers are the same uid, so a shared volume
+      # would let any of them read the others' peer identity) and not the CA private key.
+      - mqttd-tls-1:/etc/mqttd/tls:ro
 
   mqttd-2:
     <<: *broker
     hostname: mqttd-2
-    depends_on: [mqttd-1]
+    depends_on:
+      init: {condition: service_completed_successfully}
+      mqttd-1: {condition: service_started}
     environment:
       <<: *broker-env
       MQTTD_NODE_ID: mqttd-2
+      MQTTD_TLS_CERT: /etc/mqttd/tls/mqttd-2.pem      # CN=mqttd-2, SAN covers mqttd-2
+      MQTTD_TLS_KEY: /etc/mqttd/tls/mqttd-2.key
+      MQTTD_PEER_TLS_CERT: /etc/mqttd/tls/mqttd-2.pem
+      MQTTD_PEER_TLS_KEY: /etc/mqttd/tls/mqttd-2.key
       MQTTD_PEER_ADVERTISE: mqttd-2:7001
       MQTTD_SWIM_SEEDS: mqttd-1:7946
-    ports: ["1884:1883", "8081:8080"]
+    ports: ["8884:8883", "127.0.0.1:8081:8080"]
     volumes:
       - mqttd-2-data:/var/lib/mqttd
       - ./acl.toml:/etc/mqttd/acl.toml:ro
-      - ./secrets:/run/secrets:ro
+      - mqttd-secrets:/run/secrets:ro
+      # … and ONLY its own: this holds mqttd-2.key, mqttd-2.pem and the CA CERTIFICATE.
+      # Not the other nodes' keys (all three brokers are the same uid, so a shared volume
+      # would let any of them read the others' peer identity) and not the CA private key.
+      - mqttd-tls-2:/etc/mqttd/tls:ro
 
   mqttd-3:
     <<: *broker
     hostname: mqttd-3
-    depends_on: [mqttd-1]
+    depends_on:
+      init: {condition: service_completed_successfully}
+      mqttd-1: {condition: service_started}
     environment:
       <<: *broker-env
       MQTTD_NODE_ID: mqttd-3
+      MQTTD_TLS_CERT: /etc/mqttd/tls/mqttd-3.pem      # CN=mqttd-3, SAN covers mqttd-3
+      MQTTD_TLS_KEY: /etc/mqttd/tls/mqttd-3.key
+      MQTTD_PEER_TLS_CERT: /etc/mqttd/tls/mqttd-3.pem
+      MQTTD_PEER_TLS_KEY: /etc/mqttd/tls/mqttd-3.key
       MQTTD_PEER_ADVERTISE: mqttd-3:7001
       # Two seeds, so a node-1 outage does not stop node 3 rejoining after a restart.
       MQTTD_SWIM_SEEDS: mqttd-1:7946,mqttd-2:7946
-    ports: ["1885:1883", "8082:8080"]
+    ports: ["8885:8883", "127.0.0.1:8082:8080"]
     volumes:
       - mqttd-3-data:/var/lib/mqttd
       - ./acl.toml:/etc/mqttd/acl.toml:ro
-      - ./secrets:/run/secrets:ro
+      - mqttd-secrets:/run/secrets:ro
+      # … and ONLY its own: this holds mqttd-3.key, mqttd-3.pem and the CA CERTIFICATE.
+      # Not the other nodes' keys (all three brokers are the same uid, so a shared volume
+      # would let any of them read the others' peer identity) and not the CA private key.
+      - mqttd-tls-3:/etc/mqttd/tls:ro
 
 volumes:
   # Named, not bind-mounted: these hold durable sessions and the cluster identity.
@@ -133,3 +288,18 @@ volumes:
   mqttd-1-data:
   mqttd-2-data:
   mqttd-3-data:
+  # The cluster PKI and the staged secrets, both minted/staged by the `init` one-shot.
+  # `down -v` destroys the CA too, so every client must re-trust after a wipe; the next
+  # `up` mints a brand-new CA and a fresh secrets/ca.pem.
+  #
+  # SPLIT ON PURPOSE, one volume per trust boundary:
+  #   mqttd-ca      the CA certificate AND private key — mounted into `init` only
+  #   mqttd-tls-N   node N's key + certificate + the CA certificate — mounted read-only
+  #                 into broker N only, so no broker holds another node's peer identity
+  # A single shared volume cannot express that: the brokers are all uid 65532, so the only
+  # boundary available is the mount list.
+  mqttd-ca:
+  mqttd-tls-1:
+  mqttd-tls-2:
+  mqttd-tls-3:
+  mqttd-secrets:

@@ -46,7 +46,12 @@ impl ClusterIdentity {
     pub fn load_or_mint(founder: bool, path: Option<PathBuf>) -> std::io::Result<Self> {
         let persisted = match &path {
             Some(p) if p.exists() => {
-                let raw = std::fs::read_to_string(p)?;
+                let raw = std::fs::read_to_string(p).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("read cluster identity {}: {e}", p.display()),
+                    )
+                })?;
                 let id = raw.trim().to_string();
                 if id.is_empty() {
                     None
@@ -115,9 +120,18 @@ impl ClusterIdentity {
         true
     }
 
+    /// Errors name the FILE. The founder path is reached during startup and propagates
+    /// straight out of `main`, so a bare `NotFound` here used to surface as
+    /// `Error: Os { code: 2, kind: NotFound }` with no path and no clue that the cause was a
+    /// data directory the operator had not created yet.
     fn persist(&self, id: &str) -> std::io::Result<()> {
         if let Some(p) = &self.path {
-            std::fs::write(p, format!("{id}\n"))?;
+            std::fs::write(p, format!("{id}\n")).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("write cluster identity {}: {e}", p.display()),
+                )
+            })?;
         }
         Ok(())
     }

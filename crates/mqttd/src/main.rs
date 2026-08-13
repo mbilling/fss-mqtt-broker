@@ -334,7 +334,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .data_dir
                 .as_ref()
                 .map(|d| std::path::Path::new(d).join("cluster-id")),
-        )?,
+        )
+        // Flattened to its message so the operator gets the same one-line shape as every
+        // other startup refusal. Boxing the `io::Error` itself renders as
+        // `Custom { kind: NotFound, error: "…" }`, which buries the path it now carries.
+        .map_err(|e| e.to_string())?,
     );
     // Evidence for the re-found self-quarantine (issue #92 follow-up): set the first
     // time the gossip driver drops a datagram from a FOREIGN cluster. Created here
@@ -713,6 +717,22 @@ fn admission_gate(
     ))
 }
 
+/// Prove a TLS material file is readable *before* it reaches rustls, so the failure names the
+/// **environment variable** that pointed at it as well as the path.
+///
+/// The loaders in `mqtt_net::tls` name the file they could not read, but they cannot know
+/// which setting chose it — and one acceptor is built from up to four paths (cert, key, client
+/// CA, CRL) while the cluster-bus context is built from another three. An operator who has
+/// just been told to edit five marked lines in `mqttd.env` needs to know *which* line is
+/// wrong, and on a host where the file exists but the broker's service account cannot read it
+/// the filename alone says nothing. Checked in the order the env file lists them, so the
+/// message names the first setting to fix rather than an arbitrary one.
+fn tls_path_readable(var: &str, path: &str) -> Result<(), String> {
+    std::fs::File::open(path)
+        .map(|_| ())
+        .map_err(|e| format!("cannot read {var} ({path}): {e}"))
+}
+
 // One linear listener-wiring flow; splitting it would scatter the env-var reads.
 #[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
@@ -743,6 +763,17 @@ async fn start_client_listeners(
         // rejected at the TLS handshake. Reloadable on SIGHUP via the same closure below, so a
         // freshly-published CRL takes effect on the next handshake with no restart (ADR 0032 §5).
         let crl = config.tls.crl.clone();
+        // Named-variable readability check (see `tls_path_readable`): all four of these come
+        // from different lines of the operator's environment file, and rustls would report
+        // only the filename.
+        tls_path_readable("MQTTD_TLS_CERT", &cert)?;
+        tls_path_readable("MQTTD_TLS_KEY", &key)?;
+        if let Some(p) = &client_ca {
+            tls_path_readable("MQTTD_TLS_CLIENT_CA", p)?;
+        }
+        if let Some(p) = &crl {
+            tls_path_readable("MQTTD_TLS_CRL", p)?;
+        }
         // Resumption cache sized for the fleet (MQTTD_TLS_SESSION_CACHE; 0 disables) —
         // rustls' own 256-entry default is no resumption at all once more devices than
         // that reconnect, and battery-powered clients pay a full handshake every time.
@@ -1028,6 +1059,7 @@ fn authorizer_from_config(
     config: &Config,
 ) -> Result<Arc<dyn Authorizer>, Box<dyn std::error::Error>> {
     if let Some(path) = &config.security.acl_file {
+        tls_path_readable("MQTTD_ACL_FILE", path)?;
         let text = std::fs::read_to_string(path)?;
         let policy = mqtt_auth::acl::AclPolicy::from_toml_str(&text)?;
         info!(%path, "topic ACL policy loaded (deny by default)");
@@ -1144,6 +1176,7 @@ fn authenticator_from_config(
         vec![Arc::new(BasicAuthenticator { allow_anonymous })];
 
     if let Some(path) = &config.security.password_file {
+        tls_path_readable("MQTTD_PASSWORD_FILE", path)?;
         let text = std::fs::read_to_string(path)?;
         let pw = mqtt_auth::password::PasswordAuthenticator::from_file_contents(&text)?;
         info!(%path, "Argon2id password file loaded");
@@ -1576,6 +1609,15 @@ fn peer_tls_from_config(
         config.cluster.peer_tls.key.clone(),
     ) {
         (Some(ca), Some(cert), Some(key)) => {
+            // Named-variable readability check (see `tls_path_readable`). This is the FIRST
+            // material an unedited `mqttd.env.example` install reaches, so this message is
+            // the one the systemd README quotes as the fail-closed symptom.
+            tls_path_readable("MQTTD_PEER_TLS_CA", &ca)?;
+            tls_path_readable("MQTTD_PEER_TLS_CERT", &cert)?;
+            tls_path_readable("MQTTD_PEER_TLS_KEY", &key)?;
+            if let Some(p) = &crl_path {
+                tls_path_readable("MQTTD_PEER_TLS_CRL", p)?;
+            }
             let (ca, cert, key) = (Path::new(&ca), Path::new(&cert), Path::new(&key));
             let ca_der = tls::first_cert_der(ca)?;
             // Cluster-bus CRL (ADR 0022 T7): parsed and CA-verified up front — a bad CRL
@@ -1928,6 +1970,11 @@ async fn start_swim(
         match (&config.cluster.swim.key, &config.cluster.swim.key_file) {
             (Some(hex), _) => Some(hex.clone()),
             (None, Some(path)) => {
+                // Named-variable readability check, same reason as `tls_path_readable`:
+                // a bare `Os { code: 2 }` here is indistinguishable from an unreadable
+                // password or ACL file, and the operator was just told to edit three
+                // secrets-by-path lines (issue #254 round 3).
+                tls_path_readable("MQTTD_SWIM_KEY_FILE", path)?;
                 Some(String::from_utf8_lossy(&mqtt_core::read_secret_file(path)?).to_string())
             }
             (None, None) => None,

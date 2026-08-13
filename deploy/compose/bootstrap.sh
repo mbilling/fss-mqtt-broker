@@ -9,6 +9,12 @@
 #   secrets/mqttd-passwd     — Argon2id `username:hash` lines (ADR 0004)
 #   secrets/PASSWORDS.txt    — the generated plaintext passwords, so you can hand them out
 #
+# Does NOT write the cluster PKI. That is minted by the `init` one-shot inside
+# `docker compose up` (deploy/compose/init.sh), which needs to be root to hand the
+# brokers' uid 65532 readable files — and which drops secrets/ca.pem here afterwards, so
+# a client on this host has a trust anchor. Running this script is a precondition for that
+# one-shot: it refuses to continue, by name, if these files are missing.
+#
 # `secrets/` is gitignored. PASSWORDS.txt is yours to distribute and then DELETE; the
 # broker never reads it. Nothing here is reversible — losing the passwords means
 # re-running for those users, which is the correct property for a credential store.
@@ -66,6 +72,8 @@ if [[ -e "$PW_FILE" ]]; then
   echo "$PW_FILE already exists — refusing to overwrite it."
   echo "Add a user without touching the others:"
   echo "  printf %s '<password>' | mqttd --hash-password <username> >> $PW_FILE"
+  echo "  docker compose up -d init                          # restage the file for the brokers"
+  echo "  docker compose kill -s HUP mqttd-1 mqttd-2 mqttd-3 # reload it in place"
   exit 0
 fi
 
@@ -95,5 +103,10 @@ echo "wrote $PW_FILE ($(wc -l < "$PW_FILE" | tr -d ' ') users, Argon2id)"
 echo "wrote $PLAIN_FILE — the plaintext passwords. Distribute, then delete."
 echo
 echo "Next:"
-echo "  docker compose up -d"
+echo "  docker compose up -d       # a one-shot mints the cluster PKI, then the brokers start"
 echo "  docker compose ps          # all three healthy in ~60s"
+echo
+echo "The listener is TLS 1.3 on 8883 (8884, 8885 for nodes 2 and 3); there is no plaintext"
+echo "port. The one-shot writes $SECRETS/ca.pem — use it as the client trust anchor:"
+echo "  mosquitto_sub -h 127.0.0.1 -p 8883 --cafile secrets/ca.pem \\"
+echo "                -t 'devices/+/up/#' -u backend -P '<password from PASSWORDS.txt>'"
