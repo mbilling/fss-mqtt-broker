@@ -35,6 +35,17 @@
 //!   **default** (ADR 0029). Opt out with `0`/`false`/`off`/`no` for the lightweight
 //!   in-memory store. A node with no `MQTTD_SWIM_SEEDS` is the cluster founder that
 //!   bootstraps the lease group (exactly one per cluster).
+//! - `MQTTD_MIN_REPLICAS`    — the min-replicas write floor (issues #167, #239). Default
+//!   `majority`: a placement group holding fewer than a majority of the members this node
+//!   knows about — **capped at the replication factor** — REFUSES durable writes (QoS>=1
+//!   acks withheld, retained mutations queue) rather than acking a durability promise it
+//!   cannot keep. That is no floor at all while the node has never known a peer
+//!   (single-node stays fully operational) and 2 copies once it knows it has peers, which
+//!   the write quorum already requires. Because of the cap it stays 2 in wider topologies:
+//!   on 5 or 7 nodes a group down to 2 copies still commits. An integer sets an absolute
+//!   floor on the replica-set size instead; `1` disables the refusal and accepts
+//!   single-copy acks. A floor above the replication factor is rejected at startup (and by
+//!   `--check-config` and a live reload). With durable sessions off there is no floor.
 //! - `MQTTD_DATA_DIR`        — directory for on-disk session persistence (ADR 0018),
 //!   orthogonal to durability. With durable on (the default) it makes the lease group
 //!   and replicated log on-disk, so sessions survive a full-cluster restart (the
@@ -153,11 +164,11 @@
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
-use mqtt_cluster::placement::{self, Placement};
+use mqtt_cluster::placement::{self, Placement, WriteFloor};
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
-use mqtt_config::{Config, ConfigError, Jwt};
+use mqtt_config::{Config, ConfigError, Jwt, MinReplicas};
 use mqtt_net::tls;
 use mqtt_observability::{AuditLog, AuditSink};
 use mqtt_storage::logged::ReplicatedSessionStore;
@@ -270,25 +281,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Session-placement ring (ADR 0005), kept in step with SWIM membership and
     // read by the hub to identify each persistent session's owner node.
-    // The min-replicas write floor (issue #167): checked against the replication
-    // factor HERE, where the factor is known — a floor above R can never be met and
-    // would refuse every durable write forever, so it fails fast like any other
-    // invalid configuration.
-    let min_replicas = config.durable.min_replicas as usize;
-    if min_replicas > placement::DEFAULT_REPLICAS {
-        return Err(format!(
-            "durable.min_replicas ({min_replicas}) exceeds the replication factor \
-             ({}) — no group can ever satisfy that floor",
-            placement::DEFAULT_REPLICAS
-        )
-        .into());
-    }
+    let write_floor = resolve_write_floor(&config)?;
     let placement = Arc::new(RwLock::new(
         Placement::new(node_id.clone(), placement::DEFAULT_REPLICAS)
             // This node's own failure-domain label (ADR 0016 T5), so placement reports it
             // in the topology map without waiting for gossip to round-trip.
             .with_local_domain(config.node.failure_domain.clone())
-            .with_min_replicas(min_replicas),
+            .with_write_floor(write_floor),
     ));
 
     // Graceful-shutdown plumbing (ADR 0019): a cancellation token that stops the accept
@@ -1297,17 +1296,59 @@ fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure
             founder,
             voter_cap,
             failure_domains,
-            min_replicas = config.durable.min_replicas,
+            min_replicas = %config.durable.min_replicas,
             "DURABLE sessions enabled: consensus-backed replicated store (on disk)"
         );
     }
-    if config.durable.min_replicas > 1 {
-        info!(
-            floor = config.durable.min_replicas,
-            "min-replicas write floor active (issue #167): a placement group whose \
-             replica set shrinks below the floor REFUSES durable writes (QoS>=1 acks \
-             withheld, retained mutations queue) until capacity returns"
-        );
+    // The write-floor posture, always stated (issue #239): it is ON by default now, so
+    // silence would leave an operator guessing which of the two postures is live. Reached
+    // only in durable mode (the sole caller is the `if durable` branch), which is also why
+    // `resolve_write_floor` reports no floor at all with durable sessions off.
+    match config.durable.min_replicas {
+        MinReplicas::Majority => info!(
+            floor = "majority",
+            declared_members = config.runtime.ready_min_members,
+            replication_factor = placement::DEFAULT_REPLICAS,
+            "min-replicas write floor: DERIVED (issues #167, #239) — a placement group \
+             holding fewer than a majority of the members this node knows about, CAPPED \
+             at the replication factor, REFUSES durable writes (QoS>=1 acks withheld, \
+             retained mutations queue) until capacity returns. That is no floor at all \
+             while this node has never known a peer (a lone node stays fully operational) \
+             and 2 copies once it knows it is part of a cluster of 2 or more — which the \
+             write quorum already requires, so a one-at-a-time roll is unaffected. Because \
+             of the cap it is 2 in a wider topology too: on 5 or 7 nodes a group down to 2 \
+             copies still commits"
+        ),
+        MinReplicas::Count(1) => {
+            if config.runtime.ready_min_members >= 2 {
+                warn!(
+                    declared_members = config.runtime.ready_min_members,
+                    "min-replicas write floor DISABLED (durable.min_replicas = 1) on a \
+                     node that declares it expects a mesh of \
+                     {} members: a group degraded to one live member will ACK durable \
+                     writes on a SINGLE copy, and one further node loss then loses \
+                     acknowledged data. Remove the setting to restore the derived \
+                     majority floor",
+                    config.runtime.ready_min_members
+                );
+            } else {
+                info!(
+                    floor = 1,
+                    "min-replicas write floor: OFF (durable.min_replicas = 1) — \
+                     single-copy durable acks are accepted"
+                );
+            }
+        }
+        MinReplicas::Count(n) => info!(
+            floor = n,
+            "min-replicas write floor: ABSOLUTE — a placement group whose replica SET \
+             shrinks below {n} members REFUSES durable writes (QoS>=1 acks withheld, \
+             retained mutations queue) until capacity returns (issue #167). This bounds \
+             the size of the set an append replicates over, NOT the number of copies the \
+             commit waits for: the write quorum is len/2+1, so a floor of {n} over a \
+             {n}-member set still acks once {} copies have the record",
+            n / 2 + 1
+        ),
     }
 }
 
@@ -2435,9 +2476,9 @@ fn quotas_from_config(config: &Config) -> Result<hub::Quotas, Box<dyn std::error
 /// The runtime acceptance gate (ADR 0046 T4): can this config be built into every derived
 /// runtime value the broker boots with? Runs the same fallible conversions startup does — wire
 /// limits (packet-size fits u32, publish-rate positive), queue limits (queued-messages fits
-/// usize, valid overflow enum), the state quotas, the admission caps, and the disk watermark —
-/// so a config that could not start is rejected *before* it is swapped in live. Returns a
-/// human-readable reason on the first failure.
+/// usize, valid overflow enum), the state quotas, the admission caps, the disk watermark, and
+/// the min-replicas write floor — so a config that could not start is rejected *before* it is
+/// swapped in live. Returns a human-readable reason on the first failure.
 fn runtime_precheck(config: &Config) -> Result<(), String> {
     fn ok<T>(r: Result<T, Box<dyn std::error::Error>>) -> Result<(), String> {
         r.map(|_| ()).map_err(|e| e.to_string())
@@ -2456,6 +2497,12 @@ fn runtime_precheck(config: &Config) -> Result<(), String> {
     if config.durable.store_max_bytes == Some(0) {
         return Err("durable.store_max_bytes must be a positive integer".to_string());
     }
+    // The min-replicas write floor (issue #239). `durable` is restart-scoped, so a reload
+    // that changes it is only reported by `apply_live_config` as a requires-RESTART section
+    // — which is exactly why the check belongs here too: accepting an unsatisfiable floor
+    // live would commit a config that bricks the NEXT boot (`resolve_write_floor` errors
+    // out of `main`), hours later and detached from the reload that caused it.
+    resolve_write_floor(config)?;
     Ok(())
 }
 
@@ -2951,10 +2998,20 @@ enum CheckError {
 /// resolved path on success (so the caller can report it) or a classified error.
 fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
     let path = config_path().map_err(CheckError::Usage)?;
-    match Config::load(path.as_deref()) {
-        Ok(_) => Ok(path),
-        Err(error) => Err(CheckError::Invalid { path, error }),
+    let config = match Config::load(path.as_deref()) {
+        Ok(c) => c,
+        Err(error) => return Err(CheckError::Invalid { path, error }),
+    };
+    // Assembly-time checks that need constants the config layer does not know (issue
+    // #239): an unsatisfiable min-replicas floor is a bad config, and the pre-rollout
+    // gate is the right place to say so — not the first refused write of a live broker.
+    if let Err(message) = resolve_write_floor(&config) {
+        return Err(CheckError::Invalid {
+            path,
+            error: ConfigError::Invalid(message),
+        });
     }
+    Ok(path)
 }
 
 /// The config-file path from `--config <path>` / `--config=<path>` (highest precedence) or the
@@ -2993,6 +3050,51 @@ fn log_effective_config(config: &Config) {
     // Every other secret is now referenced by path (ADR 0046 T5) — paths are safe to log; only
     // the inline gossip key(s) above are raw secrets. The HS256 secret is a file path.
     info!(config = ?redacted, "effective configuration (ADR 0046; secrets redacted)");
+}
+
+/// Resolve `durable.min_replicas` into the placement write-floor policy (issues #167,
+/// #239), rejecting an unsatisfiable configuration.
+///
+/// An explicit integer above the replication factor can never be met and would refuse
+/// every durable write forever, so it fails fast like any other invalid configuration —
+/// and, since this runs from `--check-config` too, it fails *before* a rollout rather
+/// than on the first write of a booted broker. The derived `majority` posture caps its
+/// witness at R, so it is satisfiable by construction: `declared` is carried through as
+/// the operator's floor on the witness (`runtime.ready_min_members`), which is the one
+/// restart-surviving, operator-declared cluster-size number every deploy path renders.
+///
+/// With durable sessions OFF there is no durable plane to gate, and yet the placement ring
+/// is still built and still reported (`HealthState` and both non-durable hub branches carry
+/// it): resolving to `Fixed(1)` there keeps `/statusz`'s `write_floor` and the
+/// `replication_write_floor` gauge honest, so the documented page rule
+/// (`min_actual < write_floor`) cannot fire on a node that refuses nothing. The bound check
+/// still runs first, so `--check-config` rejects an unsatisfiable floor whichever mode the
+/// config names — a config that is invalid the moment durable sessions come back on is
+/// invalid now.
+fn resolve_write_floor(config: &Config) -> Result<WriteFloor, String> {
+    let floor = match config.durable.min_replicas {
+        MinReplicas::Count(n) => {
+            let n = n as usize;
+            if n > placement::DEFAULT_REPLICAS {
+                return Err(format!(
+                    "durable.min_replicas ({n}) exceeds the replication factor \
+                     ({}) — no group can ever satisfy that floor",
+                    placement::DEFAULT_REPLICAS
+                ));
+            }
+            WriteFloor::Fixed(n.max(1))
+        }
+        MinReplicas::Majority => WriteFloor::Majority {
+            declared: config.runtime.ready_min_members,
+        },
+    };
+    Ok(if config.durable.enabled {
+        floor
+    } else {
+        // No durable plane: the gate can never fire, and /statusz must not report this
+        // as an operator-chosen floor of 1 (issue #239 round 2).
+        WriteFloor::DurableOff
+    })
 }
 
 /// Build the server-wide MQTT 5 wire limits from env (ADR 0011/0012/0013), each with a
@@ -3185,9 +3287,9 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::{
         identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
-        runtime_precheck, unknown_flags, wire_limits_from_config,
+        resolve_write_floor, runtime_precheck, unknown_flags, wire_limits_from_config, WriteFloor,
     };
-    use mqtt_config::Config;
+    use mqtt_config::{Config, MinReplicas};
     use mqtt_storage::OverflowPolicy;
 
     /// #169 self-guard: every double-dash flag this source compares against must be in
@@ -3374,5 +3476,66 @@ mod tests {
         let mut c = Config::default();
         c.durable.store_max_bytes = Some(0);
         assert!(runtime_precheck(&c).is_err());
+        // Issue #239: an unsatisfiable min-replicas floor. `durable` is restart-scoped, so
+        // a reload of this is only reported as a requires-RESTART section — and would then
+        // brick the next boot. The reload gate must refuse it, as startup does.
+        let mut c = Config::default();
+        c.durable.min_replicas = MinReplicas::Count(9);
+        let err = runtime_precheck(&c).expect_err("a floor above R must not be swapped in");
+        assert!(
+            err.contains("exceeds the replication factor"),
+            "reason was: {err}"
+        );
+        // The satisfiable spellings both pass, in both durability modes.
+        for enabled in [true, false] {
+            for floor in [MinReplicas::Majority, MinReplicas::Count(1)] {
+                let mut c = Config::default();
+                c.durable.enabled = enabled;
+                c.durable.min_replicas = floor;
+                assert!(runtime_precheck(&c).is_ok(), "{floor} / durable={enabled}");
+            }
+        }
+    }
+
+    /// Issue #239: with durable sessions OFF there is no durable plane to gate, but the
+    /// placement ring is still built and still reported on `/statusz` and the
+    /// `replication_write_floor` gauge. The resolved floor must be 1 there, or the
+    /// documented page rule (`min_actual < write_floor`) fires on a non-durable cluster
+    /// that drops to one live member — where every write is in fact accepted.
+    ///
+    /// It resolves to `DurableOff`, not `Fixed(1)`: both gate identically, but `/statusz`
+    /// renders `Fixed` as `write_floor_source: "configured"`, which would tell an operator
+    /// running the DEFAULT `min_replicas = "majority"` that they had chosen a floor of 1.
+    /// That mislabel was found by the round-2 review of this change.
+    #[test]
+    fn a_non_durable_node_resolves_no_write_floor() {
+        let mut c = Config::default();
+        c.durable.enabled = false;
+        assert_eq!(resolve_write_floor(&c).unwrap(), WriteFloor::DurableOff);
+        // Even with the derived posture named, and even with an explicit floor set.
+        c.durable.min_replicas = MinReplicas::Majority;
+        c.runtime.ready_min_members = 3;
+        assert_eq!(resolve_write_floor(&c).unwrap(), WriteFloor::DurableOff);
+        c.durable.min_replicas = MinReplicas::Count(2);
+        assert_eq!(resolve_write_floor(&c).unwrap(), WriteFloor::DurableOff);
+        // And it still gates as a floor of 1 — the gate behaviour is unchanged.
+        assert_eq!(
+            crate::Placement::new(mqtt_cluster::NodeId("n".into()), 3)
+                .with_write_floor(WriteFloor::DurableOff)
+                .min_replicas(),
+            1
+        );
+        // But the bound is still enforced: a config that is invalid the moment durable
+        // sessions come back on is invalid now.
+        c.durable.min_replicas = MinReplicas::Count(9);
+        assert!(resolve_write_floor(&c).is_err());
+
+        // With durable ON (the default) the derived posture is what boots.
+        let mut on = Config::default();
+        on.runtime.ready_min_members = 2;
+        assert_eq!(
+            resolve_write_floor(&on).unwrap(),
+            WriteFloor::Majority { declared: 2 }
+        );
     }
 }

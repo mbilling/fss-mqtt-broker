@@ -70,6 +70,25 @@ alertable equivalent).
   replica set and verifies before exiting. Watch `/readyz` and the drain logs; then
   take the next step. Never drop below a durable quorum
   (`lease_voters`, default 5 → keep ≥ 3 running).
+- **Down and the write floor:** a *consented* decommission shrinks the quorum-committed
+  durable roster, so the derived `durable.min_replicas` floor follows it down by itself —
+  the common 3→2 and 5→3 shrinks need no action, and neither does 3→1 once the drain has
+  committed the 1-member roster. Two cases still need explicit consent, and for both the
+  knob is the same one:
+  - a shrink to a **single** member while the node still declares
+    `ready_min_members >= 2` — `declared` is a lower bound on the witness, so the floor
+    stays at 2;
+  - an **unconsented** loss with no drain behind it: two of three nodes gone for good, an
+    AZ loss, or a DR restore of one node's `data_dir`. Here the committed roster still
+    names three members and arms the floor **by itself**, so lowering
+    `ready_min_members` changes nothing.
+
+  In both cases the remedy is `durable.min_replicas = 1` on the surviving node. It is a
+  `[durable]` edit and `durable` is restart-scoped, so a SIGHUP reload does **not** apply
+  it (it logs a requires-RESTART warning with `sections=durable` and keeps the running
+  value) — restart the node. Setting it means accepting single-copy durable acks, and the
+  broker logs a warning saying so on every start while `ready_min_members >= 2`. Full
+  symptom-to-remedy path: [TROUBLESHOOTING](TROUBLESHOOTING.md).
 - **PVCs:** on Kubernetes ≥ 1.27 the chart deletes the scaled-down pod's PVC
   (`persistence.retentionPolicy.whenScaled: Delete`) — safe *because* the drain ran
   first, and it prevents a later scale-up from reattaching a stale data dir under the
@@ -196,6 +215,21 @@ restart and rejoins behind the caught-up watermark. Version-skew rules are
 compatibility is promised; post-1.0: adjacent releases negotiate). A roll currently
 pays the full drain on every pod — a known cost, recorded in the ADR 0047 amendment.
 
+A one-at-a-time roll does **not** trip the min-replicas write floor: with two of three
+members live the replica set holds two copies and the write quorum already required two
+acks, so the default (derived) floor of 2 refuses nothing. The floor is capped at the
+replication factor, so this holds in wider topologies too — on 5 or 7 nodes it is still 2.
+See the monitoring table's *Durable writes refused* row for the condition that would trip
+it, and [TROUBLESHOOTING](TROUBLESHOOTING.md) for the symptom and the remedy.
+
+**Rolling back across the write-floor change.** `durable.min_replicas` widened from an
+integer to integer-or-`"majority"`, and `docs/mqttd.example.toml` ships the word form. A
+config carrying `min_replicas = "majority"` is a **type mismatch** for the previous
+release, and `runtime.config_unknown_keys = "warn"` does not rescue type mismatches
+([ADR 0058](adr/0058-one-dot-zero-stability-contract.md) §E). If a config must stay readable by the
+release you might roll back to, spell the floor as an integer or omit the key entirely —
+omitting it takes the same derived default.
+
 ## Backup
 
 Durable state is quorum-replicated: the primary recovery story is *the cluster itself*
@@ -220,6 +254,7 @@ the demo dashboard's "Operator signals" row):
 | **Stuck drain** | `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m | Inspect the drain logs; the grace deadline will fall back to crash semantics |
 | **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | Node not catch-up-current; takeover from it would be degraded |
 | **Quorum thinning** | `mqttd_voters < 3` (with `lease_voters = 5`) | One more loss risks durable writes; restore nodes |
+| **Durable writes refused (under-replicated)** | `mqttd_replication_min_actual < mqttd_replication_write_floor` (page); `mqttd_replication_min_actual < mqttd_replication_desired` (warn) | **Page**: a group is below the min-replicas write floor, so durable writes are being REFUSED — QoS≥1 publishers get no ack, redeliver, and are disconnected; retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not. Corroborate with `mqttd_durable_append_failures_total{reason="unavailable"}` climbing. **Warn**: a group merely holds fewer copies than R. Either way: restore the missing members ([TROUBLESHOOTING](TROUBLESHOOTING.md)). Do **not** lower `durable.min_replicas` to silence it unless you are consciously accepting single-copy acks. Non-durable clusters (`durable.enabled = false`) report a floor of 1, so this rule cannot fire there |
 | **Prolonged rotation window** | `mqttd_swim_keys_accepted > 1` for > 1h | A rotation phase was never closed (see key rotation above) |
 | **Config divergence** | `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m | A config roll did not converge; check the stuck pod |
 | **Degraded durable plane** | `mqttd_lease_quorum_ack_ms` growing (ADR 0049) | fsync-bound consensus; check disks before sessions are refused |

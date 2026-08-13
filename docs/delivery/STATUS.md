@@ -13,7 +13,7 @@
 | [0003](../adr/0003-gossip-authentication.md) | Gossip-plane authentication: keyed MAC on SWIM datagrams | Accepted | [8/9 done](0003-gossip-authentication.md) | — |
 | [0004](../adr/0004-identity-and-authentication.md) | Identity model: mTLS Common Name first, deny by default | Accepted | [13/16 done](0004-identity-and-authentication.md) | 1 deferred |
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [4/6 done](0005-session-affinity.md) | 2 deferred |
-| [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [12/12 done](0006-consensus-and-replication.md) | — |
+| [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [13/13 done](0006-consensus-and-replication.md) | — |
 | [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [9/9 done](0007-durable-store-integration.md) | — |
 | [0008](../adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec | Accepted | [9/9 done](0008-mqtt-5-codec.md) | — |
 | [0009](../adr/0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [3/3 done](0009-mqtt5-expiry.md) | — |

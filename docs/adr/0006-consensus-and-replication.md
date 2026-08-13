@@ -78,7 +78,10 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    the log.
 
    **As delivered — degradation is visible, and gating it is the operator's
-   choice (issue #167).** "R=3, quorum=2" holds only while three nodes are
+   choice (issue #167).** *(2026-08-12 — **partly superseded**: the default is no
+   longer off. Read the 2026-08-13 / issue #239 note below for the shipped posture;
+   everything here about the mechanism still holds.)* "R=3, quorum=2" holds only
+   while three nodes are
    placement-eligible: replica sets truncate to `min(R, members)`, so a
    shrinking cluster keeps acking durable writes on smaller sets — down to
    quorum-of-1 on a lone node — which is availability silently spending the
@@ -87,14 +90,133 @@ single-owner sessions need consensus. This ADR decides *what provides it*,
    holds) is exported as the `replication_desired` / `replication_min_actual`
    gauges, in the `/statusz` `replication` block, and as an edge-triggered
    WARN/recovery log from the reconcile driver. *Gating* (`durable.min_replicas`,
-   default 1 = off): a group whose replica set is below the operator's floor
+   default 1 = off **at the time of this note; now `"majority"` — see below**): a
+   group whose replica set is below the operator's floor
    REFUSES `append` — transient like `NoQuorum`, so QoS≥1 acks are withheld
    (sources redeliver) and retained mutations queue until capacity returns;
    reads, acked-driven truncation and removal stay served, degrading the node
-   to serving what it already promised rather than dying. The default keeps
-   the standing requirement that a lone node is fully operational when alone;
-   a floor above the replication factor is rejected at startup as
+   to serving what it already promised rather than dying. The default of this note
+   kept the standing requirement that a lone node is fully operational when alone —
+   the derived default below keeps that requirement while arming the floor
+   everywhere else; a floor above the replication factor is rejected at startup as
    unsatisfiable.
+
+   **As delivered (2026-08-13, issue #239) — the floor is ON by default, derived
+   from the membership the node knows.** Leaving the gate opt-in left the default
+   posture exactly the one the audit called out: a group degraded to one live
+   member acked durable writes on ONE copy while the operator believed R=3. The
+   default is now `durable.min_replicas = "majority"`, which resolves per node to
+   `min(R, witness) / 2 + 1`, where the *witness* is the largest membership this
+   node can justify believing in: the **quorum-committed durable raft roster**
+   (issue #229) when it has been pushed, otherwise the high-water observed
+   gossip membership — and never below the operator-declared
+   `runtime.ready_min_members`. So the floor is **1** while a node has never
+   known a peer (a fresh single node keeps acking — the standing requirement is
+   untouched) and **2** once it knows it belongs to a cluster of two or more (the
+   lone survivor of a three-node group refuses). An explicit integer keeps #167's
+   absolute-floor meaning, with `1` as the documented opt-out.
+
+   *Why the roster and not liveness.* Any witness that follows liveness *down*
+   disarms itself during the very outage it guards: burying two peers would
+   "un-know" them and drop the floor back to 1. The raft roster cannot shrink
+   without a lease quorum, so it cannot shrink while a majority is down; it
+   survives restart via the on-disk lease state, so a node that cold-boots alone
+   out of a three-member group is still armed; and it *does* shrink on a consented
+   decommission, so a deliberate resize needs no operator edit.
+
+   *Why this costs no availability.* The write quorum is already
+   `replica_set.len() / 2 + 1`, so at two or three live members a floor of 2
+   refuses nothing that a one-at-a-time roll did not already require — the witness
+   is capped at R, which makes the derived floor satisfiable by construction.
+   That is the load-bearing reason the default could be turned on at all; an
+   unconditional floor of 2 (breaking the fresh single node and founder bootstrap)
+   or a strict R=3 (breaking the documented roll) could not have been.
+
+   *What the gate enforces, exactly.* The floor bounds the **size of the replica
+   set** an append replicates over, not the number of copies the commit waits for —
+   `ClusterLog`'s write quorum is `replica_set.len() / 2 + 1`. For the derived
+   default the two coincide at every satisfiable size (a set of 2 or 3 needs 2 acks
+   and the floor is 2), so the promise "no single-copy durable acks once the node
+   knows it has peers" is exactly what is enforced. An **explicit** integer is
+   looser than its wording suggests: `min_replicas = 3` passes on a 3-member set and
+   then commits once 2 of the 3 hold the record. That is #167's carried semantics;
+   the config docs, the reference TOML and the startup log all say so rather than
+   promising the stricter reading.
+
+   *Residual gaps, stated rather than papered over.* (i) A bare-metal node that
+   boots alone with `ready_min_members = 1` but is really part of a mesh resolves
+   the floor to 1 until its first peer observation or roster push — a seconds-long
+   window. Folding the declared member count into the witness closes it for every
+   deploy path that renders one (the operator and Helm chart do); persisting a
+   gossip-only latch instead is rejected (ADR 0038 pre-1.0 format freeze — and it
+   would buy nothing here, because the roster below already produces the
+   restart-armed behaviour, DR case included).
+
+   (ii) **A shrink to one member needs explicit consent, and the roster arms the
+   floor by itself.** Two distinct paths reach it. A *consented* decommission
+   commits a 1-member roster, and the roster is the authority in
+   `Placement::min_replicas`, so the floor follows it down with no operator edit —
+   `ready_min_members` is then the only thing that can still hold it at 2, and
+   lowering it to 1 suffices. But an **unconsented** loss (two of three nodes gone
+   for good, an AZ loss, a DR restore of a single node's `data_dir`) leaves the
+   committed roster naming three members, so the floor stays at 2 **whatever
+   `ready_min_members` says** — that is the witness doing its job, and it is the
+   case an operator hits at 3am. The remedy for both, and the one the runbooks
+   name, is `durable.min_replicas = 1`; it is a restart-scoped `[durable]` edit
+   (`requires_restart`), so a SIGHUP reload stages it without applying it. See
+   OPERATIONS (Scaling) and TROUBLESHOOTING.
+
+   (iii) **None — the refusal is reachable end to end at R=3 and is asserted
+   there.** An earlier draft of this note claimed the opposite ("every state whose
+   replica set is 1 also has no lease quorum, so the refusal is not reachable at
+   this cluster size"); that claim was false and has been withdrawn. A lone
+   survivor of a three-member cluster still holds the committed lease for the
+   groups it owned — `LocalLeaseSource::epoch_for` is a local read of the applied
+   lease map with no leadership, quorum or TTL check, and reassignment is what needs
+   a quorum — so a QoS 1 publish for a durable session in one of those groups
+   reaches the append, is refused by the floor, and the publisher's PUBACK is
+   withheld (`mqttd_durable_append_failures_total{reason="unavailable"}`; log:
+   `replica set holds 1 of the configured floor of 2 copies`). Measured on spawned
+   binaries while settling this question — 30/30 attempts refused, the counter
+   moving once per attempt, on both a follower and a leader survivor — and now
+   asserted every run by
+   `cluster_proc::the_default_write_floor_arms_itself_and_refuses_the_single_copy_promise`.
+   With the floor off (`MQTTD_MIN_REPLICAS=1`) the same publish is ACKED on a single
+   copy: issue #239's defect, and the one-env-var falsification of that test. One sequencing caveat belongs in the record:
+   `enqueue_with_expiry` reads (`live_range`) before it appends and the read is not
+   floor-gated, so until the ADR 0043 P1 catch-up sweep re-stamps the shrunken
+   replica set the enqueue fails earlier with `NoQuorum`; the refusal is what the
+   state settles on, and the process-tier test gates on `/statusz`
+   `replica_groups.current == tracked` before probing.
+
+   (iv) **The floor covers only writes that reach a group this node leases.** A
+   publish for a durable session whose owner is gone is still acked and dropped by
+   the pre-existing no-known-subscriber path, with no refusal logged and no
+   `publish_dropped{reason}` distinguishing it. So "too thin to promise ⇒ refuse"
+   is true of the leased path and not of that one; README Limitations says so, and
+   changing it is out of scope for #239.
+
+   *Operator surface.* The resolved floor is exported as the
+   `replication_write_floor` gauge beside `replication_desired` /
+   `replication_min_actual`, and `/statusz`'s `replication` block carries
+   `write_floor` plus `write_floor_source` (`derived` | `configured`) so a floor of
+   1 reads unambiguously: "this node is alone" versus "someone disabled it".
+   `min_actual < write_floor` is the page condition (durable writes are being
+   REFUSED); `min_actual < desired` remains the warn. With durable sessions off the
+   resolved floor is 1, so that rule cannot fire on a cluster that refuses nothing.
+   `--check-config` **and the ADR 0046 T4 live-reload acceptance gate** now reject
+   an unsatisfiable explicit floor before a rollout instead of at the first refused
+   write — the reload gate matters because `durable` is restart-scoped, so an
+   accepted-but-unsatisfiable floor would brick the next boot hours later.
+
+   *Rollback (ADR 0058 §E).* This widened an existing key's value shape from
+   integer to integer-or-`"majority"`, and the reference config ships the word
+   form. A config carrying `min_replicas = "majority"` therefore **cannot be read
+   by the previous release**: it is a type mismatch, which
+   `runtime.config_unknown_keys = "warn"` does not rescue. Pre-1.0 that is allowed, and it is recorded
+   here so it is a decision rather than a surprise: to keep a config
+   roll-back-safe within this release, spell the floor as an integer (or leave the
+   key out and take the default).
 
 ## Consequences
 

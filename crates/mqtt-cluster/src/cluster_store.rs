@@ -176,7 +176,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     /// The `ClusterLog` for `key`'s group, built and recovered lazily. Errors with
     /// [`ReplError::NotOwner`] if this node does not own the group, or
     /// [`ReplError::NoQuorum`] if recovery cannot reach a quorum of replicas.
-    async fn log_for_key(&self, key: &str) -> Result<Arc<ClusterLog<T>>, ReplError> {
+    ///
+    /// `gate_write_floor` applies the min-replicas write floor (issues #167, #239) to the
+    /// replica set this call resolves — set only by [`ReplicatedLog::append`], the one
+    /// operation that makes a NEW durability promise. It lives here, rather than in
+    /// `append`, so the floor is judged against the very set the returned `ClusterLog` is
+    /// built over, read under a SINGLE placement-lock acquisition: checking the floor
+    /// under one guard and rebuilding the set under another let a membership shrink land
+    /// between them and commit the append over the smaller set anyway.
+    async fn log_for_key(
+        &self,
+        key: &str,
+        gate_write_floor: bool,
+    ) -> Result<Arc<ClusterLog<T>>, ReplError> {
         // Keys carry a 2-byte kind prefix (`q/`/`m/`/`r/`) ahead of the placement key.
         let group = group_of_key(key);
 
@@ -192,8 +204,27 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             if !placement.owns_group(group) {
                 return Err(ReplError::NotOwner);
             }
+            let replica_set = placement.group_replica_set(group);
+            // The min-replicas write floor (issues #167, #239): replica sets truncate to
+            // min(R, members), so a shrinking cluster silently commits new durability
+            // promises on fewer copies than the operator configured — down to
+            // quorum-of-1. Below the resolved floor, REFUSE instead: transient like
+            // NoQuorum (capacity returning lifts it), and gating only NEW promises —
+            // reads, acked-driven truncation and removal come through here with
+            // `gate_write_floor = false`, so the node degrades to serving what it already
+            // promised rather than dying. A resolved floor of 1 = no refusal: a lone node
+            // stays healthy when alone.
+            if gate_write_floor {
+                let floor = placement.min_replicas();
+                if floor > 1 && replica_set.len() < floor {
+                    return Err(ReplError::UnderReplicated {
+                        actual: replica_set.len(),
+                        floor,
+                    });
+                }
+            }
             (
-                placement.group_replica_set(group),
+                replica_set,
                 placement.group_owner(group),
                 placement.voter_ids(),
                 placement.members(),
@@ -374,7 +405,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> crate::durable_plane
         // same offsets, same bytes, fenced at this owner's epoch; a follower that
         // already holds an entry just re-applies it. Best-effort — the requesting
         // replica's sweep retries while its copy stays hollow.
-        let log = match self.log_for_key(key).await {
+        let log = match self.log_for_key(key, false).await {
             Ok(log) => log,
             Err(e) => {
                 tracing::debug!(key, error = ?e, "catch-up: cannot route/recover key; requester will retry");
@@ -399,7 +430,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> crate::durable_plane
         // Route (recovering on first touch as usual), then hand the committed
         // log to the ONE requested node — the decommission drain's targeted
         // re-commit (ADR 0043 P3). Best-effort: the drain verifies and re-asks.
-        let log = match self.log_for_key(key).await {
+        let log = match self.log_for_key(key, false).await {
             Ok(log) => log,
             Err(e) => {
                 tracing::debug!(key, error = ?e, "targeted catch-up: cannot route/recover key; drain will retry");
@@ -415,30 +446,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
     type Key = String;
 
     async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
-        // The min-replicas write floor (issue #167): replica sets truncate to
-        // min(R, members), so a shrinking cluster silently commits new durability
-        // promises on fewer copies than the operator configured — down to
-        // quorum-of-1. Below the operator's floor, REFUSE the append instead:
-        // transient like NoQuorum (capacity returning lifts it), and gating only
-        // NEW promises — reads, acked-driven truncation and removal stay served, so
-        // the node degrades to serving what it already promised rather than dying.
-        // Default floor 1 = no refusal: a lone node stays healthy when alone.
-        {
-            let placement = self
-                .placement
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let floor = placement.min_replicas();
-            if floor > 1 {
-                // The same set `log_for_key` will replicate over — the floor judges
-                // exactly the durability this append would get.
-                let actual = placement.group_replica_set(group_of_key(key)).len();
-                if actual < floor {
-                    return Err(ReplError::UnderReplicated { actual, floor });
-                }
-            }
-        }
-        self.log_for_key(key).await?.append(key, record).await
+        // `gate_write_floor = true`: the min-replicas write floor (issues #167, #239) is
+        // applied inside `log_for_key`, against the replica set the returned log is built
+        // over and under the same placement-lock acquisition — see the note there for why
+        // a separate pre-check here was a race. This is the ONLY caller that gates.
+        self.log_for_key(key, true).await?.append(key, record).await
     }
 
     async fn read(
@@ -447,19 +459,25 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
         after: Offset,
         limit: usize,
     ) -> Result<Vec<LogEntry>, ReplError> {
-        self.log_for_key(key).await?.read(key, after, limit).await
+        self.log_for_key(key, false)
+            .await?
+            .read(key, after, limit)
+            .await
     }
 
     async fn live_range(&self, key: &String) -> Result<Option<(Offset, Offset)>, ReplError> {
-        self.log_for_key(key).await?.live_range(key).await
+        self.log_for_key(key, false).await?.live_range(key).await
     }
 
     async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
-        self.log_for_key(key).await?.truncate(key, up_to).await
+        self.log_for_key(key, false)
+            .await?
+            .truncate(key, up_to)
+            .await
     }
 
     async fn remove(&self, key: &String) -> Result<(), ReplError> {
-        self.log_for_key(key).await?.remove(key).await
+        self.log_for_key(key, false).await?.remove(key).await
     }
 
     async fn keys(&self) -> Result<Vec<String>, ReplError> {
@@ -483,7 +501,7 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
     async fn epoch_for(&self, key: &String) -> Result<u64, ReplError> {
         // The routed log is rebuilt per lease epoch, so this is exactly the epoch an
         // `append` through the same route would stamp its ops with (ADR 0037 token).
-        Ok(self.log_for_key(key).await?.epoch())
+        Ok(self.log_for_key(key, false).await?.epoch())
     }
 }
 
@@ -737,6 +755,152 @@ mod tests {
             ),
             "below the floor again, the next append must refuse"
         );
+    }
+
+    /// Issue #239, the defect itself: with the SHIPPED default posture (the derived
+    /// majority floor), a node that knows it belongs to a three-member group and has
+    /// buried both peers must REFUSE new durable promises instead of acking them on its
+    /// own single copy while the operator believes R=3. Reads of what was already
+    /// committed stay served — the node degrades to keeping its old promises, not to
+    /// dying.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lone_survivor_of_a_known_three_node_group_refuses_appends_by_default() {
+        use crate::placement::WriteFloor;
+        use mqtt_storage::repl::ReplError;
+        use std::collections::BTreeSet;
+
+        let owner = nid("owner");
+        // The default posture: no explicit floor, `declared` at its default of 1 — every
+        // bit of the arming comes from the membership the node actually knows.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS)
+            .with_write_floor(WriteFloor::Majority { declared: 1 });
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        // The quorum-committed roster of the three-member durable group (#229).
+        p.set_durable_roster(
+            [nid("owner"), nid("f1"), nid("f2")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            0,
+        );
+        assert_eq!(p.min_replicas(), 2, "three known members ⇒ a floor of 2");
+        let placement = Arc::new(RwLock::new(p));
+
+        let transport = Arc::new(PeerReplicaTransport::new());
+        for node in [nid("f1"), nid("f2")] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            transport.register(node, tx);
+            spawn_follower(
+                transport.clone(),
+                Arc::new(Mutex::new(ReplicaState::new())),
+                rx,
+            );
+        }
+        // An established (non-joiner) node: its catch-up sweep completed long ago.
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        stamp_current(&replicas, &placement.read().unwrap());
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport.clone(),
+            FixedLease(1),
+            replicas.clone(),
+        );
+
+        // Healthy: three members, floor 2, the append commits at quorum.
+        let (_, client) = owned_group_and_client(&placement.read().unwrap());
+        let key = format!("q/{}", client.0);
+        log.append(&key, vec![7])
+            .await
+            .expect("a healthy three-member group commits under the default floor");
+        assert_eq!(
+            log.read(&key, 0, usize::MAX).await.unwrap().len(),
+            1,
+            "the committed entry reads back"
+        );
+
+        // Both peers die. The roster is unchanged (a CRASHED member stays on it), so the
+        // node still knows it owes three copies — and refuses to promise on one.
+        {
+            let mut p = placement.write().unwrap();
+            p.observe(&nid("f1"), MemberState::Dead, "f1:7000", None);
+            p.observe(&nid("f2"), MemberState::Dead, "f2:7000", None);
+        }
+        // Model the CONVERGED post-shrink state, not the instant after it: re-stamp this
+        // node's own replica copy as current for the shrunken sets, which is what the
+        // reconcile driver's catch-up sweep does (ADR 0043 P1) and what this unit harness
+        // does not run. That matters for what this test proves — without it, the append
+        // below fails with `NoQuorum` (a one-member recovery quorum with no *complete*
+        // read) whatever the floor says, and the assertion would pass on the old default
+        // for the wrong reason. With it, the floor is the only thing standing between a
+        // lone survivor and a single-copy `Ok` — which is exactly issue #239.
+        stamp_current(&replicas, &placement.read().unwrap());
+        let err = log.append(&key, vec![8]).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReplError::UnderReplicated {
+                    actual: 1,
+                    floor: 2
+                }
+            ),
+            "the lone survivor of a known 3-node group must refuse, got {err:?}"
+        );
+
+        // Only NEW promises are gated. The read path is structurally ungated by the
+        // floor — whatever it reports across a shrink (serving reads through one is the
+        // ADR 0043 P1 catch-up machinery's job, and this unit harness runs no reconcile
+        // loop), it is never the floor's refusal. The node degrades to keeping the
+        // promises it made, not to dying.
+        assert!(
+            !matches!(
+                log.read(&key, 0, usize::MAX).await,
+                Err(ReplError::UnderReplicated { .. })
+            ),
+            "the write floor must never gate a read"
+        );
+    }
+
+    /// The standing requirement, pinned permanently: a node that has never known a
+    /// cluster still acks durable writes under the SHIPPED default. Non-vacuous against
+    /// the resolver, not against the old default — it fails the moment the derived floor
+    /// forgets the degenerate case (resolving the majority over `R` instead of over the
+    /// witness, or seeding the witness at `R`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_that_never_knew_a_cluster_acks_durable_writes_under_the_default_floor() {
+        use crate::placement::WriteFloor;
+        use std::collections::BTreeSet;
+
+        let owner = nid("solo");
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS)
+            .with_write_floor(WriteFloor::Majority { declared: 1 });
+        // A single-node durable group: the roster names only this node.
+        p.set_durable_roster([nid("solo")].into_iter().collect::<BTreeSet<_>>(), 0);
+        assert_eq!(p.min_replicas(), 1, "alone ⇒ no floor");
+        let placement = Arc::new(RwLock::new(p));
+
+        let replicas = Arc::new(Mutex::new(ReplicaState::new()));
+        stamp_current(&replicas, &placement.read().unwrap());
+        let log = GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            Arc::new(PeerReplicaTransport::new()),
+            FixedLease(1),
+            replicas,
+        );
+
+        for key in ["q/solo-client", "r/solo/topic"] {
+            let key = key.to_string();
+            let first = log
+                .append(&key, vec![1])
+                .await
+                .expect("a lone node must keep acking durable writes");
+            let second = log
+                .append(&key, vec![2])
+                .await
+                .expect("and keep acking the next one");
+            assert!(second > first, "offsets stay monotone: {first} -> {second}");
+        }
     }
 
     /// `LocalLeaseSource` reads a lease the (leader-driven) consensus group assigned

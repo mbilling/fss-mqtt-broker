@@ -76,11 +76,95 @@ not route traffic.
 **Symptom:** the broker logs that a placement group holds fewer copies than the configured
 replication factor.
 
-- **Too few nodes are alive** to hold R copies of every group, so durable appends there
-  commit on a smaller quorum than you configured. It is not corruption — data is still
-  quorum-durable at the reduced size — but durability is weaker than intended. Restore
-  cluster capacity to return to the configured factor; the broker logs again when it
-  recovers.
+- **Too few nodes are alive** to hold R copies of every group. Replica sets truncate to
+  `min(R, members)`, so durability is weaker than intended. It is not corruption: what was
+  already acknowledged is still held at the quorum it was committed at, and reads, QoS 0 and
+  acked-driven truncation and removal keep serving throughout. QoS 2 in-flight bookkeeping
+  does **not**: it writes durable state, so it is refused with everything else (see below).
+- **Whether NEW durable writes still commit depends on the write floor** — and by default
+  they do not, once the group is down to a single copy. See the next section. Restore
+  cluster capacity; the broker logs again when it recovers.
+- **Which state you are in is on `/statusz`,** in the `replication` block:
+  `min_actual < desired` is under-replicated (warn), `min_actual < write_floor` is
+  *refusing* (page).
+
+## Durable writes are refused: no PUBACKs, refused CONNECTs, failed SUBACKs
+
+**Symptom:** any of these, on a cluster that otherwise looks healthy — reads, QoS 0 and
+`mqttd --check-config` all fine:
+
+- publishers using QoS 1 or 2 receive no acknowledgement, redeliver forever, and see their
+  connection closed and reopened;
+- a QoS 2 publisher is disconnected part-way through the handshake;
+- **new** persistent sessions are refused at CONNECT with `0x88` after a ~5 s pause;
+- SUBSCRIBE on a persistent session comes back `0x80` (failure);
+- an in-flight QoS 2 *delivery* stalls without completing.
+
+They share one cause, and each has its **own** signal — the publisher log line below is not
+emitted for the others, so do not conclude "the floor is not firing" from its absence:
+
+| Refused write | What the client sees | The signal to look for |
+|---|---|---|
+| Offline/online enqueue (QoS≥1 publish) | no PUBACK, then disconnect | `failed to enqueue message; withholding the publisher's ack` + `mqttd_durable_append_failures_total{reason="unavailable"}` |
+| Inbound QoS 2 dedup record | no PUBREC, then disconnect | `QoS2 dedup store write failed; withholding PUBREC (fail closed)` — **no counter** |
+| New persistent session (`claim_session`) | CONNACK `0x88` after ~5 s | `mqttd_durable_recovery_failures_total{reason="deadline"}` — indistinguishable from real quorum loss, so corroborate with `/statusz` |
+| Persistent SUBSCRIBE (`set_subscriptions`) | SUBACK `0x80` | `durable subscription write failed` — **no counter** |
+| Outbound QoS 2 id bookkeeping | PUBLISH or PUBREL never sent | `mqttd_publish_dropped_total{reason="outbound-id-write-failed"}` |
+
+Because three of those five have no dedicated counter, **`/statusz` is the reliable
+discriminator** (step 2 below), not the log line.
+
+This is the **min-replicas write floor** refusing to make a durability promise it cannot
+keep (`durable.min_replicas`, default `majority` — issues #167/#239). A placement group
+whose replica set has shrunk below the floor refuses new durable writes rather than acking
+them on a single copy. Withholding the ack is deliberate: the source keeps the message and
+redelivers, so nothing is lost. The connection close is a consequence of the withheld ack,
+not a separate fault.
+
+**Confirm it, in this order:**
+
+1. The broker log names it exactly, on the node the publisher is attached to:
+
+   ```text
+   WARN mqttd::hub: failed to enqueue message; withholding the publisher's ack (ADR 0041 T5)
+        client=<durable-session-id>
+        error=storage temporarily unavailable: replica set holds 1 of the configured floor of 2 copies
+   ```
+
+   A withheld ack with a *different* `error=` is a different problem. The exact strings the
+   broker renders: **`no replication quorum`** is recovery/quorum loss (restore members, or
+   wait for the catch-up sweep — watch `replica_groups` on `/statusz`), and **`not the owning
+   node for this group`** is a transient ownership hand-off.
+2. `/statusz` → `"replication":{"desired":3,"min_actual":1,"under_replicated":true,`
+   `"write_floor":2,"write_floor_source":"derived"}`. `min_actual < write_floor` is the
+   refusal condition; `write_floor_source` tells you whether the floor was derived from the
+   membership this node knows (`derived`) or set explicitly (`configured`).
+3. `/metrics` → `mqttd_replication_min_actual < mqttd_replication_write_floor`, and
+   `mqttd_durable_append_failures_total{reason="unavailable"}` climbing once per refused
+   publish. This pair is the alert rule in
+   [OPERATIONS.md](OPERATIONS.md#monitoring-for-the-operator-and-humans).
+
+**Fix it:** restore the missing members. The refusal is transient and lifts by itself, with
+no operator action, the moment the replica set is back at the floor.
+
+**If the members are not coming back** (an unconsented loss — two of three nodes gone for
+good, an AZ loss, or a DR restore of a single node's `data_dir`), the floor stays armed
+because the witness is the *quorum-committed* raft roster, which cannot shrink without a
+quorum. Consent explicitly on the surviving node:
+
+```toml
+[durable]
+min_replicas = 1   # accept single-copy durable acks
+```
+
+`durable` is **restart-scoped** (`requires_restart`), so a SIGHUP reload does not apply it: it
+logs `config reload: settings changed that require a RESTART to take effect` with
+`sections=durable` and keeps the running value. Restart the node. Lowering
+`runtime.ready_min_members` does **not** help here: it only bounds the witness from below,
+and the persisted roster arms the floor on its own. Setting `min_replicas = 1` means you are
+accepting that an acknowledged message may exist on one copy only, and one further loss can
+lose it — the broker logs a warning saying so on every start while
+`ready_min_members >= 2`.
 
 ## An unrecognised flag or `mqttd --version`
 

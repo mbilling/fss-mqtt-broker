@@ -107,6 +107,45 @@ fn a_bad_env_value_fails_check_config() {
     assert!(stderr.contains("lease_voters"), "stderr was: {stderr}");
 }
 
+/// Issue #239: an *unsatisfiable* min-replicas floor (above the replication factor)
+/// would refuse every durable write forever. `--check-config` is the pre-rollout gate,
+/// so it must catch that here rather than deferring it to a broker that boots and then
+/// refuses its first write. Both valid spellings — the derived `majority` posture and a
+/// satisfiable integer — pass.
+#[test]
+fn check_config_rejects_a_min_replicas_floor_above_the_replication_factor() {
+    let out = mqttd()
+        .arg("--check-config")
+        .env("MQTTD_MIN_REPLICAS", "9")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unsatisfiable floor must fail the check; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeds the replication factor"),
+        "stderr was: {stderr}"
+    );
+
+    for value in ["majority", "2"] {
+        let out = mqttd()
+            .arg("--check-config")
+            .env("MQTTD_MIN_REPLICAS", value)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "MQTTD_MIN_REPLICAS={value} must validate; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn a_config_flag_without_a_value_is_a_usage_error_exit_2() {
     let out = mqttd()

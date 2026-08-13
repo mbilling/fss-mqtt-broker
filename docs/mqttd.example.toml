@@ -142,14 +142,40 @@ lease_voters = 5
 # Disk high-water cap over the on-disk stores, bytes (needs [node] data_dir). Above it the broker
 # browns out growth-writes while acks/deletes/resumes continue. Unset = no watermark.
 # store_max_bytes = 10737418240
-# Min-replicas write floor (issue #167). Replica sets shrink with membership — min(R, alive) — so
-# a shrinking cluster silently trades the configured durability for availability, down to
-# quorum-of-1. A floor above 1 makes a group below it REFUSE durable writes instead (QoS>=1 acks
-# withheld so sources redeliver; retained mutations queue until capacity returns; reads and QoS 0
-# keep serving). Default 1 = no floor: a lone node stays fully operational. Cannot exceed the
-# replication factor (3). Watch it via the replication_min_actual/replication_desired gauges and
-# the /statusz "replication" block.
-# min_replicas = 2
+# Min-replicas write floor (issues #167, #239). Replica sets shrink with membership —
+# min(R, alive) — so without a floor a shrinking cluster silently trades the configured
+# durability for availability, down to quorum-of-1. A group below the floor REFUSES durable
+# writes instead (QoS>=1 acks withheld so sources redeliver; retained mutations queue until
+# capacity returns; reads, QoS 0 and acked-driven truncation/removal keep serving — but QoS 2
+# in-flight bookkeeping writes durable state, so it is refused with everything else).
+#
+# The default, shown here, is the DERIVED majority floor: a majority of the members this node
+# knows about — the quorum-committed durable roster is authoritative, the largest membership it
+# has ever observed is a fallback used only before a roster exists, and
+# [runtime].ready_min_members bounds the result from below — capped at the replication factor. That is no floor at
+# all while the node has never known a peer (a single node stays fully operational) and 2 copies
+# in a 3-node cluster, which the write quorum already needs, so a one-at-a-time roll is unaffected.
+# The cap also keeps it at 2 in a wider topology: on 5 or 7 nodes a group down to 2 copies still
+# commits. With [durable].enabled = false there is no durable plane and no floor at all.
+#
+# ROLLBACK NOTE (ADR 0058 §E): the word form below is a value shape the PREVIOUS release cannot
+# parse (it expects an integer), and a type mismatch is a hard error that
+# [runtime].config_unknown_keys = "warn" does not rescue. Pre-1.0 that is allowed; if you need this
+# file to stay readable by the release you might roll back to, spell the floor as an integer or
+# leave the key out entirely and take the same default.
+min_replicas = "majority"
+# min_replicas = 1  # opt out: accept single-copy acks (single-node dev; a shrink to one member, or
+#                   # an unconsented loss of the rest — see docs/TROUBLESHOOTING.md and
+#                   # docs/OPERATIONS.md "Scaling". A [durable] edit: restart, not SIGHUP)
+# min_replicas = 2  # an absolute floor on the replica-set SIZE, whatever the topology says (cannot
+#                   # exceed R = 3). It bounds the SET, not the acks: the write quorum is still
+#                   # len/2+1, so min_replicas = 3 over a 3-member set commits once 2 copies hold
+#                   # the record. The derived default above has no such gap (a set of 2 or 3 needs
+#                   # 2 acks and the floor is 2).
+#
+# Watch it via the replication_min_actual / replication_desired / replication_write_floor gauges
+# and the /statusz "replication" block (which also reports write_floor_source: derived|configured).
+# The symptom when it fires: QoS>=1 publishers stop getting PUBACKs (docs/TROUBLESHOOTING.md).
 
 [limits]
 # Resource governance (ADR 0041). Unset generally = uncapped. A configured 0 where a positive

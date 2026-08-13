@@ -128,8 +128,16 @@ The full matrix — including every cell we lose — is
 - **Durable sessions are on by default**, quorum-replicated, with an acked QoS
   1/2 message surviving the loss of the node that accepted it — whether it was
   queued for a disconnected subscriber *or already in flight to a connected
-  one*. Mosquitto and NanoMQ are single-node; VerneMQ documents queue loss on
-  node death; EMQX's durable sessions are opt-in.
+  one*. And when a group is too thin to keep that promise, the durable write is
+  **refused** rather than acked on one copy: a group holding fewer copies than a
+  majority of the members the node knows about — capped at the replication
+  factor — takes no new durable writes by default, and QoS≥1 publishers get no
+  ack and redeliver. One scope caveat, stated where the claim is: the floor
+  covers writes that reach a group this node leases; a publish for a durable
+  session whose owner is *gone* is still acked and dropped by the
+  no-known-subscriber path (see [Limitations](#limitations)). Mosquitto and
+  NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's
+  durable sessions are opt-in.
 - **A policy reload evicts live sessions.** Revoke a certificate, remove a user,
   or tighten a grant, and the *already-connected* client is cut — not left
   running until it happens to reconnect. No compared broker documents this.
@@ -493,7 +501,7 @@ version:
 
 |  | mqttd's answer |
 |---|---|
-| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses), and covers a message **in flight to a connected subscriber** as well as one queued for a disconnected one — the durable append happens before the wire send ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124), reproduced against the real binary under SIGKILL). One caveat, stated where the claim is: if you enable the (off-by-default) store or memory watermark, a **growth refusal** under brownout — or the session queue cap — refuses an offline enqueue while still acking the publisher (ADR 0041 §5), so that offline subscriber never receives it; the refusal is counted as `publish_dropped{reason}`. Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
+| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses), and covers a message **in flight to a connected subscriber** as well as one queued for a disconnected one — the durable append happens before the wire send ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124), reproduced against the real binary under SIGKILL). A group too thin to keep the promise **refuses** new durable writes by default (the min-replicas floor, `MQTTD_MIN_REPLICAS=majority`: a majority of the members the node knows about, capped at R) rather than acking on one copy; a node that has never known peers still serves fully, and the floor covers writes that reach a group this node leases — a publish for a durable session whose owner is gone is still acked-and-dropped by the no-known-subscriber path. One caveat, stated where the claim is: if you enable the (off-by-default) store or memory watermark, a **growth refusal** under brownout — or the session queue cap — refuses an offline enqueue while still acking the publisher (ADR 0041 §5), so that offline subscriber never receives it; the refusal is counted as `publish_dropped{reason}`. Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
 | Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery yet — and **no production track record**: the matrix says so in as many words. |
@@ -553,6 +561,28 @@ be found. Each is tracked; none is a silent surprise.
   subscribers do not need redelivery across a broker restart, connect them with
   `clean_session` / a zero Session Expiry and the write never happens. See
   [`docs/SIZING.md`](docs/SIZING.md).
+- **The write floor is derived, so it has three honest edges.** By default a group
+  holding fewer copies than a majority of the members this node knows about —
+  **capped at the replication factor**, so it is 2 in a 3-node cluster and still 2
+  on 5 or 7 nodes — refuses new durable writes (`MQTTD_MIN_REPLICAS=majority`). The
+  witness is the quorum-committed durable roster **when it has one** — the largest
+  membership ever observed is only a pre-roster fallback, and `MQTTD_READY_MIN_MEMBERS`
+  bounds the result from below. So (a) a bare-metal node that boots alone with
+  `MQTTD_READY_MIN_MEMBERS=1` but really belongs to a mesh has a seconds-long window
+  before the floor arms; (b) a shrink to a **single** member refuses durable writes
+  until you consent explicitly. What consent means depends on why you are down to one:
+  a *consented* decommission shrinks the committed roster, but the floor is still
+  bounded below by `MQTTD_READY_MIN_MEMBERS`, which the operator and the chart render
+  as a majority for every cluster of three or more — so that node keeps a floor of 2
+  until you lower the readiness floor too. After an **unconsented** loss (two of three
+  nodes gone for good, an AZ loss, a DR restore of one node's data dir) the roster
+  stays at three, and then only `durable.min_replicas = 1` clears it — a restart-scoped
+  `[durable]` edit, not a reload; lowering the readiness floor alone does nothing
+  ([TROUBLESHOOTING](docs/TROUBLESHOOTING.md), [OPERATIONS](docs/OPERATIONS.md)). And (c) the floor covers only writes that
+  reach a group this node leases: a publish for a durable session owned by a node that
+  is gone is still acked and dropped by the pre-existing no-known-subscriber path, with
+  no refusal logged. All three are stated in
+  [ADR 0006](docs/adr/0006-consensus-and-replication.md) §4 rather than papered over.
 - **Migration tooling covers Mosquitto only.**
   `scripts/migrate/from-mosquitto.py` translates `mosquitto.conf` and its
   `acl_file`, marking anything without an equivalent as `TODO(migrate)` in the
@@ -879,6 +909,7 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
 | `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); unset → in-memory |
 | `MQTTD_LEASE_VOTERS` | Bounded lease-consensus voter set `N` (ADR 0021; default `5`, recommend odd). At most `N` members vote on lease ownership; every other member joins as a learner that still receives the lease log and can own/serve sessions — so consensus cost stays fixed (quorum `⌊N/2⌋+1`) as the cluster grows. `1` = no fault tolerance, `3` tolerates one voter loss, `5` two |
+| `MQTTD_MIN_REPLICAS` | Min-replicas write floor (issues #167/#239; default `majority`). Replica sets shrink with membership — `min(R, alive)` — so without a floor a shrinking cluster silently trades the configured durability for availability, down to quorum-of-1. A group below the floor **refuses** durable writes instead (QoS≥1 acks withheld so sources redeliver, retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not). `majority` derives the floor from the members this node knows about — the quorum-committed durable roster (authoritative), falling back to the largest membership it has ever observed only before a roster exists, bounded below by `MQTTD_READY_MIN_MEMBERS` — capped at R: **no floor at all** while it has never known a peer (single-node stays fully operational) and **2** in a 3-node cluster, which the write quorum already needs. An integer sets an absolute floor; `1` disables it and accepts single-copy acks. Above R = rejected at startup (and by `--check-config`) |
 | `MQTTD_FAILURE_DOMAIN` | This node's own failure-domain label (ADR 0016 T5), e.g. `rack-a`. Advertised over the authenticated SWIM gossip so the topology **self-assembles** — the bounded voter set spreads across racks/zones (losing a whole domain can't take quorum) with each node setting only its own label. The preferred mechanism. Unset → this node is unlabelled unless a peer/static map supplies one. If the cluster-bus cert **attests** a label (ADR 0016 T6), the cert wins: this value must match it (or peers reject this node's gossip) and may be omitted |
 | `MQTTD_FAILURE_DOMAINS` | Static failure-domain topology (ADR 0016 T4): `node-id=domain` pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`). A cluster-uniform seed/fallback; per-node gossip labels (`MQTTD_FAILURE_DOMAIN`) override it. Unset → no static spread (id-ordered selection unless labels are gossiped) |
 | `MQTTD_TLS_BIND` | TLS 1.3 client listener, e.g. `0.0.0.0:8883` (needs `…_CERT`/`…_KEY`) |
@@ -1143,13 +1174,17 @@ then it counts toward no recovery — and ownership it gains is materialized eag
 with publisher acknowledgements held honest through the window. Growing a 1-node
 broker re-replicates its whole history the same way: the laptop→server upgrade is
 just "start two more nodes". Watch `/readyz` on the joiner (`lease_group_ready`) and
-route client traffic to it once ready.
+route client traffic to it once ready. The min-replicas write floor does not get in
+the way of that motion: the 1-node broker has never known a peer, so its derived
+floor is no floor at all, and it arms itself once peers appear.
 
 **The two-node truth.** Two members mean replica sets of two and a write quorum of
 2-of-2 — a two-node durable cluster has *strictly worse* write availability than one
-node (either node down blocks durable writes). Two nodes are supported as a
-waypoint, but the recommended upgrade is **1→3 in one motion**: start both new nodes,
-then treat the pair-state as transient.
+node (either node down blocks durable writes). The write floor makes that literally
+true: before it, a two-node cluster silently resumed acking on a single copy once the
+dead peer was declared `Dead`. Two nodes are supported as a waypoint, but the
+recommended upgrade is **1→3 in one motion**: start both new nodes, then treat the
+pair-state as transient.
 
 **Shrink (decommission).** Send the node `SIGUSR1`. It fails readiness immediately,
 then **drains**: every durable key it holds is handed to the replica set each group
