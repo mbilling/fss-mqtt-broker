@@ -138,6 +138,19 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedRetained<L> {
         Ok(last.and_then(|e| decode_retained(&e.record, e.offset)))
     }
 
+    /// REAP `topic`'s committed record entirely — tombstone discharge (issue #229):
+    /// called only once the cluster has observably converged past a clear, so the
+    /// fence the record provided is no longer needed by anyone. Routed like any
+    /// write (`NotOwner` off the owner). A record that resurfaces from an old
+    /// replica after a reap merely re-arms a redundant fence — harmless by
+    /// construction, never a resurrection.
+    ///
+    /// # Errors
+    /// Storage/routing errors as for any durable write.
+    pub async fn reap(&self, topic: &str) -> Result<(), StorageError> {
+        Ok(self.log.remove(&retained_key(topic)).await?)
+    }
+
     /// Every topic with a committed retained record — values **and** tombstones —
     /// that this node can enumerate (its own replicas, unioned with reachable peers'
     /// key sets on a clustered backend, per [`ReplicatedLog::keys`]).
@@ -201,6 +214,12 @@ pub trait DurableRetained: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// As [`ReplicatedRetained::topics`].
     async fn topics(&self) -> Result<Vec<String>, StorageError>;
+
+    /// Reap `topic`'s record entirely — tombstone discharge (issue #229).
+    ///
+    /// # Errors
+    /// As [`ReplicatedRetained::reap`].
+    async fn reap(&self, topic: &str) -> Result<(), StorageError>;
 }
 
 #[async_trait]
@@ -226,6 +245,10 @@ impl<L: ReplicatedLog<Key = String>> DurableRetained for ReplicatedRetained<L> {
 
     async fn topics(&self) -> Result<Vec<String>, StorageError> {
         Self::topics(self).await
+    }
+
+    async fn reap(&self, topic: &str) -> Result<(), StorageError> {
+        Self::reap(self, topic).await
     }
 }
 

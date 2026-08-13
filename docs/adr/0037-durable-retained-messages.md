@@ -112,14 +112,22 @@ time cover the window before the first warm. No schema was added: the committed 
 already carried everything (0037-P10's finding, extended from read-through to
 enumeration).
 
-**Tombstone retention (the growth bound).** A clear is kept as the topic's single
-compacted record **indefinitely** — the same storage class as a value, one small record
-per ever-cleared topic. Reaping is deliberately not implemented: any time-based floor
-re-opens the resurrection this ADR exists to prevent (a node absent longer than the floor
-returns un-fenced), and a correct floor needs cluster-wide convergence tracking ("every
-live member has converged past token T") that today's machinery does not carry. If topic
-churn ever makes the residue material, that horizon-GC is the shape to build — until
-then, durable retraction is priced like durable state, because it is.
+**Tombstone retention (the growth bound — as delivered, issue #229).** A time-based
+floor was rejected here from the start: a node absent longer than any fixed floor
+returns un-fenced and resurrects the deleted value. The delivered bound is
+**convergence-gated discharge**: the anti-entropy digest exchange already yields an
+observable "this pair has converged" instant per peer, and the durable raft membership
+ROSTER (voters and learners — a crashed member stays on it until decommissioned, a
+member the process cannot even name blocks outright) is exactly the set of nodes that
+may still return holding pre-clear state. Once every roster member's digest has matched
+after a clear was observed, and a full anti-entropy period has passed, the fence is
+redundant by construction: each node discharges its in-memory token independently off
+the same signals, and the topic's group owner also removes the keyspace record (a
+record resurfacing from an old replica merely re-arms a redundant fence). The
+`retained_tombstones` gauge counts fences still held — sustained growth means an absent
+roster member or chronic divergence, both alert-worthy on their own. Re-attaching a
+DECOMMISSIONED node's old data dir is outside this contract (its departure was drained
+and content-verified; the wipe-and-rejoin posture applies).
 
 ### 5. Partition semantics: queue-until-heal (CP, bounded)
 

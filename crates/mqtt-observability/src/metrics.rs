@@ -112,6 +112,7 @@ struct OtelInstruments {
     peer_links: OtelGauge<i64>,
     replication_desired: OtelGauge<i64>,
     replication_min_actual: OtelGauge<i64>,
+    retained_tombstones: OtelGauge<i64>,
     members: OtelGauge<i64>,
     lease_leader: OtelGauge<i64>,
     lease_epoch: OtelGauge<i64>,
@@ -170,6 +171,7 @@ impl OtelInstruments {
             peer_links: meter.i64_gauge("peer_links").build(),
             replication_desired: meter.i64_gauge("replication_desired").build(),
             replication_min_actual: meter.i64_gauge("replication_min_actual").build(),
+            retained_tombstones: meter.i64_gauge("retained_tombstones").build(),
             members: meter.i64_gauge("members").build(),
             lease_leader: meter.i64_gauge("lease_leader").build(),
             lease_epoch: meter.i64_gauge("lease_epoch").build(),
@@ -242,6 +244,7 @@ pub struct Metrics {
     cluster_members: Gauge,
     replication_desired: Gauge,
     replication_min_actual: Gauge,
+    retained_tombstones: Gauge,
     peer_links: Gauge,
     members_by_state: Family<StateLabel, Gauge>,
     lease_leader: Gauge,
@@ -450,6 +453,13 @@ impl Metrics {
             "Smallest replica-set size any placement group currently has — the \
              worst-case durability; below replication_desired means at least one \
              group is under-replicated (issue #167)",
+        );
+        let retained_tombstones = register_gauge(
+            &mut registry,
+            "retained_tombstones",
+            "Retained tombstone fences currently held awaiting cluster-wide \
+             convergence (issue #229); sustained growth means an absent durable \
+             member or chronic divergence",
         );
 
         let members_by_state = register_gauge_family(
@@ -688,6 +698,7 @@ impl Metrics {
             peer_links,
             replication_desired,
             replication_min_actual,
+            retained_tombstones,
             members_by_state,
             lease_leader,
             lease_epoch,
@@ -888,6 +899,13 @@ impl Metrics {
         self.otel
             .replication_min_actual
             .record(clamp_gauge(min_actual), &[]);
+    }
+
+    /// Set the count of retained tombstone fences held awaiting cluster-wide
+    /// convergence (issue #229).
+    pub fn set_retained_tombstones(&self, n: usize) {
+        self.retained_tombstones.set(clamp_gauge(n));
+        self.otel.retained_tombstones.record(clamp_gauge(n), &[]);
     }
 
     /// Set the member count for one bounded SWIM `state` (`"alive"`/`"suspect"`/`"dead"`).

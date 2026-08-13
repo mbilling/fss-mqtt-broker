@@ -119,6 +119,14 @@ pub struct Placement {
     /// (ADR 0016 T5). Populated from membership observations so the lease-voter
     /// selection topology assembles itself instead of a static cluster-uniform map.
     domains: BTreeMap<NodeId, String>,
+    /// The durable raft membership roster (issue #229): every node the lease
+    /// consensus still counts — voters AND learners — as `(known ids, unmappable
+    /// count)`. A CRASHED node stays on it (it may return holding pre-clear
+    /// retained state); a DECOMMISSIONED node left it deliberately. `None` until
+    /// the reconcile driver first pushes it. The tombstone reap gates on this
+    /// roster, never on live gossip membership, exactly because gossip forgets
+    /// the absent.
+    durable_roster: Option<(BTreeSet<NodeId>, usize)>,
     /// The smallest replica set a durable append may commit on (issue #167). Replica
     /// sets truncate to `min(R, members)`, so a shrinking cluster silently trades the
     /// configured durability for availability — down to quorum-of-1. Groups below
@@ -145,6 +153,7 @@ impl Placement {
             local_domain: None,
             domains: BTreeMap::new(),
             min_replicas: 1,
+            durable_roster: None,
         }
     }
 
@@ -169,6 +178,20 @@ impl Placement {
     #[must_use]
     pub fn min_replicas(&self) -> usize {
         self.min_replicas
+    }
+
+    /// Push the durable raft membership roster (issue #229): `known` are the
+    /// members the node registry could name; `unknown` counts raft members with no
+    /// known `NodeId` yet (e.g. a node crashed before this process ever observed
+    /// it) — anything the reap gate must treat as "may still return".
+    pub fn set_durable_roster(&mut self, known: BTreeSet<NodeId>, unknown: usize) {
+        self.durable_roster = Some((known, unknown));
+    }
+
+    /// The durable membership roster, or `None` until first pushed.
+    #[must_use]
+    pub fn durable_roster(&self) -> Option<&(BTreeSet<NodeId>, usize)> {
+        self.durable_roster.as_ref()
     }
 
     /// Apply an observed membership state. A non-`Dead` peer becomes eligible
