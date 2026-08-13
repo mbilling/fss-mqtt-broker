@@ -395,6 +395,9 @@ fn report_replication_health(placement: &Arc<RwLock<Placement>>, last: &mut Opti
 /// A membership change (and boot) also arms the replica catch-up sweep (ADR 0043
 /// P1), which back-fills this node's copies of the groups it newly replicates.
 #[allow(clippy::too_many_arguments)]
+// One linear reconcile pass per tick — membership, voters, roster, leases, sweep —
+// long by the number of pushed facts, not by branching.
+#[allow(clippy::too_many_lines)]
 async fn run_driver(
     raft: LeaseRaft,
     network: MeshRaftNetwork,
@@ -488,6 +491,28 @@ async fn run_driver(
         }
 
         push_committed_lease_owners(&placement, &lease_store, &mut id_map);
+
+        // The durable membership ROSTER (issue #229): every raft member — voters
+        // and learners — named where the accumulated id map can, counted where it
+        // cannot (a member this process has never observed still blocks the
+        // tombstone reap). A crashed member stays here until decommissioned, which
+        // is what lets the reap know who may still return holding pre-clear state.
+        {
+            let mut known = BTreeSet::new();
+            let mut unknown = 0usize;
+            for rid in &view.nodes {
+                match id_map.get(rid) {
+                    Some(n) => {
+                        known.insert(n.clone());
+                    }
+                    None => unknown += 1,
+                }
+            }
+            placement
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_durable_roster(known, unknown);
+        }
 
         let (members, live_domains): (Vec<RaftNodeId>, BTreeMap<RaftNodeId, FailureDomain>) = {
             let p = placement

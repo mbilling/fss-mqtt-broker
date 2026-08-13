@@ -1187,6 +1187,16 @@ pub struct Hub {
     /// through the window's ledger. Empty in the steady state, so the apply path's
     /// cost is one `is_empty()` check.
     retained_windows: HashMap<ClientId, RetainedWindow>,
+    /// Per peer, the wall-clock second our retained digests last MATCHED theirs
+    /// (issue #229): the observable "this pair has converged" instant the tombstone
+    /// reap gates on. Wall clock (the clock seam), not `Instant`, so the gate is
+    /// testable and comparable with tombstone observation times.
+    retained_digest_matched_at: HashMap<NodeId, u64>,
+    /// Per tombstoned topic, the wall-clock second this node first held the clear
+    /// (issue #229). Present exactly while the fence is a tombstone (a re-set value
+    /// discharges the entry); the reap discharges it once every roster member's
+    /// digest has matched since.
+    retained_tombstone_observed_at: HashMap<String, u64>,
     /// Whether any retained value currently held MIGHT carry an expiry deadline
     /// (issue #227) — flipped on when one lands, cleared by the reap scan finding
     /// none. Keeps the per-tick reap pay-for-use: a broker with no expiring
@@ -1557,6 +1567,8 @@ impl Hub {
                 quotas: Quotas::default(),
                 retained_tokens: HashMap::new(),
                 retained_windows: HashMap::new(),
+                retained_digest_matched_at: HashMap::new(),
+                retained_tombstone_observed_at: HashMap::new(),
                 retained_may_expire: false,
                 retained_queue: VecDeque::new(),
                 retained_commit_inflight: false,
@@ -4106,6 +4118,10 @@ impl Hub {
         if self.retained_may_expire {
             self.reap_expired_retained().await;
         }
+        if !self.retained_tombstone_observed_at.is_empty() {
+            self.reap_discharged_tombstones().await;
+        }
+
         if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 {
             // Re-learn committed retained state this process no longer remembers
             // BEFORE offering the digest built from it (issue #183): a restart
@@ -4499,6 +4515,10 @@ impl Hub {
                 // commits on fewer copies than the operator configured.
                 let health = p.replication_health();
                 m.set_replication_health(health.desired, health.min_actual);
+                // Held retained tombstones (issue #229): growth here means a
+                // chronically absent roster member or chronic divergence — both
+                // alert-worthy on their own.
+                m.set_retained_tombstones(self.retained_tombstone_observed_at.len());
             }
         }
         // Lease-group role/epoch, read from the durable plane's raft metrics (durable mode).
@@ -4952,7 +4972,13 @@ impl Hub {
     /// nothing diverging, nothing transferred. Any difference: pull the peer's (chunked)
     /// snapshot — to gap-fill missing topics and to detect (count, warn) divergent
     /// values on topics both sides hold.
-    async fn handle_retained_digest(&self, node: &NodeId, count: u64, hash: u64, value_hash: u64) {
+    async fn handle_retained_digest(
+        &mut self,
+        node: &NodeId,
+        count: u64,
+        hash: u64,
+        value_hash: u64,
+    ) {
         let Some(peer) = self.peers.get(node) else {
             return;
         };
@@ -4968,6 +4994,10 @@ impl Hub {
             )
         }));
         if ours == (count, hash, value_hash) {
+            // The pair has observably converged: the instant the tombstone reap
+            // gates on (issue #229).
+            self.retained_digest_matched_at
+                .insert(node.clone(), self.clock.now_epoch_secs());
             debug!(node = %node.0, topics = count, "retained sets already match; skipping back-fill");
             return;
         }
@@ -5195,9 +5225,18 @@ impl Hub {
             };
             let topic_key = message.topic.clone();
             self.retained_may_expire |= message.expires_at.is_some();
+            let tombstone = message.payload.is_empty();
             if self.retained.set(&message).await.is_ok() {
                 if let Some(token) = pending_token {
-                    self.retained_tokens.insert(topic_key, token);
+                    self.retained_tokens.insert(topic_key.clone(), token);
+                    // Issue #229: same bookkeeping as the fan-out apply.
+                    if tombstone {
+                        self.retained_tombstone_observed_at
+                            .entry(topic_key)
+                            .or_insert_with(|| self.clock.now_epoch_secs());
+                    } else {
+                        self.retained_tombstone_observed_at.remove(&topic_key);
+                    }
                 }
                 filled += 1;
                 if value_differs {
@@ -5931,6 +5970,74 @@ impl Hub {
         self.retained_may_expire = deadlines_remain;
     }
 
+    /// Discharge retained tombstones the cluster has observably converged past
+    /// (issue #229) — the growth bound on durable retraction. A tombstone's fence
+    /// exists to stop an absent node's pre-clear value from resurrecting; once
+    /// every member that could still return has been SEEN converged (its digest
+    /// matched ours after the clear was observed), the fence is discharged: the
+    /// in-memory token drops here, and the topic's group owner also removes the
+    /// keyspace record. Gated on the durable membership ROSTER (voters and
+    /// learners — crashed members stay on it until decommissioned, and members
+    /// this process cannot even name block the reap outright), never on live
+    /// gossip, which forgets the absent. Each node discharges independently off
+    /// the same signals; a record resurfacing from an old replica after a reap
+    /// merely re-arms a redundant fence. Runs per tick, pay-for-use (no
+    /// tombstones = no work); one full anti-entropy period must also have passed
+    /// so a match instant is never stale-by-construction.
+    async fn reap_discharged_tombstones(&mut self) {
+        let Some(durable) = self.durable_retained.clone() else {
+            return;
+        };
+        let Some((roster, unknown)) = self.placement.as_ref().and_then(|p| {
+            p.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .durable_roster()
+                .cloned()
+        }) else {
+            return; // the roster has never been pushed: nothing is dischargeable
+        };
+        if unknown > 0 {
+            return; // a member we cannot even name may still hold the value
+        }
+        let now = self.clock.now_epoch_secs();
+        let period = u64::from(RETAINED_ANTIENTROPY_EVERY);
+        let discharged: Vec<String> = self
+            .retained_tombstone_observed_at
+            .iter()
+            .filter(|(_, observed)| now.saturating_sub(**observed) >= period)
+            .filter(|(_, observed)| {
+                roster.iter().filter(|n| **n != self.node_id).all(|n| {
+                    self.retained_digest_matched_at
+                        .get(n)
+                        .is_some_and(|m| m > *observed)
+                })
+            })
+            .map(|(t, _)| t.clone())
+            .collect();
+        for topic in discharged {
+            let owned = self.placement.as_ref().is_some_and(|p| {
+                p.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .owner(&topic)
+                    == self.node_id
+            });
+            if owned {
+                if let Err(e) = durable.reap(&topic).await {
+                    // Keep the fence and the clock; the next tick retries.
+                    debug!(topic = %topic, error = %e, "tombstone reap deferred");
+                    continue;
+                }
+            }
+            self.retained_tokens.remove(&topic);
+            self.retained_tombstone_observed_at.remove(&topic);
+            info!(
+                topic = %topic,
+                "retained tombstone DISCHARGED: every durable-roster member converged \
+                 past the clear (issue #229)"
+            );
+        }
+    }
+
     /// An empty payload is a committed clear — the cache drops the topic, but the
     /// tombstone's token is kept so a staler value cannot resurrect it.
     async fn apply_retained_update(
@@ -5965,6 +6072,7 @@ impl Hub {
         // one node permanently, while its peers served the value normally — with no metric
         // and no divergence signal, because a node with no value has nothing to compare.
         self.retained_may_expire |= message.expires_at.is_some();
+        let tombstone = message.payload.is_empty();
         if let Err(e) = self.retained.set(&message).await {
             // No token recorded: the next commit for this topic, and the next digest
             // repair, both still apply.
@@ -5975,6 +6083,15 @@ impl Hub {
             return;
         }
         self.retained_tokens.insert(topic.to_string(), token);
+        // Tombstone bookkeeping (issue #229): a clear starts the discharge clock;
+        // a value re-taking the topic ends it (the fence is a value token again).
+        if tombstone {
+            self.retained_tombstone_observed_at
+                .entry(topic.to_string())
+                .or_insert_with(|| self.clock.now_epoch_secs());
+        } else {
+            self.retained_tombstone_observed_at.remove(topic);
+        }
 
         // #87 item 3, delivered WINDOW-SCOPED (#219). Live delivery to an established
         // subscriber is the interest-forward path's job (`forward_to_peers` →
@@ -9185,6 +9302,37 @@ mod tests {
         );
     }
 
+    /// Push a durable roster (issue #229) onto the hub's placement via the
+    /// attached ring — the seam the reconcile driver uses in production.
+    fn set_roster_on(placement: &Arc<RwLock<Placement>>, names: &[&str], unknown: usize) {
+        let known = names.iter().map(|n| NodeId((*n).into())).collect();
+        placement
+            .write()
+            .unwrap()
+            .set_durable_roster(known, unknown);
+    }
+
+    /// Ask the hub for a fresh digest by requesting one through the peer seam:
+    /// read `RetainedDigest` frames until the channel goes quiet, returning the
+    /// LAST one seen (the freshest picture).
+    async fn latest_digest(peer: &mut mpsc::UnboundedReceiver<PeerMessage>) -> (u64, u64, u64) {
+        // The link-up offer is already in flight: poll frames until quiet and
+        // keep the last digest (the freshest picture).
+        let mut last = None;
+        loop {
+            match recv_peer(peer).await {
+                Some(PeerMessage::RetainedDigest {
+                    count,
+                    hash,
+                    value_hash,
+                }) => last = Some((count, hash, value_hash)),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        last.expect("a digest frame must have been offered")
+    }
+
     fn publish_retained_with_expiry(
         tx: &HubTx,
         topic: &str,
@@ -9207,14 +9355,19 @@ mod tests {
 
     /// A single-node durable-retained hub on a controllable wall clock (issue #227):
     /// this node owns every group, so owner-side expiry reaping is exercised.
-    fn start_durable_hub_with_clock() -> (HubTx, TestDurableRetained, TestClock) {
+    fn start_durable_hub_with_clock() -> (
+        HubTx,
+        TestDurableRetained,
+        TestClock,
+        Arc<RwLock<Placement>>,
+    ) {
         let clock = TestClock::new(1_000_000);
         let local = NodeId("hub-test".into());
         let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
         let (mut hub, tx) = Hub::with_config_and_placement(
             local,
             Arc::new(MemorySessionStore::new()),
-            Some(placement),
+            Some(placement.clone()),
         );
         let handle = Arc::new(mqtt_storage::retained_log::ReplicatedRetained::new(
             InMemoryReplicatedLog::new(),
@@ -9222,7 +9375,7 @@ mod tests {
         hub.attach_durable_retained(handle.clone());
         hub.attach_clock(Arc::new(clock.clone()));
         tokio::spawn(hub.run());
-        (tx, handle, clock)
+        (tx, handle, clock, placement)
     }
 
     fn publish_retained(tx: &HubTx, topic: &str, payload: &'static [u8]) {
@@ -9893,6 +10046,15 @@ mod tests {
                         expires_at: *expires_at,
                     }
                 }))
+        }
+
+        /// Reap a topic's record — tombstone discharge (issue #229).
+        async fn reap(&self, topic: &str) -> Result<(), mqtt_storage::StorageError> {
+            self.committed
+                .lock()
+                .unwrap()
+                .retain(|(t, _, _, _)| t != topic);
+            Ok(())
         }
 
         /// Enumerate committed topics, tombstones included — the issue #183 warm
@@ -10710,6 +10872,127 @@ mod tests {
         assert_eq!(payload_of(&p), b"v1");
     }
 
+    /// Issue #229, the discharge: once every durable-roster member's digest has
+    /// MATCHED ours after a clear was observed (and a full anti-entropy period has
+    /// passed), the tombstone's fence is redundant — nobody who could return still
+    /// holds the pre-clear value — so the fence drops and the owner removes the
+    /// keyspace record. Durable retraction becomes bounded instead of forever.
+    #[tokio::test]
+    async fn a_discharged_tombstone_is_reaped_after_the_roster_converges() {
+        let (tx, durable, clock, placement) = start_durable_hub_with_clock();
+        // The roster: this node plus peer "n" — both must converge.
+        set_roster_on(&placement, &["hub-test", "n"], 0);
+        publish_retained_with_expiry(&tx, "gc/t", b"v", None);
+        publish_retained_with_expiry(&tx, "gc/t", b"", None); // the clear
+        wait_durable_retained(&durable, "gc/t", |e| e.tombstone).await;
+
+        // The peer links up AFTER the clear (a tombstone-only state still offers
+        // its digest — the #183 guarantee); echoing that digest back is the
+        // convergence observation the reap gates on.
+        clock.advance(2);
+        let mut peer = connect_peer(&tx, "n", 1);
+        let digest = latest_digest(&mut peer).await;
+        tx.send(HubCommand::RemoteRetainedDigest {
+            node: NodeId("n".into()),
+            count: digest.0,
+            hash: digest.1,
+            value_hash: digest.2,
+        })
+        .unwrap();
+
+        // One full anti-entropy period after the observation, the fence discharges
+        // and the owner reaps the record.
+        clock.advance(u64::from(super::RETAINED_ANTIENTROPY_EVERY) + 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if durable.get("gc/t").await.unwrap().is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the converged-past tombstone must be REAPED from the keyspace"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Issue #229, the safety half: a roster member that has NOT been seen
+    /// converged since the clear — or a member this process cannot even name —
+    /// blocks the reap indefinitely. The fence outlives every possible stale
+    /// holder; that is the whole point of gating on the durable roster instead of
+    /// live gossip.
+    #[tokio::test]
+    async fn an_unconverged_or_unnameable_roster_member_blocks_the_reap() {
+        let (tx, durable, clock, placement) = start_durable_hub_with_clock();
+        set_roster_on(&placement, &["hub-test", "n"], 0);
+        publish_retained_with_expiry(&tx, "gc/t", b"v", None);
+        publish_retained_with_expiry(&tx, "gc/t", b"", None);
+        wait_durable_retained(&durable, "gc/t", |e| e.tombstone).await;
+
+        // No digest from "n" ever matched: a period passing changes nothing.
+        clock.advance(u64::from(super::RETAINED_ANTIENTROPY_EVERY) * 3);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            durable.get("gc/t").await.unwrap().is_some(),
+            "an unconverged roster member must block the reap"
+        );
+
+        // Even a converged NAMED member cannot compensate for an unnameable one.
+        let mut peer = connect_peer(&tx, "n", 1);
+        clock.advance(2);
+        let digest = latest_digest(&mut peer).await;
+        tx.send(HubCommand::RemoteRetainedDigest {
+            node: NodeId("n".into()),
+            count: digest.0,
+            hash: digest.1,
+            value_hash: digest.2,
+        })
+        .unwrap();
+        set_roster_on(&placement, &["hub-test", "n"], 1);
+        clock.advance(u64::from(super::RETAINED_ANTIENTROPY_EVERY) + 1);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            durable.get("gc/t").await.unwrap().is_some(),
+            "an unnameable roster member must block the reap"
+        );
+    }
+
+    /// Issue #229: a value re-taking a cleared topic ends the tombstone's
+    /// discharge bookkeeping — the fence is a value token again and is never
+    /// reaped as if it were a clear.
+    #[tokio::test]
+    async fn a_recreated_topic_leaves_the_discharge_clock() {
+        let (tx, durable, clock, placement) = start_durable_hub_with_clock();
+        set_roster_on(&placement, &["hub-test"], 0); // roster of one: vacuously converged
+        publish_retained_with_expiry(&tx, "gc/t", b"v1", None);
+        publish_retained_with_expiry(&tx, "gc/t", b"", None);
+        wait_durable_retained(&durable, "gc/t", |e| e.tombstone).await;
+        publish_retained_with_expiry(&tx, "gc/t", b"v2", None); // re-taken
+        wait_durable_retained(&durable, "gc/t", |e| !e.tombstone).await;
+        clock.advance(u64::from(super::RETAINED_ANTIENTROPY_EVERY) * 2);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let e = durable.get("gc/t").await.unwrap();
+        assert!(
+            e.is_some_and(|e| !e.tombstone),
+            "a re-taken topic's record must never be reaped by the discharge pass"
+        );
+        // And a roster-of-one clear DOES discharge (vacuous convergence).
+        publish_retained_with_expiry(&tx, "gc/t", b"", None);
+        wait_durable_retained(&durable, "gc/t", |e| e.tombstone).await;
+        clock.advance(u64::from(super::RETAINED_ANTIENTROPY_EVERY) + 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if durable.get("gc/t").await.unwrap().is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a lone-roster clear discharges after one period"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// Issue #227 [MQTT-3.3.2-6]: a retained replay carries the REMAINING Message
     /// Expiry Interval — the received value minus the time the copy sat in the
     /// broker — never the original, and never silence.
@@ -10780,7 +11063,7 @@ mod tests {
     /// zero-length publish, never by comparing clocks across nodes.
     #[tokio::test]
     async fn an_owner_reaps_an_expired_retained_value_as_a_committed_clear() {
-        let (tx, durable, clock) = start_durable_hub_with_clock();
+        let (tx, durable, clock, _placement) = start_durable_hub_with_clock();
         publish_retained_with_expiry(&tx, "exp/t", b"v", Some(10));
         // The commit itself carries the deadline (start epoch 1_000_000 + 10).
         let e = wait_durable_retained(&durable, "exp/t", |e| !e.tombstone).await;
@@ -10800,7 +11083,7 @@ mod tests {
     /// absolute instant.
     #[tokio::test]
     async fn the_fanout_and_snapshot_carry_the_deadline() {
-        let (tx, _durable, clock) = start_durable_hub_with_clock();
+        let (tx, _durable, clock, _placement) = start_durable_hub_with_clock();
         let _ = clock; // deadline fixed by the start epoch
         let mut peer = connect_peer(&tx, "n", 1);
         publish_retained_with_expiry(&tx, "exp/t", b"v", Some(100));
