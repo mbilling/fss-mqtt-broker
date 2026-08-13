@@ -52,7 +52,11 @@ spec:
         #    replica count for every joiner (a minority pod stays out of rotation). The broker
         #    image is distroless (no shell), so this tiny POSIX-shell step does the templating.
         - name: render-config
+          {{- if .Values.initImage.digest }}
+          image: "{{ .Values.initImage.repository }}@{{ .Values.initImage.digest }}"
+          {{- else }}
           image: "{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.initImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -62,6 +66,27 @@ spec:
               set -eu
               ORD="${POD_NAME##*-}"
               STS="${POD_NAME%-*}"
+              # The cluster-bus certificate is PER POD (issue #262): the bus binds node
+              # identity to the certificate's Subject CN, so one leaf shared by every pod
+              # drops every peer link. The Secret therefore carries one leaf per node id,
+              # keyed by pod name — and an ordinal with no leaf is a scale-up that outran
+              # its PKI. Fail HERE, naming the fix, rather than let the broker crash-loop
+              # on an unreadable path or (worse) form no mesh while looking healthy.
+              if [ -n "${PEER_TLS_DIR:-}" ]; then
+                for f in "${POD_NAME}.crt" "${POD_NAME}.key" "ca.crt"; do
+                  if [ ! -s "${PEER_TLS_DIR}/${f}" ]; then
+                    echo "FATAL: no cluster-bus certificate material for ${POD_NAME}:" >&2
+                    echo "  ${PEER_TLS_DIR}/${f} is missing or empty." >&2
+                    echo "  The chart derives the peer-TLS env paths from the Secret, so it must" >&2
+                    echo "  carry ca.crt plus ${POD_NAME}.crt AND ${POD_NAME}.key (CN = the node id)." >&2
+                    echo "  An operator-supplied Secret with differently-named keys fails HERE," >&2
+                    echo "  by name, instead of as a bare broker filesystem error." >&2
+                    echo "  Mint or fix the leaves, re-apply the Secret, and retry:" >&2
+                    echo "    REPLICAS=${REPLICAS} ./deploy/helm/mqttd/bootstrap.sh" >&2
+                    exit 1
+                  fi
+                done
+              fi
               SEED0="\"${STS}-0.${HEADLESS_DOMAIN}:7946\""
               SEED1="\"${STS}-1.${HEADLESS_DOMAIN}:7946\""
               SEED2="\"${STS}-2.${HEADLESS_DOMAIN}:7946\""
@@ -131,11 +156,22 @@ spec:
             - name: STORE_MAX_BYTES
               value: {{ .Values.storeMaxBytes | quote }}
             {{- end }}
+            {{- if .Values.secrets.peerTls.secretName }}
+            # Arms the per-pod cluster-bus leaf preflight above (issue #262). Set only when
+            # a peer-bus Secret is wired, so the check is inert on a plaintext-mesh install.
+            - name: PEER_TLS_DIR
+              value: {{ .Values.secrets.peerTls.mountPath | quote }}
+            {{- end }}
           volumeMounts:
             - name: config-tmpl
               mountPath: /tmpl
             - name: config
               mountPath: /config
+            {{- if .Values.secrets.peerTls.secretName }}
+            - name: peer-tls
+              mountPath: {{ .Values.secrets.peerTls.mountPath }}
+              readOnly: true
+            {{- end }}
         {{- if .Values.checkConfig.enabled }}
         # 2) Fail the pod BEFORE it serves if the rendered config is invalid (ADR 0046 T3).
         - name: check-config
@@ -155,9 +191,9 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           args: ["--config", "/config/mqttd.toml"]
-          {{- with .Values.extraEnv }}
+          {{- with (include "mqttd.brokerEnv" . | trim) }}
           env:
-            {{- toYaml . | nindent 12 }}
+            {{- . | nindent 12 }}
           {{- end }}
           ports:
             - name: mqtt-tls
@@ -215,6 +251,12 @@ spec:
               mountPath: {{ .Values.secrets.gossipKey.mountPath }}
               readOnly: true
             {{- end }}
+            {{- /* Broker-level extension point (issue #262): the intended use is a
+                   cert-manager csi-driver volume for per-pod peer-bus keys, paired with
+                   secrets.peerTls.dir. */}}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config-tmpl
           configMap:
@@ -240,6 +282,9 @@ spec:
         - name: gossip-key
           secret:
             secretName: {{ .Values.secrets.gossipKey.secretName }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

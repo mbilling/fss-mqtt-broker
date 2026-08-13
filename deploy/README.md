@@ -6,7 +6,7 @@ path).
 
 | | Where it lives | Use it when | Tested by |
 |---|---|---|---|
-| **Helm chart** | [`helm/mqttd`](helm/mqttd) | You run Kubernetes | `helm lint` + kubeconform + a kind end-to-end job |
+| **Helm chart** | [`helm/mqttd`](helm/mqttd) | You run Kubernetes | `helm lint` + kubeconform + [`scripts/k8s/peer-tls-check.sh`](../scripts/k8s/peer-tls-check.sh) + a kind end-to-end job with the cluster bus ON |
 | **Compose** | [`compose/`](compose) | One host, or a small fleet with Docker | [`scripts/deploy-smoke.sh`](../scripts/deploy-smoke.sh) per PR + [`scripts/compose-smoke.sh`](../scripts/compose-smoke.sh) (real containers, nightly) |
 | **systemd** | [`systemd/`](systemd) | Bare metal or VMs, no container runtime | [`scripts/deploy-smoke.sh`](../scripts/deploy-smoke.sh) |
 | **Operator** | [`operator/`](operator) | **Not installable yet** — no published image (ADR 0055 T8) | kind e2e only |
@@ -68,7 +68,9 @@ they are looking at.
   chart is TLS-only, Compose mints a throwaway starter PKI in a one-shot at bring-up (so
   `up -d` is TLS on the first run), and the systemd packaging ships the TLS and cluster-bus
   lines *uncommented* plus [`systemd/gen-certs.sh`](systemd/gen-certs.sh) to mint the
-  material, as a marked install step. What none of them gives you is a **real** CA: every
+  material, as a marked install step, and on Kubernetes
+  [`helm/mqttd/bootstrap.sh`](helm/mqttd/bootstrap.sh) mints and self-verifies the whole set
+  (server TLS, per-node cluster-bus leaves, gossip key) into Secrets. What none of them gives you is a **real** CA: every
   starter PKI here is self-signed, unrevocable and disposable. Bring your own before
   production — and when you do, satisfy the four rules the cluster bus enforces on the peer
   certificate, which [`systemd/mqttd.env.example`](systemd/mqttd.env.example) lists at the

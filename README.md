@@ -1109,10 +1109,23 @@ Day-2 procedures — cert/key rotation, scaling, PVC lifecycle, founder recovery
 are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md):
 
 ```sh
-helm install mqttd deploy/helm/mqttd \
+# Mints the gossip key, server TLS, a starter ACL and ONE CLUSTER-BUS CERTIFICATE PER NODE
+# into the namespace, then prints the exact --set flags to wire them. Verifies every
+# certificate property it reports before installing it.
+NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
+
+# mqttd-tls is a kubernetes.io/tls Secret; mqttd-peer-tls carries ca.crt plus
+# <pod>.crt/<pod>.key per pod (the layout bootstrap.sh mints and prints).
+helm install mqttd deploy/helm/mqttd -n mqttd \
   --set replicaCount=3 \
-  --set secrets.tls.secretName=mqttd-server-tls   # a kubernetes.io/tls Secret
+  --set secrets.tls.secretName=mqttd-tls \
+  --set secrets.peerTls.secretName=mqttd-peer-tls \
+  --set secrets.gossipKey.secretName=mqttd-gossip
 ```
+
+Naming those Secrets is all that is needed: the chart derives the paths the broker reads
+(`MQTTD_PEER_TLS_*` — each pod's **own** leaf — and `MQTTD_SWIM_KEY_FILE`) from the names, so
+material that is mounted is always material that is used.
 
 - **Per-pod PersistentVolume** (`volumeClaimTemplate`) for the redb data dir — a rescheduled pod
   reattaches its volume and recovers durable state, never the ephemeral-storage data-loss trap.
@@ -1125,6 +1138,12 @@ helm install mqttd deploy/helm/mqttd \
   post-departure replica set (ADR 0043) and holds the pod open until the drain completes — a
   planned removal loses nothing.
 - **Quorum-safe rollout:** one pod at a time (ADR 0039) + a `PodDisruptionBudget` (`maxUnavailable: 1`).
+- **Mutually-authenticated cluster bus, one certificate per node.** The bus binds node identity to
+  the certificate's Subject CN, so each pod reads its own leaf out of the peer-TLS Secret
+  (`<pod>.crt` / `<pod>.key`) — a single shared certificate would drop every peer link. Growing the
+  cluster means minting the new ordinals' leaves first; a pod whose ordinal has none fails its init
+  container and says so. See
+  [Cluster-bus certificates](docs/OPERATIONS.md#cluster-bus-certificates--one-per-node-and-why-that-is-not-negotiable).
 
 Validate a rendered config without a cluster: `mqttd --check-config --config <file>`. See
 [`docs/mqttd.example.toml`](docs/mqttd.example.toml) for every setting.

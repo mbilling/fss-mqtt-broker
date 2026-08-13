@@ -76,10 +76,17 @@ pub struct SecretRefs {
     /// Topic ACL policy (`ConfigMap` name, key `acl.toml`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acl: Option<String>,
-    /// Cluster-bus mTLS material (Secret with `ca.crt`/`tls.crt`/`tls.key`).
+    /// Cluster-bus mTLS material: a Secret with `ca.crt` plus ONE LEAF PER POD, keyed by
+    /// pod name (`<pod>.crt` / `<pod>.key`). Each pod is given its own by path, because the
+    /// bus binds node identity to the certificate's Subject CN — one shared leaf drops every
+    /// peer link (issue #262). Every leaf needs CN = the pod name, a SAN covering that pod's
+    /// `<pod>.<headless>.<ns>.svc.cluster.local` advertise host, both serverAuth and
+    /// clientAuth EKUs, and an ECDSA P-256/P-384 or Ed25519 PKCS#8 key (never RSA — the same
+    /// key signs gossip). A new ordinal needs its own leaf before it can start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_tls: Option<String>,
-    /// Gossip key file (Secret with key `swim-key`).
+    /// Gossip key file (Secret with key `swim-key`). Setting this together with `peerTls`
+    /// arms signed per-node gossip (ADR 0022).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_key: Option<String>,
 }

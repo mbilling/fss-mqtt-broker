@@ -40,6 +40,27 @@ fn config_checksum(config: &str) -> String {
 const RENDER_SCRIPT: &str = r#"set -eu
 ORD="${POD_NAME##*-}"
 STS="${POD_NAME%-*}"
+# The cluster-bus certificate is PER POD (issue #262): the bus binds node
+# identity to the certificate's Subject CN, so one leaf shared by every pod
+# drops every peer link. The Secret therefore carries one leaf per node id,
+# keyed by pod name — and an ordinal with no leaf is a scale-up that outran
+# its PKI. Fail HERE, naming the fix, rather than let the broker crash-loop
+# on an unreadable path or (worse) form no mesh while looking healthy.
+if [ -n "${PEER_TLS_DIR:-}" ]; then
+  for f in "${POD_NAME}.crt" "${POD_NAME}.key" "ca.crt"; do
+    if [ ! -s "${PEER_TLS_DIR}/${f}" ]; then
+      echo "FATAL: no cluster-bus certificate material for ${POD_NAME}:" >&2
+      echo "  ${PEER_TLS_DIR}/${f} is missing or empty." >&2
+      echo "  The chart derives the peer-TLS env paths from the Secret, so it must" >&2
+      echo "  carry ca.crt plus ${POD_NAME}.crt AND ${POD_NAME}.key (CN = the node id)." >&2
+      echo "  An operator-supplied Secret with differently-named keys fails HERE," >&2
+      echo "  by name, instead of as a bare broker filesystem error." >&2
+      echo "  Mint or fix the leaves, re-apply the Secret, and retry:" >&2
+      echo "    REPLICAS=${REPLICAS} ./deploy/helm/mqttd/bootstrap.sh" >&2
+      exit 1
+    fi
+  done
+fi
 SEED0="\"${STS}-0.${HEADLESS_DOMAIN}:7946\""
 SEED1="\"${STS}-1.${HEADLESS_DOMAIN}:7946\""
 SEED2="\"${STS}-2.${HEADLESS_DOMAIN}:7946\""
@@ -106,11 +127,18 @@ const DEFAULT_IMAGE: &str = concat!(
     env!("CARGO_PKG_VERSION")
 );
 /// The shell image for the render init container (the broker image is distroless).
-const INIT_IMAGE: &str = "busybox:1.36";
+const INIT_IMAGE: &str =
+    "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 /// Drain + graceful-shutdown allowance (chart default).
 const TERMINATION_GRACE_SECONDS: i64 = 300;
 /// Default PVC size when the CR does not set one.
 const DEFAULT_PVC_SIZE: &str = "10Gi";
+/// Mount path for the cluster-bus mTLS Secret — the chart's
+/// `secrets.peerTls.mountPath` default, and the prefix of the `MQTTD_PEER_TLS_*`
+/// paths the broker container is given.
+const PEER_TLS_PATH: &str = "/etc/mqttd/cluster";
+/// Mount path for the gossip-key Secret (the chart's `secrets.gossipKey.mountPath`).
+const GOSSIP_PATH: &str = "/etc/mqttd/gossip";
 
 /// Every object the operator owns for one `MqttdCluster`.
 #[derive(Debug)]
@@ -302,14 +330,14 @@ fn secret_wiring(cr: &MqttdCluster) -> (Vec<Value>, Vec<Value>) {
     if let Some(peer) = s.and_then(|s| s.peer_tls.as_ref()) {
         add(
             "peer-tls",
-            "/etc/mqttd/cluster",
+            PEER_TLS_PATH,
             json!({ "name": "peer-tls", "secret": { "secretName": peer } }),
         );
     }
     if let Some(key) = s.and_then(|s| s.gossip_key.as_ref()) {
         add(
             "gossip-key",
-            "/etc/mqttd/gossip",
+            GOSSIP_PATH,
             json!({ "name": "gossip-key", "secret": { "secretName": key } }),
         );
     }
@@ -359,6 +387,56 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
     if founding_disarmed(cr) {
         init_env.push(json!({ "name": "CLUSTER_ESTABLISHED", "value": "true" }));
     }
+    let peer_tls = cr
+        .spec
+        .secrets
+        .as_ref()
+        .and_then(|s| s.peer_tls.as_ref())
+        .is_some();
+    let gossip_key = cr
+        .spec
+        .secrets
+        .as_ref()
+        .and_then(|s| s.gossip_key.as_ref())
+        .is_some();
+    // The render init container also mounts the peer-bus Secret, purely to arm the
+    // per-pod-leaf preflight in RENDER_SCRIPT (issue #262).
+    let mut init_mounts = vec![
+        json!({ "name": "config-tmpl", "mountPath": "/tmpl" }),
+        json!({ "name": "config", "mountPath": "/config" }),
+    ];
+    if peer_tls {
+        init_env.push(json!({ "name": "PEER_TLS_DIR", "value": PEER_TLS_PATH }));
+        init_mounts
+            .push(json!({ "name": "peer-tls", "mountPath": PEER_TLS_PATH, "readOnly": true }));
+    }
+    // Secret material is referenced BY PATH, and the paths are DERIVED from the secret
+    // names here rather than left to the CR author — the fix for issue #262, mirroring
+    // the chart's `mqttd.brokerEnv`. Before it, both paths MOUNTED the cluster-bus
+    // Secret and referenced nothing in it, so the bus stayed plaintext while the
+    // deployment looked mutually authenticated. Each pod gets ITS OWN leaf through
+    // Kubernetes' dependent-env expansion of $(POD_NAME): a StatefulSet pod template
+    // cannot select a Secret per ordinal, but every pod can select a KEY within one.
+    let mut broker_env: Vec<Value> = Vec::new();
+    if peer_tls {
+        broker_env.push(
+            json!({ "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } }),
+        );
+        broker_env.push(
+            json!({ "name": "MQTTD_PEER_TLS_CA", "value": format!("{PEER_TLS_PATH}/ca.crt") }),
+        );
+        broker_env.push(
+            json!({ "name": "MQTTD_PEER_TLS_CERT", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).crt") }),
+        );
+        broker_env.push(
+            json!({ "name": "MQTTD_PEER_TLS_KEY", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).key") }),
+        );
+    }
+    if gossip_key {
+        broker_env.push(
+            json!({ "name": "MQTTD_SWIM_KEY_FILE", "value": format!("{GOSSIP_PATH}/swim-key") }),
+        );
+    }
     let (secret_mounts, secret_volumes) = secret_wiring(cr);
     let persistence = cr.spec.persistence.as_ref();
     let size = persistence
@@ -384,7 +462,7 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
         pvc_spec["storageClassName"] = json!(class);
     }
 
-    json!({
+    let mut sts = json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
         "metadata": {
@@ -434,10 +512,7 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
                             "command": ["/bin/sh", "-c"],
                             "args": [RENDER_SCRIPT],
                             "env": init_env,
-                            "volumeMounts": [
-                                { "name": "config-tmpl", "mountPath": "/tmpl" },
-                                { "name": "config", "mountPath": "/config" },
-                            ],
+                            "volumeMounts": init_mounts,
                         },
                         {
                             "name": "check-config",
@@ -487,7 +562,13 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
                 "spec": pvc_spec,
             }],
         },
-    })
+    });
+    // Emitted only when there is something to emit, so a secret-less CR renders a
+    // container with NO env key — exactly what the chart's `{{- with ... }}` does.
+    if !broker_env.is_empty() {
+        sts["spec"]["template"]["spec"]["containers"][0]["env"] = json!(broker_env);
+    }
+    sts
 }
 
 fn security_context() -> Value {

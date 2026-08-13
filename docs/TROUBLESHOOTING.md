@@ -60,6 +60,16 @@ not route traffic.
   group yet?
 - **A lone durable node is healthy alone**, by design; readiness only fails when *more than
   one* member is expected and fewer are present.
+- **On a mutually-authenticated cluster bus, look for a certificate mismatch.** If the logs
+  carry `peer Hello node id does not match its certificate Common Name`, every peer link is
+  being dropped after a *successful* handshake: the bus binds node identity to the
+  certificate's Subject CN, so each node needs **its own** leaf with `CN` = its node id (on
+  Kubernetes, its pod name). One certificate shared by the whole cluster produces exactly
+  this — brokers that start, log signed gossip, and never reach readiness. See
+  [Cluster-bus certificates](OPERATIONS.md#cluster-bus-certificates--one-per-node-and-why-that-is-not-negotiable).
+  Two more shapes of the same mistake: a leaf with **no SAN** covering the node's
+  `peer_advertise` host fails name verification at the dialer (rustls checks SANs only, never
+  the CN), and a leaf **missing the `clientAuth` EKU** is rejected when the node dials out.
 
 ## The broker started but "durability" isn't surviving restarts
 

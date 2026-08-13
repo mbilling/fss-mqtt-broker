@@ -27,3 +27,8 @@ dist/
 # removes them on a clean run; an aborted run leaves them behind)
 dist-e2e-mqttd
 dist-e2e-operator
+
+# The helm bootstrap's local PKI working tree (deploy/helm/mqttd/bootstrap.sh, issue #262):
+# the CA private key, per-node leaves, and the SHARED GOSSIP KEY (extensionless, so the
+# *.key/*.pem globs above do NOT cover it). Kept on the admin box; never committed.
+mqttd-pki/

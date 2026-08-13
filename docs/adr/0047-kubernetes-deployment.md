@@ -57,6 +57,13 @@ GitOps commit is the unit of change; TLS material, password/JWT keys, and the go
 **Secret** mounts referenced by path. `--check-config` runs as an init container or CI gate,
 so a bad config fails the rollout before a pod serves.
 
+**As delivered, "referenced by path" means the chart DERIVES the paths from the Secret
+names** rather than asking the operator to restate them (`MQTTD_PEER_TLS_{CA,CERT,KEY}`,
+`MQTTD_SWIM_KEY_FILE`). Mounting and referencing were separate steps until issue #262, and
+that gap was the whole defect: a cluster-bus Secret could be mounted while nothing read it,
+so the bus stayed plaintext under a deployment that looked mutually authenticated. See the
+2026-08-13 amendment.
+
 ### 3. Probes and services wired to the broker's real signals
 
 `readinessProbe` → `/readyz` (which already reports membership + lease-group readiness +
@@ -350,3 +357,99 @@ config` and `systemd-analyze verify` run when available and **skip loudly** when
 The `systemd-analyze` check earns its place for a specific reason: systemd *silently
 ignores* a directive it does not recognise, so a typo'd hardening option leaves a unit that
 looks hardened and is not.
+
+## Amendment (2026-08-13): the cluster bus needs one certificate per NODE (issue #262)
+
+`bootstrap.sh` minted the cluster-bus material as **one shared leaf for the whole cluster**
+— `CN=<release>-node`, no SANs, an RSA key — created a Secret from it, and printed
+`--set secrets.peerTls.secretName=mqttd-peer-tls` as the way to turn the mutually
+authenticated bus on. Each of those three properties is independently fatal, and the chart
+had a fourth problem that made the first three invisible.
+
+**Why a shared certificate cannot work here, at all.** The bus binds node identity to the
+certificate: a peer may only claim the node id its Subject CN attests to (ADR 0004), and the
+gossip plane enforces the same CN against the datagram sender (ADR 0022). Every pod
+presenting `CN=<release>-node` while claiming its own pod name means **every** link is
+dropped after a successful handshake. Separately, name verification uses **SANs only**, so a
+leaf with none can never satisfy a dialer whose `ServerName` is the peer's advertise host —
+CN and SAN are two different requirements, and satisfying one says nothing about the other.
+Separately again, the peer key **is** the per-node gossip signing key, which accepts only
+ECDSA P-256/P-384 or Ed25519 in PKCS#8; an RSA leaf gives a working TLS handshake and then a
+hard startup failure. Signed gossip arms *itself* once peer TLS and a gossip key are both
+present, so that last one is not opt-in.
+
+This is the same defect class as issue #254: a shipped artifact the project's own words
+present as usable, which nobody had executed.
+
+### What ships instead
+
+**One CA plus one leaf per node**, keyed in the Secret by pod name (`<pod>.crt` /
+`<pod>.key` alongside `ca.crt`). In a StatefulSet the identities are knowable in advance —
+node id = pod name = `<fullname>-<ordinal>` — so the mint loops over ordinals. Each leaf
+carries `CN` = the pod name, a SAN covering that pod's
+`<pod>.<headless>.<ns>.svc.cluster.local` advertise host, both `serverAuth` and `clientAuth`,
+and an ECDSA P-256 PKCS#8 key.
+
+**The chart hands each pod its own leaf by path**, through Kubernetes' dependent-env
+expansion of `$(POD_NAME)`. That indirection is what makes a per-node CN possible at all: a
+StatefulSet pod template cannot select a different *Secret* per ordinal, but every pod can
+select a different *key inside one Secret*. The alternative shapes were considered and
+rejected — one Secret per pod cannot be mounted by ordinal (a pod template cannot vary a
+Secret name per ordinal; `subPathExpr` could vary a path, but subPath-mounted Secrets never
+receive updates, foreclosing any future hot-rotation work), and an init container minting its
+own leaf requires the CA private key in every pod, which is precisely the custody rule this
+project states elsewhere. Rotation itself is **not hot** — the peer-bus CA/cert/key are not
+file-watched and the gossip signer is a startup snapshot even across SIGHUP, so a rotation is
+completed by a rolling restart; an earlier draft of this section claimed otherwise
+(issue #262, corrected in place; hot rotation is tracked as follow-up work).
+
+**Announcing a Secret now implies consuming it.** The chart derives
+`MQTTD_PEER_TLS_{CA,CERT,KEY}` and `MQTTD_SWIM_KEY_FILE` from the secret names, so the
+mounted-but-unread state is no longer expressible. This is the structural half of the fix,
+and the more important half: the three certificate defects only ever *armed* once an
+operator additionally hand-wrote those paths, which means the shipped script's own
+instructions produced a mounted secret, a plaintext bus, and a log line saying so that
+nobody was told to look for.
+
+**The mint verifies itself.** Every property it prints is read back out of the file with
+`openssl` — CA:TRUE and self-verification for the CA; CN, SANs, both EKUs, CA:FALSE,
+named-curve P-256, `ecdsa-with-SHA256` and a successful `openssl verify` for each leaf —
+failures accumulate so one run reports all of them, and material is staged and installed
+only after it passes. Reuse **re-verifies what is on disk** instead of testing that files
+exist, so a mint this script rejected is never blessed by the next run. The recipe is
+written to the intersection LibreSSL (`/usr/bin/openssl` on macOS) and OpenSSL 3 both get
+right, because it runs on the operator's workstation rather than in a pinned image; it is
+verified on both, and a non-conforming openssl fails with the remedy named.
+
+**Scale-up has an answer.** A new ordinal is a new node id and a new DNS name, so it needs
+its own leaf: `REPLICAS=<n> ./bootstrap.sh` re-verifies and keeps the CA, the existing leaves
+and the gossip key, mints only what is missing, and re-applies the Secret. A pod whose
+ordinal has no leaf fails its **init container** with a message naming that command, instead
+of crash-looping on an unreadable path.
+
+### The residual, stated
+
+On this starter path one Secret holds every node's key, and Kubernetes gives a pod the whole
+Secret — so **every broker pod can read every other node's peer key**. The CN binding stops
+an outsider, not a compromised pod. The CA private key never enters the cluster, which is the
+custody line that matters most, but per-pod *key* isolation needs a per-pod issuer:
+cert-manager's csi-driver, which is documented as the production path and is the only option
+expressing all four rules while keeping each pod to its own key. Note that a single
+cert-manager `Certificate` listing every pod's DNS name — the shape RabbitMQ's inter-node
+example uses, and evidently the shape this script was copied from — does **not** work here:
+it has one CN, and rule 1 is per-pod. Erlang distribution does not bind node identity to the
+CN; this bus does.
+
+### Why it rotted, and what now stops it
+
+Nothing had ever run it. `values.yaml` shipped `peerTls.secretName: ""`, the kind smoke
+pinned it to `""` explicitly, and no lane at either tier set it — so the one path that could
+have caught an unusable certificate never executed. Three gates now exist: the kind smoke
+runs with the bus **on**, minting through the shipped script and asserting `mtls=true`,
+signed per-node gossip and the *absence* of CN-binding drops on every pod;
+`scripts/k8s/peer-tls-check.sh` runs at PR time with no cluster, checking each leaf's CN
+against the pod names the chart renders and its SAN against the advertise host the chart's
+own init script computes, that the render consumes what it mounts, and that a real broker
+boots on a minted leaf — with the original certificate as a **negative control** that must
+be refused; and the render-parity gate gained a third pass with the bus on, so the operator
+path (which had the same mounted-but-unread gap) cannot drift from the chart.
