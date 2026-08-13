@@ -10,6 +10,7 @@ license.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+serde_ignored.workspace = true
 
 [lints]
 workspace = true

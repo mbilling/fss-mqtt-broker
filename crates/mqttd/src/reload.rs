@@ -344,6 +344,15 @@ impl Reloader {
                     Ok(c) => c,
                     Err(e) => return self.reject(trigger, &format!("config: {e}")),
                 };
+                // Same loud line the boot path emits (issue #230): a hot-reload
+                // under the warn posture must not ignore keys more quietly.
+                for key in &new.ignored_keys {
+                    tracing::warn!(
+                        key = %key,
+                        "config key IGNORED on reload (runtime.config_unknown_keys = \
+                         \"warn\") — unknown to this broker version (ADR 0058 T4)"
+                    );
+                }
                 if let Err(e) = (cs.precheck)(&new) {
                     return self.reject(trigger, &format!("config: {e}"));
                 }

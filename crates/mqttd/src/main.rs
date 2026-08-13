@@ -2552,7 +2552,19 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(p) = &path {
         info!(path = %p.display(), "loading configuration file (ADR 0046)");
     }
-    Ok(Config::load(path.as_deref())?)
+    let cfg = Config::load(path.as_deref())?;
+    // The warn posture (issue #230, ADR 0058 T4) ignores keys a NEWER config
+    // carries — one loud line per key, every boot, so a long-forgotten skew
+    // setting cannot silently eat a typo forever.
+    for key in &cfg.ignored_keys {
+        warn!(
+            key = %key,
+            "config key IGNORED (runtime.config_unknown_keys = \"warn\"): unknown \
+             to this broker version — a config written for a newer broker, or a typo \
+             this posture cannot catch (ADR 0058 T4)"
+        );
+    }
+    Ok(cfg)
 }
 
 /// Every flag `mqttd` recognises (#169). A dash-prefixed argument not in this list is a
