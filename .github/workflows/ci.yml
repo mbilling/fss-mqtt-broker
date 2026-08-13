@@ -207,6 +207,15 @@ jobs:
       # them for equivalent inputs and fails on any load-bearing divergence.
       - name: Render parity (operator vs chart)
         run: ./scripts/k8s/render-parity.sh
+      # Issue #262 (0047-T10): the chart's CLUSTER BUS, with peerTls actually set. Runs
+      # the SHIPPED bootstrap.sh mint, checks every leaf's CN against the pod names the
+      # chart renders and its SAN against the advertise host the chart's own init script
+      # computes, asserts the render CONSUMES the Secret it mounts (per-pod
+      # MQTTD_PEER_TLS_* paths), boots a real broker on a minted leaf, and requires the
+      # original unusable certificate to be refused. The bus used to be exercised by
+      # nothing at either tier, which is how it shipped broken.
+      - name: Cluster-bus PKI + wiring (peerTls ON)
+        run: ./scripts/k8s/peer-tls-check.sh
       # The rendered per-pod config template must itself be valid input to --check-config once its
       # placeholders are filled — a quick shell-level render mirrors the init container.
       - name: Rendered config is check-config-valid

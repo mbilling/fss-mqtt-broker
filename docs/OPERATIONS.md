@@ -31,6 +31,54 @@ Protect the policy volume (Secret RBAC, no wide ConfigMap write grants) to the s
 standard as the credentials it revokes; the audit log records each reload with its
 trigger, which is the forensic trail if it happens.
 
+## Cluster-bus certificates — one per node, and why that is not negotiable
+
+The inter-node bus (`secrets.peerTls`) is **mutually authenticated per node**, so its
+Secret holds `ca.crt` plus **one leaf per pod**, keyed by pod name (`<pod>.crt` /
+`<pod>.key`). The chart hands each pod its own by path
+(`MQTTD_PEER_TLS_CERT=/etc/mqttd/cluster/$(POD_NAME).crt`), which is what makes a per-pod
+identity possible at all: a StatefulSet pod template cannot select a different Secret per
+ordinal, but every pod can select a different *key* inside one Secret.
+
+A single shared certificate cannot work, however it is minted (issue #262). Four rules,
+three of which fail at runtime rather than at issue time:
+
+1. **CN == node id == pod name.** A peer may only claim the id its certificate attests to
+   ([ADR 0004](adr/0004-authentication-authorization.md)); a mismatch logs `peer Hello node
+   id does not match its certificate Common Name` and drops the link.
+2. **A SAN covering that pod's advertise host** —
+   `<pod>.<release>-mqttd-headless.<ns>.svc.cluster.local`. That is the name a dialing peer
+   verifies, and rustls checks SANs only: rule 1 satisfies nothing here.
+3. **Both `serverAuth` and `clientAuth` EKUs** — every node dials and is dialed.
+4. **An ECDSA P-256/P-384 or Ed25519 PKCS#8 key, never RSA.** The same key is the per-node
+   gossip signing key ([ADR 0022](adr/0022-signed-gossip.md)), which accepts nothing else.
+
+`deploy/helm/mqttd/bootstrap.sh` mints all of this and **verifies every property it
+prints** before installing anything; the CA private key stays on your workstation and never
+enters the cluster. For production, cert-manager's csi-driver is the better path — it is the
+only option that also keeps each pod to its own key, and the chart supports it directly:
+mount the csi ephemeral volume via `extraVolumes`/`extraVolumeMounts` and set
+`secrets.peerTls.dir` to its mountPath (the chart then derives `MQTTD_PEER_TLS_*` from the
+csi layout `tls.crt`/`tls.key`/`ca.crt`; the annotated example is in `values.yaml`). The
+attributes that satisfy the bus's rules: `common-name: "${POD_NAME}"`,
+`key-algorithm: ECDSA`, `key-encoding: PKCS8`, `key-usages: "server auth,client auth"`.
+
+**Symptoms.** Pods running but never Ready, with `does not match its certificate Common
+Name` in the logs → a leaf's CN is not its pod name. A startup failure naming the *gossip
+signing key* → the key is RSA. `INSECURE: starting PLAINTEXT peer listener` while a
+peerTls Secret is set → the paths are not reaching the broker (the chart derives them; a
+hand-rolled `extraEnv` override may be shadowing them). A pod stuck in `Init:Error` whose
+init container says `no cluster-bus certificate for <pod>` → see Scaling, below.
+
+**Rotation needs a rolling restart** (`kubectl rollout restart statefulset/<name>`, or a
+per-host service restart on bare metal). The peer-bus CA/cert/key are **not** in the broker's
+file-watch scope, and the per-node gossip signing key — the same key file — is read once at
+startup and not rebuilt even by SIGHUP; a re-mounted leaf keeps signing gossip with the old
+key, which still chain-verifies against the unchanged CA, so nothing fails until the OLD
+cert's expiry — long after the rotation that caused it. Roll the pods when you rotate.
+The one hot piece is revocation: a revoked peer's established link is torn down when the
+cluster CRL (`MQTTD_PEER_TLS_CRL`) lands — the CRL *is* file-watched.
+
 ## SWIM gossip key rotation — three config rolls (manual by design)
 
 The broker supports a dual-key window (`[cluster.swim] key_accept`,
@@ -59,6 +107,13 @@ alertable equivalent).
 
 ## Scaling
 
+- **Up — mint the new nodes' certificates FIRST if the cluster bus is on.** A new ordinal is
+  a new node id and a new DNS name, so it needs its own leaf (see *Cluster-bus certificates*
+  above). Run `REPLICAS=<n> ./deploy/helm/mqttd/bootstrap.sh` before raising the count: it
+  re-verifies and keeps the existing CA, leaves and gossip key, mints only the new ordinals,
+  and re-applies the Secret. A pod whose ordinal has no leaf fails its **init container**
+  with a message naming that command, so the rollout stalls visibly at that ordinal instead
+  of crash-looping obscurely — and, with `OrderedReady`, no higher ordinal is created.
 - **Up:** `kubectl scale sts <name> --replicas=N` or `helm upgrade --set replicaCount=N`.
   New pods seed to the first two stable ordinals and back-fill behind the caught-up
   watermark ([ADR 0043](adr/0043-elastic-cluster-resize.md)). Note `helm upgrade`
@@ -70,11 +125,14 @@ alertable equivalent).
   replica set and verifies before exiting. Watch `/readyz` and the drain logs; then
   take the next step. Never drop below a durable quorum
   (`lease_voters`, default 5 → keep ≥ 3 running).
-- **PVCs:** on Kubernetes ≥ 1.27 the chart deletes the scaled-down pod's PVC
-  (`persistence.retentionPolicy.whenScaled: Delete`) — safe *because* the drain ran
-  first, and it prevents a later scale-up from reattaching a stale data dir under the
-  same node id. On older clusters delete the orphaned PVC by hand after the drain
-  completes. Deleting the whole release keeps PVCs (`whenDeleted: Retain`).
+- **PVCs:** the chart ships `persistence.retentionPolicy.whenScaled: Retain` (since
+  issue #97), so a scale-down leaves the departed pod's PVC behind **deliberately** —
+  see "That orphan is deliberate" below for why (`Delete` applied uniformly erases
+  everything at `--replicas=0`), and for when flipping it to `Delete` is reasonable.
+  If you keep `Retain`, delete the orphaned PVC by hand once the scale-down is
+  permanent — **before** any later scale-up re-creates the ordinal, so the new pod
+  starts clean instead of over the drained node's stale data dir.
+  Deleting the whole release keeps PVCs (`whenDeleted: Retain`).
 
 ## Split-brain detection (ADR 0054 T2)
 

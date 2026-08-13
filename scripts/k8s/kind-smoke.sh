@@ -44,7 +44,12 @@ dump() {
   echo "::endgroup::"
 }
 
-cleanup() { kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
+cleanup() {
+  kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+  # The throwaway cluster PKI, CA private key included.
+  [ -n "${PKI_DIR:-}" ] && rm -rf "$PKI_DIR"
+  return 0
+}
 trap 'rc=$?; if [ $rc -ne 0 ]; then dump; fi; cleanup; exit $rc' EXIT
 
 # A throwaway mosquitto client pod runs pub/sub against the client Service.
@@ -108,8 +113,29 @@ kind load docker-image "$IMAGE" --name "$CLUSTER"
 # Preload the busybox init image so the render init container needs no registry pull.
 docker pull busybox:1.36 && kind load docker-image busybox:1.36 --name "$CLUSTER"
 
-log "helm install the chart (smoke values)"
+log "Mint the cluster-bus PKI with the SHIPPED bootstrap.sh (issue #262)"
 kubectl create namespace "$NS"
+# The recipe is EXECUTED, not restated: bootstrap.sh mints one CA plus ONE LEAF PER NODE
+# (CN = pod name, SAN = that pod's advertise host, both EKUs, ECDSA P-256) and creates the
+# Secrets. A shipped recipe this smoke does not run is a shipped recipe nothing checks —
+# which is exactly how it came to ship a single shared RSA leaf that could not work.
+# REPLICAS must match the chart's replicaCount, or an ordinal comes up with no leaf.
+PKI_DIR="$(mktemp -d)"
+NS="$NS" RELEASE="$RELEASE" REPLICAS=3 PKI_DIR="$PKI_DIR" "$CHART/bootstrap.sh"
+# The CA private key must never enter the cluster — only ca.crt does. Assert it, because the
+# whole trust model of the bus rests on it: anything holding this key can mint a leaf with
+# any CN, and the bus binds node identity to the CN.
+if kubectl -n "$NS" get secret mqttd-peer-tls -o jsonpath='{.data}' | grep -q 'cluster-ca.key'; then
+  echo "FAIL: the cluster CA PRIVATE key was put into the peer-bus Secret"; exit 1
+fi
+# One leaf per pod, keyed by pod name — the property that makes a per-node CN possible.
+for i in 0 1 2; do
+  kubectl -n "$NS" get secret mqttd-peer-tls -o "jsonpath={.data.$STS-$i\\.crt}" | grep -q . \
+    || { echo "FAIL: the peer-bus Secret has no leaf for pod $STS-$i"; exit 1; }
+done
+echo "peer-bus Secret carries ca.crt + one leaf per pod, and no CA private key"
+
+log "helm install the chart (smoke values, cluster bus ON)"
 helm install "$RELEASE" "$CHART" -n "$NS" -f "$SMOKE_VALUES" \
   --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE#*:}" \
   --set image.pullPolicy=Never --set initImage.pullPolicy=IfNotPresent
@@ -117,6 +143,29 @@ helm install "$RELEASE" "$CHART" -n "$NS" -f "$SMOKE_VALUES" \
 log "Wait for the StatefulSet to roll out (all 3 pods Ready = mesh + lease group formed)"
 kubectl -n "$NS" rollout status "statefulset/$STS" --timeout="$READY_TIMEOUT"
 kubectl -n "$NS" get pods -o wide
+
+# The cluster bus is the thing issue #262 left unexercised, so assert its posture directly
+# rather than inferring it from readiness. Each pod must have a MUTUALLY AUTHENTICATED peer
+# listener, signed per-node gossip, and — the leg that a shared certificate would fail —
+# no link dropped on the node-id/CN binding. Tracing writes ANSI escapes between a field
+# name and its value even through `kubectl logs`, so strip them before matching: a naive
+# `grep mtls=true` silently never matches and the assertion passes vacuously.
+log "Cluster-bus posture: mTLS peer links + signed per-node gossip on every pod"
+nocolor() { sed $'s/\033\\[[0-9;]*m//g'; }
+for i in 0 1 2; do
+  plog="$(kubectl -n "$NS" logs "$STS-$i" -c mqttd 2>/dev/null | nocolor)"
+  printf '%s' "$plog" | grep -Eq 'accepting cluster peer links.*mtls=true' \
+    || { echo "FAIL: $STS-$i did not bring up a mutually-authenticated peer listener"
+         printf '%s\n' "$plog" | grep -E 'peer|mtls' | head; exit 1; }
+  printf '%s' "$plog" | grep -q 'SWIM gossip is SIGNED per-node' \
+    || { echo "FAIL: $STS-$i did not arm signed per-node gossip"; exit 1; }
+  printf '%s' "$plog" | grep -q 'INSECURE: starting PLAINTEXT peer listener' \
+    && { echo "FAIL: $STS-$i ran a PLAINTEXT peer bus despite a peer-TLS Secret"; exit 1; }
+  printf '%s' "$plog" | grep -q 'does not match its certificate Common Name' \
+    && { echo "FAIL: $STS-$i dropped a peer link on the node-id/CN binding — the shared-leaf defect"
+         printf '%s\n' "$plog" | grep 'Common Name'; exit 1; }
+done
+echo "all 3 pods: peer listener mtls=true, gossip SIGNED per-node, no CN-binding drops"
 
 log "Connectivity + durable retained publish"
 # Publish a RETAINED message; a fresh subscriber must receive it (retained state is durable).
@@ -236,4 +285,4 @@ case "$eps" in
 esac
 echo "self-quarantine held: pod-0 refuses readiness and is out of the Service endpoints"
 
-log "SMOKE PASSED: cluster formed, drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"
+log "SMOKE PASSED: cluster formed over a MUTUALLY AUTHENTICATED bus (per-node certs from the shipped bootstrap.sh, signed per-node gossip), drained on scale-down, survived a quorum-safe roll that STAYED healthy, self-quarantined a re-founder, and rejoined a wiped pod-0 once the founder guard was armed"

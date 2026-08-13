@@ -113,10 +113,22 @@ acl_file = "/etc/mqttd/acl.toml"
 # for a loudly-logged plaintext mesh). The key is a secret — mount it.
 peer_bind = "0.0.0.0:7001"
 # peer_advertise = "node-1.mqttd.svc:7001"   # address peers dial, if it differs from the bind
+#
+# THIS CERTIFICATE IS PER NODE, and four rules make it so. Three of them fail at RUNTIME, not
+# when the certificate is issued, and one shared certificate breaks all of them at once:
+#   1. Subject CN == this node's `[node] id`. A peer may only claim the id its certificate
+#      attests to; a mismatch logs "peer Hello node id does not match its certificate Common
+#      Name" and drops the link, so a shared CN drops EVERY link.
+#   2. A SAN covering the HOST PART of this node's peer_advertise — that is what a dialing peer
+#      verifies. SANs only: the CN above satisfies rule 1 and nothing about name verification.
+#   3. BOTH serverAuth and clientAuth EKUs — every node dials as well as being dialed.
+#   4. An ECDSA P-256/P-384 or Ed25519 key in PKCS#8, never RSA: this key is ALSO the per-node
+#      gossip signing key (`signed`, below), and that signer accepts nothing else. RSA gives a
+#      working TLS handshake and then a startup failure about the gossip signing key.
 [cluster.peer_tls]
 # ca = "/etc/mqttd/cluster/ca.crt"
-# cert = "/etc/mqttd/cluster/node.crt"
-# key = "/etc/mqttd/cluster/node.key"
+# cert = "/etc/mqttd/cluster/node.crt"       # THIS node's leaf — CN = [node] id (rules 1-4)
+# key = "/etc/mqttd/cluster/node.key"        # ECDSA/Ed25519 PKCS#8, not RSA (rule 4)
 # crl = "/etc/mqttd/cluster/node.crl"        # cluster-CA-signed; hot-reloads
 
 [cluster.swim]

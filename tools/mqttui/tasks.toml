@@ -311,6 +311,26 @@ Operates on this repository — it needs a checkout.
 requires = ["helm", "cargo"]
 duration = "~40s"
 
+[[task]]
+id = "k8s-peer-tls"
+group = "Kubernetes"
+name = "Check the chart's cluster-bus PKI and wiring"
+script = "scripts/k8s/peer-tls-check.sh"
+# Runs the shipped bootstrap.sh mint and boots a real broker on one of its leaves.
+needs_checkout = true
+about = """
+The cluster bus binds node identity to the certificate's Subject CN, so it needs ONE LEAF PER
+NODE — a single shared leaf drops every peer link, and an RSA key fails at startup because the
+same key signs gossip. This runs the shipped mint, checks each leaf's CN against the pod names
+the chart renders and its SAN against the advertise host the chart's own init script computes,
+asserts the render actually CONSUMES the Secret it mounts, boots a broker on a minted leaf, and
+requires the old unusable certificate to be refused.
+
+Operates on this repository — it needs a checkout. No Kubernetes cluster required.
+"""
+requires = ["helm", "openssl", "python3", "cargo"]
+duration = "~1m"
+
 # ── Benchmark ────────────────────────────────────────────────────────────────────────
 [[task]]
 id = "bench-certs"

@@ -15,9 +15,13 @@ imagePullSecrets: []
 
 # A small POSIX-shell image used only by the init container that renders the per-pod config
 # (the broker image itself is distroless and has no shell). Any busybox/alpine works.
+# Pinned by DIGEST, not a floating tag: with the cluster bus on, this container is handed a
+# read-only mount of the peer-bus Secret for its preflight (issue #262), so what runs here is
+# security-relevant. `digest` wins over `tag` when set; clear it to track a tag instead.
 initImage:
   repository: busybox
   tag: "1.36"
+  digest: "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
   pullPolicy: IfNotPresent
 
 # Cluster size. The StatefulSet's pod-0 is the gossip founder (no seeds); pods 1..N seed to it
@@ -85,10 +89,15 @@ config: |
 # name empty to skip that mount.
 #
 # NEW HERE? deploy/helm/mqttd/bootstrap.sh mints all of these (gossip key, server TLS,
-# cluster-bus mTLS, a starter ACL, optional password users) into a namespace and prints
-# the `helm install` flags that wire them — the Kubernetes equivalent of the compose
-# bootstrap. Run it once before the first install; replace the throwaway certs with real
-# ones (cert-manager) for production.
+# per-node cluster-bus certificates, a starter ACL, optional password users) into a
+# namespace and prints the `helm install` flags that wire them — the Kubernetes equivalent
+# of the compose bootstrap. Run it once before the first install; replace the throwaway
+# certs with real ones (cert-manager) for production.
+#
+# Setting a `secretName` is enough: the chart DERIVES the paths the broker reads (the
+# `MQTTD_PEER_TLS_*` trio and `MQTTD_SWIM_KEY_FILE`) from these names, so material that is
+# mounted is always material that is used. Before issue #262 it did not, and a cluster-bus
+# Secret could be mounted while the bus itself stayed PLAINTEXT.
 secrets:
   # Server TLS keypair (kubernetes.io/tls Secret: keys tls.crt + tls.key).
   tls:
@@ -98,20 +107,95 @@ secrets:
   acl:
     configMapName: ""
     mountPath: /etc/mqttd/acl
-  # Cluster-bus mTLS material (Secret with ca.crt/tls.crt/tls.key).
+
+  # --- Cluster-bus mTLS: ONE CERTIFICATE PER NODE (not one for the cluster) ------------
+  # A Secret holding `ca.crt` plus, FOR EVERY POD, `<pod-name>.crt` and `<pod-name>.key`.
+  # The chart points each pod at its own pair (…/$(POD_NAME).crt) and at ca.crt, and sets
+  # MQTTD_PEER_TLS_{CA,CERT,KEY} accordingly.
+  #
+  # A single shared certificate CANNOT work here, however it is minted (issue #262). The
+  # bus binds node identity to the certificate, and three separate rules enforce it — each
+  # failing at RUNTIME, not at issue time. Any certificate you supply must satisfy all four:
+  #
+  #   1. Subject CN == the node id == the POD NAME (<fullname>-<ordinal>). A peer may only
+  #      claim the id its certificate attests to; a mismatch logs "peer Hello node id does
+  #      not match its certificate Common Name" and drops the link. One shared CN therefore
+  #      drops EVERY link, and the pods stay running but never reach readiness.
+  #   2. A SAN covering that pod's advertise host,
+  #      <pod>.<fullname>-headless.<namespace>.svc.cluster.local — the per-pod DNS name the
+  #      init container renders into peer_advertise, and the name a dialing peer verifies.
+  #      rustls checks SANs only, so rule 1 buys nothing here and vice versa.
+  #   3. BOTH serverAuth and clientAuth EKUs: every node dials and is dialed, and rustls
+  #      rejects a client certificate without clientAuth.
+  #   4. An ECDSA P-256/P-384 or Ed25519 key in PKCS#8 — never RSA. This key is also the
+  #      per-node gossip signing key (ADR 0022), and that signer accepts nothing else: RSA
+  #      gives a working TLS handshake and then a hard startup failure. Signed gossip arms
+  #      ITSELF once this Secret and gossipKey are both present, so it is not opt-in.
+  #
+  # SCALING: a new ordinal is a new node id and a new DNS name, so it needs its own leaf.
+  # Mint before you grow — `REPLICAS=<n> ./bootstrap.sh`, then raise replicaCount. A pod
+  # whose ordinal has no leaf fails its init container with a message naming that command,
+  # rather than crash-looping on a missing file. Scale-down needs nothing.
+  #
+  # ROTATION needs a ROLLING RESTART (`kubectl rollout restart statefulset/<name>`): the
+  # peer-bus ca/cert/key are NOT in the broker's file-watch scope (only the peer CRL is),
+  # and the per-node gossip signing key — the same key file — is read once at startup and
+  # is not rebuilt even by SIGHUP. A renewed leaf that is only re-mounted keeps SIGNING
+  # gossip with the old key until the pod restarts; that still chain-verifies against the
+  # unchanged CA, so nothing fails until the OLD cert's notAfter — up to LEAF_DAYS later,
+  # with no correlating change to point at. Roll the pods when you rotate. An earlier
+  # version of this comment claimed rotation was hot; it was not (issue #262).
+  #
+  # RESIDUAL on the bootstrap.sh path: one Secret holds every node's key, and Kubernetes
+  # hands a pod the whole Secret — so every broker can read every other node's peer key.
+  # The CN binding stops an outsider, not a compromised pod. For per-pod key isolation use
+  # cert-manager's csi-driver via `dir` below + extraVolumes/extraVolumeMounts (annotated
+  # example at extraVolumes): each pod's leaf is minted into an ephemeral volume no other
+  # pod can read. Note that ONE cert-manager Certificate listing every pod's DNS name does
+  # NOT work: it has a single CN, and rule 1 is per-pod.
   peerTls:
     secretName: ""
     mountPath: /etc/mqttd/cluster
-  # Gossip key file (Secret with key `swim-key`); set MQTTD_SWIM_KEY_FILE to <mountPath>/swim-key
-  # via extraEnv, or reference it in `config`.
+    # ALTERNATIVE to secretName: a directory ALREADY mounted into the broker container
+    # (via extraVolumes/extraVolumeMounts below) holding this pod's own leaf as
+    # tls.crt / tls.key plus ca.crt — the layout cert-manager's csi-driver produces.
+    # With `dir` the chart derives MQTTD_PEER_TLS_{CA,CERT,KEY} from it and no shared
+    # Secret exists at all: per-pod key isolation, which secretName cannot give you
+    # (Kubernetes hands a pod the whole Secret). Mutually exclusive with secretName.
+    dir: ""
+
+  # Gossip key file (Secret with key `swim-key`). The chart sets MQTTD_SWIM_KEY_FILE to
+  # <mountPath>/swim-key for you when this is set.
   gossipKey:
     secretName: ""
     mountPath: /etc/mqttd/gossip
 
 # Extra environment variables (the highest config layer — override any file setting per ADR 0046).
+# A name set here WINS over the chart-derived secret paths above, so this stays the escape
+# hatch for a layout the chart does not assume.
 extraEnv: []
-#  - name: MQTTD_SWIM_KEY_FILE
-#    value: /etc/mqttd/gossip/swim-key
+
+# Extra volumes/mounts for the BROKER container (the bridge has its own pair below).
+# The intended use is cert-manager's csi-driver for per-pod peer-bus keys — mount the
+# ephemeral csi volume here and point secrets.peerTls.dir at its mountPath.
+extraVolumes: []
+#  - name: peer-tls-csi
+#    csi:
+#      driver: csi.cert-manager.io
+#      readOnly: true
+#      volumeAttributes:
+#        csi.cert-manager.io/issuer-name: mqttd-cluster-ca
+#        csi.cert-manager.io/common-name: "${POD_NAME}"
+#        csi.cert-manager.io/dns-names: "${POD_NAME}.<release>-headless.${POD_NAMESPACE}.svc.cluster.local"
+#        csi.cert-manager.io/key-usages: "server auth,client auth"
+#        csi.cert-manager.io/key-algorithm: ECDSA
+#        csi.cert-manager.io/key-encoding: PKCS8
+extraVolumeMounts: []
+#  - name: peer-tls-csi
+#    mountPath: /etc/mqttd/cluster-csi
+#    readOnly: true
+#  - name: MQTTD_PEER_TLS_CRL
+#    value: /etc/mqttd/cluster/crl.pem
 
 # --- Persistence (ADR 0018) -----------------------------------------------------------------
 # FOUNDER GUARD (ADR 0055 T9). Leave false for the FIRST install: ordinal 0 founds the

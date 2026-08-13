@@ -6,7 +6,7 @@ path).
 
 | | Where it lives | Use it when | Tested by |
 |---|---|---|---|
-| **Helm chart** | [`helm/mqttd`](helm/mqttd) | You run Kubernetes | `helm lint` + kubeconform + a kind end-to-end job |
+| **Helm chart** | [`helm/mqttd`](helm/mqttd) | You run Kubernetes | `helm lint` + kubeconform + [`scripts/k8s/peer-tls-check.sh`](../scripts/k8s/peer-tls-check.sh) + a kind end-to-end job with the cluster bus ON |
 | **Compose** | [`compose/`](compose) | One host, or a small fleet with Docker | [`scripts/deploy-smoke.sh`](../scripts/deploy-smoke.sh) |
 | **systemd** | [`systemd/`](systemd) | Bare metal or VMs, no container runtime | [`scripts/deploy-smoke.sh`](../scripts/deploy-smoke.sh) |
 | **Operator** | [`operator/`](operator) | **Not installable yet** — no published image (ADR 0055 T8) | kind e2e only |
@@ -36,8 +36,18 @@ It runs in CI on every push.
 
 ## What none of these do for you
 
-- **Certificates.** TLS is off in the reference configs (plaintext on a trusted network);
-  every artifact carries the commented-out lines and the file paths. Bring your own PKI.
+- **Certificates.** Bring your own PKI — but each packaging now ships a *starter* recipe that
+  runs and self-verifies: [`helm/mqttd/bootstrap.sh`](helm/mqttd/bootstrap.sh) on Kubernetes,
+  and the compose/systemd equivalents elsewhere. The client-facing side is off by default in
+  the compose/systemd reference configs (plaintext on a trusted network, commented-out lines
+  and paths carried in every artifact); the chart's default config requires TLS.
+
+  **The cluster bus is the part with real constraints,** because it binds node identity to the
+  certificate: **one leaf per node**, CN = the node id, a SAN covering that node's advertise
+  host, both `serverAuth` and `clientAuth`, and an ECDSA/Ed25519 key (never RSA — the same key
+  signs gossip). One shared certificate drops every peer link no matter how it is minted
+  (issue #262). **One CA for the whole cluster, and its private key on none of the broker
+  hosts** — anything holding it can mint any node's identity.
 - **Load balancing.** MQTT is long-lived and stateful; any TCP load balancer works, but
   point its health check at `/readyz` (majority-aware) rather than at the MQTT port.
 - **Backups.** Durable state is quorum-replicated, so the primary recovery story is the

@@ -1,7 +1,9 @@
 # Test-only values for the kind/k3d runtime smoke (ADR 0047 T5). Not packaged (see .helmignore
-# `ci/`). Runs the broker WITHOUT TLS/secret provisioning: a plaintext listener + anonymous auth,
-# durable sessions on, tiny grace so the smoke is fast. The image + tag are injected by the CI job
-# (`--set image.repository=... --set image.tag=...`).
+# `ci/`). The CLIENT side runs without TLS — a plaintext listener + anonymous auth, so the
+# mosquitto steps need no certificates — while the CLUSTER BUS runs mutually authenticated
+# (issue #262): those are independent, and the bus is the half that had never been exercised.
+# Durable sessions on, tiny grace so the smoke is fast. The image + tag are injected by the
+# CI job (`--set image.repository=... --set image.tag=...`).
 
 replicaCount: 3
 
@@ -35,16 +37,28 @@ config: |
   config_watch_secs = 5
   ready_min_members = __READY_MIN__
 
-# No secret mounts in the smoke.
+# The CLUSTER BUS is ON: these two Secrets are minted into the namespace by the shipped
+# deploy/helm/mqttd/bootstrap.sh before `helm install` (scripts/k8s/kind-smoke.sh runs it
+# rather than restating the recipe), and the chart derives MQTTD_PEER_TLS_{CA,CERT,KEY} —
+# each pod's own leaf, by pod name — plus MQTTD_SWIM_KEY_FILE from these names. Signed
+# per-node gossip then arms itself (ADR 0022).
+#
+# Issue #262: the smoke used to pin peerTls.secretName to "" and nothing anywhere set it, so
+# the one path that could have caught an unusable cluster-bus certificate never ran.
+#
+# These live in the FILE, not in a `--set` flag, on purpose. kind-smoke.sh re-passes
+# `-f values-smoke.yaml` on every `helm upgrade --reuse-values`, and the file is merged over
+# the stored values each time — so a name set only with `--set` at install time would be
+# reverted to "" by the first upgrade, silently turning the bus back off mid-smoke.
 secrets:
   tls:
     secretName: ""
   acl:
     configMapName: ""
   peerTls:
-    secretName: ""
+    secretName: "mqttd-peer-tls"
   gossipKey:
-    secretName: ""
+    secretName: "mqttd-gossip"
 
 # The client Service exposes the plaintext listener for the smoke. targetPort is numeric (the
 # container declares only the TLS/health/peer/gossip named ports; kube-proxy routes to a numeric
