@@ -176,14 +176,25 @@ Brings up three real nodes using the values from the SHIPPED deploy/systemd/mqtt
 — it parses that file rather than restating it, so a setting renamed in the artifact fails
 here rather than on somebody's first install.
 
-Proves anonymous clients are refused, a generated password authenticates, the ACL confines
-a device to its own subtree, a publish on node 1 reaches a subscriber on node 3, an
-acknowledged QoS 1 message survives SIGKILL of the node that accepted it, and a minority
-node reports live-but-not-ready.
+Every client connection is over TLS and the cluster bus is mutually authenticated, because
+that is what the shipped artifacts configure. BOTH shipped PKI recipes are called rather than
+restated: deploy/compose/init.sh mints the three-node cluster's material, and
+deploy/systemd/gen-certs.sh mints one cluster CA plus per-node leaves that TWO MORE nodes are
+booted from and made to route to each other. So the four peer-certificate rules that are easy
+to get wrong — CN equals the node id, the SAN covers the MQTTD_PEER_ADVERTISE host, both
+serverAuth and clientAuth, an ECDSA key rather than RSA — are exercised rather than merely
+documented, as is the one-CA-per-cluster contract (a per-host CA forms no mesh at all).
+
+Proves anonymous clients are refused, a cleartext client is refused, a generated password
+authenticates, the ACL confines a device to its own subtree, a publish on node 1 reaches a
+subscriber on node 3, an acknowledged QoS 1 message survives SIGKILL of the node that
+accepted it, a minority node reports live-but-not-ready, no node logs INSECURE, every node
+signs its gossip per-node (ADR 0022), and plaintext exists only behind the explicit
+compose.plaintext.yaml overlay.
 """
-requires = ["mosquitto_pub", "mosquitto_sub", "python3"]
+requires = ["mosquitto_pub", "mosquitto_sub", "python3", "openssl"]
 optional = ["docker", "systemd-analyze"]
-duration = "~60s"
+duration = "~90s"
 [[task.env]]
 name = "MQTTD_BIN"
 default = ""
@@ -205,6 +216,39 @@ duration = "~40s"
 name = "IMAGE"
 default = "ghcr.io/mbilling/fss-mqtt-broker:latest"
 help = "Image to exercise"
+
+[[task]]
+id = "compose-smoke"
+group = "Try it"
+name = "Bring the shipped compose reference deployment up in containers"
+script = "scripts/compose-smoke.sh"
+about = """
+Runs the reader's own two commands — `./bootstrap.sh` then `docker compose up -d` — on the
+shipped deploy/compose/compose.yaml, in real containers. deploy-smoke.sh proves the broker's
+behaviour with the shipped VALUES but only ever `docker compose config`s the file; this
+covers everything that lives between the YAML and a running container.
+
+Proves: with secrets/ absent the bring-up fails, creates no broker, and names ./bootstrap.sh;
+after bootstrap all three brokers reach HEALTHY (which on a native-Linux host is the proof
+that uid 65532 can read the staged secrets under a read-only rootfs); a TLS publish on node 3
+reaches a TLS subscriber on node 1; a client with no --cafile is refused; nothing is
+published on host port 1883; no container logs INSECURE and all three sign their gossip
+per-node; and the explicit `-f compose.yaml -f compose.plaintext.yaml` overlay restores
+plaintext on loopback while logging INSECURE for it.
+
+WHAT IT DOES NOT COVER: the lane always supplies its own image, so compose.yaml's published
+`:latest` default is never exercised. That default is currently broken — `--probe` and
+`--hash-password` postdate v0.9.0, which `:latest` is — and is tracked as issue #263. Read
+"all three brokers reach HEALTHY" as true of the image under test, not of the shipped default.
+
+Needs host ports 8883-8885 (and 1883-1885 during the overlay phase) to be free.
+"""
+requires = ["docker", "mosquitto_pub", "mosquitto_sub"]
+duration = "~3m"
+[[task.env]]
+name = "MQTTD_IMAGE"
+default = ""
+help = "Prebuilt image; empty builds one from the working tree"
 
 # ── Conformance ──────────────────────────────────────────────────────────────────────
 [[task]]

@@ -65,7 +65,8 @@ SystemCallErrorNumber=EPERM
 StateDirectory=mqttd
 StateDirectoryMode=0700
 ReadWritePaths=/var/lib/mqttd
-# No listener below 1024 in the reference config (1883/8883), so no capabilities at all.
+# No listener below 1024 in the reference config (8883, plus 8080 for health), so no
+# capabilities at all. The opt-in plaintext listener is 1883, also above 1024.
 # If you bind :443 for WSS, add: AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=
 

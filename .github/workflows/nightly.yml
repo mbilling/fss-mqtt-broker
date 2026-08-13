@@ -286,3 +286,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools mosquitto-clients
       - name: image smoke (nonroot data dir, restart durability, read-only rootfs)
         run: ./scripts/image-smoke.sh
+
+      # The cheapest place a real `docker compose up` can live: this job already has the
+      # musl toolchain, mosquitto-clients and a built image. It is also the ONLY lane that
+      # runs on a native-Linux docker host, which is what proves the staged secrets are
+      # readable by uid 65532 — a bind-mounted 0700 ./secrets is untraversable by that uid
+      # on Linux and invisibly fine under Docker Desktop's uid mapping. Per-PR CI validates
+      # the same file with `docker compose config` but never brings it up (issue #254).
+      - name: compose reference deployment (TLS by default, real containers)
+        run: ./scripts/compose-smoke.sh
