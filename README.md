@@ -613,6 +613,7 @@ be found. Each is tracked; none is a silent surprise.
 | `mqtt-bridge` | Outbound bridging to an upstream broker: durable spool, QoS-1 replay |
 | `mqttd` | The server binary: hub routing actor, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for the `MqttdCluster` CRD (**not yet packaged for install** — the Helm chart is the supported path) |
+| `history-check` | Independent checker for recorded client-visible histories (issue #231): re-derives the durability promises from what clients actually saw, with no imports from the broker crates |
 
 ## Build & test
 
