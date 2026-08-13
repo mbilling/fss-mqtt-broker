@@ -294,6 +294,19 @@ impl Properties {
         })
     }
 
+    /// Whether this block carries a Subscription Identifier (`0x0B`) at all (MQTT 5.0
+    /// §3.8.2.1.2 on SUBSCRIBE, §3.3.2.3.8 on PUBLISH).
+    ///
+    /// Deliberately a predicate rather than a getter: the broker uses this to **refuse**
+    /// identifiers, not to read them (issue #245). A `subscription_identifiers()` returning
+    /// the repeatable PUBLISH multiset belongs with the code that delivers them.
+    #[must_use]
+    pub fn has_subscription_identifier(&self) -> bool {
+        self.0
+            .iter()
+            .any(|p| matches!(p, Property::SubscriptionIdentifier(_)))
+    }
+
     /// Append the length-prefixed block to `out`.
     ///
     /// # Errors
@@ -353,12 +366,42 @@ impl Properties {
     /// The repeatable properties are User Property (everywhere) and Subscription Identifier
     /// (only on PUBLISH, where a single message may carry several).
     ///
+    /// One value-level rule lives here too, because the spec states it as a Protocol Error
+    /// rather than a malformed value: a Subscription Identifier of 0 (§3.8.2.1.2,
+    /// §3.3.2.3.8).
+    ///
     /// # Errors
-    /// [`CodecError::ProtocolViolation`] on a disallowed or duplicated property.
+    /// [`CodecError::ProtocolViolation`] on a disallowed or duplicated property, or a
+    /// Subscription Identifier of 0.
     pub fn validate_for(&self, ctx: PropContext) -> Result<(), CodecError> {
         // Property identifiers are 0x01..=0x2A, so a u64 is a sufficient "seen" bitset.
         let mut seen: u64 = 0;
         for p in &self.0 {
+            // §3.8.2.1.2 (SUBSCRIBE) and §3.3.2.3.8 (PUBLISH), both verbatim: "The
+            // Subscription Identifier can have the value of 1 to 268,435,455. It is a
+            // Protocol Error if the Subscription Identifier has a value of 0." The upper
+            // bound is the varint 4-byte maximum, already enforced by `varint::decode`,
+            // so only the zero needs checking here. Context-independent on purpose: the
+            // PUBLISH rule stands on its own, and `mqtt-bridge` decodes genuine
+            // server->client PUBLISHes in `PropContext::Publish` (issue #245).
+            if matches!(p, Property::SubscriptionIdentifier(0)) {
+                return Err(CodecError::ProtocolViolation(
+                    "subscription identifier of 0",
+                ));
+            }
+            // §3.2.2.3.12, same sentence that makes an absent `0x29` mean "supported":
+            // "It is a Protocol Error to include the Subscription Identifier Available
+            // more than once, or to send a value other than 0 or 1." Duplication is
+            // caught by `repeatable()` below; the VALUE was accepted unchecked. This is
+            // the receiving half of the property mqttd now emits, so it matters for
+            // `mqtt-bridge` reading a remote broker's CONNACK (issue #245 round 2).
+            if let Property::SubscriptionIdentifierAvailable(v) = p {
+                if *v > 1 {
+                    return Err(CodecError::ProtocolViolation(
+                        "subscription identifier available must be 0 or 1",
+                    ));
+                }
+            }
             let id = p.id();
             if !ctx.allows(id) {
                 return Err(CodecError::ProtocolViolation(
@@ -445,6 +488,12 @@ impl PropContext {
             ),
             // payload-format, message-expiry, topic-alias, response-topic, correlation-data,
             // user-property, subscription-identifier, content-type
+            //
+            // 0x0B stays allowed on PUBLISH in BOTH directions on purpose (issue #245): the
+            // codec is a codec. The [MQTT-3.3.4-6] "a client must not send one" guard lives
+            // in the broker's ingest path (mqttd conn.rs), so the encode side stays ready to
+            // emit identifiers and `mqtt-bridge`'s inbound decode keeps working. Do not
+            // "tidy" 0x0B out of this arm, nor out of `repeatable` below.
             PropContext::Publish => {
                 matches!(id, 0x01 | 0x02 | 0x23 | 0x08 | 0x09 | 0x26 | 0x0B | 0x03)
             }
@@ -572,6 +621,83 @@ mod tests {
             Properties::decode_for(&mut r, PropContext::Connect),
             Err(CodecError::ProtocolViolation(_))
         ));
+    }
+
+    // ---- subscription-identifier value range (issue #245) ----
+    //
+    // MQTT 5.0 §3.8.2.1.2 (SUBSCRIBE) and §3.3.2.3.8 (PUBLISH), both verbatim: "The
+    // Subscription Identifier can have the value of 1 to 268,435,455. It is a Protocol
+    // Error if the Subscription Identifier has a value of 0."
+
+    /// Encode a `Properties` block carrying only `SubscriptionIdentifier(id)` and read it
+    /// back through `decode_for` in `ctx` — the wire boundary a real peer crosses.
+    fn decode_sub_id_for(id: u32, ctx: PropContext) -> Result<Properties, CodecError> {
+        let mut out = Vec::new();
+        Properties(vec![Property::SubscriptionIdentifier(id)])
+            .encode(&mut out)
+            .unwrap();
+        let mut r = Reader::new(Bytes::from(out));
+        Properties::decode_for(&mut r, ctx)
+    }
+
+    #[test]
+    fn subscription_identifier_zero_is_a_protocol_error_on_subscribe() {
+        assert!(matches!(
+            decode_sub_id_for(0, PropContext::Subscribe),
+            Err(CodecError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn subscription_identifier_zero_is_a_protocol_error_on_publish() {
+        // §3.3.2.3.8 states the value-0 Protocol Error for PUBLISH independently of
+        // SUBSCRIBE. This is the assertion that protects `mqtt-bridge`, which decodes
+        // genuine server->client PUBLISHes from remote brokers in exactly this context.
+        assert!(matches!(
+            decode_sub_id_for(0, PropContext::Publish),
+            Err(CodecError::ProtocolViolation(_))
+        ));
+    }
+
+    /// §3.2.2.3.12: "It is a Protocol Error … to send a value other than 0 or 1" for
+    /// Subscription Identifier Available. This is the RECEIVING half of the property
+    /// mqttd now emits — `mqtt-bridge` reads a remote broker's CONNACK — and the value
+    /// was previously accepted unchecked (issue #245 round 2).
+    #[test]
+    fn subscription_identifier_available_rejects_values_other_than_zero_or_one() {
+        for v in [2u8, 7, 255] {
+            let props = Properties(vec![Property::SubscriptionIdentifierAvailable(v)]);
+            assert!(
+                matches!(
+                    props.validate_for(PropContext::ConnAck),
+                    Err(CodecError::ProtocolViolation(_))
+                ),
+                "0x29 = {v} must be a Protocol Error"
+            );
+        }
+        // Both legal values still pass — the check must not be written over-broadly.
+        for v in [0u8, 1] {
+            let props = Properties(vec![Property::SubscriptionIdentifierAvailable(v)]);
+            assert!(
+                props.validate_for(PropContext::ConnAck).is_ok(),
+                "0x29 = {v}"
+            );
+        }
+    }
+
+    /// Guard (passes today): the range check must not be written over-broadly. The
+    /// spec's upper bound is the varint 4-byte maximum, already enforced by
+    /// `varint::decode`, so 268,435,455 must still decode in both contexts.
+    #[test]
+    fn subscription_identifier_at_the_varint_maximum_still_decodes() {
+        for ctx in [PropContext::Subscribe, PropContext::Publish] {
+            let props = decode_sub_id_for(268_435_455, ctx).expect("the spec's upper bound");
+            assert_eq!(
+                props.0,
+                vec![Property::SubscriptionIdentifier(268_435_455)],
+                "round-trips unchanged in {ctx:?}"
+            );
+        }
     }
 
     #[test]

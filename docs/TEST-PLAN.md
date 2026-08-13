@@ -50,7 +50,12 @@ Keep **both** client styles, deliberately:
   **zero** crates added to the dependency tree — the foreign client is an external process,
   not a `dev-dependency`. Drives the real `mqttd` binary through v3.1.1 QoS 0/1/2 round-trips,
   a retained-to-a-late-subscriber, a v5 User Property surviving a hop (ADR 0030), and
-  OpenSSL↔rustls TLS 1.3 + mTLS. (`rumqttc` remains a possible Rust-side complement if an
+  OpenSSL↔rustls TLS 1.3 + mTLS. A second oracle (Eclipse Paho, ADR 0034 T7) reaches the
+  control plane: v5 reason codes, per-filter granted QoS, session-present on resume, and
+  (T8, issue #245) the **capability advertisement** — the CONNACK's `Subscription
+  Identifiers Available = 0` and the `0xA1` refusal that must accompany it. The Mosquitto
+  CLI cannot drive that last case: its `-D subscribe` accepts only `user-property`, so it
+  cannot request an identifier. (`rumqttc` remains a possible Rust-side complement if an
   in-`cargo test` interop check is ever wanted.)
 - **One process-level smoke test** — done (`binary_smoke`): launches the real
   `mqttd` binary (env-var config, plaintext listener) and drives a pub/sub

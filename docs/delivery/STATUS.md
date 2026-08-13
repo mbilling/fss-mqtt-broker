@@ -15,7 +15,7 @@
 | [0005](../adr/0005-session-affinity.md) | Session affinity: relocate persistent sessions to their owner | Accepted | [4/6 done](0005-session-affinity.md) | 2 deferred |
 | [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [13/13 done](0006-consensus-and-replication.md) | — |
 | [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [9/9 done](0007-durable-store-integration.md) | — |
-| [0008](../adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec | Accepted | [9/9 done](0008-mqtt-5-codec.md) | — |
+| [0008](../adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec | Accepted | [10/10 done](0008-mqtt-5-codec.md) | — |
 | [0009](../adr/0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [3/3 done](0009-mqtt5-expiry.md) | — |
 | [0010](../adr/0010-shared-subscriptions.md) | Shared subscriptions | Accepted | [7/8 done](0010-shared-subscriptions.md) | 1 deferred |
 | [0011](../adr/0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted | [7/7 done](0011-topic-aliases.md) | — |
@@ -37,11 +37,11 @@
 | [0027](../adr/0027-replica-group-commit.md) | Group-commit for the durable replica apply path | Accepted | [4/4 done](0027-replica-group-commit.md) | — |
 | [0028](../adr/0028-link-gated-voter-admission.md) | Link-gated lease-group voter admission | Accepted | [3/3 done](0028-link-gated-voter-admission.md) | — |
 | [0029](../adr/0029-durable-by-default.md) | Durable sessions by default | Accepted | [3/3 done](0029-durable-by-default.md) | — |
-| [0030](../adr/0030-user-property-forwarding.md) | Forward MQTT 5 User Properties through delivery | Accepted | [5/5 done](0030-user-property-forwarding.md) | — |
+| [0030](../adr/0030-user-property-forwarding.md) | Forward MQTT 5 User Properties through delivery | Accepted | [6/6 done](0030-user-property-forwarding.md) | — |
 | [0031](../adr/0031-session-identity-binding.md) | Bind the session to the authenticated identity | Accepted | [6/6 done](0031-session-identity-binding.md) | — |
 | [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |
 | [0033](../adr/0033-config-file-watch-reload.md) | Filesystem-watch auto-reload of the security policy | Accepted | [6/7 done](0033-config-file-watch-reload.md) | 1 deferred |
-| [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [7/7 done](0034-foreign-client-interop-conformance.md) | — |
+| [0034](../adr/0034-foreign-client-interop-conformance.md) | Foreign-client interop conformance testing | Accepted | [8/8 done](0034-foreign-client-interop-conformance.md) | — |
 | [0035](../adr/0035-websocket-transport.md) | Native MQTT-over-WebSocket transport | Accepted | [7/7 done](0035-websocket-transport.md) | — |
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [14/14 done](0037-durable-retained-messages.md) | — |
@@ -86,7 +86,7 @@
 
 **0010 — Shared subscriptions**
 
-- `0010-T7` 💤 deferred: Subscription-Identifier handling for shared subscriptions — ADR 0010 Consequences notes no Subscription-Identifier handling yet; out of scope for the routing lever
+- `0010-T7` 💤 deferred: Subscription-Identifier handling for shared subscriptions — "STAYS DEFERRED — issue #245 shipped only the honest wire posture (CONNACK 0x29 = 0; a SUBSCRIBE using an identifier is refused with DISCONNECT 0xA1), NOT delivery, so nothing here is done. Delivery is tracked by issue #266, which owns this task. Design fact to preserve: the peer wire does NOT need to grow. Per §3.3.4 only the RECEIVING client's own identifiers may appear on a shared delivery — never another session's — so RemoteSharedDeliver resolves them locally on the target node and SharedMemberWire / WireAppProps stay unchanged. Also §3.8.4: no retained messages on a shared subscribe, so the retained-with-identifier case does not arise here."
 
 **0013 — MQTT 5.0 enhanced authentication (AUTH exchange)**
 

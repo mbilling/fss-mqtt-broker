@@ -53,7 +53,7 @@ All five serve MQTT 3.1.1 and 5.0. The differences are in the v5 details:
 | Topic aliases | ✅ both directions | ⚠️ 2.0 inbound-only → ✅ 2.1 both | ✅ | ✅ | ✅ both |
 | Flow control (Receive Maximum) | ✅ enforced (`0x93`) | ⚠️ 2.0 outbound-only → ✅ 2.1 enforced | ✅ | ✖ inflight window marked "unsupported now" in shipped config | ✅ both directions |
 | Shared subscriptions | ✅ incl. **cluster-wide** (ADR 0010/0015) | ✅ (single node) | ✅ cluster-wide | ⚠️ `$share`+wildcard protocol error (nanomq#1883) | ⚠️ cluster-wide; recurring cluster bugs 2018→2025 (vernemq#1570, #2405) |
-| Subscription identifiers | **✖ not delivered** (codec-only; tracked) | ✅ | ✅ | ✅ | ✅ |
+| Subscription identifiers | **✖ not delivered — and the wire says so**: CONNACK advertises `Subscription Identifiers Available = 0`, a SUBSCRIBE carrying one is refused with DISCONNECT `0xA1` (§3.2.2.3.12), so a client fails fast instead of silently losing its demux. Delivery tracked. | ✅ | ✅ | ✅ | ✅ |
 | User properties | ✅ end-to-end | ✅ | ✅ | ⚠️ property size cap (default 32) | ✅ |
 | Enhanced auth (AUTH) | ⚠️ **built-in** challenge/response; server-initiated re-auth deferred (0013-T8) | ⚠️ plugin events only, no built-in | ✅ | ✖ documented unsupported | ⚠️ plugin-provided only, no built-in |
 | Will delay | ✅ | ✅ | ✅ | n/v (documented for bridges only) | ⚠️ lost across netsplit "window of uncertainty" (documented) |
@@ -195,6 +195,12 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-08-13 — The subscription-identifiers cell is rewritten (issue #245): it read
+  "not delivered (codec-only; tracked)", which was true of the *feature* but omitted that
+  the wire actively claimed the opposite — MQTT 5.0 §3.2.2.3.12 makes an absent CONNACK
+  `0x29` mean "supported". mqttd now advertises `0x29 = 0`, refuses an identifier-bearing
+  SUBSCRIBE with DISCONNECT `0xA1`, and refuses a client PUBLISH carrying one with `0x82`
+  ([MQTT-3.3.4-6]). Delivery itself remains unimplemented and is tracked by #266.
 - 2026-08-11 — Corrections from the review-panel re-run, which found this file stale in
   seven checkable places (all five reviewers hit at least one): release status
   ("unreleased"/"first tag pending" — v0.9.0 shipped 2026-07-22), the date header, the

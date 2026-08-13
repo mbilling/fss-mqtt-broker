@@ -5,7 +5,9 @@ The Mosquitto CLI suite (run.sh) proves payloads round-trip. Paho, a second
 *independent* MQTT implementation, is driven programmatically so it can assert
 the things a CLI cannot surface: MQTT 5 **reason codes**, CONNACK/SUBACK
 **properties**, per-filter **granted QoS** (including a downgrade), **session
-present** on resume, and **Will** delivery. A passing run is independent
+present** on resume, **Will** delivery, and the broker's **capability
+advertisement** (Subscription Identifiers Available = 0) together with the
+DISCONNECT 0xA1 refusal that must accompany it. A passing run is independent
 evidence the broker's control-plane semantics — not just its payloads — match
 what the ecosystem expects.
 
@@ -15,6 +17,7 @@ caller passes in $MQTT_PORT. Exits non-zero on any mismatch.
 """
 
 import os
+import socket
 import sys
 import time
 
@@ -79,6 +82,60 @@ def connect(c, clean_start=True):
     if not wait(lambda: "rc" in box, time.time() + TMO):
         raise SystemExit("FATAL: no CONNACK from broker")
     return box
+
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def _str(b):
+    return len(b).to_bytes(2, "big") + b
+
+
+def raw_subscribe_with_identifier():
+    """Hand-build a v5 CONNECT + SUBSCRIBE carrying Subscription Identifier 7 on a bare
+    socket, and return the broker's reply frame as hex.
+
+    Needed only because paho 2.1.0 cannot surface a 2-byte DISCONNECT's reason code
+    (see the note at the call site). Expected reply: `e0 02 a1 00` — DISCONNECT,
+    Remaining Length 2, reason 0xA1, zero-length property block.
+    """
+    body = (
+        b"\x00\x04MQTT"  # protocol name
+        b"\x05"  # protocol level 5
+        b"\x02"  # connect flags: clean start
+        + (30).to_bytes(2, "big")  # keep alive
+        + b"\x00"  # zero-length CONNECT properties
+        + _str(b"raw-subid")  # client id
+    )
+    connect_pkt = b"\x10" + _varint(len(body)) + body
+
+    props = b"\x0b\x07"  # 0x0B Subscription Identifier = 7
+    body = (
+        (1).to_bytes(2, "big")  # packet id
+        + _varint(len(props))
+        + props
+        + _str(b"raw/subid")  # topic filter
+        + b"\x01"  # options: QoS 1
+    )
+    subscribe_pkt = b"\x82" + _varint(len(body)) + body
+
+    sock = socket.create_connection((HOST, PORT), TMO)
+    try:
+        sock.settimeout(TMO)
+        sock.sendall(connect_pkt)
+        if not sock.recv(256):
+            return "no CONNACK"
+        sock.sendall(subscribe_pkt)
+        return sock.recv(256).hex()
+    finally:
+        sock.close()
 
 
 def main():
@@ -153,6 +210,110 @@ def main():
     expect("resume reports session-present true", True, bool(info2["flags"].session_present))
     again.loop_stop()
     again.disconnect()
+
+    # --- 6. Subscription Identifiers: advertised unavailable, and refused -----
+    #
+    # MQTT 5.0 §3.2.2.3.12, verbatim: "If not present, then Subscription Identifiers
+    # are supported." This broker does not deliver them, so it must say 0 — and must
+    # then refuse any SUBSCRIBE that uses one (issue #245). Paho does no client-side
+    # validation of property 41 (there is no `SubscriptionIdentifier` reference
+    # anywhere in client.py), so it genuinely puts the property on the wire — which is
+    # what makes this drivable by a real foreign client and not just our own codec.
+    expect(
+        "CONNACK advertises Subscription Identifiers unavailable",
+        0,
+        getattr(info["props"], "SubscriptionIdentifierAvailable", None),
+    )
+
+    # A DEDICATED client: this case ends in a server-initiated disconnect, which would
+    # poison `paho-main` for the sections above. `reconnect_on_failure=False` stops the
+    # loop thread from re-dialling after the broker closes us.
+    sub = mqtt.Client(
+        CallbackAPIVersion.VERSION2,
+        client_id="paho-subid",
+        protocol=mqtt.MQTTv5,
+        reconnect_on_failure=False,
+    )
+    sub.enable_logger(None)
+    seen = {"subacks": 0}
+    sub.on_subscribe = lambda cl, u, mid, rcs, props: seen.update(
+        subacks=seen["subacks"] + 1
+    )
+    # VERSION2 signature (paho 2.x `_do_on_disconnect`):
+    #   on_disconnect(client, userdata, disconnect_flags, reason_code, properties)
+    sub.on_disconnect = lambda cl, u, flags, rc, props: seen.update(
+        dc_reason=int(rc.value), from_server=bool(flags.is_disconnect_packet_from_server)
+    )
+    connect(sub)
+    sub_props = Properties(PacketTypes.SUBSCRIBE)
+    sub_props.SubscriptionIdentifier = 7
+    sub.subscribe("paho/subid", qos=1, properties=sub_props)
+    if not wait(lambda: "dc_reason" in seen, time.time() + TMO):
+        bad(
+            "SUBSCRIBE with a Subscription Identifier is refused",
+            "no DISCONNECT arrived",
+        )
+    else:
+        expect(
+            "a real client's identifier-bearing SUBSCRIBE is disconnected by the server",
+            True,
+            seen.get("from_server"),
+        )
+        expect("no SUBACK preceded the refusal", 0, seen["subacks"])
+    sub.loop_stop()
+
+    # The reason BYTE, read off the wire directly, because Paho cannot report it:
+    # `Client._handle_disconnect` (paho 2.1.0) only decodes the reason code when the
+    # DISCONNECT's Remaining Length is > 2, and a reason-plus-empty-properties
+    # DISCONNECT is exactly 2 (`e0 02 a1 00`). Its own inline comment says "if reason
+    # is absent (remaining length < 1)", so the intent was >= 1 — an upstream
+    # off-by-one that hides EVERY reason code this broker sends (0x82, 0x93, 0x94,
+    # 0xA1) behind reason 0 "Normal disconnection". Our encoding is spec-legal:
+    # §3.14.2.2.1 permits omitting the property length only when Remaining Length < 2,
+    # and an explicit zero is always allowed.
+    #
+    # So this assertion is deliberately NOT Paho's decoder — it is a hand-built v5
+    # CONNECT + SUBSCRIBE on a bare socket, which is what keeps the lane able to catch
+    # 0xA1 being swapped for 0xA2 (Wildcard Subscriptions not supported).
+    expect(
+        "the refusal's reason byte is 0xA1 (not 0xA2)",
+        "e002a100",
+        raw_subscribe_with_identifier(),
+    )
+
+    # [MQTT-3.3.4-6]: a client->server PUBLISH MUST NOT carry a Subscription Identifier.
+    # This half had NO foreign-client coverage: deleting the guard in conn.rs left the
+    # whole lane green, so a real client is what pins it. Paho permits setting the
+    # property on a PUBLISH (verified: Properties(PacketTypes.PUBLISH) accepts it), which
+    # is exactly the mistake the guard exists to catch.
+    pubc = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2, client_id="paho-subid-pub", protocol=mqtt.MQTTv5
+    )
+    pubc.enable_logger(None)
+    pseen = {"pubacks": 0}
+    pubc.on_publish = lambda cl, u, mid, rc, props: pseen.update(
+        pubacks=pseen["pubacks"] + 1
+    )
+    pubc.on_disconnect = lambda cl, u, flags, rc, props: pseen.update(
+        dc=True, from_server=bool(flags.is_disconnect_packet_from_server)
+    )
+    connect(pubc)
+    pub_props = Properties(PacketTypes.PUBLISH)
+    pub_props.SubscriptionIdentifier = 5
+    pubc.publish("paho/subid-pub", b"x", qos=1, properties=pub_props)
+    if not wait(lambda: "dc" in pseen, time.time() + TMO):
+        bad(
+            "PUBLISH carrying a Subscription Identifier is refused [MQTT-3.3.4-6]",
+            "no DISCONNECT arrived",
+        )
+    else:
+        expect(
+            "a real client's identifier-bearing PUBLISH is disconnected by the server",
+            True,
+            pseen.get("from_server"),
+        )
+        expect("no PUBACK preceded the refusal", 0, pseen["pubacks"])
+    pubc.loop_stop()
 
     c.loop_stop()
     c.disconnect()
