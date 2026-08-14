@@ -21,9 +21,43 @@ WARNING: no TLS Secret is set (secrets.tls.secretName is empty). The config refe
 kubernetes.io/tls Secret, or the TLS listener will fail to start. Provision TLS (e.g. with
 cert-manager) before serving clients.
 
-  First time? deploy/helm/mqttd/bootstrap.sh mints the gossip key, server TLS, cluster-bus
-  mTLS and a starter ACL into your namespace and prints the exact `helm install --set`
-  flags to wire them. Run it, then re-run helm with those flags.
+  First time? deploy/helm/mqttd/bootstrap.sh mints the gossip key, server TLS, per-node
+  cluster-bus certificates and a starter ACL into your namespace and prints the exact
+  `helm install --set` flags to wire them. Run it, then re-run helm with those flags.
+{{- end }}
+{{- if not .Values.secrets.peerTls.secretName }}
+
+NOTE: the cluster bus is PLAINTEXT (secrets.peerTls.secretName is empty). Inter-node
+traffic — every routed message and every session handoff — is readable and forgeable by
+anything that can reach port 7001, and each broker logs this at startup as an INSECURE
+mode. Fine on a trusted network; not fine otherwise.
+
+  To turn it on you need ONE CERTIFICATE PER NODE, in a Secret holding ca.crt plus
+  <pod>.crt / <pod>.key for each pod. A single shared certificate cannot work: the bus
+  binds node identity to the certificate's Subject CN, so every link would be dropped.
+  Each leaf needs CN = the pod name ({{ include "mqttd.fullname" . }}-<ordinal>), a SAN
+  covering <pod>.{{ include "mqttd.headlessName" . }}.{{ .Release.Namespace }}.svc.cluster.local,
+  BOTH serverAuth and clientAuth EKUs, and an ECDSA/Ed25519 key (never RSA — the same key
+  signs gossip). bootstrap.sh mints exactly that; see the notes by `peerTls` in values.yaml.
+{{- else }}
+
+Cluster bus: mutually authenticated from Secret "{{ .Values.secrets.peerTls.secretName }}".
+Each pod reads its OWN leaf ({{ .Values.secrets.peerTls.mountPath }}/$(POD_NAME).crt), because the
+bus binds node identity to the certificate's Subject CN. That Secret must therefore carry
+ca.crt plus <pod>.crt / <pod>.key for EVERY ordinal 0..{{ sub (int .Values.replicaCount) 1 }}
+— a pod whose ordinal has no leaf fails its init container and says so. Expect "SWIM gossip
+is SIGNED per-node" in each log; if you instead see "does not match its certificate Common
+Name", a leaf's CN is not its pod name.
+  Growing the cluster? Mint the new ordinals' leaves BEFORE raising replicaCount:
+    REPLICAS=<n> ./deploy/helm/mqttd/bootstrap.sh
+{{- if not .Values.secrets.gossipKey.secretName }}
+
+WARNING: secrets.peerTls is set but secrets.gossipKey is EMPTY. The peer links are
+mutually authenticated, but without MQTTD_SWIM_KEY_FILE the gossip plane runs
+UNAUTHENTICATED (each broker logs "INSECURE: SWIM gossip is UNAUTHENTICATED") — anyone
+who can reach UDP 7946 can inject membership claims. This pairing is almost never what
+you want: set secrets.gossipKey.secretName (bootstrap.sh creates mqttd-gossip).
+{{- end }}
 {{- end }}
 {{- if not .Values.secrets.acl.configMapName }}
 

@@ -54,7 +54,7 @@
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [8/9 done](0044-release-readiness-assurance.md) | 1 open |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Accepted | [6/6 done](0045-release-engineering-and-distribution.md) | — |
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/6 done](0046-file-based-configuration.md) | 1 open |
-| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [10/10 done](0047-kubernetes-deployment.md) | — |
+| [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [11/11 done](0047-kubernetes-deployment.md) | — |
 | [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [2/4 done](0048-comparative-benchmarking.md) | 2 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
 | [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |

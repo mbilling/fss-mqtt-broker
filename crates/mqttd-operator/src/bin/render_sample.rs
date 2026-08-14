@@ -14,6 +14,16 @@ fn main() {
     } else {
         serde_json::Value::Null
     };
+    // `--peer-tls` renders the CLUSTER-BUS-ON form, matching `helm template --set
+    // secrets.peerTls.secretName=... --set secrets.gossipKey.secretName=...`. Issue #262:
+    // both paths must derive the per-pod MQTTD_PEER_TLS_* / MQTTD_SWIM_KEY_FILE paths from
+    // the secret names, and a secret-less parity pass alone would never compare that
+    // wiring — which is how the chart came to mount cluster-bus material nothing read.
+    let secrets = if std::env::args().any(|a| a == "--peer-tls") {
+        serde_json::json!({ "peerTls": "mqttd-peer-tls", "gossipKey": "mqttd-gossip" })
+    } else {
+        serde_json::Value::Null
+    };
     let cr: mqttd_operator::crd::MqttdCluster = serde_json::from_value(serde_json::json!({
         "apiVersion": "mqttd.io/v1alpha1",
         "kind": "MqttdCluster",
@@ -26,6 +36,7 @@ fn main() {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../deploy/helm/mqttd/parity-config.toml"
             )),
+            "secrets": secrets,
         },
         "status": status,
     }))
