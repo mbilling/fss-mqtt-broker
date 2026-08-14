@@ -208,10 +208,12 @@ script = "scripts/image-smoke.sh"
 about = """
 Runs the published image and checks the properties a hardened image claims: it runs as a
 non-root user, its data directory is writable by that user, durable state survives a
-restart, and it still works under `--read-only --cap-drop ALL`.
+restart, and it still works under `--read-only --cap-drop ALL`. Also runs the README's
+secured container invocation (mounted certs + ACL): an mTLS round-trip inside the grant,
+a no-certificate client refused at the handshake, and no INSECURE log line.
 """
-requires = ["docker"]
-duration = "~40s"
+requires = ["docker", "mosquitto_pub", "mosquitto_sub", "openssl"]
+duration = "~60s"
 [[task.env]]
 name = "IMAGE"
 default = "ghcr.io/mbilling/fss-mqtt-broker:latest"

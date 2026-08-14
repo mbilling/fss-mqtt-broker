@@ -14,26 +14,33 @@
 #   2. durable state actually survives a container restart;
 #   3. the broker runs under a READ-ONLY root filesystem with all capabilities
 #      dropped and no-new-privileges — the hardened posture the docs advertise;
-#   4. it still runs as nonroot (a regression to root would pass 1-3 silently).
+#   4. it still runs as nonroot (a regression to root would pass 1-3 silently);
+#   5. the README's SECURED container invocation (issue #257) works as written:
+#      mounted certs + ACL, TLS 1.3 + mTLS round-trip inside the grant, a client
+#      with no certificate refused at the handshake, and no INSECURE log line.
 #
-# Needs docker + mosquitto-clients. Set MQTTD_IMAGE to test a prebuilt image
-# (e.g. a published tag) instead of building one from the working tree.
+# Needs docker + mosquitto-clients + openssl. Set MQTTD_IMAGE to test a prebuilt
+# image (e.g. a published tag) instead of building one from the working tree.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-for tool in docker mosquitto_pub mosquitto_sub; do
+for tool in docker mosquitto_pub mosquitto_sub openssl; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FATAL: '$tool' not found on PATH"; exit 2; }
 done
 
 IMAGE="${MQTTD_IMAGE:-}"
 VOL_A=mqttd-imgsmoke-a
 VOL_B=mqttd-imgsmoke-b
+VOL_C=mqttd-imgsmoke-c
 PORT_A=31883
 PORT_B=31884
+PORT_C=38883
+WORK="$(mktemp -d)"
 
 cleanup() {
-  docker rm -f mqttd-imgsmoke-a mqttd-imgsmoke-b >/dev/null 2>&1 || true
-  docker volume rm -f "$VOL_A" "$VOL_B" >/dev/null 2>&1 || true
+  docker rm -f mqttd-imgsmoke-a mqttd-imgsmoke-b mqttd-imgsmoke-c >/dev/null 2>&1 || true
+  docker volume rm -f "$VOL_A" "$VOL_B" "$VOL_C" >/dev/null 2>&1 || true
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 cleanup
@@ -129,5 +136,96 @@ if [[ "$RO" != "ok" ]]; then
   exit 1
 fi
 echo "  ok   — serves under --read-only --cap-drop ALL --security-opt no-new-privileges"
+
+# --- 5. the secured container invocation the README documents ---------------
+# README "Single node, secured, in a container" (issue #257): the same TLS 1.3 +
+# mTLS + deny-by-default-ACL posture as the cargo walkthrough, as one hardened
+# `docker run` with the PKI and ACL mounted read-only. Exercised here so the
+# documented block cannot rot. Deviations are mechanical only: a host port from
+# the 3xxxx range, and this script's own throwaway PKI (same shape as the
+# README's steps 1–2, one client leaf being enough to prove the round-trip).
+PKI="$WORK/pki"; mkdir -p "$PKI"
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout "$PKI/ca.key" -out "$PKI/ca.crt" -subj '/CN=mqttd-imgsmoke-ca' >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout "$PKI/server.key" -out "$PKI/server.csr" \
+  -subj '/CN=127.0.0.1' >/dev/null 2>&1
+openssl x509 -req -in "$PKI/server.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+  -CAcreateserial -out "$PKI/server.crt" -days 365 \
+  -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth') >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout "$PKI/sensor-1.key" -out "$PKI/sensor-1.csr" \
+  -subj '/CN=sensor-1' >/dev/null 2>&1
+openssl x509 -req -in "$PKI/sensor-1.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+  -CAcreateserial -out "$PKI/sensor-1.crt" -days 365 \
+  -extfile <(printf 'extendedKeyUsage=clientAuth') >/dev/null 2>&1
+
+cat > "$WORK/acl.toml" <<'ACL'
+default = "deny"
+
+[[rules]]
+identities = ["sensor-1", "sensor-2"]
+actions = ["publish", "subscribe"]
+effect = "allow"
+topics = ["sensors/%i/#"]
+ACL
+
+# The image runs as uid 65532; the bind-mounted material must be readable to it.
+# Exactly what the README block tells the reader to do (throwaway PKI only).
+chmod 0755 "$WORK" "$PKI"
+chmod 0644 "$PKI/server.key" "$WORK/acl.toml"
+
+docker volume create "$VOL_C" >/dev/null
+docker run -d --name mqttd-imgsmoke-c \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v "$PKI":/etc/mqttd/pki:ro -v "$WORK/acl.toml":/etc/mqttd/acl.toml:ro \
+  -v "$VOL_C":/var/lib/mqttd -p "$PORT_C":8883 \
+  -e MQTTD_TLS_BIND=0.0.0.0:8883 \
+  -e MQTTD_TLS_CERT=/etc/mqttd/pki/server.crt \
+  -e MQTTD_TLS_KEY=/etc/mqttd/pki/server.key \
+  -e MQTTD_TLS_CLIENT_CA=/etc/mqttd/pki/ca.crt \
+  -e MQTTD_ACL_FILE=/etc/mqttd/acl.toml \
+  -e MQTTD_DATA_DIR=/var/lib/mqttd \
+  "$IMAGE" >/dev/null
+
+MOSQ_TLS=(--cafile "$PKI/ca.crt" --cert "$PKI/sensor-1.crt" --key "$PKI/sensor-1.key")
+for _ in $(seq 1 60); do
+  [[ "$(docker inspect -f '{{.State.Running}}' mqttd-imgsmoke-c 2>/dev/null)" == "true" ]] || break
+  mosquitto_pub -h 127.0.0.1 -p "$PORT_C" "${MOSQ_TLS[@]}" -i imgsmoke-sec-ping \
+    -t 'sensors/sensor-1/ping' -m x >/dev/null 2>&1 && break
+  sleep 1
+done
+if [[ "$(docker inspect -f '{{.State.Running}}' mqttd-imgsmoke-c 2>/dev/null)" != "true" ]]; then
+  echo "  FAIL — the secured invocation did not stay up with mounted certs + ACL:"
+  docker logs mqttd-imgsmoke-c 2>&1 | tail -5 | sed 's/^/         /'
+  exit 1
+fi
+
+# The round-trip inside the grant, judged by delivery (retained, so no race).
+mosquitto_pub -h 127.0.0.1 -p "$PORT_C" "${MOSQ_TLS[@]}" -i imgsmoke-sec-pub \
+  -t 'sensors/sensor-1/temp' -m 'secured-ok' -r -q 1 2>/dev/null
+SEC_GOT="$(mosquitto_sub -h 127.0.0.1 -p "$PORT_C" "${MOSQ_TLS[@]}" -i imgsmoke-sec-sub \
+  -t 'sensors/sensor-1/#' -C 1 -W 8 2>/dev/null || true)"
+if [[ "$SEC_GOT" != "secured-ok" ]]; then
+  echo "  FAIL — secured container: mTLS round-trip inside the grant: expected [secured-ok] got [$SEC_GOT]"
+  exit 1
+fi
+echo "  ok   — secured container: an mTLS client round-trips inside its ACL grant"
+
+# A client with no certificate must fail at the TLS handshake — nothing reaches
+# the MQTT layer at all.
+if mosquitto_pub -h 127.0.0.1 -p "$PORT_C" --cafile "$PKI/ca.crt" -i imgsmoke-sec-nocert \
+     -t 'sensors/sensor-1/temp' -m 'nope' >/dev/null 2>&1; then
+  echo "  FAIL — secured container: a client with NO certificate was accepted"
+  exit 1
+fi
+echo "  ok   — secured container: a client with no certificate is refused at the handshake"
+
+# The README's claim about this configuration: it logs no INSECURE warning.
+# Every opt-out of a secure default is loudly logged, so absence is a signal.
+if docker logs mqttd-imgsmoke-c 2>&1 | grep -q "INSECURE"; then
+  echo "  FAIL — the secured invocation logged an INSECURE warning:"
+  docker logs mqttd-imgsmoke-c 2>&1 | grep "INSECURE" | sed 's/^/         /'
+  exit 1
+fi
+echo "  ok   — secured container: the configuration logs no INSECURE warning"
 
 echo "IMAGE SMOKE OK"

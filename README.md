@@ -786,7 +786,8 @@ docker run -d --name mqttd \
   -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
   -e MQTTD_DATA_DIR=/var/lib/mqttd -e MQTTD_HEALTH_BIND=0.0.0.0:8080 \
   ghcr.io/mbilling/fss-mqtt-broker:latest
-# (plaintext + anonymous for a first look only — see the secured quickstart below)
+# (plaintext + anonymous for a first look only — the secured quickstart below has
+#  the TLS + mTLS + ACL version, including the same-shape hardened `docker run`)
 
 # Or download a binary from the GitHub Release and verify + reproduce it — see RELEASING.md.
 ```
@@ -833,6 +834,8 @@ mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
 The path to run if you are evaluating this as a **secure** broker: no plaintext
 listener, no anonymous clients, client certificates required, and a deny-by-default
 topic policy. CI runs these exact commands (`scripts/quickstart-smoke.sh`).
+Prefer a container? The [same posture as one `docker run`](#single-node-secured-in-a-container)
+follows below, reusing the PKI and ACL minted here.
 
 ```sh
 # 1. A local CA, a server cert for 127.0.0.1, and a client cert whose CN is the
@@ -913,6 +916,50 @@ mosquitto_sub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
 > `acl.deny.publish`; for 3.1.1 that, not the client's return code, is where you
 > see it. Denied *subscriptions* are refused visibly in both versions, with a
 > per-filter reason code.
+
+### Single node, secured, in a container
+
+The same posture — TLS 1.3, mutual TLS, deny-by-default ACL, durable state on a
+volume — as one hardened `docker run`, reusing the `pki/` and `acl.toml` minted
+in steps 1–2 above. This is the container shape of the secured walkthrough; the
+plaintext `docker run` in [Install](#install) is only ever the first look.
+
+```sh
+# The image runs as uid 65532 (nonroot), so the mounted material must be
+# readable to it. Plain read permission is fine for THIS THROWAWAY quickstart
+# PKI and nothing else — a real deployment mounts secrets with owned
+# permissions (the compose, systemd and Helm packagings all do).
+chmod 0644 pki/server.key acl.toml
+
+docker run -d --name mqttd-secured \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v "$PWD/pki":/etc/mqttd/pki:ro -v "$PWD/acl.toml":/etc/mqttd/acl.toml:ro \
+  -v mqttd-secured-data:/var/lib/mqttd -p 8883:8883 \
+  -e MQTTD_TLS_BIND=0.0.0.0:8883 \
+  -e MQTTD_TLS_CERT=/etc/mqttd/pki/server.crt \
+  -e MQTTD_TLS_KEY=/etc/mqttd/pki/server.key \
+  -e MQTTD_TLS_CLIENT_CA=/etc/mqttd/pki/ca.crt \
+  -e MQTTD_ACL_FILE=/etc/mqttd/acl.toml \
+  -e MQTTD_DATA_DIR=/var/lib/mqttd \
+  ghcr.io/mbilling/fss-mqtt-broker:latest
+
+# The same foreign client over mutual TLS, inside its grant:
+mosquitto_sub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
+  --cert pki/sensor-1.crt --key pki/sensor-1.key -t 'sensors/sensor-1/#' &
+mosquitto_pub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
+  --cert pki/sensor-1.crt --key pki/sensor-1.key \
+  -t 'sensors/sensor-1/temp' -m '21.5C'
+```
+
+No `MQTTD_PLAINTEXT_BIND`, no `MQTTD_ALLOW_ANONYMOUS`, and no ephemeral opt-in:
+durable sessions land on the `mqttd-secured-data` volume, and this configuration
+logs no `INSECURE` warning. The nightly image lane runs this invocation
+(`scripts/image-smoke.sh`, also runnable as `mqttui --run image-smoke`) and
+asserts the mTLS round-trip inside the grant, the refusal of a client with no
+certificate at the TLS handshake, and the absence of any `INSECURE` log line.
+For more than one node in containers, the [compose reference
+deployment](#without-kubernetes-compose-systemd) is the shipped three-node
+version of exactly this posture.
 
 ### Two-node cluster via gossip discovery (insecure, local testing)
 
