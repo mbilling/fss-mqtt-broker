@@ -60,6 +60,7 @@ arithmetic can include them):
 | Flow-control backlog per session | 10 000 msgs, drop-oldest |
 | Replay to a resuming session | 10 000 msgs |
 | Pending publishes awaiting durability | 4 096, ack withheld |
+| Durable-append lane per session (issue #242) | 256 jobs (appends and QoS 2 outbound-id records share the cap), reject-newest (ack withheld), plus 16 reserved control slots for detach-spill/discard jobs; payload bytes are refcounted clones of the pending entry's, so the added cost per job is the message envelope, not a second payload copy |
 | Retained mutations queued during heal (ADR 0037 §5) | 1 024, drop-oldest, counted |
 | Peer-link read buffer | 32 MiB per peer |
 | Peer frame / raft RPC / SWIM datagram | 16 MiB / 4 MiB / 64 KiB |
@@ -165,6 +166,24 @@ so it costs a cross-node round trip as well.
 If a topic's subscribers do not need redelivery across a broker restart, connecting them
 with a clean session is the whole optimisation — there is no flag to turn durability off
 for a session that asked for it, by design.
+
+**Where a slow write is felt** (issue #242 / ADR 0061): these writes — the durable
+append AND the QoS 2 outbound-id record that precedes an online wire send, AND the
+once-per-1024-deliveries packet-id block reservation — run in per-session append lanes
+off the hub loop, so replication latency no longer sets the pace for other clients.
+The bounded worst case under a degraded follower set is per *session*: each of that
+session's lane jobs is bounded by the 5 s replication RPC timeout, FIFO in its lane
+(up to 256 queued jobs, shared between appends and outbound-id records — worst case
+~21 min of retrying backlog for one session before new publishes to it are withheld
+and retried by their publishers). Online QoS 2 delivery to a degraded group's
+subscriber is additionally serial per subscriber: one 5 s-bounded record write per
+message before its wire send (unchanged from the pre-ADR bound; the serialization
+moved from the shared loop to that session's lane). Publishes to other groups'
+sessions, connects, and subscribes are unaffected; hub dispatch time is independent
+of replication latency on the publish and delivery paths (residual store awaits stay
+in the ack/attach/control classes, ADR 0061), and `mqttd_hub_dispatch_seconds` /
+`mqttd_append_lane_jobs` are the observables (see
+[OPERATIONS](OPERATIONS.md#monitoring-for-the-operator-and-humans)).
 
 ## Worked example — 4 GiB RAM / 20 GiB disk
 
