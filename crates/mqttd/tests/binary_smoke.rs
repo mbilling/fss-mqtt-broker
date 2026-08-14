@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -43,6 +44,101 @@ async fn wait_until_listening(addr: SocketAddr) {
     panic!("the mqttd binary never started listening on {addr}");
 }
 
+/// Issue #240: durable-on (the default) with no `MQTTD_DATA_DIR` is a hard startup
+/// error — quorum-of-RAM loses acked messages on a correlated restart, and a warning
+/// log is not a substitute for refusing the configuration. The refusal must name
+/// both ways out.
+#[test]
+fn durable_on_with_no_data_dir_refuses_to_start() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+    // Hermetic: strip any MQTTD_* the runner carries (a data dir or the opt-in in the
+    // ambient env would make this pass for the wrong reason).
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
+        .env("MQTTD_NODE_ID", "refuse-ephemeral")
+        .env("MQTTD_PLAINTEXT_BIND", &addr)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the mqttd binary");
+    let mut guard = ChildGuard(child);
+    // Poll instead of .output(): on a regression the broker BOOTS and stays up, and an
+    // unbounded wait would wedge the suite instead of failing it.
+    let mut status = None;
+    for _ in 0..100 {
+        if let Some(s) = guard.0.try_wait().expect("try_wait") {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let Some(status) = status else {
+        panic!("mqttd stayed up: durable-on with no data dir must refuse to start (#240)");
+    };
+    assert!(
+        !status.success(),
+        "expected a non-zero exit for the refused configuration, got {status:?}"
+    );
+    let mut stderr = String::new();
+    guard
+        .0
+        .stderr
+        .take()
+        .expect("stderr piped")
+        .read_to_string(&mut stderr)
+        .unwrap();
+    for remedy in ["MQTTD_DATA_DIR", "MQTTD_ALLOW_EPHEMERAL_DURABILITY"] {
+        assert!(
+            stderr.contains(remedy),
+            "the refusal must name {remedy}; stderr was: {stderr}"
+        );
+    }
+}
+
+/// Issue #240, the other half: the explicit opt-in boots — and the EPHEMERAL warning
+/// still fires. The flag permits the mode; it must never silence the loud register.
+#[tokio::test]
+async fn the_ephemeral_opt_in_boots_and_still_warns() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
+        .env("MQTTD_NODE_ID", "opted-ephemeral")
+        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+        .env("RUST_LOG", "warn")
+        // The tracing subscriber writes to STDOUT; that is where the warning lands.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the mqttd binary");
+    let mut guard = ChildGuard(child);
+    wait_until_listening(addr).await;
+    // The broker is up (the opt-in worked); kill it and read the captured log.
+    let _ = guard.0.kill();
+    let mut logs = String::new();
+    guard
+        .0
+        .stdout
+        .take()
+        .expect("stdout piped")
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert!(
+        logs.contains("EPHEMERAL durability"),
+        "the opt-in must not silence the EPHEMERAL warning; logs were: {logs}"
+    );
+}
+
 #[tokio::test]
 async fn binary_serves_a_plaintext_pubsub_roundtrip() {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
@@ -52,6 +148,8 @@ async fn binary_serves_a_plaintext_pubsub_roundtrip() {
         .env("MQTTD_NODE_ID", "smoke")
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
+        // Ephemeral durability needs the explicit opt-in (#240); tests are its use case.
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("RUST_LOG", "off")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -107,6 +205,7 @@ async fn max_connections_cap_refuses_at_accept_and_recovers() {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
         .env("MQTTD_NODE_ID", "cap")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_MAX_CONNECTIONS", "2")
@@ -146,6 +245,7 @@ async fn per_ip_cap_refuses_a_second_connection_from_the_same_address() {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
         .env("MQTTD_NODE_ID", "ipcap")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_ALLOW_ANONYMOUS", "1")
         .env("MQTTD_MAX_CONNECTIONS_PER_IP", "1")
@@ -239,6 +339,7 @@ async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
         .env("MQTTD_NODE_ID", "penalty")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_PASSWORD_FILE", &pw_path)
         .env("MQTTD_AUTH_PENALTY_THRESHOLD", "2")

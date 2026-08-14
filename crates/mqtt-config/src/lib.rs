@@ -55,7 +55,9 @@ pub struct Config {
 pub struct Node {
     /// Stable node id (`MQTTD_NODE_ID`). Default `node-local`.
     pub id: String,
-    /// Durable-plane data directory (`MQTTD_DATA_DIR`). Unset → in-memory only.
+    /// Durable-plane data directory (`MQTTD_DATA_DIR`). Unset with durable ON (the
+    /// default) is refused at validation unless `durable.allow_ephemeral` opts in
+    /// (issue #240); unset with durable off is simply the in-memory store.
     pub data_dir: Option<String>,
     /// This node's self-advertised failure-domain label (`MQTTD_FAILURE_DOMAIN`, ADR 0016).
     pub failure_domain: Option<String>,
@@ -379,6 +381,16 @@ pub struct Durable {
     /// rejected at startup as unsatisfiable. With `enabled = false` there is no durable
     /// plane and no floor at all.
     pub min_replicas: MinReplicas,
+    /// Opt in to **ephemeral durability** (`MQTTD_ALLOW_EPHEMERAL_DURABILITY`,
+    /// presence = on; ADR 0029 as-delivered, issue #240): durable sessions ON with no
+    /// `node.data_dir`, so the consensus-replicated state lives only in MEMORY and a
+    /// correlated restart of a quorum LOSES acknowledged messages. **Off by default**:
+    /// without it that combination REFUSES to start (and fails `--check-config` and a
+    /// live reload). For development and tests only, loudly **warned** while active —
+    /// styled on the bridge's `spool.allow_ephemeral_spool` (ADR 0060 T4). Durable
+    /// explicitly off (`enabled = false`) never needs it: the lightweight in-memory
+    /// store is an explicit choice already.
+    pub allow_ephemeral: bool,
 }
 
 impl Default for Durable {
@@ -388,6 +400,7 @@ impl Default for Durable {
             lease_voters: 5,
             store_max_bytes: None,
             min_replicas: MinReplicas::Majority,
+            allow_ephemeral: false,
         }
     }
 }
@@ -618,6 +631,34 @@ impl Config {
     #[must_use]
     pub fn durability_is_ephemeral(&self) -> bool {
         self.durable.enabled && self.node.data_dir.is_none()
+    }
+
+    /// The issue #240 refusal, in one testable home shared by every gate: ephemeral
+    /// durability ([`durability_is_ephemeral`](Self::durability_is_ephemeral)) without
+    /// the explicit opt-in (`durable.allow_ephemeral`) is an invalid configuration.
+    /// Called from [`validate`](Self::validate) — so startup, `--check-config`, and the
+    /// reload acceptance gate all reject it by construction — and duplicated
+    /// belt-and-braces in the broker's `runtime_precheck`, through this same helper so
+    /// the message can never drift between gates.
+    ///
+    /// # Errors
+    /// The refusal message, naming both remedies, when the config is ephemeral-durable
+    /// without the opt-in.
+    pub fn refuse_unopted_ephemeral_durability(&self) -> Result<(), String> {
+        if self.durability_is_ephemeral() && !self.durable.allow_ephemeral {
+            return Err(
+                "EPHEMERAL durability REFUSED: durable sessions are ON (the default) but no \
+                 data dir is set — the replicated state would live only in MEMORY, and a \
+                 correlated restart of a quorum LOSES acknowledged messages. Either set \
+                 MQTTD_DATA_DIR ([node] data_dir) and mount a volume for real durability, or \
+                 opt into ephemeral operation for development/tests with \
+                 MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 ([durable] allow_ephemeral = true). \
+                 (MQTTD_DURABLE_SESSIONS=0 — the lightweight in-memory store — needs no \
+                 opt-in.)"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Parse a strict TOML document into a `Config` and [`validate`](Self::validate) it.
@@ -938,6 +979,11 @@ impl Config {
             self.durable.min_replicas = MinReplicas::parse(&v)
                 .map_err(|e| ConfigError::Invalid(format!("MQTTD_MIN_REPLICAS: {e}")))?;
         });
+        // Presence = on, matching MQTTD_ALLOW_ANONYMOUS / MQTTD_OIDC_ALLOW_HTTP: a
+        // loudly-dangerous opt-in should not hinge on parsing "false" (issue #240).
+        if get("MQTTD_ALLOW_EPHEMERAL_DURABILITY").is_some() {
+            self.durable.allow_ephemeral = true;
+        }
 
         // -- limits --
         on!("MQTTD_MAX_CONNECTIONS", v, {
@@ -1113,6 +1159,12 @@ impl Config {
                     .to_string(),
             ));
         }
+        // Ephemeral durability without the explicit opt-in (issue #240, ADR 0029
+        // as-delivered): durable ON + no data_dir is quorum-of-RAM — refused rather
+        // than warned. Checked last so a config broken in a more specific way is
+        // reported for that reason first.
+        self.refuse_unopted_ephemeral_durability()
+            .map_err(ConfigError::Invalid)?;
         Ok(())
     }
 }
@@ -1184,6 +1236,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_LEASE_VOTERS",
     "MQTTD_MIN_REPLICAS",
     "MQTTD_STORE_MAX_BYTES",
+    "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
     // limits
     "MQTTD_MAX_CONNECTIONS",
     "MQTTD_MAX_CONNECTIONS_PER_IP",
@@ -1224,6 +1277,16 @@ mod tests {
         assert!(c.listeners.tls_bind.is_none());
         assert!(c.durable.enabled, "durable is the default (ADR 0029)");
         assert_eq!(c.durable.lease_voters, 5);
+        assert!(
+            !c.durable.allow_ephemeral,
+            "ephemeral durability is opt-in (#240)"
+        );
+        // Bare defaults are durable-on with no data dir — ephemeral durability, REFUSED
+        // since #240 (the dedicated test below pins the message). With a data dir the
+        // same defaults validate.
+        assert!(c.validate().is_err());
+        let mut c = c;
+        c.node.data_dir = Some("/var/lib/mqttd".into());
         assert!(c.validate().is_ok());
     }
 
@@ -1292,7 +1355,8 @@ mod tests {
     fn warn_mode_boots_a_newer_config_and_reports_the_ignored_keys() {
         // The knob in the file: the newer config ships its own skew posture.
         let c = Config::from_toml(
-            "[runtime]\nconfig_unknown_keys = \"warn\"\n[durable]\nknob_from_the_future = 7\n",
+            "[runtime]\nconfig_unknown_keys = \"warn\"\n[durable]\nallow_ephemeral = true\n\
+             knob_from_the_future = 7\n",
         )
         .expect("warn mode must boot a newer config");
         assert_eq!(c.ignored_keys, vec!["durable.knob_from_the_future"]);
@@ -1336,7 +1400,10 @@ mod tests {
         // a plausible-sounding synonym must not silently become some other posture.
         assert!(Config::from_toml("[durable]\nmin_replicas = \"quorum\"\n").is_err());
         // shutdown_grace_secs = 0 is *valid* (drain immediately) — not out of range.
-        assert!(Config::from_toml("[runtime]\nshutdown_grace_secs = 0\n").is_ok());
+        assert!(Config::from_toml(
+            "[runtime]\nshutdown_grace_secs = 0\n[durable]\nallow_ephemeral = true\n"
+        )
+        .is_ok());
     }
 
     /// Issue #239 — the min-replicas write floor is ON by default, as the *derived*
@@ -1349,12 +1416,14 @@ mod tests {
             super::MinReplicas::Majority,
             "the shipped default must be the derived majority floor, not 1"
         );
-        let c = Config::from_toml("[durable]\nmin_replicas = 2\n").unwrap();
+        let c = Config::from_toml("[durable]\nallow_ephemeral = true\nmin_replicas = 2\n").unwrap();
         assert_eq!(c.durable.min_replicas, super::MinReplicas::Count(2));
-        let c = Config::from_toml("[durable]\nmin_replicas = \"majority\"\n").unwrap();
+        let c =
+            Config::from_toml("[durable]\nallow_ephemeral = true\nmin_replicas = \"majority\"\n")
+                .unwrap();
         assert_eq!(c.durable.min_replicas, super::MinReplicas::Majority);
         // The opt-out is still spelled 1.
-        let c = Config::from_toml("[durable]\nmin_replicas = 1\n").unwrap();
+        let c = Config::from_toml("[durable]\nallow_ephemeral = true\nmin_replicas = 1\n").unwrap();
         assert_eq!(c.durable.min_replicas, super::MinReplicas::Count(1));
 
         let env = |v: &'static str| {
@@ -1384,7 +1453,10 @@ mod tests {
     fn a_bad_enum_value_is_rejected() {
         assert!(Config::from_toml("[cluster.swim]\nsigned = \"maybe\"\n").is_err());
         assert!(Config::from_toml("[limits]\nqueue_overflow = \"drop-middle\"\n").is_err());
-        assert!(Config::from_toml("[limits]\nqueue_overflow = \"reject-newest\"\n").is_ok());
+        assert!(Config::from_toml(
+            "[limits]\nqueue_overflow = \"reject-newest\"\n[durable]\nallow_ephemeral = true\n"
+        )
+        .is_ok());
     }
 
     // --- ADR 0046 T2: env overlay + precedence ---
@@ -1403,8 +1475,10 @@ mod tests {
     #[test]
     fn env_overlay_wins_over_the_file() {
         // File sets node id + lease voters; env overrides both (env is the higher layer).
-        let mut c =
-            Config::from_toml("[node]\nid = \"from-file\"\n[durable]\nlease_voters = 3\n").unwrap();
+        let mut c = Config::from_toml(
+            "[node]\nid = \"from-file\"\n[durable]\nallow_ephemeral = true\nlease_voters = 3\n",
+        )
+        .unwrap();
         c.overlay_from(getter(&[
             ("MQTTD_NODE_ID", "from-env"),
             ("MQTTD_LEASE_VOTERS", "5"),
@@ -1461,7 +1535,10 @@ mod tests {
             assert_eq!(c.cluster.refound_guard, want, "MQTTD_REFOUND_GUARD={v:?}");
         }
         // And from the file, for a deliberate, reviewed opt-out.
-        let c = Config::from_toml("[cluster]\nrefound_guard = false\n").unwrap();
+        let c = Config::from_toml(
+            "[cluster]\nrefound_guard = false\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
         assert!(!c.cluster.refound_guard);
     }
 
@@ -1501,8 +1578,11 @@ mod tests {
     #[test]
     fn an_unset_env_leaves_file_and_defaults_intact() {
         // Overlaying an empty environment changes nothing.
-        let base =
-            Config::from_toml("[node]\nid = \"keep\"\n[limits]\nmax_connections = 42\n").unwrap();
+        let base = Config::from_toml(
+            "[node]\nid = \"keep\"\n[limits]\nmax_connections = 42\n\
+                 [durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
         let mut c = base.clone();
         c.overlay_from(getter(&[])).unwrap();
         assert_eq!(c, base);
@@ -1515,8 +1595,10 @@ mod tests {
         match var {
             // Data-safe defaults are ON, so only a falsey value *changes* them.
             "MQTTD_DURABLE_SESSIONS" | "MQTTD_REFOUND_GUARD" => "off",
-            // Presence flips anonymous on (default off).
-            "MQTTD_ALLOW_ANONYMOUS" | "MQTTD_OIDC_ALLOW_HTTP" => "1",
+            // Presence flips these on (default off).
+            "MQTTD_ALLOW_ANONYMOUS"
+            | "MQTTD_OIDC_ALLOW_HTTP"
+            | "MQTTD_ALLOW_EPHEMERAL_DURABILITY" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
@@ -1587,7 +1669,9 @@ mod tests {
     #[test]
     fn an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted() {
         for good in ["cn", "san-dns", "san-uri", "san-email", " SAN-DNS "] {
-            let toml = format!("[security]\nmtls_identity_source = \"{good}\"\n");
+            let toml = format!(
+                "[security]\nmtls_identity_source = \"{good}\"\n[durable]\nallow_ephemeral = true\n"
+            );
             assert!(Config::from_toml(&toml).is_ok(), "{good:?} should be valid");
         }
         for bad in ["", "san", "dns", "common-name", "san_dns"] {
@@ -1609,8 +1693,12 @@ mod tests {
     #[test]
     fn the_gossip_key_is_inline_xor_by_reference() {
         // Either form alone validates; both together is rejected (ADR 0046 T5).
-        assert!(Config::from_toml("[cluster.swim]\nkey = \"deadbeef\"\n").is_ok());
-        assert!(Config::from_toml("[cluster.swim]\nkey_file = \"/run/secrets/swim\"\n").is_ok());
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        assert!(Config::from_toml(&format!("[cluster.swim]\nkey = \"deadbeef\"{flag}")).is_ok());
+        assert!(Config::from_toml(&format!(
+            "[cluster.swim]\nkey_file = \"/run/secrets/swim\"{flag}"
+        ))
+        .is_ok());
         let err = Config::from_toml(
             "[cluster.swim]\nkey = \"deadbeef\"\nkey_file = \"/run/secrets/swim\"\n",
         )
@@ -1633,7 +1721,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            73,
+            74,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
@@ -1679,6 +1767,63 @@ mod tests {
         assert_eq!(c.runtime.ready_min_members, 7);
     }
 
+    /// Issue #240: durable ON (the default) with no data dir is REFUSED at validation —
+    /// a warning log is not a substitute for refusing the configuration — and the
+    /// refusal names both ways out.
+    #[test]
+    fn durable_on_without_a_data_dir_refuses_naming_both_remedies() {
+        let err = Config::default()
+            .validate()
+            .expect_err("bare defaults are ephemeral durability and must be refused");
+        assert!(matches!(err, super::ConfigError::Invalid(_)));
+        let msg = err.to_string();
+        for remedy in [
+            "MQTTD_DATA_DIR",
+            "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
+            "allow_ephemeral",
+        ] {
+            assert!(msg.contains(remedy), "must name {remedy}; message: {msg}");
+        }
+    }
+
+    /// Issue #240: each documented remedy, alone, unblocks validation — the opt-in
+    /// flag, a real data dir, or durable explicitly off (which needs no flag). Guards
+    /// each against being accidentally narrowed later.
+    #[test]
+    fn each_remedy_individually_unblocks_validation() {
+        let mut c = Config::default();
+        c.durable.allow_ephemeral = true;
+        assert!(c.validate().is_ok(), "the explicit ephemeral opt-in passes");
+
+        let mut c = Config::default();
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        assert!(c.validate().is_ok(), "a data dir is real durability");
+
+        let mut c = Config::default();
+        c.durable.enabled = false;
+        assert!(
+            c.validate().is_ok(),
+            "durable OFF is an explicit choice already — no flag needed"
+        );
+
+        // And from the env, the same three postures (the flag is presence = on).
+        for pairs in [
+            &[("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")][..],
+            &[("MQTTD_DATA_DIR", "/var/lib/mqttd")][..],
+            &[("MQTTD_DURABLE_SESSIONS", "0")][..],
+        ] {
+            let mut c = Config::default();
+            c.overlay_from(getter(pairs)).unwrap();
+            assert!(c.validate().is_ok(), "{pairs:?} must validate");
+        }
+        // Presence = on even for a falsey-looking value, per the pinned dangerous-
+        // opt-in convention (MQTTD_ALLOW_ANONYMOUS / MQTTD_OIDC_ALLOW_HTTP).
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "0")]))
+            .unwrap();
+        assert!(c.durable.allow_ephemeral, "any value enables the opt-in");
+    }
+
     /// #166 — the ephemeral-durability predicate: durable ON + no `data_dir` is the one
     /// dangerous combination (quorum-of-RAM), and only that one.
     #[test]
@@ -1689,6 +1834,15 @@ mod tests {
             c.durability_is_ephemeral(),
             "durable ON + no data_dir = ephemeral"
         );
+
+        // #240: the opt-in flag PERMITS ephemeral mode — it must not redefine it, or
+        // the startup EPHEMERAL warning would fall silent exactly when it matters.
+        c.durable.allow_ephemeral = true;
+        assert!(
+            c.durability_is_ephemeral(),
+            "the opt-in permits ephemeral mode; it does not redefine it"
+        );
+        c.durable.allow_ephemeral = false;
 
         c.node.data_dir = Some("/var/lib/mqttd".into());
         assert!(

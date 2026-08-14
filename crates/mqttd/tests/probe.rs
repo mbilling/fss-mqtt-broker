@@ -119,6 +119,38 @@ async fn a_ready_broker_probes_zero_and_an_unreachable_one_probes_one() {
     assert!(out.contains("unreachable"), "output was: {out}");
 }
 
+/// Issue #240 fallout, pinned: the probe is a read-only diagnostic against a RUNNING
+/// broker, so an environment the broker itself could not boot with — here just
+/// `MQTTD_HEALTH_BIND`, no data dir, no ephemeral opt-in (which `Config::load` refuses)
+/// — must still resolve the health endpoint and probe it, not die with "no health
+/// endpoint to probe".
+#[tokio::test]
+async fn the_probe_resolves_its_endpoint_from_an_env_the_broker_would_refuse_to_boot() {
+    let (_broker, health, _dir) = start_broker(1).await;
+    let mut last = (i32::MIN, String::new());
+    for _ in 0..200 {
+        let out = mqttd()
+            .env("MQTTD_HEALTH_BIND", health.to_string())
+            .arg("--probe")
+            .arg("/readyz")
+            .output()
+            .expect("run --probe");
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        last = (out.status.code().unwrap_or(-1), text);
+        if last.0 == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        last.0, 0,
+        "the probe must reach the running broker from a boot-refused env; got: {}",
+        last.1
+    );
+    assert!(last.1.contains("/readyz 200"), "output was: {}", last.1);
+}
+
 /// The reason the subcommand exists: alive is not the same as ready, and the probe must
 /// say which. A node below its readiness floor is serving `/livez` (do not restart me)
 /// while failing `/readyz` (do not send me clients).

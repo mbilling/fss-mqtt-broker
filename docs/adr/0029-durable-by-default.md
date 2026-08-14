@@ -78,3 +78,28 @@ the group to form before routing traffic.
   surprising. A single, predictable default plus a documented opt-out is clearer.
 - **Require `MQTTD_DATA_DIR` for the durable default.** Rejected: it would break zero-config
   startup. Persistence stays an orthogonal, recommended-but-optional axis.
+
+  **As delivered (2026-08-14, issue #240) — this rejection is reversed: durable-on with no
+  data dir now REFUSES to start unless explicitly opted in.** The "sane zero-config cluster
+  default" above turned out to be the configuration two external reviewers independently
+  called out: with durable on by default and no `MQTTD_DATA_DIR`, the replicated state is
+  RAM-only, so a correlated restart of a quorum loses acknowledged messages — and the loud
+  `EPHEMERAL durability` startup warning this ADR relied on was judged insufficient ("a
+  warning log is not a substitute for refusing the configuration"; "novices don't read
+  logs — the marketing headline contradicts the default experience"). Zero-config startup
+  now requires an explicit posture, one of:
+  - `MQTTD_DATA_DIR` (`[node] data_dir`) — real durability, the production answer;
+  - `MQTTD_ALLOW_EPHEMERAL_DURABILITY=1` (`[durable] allow_ephemeral = true`, presence =
+    on) — the development/test opt-in, still loudly WARNed on every start while active;
+  - `MQTTD_DURABLE_SESSIONS=0` — the lightweight in-memory store, an explicit choice
+    already, which needs no flag.
+
+  The refusal lives in `Config::validate()`, so startup, `--check-config` (ADR 0046 T3)
+  and the reload acceptance gate (ADR 0046 T4) reject it **by construction** — the #239
+  round-2 lesson about gate drift, satisfied structurally — with a belt-and-braces
+  duplicate in `runtime_precheck` through the same helper so the message can never
+  diverge. No path is defaulted (a defaulted path recreates the same acked-loss lie one
+  level down — in the container it would silently write the pod's ephemeral writable
+  layer, and the hardened `--read-only` run could not write at all); the refusal names
+  both remedies instead. Mirrors the bridge's ADR 0060 T4 `spool.allow_ephemeral_spool`
+  precedent.

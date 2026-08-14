@@ -34,7 +34,15 @@
 //!   (ADR 0006/0007), replicating persistent sessions across the peer mesh, is the
 //!   **default** (ADR 0029). Opt out with `0`/`false`/`off`/`no` for the lightweight
 //!   in-memory store. A node with no `MQTTD_SWIM_SEEDS` is the cluster founder that
-//!   bootstraps the lease group (exactly one per cluster).
+//!   bootstraps the lease group (exactly one per cluster). Durable ON with no
+//!   `MQTTD_DATA_DIR` **refuses to start** (issue #240) unless
+//!   `MQTTD_ALLOW_EPHEMERAL_DURABILITY` is set — see below.
+//! - `MQTTD_ALLOW_EPHEMERAL_DURABILITY` — any non-empty value opts in to **ephemeral
+//!   durability** (issue #240): durable sessions ON with no data dir, the replicated
+//!   state living only in MEMORY, so a correlated restart of a quorum loses
+//!   acknowledged messages. Without it that combination is a hard startup error
+//!   (and fails `--check-config` and a live reload) naming both remedies. For
+//!   development and tests only; loudly **warned** on every start while active.
 //! - `MQTTD_MIN_REPLICAS`    — the min-replicas write floor (issues #167, #239). Default
 //!   `majority`: a placement group holding fewer than a majority of the members this node
 //!   knows about — **capped at the replication factor** — REFUSES durable writes (QoS>=1
@@ -46,11 +54,13 @@
 //!   floor on the replica-set size instead; `1` disables the refusal and accepts
 //!   single-copy acks. A floor above the replication factor is rejected at startup (and by
 //!   `--check-config` and a live reload). With durable sessions off there is no floor.
-//! - `MQTTD_DATA_DIR`        — directory for on-disk session persistence (ADR 0018),
-//!   orthogonal to durability. With durable on (the default) it makes the lease group
-//!   and replicated log on-disk, so sessions survive a full-cluster restart (the
-//!   recommended production setup). With durable opted out, it stores single-node
-//!   sessions in `<dir>/sessions.redb` (restart-safe, not replicated). Unset → in-memory.
+//! - `MQTTD_DATA_DIR`        — directory for on-disk session persistence (ADR 0018).
+//!   With durable on (the default) it makes the lease group and replicated log
+//!   on-disk, so sessions survive a full-cluster restart (the recommended production
+//!   setup); **unset with durable on is REFUSED at startup** (issue #240) unless
+//!   `MQTTD_ALLOW_EPHEMERAL_DURABILITY` opts into the in-memory mode. With durable
+//!   opted out, it stores single-node sessions in `<dir>/sessions.redb` (restart-safe,
+//!   not replicated); unset is then plain in-memory, no opt-in needed.
 //! - `MQTTD_FAILURE_DOMAIN`  — this node's own failure-domain label (ADR 0016 T5), e.g.
 //!   `rack-a`. Advertised over the authenticated SWIM gossip payload so the cluster's
 //!   failure-domain topology **self-assembles** (the bounded lease-voter set spreads across
@@ -1312,7 +1322,8 @@ type HubHandle = (
 /// no `MQTTD_DATA_DIR`, so the replicated state is only in RAM — is announced in the same
 /// loud register as the other degraded modes (plaintext, unauthenticated gossip), because
 /// logging it as a plain "DURABLE sessions enabled" line is a durability lie an operator
-/// reads and trusts.
+/// reads and trusts. Since issue #240 this branch only fires under the explicit opt-in
+/// (`MQTTD_ALLOW_EPHEMERAL_DURABILITY`); without it the configuration refuses to start.
 fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure_domains: usize) {
     if config.durability_is_ephemeral() {
         warn!(
@@ -1322,7 +1333,8 @@ fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure
              the replicated state lives only in MEMORY. A single node's loss is survived \
              (peers hold it), but a correlated restart of a quorum LOSES acknowledged \
              facts. Set MQTTD_DATA_DIR and mount a volume for real durability; this mode \
-             is for development and tests."
+             is for development and tests (opted in via MQTTD_ALLOW_EPHEMERAL_DURABILITY \
+             / [durable] allow_ephemeral, issue #240)."
         );
     } else {
         info!(
@@ -1415,7 +1427,9 @@ async fn start_hub(
         // Persist the lease store and follower replica copy on disk when a data dir
         // is set (ADR 0018 phases 2–3): the lease vote/assignments and the replicated
         // session log survive a restart (restoring Raft safety and full-cluster-restart
-        // durability). Without it the durable plane is in-memory (rebuilds from peers).
+        // durability). Without it the durable plane is in-memory (rebuilds from peers) —
+        // reachable only through the explicit MQTTD_ALLOW_EPHEMERAL_DURABILITY opt-in
+        // since issue #240; `Config::validate()` refuses the combination otherwise.
         let data_dir = config.node.data_dir.clone();
         // Bound the lease-consensus voter set (ADR 0021): at most `N` members vote, the
         // rest join as learners that still receive the lease log. Default 5 (recommend
@@ -2550,6 +2564,12 @@ fn runtime_precheck(config: &Config) -> Result<(), String> {
     // live would commit a config that bricks the NEXT boot (`resolve_write_floor` errors
     // out of `main`), hours later and detached from the reload that caused it.
     resolve_write_floor(config)?;
+    // Ephemeral durability without the opt-in (issue #240). Already rejected by
+    // `Config::validate()` — which every gate (startup, `--check-config`, the reload's
+    // `Config::load`) runs by construction — so this is belt-and-braces through the
+    // SAME helper, keeping the reload acceptance gate self-sufficient (#239 round 2)
+    // and the message drift-proof. Last, so a more specific failure is reported first.
+    config.refuse_unopted_ephemeral_durability()?;
     Ok(())
 }
 
@@ -2810,13 +2830,20 @@ async fn probe_health() -> ! {
 
 /// The `MQTTD_HEALTH_BIND` the broker would use, read through the ordinary config path so
 /// a probe honours a config file exactly as the running broker does.
+///
+/// The probe is a **read-only diagnostic against an already-running broker**, so a config
+/// that would refuse to BOOT (e.g. the issue #240 ephemeral-durability refusal, when the
+/// probe's environment carries less than the broker's did) must not stop it asking the
+/// running broker how it feels: on a failed load it falls back to defaults + the env
+/// overlay without validation — the probe only needs the health bind.
 fn health_bind_from_config() -> Option<String> {
     let path = config_path().ok()?;
-    Config::load(path.as_deref())
-        .ok()?
-        .listeners
-        .health_bind
-        .clone()
+    let config = Config::load(path.as_deref()).ok().or_else(|| {
+        let mut c = Config::default();
+        c.overlay_env().ok()?;
+        Some(c)
+    })?;
+    config.listeners.health_bind
 }
 
 /// One HTTP/1.0 `GET`, returning the numeric status. Hand-rolled to match the equally
@@ -3467,7 +3494,12 @@ mod tests {
     fn the_config_and_the_authenticator_agree_on_identity_source_spellings() {
         use mqtt_auth::mtls::IdentitySource;
         for good in ["cn", "san-dns", "san-uri", "san-email"] {
-            let toml = format!("[security]\nmtls_identity_source = \"{good}\"\n");
+            // The ephemeral opt-in (#240) keeps validation green; the subject here is
+            // the identity-source spelling.
+            let toml = format!(
+                "[security]\nmtls_identity_source = \"{good}\"\n\
+                 [durable]\nallow_ephemeral = true\n"
+            );
             let cfg = Config::from_toml(&toml).expect("config accepts it");
             assert_eq!(
                 IdentitySource::parse(good)
@@ -3512,7 +3544,27 @@ mod tests {
 
     #[test]
     fn runtime_precheck_rejects_what_startup_would_reject() {
-        assert!(runtime_precheck(&Config::default()).is_ok());
+        // Issue #240: bare defaults are ephemeral durability (durable ON, no data dir)
+        // — the precheck now refuses them exactly as startup does, naming both remedies.
+        let err = runtime_precheck(&Config::default())
+            .expect_err("ephemeral durability without the opt-in must not be swapped in");
+        for remedy in ["MQTTD_DATA_DIR", "MQTTD_ALLOW_EPHEMERAL_DURABILITY"] {
+            assert!(
+                err.contains(remedy),
+                "must name {remedy}; reason was: {err}"
+            );
+        }
+        // And each remedy unblocks it: the opt-in, a data dir, or durable off.
+        let mut c = Config::default();
+        c.durable.allow_ephemeral = true;
+        assert!(runtime_precheck(&c).is_ok());
+        let mut c = Config::default();
+        c.node.data_dir = Some("/var/lib/mqttd".into());
+        assert!(runtime_precheck(&c).is_ok());
+        let mut c = Config::default();
+        c.durable.enabled = false;
+        assert!(runtime_precheck(&c).is_ok());
+
         // A zero publish rate / zero quota / zero watermark are all rejected before a live swap.
         let mut c = Config::default();
         c.limits.max_publish_rate = Some(0);
@@ -3525,8 +3577,11 @@ mod tests {
         assert!(runtime_precheck(&c).is_err());
         // Issue #239: an unsatisfiable min-replicas floor. `durable` is restart-scoped, so
         // a reload of this is only reported as a requires-RESTART section — and would then
-        // brick the next boot. The reload gate must refuse it, as startup does.
+        // brick the next boot. The reload gate must refuse it, as startup does. The
+        // ephemeral opt-in is set so the failure is the FLOOR's (asserted on the text),
+        // not #240's.
         let mut c = Config::default();
+        c.durable.allow_ephemeral = true;
         c.durable.min_replicas = MinReplicas::Count(9);
         let err = runtime_precheck(&c).expect_err("a floor above R must not be swapped in");
         assert!(
@@ -3537,6 +3592,7 @@ mod tests {
         for enabled in [true, false] {
             for floor in [MinReplicas::Majority, MinReplicas::Count(1)] {
                 let mut c = Config::default();
+                c.durable.allow_ephemeral = true;
                 c.durable.enabled = enabled;
                 c.durable.min_replicas = floor;
                 assert!(runtime_precheck(&c).is_ok(), "{floor} / durable={enabled}");

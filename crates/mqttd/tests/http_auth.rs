@@ -107,6 +107,7 @@ async fn start_broker(hook_url: &str, extra: &[(&str, &str)]) -> (Broker, Socket
         }
     }
     cmd.env("MQTTD_NODE_ID", "hook-node")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_PLAINTEXT_BIND", client.to_string())
         .env("MQTTD_HTTP_AUTH_URL", hook_url)
         // The stub speaks plaintext; the broker refuses that unless told, which is

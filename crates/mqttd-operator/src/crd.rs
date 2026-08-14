@@ -38,6 +38,12 @@ pub struct MqttdClusterSpec {
     /// The broker config TOML template — the SAME contract as the chart's
     /// `values.config` (ADR 0046): `__NODE_ID__`, `__SEEDS__`,
     /// `__PEER_ADVERTISE__`, and `__READY_MIN__` are rendered per pod.
+    ///
+    /// A config that omits `[node] data_dir` with durable sessions on (the
+    /// default) now CRASHLOOPS with the issue #240 refusal — the check-config
+    /// init container rejects it before the broker starts. Set `data_dir`
+    /// (the chart default `/var/lib/mqttd` plus a PVC already does), or add
+    /// `[durable] allow_ephemeral = true` for a throwaway cluster.
     pub config: String,
     /// Secret material by PATH (ADR 0046 T5), mirroring the chart's `secrets`
     /// block. The operator only ever references these Secrets — it never reads

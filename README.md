@@ -183,13 +183,18 @@ process and credentials — see [Bridging](#bridging-to-other-security-zones).
 ```sh
 docker run -d --name mqttd -p 1883:1883 \
   -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
+  -e MQTTD_DATA_DIR=/var/lib/mqttd -v mqttd-data:/var/lib/mqttd \
   ghcr.io/mbilling/fss-mqtt-broker:latest
 
 mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
 mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
 ```
 
-That is **plaintext with anonymous clients** — a first look, never a deployment.
+That is **plaintext with anonymous clients** — a first look, never a deployment. The
+named volume is what makes it honest: durable sessions are on by default, and durable-on
+with no data dir **refuses to start** (issue #240) rather than silently keeping acked
+messages in RAM. (The volume outlives `docker rm -f mqttd`; `docker volume rm mqttd-data`
+removes the state too.)
 The broker says so in its own logs, loudly, every time. When you are ready for
 something real, the [secured quickstart](#single-node-secured-tls-13--mtls--acl)
 stands up TLS 1.3, mutual TLS and a deny-by-default ACL in about the same number
@@ -519,10 +524,11 @@ The four things most likely to bite a first deployment, each of which is silent 
 don't know to look. New to MQTT? Start with the [glossary](docs/GLOSSARY.md); hitting an
 error? the [troubleshooting guide](docs/TROUBLESHOOTING.md).
 
-- [ ] **Set `MQTTD_DATA_DIR` and mount a volume.** Durable sessions are on by default but
-  keep state *in memory* until a data dir is set — a correlated restart then loses
-  acknowledged messages. The broker logs an `EPHEMERAL durability` warning when you've
-  missed this.
+- [ ] **Set `MQTTD_DATA_DIR` and mount a volume.** Durable sessions are on by default,
+  and durable-on with no data dir **refuses to start** (issue #240) — in-memory
+  replicated state loses acknowledged messages on a correlated restart. The refusal
+  names the ways out; `MQTTD_ALLOW_EPHEMERAL_DURABILITY=1` is the development/test
+  override, loudly warned while active — never production.
 - [ ] **Configure an ACL (`MQTTD_ACL_FILE`).** With none, every authenticated client may
   publish and subscribe anywhere (logged as INSECURE at startup). And note: **a denied
   publish is still acknowledged** — the message is dropped after the ACK, so a
@@ -719,8 +725,10 @@ build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook
 ```sh
 # Container image — fully-static musl binary on distroless/static, non-root,
 # multi-arch (linux/amd64 + linux/arm64), nothing but the broker and a CA bundle:
-docker run --rm ghcr.io/mbilling/fss-mqtt-broker:latest --check-config
-# → config OK: defaults + MQTTD_* env overlay validates (no config file set)
+docker run --rm -e MQTTD_DATA_DIR=/var/lib/mqttd \
+  ghcr.io/mbilling/fss-mqtt-broker:latest --check-config
+# → config OK: env overlay validates. (BARE defaults now REFUSE — durable-on needs a
+#   data dir or the explicit MQTTD_ALLOW_EPHEMERAL_DURABILITY opt-in, issue #240.)
 #
 # `mqttd --version` prints the version and exits; `mqttd --help` lists every flag.
 # An unrecognised flag is now an ERROR (exit 2), not a silent broker start.
@@ -743,16 +751,19 @@ docker run -d --name mqttd \
 ```
 
 > **`/var/lib/mqttd` is the image's data directory** and the only path inside the
-> image the broker's uid (65532) may write. Durable sessions are on by default but
-> keep state **in memory** until `MQTTD_DATA_DIR` is set, so persistence needs both
-> the env var and a volume. The image runs non-root under a read-only root
-> filesystem with every capability dropped.
+> image the broker's uid (65532) may write. Durable sessions are on by default and
+> **require `MQTTD_DATA_DIR`** (issue #240), so persistence needs both the env var
+> and a volume. The image runs non-root under a read-only root filesystem with
+> every capability dropped.
 
-> ⚠️ **Durable-on with no `MQTTD_DATA_DIR` is in-memory durability.** It survives one
-> node's loss (peers still hold the state) but **a correlated restart of a quorum loses
-> acknowledged messages** — the replicated state was only in RAM. The broker logs an
-> `EPHEMERAL durability` warning on every start in this mode. For real durability set
-> `MQTTD_DATA_DIR` and mount a volume; the in-memory mode is for development and tests.
+> ⚠️ **Durable-on with no `MQTTD_DATA_DIR` refuses to start** (issue #240). In-memory
+> durability survives one node's loss (peers still hold the state) but **a correlated
+> restart of a quorum loses acknowledged messages** — so it is no longer a warning, it
+> is a startup error naming both ways out: set `MQTTD_DATA_DIR` and mount a volume for
+> real durability, or set `MQTTD_ALLOW_EPHEMERAL_DURABILITY=1` to accept the in-memory
+> mode for development and tests (loudly `EPHEMERAL durability`-warned on every start
+> while active). `MQTTD_DURABLE_SESSIONS=0` — the lightweight in-memory store — is an
+> explicit choice already and needs no flag.
 
 > **What exists today: `v0.9.0`** — both musl binaries with signatures and
 > certificates, a signed CycloneDX SBOM, a multi-arch image, and SLSA provenance,
@@ -770,7 +781,8 @@ docker run -d --name mqttd \
 ### Single node (insecure, local testing)
 
 ```sh
-MQTTD_PLAINTEXT_BIND=127.0.0.1:1883 cargo run --bin mqttd
+MQTTD_PLAINTEXT_BIND=127.0.0.1:1883 MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
+  cargo run --bin mqttd
 mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
 mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
 ```
@@ -817,7 +829,10 @@ EOF
 
 # 3. Run it. No MQTTD_PLAINTEXT_BIND, no MQTTD_ALLOW_ANONYMOUS — the broker logs
 #    an INSECURE warning for either, and this configuration logs none.
+#    (MQTTD_ALLOW_EPHEMERAL_DURABILITY is the local-evaluation escape hatch for
+#    durable-on with no data dir, issue #240; production sets MQTTD_DATA_DIR instead.)
 MQTTD_TLS_BIND=127.0.0.1:8883 \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_TLS_CERT=pki/server.crt MQTTD_TLS_KEY=pki/server.key \
 MQTTD_TLS_CLIENT_CA=pki/ca.crt \
 MQTTD_ACL_FILE=acl.toml \
@@ -862,16 +877,22 @@ no static peer list. Node B seeds off node A's gossip address.
 ```sh
 # Node A — client :1883, peer :7001, gossip :7946 (seed)
 MQTTD_NODE_ID=node-a MQTTD_PLAINTEXT_BIND=127.0.0.1:1883 \
+  MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
   MQTTD_PEER_BIND=127.0.0.1:7001 MQTTD_SWIM_BIND=127.0.0.1:7946 \
   cargo run --bin mqttd &
 # Node B — client :1884, peer :7002, gossip :7947, seeds off A
 MQTTD_NODE_ID=node-b MQTTD_PLAINTEXT_BIND=127.0.0.1:1884 \
+  MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
   MQTTD_PEER_BIND=127.0.0.1:7002 MQTTD_SWIM_BIND=127.0.0.1:7947 \
   MQTTD_SWIM_SEEDS=127.0.0.1:7946 cargo run --bin mqttd &
 
 mosquitto_sub -h 127.0.0.1 -p 1883 -t 'fleet/+/telemetry' &           # on node A
 mosquitto_pub -h 127.0.0.1 -p 1884 -t 'fleet/truck7/telemetry' -m hi  # on node B
 ```
+
+> `MQTTD_ALLOW_EPHEMERAL_DURABILITY=1` in these local runs is the issue #240 opt-in:
+> durable-on with no data dir would otherwise refuse to start. A production node sets
+> `MQTTD_DATA_DIR` (and a volume) instead.
 
 ## Configuration
 
@@ -935,8 +956,9 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | `MQTTD_STORE_MAX_BYTES` | Disk watermark over the node's on-disk stores, total bytes (ADR 0041; needs `MQTTD_DATA_DIR`). Above it the broker **browns out**: writes that *grow* durable state (new retained topics, new sessions, offline enqueues) are refused with the quota behaviors, while acks, deletes, expiry, and resumes continue — read-mostly, never the disk-full cliff; dropping back under restores writes. Per-store sizes are always exported as the `store_bytes{store}` gauge. Unset = no watermark |
 | `MQTTD_MEMORY_MAX_BYTES` | **Memory watermark** over this process's RSS, bytes (ADR 0041 T8). Above it the broker **browns out** exactly as the disk watermark does — growth writes refused, acks/reads/deletes/expiry/resumes continue — and dropping back under restores growth. Brownout is active while **either** axis is over; `brownout{axis="memory"}` and `process_resident_bytes` say which. A **watermark, not a ceiling**: nothing here stops RSS rising, so keep the container/cgroup limit as the hard bound. Needs `/proc` (Linux); elsewhere the broker logs at WARN that it is not enforcing, rather than pretending. Unset = off |
 | `MQTTD_AUTH_TIMEOUT` | Per-round enhanced-auth reply timeout, seconds (ADR 0013; default `10`) |
-| `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store. A node with no `MQTTD_SWIM_SEEDS` founds the lease group |
-| `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); unset → in-memory |
+| `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store (an explicit choice: it needs no ephemeral opt-in). A node with no `MQTTD_SWIM_SEEDS` founds the lease group. On with no `MQTTD_DATA_DIR` → **REFUSED at startup** (issue #240) unless `MQTTD_ALLOW_EPHEMERAL_DURABILITY` is set |
+| `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); **unset with durable on → REFUSED at startup** (issue #240) unless the ephemeral opt-in below is set. With durable off, unset is plain in-memory |
+| `MQTTD_ALLOW_EPHEMERAL_DURABILITY` | **Dev/tests only** (issue #240): any non-empty value (presence = on) permits durable-on with **no** data dir — replicated state in MEMORY only, so a correlated quorum restart loses acked messages. Without it that combination refuses to start (and fails `--check-config` and a live reload), naming both remedies. Loudly `EPHEMERAL durability`-warned on every start while active |
 | `MQTTD_LEASE_VOTERS` | Bounded lease-consensus voter set `N` (ADR 0021; default `5`, recommend odd). At most `N` members vote on lease ownership; every other member joins as a learner that still receives the lease log and can own/serve sessions — so consensus cost stays fixed (quorum `⌊N/2⌋+1`) as the cluster grows. `1` = no fault tolerance, `3` tolerates one voter loss, `5` two |
 | `MQTTD_MIN_REPLICAS` | Min-replicas write floor (issues #167/#239; default `majority`). Replica sets shrink with membership — `min(R, alive)` — so without a floor a shrinking cluster silently trades the configured durability for availability, down to quorum-of-1. A group below the floor **refuses** durable writes instead (QoS≥1 acks withheld so sources redeliver, retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not). `majority` derives the floor from the members this node knows about — the quorum-committed durable roster (authoritative), falling back to the largest membership it has ever observed only before a roster exists, bounded below by `MQTTD_READY_MIN_MEMBERS` — capped at R: **no floor at all** while it has never known a peer (single-node stays fully operational) and **2** in a 3-node cluster, which the write quorum already needs. An integer sets an absolute floor; `1` disables it and accepts single-copy acks. Above R = rejected at startup (and by `--check-config`) |
 | `MQTTD_FAILURE_DOMAIN` | This node's own failure-domain label (ADR 0016 T5), e.g. `rack-a`. Advertised over the authenticated SWIM gossip so the topology **self-assembles** — the bounded voter set spreads across racks/zones (losing a whole domain can't take quorum) with each node setting only its own label. The preferred mechanism. Unset → this node is unlabelled unless a peer/static map supplies one. If the cluster-bus cert **attests** a label (ADR 0016 T6), the cert wins: this value must match it (or peers reject this node's gossip) and may be omitted |
@@ -1078,11 +1100,13 @@ them, both from the one registry (ADR 0020):
   Prometheus endpoint. Unset = Prometheus only.
 
 ```sh
-# Prometheus scrape
-MQTTD_HEALTH_BIND=0.0.0.0:8080 cargo run --bin mqttd   # then GET :8080/metrics
+# Prometheus scrape (the dev-only ephemeral opt-in, #240 — production sets MQTTD_DATA_DIR)
+MQTTD_HEALTH_BIND=0.0.0.0:8080 MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
+  cargo run --bin mqttd   # then GET :8080/metrics
 
 # also push to an OpenTelemetry Collector
 MQTTD_HEALTH_BIND=0.0.0.0:8080 MQTTD_OTLP_ENDPOINT=http://localhost:4318 \
+  MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
   cargo run --bin mqttd
 ```
 
