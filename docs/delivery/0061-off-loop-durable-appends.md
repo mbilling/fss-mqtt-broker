@@ -57,6 +57,33 @@ actually built, task by task, with evidence.
 
 ## Changelog
 
+- 2026-08-14 (CI round) — THE ESCAPE THAT ONLY CI CAUGHT, and the one worth remembering
+  from this slice: `cluster_stress::a_full_cluster_stop_start_recovers_every_acked_fact`
+  failed with `lease-store … Database already open. Cannot acquire lock.` while every
+  local run of the same suite passed. Root cause: a lane worker holds an `Arc` of the
+  session store, whose redb handle is an exclusive lock and which transitively owns the
+  cluster log and the lease store. The harness stops a node by aborting the tasks it
+  spawned — its stand-in for the OS reclaiming a crashed process's handles — but the lane
+  workers were spawned bare *inside* the hub, so the abort never reached them; at a
+  full-cluster stop their in-flight append cannot reach quorum, so it parks for the 5 s
+  replication bound holding the lock, and the restart arrives first. Before this ADR the
+  append was awaited inline on the loop, where the abort killed it for free: **moving work
+  off-loop silently converted an implicit teardown guarantee into one nobody owned.**
+  Fixed by ownership — a `JoinSet` (`owned_tasks`) plus `Hub::spawn_owned`, through which
+  EVERY store-capturing task now spawns, including three that predate this ADR
+  (clean-start discard, session recovery, inherited-session scan) and were latently
+  exposed. Confidence: the failing test went from 1-in-3 red to 6/6 green, and unmodified
+  main measured 4/4 green first, which is what established this as a regression rather
+  than a pre-existing flake. Pinned deterministically at the unit tier by
+  `a_crashed_hub_releases_the_store_so_the_node_can_restart`, mutation-proven against the
+  bare-spawn shape (mutation → `a lane worker outlived the crashed hub and still holds the
+  session store…`). Two claims were withdrawn in the same pass rather than left standing:
+  a graceful shutdown drain I wrote first was DELETED as unreachable code — the hub holds
+  a clone of its own command sender, so the loop's `None` arm cannot fire and every real
+  stop is an abort — and ADR 0061 §8's "a worker always runs an admitted job to a real
+  store outcome even when the hub is gone" was rewritten, because at a crash stop the
+  write is now abandoned (honest: the publisher's ack was withheld, so nothing was falsely
+  promised, and a crash is the event the durable plane already recovers from).
 - 2026-08-14 (pre-commit audit) — PROCESS SCAR, recorded because it nearly shipped: the
   pre-commit check found ONE mutation from T6's table still live in the tree — the
   `records_pending` conjunct was missing from `must_queue`, so

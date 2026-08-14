@@ -165,13 +165,51 @@ live in
 [OPERATIONS](../OPERATIONS.md#monitoring-for-the-operator-and-humans); sizing math in
 [SIZING](../SIZING.md#what-actually-writes-to-disk-on-the-publish-path).
 
-### 8. Shutdown posture
+### 8. Shutdown posture: the lanes die with the hub, because they hold the store's lock
 
-A lane worker always runs an **admitted** job to a real store outcome, even if the hub
-is already gone — the completion send no-ops and the publisher's pending entry dies
-withheld (fail closed, never a fabricated ack), and no admitted write is abandoned
-mid-job. `main`'s ordering (connections drain before the durable plane closes) is
-unchanged; a job racing plane shutdown fails like any store error → withheld.
+A worker holds an `Arc` of the session store, and a redb store is **exclusive-locked by
+its handle**. That makes worker lifetime a correctness property, not hygiene: a worker
+outliving its node keeps the data dir locked, and the next start fails with *"Database
+already open. Cannot acquire lock."*
+
+A node stops by having its hub task **aborted** (or by the process exiting). The loop's
+`None` arm cannot fire — the hub holds a clone of its own command sender — so there is no
+graceful-exit path to drain, and the abort must cascade. It does, by ownership: the hub
+holds its store-touching tasks in a `tokio::task::JoinSet` (`owned_tasks`), aborting the
+task drops `self`, and dropping a `JoinSet` aborts every task in it. Every handle is
+released at once, exactly as the OS reclaims a killed process's files. The sweep also
+polls `JoinSet::try_join_next` so finished slots do not accumulate.
+
+**Every** task that captures the session store goes through `Hub::spawn_owned`, not
+`tokio::spawn` — the lane workers, the packet-id reserve, the off-loop session removes,
+the clean-start discards, the session recoveries, and the inherited-session scan. Three
+of those predate this ADR and were spawned bare: they were latently exposed to the same
+lock leak, and it did not bite only because they usually finish fast. That reasoning is
+invalid at a full-cluster stop, where **every** store call blocks for the replication
+bound — so "it finishes quickly" is exactly the assumption to distrust. The store Arc
+reaches the lease store transitively (a replicated session store owns the cluster log,
+which owns the lease store), which is why the symptom named `lease-store` while the
+handle being leaked was the session store's.
+
+An in-flight append is therefore **abandoned** at a crash stop, and that is the honest
+trade rather than a loss: the publisher's ack was already **withheld** (fail closed, never
+fabricated), and a crash is precisely the event whose torn writes the durable plane
+recovers from (ADR 0044). The rejected alternative — letting the worker finish — means
+waiting out a quorum append that *cannot* reach quorum during a full-cluster stop, up to
+the 5 s replication bound, with the lock held the whole time.
+
+**This was a real escape, recorded because it shows the shape of the risk.** The first
+implementation spawned workers bare, so they survived the abort; every local run passed
+(the drop won the race) and CI's slower
+`cluster_stress::a_full_cluster_stop_start_recovers_every_acked_fact` failed on the held
+lock. Before this ADR the append was awaited *inline on the loop*, so an abort killed it
+for free — the off-loop motion is what turned an implicit guarantee into one that has to
+be stated and owned. It is now pinned deterministically at the unit tier
+(`a_crashed_hub_releases_the_store_so_the_node_can_restart`, mutation-proven against the
+bare-spawn shape) rather than left to a stop/start race.
+
+`main`'s ordering (connections drain before the durable plane closes) is unchanged; a job
+racing plane shutdown fails like any store error → withheld.
 
 ## What deliberately does NOT move (named residuals, with their dispatch class)
 

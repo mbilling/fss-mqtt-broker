@@ -1792,6 +1792,29 @@ pub struct Hub {
     /// group's degraded followers stall only its own sessions' appends — never every
     /// client on the node. Spawned on first submission; reaped by the sweep when idle.
     append_lanes: HashMap<ClientId, AppendLane>,
+    /// The lane workers themselves, owned by the hub so their lifetime is the hub's.
+    ///
+    /// This ownership is load-bearing, not tidiness. A worker holds an `Arc` of the
+    /// session store, and a redb store is exclusive-locked by its handle, so a worker
+    /// that outlives the node keeps the data dir locked and the next start fails with
+    /// "Database already open. Cannot acquire lock."
+    ///
+    /// A node always stops by having its hub task ABORTED (or by the process exiting):
+    /// the loop's `None` arm cannot fire, because the hub holds a clone of its own
+    /// command sender. Aborting drops `self`, and dropping a
+    /// [`JoinSet`](tokio::task::JoinSet) aborts every task in it — so every store
+    /// handle is released at once, exactly as the OS reclaims a killed process's files.
+    /// An in-flight append is abandoned, which is honest: its publisher's ack was
+    /// withheld, so nothing was falsely promised, and the alternative (finishing a
+    /// quorum append that cannot reach quorum, up to the 5s RPC bound) is what leaked
+    /// the lock past the stop and broke restarts.
+    ///
+    /// Before ADR 0061 the append was awaited INLINE on the loop, so an abort killed it
+    /// for free; moving it off-loop is what made this ownership explicit. Found by CI:
+    /// `cluster_stress::a_full_cluster_stop_start_recovers_every_acked_fact` restarts a
+    /// stopped cluster over the same data dirs and failed on the held lock, where every
+    /// local run had won the race.
+    owned_tasks: tokio::task::JoinSet<()>,
     /// Peer verdict aggregates for forwards whose fan-out submitted lane jobs
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
@@ -2105,6 +2128,7 @@ impl Hub {
                 self_tx: tx.clone(),
                 connecting: HashMap::new(),
                 append_lanes: HashMap::new(),
+                owned_tasks: tokio::task::JoinSet::new(),
                 remote_append_pending: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
@@ -2308,6 +2332,10 @@ impl Hub {
                     // the worker; a later submission re-spawns one. Only with zero
                     // outstanding jobs, so no completion is ever orphaned.
                     self.append_lanes.retain(|_, lane| lane.outstanding > 0);
+                    // Reap the reaped lanes' finished workers too: a JoinSet holds a
+                    // completed task's slot until polled, so without this the set grows
+                    // by one per lane ever spawned.
+                    while self.owned_tasks.try_join_next().is_some() {}
                     if let Some(m) = &self.metrics {
                         m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
                     }
@@ -3131,7 +3159,7 @@ impl Hub {
                         let LaneJob::Discard(pending) = job else {
                             unreachable!("the job sent just above is a Discard");
                         };
-                        tokio::spawn(discard_session(
+                        self.spawn_owned(discard_session(
                             self.store.clone(),
                             self.self_tx.clone(),
                             *pending,
@@ -3140,7 +3168,7 @@ impl Hub {
                     }
                 }
             }
-            tokio::spawn(discard_session(
+            self.spawn_owned(discard_session(
                 self.store.clone(),
                 self.self_tx.clone(),
                 pending,
@@ -3155,7 +3183,7 @@ impl Hub {
         self.note_session_ownership(&pending.client);
         self.connecting
             .insert(pending.client.clone(), pending.conn_id);
-        tokio::spawn(recover_session(
+        self.spawn_owned(recover_session(
             self.store.clone(),
             self.self_tx.clone(),
             pending,
@@ -3266,7 +3294,7 @@ impl Hub {
                 // the client cannot observe the refusal and reconnect into a
                 // half-removed session.
                 let store = self.store.clone();
-                tokio::spawn(async move {
+                self.spawn_owned(async move {
                     let _ = store.remove(&client).await;
                     let _ = reply.send(AttachOutcome::QuotaExceeded);
                 });
@@ -4265,20 +4293,43 @@ impl Hub {
 
     /// This session's append lane, spawning it (bounded channel + worker) on first use.
     fn lane_for(&mut self, client: &ClientId) -> &mut AppendLane {
-        self.append_lanes.entry(client.clone()).or_insert_with(|| {
+        if !self.append_lanes.contains_key(client) {
             // The channel holds LANE_CONTROL_HEADROOM slots beyond the delivery cap
             // (enforced on `outstanding` below) so a discard/spill control job is
             // admitted even at the cap — see LANE_CONTROL_HEADROOM.
             let (tx, rx) = mpsc::channel(LANE_QUEUE_CAP + LANE_CONTROL_HEADROOM);
-            tokio::spawn(append_lane_worker(
+            // Spawned INTO the hub's own JoinSet, never bare: the worker holds the
+            // store's exclusive handle, so its lifetime must not outlive the hub's
+            // (see `owned_tasks`).
+            self.owned_tasks.spawn(append_lane_worker(
                 self.store.clone(),
                 self.self_tx.clone(),
                 rx,
                 self.metrics.clone(),
                 self.durable_plane.is_some(),
             ));
-            AppendLane { tx, outstanding: 0 }
-        })
+            self.append_lanes
+                .insert(client.clone(), AppendLane { tx, outstanding: 0 });
+        }
+        self.append_lanes
+            .get_mut(client)
+            .expect("just inserted above")
+    }
+
+    /// Spawn a task that holds an `Arc` of the session store, OWNED by the hub.
+    ///
+    /// Never `tokio::spawn` such a task bare. The store's redb handle is an exclusive
+    /// lock, so a task holding it past the node's stop keeps the data dir locked and the
+    /// next start fails with "Database already open. Cannot acquire lock." — and at a
+    /// full-cluster stop every store call blocks for the replication bound, so "it
+    /// finishes quickly" is exactly the assumption that does not hold. Spawning into
+    /// `owned_tasks` makes the abort that stops the node cascade here too (see
+    /// [`Hub::owned_tasks`]).
+    fn spawn_owned<F>(&mut self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.owned_tasks.spawn(fut);
     }
 
     /// Admit one job into its session's lane (spawning the lane on first use), record
@@ -4635,7 +4686,7 @@ impl Hub {
         let store = self.store.clone();
         let self_tx = self.self_tx.clone();
         let client = client.clone();
-        tokio::spawn(async move {
+        self.spawn_owned(async move {
             let result = store.reserve_packet_ids(&client, PKID_BLOCK).await;
             let _ = self_tx.send(HubCommand::PkidBlockReserved { client, result });
         });
@@ -5779,7 +5830,7 @@ impl Hub {
         }
         let store = self.store.clone();
         let client = client.clone();
-        tokio::spawn(async move {
+        self.spawn_owned(async move {
             let _ = store.remove(&client).await;
         });
     }
@@ -5918,7 +5969,7 @@ impl Hub {
         let store = self.store.clone();
         let tx = self.self_tx.clone();
         debug!("inherited-session scan started");
-        tokio::spawn(async move {
+        self.spawn_owned(async move {
             let scan = match store.all_sessions().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -15948,56 +15999,73 @@ mod tests {
         }
     }
 
-    /// The shutdown-drain posture (issue #242 / ADR 0061): a lane worker owns the
-    /// store and always runs an ADMITTED job to a real store outcome, even when the
-    /// hub task is already gone — the completion send no-ops and the publisher's
-    /// pending entry dies withheld (fail closed), never falsely acked, and no
-    /// admitted write is silently abandoned mid-job.
+    /// A CRASH STOP RELEASES THE STORE (issue #242 / ADR 0061 §8). A node stops by
+    /// having its hub task aborted — the loop's `None` arm cannot fire, since the hub
+    /// holds a clone of its own command sender — and a lane worker holds an `Arc` of
+    /// the session store whose redb handle is an exclusive lock. So the abort MUST
+    /// cascade to the lanes: the hub owns them in a `JoinSet`, and dropping `self`
+    /// aborts them, releasing every handle at once, as the OS would for a killed
+    /// process.
+    ///
+    /// This is the regression CI caught and no local run did
+    /// (`cluster_stress::a_full_cluster_stop_start_recovers_every_acked_fact`, which
+    /// restarts a stopped cluster over the same data dirs): at a full-cluster stop an
+    /// in-flight append cannot reach quorum, so it parks for the 5s replication bound
+    /// holding the handle, and the restart arrives first with
+    /// "Database already open. Cannot acquire lock." Before the off-loop motion the
+    /// append was awaited on the loop, so the abort killed it for free.
+    ///
+    /// Abandoning that write is the honest trade, not a loss: the publisher's ack was
+    /// WITHHELD (asserted below), so nothing was falsely promised, and a crash is
+    /// exactly the event whose torn writes the durable plane already recovers from
+    /// (ADR 0044). Pinned at the unit tier because the stop/start tier makes it a race.
     #[tokio::test]
-    async fn a_dead_hub_mid_append_still_runs_the_admitted_job_to_a_store_outcome() {
+    async fn a_crashed_hub_releases_the_store_so_the_node_can_restart() {
         let store = ParkingStore::new();
-        let release = store.park("s");
-        let (hub, tx) = Hub::with_config(
-            NodeId("hub-test".into()),
-            store.clone() as std::sync::Arc<dyn mqtt_storage::SessionStore>,
-        );
+        let _release = store.park("s");
+        let arc = store.clone() as std::sync::Arc<dyn mqtt_storage::SessionStore>;
+        let before = std::sync::Arc::strong_count(&arc);
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), arc.clone());
         let hub_task = tokio::spawn(hub.run());
 
         let (_rx, _) = attach(&tx, "s", 1, false).await;
         subscribe_qos(&tx, "s", "shut/t", QoS::AtLeastOnce);
         detach(&tx, "s", 1);
 
-        let done = publish_gated(&tx, "shut/t", b"draining", QoS::AtLeastOnce, true);
-        // Barrier: the publish is dispatched (the job ADMITTED) before the hub dies.
+        let done = publish_gated(&tx, "shut/t", b"parked", QoS::AtLeastOnce, true);
+        // Barrier: the job is ADMITTED and parked in the lane before the crash, so a
+        // worker is genuinely holding the store when the abort lands.
         let (ping_tx, ping_rx) = oneshot::channel();
         tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
         timeout(Duration::from_secs(1), ping_rx)
             .await
             .unwrap()
             .unwrap();
+        assert!(
+            std::sync::Arc::strong_count(&arc) > before,
+            "the lane worker must be holding the store for this test to mean anything"
+        );
 
-        // The hub dies with the append admitted and parked.
+        // The crash: abort the hub task, exactly as the node teardown does.
         hub_task.abort();
         let _ = hub_task.await;
-        release.send(true).unwrap();
 
-        // The worker still completes the admitted write...
+        // The store handle must come back WITHOUT waiting out the parked append (the
+        // park is never released here — that is the point).
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if store
-                .ops()
-                .iter()
-                .any(|(op, d)| op == "enqueue" && d == "s draining")
-            {
+            if std::sync::Arc::strong_count(&arc) == before {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "an admitted lane job must run to a real store outcome"
+                "a lane worker outlived the crashed hub and still holds the session \
+                 store: redb stays locked and the next start over this data dir fails \
+                 with \"Database already open\" (issue #242)"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // ...and the publisher is WITHHELD, never falsely acked.
+        // And the publisher was WITHHELD, never falsely acked.
         assert!(
             timeout(Duration::from_secs(1), done)
                 .await
