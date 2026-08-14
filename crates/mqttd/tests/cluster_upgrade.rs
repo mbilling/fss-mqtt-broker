@@ -35,13 +35,18 @@ use proc_common::{
     build_topology, establish_subscribers, oracle_acked_facts, proc_over, wait_all_ready,
 };
 
-/// The pinned baseline: the issue #92 generation merge — the oldest ref a HEAD
-/// build can interoperate with. #92 appended `generation` to every membership
-/// `Update` and `from_generation` to the SWIM datagram (a disclosed pre-1.0 wire
-/// reshape under ADR 0039, like ADR 0054-T2's `cluster_id` and ADR 0052's before
-/// it), so pre-#92 builds cannot decode HEAD gossip. Bump DELIBERATELY, together
-/// with any pre-1.0 wire/schema reshape — and bump this comment's story with it.
-const BASELINE_REF: &str = "e39b6e139578c9605d39cea9f406b3b7e182a53c";
+/// The pinned baseline: the issue #227 retained-expiry merge (#232) — the oldest
+/// ref a HEAD build can interoperate with. #232 reshaped `retained.redb` v1 → v2
+/// (per-value expiry, no pre-1.0 migration path), so a HEAD binary refuses to
+/// reopen any pre-#232 data dir at the ADR 0038 schema gate and the roll fails at
+/// the first swapped node. NOTE the process scar: #232 landed WITHOUT this bump
+/// (2026-08-13) and the breakage surfaced only when this oracle next ran
+/// (2026-08-14, issue #238's proto-7 verification) — a schema reshape's PR must
+/// carry the bump itself. Previous baseline: the issue #92 generation merge
+/// (`e39b6e13…`, SWIM `generation`/`from_generation` reshape). Bump DELIBERATELY,
+/// together with any pre-1.0 wire/schema reshape — and bump this comment's story
+/// with it.
+const BASELINE_REF: &str = "c6b84f23cbda235514c3d237b85f17f955a37714";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
