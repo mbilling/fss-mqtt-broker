@@ -22,13 +22,14 @@
 # two are the same broker with the same environment; pick whichever your fleet runs.
 #
 # WHAT IS ACTUALLY TESTED, and what is not:
-#   - `scripts/compose-smoke.sh` brings THIS file up in real containers — but always with
-#     MQTTD_IMAGE pointing at an image built from this repository's working tree. The
-#     `${MQTTD_IMAGE:-ghcr.io/...:latest}` DEFAULT below is therefore NOT exercised by any
-#     gate, and the currently published `:latest` (v0.9.0) predates both `--probe` and
-#     `--hash-password`, so `./bootstrap.sh` and the healthcheck below do not work against
-#     it. Tracked in issue #263; see deploy/compose/README.md, "If your containers never
-#     go healthy".
+#   - `scripts/compose-smoke.sh` brings THIS file up in real containers, in two nightly
+#     lanes: once with MQTTD_IMAGE pointing at an image built from this repository's
+#     working tree, and once (MQTTD_SMOKE_DEFAULT_IMAGE=1) with NO override, so the pinned
+#     DEFAULT tag below is exercised exactly as a reader resolves it — the lane that was
+#     missing when issue #263 shipped a default image lacking `--probe`/`--hash-password`.
+#     Until the pinned tag is published the default-image lane skips LOUDLY, and the
+#     per-PR gate `scripts/check-deploy-image-pin.sh` proves the pin is forward-looking
+#     and that every mqttd flag these artifacts use exists at that tag.
 #   - Every PR runs `scripts/deploy-smoke.sh`: three real nodes with TLS + peer mTLS built
 #     from the values in these shipped files, the PKI minted by the shipped init.sh, and
 #     `docker compose config` assertions on this file — including that each broker mounts
@@ -38,7 +39,13 @@ name: mqttd
 
 # ─── Every broker shares this, and differs only in identity/seeds ──────────────────
 x-broker: &broker
-  image: ${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}
+  # PINNED, deliberately — never `:latest` (issue #263: a floating tag is exactly how the
+  # artifacts and the image drifted apart). This is the oldest release whose binary has
+  # every flag this file and bootstrap.sh use (`--probe`, `--hash-password`); the per-PR
+  # gate scripts/check-deploy-image-pin.sh enforces both properties, and the nightly
+  # default-image lane runs this file against the tag as published. When you change the
+  # pin here, change bootstrap.sh's to match (the gate holds them together).
+  image: ${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:v0.9.1}
   restart: unless-stopped
   # The image is distroless and already runs as uid 65532; this is belt-and-braces
   # for hosts whose daemon is configured otherwise.
@@ -62,10 +69,10 @@ x-broker: &broker
     # anything but 200, so a wedged or minority broker actually reports unhealthy.
     # (The image is distroless — no shell, no curl — so the binary does it.)
     #
-    # NEEDS A BROKER NEWER THAN v0.9.0. In v0.9.0 — which is what the published `:latest`
-    # tag still points at — `--probe` boots a second broker instead of making one HTTP
-    # request, so with the default image below every container stays `unhealthy` forever.
-    # Issue #263 tracks the tag; deploy/compose/README.md says what to do meanwhile.
+    # `--probe` needs a broker newer than v0.9.0 (in v0.9.0 an unknown flag boots a
+    # second broker instead of probing — issue #263). The pinned default image above is
+    # the guarantee: scripts/check-deploy-image-pin.sh fails any PR that points the
+    # default at a tag whose binary lacks this flag.
     #
     # /readyz, not /livez, on purpose: readiness is majority-aware, so a node that
     # cannot see a quorum drops out of rotation rather than serving clients from a

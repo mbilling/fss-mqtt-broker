@@ -27,8 +27,11 @@ PW_FILE="$SECRETS/mqttd-passwd"
 PLAIN_FILE="$SECRETS/PASSWORDS.txt"
 
 # The broker binary does the hashing (`--hash-password`). Prefer a local build; fall back
-# to the published image so this works on a host with no Rust toolchain.
-IMAGE="${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}"
+# to the published image so this works on a host with no Rust toolchain. The fallback tag
+# is PINNED to the same release as compose.yaml's default — `--hash-password` postdates
+# v0.9.0, and against that image this fallback wrote a corrupt password file (issue #263);
+# scripts/check-deploy-image-pin.sh keeps the two pins identical and the flag present.
+IMAGE="${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:v0.9.1}"
 if [[ -n "${MQTTD_BIN:-}" ]]; then
   hash_password() { printf %s "$2" | "$MQTTD_BIN" --hash-password "$1"; }
   echo "hashing with $MQTTD_BIN"

@@ -528,3 +528,21 @@ about = "Inner half of k8s-render-parity; run that instead."
 requires = ["helm", "cargo"]
 duration = "~20s"
 hidden = true
+
+[[task]]
+id = "check-deploy-image-pin"
+group = "Internal"
+name = "Check the compose default-image pin against its tag"
+script = "scripts/check-deploy-image-pin.sh"
+# Per-PR CI gate (issue #263); nothing to run by hand outside a PR.
+needs_checkout = true
+about = """
+Asserts deploy/compose's default image reference is one exact release tag shared by
+compose.yaml and bootstrap.sh, that every mqttd flag those artifacts use is on the
+checked list, and that the pinned tag's binary parses each flag (or, for a not-yet-
+released pin, that it is strictly newer than every released tag and satisfiable by
+HEAD). CI runs it on every PR; running it locally needs only git.
+"""
+requires = ["git"]
+duration = "~1s"
+hidden = true

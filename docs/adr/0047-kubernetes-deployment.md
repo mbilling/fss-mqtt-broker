@@ -278,15 +278,20 @@ compose file up in containers — which is also what makes `compose.yaml`'s long
 "tested by `scripts/compose-smoke.sh`" comment true, rather than a comment naming a script
 that did not exist.
 
-The bound on that second lane is the **image**, and it is stated in the file rather than left
-to be discovered: `compose-smoke.sh` exports `MQTTD_IMAGE` before `./bootstrap.sh` and every
-compose call, so the `${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}` default is
-never exercised — and cannot be until the tag moves, because the published `:latest` is still
-v0.9.0, which predates both `mqttd --hash-password` (bootstrap.sh) and the `--probe` early
-exit (the healthcheck). Issue #263 tracks it; `compose.yaml`, `deploy/README.md`,
-`deploy/compose/README.md` and the script's own output all say plainly what is and is not
-covered, so an adopter who hits three permanently `unhealthy` containers finds the cause
-rather than a claim it works.
+The bound that second lane USED to carry was the **image**: `compose-smoke.sh` exported
+`MQTTD_IMAGE` before every call, so the compose file's default — then a floating
+`ghcr.io/...:latest`, which had drifted to a v0.9.0 that predates both `mqttd
+--hash-password` (bootstrap.sh) and the `--probe` early exit (the healthcheck) — was the
+one input no lane exercised, and the reference deployment could not work as pulled.
+Since issue #263 the default is **pinned** to an exact release tag and the bound is
+closed from both sides: `scripts/check-deploy-image-pin.sh` fails any PR whose compose
+artifacts use an mqttd flag the pinned tag's binary does not parse (or whose pin floats,
+or whose two defaults — compose.yaml and bootstrap.sh — disagree), and a second nightly
+`compose-smoke.sh` run (`MQTTD_SMOKE_DEFAULT_IMAGE=1`) brings the file up with **no
+override**, resolving the pinned default exactly as a reader does. While a forward pin
+awaits its release the default-image lane skips loudly — never silently green — and the
+per-PR gate proves the pin is strictly newer than every released tag and satisfiable by
+releasing HEAD.
 
 Two custody properties of the compose reference are structural, and checked as such. Each
 broker mounts **only its own** `mqttd-tls-N` volume, and the CA private key lives in

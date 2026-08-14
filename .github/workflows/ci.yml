@@ -105,6 +105,16 @@ jobs:
       - name: Deployment smoke (compose + systemd reference deployment)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/deploy-smoke.sh
 
+      # Issue #263: the compose artifacts default to a PINNED image tag, and every mqttd
+      # flag they hand that image must exist in the binary at that tag — the skew that
+      # shipped a healthcheck no published image could pass. Tags are fetched explicitly
+      # because checkout@v5 clones tagless, and without them the released-tag branch of
+      # the gate would silently never engage.
+      - name: Deploy artifacts match their pinned image tag
+        run: |
+          git fetch --tags --force --quiet
+          ./scripts/check-deploy-image-pin.sh
+
   mqttui:
     name: mqttui (separate workspace)
     runs-on: ubuntu-latest

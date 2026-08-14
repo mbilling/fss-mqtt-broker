@@ -27,15 +27,17 @@
 #      broker logs "INSECURE: starting PLAINTEXT MQTT listener" — checked PER BROKER, so
 #      one noisy container cannot satisfy it for the other two.
 #
-# ── WHAT THIS DOES NOT COVER ──────────────────────────────────────────────────────────
-# The IMAGE. Every command below runs with MQTTD_IMAGE exported, pointing at an image built
-# from this working tree (or at whatever prebuilt tag you passed in), so compose.yaml's
-# `${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}` DEFAULT is never exercised here.
-# That is deliberate rather than incidental: the published `:latest` is still v0.9.0, which
-# predates both `mqttd --hash-password` (bootstrap.sh) and the `--probe` early exit (the
-# healthcheck), so the default-image path cannot pass today and this lane would report a
-# stale tag as a defect in these files. Issue #263 tracks the tag; nothing below should be
-# read as a statement about the published image.
+# ── TWO MODES, both nightly ───────────────────────────────────────────────────────────
+# Default mode exports MQTTD_IMAGE (an image built from this working tree, or whatever
+# prebuilt tag you passed in) before every compose invocation — it proves the ARTIFACTS
+# against today's code. With MQTTD_SMOKE_DEFAULT_IMAGE=1 nothing is exported and nothing
+# is built: compose.yaml's pinned default tag resolves exactly as it does for a reader,
+# `./bootstrap.sh` falls back to that same published tag, and the run proves the artifacts
+# against THE IMAGE USERS ACTUALLY PULL — the lane whose absence let issue #263 ship a
+# default image lacking `--probe` and `--hash-password`. If the pinned tag is not
+# published yet (a forward pin awaiting its release; scripts/check-deploy-image-pin.sh
+# verifies that shape on every PR), the default-image mode SKIPS LOUDLY rather than
+# reporting the pending release as a defect in these files.
 #
 # Assertion (2) carries a second one implicitly and it is the load-bearing one on native
 # Linux: a container only reaches healthy if uid 65532 could read /run/secrets/mqttd-passwd
@@ -90,6 +92,31 @@ trap cleanup EXIT
 cleanup
 
 # ── the image under test ────────────────────────────────────────────────────────────
+if [[ "${MQTTD_SMOKE_DEFAULT_IMAGE:-0}" == 1 ]]; then
+  # The reader's path: no override, no build. compose.yaml and bootstrap.sh resolve
+  # their own pinned default; this block only decides whether that tag is pullable yet.
+  [[ -z "${MQTTD_IMAGE:-}" ]] \
+    || { echo "FATAL: MQTTD_SMOKE_DEFAULT_IMAGE=1 with MQTTD_IMAGE set — pick one"; exit 2; }
+  DEFAULT_REF="$(grep -oE 'MQTTD_IMAGE:-[^}]+' "$COMPOSE_DIR/compose.yaml" | head -1 | cut -d- -f2-)"
+  [[ -n "$DEFAULT_REF" ]] || { echo "FATAL: no MQTTD_IMAGE default in compose.yaml"; exit 2; }
+  if ! docker manifest inspect "$DEFAULT_REF" >/dev/null 2>&1; then
+    echo "SKIP — the pinned default image $DEFAULT_REF is not published yet; the"
+    echo "       default-image lane engages on the first nightly after that release tag"
+    echo "       is pushed (the per-PR pin gate proves the pin is forward-looking)."
+    exit 0
+  fi
+  echo "image under test: $DEFAULT_REF — compose.yaml's OWN default, no override (issue #263)"
+  # The exact invocation bootstrap.sh's no-toolchain fallback uses. Asserted directly,
+  # because a binary without the flag does not fail — it BOOTS A BROKER, and the garbage
+  # lands in the password file (the corrupt-passwd half of issue #263). A booted broker
+  # never exits, so the call is bounded where `timeout` exists (Linux CI always has it).
+  TIMEOUT=(); command -v timeout >/dev/null 2>&1 && TIMEOUT=(timeout 60)
+  # (The guarded expansion keeps macOS's bash 3.2 happy under set -u when TIMEOUT is empty.)
+  probe_hash="$(printf %s smoke | ${TIMEOUT[@]+"${TIMEOUT[@]}"} docker run --rm -i "$DEFAULT_REF" --hash-password probe-user 2>/dev/null || true)"
+  grep -qE '^probe-user:\$argon2id\$' <<<"$probe_hash" \
+    || fail "the published $DEFAULT_REF does not hash passwords ('--hash-password' output: ${probe_hash:0:60}…)"
+  pass "the published image's --hash-password emits one valid argon2id line"
+else
 # Built exactly as scripts/image-smoke.sh builds it (musl release binary staged into
 # dist/, then `docker build`), which is also how the release pipeline stages it. Keep the
 # two recipes together: if one changes, change both.
@@ -121,10 +148,11 @@ else
 fi
 # Exported for `./bootstrap.sh` as well as for compose: when it has no local build to hash
 # with it falls back to `docker run $MQTTD_IMAGE --hash-password`, and that must be this
-# image rather than the published default. It is also what makes compose.yaml's default tag
-# untested here — see "WHAT THIS DOES NOT COVER" in the header.
+# image rather than the published default. The default tag is exercised by the OTHER mode
+# (MQTTD_SMOKE_DEFAULT_IMAGE=1) — see "TWO MODES" in the header.
 export MQTTD_IMAGE="$IMAGE"
-echo "image under test: $IMAGE (compose.yaml's default tag is NOT exercised — issue #263)"
+echo "image under test: $IMAGE (override mode; the pinned default tag is the other lane's job)"
+fi
 
 # Is something already on host 1883? If so the "nothing on 1883" and plaintext-overlay
 # assertions cannot distinguish our stack from theirs, so they are skipped loudly rather
@@ -167,7 +195,13 @@ BACKEND_PW="$(awk -F'\t' '$1=="backend"{print $2}' "$SECRETS/PASSWORDS.txt")"
 DEVICE_A_PW="$(awk -F'\t' '$1=="device-a"{print $2}' "$SECRETS/PASSWORDS.txt")"
 [[ -n "$BACKEND_PW" && -n "$DEVICE_A_PW" ]] \
   || fail "could not read the generated passwords out of $SECRETS/PASSWORDS.txt"
-pass "./bootstrap.sh minted the gossip key and an Argon2id password file"
+# Every line must be one `user:$argon2id$…` record. Issue #263's corrupt-passwd failure
+# looked exactly like success from here — the file existed and was non-empty, but held a
+# broker's boot log — so the SHAPE is asserted, not just the presence.
+if grep -qvE '^[A-Za-z0-9_-]+:\$argon2id\$' "$SECRETS/mqttd-passwd"; then
+  fail "$SECRETS/mqttd-passwd holds something that is not a user:argon2id line: $(grep -vE '^[A-Za-z0-9_-]+:\$argon2id\$' "$SECRETS/mqttd-passwd" | head -1)"
+fi
+pass "./bootstrap.sh minted the gossip key and a well-formed Argon2id password file"
 
 compose up -d >/dev/null 2>&1 || { compose logs; fail "docker compose up -d failed"; }
 
