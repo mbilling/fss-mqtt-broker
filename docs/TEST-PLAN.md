@@ -243,7 +243,10 @@ statements; this register covers the choices, not the requirements.)
 
 | Choice | Our behaviour | Pinned by |
 |---|---|---|
-| Codec error after CONNACK | Close **without** a `DISCONNECT` first. Permitted — [MQTT-4.13.2] makes the close the MUST and the DISCONNECT a SHOULD — but note it disagrees with the higher-level protocol-error path, which *does* announce (`conn.rs`, DISCONNECT `0xA1`, issue #245) | `wire::malformed_input_closes_without_a_disconnect` |
+| Decode failure **after** CONNACK | Announced: `DISCONNECT(reason)` then close, satisfying both halves of [MQTT-4.13.2]. `0x81` when the bytes are not parseable as MQTT, `0x82` when they parse and say something illegal, `0x95` when over the advertised size (`conn.rs::codec_reason`) | `wire::malformed_input_after_connack_is_announced_then_closed`, `wire::malformed_and_protocol_errors_are_told_apart` |
+| Decode failure **before** CONNACK | Silence. [MQTT-3.14.0-1] forbids a server DISCONNECT before a success CONNACK, so the uniform "always announce" refactor is a spec violation | `wire::malformed_input_before_connack_is_met_with_silence` |
+| Property carried on a packet type that disallows it | Refused as `0x82` Protocol Error. §2.2.2.2 is arguably read as Malformed (`0x81`); the codec classifies it `ProtocolViolation` and we answer accordingly rather than re-classify on a contested reading. The *refusal* is not in doubt — only the code | `wire::a_property_from_another_packet_type_is_refused` |
+| Decode failure on a **QUIC** stream | Not announced — the QUIC mux (`mqtt-net/src/quic.rs`) ends its own read loop on a framing error, so it never reaches the announcing path. Known asymmetry, not yet closed | — |
 | Invalid topic filter | Refused **per filter** (SUBACK `0x8F`), not by closing the connection: the other filters in the same SUBSCRIBE are independently valid | `wire::a_hash_sharing_its_level_is_an_invalid_filter` |
 | `$SYS` topic tree | **Not implemented.** `$SYS` appears only as something the bridge refuses to bridge (`mqtt-bridge/src/config.rs`) | — |
 | Denied publish | Still ACKed, then dropped (no information leak about ACL shape) | `acl`, `audit` |

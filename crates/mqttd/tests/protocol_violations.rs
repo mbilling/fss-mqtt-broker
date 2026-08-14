@@ -171,16 +171,14 @@ async fn v5_subscribe_with_subscription_identifier_disconnects_0xa1() {
 
 /// A v5 SUBSCRIBE carrying `SubscriptionIdentifier(0)` is rejected at the CODEC boundary
 /// (§3.8.2.1.2: "It is a Protocol Error if the Subscription Identifier has a value of 0"),
-/// i.e. before the 0xA1 guard ever sees the packet — so the connection closes with no
-/// packet at all.
+/// i.e. before the 0xA1 guard ever sees the packet.
 ///
-/// Residual, recorded honestly: closing satisfies `[MQTT-4.13.1-1]`'s MUST, but the
-/// SHOULD-level "send a DISCONNECT with the reason first" is not met — no codec-level
-/// protocol error in this repo sends one (the same is true of a duplicated 0x0B, already
-/// rejected by `repeatable()`, and of `retain_handling == 3`). Changing that is a global
-/// frame-error-path decision, out of scope here.
+/// The residual this test used to record — that the codec path closed WITHOUT the
+/// SHOULD-level DISCONNECT of `[MQTT-4.13.2]` — is now closed: decode failures after
+/// CONNACK are announced with a reason code (`conn.rs::codec_reason`). A Protocol Error
+/// answers `0x82`, distinct from `0x81` for input that is not parseable as MQTT at all.
 #[tokio::test]
-async fn v5_subscribe_with_subscription_identifier_zero_closes_connection() {
+async fn v5_subscribe_with_subscription_identifier_zero_disconnects_with_protocol_error() {
     let addr = start_broker().await;
     let mut c = Client::connect_v5_ok(addr, "subid-zero").await;
     c.send(&Packet::Subscribe(Subscribe {
@@ -193,6 +191,7 @@ async fn v5_subscribe_with_subscription_identifier_zero_closes_connection() {
         }],
     }))
     .await;
+    c.expect_disconnect(0x82).await;
     c.expect_closed().await;
 }
 

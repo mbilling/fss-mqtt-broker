@@ -9,13 +9,13 @@
 //!
 //! Three outcomes are distinguished throughout, and they are NOT interchangeable:
 //!
-//! - **silent close** — the only correct answer to a Malformed Packet detected
-//!   before a session exists: the server cannot send a CONNACK in response to a
-//!   packet it could not parse [MQTT-3.1.4-1].
-//! - **refused** — the packet was rejected once a session exists. [MQTT-4.13.2]
-//!   makes *closing* the MUST and the explanatory `DISCONNECT` a SHOULD, so both
-//!   shapes are conformant; `expect_refused` accepts either. What it does not
-//!   accept is the packet being taken.
+//! - **silent close** — the only correct answer to garbage arriving *before* a
+//!   success CONNACK. The server may not send a DISCONNECT there
+//!   [MQTT-3.14.0-1], and it cannot answer with a CONNACK a packet it could not
+//!   parse, so silence is all that is left.
+//! - **refused** — rejected *after* CONNACK, where the server both closes (the MUST)
+//!   and says why (the SHOULD) [MQTT-4.13.2]. `expect_refused` asserts the reason
+//!   code; `expect_disconnect_bytes` additionally requires the packet.
 //! - **accepted** — the connection stays open and usable.
 //!
 //! Asserting merely that "an error happened" would pass against a server that hung
@@ -505,10 +505,17 @@ async fn an_unknown_property_identifier_is_malformed() {
     c.expect_refused(MALFORMED_PACKET).await;
 }
 
-/// WIRE-043: a property that is valid on a DIFFERENT packet type is malformed here
-/// — Will Delay Interval (`0x18`) belongs to a Will's properties, not a PUBLISH.
+/// WIRE-043: a property valid on a DIFFERENT packet type is refused — Will Delay
+/// Interval (`0x18`) belongs to a Will's properties, not a PUBLISH.
+///
+/// We answer `0x82` Protocol Error. §2.2.2.2 can be read as making an
+/// out-of-context property a *Malformed Packet* (`0x81`) instead, and the codec
+/// classifies it as `ProtocolViolation`, which our mapping sends as `0x82`. The
+/// refusal is what matters and is not in doubt; the code is the arguable half, so
+/// it is asserted here and recorded in the policy register rather than left to be
+/// discovered by whoever next reads the spec.
 #[tokio::test]
-async fn a_property_from_another_packet_type_is_malformed() {
+async fn a_property_from_another_packet_type_is_refused() {
     let addr = start_broker().await;
     let mut c = connected(addr, "wire-wrong-prop").await;
 
@@ -518,7 +525,7 @@ async fn a_property_from_another_packet_type_is_malformed() {
     body.extend_from_slice(&vbi(u32::try_from(props.len()).unwrap()));
     body.extend_from_slice(&props);
     c.send_bytes(&frame(0x30, &body)).await;
-    c.expect_refused(MALFORMED_PACKET).await;
+    c.expect_refused(PROTOCOL_ERROR).await;
 }
 
 /// WIRE-040: a property identifier repeated in one packet is a Protocol Error,
@@ -660,34 +667,64 @@ async fn a_zero_length_publish_topic_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Policy pin
+// The CONNACK boundary — where the server may explain itself, and where it may not
 // ---------------------------------------------------------------------------
 
-/// POLICY: on a codec-level error after CONNACK this broker closes the connection
-/// **without** sending a DISCONNECT first.
+/// After CONNACK, a decode failure is ANNOUNCED with `DISCONNECT(0x81)` before the
+/// close, so a client debugging its encoder learns why [MQTT-4.13.2].
 ///
-/// [MQTT-4.13.2] permits this — closing is the MUST, the explanatory DISCONNECT is
-/// a SHOULD — but the broker does send one for higher-level protocol errors it
-/// detects itself (see `conn.rs`, DISCONNECT 0xA1 for an unsupported Subscription
-/// Identifier, issue #245). So the two paths disagree, and this test states which
-/// is which rather than leaving it to be rediscovered.
-///
-/// If DISCONNECT-before-close is ever implemented for the codec path, THIS TEST
-/// SHOULD FAIL — that is its job. Update it deliberately; do not relax it.
+/// This is the pair to the test below: the same class of garbage gets a different
+/// (and individually mandatory) answer on each side of the CONNACK boundary, so the
+/// two are stated together.
 #[tokio::test]
-async fn malformed_input_closes_without_a_disconnect() {
+async fn malformed_input_after_connack_is_announced_then_closed() {
     let addr = start_broker().await;
-    let mut c = connected(addr, "wire-policy").await;
+    let mut c = connected(addr, "wire-announce").await;
 
     // An unambiguously malformed frame: PINGREQ with a body.
     c.send_bytes(&[0xC0, 0x01, 0xFF]).await;
-    match c.read_outcome(Duration::from_secs(5)).await {
-        RawOutcome::ClosedSilently => {}
-        RawOutcome::Bytes(b) if b[0] == 0xE0 => panic!(
-            "the broker now announces codec errors with DISCONNECT({:#04x}) — good, \
-             but this policy pin and the suite's expect_refused note must be updated",
-            b[2]
-        ),
-        other => panic!("expected a silent close, got {other:?}"),
-    }
+    c.expect_disconnect_bytes(MALFORMED_PACKET).await;
+}
+
+/// BEFORE a success CONNACK, the same garbage must be met with **silence**.
+///
+/// [MQTT-3.14.0-1]: the server must not send a DISCONNECT until it has sent a
+/// success CONNACK. A client that has not been accepted has no session to be told
+/// about, and answering would leak that the listener is a live MQTT broker to
+/// anything that connects and writes a byte.
+///
+/// This is the constraint that stops "announce decode errors" from being applied
+/// uniformly — the obvious refactor is a spec violation, so it is pinned.
+#[tokio::test]
+async fn malformed_input_before_connack_is_met_with_silence() {
+    let addr = start_broker().await;
+    let mut c = RawClient::open(addr).await;
+
+    // Same malformed PINGREQ, but no CONNECT has been sent.
+    c.send_bytes(&[0xC0, 0x01, 0xFF]).await;
+    c.expect_closed_silently().await;
+}
+
+/// A decode failure and a protocol violation get DIFFERENT reason codes: `0x81`
+/// means "these bytes are not MQTT", `0x82` means "they are MQTT and they are
+/// illegal". Collapsing the two would tell a client nothing it can act on.
+#[tokio::test]
+async fn malformed_and_protocol_errors_are_told_apart() {
+    let addr = start_broker().await;
+
+    // Not parseable as MQTT: a PINGREQ carrying a body.
+    let mut c = connected(addr, "wire-split-malformed").await;
+    c.send_bytes(&[0xC0, 0x01, 0xFF]).await;
+    c.expect_disconnect_bytes(MALFORMED_PACKET).await;
+
+    // Parseable, but says something the spec forbids: Subscription Identifier 0.
+    let mut c = connected(addr, "wire-split-protocol").await;
+    let mut body = 1u16.to_be_bytes().to_vec();
+    let props = vec![0x0B, 0x00];
+    body.extend_from_slice(&vbi(u32::try_from(props.len()).unwrap()));
+    body.extend_from_slice(&props);
+    body.extend_from_slice(&mqtt_str("wire/t"));
+    body.push(0x00);
+    c.send_bytes(&frame(0x82, &body)).await;
+    c.expect_disconnect_bytes(PROTOCOL_ERROR).await;
 }

@@ -891,14 +891,16 @@ impl RawClient {
         }
     }
 
-    /// Assert the server REFUSED the packet — either by closing silently, or by
-    /// sending `DISCONNECT(reason)` first.
+    /// Assert the server REFUSED the packet, and that `reason` is what it gave.
     ///
-    /// Both are conformant: [MQTT-4.13.2] makes closing the MUST and the
-    /// explanatory DISCONNECT a SHOULD. This broker currently takes the silent
-    /// path for codec-level errors (see `malformed_input_closes_without_a_disconnect`
-    /// in `tests/wire.rs`, which pins that policy). What must NOT happen — and what
-    /// this asserts against — is the packet being *accepted*.
+    /// After CONNACK this broker announces decode failures with `DISCONNECT(reason)`
+    /// before closing ([MQTT-4.13.2]: closing is the MUST, saying why the SHOULD), so
+    /// the reason assertion is live. The bare-close arm remains accepted because
+    /// **before** a success CONNACK a DISCONNECT is forbidden [MQTT-3.14.0-1] and
+    /// silence is the only correct answer — see the pair of tests around
+    /// `malformed_input_before_connack_is_met_with_silence` in `tests/wire.rs`.
+    /// What must NOT happen — and what this asserts against — is the packet being
+    /// *accepted*.
     pub async fn expect_refused(&mut self, reason: u8) {
         match self.read_outcome(RECV_TIMEOUT).await {
             RawOutcome::ClosedSilently => {}

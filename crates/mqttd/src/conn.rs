@@ -413,6 +413,46 @@ where
 /// start plus an expiry of 0 (discard at disconnect) or `u32::MAX` (keep forever); v5
 /// carries clean start in the same flag and the Session Expiry Interval as a property
 /// (absent = 0).
+/// The DISCONNECT reason code for a decode failure ([MQTT-4.13.2]).
+///
+/// The spec splits refusals into two kinds and the client is entitled to know which:
+/// **Malformed Packet** (`0x81`) means the bytes could not be parsed as MQTT at all;
+/// **Protocol Error** (`0x82`) means they parsed but say something illegal. Collapsing
+/// both into one code would tell a client debugging its encoder nothing.
+///
+/// `Incomplete` maps to Malformed rather than being treated as unreachable: the frame
+/// reader only carves whole packets, but a varint *inside* an otherwise-complete frame
+/// (a property block, a subscription identifier) can still run out — so this arm is
+/// reachable from hostile input, and a `panic!`/`unreachable!()` here would be a remote
+/// crash on the untrusted boundary.
+///
+/// `ValueOutOfRange` is an ENCODE-side error; reaching it from inbound bytes would mean
+/// an internal bug, so it answers `0x80` Unspecified rather than blaming the client.
+fn codec_reason(e: &mqtt_codec::CodecError) -> u8 {
+    use mqtt_codec::CodecError as E;
+    match e {
+        // Parsed fine, said something the spec forbids.
+        //
+        // One case is arguably misfiled here: a property carried on a packet type that
+        // does not allow it (`properties.rs`, "property not allowed on this packet
+        // type") is classified `ProtocolViolation`, while §2.2.2.2 can be read as making
+        // it Malformed. We answer 0x82 rather than re-classify the codec on a contested
+        // reading; both are refusals, and the distinction is recorded in the policy
+        // register in docs/TEST-PLAN.md.
+        E::ProtocolViolation(_) => reason::PROTOCOL_ERROR,
+        // Could not be parsed as MQTT.
+        E::MalformedPacket(_) | E::MalformedVarInt | E::InvalidUtf8 | E::Incomplete => {
+            reason::MALFORMED_PACKET
+        }
+        // Over the size this connection advertised it would accept.
+        E::PacketTooLarge => reason::PACKET_TOO_LARGE,
+        // Only reachable pre-CONNACK, where we never send a DISCONNECT; mapped for
+        // totality.
+        E::UnsupportedProtocol(_) => reason::UNSUPPORTED_PROTOCOL_VERSION,
+        E::ValueOutOfRange(_) => reason::UNSPECIFIED_ERROR,
+    }
+}
+
 /// Whether a SUBSCRIBE filter is structurally subscribable [MQTT-4.7.1], looking
 /// through a `$share/<group>/` envelope to the filter it carries — the share
 /// wrapper's own validity is checked separately by `parse_shared`, and the rules
@@ -1539,6 +1579,30 @@ where
             inbound = reader.next_packet() => {
                 // Any client packet resets the keepalive deadline.
                 deadline = grace.map(|g| Instant::now() + g);
+                // A DECODE failure is told to the client before the close, so an operator
+                // debugging a broken publisher sees a reason instead of a bare hangup
+                // ([MQTT-4.13.2]: closing is the MUST, saying why is the SHOULD). Only
+                // `Codec` — a transport error or an EOF mid-packet means the peer is
+                // already gone, so writing would fail and there is nobody to tell.
+                //
+                // Deliberately best-effort (`let _ =`), like the shutdown path: the client
+                // that just sent garbage may have vanished, and a failed write must not
+                // mask the close. `Ok(false)` keeps `graceful` false so the Will still
+                // fires ([MQTT-3.14.4-3]).
+                //
+                // This is the POST-CONNACK path only. Before a success CONNACK a server
+                // may not send DISCONNECT at all [MQTT-3.14.0-1], so `read_connect` and
+                // the enhanced-auth round still close silently.
+                if let Err(NetError::Codec(e)) = &inbound {
+                    let reason = codec_reason(e);
+                    warn!(client = %client.0, error = %e, reason,
+                          "malformed packet from client; disconnecting");
+                    count_connection_error(policy, "codec");
+                    if is_v5 {
+                        let _ = disconnect(writer, reason).await;
+                    }
+                    return Ok(false);
+                }
                 match inbound? {
                     None => return Ok(false), // EOF without DISCONNECT
                     // An AUTH on an established session is a re-authentication
@@ -2313,8 +2377,8 @@ mod tests {
     }
 
     use super::{
-        auth_handle, authz_handle, handle_stream, jwt_password_str, wire_limits, ConnPolicy,
-        DEFAULT_CONNECT_TIMEOUT,
+        auth_handle, authz_handle, codec_reason, handle_stream, jwt_password_str, wire_limits,
+        ConnPolicy, DEFAULT_CONNECT_TIMEOUT,
     };
     use crate::hub::{AttachOutcome, HubCommand, Outbound};
     use bytes::Bytes;
@@ -3156,6 +3220,41 @@ mod tests {
             auth.detail.contains("relayed by node node-a"),
             "audit detail should attribute the relaying node, got: {}",
             auth.detail
+        );
+    }
+
+    /// The decode-failure → reason-code mapping, pinned by kind rather than only
+    /// end-to-end. The distinction the table exists to preserve is `0x81` ("these
+    /// bytes are not MQTT") vs `0x82` ("they are MQTT and they are illegal") — a
+    /// client debugging its encoder can act on that; on a single collapsed code it
+    /// cannot.
+    #[test]
+    fn codec_errors_map_to_the_right_disconnect_reason() {
+        use mqtt_codec::CodecError as E;
+
+        use mqtt_codec::reason;
+
+        for e in [
+            E::MalformedPacket("x"),
+            E::MalformedVarInt,
+            E::InvalidUtf8,
+            // Reachable from hostile input: the frame reader carves whole packets,
+            // but a varint INSIDE one can still run out. An `unreachable!()` arm
+            // here would be a remote panic on the untrusted boundary.
+            E::Incomplete,
+        ] {
+            assert_eq!(codec_reason(&e), reason::MALFORMED_PACKET, "{e:?}");
+        }
+        assert_eq!(
+            codec_reason(&E::ProtocolViolation("x")),
+            reason::PROTOCOL_ERROR
+        );
+        assert_eq!(codec_reason(&E::PacketTooLarge), reason::PACKET_TOO_LARGE);
+        // Encode-side only; if it ever arrives from the wire it is our bug, so it
+        // does not blame the client.
+        assert_eq!(
+            codec_reason(&E::ValueOutOfRange("x")),
+            reason::UNSPECIFIED_ERROR
         );
     }
 

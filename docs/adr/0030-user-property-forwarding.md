@@ -113,10 +113,10 @@ Three things a later reader would otherwise re-litigate:
 `Residual:` delivery itself is not implemented — no identifier is ever attached to an
 outbound PUBLISH. Tracked by issue #266 (deliver subscription identifiers) (per-subscription attribution:
 `[MQTT-3.3.4-3/4/5]`, retained replay, offline replay, DUP repeats, session-state survival)
-and by `0010-T7` for the shared-subscription case. Separately, a codec-level protocol error
-(a `0x0B` of 0, a duplicated `0x0B`) closes with **no** DISCONNECT packet, satisfying
-`[MQTT-4.13.1-1]`'s MUST but not its SHOULD — pre-existing and repo-wide for every
-frame-decode error, not specific to this feature. And both refusals here close the connection
+and by `0010-T7` for the shared-subscription case. (The residual recorded here previously —
+that a codec-level protocol error such as a `0x0B` of 0 closed with **no** DISCONNECT, meeting
+`[MQTT-4.13.1-1]`'s MUST but not its SHOULD — is now closed: decode failures after CONNACK
+are announced with a reason code, `conn.rs::codec_reason`.) And both refusals here close the connection
 by a path the hub currently records as a *graceful* client DISCONNECT, so a refused client's
 Will is suppressed: that is issue #265, pre-existing at four other sites on `main` and fixed
 centrally there rather than patched per-path here.
