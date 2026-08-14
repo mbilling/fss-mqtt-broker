@@ -162,6 +162,10 @@ lease_voters = 5
 # REFUSED (v5 0x97 / v3.1.1 no ack + close; cross-node via a peer-bus verdict — mid-rolling-upgrade
 # an older link withholds the ack and closes instead) — an answered refusal, never a silent drop;
 # re-sending is the application's decision. Unset = no watermark.
+# ONE AGGREGATE mark over all four stores (sessions/retained/replicas/lease), so one store can
+# consume the whole budget: the broker WARNs once, naming the store, when any single store passes
+# 70% of the mark. Scanned every [limits] watermark_poll_secs, so the total can overshoot the mark
+# by one interval's growth — leave headroom for it (docs/SIZING.md).
 # store_max_bytes = 10737418240
 # Min-replicas write floor (issues #167, #239). Replica sets shrink with membership —
 # min(R, alive) — so without a floor a shrinking cluster silently trades the configured
@@ -221,9 +225,18 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # withholds the ack and closes instead) — an answered refusal; re-sending is the application's
 # decision. Unset = off.
 # A watermark, NOT a ceiling: nothing here stops memory rising, so keep the container/cgroup
-# memory limit as the hard bound. This buys warning instead of an OOM kill.
+# memory limit as the hard bound. This buys warning instead of an OOM kill. The number behind
+# "not a ceiling": the mark is SAMPLED, so RSS can overshoot it by watermark_poll_secs x the
+# allocation rate (plus the allocation in flight) — set the watermark to 75-85% of the
+# container limit and that gap IS the overshoot allowance (docs/SIZING.md).
 # Requires /proc (Linux); elsewhere the broker logs that it is not enforcing and carries on.
 # memory_max_bytes = 2147483648      # 2 GiB
+# How often BOTH watermark watchers (disk, memory) sample their axis, seconds. Range 1-300 —
+# a value outside it is a startup error. Within 10% of a mark the watchers re-check every
+# watermark_poll_secs/10 (floor 1 s), which is also how quickly a CLEARED brownout lifts.
+# Lower it to shrink overshoot on a tight budget; read at startup only (a reload reports the
+# [limits] section as requires-restart).
+# watermark_poll_secs = 10
 
 [observability]
 # OTLP/HTTP push export (ADR 0020). Unset = Prometheus /metrics endpoint only.
