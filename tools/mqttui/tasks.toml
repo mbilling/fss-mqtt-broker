@@ -233,10 +233,13 @@ covers everything that lives between the YAML and a running container.
 Proves: with secrets/ absent the bring-up fails, creates no broker, and names ./bootstrap.sh;
 after bootstrap all three brokers reach HEALTHY (which on a native-Linux host is the proof
 that uid 65532 can read the staged secrets under a read-only rootfs); a TLS publish on node 3
-reaches a TLS subscriber on node 1; a client with no --cafile is refused; nothing is
-published on host port 1883; no container logs INSECURE and all three sign their gossip
-per-node; and the explicit `-f compose.yaml -f compose.plaintext.yaml` overlay restores
-plaintext on loopback while logging INSECURE for it.
+reaches a TLS subscriber on node 1; a client with no --cafile, one verifying against the
+wrong CA, and one with a wrong password are all refused; nothing is published on host port
+1883; no container logs INSECURE and all three sign their gossip per-node; the documented
+"arm the founder" step works and an armed founder alone goes live-but-not-ready and recovers
+with the majority (docs/SECURED-CLUSTER-TUTORIAL.md runs on these checks); and the explicit
+`-f compose.yaml -f compose.plaintext.yaml` overlay restores plaintext on loopback while
+logging INSECURE for it.
 
 WHAT IT DOES NOT COVER: the lane always supplies its own image, so compose.yaml's published
 `:latest` default is never exercised. That default is currently broken — `--probe` and
@@ -245,7 +248,7 @@ WHAT IT DOES NOT COVER: the lane always supplies its own image, so compose.yaml'
 
 Needs host ports 8883-8885 (and 1883-1885 during the overlay phase) to be free.
 """
-requires = ["docker", "mosquitto_pub", "mosquitto_sub"]
+requires = ["docker", "mosquitto_pub", "mosquitto_sub", "openssl"]
 duration = "~3m"
 [[task.env]]
 name = "MQTTD_IMAGE"

@@ -326,3 +326,10 @@ Same procedures, different transport: rotation = replace the files (the watcher 
 is identical) or `kill -HUP`; decommission = `mqttd --decommission --timeout <secs>`
 or `kill -USR1` + wait for exit; the founder rule applies to whichever node you
 bootstrap with empty seeds.
+
+Standing a secured cluster up *outside* Kubernetes in the first place — three nodes
+with client TLS, the mutually-authenticated bus, a gossip key, deny-by-default ACLs
+and majority-aware readiness, plus how the starter PKI maps to a real CA — is the
+[secured three-node tutorial](SECURED-CLUSTER-TUTORIAL.md), built on
+[`deploy/compose/`](../deploy/compose/) and CI-exercised by
+`scripts/compose-smoke.sh`.
