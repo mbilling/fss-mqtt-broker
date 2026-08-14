@@ -111,6 +111,7 @@ echo "── Phase A: plaintext + server-TLS ───────────�
 gen_pki
 read -r MQTT TLSP HEALTH < <(free_ports 3)
 MQTTD_NODE_ID=interop-a \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_PLAINTEXT_BIND="127.0.0.1:$MQTT" \
 MQTTD_TLS_BIND="127.0.0.1:$TLSP" \
 MQTTD_TLS_CERT="$WORK/pki/server.crt" \
@@ -161,6 +162,7 @@ echo
 echo "── Phase B: mutual TLS ────────────────────────────────────────────────"
 read -r MTLSP HEALTHB < <(free_ports 2)
 MQTTD_NODE_ID=interop-b \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_TLS_BIND="127.0.0.1:$MTLSP" \
 MQTTD_TLS_CERT="$WORK/pki/server.crt" \
 MQTTD_TLS_KEY="$WORK/pki/server.key" \

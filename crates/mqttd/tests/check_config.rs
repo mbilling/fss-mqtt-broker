@@ -25,18 +25,58 @@ fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
     p
 }
 
+/// Issue #240: durable sessions are ON by default, and with no data dir the replicated
+/// state is RAM-only — a correlated restart of a quorum loses acked messages. That
+/// configuration is now REFUSED (a warning log is not a substitute for refusing the
+/// configuration), so the bare-defaults check fails and names both ways out.
 #[test]
-fn no_config_file_validates_defaults_plus_env() {
-    // Defaults are secure and valid, so a bare check passes and binds nothing.
+fn bare_defaults_are_refused_naming_both_remedies() {
     let out = mqttd().arg("--check-config").output().unwrap();
-    assert!(
-        out.status.success(),
-        "expected exit 0, got {:?}; stderr={}",
+    assert_eq!(
         out.status.code(),
+        Some(1),
+        "bare defaults (durable on, no data dir) must be refused; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("config OK"), "stdout was: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("config OK"), "stdout was: {stdout}");
+    for remedy in ["MQTTD_DATA_DIR", "MQTTD_ALLOW_EPHEMERAL_DURABILITY"] {
+        assert!(
+            stderr.contains(remedy),
+            "the refusal must name {remedy}; stderr was: {stderr}"
+        );
+    }
+}
+
+/// Issue #240: each of the three explicit postures validates — the ephemeral opt-in,
+/// a real data dir, and durable explicitly OFF (the lightweight in-memory store is an
+/// explicit choice already and needs no flag).
+#[test]
+fn each_posture_validates_under_check_config() {
+    let tempdir = std::env::temp_dir().join(format!("mqttd-checkcfg-data-{}", std::process::id()));
+    std::fs::create_dir_all(&tempdir).unwrap();
+    let postures: [(&str, String); 3] = [
+        ("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1".to_string()),
+        ("MQTTD_DATA_DIR", tempdir.display().to_string()),
+        ("MQTTD_DURABLE_SESSIONS", "0".to_string()),
+    ];
+    for (key, value) in &postures {
+        let out = mqttd()
+            .arg("--check-config")
+            .env(key, value)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{key}={value} must validate; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("config OK"), "{key}: stdout was: {stdout}");
+    }
+    let _ = std::fs::remove_dir_all(&tempdir);
 }
 
 #[test]
@@ -92,8 +132,11 @@ fn an_unknown_key_fails_with_a_located_error_and_exit_1() {
 #[test]
 fn a_bad_env_value_fails_check_config() {
     // An out-of-range env overlay (0 voters is un-electable) is caught by the same check.
+    // The ephemeral opt-in (#240) is set so the failure is for THIS reason, not the
+    // missing data dir.
     let out = mqttd()
         .arg("--check-config")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_LEASE_VOTERS", "0")
         .output()
         .unwrap();
@@ -114,8 +157,11 @@ fn a_bad_env_value_fails_check_config() {
 /// satisfiable integer — pass.
 #[test]
 fn check_config_rejects_a_min_replicas_floor_above_the_replication_factor() {
+    // The ephemeral opt-in (#240) is set so the failure below is the floor's, not the
+    // missing data dir's — and the assertion on the message text pins that.
     let out = mqttd()
         .arg("--check-config")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_MIN_REPLICAS", "9")
         .output()
         .unwrap();
@@ -135,6 +181,7 @@ fn check_config_rejects_a_min_replicas_floor_above_the_replication_factor() {
     for value in ["majority", "2"] {
         let out = mqttd()
             .arg("--check-config")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
             .env("MQTTD_MIN_REPLICAS", value)
             .output()
             .unwrap();

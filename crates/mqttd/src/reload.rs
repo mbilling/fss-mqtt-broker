@@ -833,7 +833,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mqttd-cfgreload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cfg.toml");
-        std::fs::write(&path, "[node]\nid = \"first\"\n").unwrap();
+        // The ephemeral opt-in (#240) keeps these configs valid; the subjects here are
+        // the swap/rollback mechanics, not the durability posture.
+        std::fs::write(
+            &path,
+            "[node]\nid = \"first\"\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
 
         let live = Arc::new(RwLock::new(mqtt_config::Config::default()));
         let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -856,7 +862,11 @@ mod tests {
 
         // Invalid config (unknown key): rejected, running config kept, apply not run.
         applied.store(false, Ordering::SeqCst);
-        std::fs::write(&path, "[node]\nid = \"second\"\nbogus = 1\n").unwrap();
+        std::fs::write(
+            &path,
+            "[node]\nid = \"second\"\nbogus = 1\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
         assert!(!reloader.reload("signal"));
         assert_eq!(
             read_lock(&live).node.id,
@@ -869,7 +879,11 @@ mod tests {
         );
 
         // Precheck failure: rejected, running config kept.
-        std::fs::write(&path, "[node]\nid = \"third\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[node]\nid = \"third\"\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
         let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
         reloader.attach_config_source(ConfigSource {
             live: live.clone(),
@@ -898,6 +912,52 @@ mod tests {
             read_lock(&live).node.id,
             "first",
             "a failed policy build rolls the config back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #240, the third gate: a reload that would edit the running broker into
+    /// unopted ephemeral durability (durable on, no data dir, no flag) is REJECTED —
+    /// `Config::load` runs `validate()`, so the reload path refuses exactly what
+    /// startup and `--check-config` refuse — and the running config is kept.
+    #[test]
+    fn a_reload_into_ephemeral_durability_is_rejected_and_the_running_config_kept() {
+        let dir = std::env::temp_dir().join(format!("mqttd-ephreload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        // Start from a valid posture: a real data dir.
+        std::fs::write(
+            &path,
+            format!("[node]\nid = \"kept\"\ndata_dir = \"{}\"\n", dir.display()),
+        )
+        .unwrap();
+
+        let live = Arc::new(RwLock::new(mqtt_config::Config::default()));
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
+        reloader.attach_config_source(ConfigSource {
+            live: live.clone(),
+            path: Some(path.clone()),
+            precheck: Box::new(|_| Ok(())),
+            apply: Box::new(|_, _| {}),
+        });
+        assert!(
+            reloader.reload("signal"),
+            "the durable-on-disk config loads"
+        );
+        assert_eq!(read_lock(&live).node.id, "kept");
+
+        // The bad edit: drop the data dir with durable still on and no opt-in.
+        std::fs::write(&path, "[node]\nid = \"ephemeral\"\n").unwrap();
+        assert!(
+            !reloader.reload("signal"),
+            "a reload into unopted ephemeral durability must be rejected"
+        );
+        let kept = read_lock(&live).clone();
+        assert_eq!(kept.node.id, "kept", "the running config is kept");
+        assert!(
+            kept.node.data_dir.is_some(),
+            "the running data dir survives the rejected edit"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

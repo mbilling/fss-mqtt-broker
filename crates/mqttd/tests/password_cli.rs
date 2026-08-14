@@ -86,6 +86,7 @@ async fn start_broker(password_file: &std::path::Path) -> (Broker, SocketAddr) {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
     let child = mqttd()
         .env("MQTTD_NODE_ID", "pwcli")
+        .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
         .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
         .env("MQTTD_PASSWORD_FILE", password_file)
         // Anonymous stays OFF: the password file is the whole gate under test.

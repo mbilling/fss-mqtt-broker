@@ -21,7 +21,7 @@ Eight numbers bound a node. Everything else has a safe default.
 
 | Decision | Knob (env / TOML `[limits]` unless noted) | Ships as |
 |---|---|---|
-| Where state lives | `MQTTD_DATA_DIR` (`[node]`) | unset = **everything in memory** |
+| Where state lives | `MQTTD_DATA_DIR` (`[node]`) | unset with durable on = **refused at startup** (issue #240) unless `MQTTD_ALLOW_EPHEMERAL_DURABILITY` opts into all-in-memory |
 | Disk high-water mark | `MQTTD_STORE_MAX_BYTES` (`[durable]`) | unset = **no bound** |
 | Concurrent connections | `MQTTD_MAX_CONNECTIONS` (+ `_PER_IP`) | unset = **uncapped** |
 | Largest packet | `MQTTD_MAX_PACKET_SIZE` | 1 MiB (floor 1 KiB) |
@@ -121,7 +121,9 @@ mid-write — with recovery and back-fill verified (ADR 0044 P2). The watermark 
 consume the whole budget and brown out the others (ADR 0041 amendment T9).
 
 If `MQTTD_DATA_DIR` is unset, none of this applies — all state is in memory and the
-memory formula is the only budget.
+memory formula is the only budget. (Reaching that state now takes an explicit choice:
+durable-on with no data dir refuses to start unless `MQTTD_ALLOW_EPHEMERAL_DURABILITY`
+is set, issue #240.)
 
 ### What actually writes to disk on the publish path
 

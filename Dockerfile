@@ -50,9 +50,12 @@ COPY --chmod=0755 dist/mqttd /usr/local/bin/mqttd
 # it covers, ownership included, so `-v mqttd-data:/var/lib/mqttd` lands writable
 # instead of root-owned.
 #
-# MQTTD_DATA_DIR is deliberately NOT defaulted to it — unset still means in-memory,
-# exactly as the bare binary behaves. Opt in with:
+# MQTTD_DATA_DIR is deliberately NOT defaulted to it — exactly as the bare binary
+# behaves: with durable sessions on (the default) and no data dir the broker now
+# REFUSES to start (issue #240) rather than silently keeping acked state in memory.
+# Set it and mount a volume:
 #   -e MQTTD_DATA_DIR=/var/lib/mqttd -v mqttd-data:/var/lib/mqttd
+# (or opt into ephemeral durability for dev/tests: -e MQTTD_ALLOW_EPHEMERAL_DURABILITY=1)
 COPY --chown=65532:65532 deploy/image/data-dir/ /var/lib/mqttd/
 
 # Conventional MQTT ports (plaintext / TLS). Actual binds are operator-chosen via

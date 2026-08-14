@@ -61,15 +61,23 @@ not route traffic.
 - **A lone durable node is healthy alone**, by design; readiness only fails when *more than
   one* member is expected and fewer are present.
 
-## The broker started but "durability" isn't surviving restarts
+## The broker refuses to start: `EPHEMERAL durability REFUSED`
 
-**Symptom:** durable sessions are on, but a restart loses acknowledged messages.
+**Symptom:** durable sessions are on (the default), no data dir is set, and startup (or
+`--check-config`, or a config reload) fails with an error naming `MQTTD_DATA_DIR` and
+`MQTTD_ALLOW_EPHEMERAL_DURABILITY`.
 
-- **Durable-on with no `MQTTD_DATA_DIR` is in-memory.** The replicated state lives only in
-  RAM: it survives one node's loss (peers hold it) but not a correlated restart of a quorum.
-  The broker logs an `EPHEMERAL durability` warning on every start in this mode. Set
-  `MQTTD_DATA_DIR` **and** mount a volume for real durability. In the container image the
-  writable path is `/var/lib/mqttd`.
+- **This is deliberate (issue #240).** Durable-on with no `MQTTD_DATA_DIR` keeps the
+  replicated state only in RAM: it survives one node's loss (peers hold it) but a
+  correlated restart of a quorum loses acknowledged messages — so the combination is
+  refused rather than warned about. Three ways out:
+  - **Set `MQTTD_DATA_DIR` and mount a volume** — real durability, the production answer.
+    In the container image the writable path is `/var/lib/mqttd`.
+  - **`MQTTD_ALLOW_EPHEMERAL_DURABILITY=1`** (`[durable] allow_ephemeral = true`) — the
+    explicit dev/test opt-in; the broker then boots and logs the `EPHEMERAL durability`
+    warning on every start while it is on.
+  - **`MQTTD_DURABLE_SESSIONS=0`** — the lightweight in-memory store, if you never wanted
+    the durable plane; an explicit choice that needs no flag.
 
 ## `UNDER-REPLICATED` warnings in the log
 

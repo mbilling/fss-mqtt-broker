@@ -55,6 +55,7 @@ echo "── The README quickstart: two-node cluster via gossip discovery ──
 # Node A — the seed (README: client :1883, peer :7001, gossip :7946).
 MQTTD_NODE_ID=node-a \
 MQTTD_PLAINTEXT_BIND="127.0.0.1:$A_CLIENT" \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_PEER_BIND="127.0.0.1:$A_PEER" \
 MQTTD_SWIM_BIND="127.0.0.1:$A_SWIM" \
 MQTTD_ALLOW_ANONYMOUS=1 \
@@ -66,6 +67,7 @@ PIDS+=("$!")
 # MQTTD_SWIM_SEEDS pointing at A's gossip address).
 MQTTD_NODE_ID=node-b \
 MQTTD_PLAINTEXT_BIND="127.0.0.1:$B_CLIENT" \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_PEER_BIND="127.0.0.1:$B_PEER" \
 MQTTD_SWIM_BIND="127.0.0.1:$B_SWIM" \
 MQTTD_SWIM_SEEDS="127.0.0.1:$A_SWIM" \
@@ -166,6 +168,7 @@ print(*[s.getsockname()[1] for s in ss])
 # point of saying so — it is checked, not asserted.
 SEC_LOG="$WORK/secured.log"
 MQTTD_NODE_ID=secured \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_TLS_BIND="127.0.0.1:$S_TLS" \
 MQTTD_TLS_CERT="$PKI/server.crt" \
 MQTTD_TLS_KEY="$PKI/server.key" \

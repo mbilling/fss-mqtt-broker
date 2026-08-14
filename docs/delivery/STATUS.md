@@ -36,7 +36,7 @@
 | [0026](../adr/0026-lease-timing-durable-storage.md) | Lease-group raft timing tolerant of durable-storage latency | Accepted | [7/7 done](0026-lease-timing-durable-storage.md) | — |
 | [0027](../adr/0027-replica-group-commit.md) | Group-commit for the durable replica apply path | Accepted | [4/4 done](0027-replica-group-commit.md) | — |
 | [0028](../adr/0028-link-gated-voter-admission.md) | Link-gated lease-group voter admission | Accepted | [3/3 done](0028-link-gated-voter-admission.md) | — |
-| [0029](../adr/0029-durable-by-default.md) | Durable sessions by default | Accepted | [3/3 done](0029-durable-by-default.md) | — |
+| [0029](../adr/0029-durable-by-default.md) | Durable sessions by default | Accepted | [4/4 done](0029-durable-by-default.md) | — |
 | [0030](../adr/0030-user-property-forwarding.md) | Forward MQTT 5 User Properties through delivery | Accepted | [6/6 done](0030-user-property-forwarding.md) | — |
 | [0031](../adr/0031-session-identity-binding.md) | Bind the session to the authenticated identity | Accepted | [6/6 done](0031-session-identity-binding.md) | — |
 | [0032](../adr/0032-hot-reloadable-security-policy.md) | Hot-reloadable security policy | Accepted | [8/9 done](0032-hot-reloadable-security-policy.md) | 1 deferred |

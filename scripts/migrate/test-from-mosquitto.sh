@@ -64,6 +64,7 @@ echo "  ok   — ACL is deny-by-default and %u became %i"
 PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
 HPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
 MQTTD_ACL_FILE="$WORK/acl.toml" MQTTD_PLAINTEXT_BIND="127.0.0.1:$PORT" \
+  MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
   MQTTD_ALLOW_ANONYMOUS=1 MQTTD_HEALTH_BIND="127.0.0.1:$HPORT" RUST_LOG=warn \
   "$MQTTD_BIN" > "$WORK/boot.log" 2>&1 &
 BROKER=$!

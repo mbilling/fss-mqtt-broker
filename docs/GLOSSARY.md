@@ -44,7 +44,9 @@ broker uses, and **mqttd** terms specific to this one's clustering and security 
   so an acknowledged message survives the loss of the node that accepted it. Turn it off
   (`MQTTD_DURABLE_SESSIONS=0`) for a lighter in-memory store. **Durable-on with no
   `MQTTD_DATA_DIR` is in-memory durability** — replicated but not on disk, so a correlated
-  restart of a quorum loses acknowledged facts. The broker warns loudly about this.
+  restart of a quorum loses acknowledged facts. Since issue #240 the broker **refuses to
+  start** in that configuration; development and tests opt in explicitly with
+  `MQTTD_ALLOW_EPHEMERAL_DURABILITY=1`, and only then does the loud warning fire.
 - **Placement group** — the unit of ownership. Every client id hashes to one of a fixed
   number of groups; a group has one owner and one replica set, so ownership and consensus
   scale with the number of *groups*, not the number of sessions.

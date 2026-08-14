@@ -79,7 +79,9 @@ persists its lease group and replicated session log to its own `/data` volume. E
 > (~90 s). **Bounded lease voters** (ADR 0021/0028, both Accepted) cap the voter set, so the
 > group stays stable at 7 nodes instead of the all-voters churn earlier revisions hit — which
 > is what makes scaling this demo up viable. Set `MQTTD_DURABLE_SESSIONS=0` to fall back to the
-> bounded in-memory store (then those panels stay empty).
+> bounded in-memory store (then those panels stay empty). Durable-on with **no** data
+> dir refuses to start (issue #240) — the demo's compose sets `MQTTD_DATA_DIR: /data`
+> per node, so it is unaffected.
 
 > **Single-host sizing caveat (fsync-bound).** This demo runs every node on one machine
 > sharing one disk. A consensus-backed cluster is **fsync-bound**: each node persists to the

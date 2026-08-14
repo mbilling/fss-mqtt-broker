@@ -24,7 +24,8 @@
 # Stable identifier for this node (default "node-local"). Must be unique per node.
 id = "node-1"
 # Directory for on-disk persistence (ADR 0018). With durable sessions on (the default) the lease
-# group + replicated log live here and survive a full-cluster restart. Unset = in-memory only.
+# group + replicated log live here and survive a full-cluster restart. Unset with durable
+# on (the default) is REFUSED at startup unless [durable] allow_ephemeral opts in (#240).
 data_dir = "/var/lib/mqttd"
 # This node's failure-domain label (ADR 0016), advertised over gossip so the topology
 # self-assembles. Unset = unlabelled (unless a peer or the static map below supplies one).
@@ -134,8 +135,13 @@ key_file = "/run/secrets/swim-key"
 
 [durable]
 # Durable, consensus-backed replicated session storage is ON by default (ADR 0029). Set false for
-# the lightweight in-memory store.
+# the lightweight in-memory store (an explicit choice — it never needs allow_ephemeral below).
 enabled = true
+# Permit durable-on with NO [node] data_dir (issue #240) — OFF by default: without it that
+# combination REFUSES to start (and fails --check-config and a live reload), because the
+# replicated state would live only in memory and a correlated quorum restart loses acked
+# messages. Dev/tests only; loudly WARNed on every start while on. Env: MQTTD_ALLOW_EPHEMERAL_DURABILITY.
+# allow_ephemeral = true
 # Bounded lease-consensus voter set size (default 5, recommend odd). Note: >=5 durable nodes on a
 # SINGLE host is fsync-bound (see the demo sizing note / ADR 0049).
 lease_voters = 5

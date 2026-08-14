@@ -57,7 +57,7 @@
                     "type": "string"
                   },
                   "config": {
-                    "description": "The broker config TOML template — the SAME contract as the chart's\n`values.config` (ADR 0046): `__NODE_ID__`, `__SEEDS__`,\n`__PEER_ADVERTISE__`, and `__READY_MIN__` are rendered per pod.",
+                    "description": "The broker config TOML template — the SAME contract as the chart's\n`values.config` (ADR 0046): `__NODE_ID__`, `__SEEDS__`,\n`__PEER_ADVERTISE__`, and `__READY_MIN__` are rendered per pod.\n\nA config that omits `[node] data_dir` with durable sessions on (the\ndefault) now CRASHLOOPS with the issue #240 refusal — the check-config\ninit container rejects it before the broker starts. Set `data_dir`\n(the chart default `/var/lib/mqttd` plus a PVC already does), or add\n`[durable] allow_ephemeral = true` for a throwaway cluster.",
                     "type": "string"
                   },
                   "gossipKeyRotation": {

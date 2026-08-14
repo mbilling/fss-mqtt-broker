@@ -173,6 +173,7 @@ ok "Keycloak realm '$REALM' + client '$CLIENT_AUD' + user provisioned"
 
 # --- 2. mqttd against the live IdP -----------------------------------------
 MQTTD_PLAINTEXT_BIND="${BROKER_HOST}:${BROKER_PORT}" \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_OIDC_ISSUER="$ISSUER" \
 MQTTD_OIDC_AUDIENCE="$CLIENT_AUD" \
 MQTTD_OIDC_ALLOW_HTTP=1 \
@@ -252,6 +253,7 @@ docker stop "$KC_NAME" >/dev/null 2>&1 || true
 kill "$BROKER_PID" 2>/dev/null || true
 wait "$BROKER_PID" 2>/dev/null || true
 MQTTD_PLAINTEXT_BIND="${BROKER_HOST}:${BROKER_PORT}" \
+MQTTD_ALLOW_EPHEMERAL_DURABILITY=1 \
 MQTTD_ALLOW_ANONYMOUS= \
 MQTTD_OIDC_ISSUER="$ISSUER" \
 MQTTD_OIDC_AUDIENCE="$CLIENT_AUD" \
