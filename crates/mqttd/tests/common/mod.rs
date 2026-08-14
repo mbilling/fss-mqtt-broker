@@ -453,6 +453,33 @@ impl Client {
         (c, present)
     }
 
+    /// Send a v3.1.1 CONNECT carrying a `QoS` 1 Last Will and assert the CONNACK.
+    /// `clean_session = false`, so the session (and therefore the will) survives long
+    /// enough for a broker-initiated close to publish it (issue #238, R1).
+    pub async fn connect_with_will(&mut self, client_id: &str, topic: &str, payload: &[u8]) {
+        self.send(&Packet::Connect(Connect {
+            properties: Properties::new(),
+            protocol: V4,
+            clean_session: false,
+            keep_alive: 0,
+            client_id: client_id.to_string(),
+            last_will: Some(mqtt_codec::packet::LastWill {
+                topic: topic.to_string(),
+                payload: bytes::Bytes::copy_from_slice(payload),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                properties: Properties::new(),
+            }),
+            username: None,
+            password: None,
+        }))
+        .await;
+        match self.recv().await {
+            Packet::ConnAck(a) => assert_eq!(a.code, 0, "CONNECT with a will should succeed"),
+            other => panic!("expected CONNACK, got {other:?}"),
+        }
+    }
+
     /// Connect as v3.1.1, waiting up to `wait` for the CONNACK instead of the default
     /// 2s recv bound. Returns `None` — dropping the half-open connection so the caller
     /// can retry a fresh connect — if the CONNACK does not arrive in time, the peer
@@ -898,9 +925,18 @@ impl mqtt_storage::SessionStore for FlakyStore {
         &self,
         client: &mqtt_core::ClientId,
         packet_id: u16,
-    ) -> Result<bool, mqtt_storage::StorageError> {
+    ) -> Result<mqtt_storage::InboundSighting, mqtt_storage::StorageError> {
         self.check_write()?;
         self.inner.record_received(client, packet_id).await
+    }
+
+    async fn ack_received(
+        &self,
+        client: &mqtt_core::ClientId,
+        packet_id: u16,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner.ack_received(client, packet_id).await
     }
 
     async fn clear_received(

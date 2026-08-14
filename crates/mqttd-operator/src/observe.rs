@@ -271,8 +271,10 @@ fn events_for(f: &Facts<'_>) -> Vec<(String, String)> {
     if f.brownout {
         events.push((
             "Brownout".to_string(),
-            "Disk watermark exceeded on at least one pod: growth writes refused \
-             (acks/reads continue). Expand storage or raise the watermark."
+            "Disk watermark exceeded on at least one pod: growth writes refused; \
+             QoS>=1 publishers are refused rather than acked, so re-delivery is \
+             theirs to decide (reads, subscriber acks and resumes continue). \
+             Expand storage or raise the watermark."
                 .to_string(),
         ));
     }

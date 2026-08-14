@@ -24,7 +24,8 @@ use mqtt_codec::{
 use mqtt_core::{is_shared_filter, parse_shared, AppProperties, ClientId, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
 use mqtt_observability::{AuditLog, AuditSink};
-use std::collections::HashSet;
+use mqtt_storage::InboundSighting;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -729,7 +730,12 @@ where
     .await;
     count_connection_closed(policy);
     // Always deregister, even on error. The hub ignores this if we were taken
-    // over. Only a clean DISCONNECT is graceful; anything else fires the will.
+    // over. Only a clean DISCONNECT (and the graceful-shutdown drain, where the
+    // SERVER is going away and the session is retained) is graceful; anything else
+    // — EOF, keepalive expiry, protocol violation, a refusal v3.1.1 can only say by
+    // hanging up — fires the will [MQTT-3.14.4-3]. `serve` narrows that to a single
+    // bool by way of [`PacketOutcome`], so a broker-initiated close can never be
+    // reported as a client DISCONNECT (issue #238).
     let graceful = matches!(result, Ok(true));
     let _ = hub.send(HubCommand::Detach {
         client,
@@ -1492,9 +1498,13 @@ where
         Duration::from_secs(u64::from(keep_alive) * KEEPALIVE_GRACE_NUM / KEEPALIVE_GRACE_DEN)
     });
     let mut deadline = grace.map(|g| Instant::now() + g);
-    // Inbound QoS 2 ids seen but not yet PUBREL-released; forwarding only on first
-    // sight is what makes inbound QoS 2 exactly-once [MQTT-4.3.3-2].
-    let mut qos2_inbound: HashSet<u16> = HashSet::new();
+    // Inbound QoS 2 ids held but not yet PUBREL-released, each with whether its PUBREC
+    // was RELEASED: forwarding only on first sight of an ACKNOWLEDGED id is what makes
+    // inbound QoS 2 exactly-once [MQTT-4.3.3-2] without fabricating success for a flow
+    // the broker never acknowledged (issue #238). The per-connection fallback only ever
+    // matters for a clean session, whose window is not required to outlive its
+    // connection; a persistent session's window lives in the store.
+    let mut qos2_inbound: HashMap<u16, bool> = HashMap::new();
     // Count of distinct unreleased inbound QoS>0 publishes — the client's outstanding
     // window against the server's Receive Maximum (ADR 0012). QoS 1 is acked inline so
     // never accumulates; QoS 2 holds a slot from PUBLISH until PUBREL. Overrun → 0x93.
@@ -1530,8 +1540,14 @@ where
                         if let (Some(limiter), Packet::Publish(_)) = (&mut publish_rate, &packet) {
                             limiter.acquire().await;
                         }
-                        if handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
-                            return Ok(true); // client sent DISCONNECT
+                        // Only a client DISCONNECT is graceful. A broker-initiated
+                        // close — protocol violation, hub gone, or a refusal v3.1.1
+                        // can only say by hanging up — is UNgraceful, so the Will
+                        // still fires (issue #238, [MQTT-3.14.4-3]).
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
+                            PacketOutcome::Continue => {}
+                            PacketOutcome::ClientDisconnect => return Ok(true),
+                            PacketOutcome::BrokerClose => return Ok(false),
                         }
                     }
                 }
@@ -1609,8 +1625,12 @@ async fn drain_signal(policy: &ConnPolicy) {
 }
 
 /// Handle one inbound PUBLISH: topic validation, ACL gate, inbound `QoS`
-/// handshakes, and the exactly-once dedup window. Returns `Ok(true)` if the
-/// connection must close (a protocol violation).
+/// handshakes, and the exactly-once dedup window.
+///
+/// Every close this can ask for is [`PacketOutcome::BrokerClose`] — a protocol
+/// violation, a hub that went away, or a refusal v3.1.1 has no reason byte to carry.
+/// None of them is a client DISCONNECT, so the client's Will fires (issue #238;
+/// [MQTT-3.14.4-3]).
 // One arm per (QoS, ack) shape; a flat dispatch, not a refactor smell.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // a connection's full publish-handling context
@@ -1621,11 +1641,11 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     client: &ClientId,
     principal: &Identity,
     policy: &ConnPolicy,
-    qos2_inbound: &mut HashSet<u16>,
+    qos2_inbound: &mut HashMap<u16, bool>,
     qos2_inflight: &mut usize,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
-) -> Result<bool, NetError> {
+) -> Result<PacketOutcome, NetError> {
     // The MQTT 5.0 Message Expiry Interval (if the publisher set one) bounds how long
     // a queued copy is deliverable (ADR 0009 §3).
     let message_expiry = publish.properties.message_expiry_interval();
@@ -1645,7 +1665,8 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         warn!(client = %client.0,
               "client PUBLISH carries a Subscription Identifier [MQTT-3.3.4-6]; DISCONNECT 0x82");
         disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
-        return Ok(true);
+        // A broker-initiated close (the client did not DISCONNECT): the Will fires.
+        return Ok(PacketOutcome::BrokerClose);
     }
     // Resolve any topic alias to the full topic name before anything else sees it
     // (ADR 0011 §2). An invalid alias is a protocol violation: close the connection.
@@ -1656,7 +1677,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         // alias property is v5-only, so reaching here implies a v5 connection.
         warn!(client = %client.0, alias = ?alias, "invalid topic alias; DISCONNECT 0x94");
         disconnect(writer, DISCONNECT_TOPIC_ALIAS_INVALID).await?;
-        return Ok(true);
+        return Ok(PacketOutcome::BrokerClose);
     };
     let Publish {
         qos,
@@ -1670,11 +1691,16 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     // than letting a `+`/`#` topic reach routing or ACL matching.
     if topic.contains(['+', '#']) {
         warn!(client = %client.0, topic = %topic, "PUBLISH topic contains wildcards; closing connection");
-        return Ok(true);
+        return Ok(PacketOutcome::BrokerClose);
     }
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped but still
     // acknowledged — 3.1.1 has no negative PUBACK, and not acking would leave
     // conforming publishers retrying forever.
+    //
+    // This is issue #246's seam: telling a v5 publisher `0x87 Not authorized` is
+    // one more `PublishRefusal` variant (`NotAuthorized` → v5 `0x87`, v3.1.1
+    // `Refusal311::PlainAck` — a retry cannot change an ACL decision) plus a line
+    // here that hands it to the same per-version mapping the refusal arms below use.
     let authorized = policy
         .authorizer()
         .authorize_publish(principal, client, &topic);
@@ -1723,7 +1749,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 warn!(client = %client.0, limit = wire_limits().receive_maximum,
                       "QoS 1 publish beyond Receive Maximum; DISCONNECT 0x93");
                 disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
-                return Ok(true);
+                return Ok(PacketOutcome::BrokerClose);
             }
             let mut ack = mqtt_codec::packet::Ack::from(id);
             if let Some(done) = forward(hub) {
@@ -1731,13 +1757,25 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 // stored: close without a PUBACK (the publisher retries) rather than
                 // acknowledge a message that could be lost.
                 match done.await {
-                    Err(_) => return Ok(true),
-                    // The retained quota refused the publish (v5, ADR 0041 T4):
-                    // nothing was delivered or retained — say so.
-                    Ok(crate::hub::PublishOutcome::RetainedQuotaExceeded) => {
-                        ack.reason = reason::QUOTA_EXCEEDED;
-                    }
+                    Err(_) => return Ok(PacketOutcome::BrokerClose),
                     Ok(crate::hub::PublishOutcome::Accepted) => {}
+                    // The hub refused the publish under a stated policy (ADR 0041
+                    // T4 retained quota, T11 brownout). v5 carries the reason on the
+                    // PUBACK; v3.1.1 has no reason byte, so each refusal declares
+                    // whether it is sayable as a plain ack or only as no-ack-and-close.
+                    // No Reason String property is attached: nothing here tracks
+                    // Request Problem Information, and sending one unconditionally
+                    // would violate [MQTT-3.1.2-29].
+                    Ok(crate::hub::PublishOutcome::Refused(r)) => {
+                        if is_v5 {
+                            ack.reason = r.v5_reason();
+                        } else if r.v311() == crate::hub::Refusal311::CloseNoAck {
+                            warn!(client = %client.0, refusal = r.as_str(),
+                                  "publish refused and v3.1.1 cannot say so; closing \
+                                   without a PUBACK (the publisher retries)");
+                            return Ok(PacketOutcome::BrokerClose);
+                        }
+                    }
                 }
             }
             writer.send(&Packet::PubAck(ack)).await?;
@@ -1756,18 +1794,39 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             // exactly as a failed durable fan-out does below; the publisher reconnects
             // and re-sends, and once the store recovers the dedup is correct. (An earlier
             // version `unwrap_or(true)`'d the error into "first sighting" — the defect.)
-            let first_sighting = match &policy.store {
+            //
+            // The window remembers TWO facts (issue #238): that the id is held, and
+            // whether its PUBREC was ever RELEASED. Only an ACKNOWLEDGED flow may answer
+            // a DUP from the window — that is the only scope in which [MQTT-4.3.3-2]'s
+            // promise was ever made. A held-but-unacknowledged id (the broker told the
+            // client nothing) re-enters the gate exactly like a first sighting, so the
+            // client's mandatory resend [MQTT-4.4.0-1] is RE-DECIDED rather than answered
+            // with a fabricated success PUBREC for a message nothing stored. That is safe
+            // to re-decide because the hub decides a refusal before taking any side
+            // effect, so a refused attempt leaves nothing for the resend to duplicate.
+            let sighting = match &policy.store {
                 Some(store) => match store.record_received(client, id).await {
-                    Ok(first) => first,
+                    Ok(s) => s,
                     Err(e) => {
                         warn!(client = %client.0, id, error = %e,
                               "QoS2 dedup store write failed; withholding PUBREC (fail closed)");
-                        return Ok(true);
+                        return Ok(PacketOutcome::BrokerClose);
                     }
                 },
-                None => qos2_inbound.insert(id),
+                // Read first, insert only when fresh: a blind insert would
+                // overwrite the acked bit, and a SECOND in-connection DUP of an
+                // already-PUBREC'd id would then re-fan-out — the very duplicate
+                // the window exists to prevent.
+                None => match qos2_inbound.get(&id).copied() {
+                    None => {
+                        qos2_inbound.insert(id, false);
+                        InboundSighting::Fresh
+                    }
+                    Some(true) => InboundSighting::HeldAcked,
+                    Some(false) => InboundSighting::HeldUnacked,
+                },
             };
-            if first_sighting {
+            if sighting != InboundSighting::HeldAcked {
                 // Receive Maximum (ADR 0012 §3): a *new* unreleased QoS 2 id beyond the
                 // server's advertised window is a flow-control breach — DISCONNECT 0x93.
                 // A DUP of an already-held id does not consume a new slot. v5 only (3.1.1
@@ -1776,45 +1835,123 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     warn!(client = %client.0, limit = wire_limits().receive_maximum,
                           "client exceeded Receive Maximum; DISCONNECT 0x93");
                     disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
-                    return Ok(true);
+                    return Ok(PacketOutcome::BrokerClose);
                 }
                 let mut rec = mqtt_codec::packet::Ack::from(id);
                 if let Some(done) = forward(hub) {
                     // As for QoS 1: PUBREC promises the broker owns the message, so
                     // it is released only after the durable fan-out completes.
+                    //
+                    // The obligation is NOT "release the record on every non-PUBREC
+                    // exit" (issue #238): a success PUBREC is the only thing that may
+                    // mark the record ACKED, and only an acked record may answer a DUP as
+                    // a duplicate. The two exits that tell the client NOTHING therefore
+                    // LEAVE the record held-unacked — that is the truth — so the client's
+                    // mandatory resend is re-decided instead of being answered from a
+                    // window whose entry never earned a PUBREC.
                     match done.await {
-                        Err(_) => return Ok(true),
-                        // Refused by the retained quota (v5, ADR 0041 T4): a
-                        // PUBREC >= 0x80 ends the flow — no slot is consumed and
-                        // the id stays reusable.
-                        Ok(crate::hub::PublishOutcome::RetainedQuotaExceeded) => {
-                            rec.reason = reason::QUOTA_EXCEEDED;
-                        }
+                        // Hub gone mid-shutdown: nothing was said, so nothing is acked.
+                        // The record stays held-unacked and the resend re-attempts.
+                        Err(_) => return Ok(PacketOutcome::BrokerClose),
                         Ok(crate::hub::PublishOutcome::Accepted) => {}
+                        // Refused under a stated policy (ADR 0041 T4 retained quota,
+                        // T11 brownout). v5: a PUBREC >= 0x80 ends the flow — no slot
+                        // is consumed and the id stays reusable. v3.1.1 has no reason
+                        // byte, so a refusal it cannot say becomes no-PUBREC + close.
+                        Ok(crate::hub::PublishOutcome::Refused(r)) => {
+                            if is_v5 {
+                                rec.reason = r.v5_reason();
+                            } else if r.v311() == crate::hub::Refusal311::CloseNoAck {
+                                warn!(client = %client.0, id, refusal = r.as_str(),
+                                      "QoS 2 publish refused and v3.1.1 cannot say so; \
+                                       closing without a PUBREC (the publisher retries)");
+                                return Ok(PacketOutcome::BrokerClose);
+                            }
+                        }
                     }
                 }
                 if rec.reason == 0 {
-                    *qos2_inflight += 1;
-                } else {
-                    // The flow ended at PUBREC: release the dedup record so a
-                    // fresh publish under this id is treated as new.
-                    match &policy.store {
-                        Some(store) => {
-                            let _ = store.clear_received(client, id).await;
-                        }
-                        None => {
-                            qos2_inbound.remove(&id);
-                        }
+                    // Only a genuinely new id consumes a Receive-Maximum slot; a
+                    // held-unacked resend re-uses the one it already holds.
+                    if sighting == InboundSighting::Fresh {
+                        *qos2_inflight += 1;
                     }
+                    // ACK THE RECORD BEFORE THE PUBREC REACHES THE WIRE — the
+                    // write-before-send rule of ADR 0057 / #124. Acking after the send
+                    // would let a crash in the PUBREC→PUBREL window lose the fact that we
+                    // acked, and the post-failover resend would re-fan-out: the very
+                    // duplicate the acked bit exists to prevent. A FAILED write fails
+                    // closed for the same reason: a PUBREC the durable record cannot
+                    // back is the fabricated-success lie in crash-shaped form.
+                    if !ack_qos2_dedup(policy, qos2_inbound, client, id).await {
+                        warn!(client = %client.0, id,
+                              "QoS2 dedup ack write failed; withholding PUBREC (fail closed)");
+                        return Ok(PacketOutcome::BrokerClose);
+                    }
+                } else {
+                    // A v5 PUBREC >= 0x80 ends the flow BY SPEC — both sides agree the id
+                    // is free — so the record must go entirely, not merely stay unacked:
+                    // a later publish under this id is genuinely new, and a lingering
+                    // record would make it look like a retry of a different message.
+                    release_qos2_dedup(policy, qos2_inbound, client, id).await;
                 }
                 writer.send(&Packet::PubRec(rec)).await?;
-                return Ok(false);
+                return Ok(PacketOutcome::Continue);
             }
             writer.send(&Packet::PubRec(id.into())).await?;
         }
         _ => debug!(client = %client.0, "dropping QoS>0 publish without packet id"),
     }
-    Ok(false)
+    Ok(PacketOutcome::Continue)
+}
+
+/// FULLY release a `QoS` 2 packet id's inbound dedup record — the durable one when a
+/// session store is configured (so it survives a failover), else the per-connection map.
+///
+/// One caller, and only one is correct (issue #238): the v5 `PUBREC >= 0x80` exit, where
+/// the flow has ENDED by spec and both sides consider the id free, so a later publish
+/// under it is genuinely new. The exits that say nothing to the client must NOT come
+/// here — they leave the record held-unacked, which is what makes the client's mandatory
+/// resend re-decidable instead of answerable as a duplicate.
+async fn release_qos2_dedup(
+    policy: &ConnPolicy,
+    qos2_inbound: &mut HashMap<u16, bool>,
+    client: &ClientId,
+    id: u16,
+) {
+    match &policy.store {
+        Some(store) => {
+            let _ = store.clear_received(client, id).await;
+        }
+        None => {
+            qos2_inbound.remove(&id);
+        }
+    }
+}
+
+/// Mark a `QoS` 2 packet id's dedup record ACKNOWLEDGED — the one fact that licenses
+/// answering a later DUP of that id from the window rather than fanning it out again
+/// (issue #238).
+///
+/// Must complete BEFORE the success PUBREC reaches the wire (ADR 0057's write-before-send
+/// rule): a crash in the PUBREC→PUBREL window that lost this bit would make the
+/// post-failover resend re-fan-out.
+///
+/// Returns `false` when the durable write failed — the caller must then WITHHOLD the
+/// PUBREC and close (the same fail-closed posture `record_received` takes), because a
+/// success PUBREC the durable record cannot back would re-fan-out after a failover.
+async fn ack_qos2_dedup(
+    policy: &ConnPolicy,
+    qos2_inbound: &mut HashMap<u16, bool>,
+    client: &ClientId,
+    id: u16,
+) -> bool {
+    if let Some(store) = &policy.store {
+        store.ack_received(client, id).await.is_ok()
+    } else {
+        qos2_inbound.insert(id, true);
+        true
+    }
 }
 
 /// Per-connection inbound publish-rate limiter (ADR 0041 T3): a token bucket
@@ -1854,7 +1991,29 @@ impl PublishRateLimiter {
     }
 }
 
-/// Handle one inbound packet. Returns `Ok(true)` if the connection should close.
+/// What an inbound packet's handling means for the connection — and therefore
+/// whether the client's Will fires when it ends.
+///
+/// The distinction is load-bearing, not bookkeeping (issue #238): `Hub::detach`
+/// publishes the Will on any end that is **not** a client DISCONNECT
+/// [MQTT-3.14.4-3], so collapsing "the client asked to go" and "the broker hung up
+/// on it" into one `bool` suppresses the Will on every broker-initiated close — a
+/// protocol violation, and one that a refusal-under-brownout makes routine (a
+/// v3.1.1 publisher's refused publish closes the connection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketOutcome {
+    /// Keep serving.
+    Continue,
+    /// The client asked to close (DISCONNECT): graceful, and the Will is discarded
+    /// [MQTT-3.14.4-3].
+    ClientDisconnect,
+    /// The BROKER is closing: a protocol violation, a refusal this protocol version
+    /// cannot say any other way, or a hub that went away. Un-graceful — the Will
+    /// fires, exactly as for an EOF or a keepalive expiry.
+    BrokerClose,
+}
+
+/// Handle one inbound packet.
 // One arm per packet type; a flat dispatch table, not a refactor smell.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // a connection's full inbound-handling context
@@ -1865,15 +2024,17 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     client: &ClientId,
     principal: &Identity,
     policy: &ConnPolicy,
-    qos2_inbound: &mut HashSet<u16>,
+    qos2_inbound: &mut HashMap<u16, bool>,
     qos2_inflight: &mut usize,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
-) -> Result<bool, NetError> {
+) -> Result<PacketOutcome, NetError> {
     match packet {
         Packet::Publish(publish) => {
             // A wildcard topic is a protocol violation: close the connection.
-            if handle_publish(
+            // Never `ClientDisconnect` — every close a publish can cause is the
+            // BROKER's, so the Will must fire.
+            match handle_publish(
                 publish,
                 writer,
                 hub,
@@ -1887,21 +2048,18 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             )
             .await?
             {
-                return Ok(true);
+                PacketOutcome::Continue => {}
+                end => return Ok(end),
             }
         }
         // QoS 2 publisher-side release: the id may be reused afterwards. (A v5
         // reason code on these acks is not acted on yet — workstream G.)
         Packet::PubRel(ack) => {
             let id = ack.pkid;
-            match &policy.store {
-                Some(store) => {
-                    let _ = store.clear_received(client, id).await;
-                }
-                None => {
-                    qos2_inbound.remove(&id);
-                }
-            }
+            // Clears the record in EITHER state (today's lenient behaviour, unchanged):
+            // a PUBREL for an id we never acked still ends the flow the client believes
+            // in, and answering PUBCOMP is the only forward-progress move.
+            release_qos2_dedup(policy, qos2_inbound, client, id).await;
             // The QoS 2 id is released — free its Receive-Maximum slot (ADR 0012).
             *qos2_inflight = qos2_inflight.saturating_sub(1);
             writer.send(&Packet::PubComp(id.into())).await?;
@@ -1946,7 +2104,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 warn!(client = %client.0,
                       "SUBSCRIBE carries a Subscription Identifier, which this server does not support; DISCONNECT 0xA1");
                 disconnect(writer, DISCONNECT_SUBSCRIPTION_IDS_NOT_SUPPORTED).await?;
-                return Ok(true);
+                // A broker-initiated close (the client did not DISCONNECT): the Will fires.
+                return Ok(PacketOutcome::BrokerClose);
             }
             // ACL gate per filter (ADR 0004 step 3): denied filters answer
             // 0x80 [MQTT-3.9.3] and never reach the hub; granted filters get
@@ -2000,7 +2159,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     reply: Some(reply_tx),
                 });
                 let Ok(verdicts) = reply_rx.await else {
-                    return Ok(true); // hub shut down mid-subscribe: close
+                    // Hub shut down mid-subscribe: the BROKER closes, so this is
+                    // not a graceful client end.
+                    return Ok(PacketOutcome::BrokerClose);
                 };
                 let denied_code = if is_v5 {
                     reason::QUOTA_EXCEEDED
@@ -2032,10 +2193,10 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             writer.send(&Packet::UnsubAck(u.pkid.into())).await?;
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
-        Packet::Disconnect(_) => return Ok(true),
+        Packet::Disconnect(_) => return Ok(PacketOutcome::ClientDisconnect),
         other => debug!(packet = ?other.packet_type(), "ignoring unexpected packet"),
     }
-    Ok(false)
+    Ok(PacketOutcome::Continue)
 }
 
 #[cfg(test)]
@@ -2252,11 +2413,18 @@ mod tests {
             &self,
             client: &mqtt_core::ClientId,
             packet_id: u16,
-        ) -> Result<bool, mqtt_storage::StorageError> {
+        ) -> Result<mqtt_storage::InboundSighting, mqtt_storage::StorageError> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(mqtt_storage::StorageError::NoQuorum);
             }
             self.inner.record_received(client, packet_id).await
+        }
+        async fn ack_received(
+            &self,
+            client: &mqtt_core::ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_received(client, packet_id).await
         }
         async fn clear_received(
             &self,
@@ -3307,6 +3475,411 @@ mod tests {
             None,
             "a QoS2 dedup store error must withhold the PUBREC and close, not ack a \
              message whose dedup window does not exist"
+        );
+    }
+
+    /// Hub stub that REFUSES every gated publish with `r`, reporting each topic it
+    /// saw on the returned channel — the seam for the issue #238 / 0041-T11
+    /// per-version refusal mapping (the real hub's brownout answer).
+    fn stub_hub_refusing(
+        hub_rx: mpsc::UnboundedReceiver<HubCommand>,
+        r: crate::hub::PublishRefusal,
+    ) -> mpsc::UnboundedReceiver<String> {
+        stub_hub_refusing_watching_detach(hub_rx, Some(r)).0
+    }
+
+    /// [`stub_hub_refusing`], plus the `graceful` flag of each `Detach` it sees — the seam
+    /// for issue #238's R1: a broker-initiated close must NOT be reported as a clean client
+    /// DISCONNECT, or `Hub::detach` skips the Will [MQTT-3.14.4-3]. `None` accepts every
+    /// publish (the control direction).
+    #[allow(clippy::type_complexity)]
+    fn stub_hub_refusing_watching_detach(
+        mut hub_rx: mpsc::UnboundedReceiver<HubCommand>,
+        r: Option<crate::hub::PublishRefusal>,
+    ) -> (
+        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<bool>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (detach_tx, detach_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                match cmd {
+                    HubCommand::Attach {
+                        outbound, reply, ..
+                    } => {
+                        keep_alive.push(outbound);
+                        let _ = reply.send(AttachOutcome::Present(false));
+                    }
+                    HubCommand::Publish { topic, done, .. } => {
+                        let _ = tx.send(topic);
+                        if let Some(done) = done {
+                            let _ = done.send(match r {
+                                Some(r) => crate::hub::PublishOutcome::Refused(r),
+                                None => crate::hub::PublishOutcome::Accepted,
+                            });
+                        }
+                    }
+                    HubCommand::Detach { graceful, .. } => {
+                        let _ = detach_tx.send(graceful);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (rx, detach_rx)
+    }
+
+    /// A connection over an in-memory duplex framed at `version`, with a durable
+    /// session store (so the `QoS` 2 dedup window survives the connection).
+    fn conn_with_store_at(
+        store: Arc<dyn mqtt_storage::SessionStore>,
+        version: ProtocolVersion,
+    ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(ConnPolicy {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            })),
+            authz: authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: None,
+            node: None,
+            store: Some(store),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: None,
+        });
+        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (
+            FrameReader::new(rh, version),
+            FrameWriter::new(wh, version),
+            hub_rx,
+        )
+    }
+
+    /// The next topic the refusing stub saw, bounded so a regression fails fast
+    /// instead of hanging until the channel closes.
+    async fn next_topic(rx: &mut mpsc::UnboundedReceiver<String>) -> Option<String> {
+        timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn qos1_publish(id: u16) -> Packet {
+        Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            topic: "t".to_string(),
+            pkid: Some(id),
+            payload: Bytes::from_static(b"x"),
+        })
+    }
+
+    /// Issue #238 / 0041-T11 — a v5 publisher whose publish the hub REFUSES is told
+    /// `0x97 Quota exceeded` on the PUBACK, and the connection stays open. A reason
+    /// >= 0x80 ends the flow: the Receive-Maximum slot is released and the packet id
+    /// is reusable, so the refusal is bounded and immediately actionable.
+    #[tokio::test]
+    async fn a_v5_publisher_is_answered_0x97_when_the_hub_refuses_the_publish() {
+        let (mut reader, mut writer, hub_rx) = v5_pipe();
+        let _topics = stub_hub_refusing(hub_rx, crate::hub::PublishRefusal::Brownout);
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos1_publish(1)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(
+                    a.reason,
+                    mqtt_codec::reason::QUOTA_EXCEEDED,
+                    "a refused publish is answered 0x97, not acked"
+                );
+            }
+            other => panic!("expected PUBACK 0x97, got {other:?}"),
+        }
+        // Still open: the refusal is per-publish, not a connection verdict.
+        writer.send(&qos1_publish(2)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => assert_eq!(a.pkid, 2),
+            other => panic!("the connection must stay open, got {other:?}"),
+        }
+    }
+
+    /// Issue #238 — v3.1.1 has no PUBACK reason byte, so each refusal must state
+    /// whether it is *sayable* as a plain ack. `Brownout` is not: the message was
+    /// not stored, so the honest answer is no ack and a close, and the publisher
+    /// retries per [MQTT-4.4.0-1]. `RetainedQuota` is: the value was deliberately
+    /// not retained and a retry would change nothing, so the plain ack stands.
+    #[tokio::test]
+    async fn a_v311_publisher_is_closed_without_a_puback_when_the_hub_refuses_a_brownout_publish() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let _topics = stub_hub_refusing(hub_rx, crate::hub::PublishRefusal::Brownout);
+        writer.send(&connect_packet("c", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos1_publish(1)).await.unwrap();
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "a v3.1.1 publisher must NOT be acked for a message brownout refused; \
+             the connection closes and it retries"
+        );
+
+        // The sibling disposition must not be conflated with it.
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let _topics = stub_hub_refusing(hub_rx, crate::hub::PublishRefusal::RetainedQuota);
+        writer.send(&connect_packet("c", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        writer.send(&qos1_publish(1)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(a.reason, 0, "v3.1.1 has no reason byte to carry");
+            }
+            other => panic!("expected a plain PUBACK, got {other:?}"),
+        }
+        writer.send(&qos1_publish(2)).await.unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => assert_eq!(a.pkid, 2, "and the connection stays open"),
+            other => panic!("the connection must stay open, got {other:?}"),
+        }
+    }
+
+    /// Issue #238, the `QoS` 2 half. REPLACES an earlier test
+    /// (`a_refused_qos2_publish_releases_the_packet_id_for_both_protocol_versions`) which
+    /// asserted that the two CLOSE exits erase the dedup record. Erasing it re-fans-out
+    /// the client's mandatory resend [MQTT-4.4.0-1] — and the first attempt may already
+    /// have stored or delivered copies — so that test codified the defect rather than
+    /// guarding against it. The record must stay HELD-UNACKED instead: the truth is that
+    /// the broker said nothing.
+    #[tokio::test]
+    async fn a_withheld_qos2_publish_stays_held_but_unacked_so_its_resend_is_never_answered_as_a_duplicate(
+    ) {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let cid = mqtt_core::ClientId("q2".into());
+        let (mut reader, mut writer, hub_rx) = conn_with_store_at(store.clone(), V4);
+        let mut topics = stub_hub_refusing(hub_rx, crate::hub::PublishRefusal::Brownout);
+        writer.send(&connect_packet("q2", false)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "no PUBREC for a refused v3.1.1 QoS 2 publish; the connection closes"
+        );
+        assert_eq!(
+            store.received(&cid).await.unwrap(),
+            vec![1],
+            "the id stays HELD: the broker has seen it"
+        );
+        assert_eq!(
+            store.record_received(&cid, 1).await.unwrap(),
+            mqtt_storage::InboundSighting::HeldUnacked,
+            "and UNACKNOWLEDGED: nothing was ever said about it"
+        );
+
+        // The resend on a fresh connection must reach ROUTING again — re-decided, not
+        // answered from a window whose entry never earned a PUBREC.
+        let (mut reader, mut writer, hub_rx) = conn_with_store_at(store, V4);
+        let mut topics = stub_hub_refusing(hub_rx, crate::hub::PublishRefusal::Brownout);
+        writer.send(&connect_packet("q2", false)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(
+            next_topic(&mut topics).await.as_deref(),
+            Some("t"),
+            "the resend after the close must be re-decided, not answered as a duplicate"
+        );
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "and still refused: no fabricated success PUBREC"
+        );
+    }
+
+    /// The anti-vacuity partner: the fix must not simply stop deduplicating. An ACCEPTED
+    /// `QoS` 2 publish marks its id acked BEFORE the PUBREC reaches the wire, so its DUP
+    /// is answered from the window with no second fan-out [MQTT-4.3.3-2].
+    #[tokio::test]
+    async fn an_accepted_qos2_publish_marks_the_id_acked_before_the_pubrec_so_its_dup_is_answered_from_the_window(
+    ) {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let cid = mqtt_core::ClientId("q2ok".into());
+        let (mut reader, mut writer, hub_rx) = conn_with_store_at(store.clone(), V4);
+        let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_packet("q2ok", false)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(1.into())));
+        assert_eq!(
+            store.record_received(&cid, 1).await.unwrap(),
+            mqtt_storage::InboundSighting::HeldAcked,
+            "the acked bit lands with (in fact before) the PUBREC"
+        );
+
+        // A DUP of an acknowledged flow: PUBREC again, and NO second fan-out.
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubRec(1.into())));
+        assert_eq!(
+            next_topic(&mut topics).await,
+            None,
+            "an acknowledged id must never be fanned out twice"
+        );
+
+        // PUBREL frees the id entirely.
+        writer
+            .send(&Packet::PubRel(mqtt_codec::packet::Ack::from(1)))
+            .await
+            .unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(1.into())));
+        assert!(store.received(&cid).await.unwrap().is_empty());
+    }
+
+    /// A v5 `PUBREC >= 0x80` ENDS the flow by spec, so the id must be freed COMPLETELY —
+    /// not merely left unacked. Both sides consider it finished; a lingering record would
+    /// make a legitimate reuse of the id look like a retry of a different message.
+    #[tokio::test]
+    async fn a_v5_qos2_refusal_ends_the_flow_and_frees_the_id_completely() {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let cid = mqtt_core::ClientId("q2v5".into());
+        let (mut reader, mut writer, hub_rx) = conn_with_store_at(store.clone(), V5);
+        let mut topics = stub_hub_refusing(hub_rx, crate::hub::PublishRefusal::Brownout);
+        writer.send(&connect_v5("q2v5", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(a.reason, mqtt_codec::reason::QUOTA_EXCEEDED);
+            }
+            other => panic!("expected PUBREC 0x97, got {other:?}"),
+        }
+        assert!(
+            store.received(&cid).await.unwrap().is_empty(),
+            "a reason >= 0x80 releases the packet id entirely"
+        );
+        // A later publish under the same id is a genuinely NEW sighting and reaches
+        // routing.
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+    }
+
+    /// The pre-existing hub-gone hole, now guarded (issue #238): the `Err(_)` arm at the
+    /// ack gate had no test at all — deleting its behaviour left every test green. A
+    /// withheld PUBREC says nothing, so the record must stay held-unacked and the resend
+    /// must be re-attempted.
+    #[tokio::test]
+    async fn a_qos2_publish_whose_durable_fan_out_failed_stays_held_unacked_and_is_re_attempted() {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let cid = mqtt_core::ClientId("q2drop".into());
+        let (mut reader, mut writer, mut hub_rx) = conn_with_store_at(store.clone(), V4);
+        // A hub that DROPS the `done` sender for every publish — the withhold path.
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                match cmd {
+                    HubCommand::Attach {
+                        outbound, reply, ..
+                    } => {
+                        keep_alive.push(outbound);
+                        let _ = reply.send(AttachOutcome::Present(false));
+                    }
+                    HubCommand::Publish { topic, done, .. } => {
+                        let _ = seen_tx.send(topic);
+                        drop(done); // withhold: the fan-out failed terminally
+                    }
+                    _ => {}
+                }
+            }
+        });
+        writer.send(&connect_packet("q2drop", false)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos2_publish(1)).await.unwrap();
+        assert_eq!(next_topic(&mut seen).await.as_deref(), Some("t"));
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "no PUBREC, connection closed"
+        );
+        assert_eq!(
+            store.record_received(&cid, 1).await.unwrap(),
+            mqtt_storage::InboundSighting::HeldUnacked,
+            "a withheld PUBREC leaves the id held-but-unacknowledged"
+        );
+    }
+
+    /// Issue #238 (R1) — a broker-initiated close must NOT be reported to the hub as a
+    /// graceful client DISCONNECT, or `Hub::detach` skips the Will [MQTT-3.14.4-3].
+    ///
+    /// Concretely: a v3.1.1 device publishing `QoS` 1 telemetry into a browned-out node is
+    /// disconnected with no PUBACK. If that close is `graceful`, its LWT never fires and
+    /// every dashboard keeps showing the device as online — through exactly the incident
+    /// the Will exists for.
+    #[tokio::test]
+    async fn a_v311_publisher_closed_by_a_refusal_detaches_ungracefully_so_its_will_fires() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let (_topics, mut detaches) =
+            stub_hub_refusing_watching_detach(hub_rx, Some(crate::hub::PublishRefusal::Brownout));
+        writer.send(&connect_packet("willy", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer.send(&qos1_publish(1)).await.unwrap();
+        assert_eq!(recv(&mut reader).await, None, "refused: no PUBACK, closed");
+        assert!(
+            !timeout(Duration::from_millis(500), detaches.recv())
+                .await
+                .expect("a Detach reaches the hub")
+                .expect("the channel is open"),
+            "the broker hung up, so this is NOT a clean client DISCONNECT — the Will \
+             must fire [MQTT-3.14.4-3]"
+        );
+    }
+
+    /// The other side of R1: a client that actually sends DISCONNECT IS graceful, so its
+    /// Will is discarded. Without this, "report every close as ungraceful" would pass the
+    /// test above while breaking the spec in the other direction.
+    #[tokio::test]
+    async fn a_client_disconnect_is_still_reported_as_graceful() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let (_topics, mut detaches) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_packet("bye", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer
+            .send(&Packet::Disconnect(mqtt_codec::packet::Disconnect {
+                reason: 0,
+                properties: mqtt_codec::Properties::new(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(500), detaches.recv())
+                .await
+                .expect("a Detach reaches the hub")
+                .expect("the channel is open"),
+            "a client DISCONNECT discards the will [MQTT-3.14.4-3]"
         );
     }
 

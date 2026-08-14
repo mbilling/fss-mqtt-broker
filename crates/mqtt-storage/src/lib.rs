@@ -147,6 +147,32 @@ pub enum Enqueued {
     Rejected,
 }
 
+/// What the inbound QoS-2 dedup window already knew about a packet id
+/// ([`SessionStore::record_received`]).
+///
+/// Three states, not two, and the third is the point (issue #238). MQTT's exactly-once
+/// guarantee [MQTT-4.3.3-2] is a promise about flows the broker ACKNOWLEDGED: a client
+/// whose PUBLISH earned no PUBREC MUST resend it [MQTT-4.4.0-1], and answering that
+/// mandatory resend from the window would fabricate a success PUBREC for a message
+/// nothing stored. Erasing the record instead re-fans-out a flow whose first attempt may
+/// already have stored or delivered copies. So the window remembers the
+/// ACKNOWLEDGEMENT — stable, one bit, version-free — rather than the reason for the
+/// refusal, which is transient (brownout lifts) and would leak a growing enum into the
+/// on-disk schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundSighting {
+    /// Never seen before. The record has just been written, held-but-unacknowledged.
+    Fresh,
+    /// Held, and its PUBREC was never released: the broker saw this id, attempted a
+    /// fan-out and told the client NOTHING. Treat the resend exactly like a first
+    /// sighting — re-decide it — except that no new record is written.
+    HeldUnacked,
+    /// Held, and its PUBREC WAS released. The only state that may answer a DUP with a
+    /// plain success PUBREC and no fan-out, because it is the only state in which the
+    /// exactly-once promise was ever made.
+    HeldAcked,
+}
+
 /// Outcome of [`claim_session`](SessionStore::claim_session): whether the connecting
 /// identity may use this client id's persistent session ([ADR 0031]).
 ///
@@ -260,10 +286,13 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// not-yet-truncated messages after a failover is spec-legal for `QoS` 1.
     async fn ack(&self, client: &ClientId, up_to: Offset) -> Result<(), StorageError>;
 
-    /// Record receipt of an inbound QoS-2 PUBLISH with `packet_id` (the
-    /// exactly-once dedup window). Returns `true` if newly recorded, `false` if
-    /// `packet_id` was already present — a duplicate re-send the broker must not
-    /// deliver again.
+    /// Record a sighting of an inbound QoS-2 PUBLISH with `packet_id`, and report what
+    /// the exactly-once dedup window already knew about it.
+    ///
+    /// The window remembers TWO facts per id: that the id is held, and whether its
+    /// PUBREC was ever released (see [`Self::ack_received`]). One bit, not the reason —
+    /// see [`InboundSighting`] for why the distinction is the whole of issue #238's
+    /// `QoS` 2 half.
     ///
     /// This is **replicated session state**: surviving failover is what keeps
     /// exactly-once holding across an owner change (ADR 0001 §5, ADR 0006 §4).
@@ -271,12 +300,22 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         &self,
         client: &ClientId,
         packet_id: u16,
-    ) -> Result<bool, StorageError>;
+    ) -> Result<InboundSighting, StorageError>;
 
-    /// Clear `packet_id` from the QoS-2 dedup window once its PUBREL completes.
+    /// Mark `packet_id`'s PUBREC as released, so a later DUP of that id may be
+    /// answered from the window instead of being fanned out again.
+    ///
+    /// MUST be durable BEFORE the success PUBREC reaches the wire — the write-before-send
+    /// rule of ADR 0057 / #124. A crash in the PUBREC→PUBREL window that lost the acked
+    /// bit would make the post-failover resend re-fan-out, which is the very duplicate
+    /// this records against.
+    async fn ack_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError>;
+
+    /// Clear `packet_id` from the QoS-2 dedup window once its PUBREL completes (or the
+    /// flow ends at a v5 PUBREC ≥ 0x80, which frees the id by spec).
     async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError>;
 
-    /// The QoS-2 packet ids currently received-but-not-completed, ascending — for
+    /// The QoS-2 packet ids currently held — acknowledged or not — ascending, for
     /// resume / takeover reconciliation.
     async fn received(&self, client: &ClientId) -> Result<Vec<u16>, StorageError>;
 
@@ -439,6 +478,9 @@ struct SessionEntry {
     next_offset: Offset,
     /// QoS-2 inbound packet ids received but not yet PUBREL-completed (dedup).
     received_qos2: BTreeSet<u16>,
+    /// The SUBSET of `received_qos2` whose PUBREC was never released (issue #238).
+    /// Mirrors the on-disk shape in `logged.rs` so the two implementations cannot drift.
+    unacked_qos2: BTreeSet<u16>,
     /// Outbound QoS-2 in-flight: packet id → (queue offset, PUBREC seen). ADR 0057.
     outbound_qos2: BTreeMap<u16, (Offset, bool)>,
     /// Last outbound packet id allocated (0 = none yet).
@@ -612,18 +654,31 @@ impl SessionStore for MemorySessionStore {
         &self,
         client: &ClientId,
         packet_id: u16,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<InboundSighting, StorageError> {
         let mut map = self.lock();
-        Ok(map
-            .entry(client.clone())
-            .or_default()
-            .received_qos2
-            .insert(packet_id))
+        let entry = map.entry(client.clone()).or_default();
+        if entry.received_qos2.insert(packet_id) {
+            entry.unacked_qos2.insert(packet_id);
+            return Ok(InboundSighting::Fresh);
+        }
+        Ok(if entry.unacked_qos2.contains(&packet_id) {
+            InboundSighting::HeldUnacked
+        } else {
+            InboundSighting::HeldAcked
+        })
+    }
+
+    async fn ack_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        if let Some(entry) = self.lock().get_mut(client) {
+            entry.unacked_qos2.remove(&packet_id);
+        }
+        Ok(())
     }
 
     async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
         if let Some(entry) = self.lock().get_mut(client) {
             entry.received_qos2.remove(&packet_id);
+            entry.unacked_qos2.remove(&packet_id);
         }
         Ok(())
     }
@@ -806,8 +861,8 @@ impl RetainedStore for MemoryRetainedStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        Enqueued, MemoryRetainedStore, MemorySessionStore, Offset, OverflowPolicy, QueueLimits,
-        RetainedStore, SessionClaim, SessionStore,
+        Enqueued, InboundSighting, MemoryRetainedStore, MemorySessionStore, Offset, OverflowPolicy,
+        QueueLimits, RetainedStore, SessionClaim, SessionStore,
     };
     use mqtt_core::{ClientId, Message, QoS};
 
@@ -1003,15 +1058,34 @@ mod tests {
     async fn qos2_dedup_and_packet_id_allocation() {
         let store = MemorySessionStore::new();
         let c = cid("client");
-        // First receipt of a packet id is new; a duplicate re-send is not.
-        assert!(store.record_received(&c, 7).await.unwrap());
-        assert!(!store.record_received(&c, 7).await.unwrap());
-        assert!(store.record_received(&c, 9).await.unwrap());
+        // First receipt of a packet id is new; a duplicate re-send is not. Until its
+        // PUBREC is released the duplicate reports HELD-UNACKED, not HELD-ACKED
+        // (issue #238): the broker has said nothing about it yet.
+        assert_eq!(
+            store.record_received(&c, 7).await.unwrap(),
+            InboundSighting::Fresh
+        );
+        assert_eq!(
+            store.record_received(&c, 7).await.unwrap(),
+            InboundSighting::HeldUnacked
+        );
+        store.ack_received(&c, 7).await.unwrap();
+        assert_eq!(
+            store.record_received(&c, 7).await.unwrap(),
+            InboundSighting::HeldAcked
+        );
+        assert_eq!(
+            store.record_received(&c, 9).await.unwrap(),
+            InboundSighting::Fresh
+        );
         assert_eq!(store.received(&c).await.unwrap(), vec![7, 9]);
         // Completing one frees it; a later re-use is new again.
         store.clear_received(&c, 7).await.unwrap();
         assert_eq!(store.received(&c).await.unwrap(), vec![9]);
-        assert!(store.record_received(&c, 7).await.unwrap());
+        assert_eq!(
+            store.record_received(&c, 7).await.unwrap(),
+            InboundSighting::Fresh
+        );
 
         // Outbound packet ids advance 1, 2, 3, ... (never 0).
         let p = cid("producer");

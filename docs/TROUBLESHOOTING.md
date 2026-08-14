@@ -46,6 +46,50 @@ nothing and there is no obvious failure.
 - **No ACL configured is worse, not better:** with no `MQTTD_ACL_FILE` the broker runs
   permissive and logs an INSECURE warning at startup — every client may publish anywhere, so
   a *different* client's data may be landing where you don't expect.
+- **Brownout is (almost) no longer a cause of this symptom.** It used to be: above a
+  watermark the broker refused the durable enqueue and acked the publisher anyway. Since
+  issue #238 it refuses the publisher instead, which surfaces as the next entry rather
+  than as silence. Two acked-and-shed arms remain, stated where the durability claim is
+  made (README): a v3.1.1 **retained** publish under brownout or over the retained quota
+  is acked and delivered live but its retained *value* is not stored, and the offline
+  queue's overflow policy (default `drop-oldest`) truncates already-acked entries at the
+  cap — check `publish_dropped{reason="queue-overflow"}` and
+  `quota_rejections_total{reason="retained"}`.
+
+## Publishes are refused (`0x97`) or the connection closes without a PUBACK
+
+**Symptom:** a v5 publisher gets `PUBACK`/`PUBREC` with reason `0x97 Quota exceeded`; a
+v3.1.1 publisher gets **no PUBACK at all** and its connection is closed (a
+`CleanSession=0` publisher resends the message on reconnect; a clean-session one does
+not).
+
+- **Most likely: brownout.** Above `MQTTD_STORE_MAX_BYTES` or `MQTTD_MEMORY_MAX_BYTES` a
+  `QoS` ≥ 1 publish that needs a durable append (any persistent subscriber) is refused
+  rather than acked — v3.1.1 has no reason byte, so a close is the only honest way to say
+  it. The watermark may be on a **different node** than the one the publisher dialed: the
+  refusal crosses the peer bus as a verdict, so check `mqttd_brownout` on every node.
+  (Mid-rolling-upgrade, a link to an older build degrades to a withheld ack and a close,
+  so a v5 publisher can briefly see the v3.1.1 answer.) **Nothing acked was lost** — the
+  publisher was answered instead of lied to. Whether the message is re-sent is the
+  application's decision, not a protocol guarantee: a v5 `PUBACK`/`PUBREC` with reason
+  ≥ `0x80` completes the packet-id lifecycle, so no client library retransmits it on its
+  own.
+- **Diagnose:** `mqttd_brownout{axis}` says whether it is on and which axis;
+  `rate(mqttd_quota_rejections_total{reason="brownout-publish"}[5m])` says publishers are
+  being refused; compare `mqttd_store_bytes` with `mqttd_store_max_bytes` and
+  `mqttd_process_resident_bytes` with `mqttd_memory_max_bytes`; `/statusz` reports the
+  onset.
+- **Remedy:** expand the disk / raise the watermark / prune retained topics / let
+  subscribers drain their queues. Brownout refuses only *growth*, so consumption, deletes
+  and expiry shrink the store until the edge lifts on its own.
+- **Also possible: the retained quota.** `MQTTD_MAX_RETAINED_MESSAGES` answers a v5
+  retained publish creating a *new* topic with the same `0x97`. For **v3.1.1 retained**
+  publishes, note that both the quota *and* brownout keep the plain PUBACK when no durable
+  enqueue is owed (delivered live, not retained) — so a plain PUBACK does **not** rule
+  brownout out. A *close* with no PUBACK points at brownout's durable-enqueue refusal; to
+  discriminate, read `mqttd_brownout{axis}` and the counters —
+  `quota_rejections_total{reason="retained"}` (retained growth, quota or brownout) vs
+  `{reason="brownout-publish"}` (a refused durable enqueue).
 
 ## `/readyz` returns not-ready but the broker is running
 

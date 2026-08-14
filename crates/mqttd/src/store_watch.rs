@@ -4,11 +4,43 @@
 //! A small poller stats each redb store file under the data directory, exports
 //! its size as the `store_bytes{store}` gauge (ADR 0020), and — when
 //! `MQTTD_STORE_MAX_BYTES` is set — drives the hub's **brownout** flag on
-//! watermark transitions: above it, writes that *grow* durable state (new
-//! retained topics, new sessions, offline enqueues) are refused with the quota
-//! behaviors while acks, deletes, expiry, and resumes continue. A broker
-//! approaching disk-full degrades to read-mostly instead of hitting the cliff
-//! where redb commits start failing mid-write.
+//! watermark transitions: above it, writes that *grow* durable state are refused
+//! while acks, deletes, expiry, and resumes continue. A broker approaching
+//! disk-full degrades to read-mostly instead of hitting the cliff where redb
+//! commits start failing mid-write.
+//!
+//! **What "refused" means to the client**, per growth write — the ambiguity in the
+//! sentence above is what produced issue #238, so it is spelled out here rather
+//! than left to the reader:
+//!
+//! - a NEW SESSION: the CONNECT is refused (`0x97` for v5, `0x03` for v3.1.1);
+//! - an OFFLINE/DURABLE ENQUEUE a `QoS` ≥ 1 subscriber is owed: the PUBLISHER is
+//!   refused, not acked (0041-T11) — a v5 publisher is told `0x97`, a v3.1.1
+//!   publisher gets no PUBACK and a close, and nothing is stored or delivered.
+//!   Cross-node, the refusal travels as a peer-bus verdict at proto ≥ 7; against an
+//!   older peer it degrades to a withheld ack (0041-T12);
+//! - a NEW RETAINED TOPIC: refused as over-quota (`0x97` for v5; a v3.1.1 retained
+//!   publish is delivered live and answered with a plain PUBACK, its retained value
+//!   simply not stored);
+//! - an UNGATED publish (a Will, a retained-window back-fill): there is no publisher
+//!   to refuse, so the durable copy is dropped and COUNTED as a drop while the live
+//!   delivery still happens — suppressing it would destroy the message outright.
+//!
+//! Nothing that owes no durable growth is affected: `QoS` 0, clean sessions, and
+//! every ack, read, delete, expiry and resume continue.
+//!
+//! **"Growth is refused" is not airtight**, and sizing headroom against it as if it
+//! were would repeat #238's mistake in the other direction. Three growth writes are
+//! deliberately NOT gated, because each protects an honesty property worth more than
+//! the bytes: the inbound `QoS` 2 dedup record (session metadata written BEFORE the
+//! hub decides, so a refusal can never race a duplicate — issue #165's ordering);
+//! SUBSCRIBE persistence (a session's subscription set, bounded by
+//! `max_subscriptions_per_client`); and the detach backlog spill (messages already
+//! accepted while the subscriber was attached — refusing them at detach would drop
+//! acked messages). All three are small (metadata and already-owed entries, never new
+//! message payloads at publish time), but a sustained brownout with active clients
+//! does keep growing the sessions store slowly. The watermark must be set with real
+//! headroom below disk-full, not at it.
 
 use crate::hub::{BrownoutAxis, HubCommand};
 use mqtt_observability::metrics::Metrics;

@@ -42,8 +42,8 @@
 
 use crate::repl::{ReplError, ReplicatedLog};
 use crate::{
-    Enqueued, OutboundInflight, QueueLimits, QueuedMessage, SessionClaim, SessionScan,
-    SessionStore, StorageError,
+    Enqueued, InboundSighting, OutboundInflight, QueueLimits, QueuedMessage, SessionClaim,
+    SessionScan, SessionStore, StorageError,
 };
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
@@ -273,18 +273,41 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         &self,
         client: &ClientId,
         packet_id: u16,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<InboundSighting, StorageError> {
         let mut meta = self.load_meta(client).await?.unwrap_or_default();
         let newly = meta.received_qos2.insert(packet_id);
+        if newly {
+            // Written HELD-UNACKED: the broker has seen the id but told the client
+            // nothing yet, which is the truth until a success PUBREC goes out.
+            meta.unacked_received_qos2.insert(packet_id);
+        }
         // Always persist: even a duplicate must have materialized the session, and
         // the durable write is what gates the QoS-2 PUBREC.
         self.store_meta(client, &meta).await?;
-        Ok(newly)
+        Ok(if newly {
+            InboundSighting::Fresh
+        } else if meta.unacked_received_qos2.contains(&packet_id) {
+            InboundSighting::HeldUnacked
+        } else {
+            InboundSighting::HeldAcked
+        })
+    }
+
+    async fn ack_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
+        if let Some(mut meta) = self.load_meta(client).await? {
+            // Persist only when it changed, mirroring `advance_outbound`'s no-op guard.
+            if meta.unacked_received_qos2.remove(&packet_id) {
+                self.store_meta(client, &meta).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn clear_received(&self, client: &ClientId, packet_id: u16) -> Result<(), StorageError> {
         if let Some(mut meta) = self.load_meta(client).await? {
-            if meta.received_qos2.remove(&packet_id) {
+            let held = meta.received_qos2.remove(&packet_id);
+            let unacked = meta.unacked_received_qos2.remove(&packet_id);
+            if held || unacked {
                 self.store_meta(client, &meta).await?;
             }
         }
@@ -465,7 +488,16 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
 #[derive(Default)]
 struct SessionMeta {
     subscriptions: Vec<Subscription>,
-    /// QoS-2 inbound packet ids received but not yet PUBREL-completed (dedup).
+    /// QoS-2 inbound packet ids received but not yet PUBREL-completed (dedup) —
+    /// acknowledged or not.
+    ///
+    /// **Codec contract**: this block MUST NOT be widened in place (e.g. to
+    /// `[u16 id][u8 acked]`). It sits mid-record, so an older `decode_session_meta`
+    /// would read the extra byte as part of the next id and DESYNCHRONISE every field
+    /// after it — `last_packet_id`, the expiry deadline, the owner, the outbound window:
+    /// silent corruption of session metadata on rollback, which is exactly what
+    /// ADR 0058 clause 3 forbids. The acked bit therefore lives in a STRICTLY TRAILING
+    /// block instead (`unacked_received_qos2`).
     received_qos2: BTreeSet<u16>,
     /// Last outbound packet id allocated (0 = none yet).
     last_packet_id: u16,
@@ -484,6 +516,17 @@ struct SessionMeta {
     /// low-churn — bounded by the client's receive maximum, mutated once per handshake
     /// phase.
     outbound_qos2: std::collections::BTreeMap<u16, (u64, bool)>,
+    /// The SUBSET of `received_qos2` whose PUBREC was never released (issue #238).
+    ///
+    /// Appended STRICTLY LAST and emitted only when NON-EMPTY, so a session with nothing
+    /// unacknowledged encodes byte-for-byte what the pre-#238 build encoded. Compatible
+    /// in both directions by the same EOF-defaulting discipline as `session_expiry_at`
+    /// (ADR 0009 §3), `owner` (ADR 0031) and `outbound_qos2` (ADR 0057): a new binary
+    /// reading an old record finds no block and treats every held id as ACKED (today's
+    /// behaviour), and an OLD binary reading a new record ignores the trailing bytes
+    /// entirely — degrading to the #238 `QoS` 2 bug for the duration of a downgrade, never
+    /// to corruption. That is the rollback trade, and it is named in the ADR.
+    unacked_received_qos2: BTreeSet<u16>,
 }
 
 fn qos_to_u8(q: QoS) -> u8 {
@@ -618,6 +661,17 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
         out.extend_from_slice(&id.to_be_bytes());
         out.extend_from_slice(&offset.to_be_bytes());
         out.push(u8::from(*pubrec_seen));
+    }
+    // Appended after the outbound window (issue #238), and ONLY when non-empty: a session
+    // with nothing unacknowledged therefore encodes exactly the bytes the pre-#238 build
+    // wrote, so nothing about the common record changes. An older record ends before this
+    // and decodes with every held id treated as ACKED — the pre-#238 behaviour.
+    if !m.unacked_received_qos2.is_empty() {
+        let un = u32::try_from(m.unacked_received_qos2.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&un.to_be_bytes());
+        for id in m.unacked_received_qos2.iter().take(un as usize) {
+            out.extend_from_slice(&id.to_be_bytes());
+        }
     }
     out
 }
@@ -777,6 +831,16 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
             outbound_qos2.insert(id, (offset, pubrec_seen));
         }
     }
+    // Backward-compatible (issue #238): a record written before the acked bit — or one
+    // whose session has nothing unacknowledged — ends here, and every held id decodes as
+    // ACKED, which is the pre-#238 behaviour exactly.
+    let mut unacked_received_qos2 = BTreeSet::new();
+    if !r.is_empty() {
+        let un = r.u32()? as usize;
+        for _ in 0..un {
+            unacked_received_qos2.insert(r.u16()?);
+        }
+    }
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
@@ -784,6 +848,7 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
         session_expiry_at,
         owner,
         outbound_qos2,
+        unacked_received_qos2,
     })
 }
 
@@ -791,7 +856,9 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
 mod tests {
     use super::{decode_session_meta, ReplicatedSessionStore};
     use crate::repl::{InMemoryReplicatedLog, ReplicatedLog};
-    use crate::{Enqueued, Offset, OverflowPolicy, QueueLimits, SessionClaim, SessionStore};
+    use crate::{
+        Enqueued, InboundSighting, Offset, OverflowPolicy, QueueLimits, SessionClaim, SessionStore,
+    };
     use mqtt_core::{ClientId, Message, QoS, Subscription};
     use std::sync::Arc;
 
@@ -1279,11 +1346,17 @@ mod tests {
         let c = cid("c");
 
         let writer = ReplicatedSessionStore::new(log.clone());
-        assert!(
+        assert_eq!(
             writer.record_received(&c, 5).await.unwrap(),
+            InboundSighting::Fresh,
             "first receipt"
         );
-        assert!(!writer.record_received(&c, 5).await.unwrap(), "duplicate");
+        writer.ack_received(&c, 5).await.unwrap();
+        assert_eq!(
+            writer.record_received(&c, 5).await.unwrap(),
+            InboundSighting::HeldAcked,
+            "duplicate of an ACKED flow"
+        );
         assert_eq!(writer.next_packet_id(&c).await.unwrap(), 1);
         assert_eq!(writer.next_packet_id(&c).await.unwrap(), 2);
 
@@ -1291,8 +1364,9 @@ mod tests {
         let reader = ReplicatedSessionStore::new(log.clone());
         // The dedup window survived: 5 is still "received".
         assert_eq!(reader.received(&c).await.unwrap(), vec![5]);
-        assert!(
-            !reader.record_received(&c, 5).await.unwrap(),
+        assert_eq!(
+            reader.record_received(&c, 5).await.unwrap(),
+            InboundSighting::HeldAcked,
             "5 is a duplicate to the replica too — no re-delivery after failover",
         );
         // The packet-id counter survived: allocation continues at 3, no collision.
@@ -1358,6 +1432,12 @@ mod tests {
         // the end of the owner field (1 byte for the None marker).
         let store = ReplicatedSessionStore::new(log.clone());
         store.record_received(&c, 3).await.unwrap();
+        // Acked, so the issue-#238 unacked-ids block is EMPTY and therefore omitted —
+        // the record then ends at the outbound tail exactly as it did before #238, which
+        // is what lets the byte arithmetic below stay the arithmetic the test was written
+        // with. (The block's own compatibility is covered by
+        // `session_meta_encoding_is_byte_identical_when_nothing_is_unacked`.)
+        store.ack_received(&c, 3).await.unwrap();
         store.record_outbound(&c, 9, 100).await.unwrap();
 
         let key = ReplicatedSessionStore::<Arc<InMemoryReplicatedLog>>::meta_key(&c);
@@ -1384,5 +1464,130 @@ mod tests {
             reborn.outbound(&c).await.unwrap().is_empty(),
             "the pre-0057 record reads as an empty outbound window, not an error"
         );
+    }
+
+    /// Issue #238, the failover half. An inbound `QoS` 2 id whose PUBREC was never
+    /// released must still report HELD-UNACKED to a NEW owner, so the client's mandatory
+    /// resend is re-decided there rather than answered with a fabricated success PUBREC —
+    /// the same lie, moved across a takeover.
+    #[tokio::test]
+    async fn an_unacked_inbound_qos2_id_survives_reopen_and_is_not_reported_as_a_duplicate() {
+        let log = Arc::new(InMemoryReplicatedLog::new());
+        let c = cid("c");
+
+        let writer = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            writer.record_received(&c, 5).await.unwrap(),
+            InboundSighting::Fresh
+        );
+
+        let reborn = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            reborn.received(&c).await.unwrap(),
+            vec![5],
+            "the id is still HELD after the owner change"
+        );
+        assert_eq!(
+            reborn.record_received(&c, 5).await.unwrap(),
+            InboundSighting::HeldUnacked,
+            "the new owner must not answer a never-acknowledged flow as a duplicate"
+        );
+
+        // Once the PUBREC IS released, the bit persists too — the anti-vacuity half.
+        reborn.ack_received(&c, 5).await.unwrap();
+        let reborn2 = ReplicatedSessionStore::new(log.clone());
+        assert_eq!(
+            reborn2.record_received(&c, 5).await.unwrap(),
+            InboundSighting::HeldAcked,
+            "an acknowledged flow stays exactly-once across a takeover"
+        );
+    }
+
+    /// The ADR 0058 compatibility guard for the issue-#238 metadata field, in BOTH
+    /// directions — and the guard against the shape that would corrupt.
+    ///
+    /// Widening the existing mid-record `received_qos2` block in place (to
+    /// `[u16 id][u8 acked]`) would desynchronise every field after it in an older
+    /// decoder: `last_packet_id`, the expiry deadline, the owner, the outbound window.
+    /// A purely behavioural test would never catch that, so the bytes are asserted.
+    #[test]
+    fn session_meta_encoding_is_byte_identical_when_nothing_is_unacked() {
+        use super::{encode_session_meta, SessionMeta};
+        use std::collections::BTreeSet;
+
+        let base = SessionMeta {
+            subscriptions: vec![Subscription {
+                filter: "a/#".into(),
+                max_qos: QoS::AtLeastOnce,
+                no_local: true,
+            }],
+            received_qos2: [4u16, 7].into_iter().collect(),
+            last_packet_id: 42,
+            session_expiry_at: Some(1_755_000_000),
+            owner: Some("subject".into()),
+            outbound_qos2: [(9u16, (100u64, true))].into_iter().collect(),
+            unacked_received_qos2: BTreeSet::new(),
+        };
+        let without = encode_session_meta(&base);
+
+        // (b) The block is STRICTLY TRAILING: adding it appends and changes nothing else.
+        let mut with = SessionMeta {
+            unacked_received_qos2: [7u16].into_iter().collect(),
+            ..SessionMeta {
+                subscriptions: base.subscriptions.clone(),
+                received_qos2: base.received_qos2.clone(),
+                last_packet_id: base.last_packet_id,
+                session_expiry_at: base.session_expiry_at,
+                owner: base.owner.clone(),
+                outbound_qos2: base.outbound_qos2.clone(),
+                unacked_received_qos2: BTreeSet::new(),
+            }
+        };
+        let encoded_with = encode_session_meta(&with);
+        assert_eq!(
+            &encoded_with[..without.len()],
+            &without[..],
+            "the no-unacked encoding must be a strict PREFIX of the with-unacked one — \
+             a block that is not strictly trailing corrupts an older decoder"
+        );
+        assert_eq!(
+            encoded_with.len(),
+            without.len() + 4 + 2,
+            "and the suffix is exactly [u32 count][u16 id], nothing else"
+        );
+
+        // (c) Decoding the old (block-less) bytes treats every held id as ACKED — the
+        // pre-#238 behaviour, which is what a new binary must do with an old record.
+        let old = decode_session_meta(&without).unwrap();
+        assert_eq!(
+            old.received_qos2, base.received_qos2,
+            "held ids decode unchanged"
+        );
+        assert!(
+            old.unacked_received_qos2.is_empty(),
+            "an old record has nothing unacknowledged"
+        );
+
+        // (d) Decoding the new bytes yields identical values for every field BEFORE the
+        // block: the addition cannot desynchronise what precedes it.
+        let new = decode_session_meta(&encoded_with).unwrap();
+        let filters = |m: &SessionMeta| -> Vec<(String, u8, bool)> {
+            m.subscriptions
+                .iter()
+                .map(|s| (s.filter.clone(), s.max_qos as u8, s.no_local))
+                .collect()
+        };
+        assert_eq!(filters(&new), filters(&base));
+        assert_eq!(new.received_qos2, base.received_qos2);
+        assert_eq!(new.last_packet_id, base.last_packet_id);
+        assert_eq!(new.session_expiry_at, base.session_expiry_at);
+        assert_eq!(new.owner, base.owner);
+        assert_eq!(new.outbound_qos2, base.outbound_qos2);
+        assert_eq!(new.unacked_received_qos2, [7u16].into_iter().collect());
+
+        // (a) An all-acked session encodes byte-for-byte what it always did: the block is
+        // omitted when empty, so the common record's bytes do not change at all.
+        with.unacked_received_qos2.clear();
+        assert_eq!(encode_session_meta(&with), without);
     }
 }

@@ -546,8 +546,8 @@ impl Metrics {
         let quota_rejections_total = register_family(
             &mut registry,
             "quota_rejections",
-            "Operations refused by a per-client or global quota (ADR 0041), by kind \
-             (subscriptions, ...)",
+            "Operations refused by a per-client or global quota (ADR 0041), by reason \
+             (subscriptions, retained, sessions, brownout, brownout-publish)",
         );
         let store_bytes = register_gauge_family(
             &mut registry,
@@ -843,7 +843,7 @@ impl Metrics {
     /// | `backlog-overflow` | the flow-control backlog hit `MAX_BACKLOG` (ADR 0012) |
     /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) |
     /// | `pending-cap` | the pending-publish table hit `PENDING_PUBLISH_CAP`, so the oldest unacknowledged publish was dropped and its publisher's ack withheld (ADR 0042 T9) |
-    /// | `brownout` | the store is above its watermark and refused growth (ADR 0041 T5) |
+    /// | `brownout` | a durable copy lost above the watermark that NOBODY was told about: a `QoS` 0 offline enqueue (nothing was owed), or an UNGATED publish with no publisher to answer — a Will, a retained-window back-fill — whose live delivery still happens. A `QoS` >= 1 refusal a publisher IS told about is `quota_rejections_total{reason="brownout-publish"}` instead, because it was answered rather than lost (issue #238) |
     /// | `too-large` | the encoded packet exceeded that subscriber's Maximum Packet Size |
     pub fn publish_dropped(&self, reason: &str) {
         self.publish_dropped_total
@@ -1211,8 +1211,16 @@ impl Metrics {
         self.otel.peer_proto_max.record(i64::from(max), &[]);
     }
 
-    /// An operation was refused by a quota (ADR 0041 T3/T4). Bounded kinds only
-    /// (`subscriptions`, later `retained`, `sessions`) — never a per-client value.
+    /// An operation was refused by a quota (ADR 0041 T3/T4/T5). Bounded kinds only —
+    /// never a per-client value:
+    ///
+    /// | kind | where |
+    /// |---|---|
+    /// | `subscriptions` | a SUBSCRIBE beyond the per-session filter cap (T3) |
+    /// | `retained` | a retained publish creating a NEW topic beyond the cap (T4) |
+    /// | `sessions` | a CONNECT creating a NEW session beyond `max_sessions` (T5) |
+    /// | `brownout` | a CONNECT creating a NEW session above a watermark (T5) |
+    /// | `brownout-publish` | a `QoS` >= 1 publish whose durable enqueue was refused above a watermark. The publisher is TOLD (v5 `0x97`, v3.1.1 no ack + close), so it is an ANSWERED refusal rather than a silent loss — which is why it is not `publish_dropped` (ADR 0041 T5/T11, issue #238). Whether the message is re-sent is not the broker's to promise: a v5 reason >= 0x80 COMPLETES the packet-id lifecycle, so re-delivery is an application decision, and a v3.1.1 publisher resends only if it used `CleanSession=0`. Counts ATTEMPTS, so a resending publisher increments it once per attempt |
     pub fn quota_rejected(&self, kind: &str) {
         self.quota_rejections_total
             .get_or_create(&ReasonLabel {

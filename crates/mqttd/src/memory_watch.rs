@@ -4,9 +4,17 @@
 //! The RSS analogue of the T5 disk watermark, and deliberately the same shape: a poller
 //! samples this process's resident set, exports it as `process_resident_bytes`, and —
 //! when `MQTTD_MEMORY_MAX_BYTES` is set — drives the hub's **brownout** flag on
-//! watermark transitions. Above it, writes that *grow* state (new sessions, new retained
-//! topics, offline enqueues) are refused with the quota behaviours, while acks, reads,
-//! deletes, expiry and resumes continue.
+//! watermark transitions. Above it, writes that *grow* state are refused while acks,
+//! reads, deletes, expiry and resumes continue.
+//!
+//! The brownout flag is one flag shared with the disk axis, so "refused" means exactly
+//! what it means there, per growth write — a refused CONNECT for a new session, a
+//! refused PUBLISHER for a durable enqueue a `QoS` ≥ 1 subscriber is owed (0041-T11,
+//! issue #238: not an ack for a message stored nowhere), an over-quota answer for a new
+//! retained topic, and a counted DROP with the live delivery preserved for an ungated
+//! publish that has no publisher to refuse. See
+//! [`store_watch`](crate::store_watch)'s module docs for the enumeration; the two axes
+//! must not drift, which is why it is stated once.
 //!
 //! ## Why a watermark and not a heap cap
 //!

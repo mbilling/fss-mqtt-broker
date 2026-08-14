@@ -125,18 +125,77 @@ Each redb store reports its file size as a gauge (ADR 0020). A soft **high-water
 (`MQTTD_STORE_MAX_BYTES`, off by default) puts the durable plane into **brownout** above
 it: writes that *grow* state (new retained topics, new sessions, offline enqueues) are
 refused with the same at-bound behaviors as §4, while acks, deletes, reads, expiry, and
-resumes — everything that shrinks or maintains state — continue. A broker approaching
+resumes — everything that shrinks or maintains state — continue. Three growth writes are
+deliberately exempt, each protecting an honesty property worth more than its bytes: the
+inbound `QoS` 2 dedup record (written before the refusal is decided, #165's ordering),
+SUBSCRIBE persistence, and the detach spill of already-accepted messages — so session
+metadata still grows slowly under a sustained brownout (the enumeration in
+`store_watch.rs`'s module doc is the authoritative list). A broker approaching
 disk-full degrades to read-mostly instead of hitting the cliff where redb commits start
 failing mid-write. The disk-full failure paths are made uniformly fail-closed while at
 it (today a cross-node offline enqueue failure drops the message where the local ack
 path correctly refuses to ack).
+
+**As delivered — the publisher's ack under brownout (0041-T11, issue #238).** The "acks …
+continue" above meant ack *processing* — subscriber PUBACKs, deletes, truncation, the
+things that **shrink** state. It was implemented as something else: a `QoS` ≥ 1 publisher
+still received a PUBACK for a growth write brownout had refused, so for an offline
+persistent subscriber the message existed nowhere and nobody was ever told. That is a
+standing violation of the product's headline claim, and this section's own last sentence
+already commits to the opposite reflex.
+
+As delivered: **a `QoS` ≥ 1 publish that needs a durable append it cannot get is refused,
+not acked** — for online and offline persistent subscribers alike (delivering live with no
+durable record would promise a redelivery the store cannot honour, the rule the store-error
+path already followed). v5 is answered `PUBACK`/`PUBREC 0x97 Quota exceeded`; v3.1.1, which
+has no reason byte, gets no ack and a connection close, exactly as the store-error path
+does today — and that close is a *broker-initiated* close, so a v3.1.1 publisher's Will
+fires ([MQTT-3.14.4-3]). Counted as `quota_rejections_total{reason="brownout-publish"}` —
+a refusal the publisher is *told about* is not a loss, so `publish_dropped{reason="brownout"}`
+covers the losses nobody is told about: the `QoS` 0 offline enqueue (nothing was owed) and
+the lost durable copy of an *ungated* publish — a Will, a settle-window back-fill — whose
+**live delivery still happens**: suppressing a live send is only justified when a publisher
+is being told, and a Will has no publisher left to tell.
+
+The refusal is decided **before any effect**: nothing is stored, nothing is sent live to
+anyone, no retained value is overwritten, no peer forward leaves the node, and a shared
+subscription's round-robin turn is not consumed. And it **travels** (0041-T12): when the
+refusing node is a peer — the *common* case for an offline persistent subscriber, whose
+quorum-replicated session usually lives on another node — the refusal crosses the peer bus
+as a verdict (peer proto 7) and the origin answers its publisher with the same per-version
+answer above. On a link still negotiating an older proto (the rolling-upgrade skew window,
+never a permanent state) the verdict degrades to a withheld ack and a connection close, so
+a v5 publisher can briefly see the v3.1.1 answer mid-roll. A cross-node *shared* delivery
+refused by its selected member re-selects within the group before the publisher is
+refused; an unreadable or failed verdict withholds the ack — never a fabricated answer.
+
+The honest cost: MQTT's acknowledgement is per-PUBLISH, not per-subscriber, so a publish
+matching **any** persistent subscriber at `QoS` ≥ 1 is refused as a whole. Brownout is
+therefore a partial *publish outage* for those topics rather than a silent lie — the trade
+this ADR prefers, and the reason the watermark is off by default. It is bounded by
+construction: a v5 reason ≥ 0x80 releases the send-quota slot and makes the packet id
+reusable ([MQTT-3.3.4-9], §4.9), so each refusal terminates in O(1) with an application-
+level delivery error and no accumulated state on either side; a v3.1.1 close costs the
+broker no per-attempt state and is paced by the client's own backoff. And it is
+self-healing: brownout refuses only *growth*, so consumption, deletes and expiry drain the
+store until the edge lifts.
+
+Unchanged: the retained-growth refusal keeps §4/T4's answer (v5 `0x97`; v3.1.1 delivered
+live, not retained) — and brownout gates retained *growth* through the same check, so a
+v3.1.1 retained publish under brownout that owes no durable enqueue is likewise answered
+with a plain PUBACK, delivered live, and not retained. The offline-queue overflow policies
+also keep their ack-and-drop: the **default** `drop-oldest` truncates the oldest
+*already-acked* entries out of a full session queue (`publish_dropped{reason="queue-overflow"}`)
+and the opt-in `reject-newest` acks and sheds the newest — a cap's shed is the stated
+policy rather than a failure to honour one.
 
 ### 6. One config and observability story
 
 Every cap: an `MQTTD_*` env var, a generous default (a cap nobody hits until they need
 it), validation at startup (a nonsensical value is a startup error, not a silent
 misconfiguration), a bounded-label metric for its rejections/throttles
-(`admission_rejected_total{reason}`, `quota_rejections_total{kind}`, throttle counters,
+(`admission_rejected_total{reason}`, `quota_rejections_total{reason}` — the Prometheus
+label is `reason`; `kind` is only the OTel attribute name — throttle counters,
 store-size gauges — never per-client labels, ADR 0020 §3), and a line in the README's
 configuration table. Limits are read at startup; hot-reloading them is deliberately out
 of scope until there is operational evidence it is needed (the reload machinery exists,
@@ -212,9 +271,12 @@ in the delivery doc and ships as its own reviewed feature work.
    watermark, reusing its shape: a poller samples process RSS, an edge-triggered
    brownout refuses growth (new sessions, new retained topics, offline enqueues —
    all already-built refusal paths) while acks, reads, deletes, expiry, and resumes
-   continue, and dropping below the mark restores growth. This is deliberately NOT
-   mosquitto's allocation-failure model (deny malloc at a heap cap) nor EMQX's
-   `force_shutdown` (kill the connection process over a per-connection heap/mailbox
+   continue, and dropping below the mark restores growth. The 0041-T11 correction
+   above is axis-agnostic — the brownout flag is the OR across axes — so the memory
+   watermark refuses a `QoS` ≥ 1 publisher's ack identically to the disk one, and
+   "acks continue" here likewise means subscriber/maintenance acks. This is
+   deliberately NOT mosquitto's allocation-failure model (deny malloc at a heap cap)
+   nor EMQX's `force_shutdown` (kill the connection process over a per-connection heap/mailbox
    bound): both destroy standing state or sessions; brownout refuses new growth,
    consistent with this ADR's founding principle. Operators who prefer a hard
    ceiling keep the container limit — the watermark's job is to make the limit

@@ -774,13 +774,20 @@ async fn qos2_inbound_dedup_survives_owner_takeover() {
     let owner = a.placement.read().unwrap().owner(client_id);
     let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
 
-    // The owner records the inbound QoS-2 PUBLISH (packet id 5). The receipt commits only
-    // across a quorum (owner + ≥1 follower), so once it returns Ok it is guaranteed to
-    // survive the owner's loss. First receipt → `true`.
+    // The owner records the inbound QoS-2 PUBLISH (packet id 5) and releases its PUBREC.
+    // Both commit only across a quorum (owner + ≥1 follower), so once they return Ok they
+    // are guaranteed to survive the owner's loss. First receipt → `Fresh`, and the release
+    // is what makes the flow an ACKNOWLEDGED one — the only scope in which exactly-once
+    // was ever promised (issue #238).
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
-        if let Ok(newly) = owner_node.store.record_received(&cid, 5).await {
-            assert!(newly, "the first receipt of packet id 5 is new");
+        if let Ok(sighting) = owner_node.store.record_received(&cid, 5).await {
+            assert_eq!(
+                sighting,
+                mqtt_storage::InboundSighting::Fresh,
+                "the first receipt of packet id 5 is new"
+            );
+            owner_node.store.ack_received(&cid, 5).await.unwrap();
             break;
         }
         assert!(
@@ -804,15 +811,19 @@ async fn qos2_inbound_dedup_survives_owner_takeover() {
     let new_owner_node = survivors.iter().find(|n| n.node_id == new_owner).unwrap();
 
     // On the new owner, the redelivered PUBLISH (same packet id 5) must be seen as a
-    // DUPLICATE — the dedup set was rebuilt from a quorum of replicas during takeover, so
-    // `record_received` returns `false` and the message is not delivered a second time.
+    // DUPLICATE OF AN ACKNOWLEDGED FLOW — the dedup set AND the released-PUBREC bit were
+    // rebuilt from a quorum of replicas during takeover, so the message is not delivered a
+    // second time. `HeldAcked` is the strong form: merely "held" would not license
+    // answering the DUP from the window (issue #238).
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(newly) = new_owner_node.store.record_received(&cid, 5).await {
-            assert!(
-                !newly,
-                "after takeover, the redelivered packet id 5 must be a duplicate \
-                 (the dedup set survived the owner change) — exactly-once preserved"
+        if let Ok(sighting) = new_owner_node.store.record_received(&cid, 5).await {
+            assert_eq!(
+                sighting,
+                mqtt_storage::InboundSighting::HeldAcked,
+                "after takeover, the redelivered packet id 5 must be a duplicate of an \
+                 ACKNOWLEDGED flow (the dedup set and its acked bit survived the owner \
+                 change) — exactly-once preserved"
             );
             break;
         }

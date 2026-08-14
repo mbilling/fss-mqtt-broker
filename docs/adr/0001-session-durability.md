@@ -208,7 +208,8 @@ pays:
 | `QoS` > 0, clean session | no | nothing to resume into |
 | `QoS` 0, any session | no | at-most-once owes no redelivery |
 | retained replay | no | the value is durable in the retained store; a crash loses the delivery, not the fact |
-| under disk brownout (ADR 0041 T5) | no — counted and logged | the durable copy is refused, not the live delivery |
+| under disk/memory brownout (ADR 0041 T5/T11) | no — and the **publisher's ack is refused with it** (v5 `0x97`, v3.1.1 no ack + close; cross-node, the refusal travels as a peer-bus verdict — an older link mid-rolling-upgrade withholds the ack and closes instead), counted as `quota_rejections_total{reason="brownout-publish"}` | the growth write is refused, so nothing is acked-and-lost; re-sending is the application's decision (issue #238) |
+| offline queue at its cap (§6, `MQTTD_QUEUE_OVERFLOW`) | **yes — but the cap sheds acked data**: the default `drop-oldest` truncates the oldest *already-acked* entries out of the durable queue; the opt-in `reject-newest` acks and drops the new message | a bounded queue must shed at its bound; the shed is counted (`publish_dropped{reason="queue-overflow"}`) and stated here, where the durability claim is made |
 
 So the §2 latency cost listed under *Consequences* — "gating PUBACK on quorum-durable
 enqueue adds publish latency for `QoS` ≥ 1 to persistent subscribers" — now applies on

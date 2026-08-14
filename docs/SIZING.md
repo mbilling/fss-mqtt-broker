@@ -73,8 +73,15 @@ point of the arithmetic is to not get there.
 
 Set it below the container limit — 75-85% is a reasonable start — and crossing it puts
 the broker into **brownout**: writes that *grow* state (new sessions, new retained
-topics, offline enqueues) are refused with the ordinary quota reason codes, while acks,
-reads, deletes, expiry and session resumes continue. Dropping back under restores growth.
+topics, offline enqueues) are refused with the ordinary quota reason codes, while
+subscriber acks, reads, deletes, expiry and session resumes continue. A `QoS` ≥ 1
+publisher whose durable enqueue is refused is **refused with it** — v5 `0x97`, v3.1.1 no
+ack and a close, cross-node too as a peer-bus verdict (an older link mid-rolling-upgrade
+withholds the ack and closes instead) — rather than acked for a message that was never
+stored (issue #238).
+Re-sending is the application's decision, not a protocol guarantee: a v5 reason ≥ `0x80`
+completes the packet-id lifecycle and a clean-session v3.1.1 publisher resends nothing.
+Dropping back under restores growth.
 It is the same mechanism as the disk watermark, on a second axis; brownout is active
 while **either** is over.
 
@@ -108,14 +115,24 @@ disk ≥ store_max_bytes + headroom (WAL/compaction slack + logs; ~20% is a sane
 `MQTTD_STORE_MAX_BYTES` is **one aggregate high-water mark** across the four stores
 (`sessions`, `retained`, `replicas`, `lease` — polled every 10 s, exported as
 `store_bytes{store}`). Crossing it triggers **brownout**, not a stop: growth writes
-are refused (new retained topics, new sessions, offline enqueues — counted in
-`quota_rejections_total{kind="brownout"}`), while acks, reads, deletes, and expiry
-continue, and dropping below the mark restores writes. It is a high-water mark, not a
-hard wall — hence the headroom.
+are refused: a new session (counted in `quota_rejections_total{reason="brownout"}`),
+a new retained topic (counted in `quota_rejections_total{reason="retained"}` — the
+same label the retained quota uses), and an offline enqueue — for which a
+`QoS` ≥ 1 publisher is **refused rather than acked** (v5 `0x97`, v3.1.1 no ack and a
+close — cross-node too, as a peer-bus verdict, an older link mid-rolling-upgrade
+degrading to a withheld ack + close; counted in
+`quota_rejections_total{reason="brownout-publish"}`, issue #238).
+Subscriber acks, reads, deletes and expiry continue, and dropping below the mark restores
+writes. It is a high-water mark, not a hard wall — hence the headroom. And "growth is
+refused" is not airtight: session **metadata** still grows under brownout (SUBSCRIBEs,
+the inbound `QoS` 2 dedup window, detach spills of already-accepted messages — each
+protects an honesty property worth more than its bytes), so a sustained brownout with
+active clients grows the sessions store slowly. Size the watermark with real headroom
+below disk-full, never at it.
 
-Past the headroom, actual disk-full **fails closed**: a write that cannot be made
-durable withholds the publisher's ack (the publisher retries; nothing is silently
-lost). This is crash-tested in the harshest form — the kernel killing the process
+Past the headroom, actual disk-full **fails closed** by the same rule brownout now
+follows: a write that cannot be made durable withholds or refuses the publisher's ack
+(nothing is silently lost; re-delivery is the publishing application's decision). This is crash-tested in the harshest form — the kernel killing the process
 mid-write — with recovery and back-fill verified (ADR 0044 P2). The watermark is an
 **aggregate** over all four stores: there is no per-store quota yet, so one store can
 consume the whole budget and brown out the others (ADR 0041 amendment T9).

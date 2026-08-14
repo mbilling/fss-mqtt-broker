@@ -24,8 +24,17 @@
 //!   [`common::FlakyStore`] fixture): while on, durable session writes fail
 //!   terminally and the broker must WITHHOLD the corresponding acks;
 //! - **brownout entry/exit** (ADR 0041 T5), driven exactly as the store-size
-//!   watcher drives it — under brownout an offline enqueue is refused-but-acked,
-//!   ADR 0041's documented trade, so such acks are recorded as non-obligations;
+//!   watcher drives it — a `QoS` ≥ 1 publish whose durable enqueue brownout
+//!   refuses is NOT acked (0041-T11, issue #238), so brownout acks are hard
+//!   obligations like every other ack. The seeded schedule reaches that refusal
+//!   through the CROSS-NODE path only: its publisher is a fresh clean-session
+//!   client, a browned-out node refuses new-session CONNECTs, so the publisher
+//!   dials a healthy node and the refusal travels back from the node routing the
+//!   subscriber as a peer-bus verdict (0041-T12). Whether any given seed hits it
+//!   is a property of that seed — the per-seed summary line reports the count, and
+//!   `a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message`
+//!   below is the DETERMINISTIC guard, which is what actually bites under a
+//!   mutation of the fix;
 //! - **client churn** — disconnects and resumes riding lease handoffs.
 //!
 //! A separate test drives the **full-cluster stop/start**: every node crashes,
@@ -521,6 +530,20 @@ impl Stress {
         alive[self.rng.pick(alive.len())]
     }
 
+    /// An alive node that is not browned out, falling back to any alive node when every
+    /// one of them is. See `publish_step` for why a publisher needs one.
+    fn pick_alive_healthy(&mut self) -> usize {
+        let healthy: Vec<usize> = self
+            .alive_nodes()
+            .into_iter()
+            .filter(|i| !self.brownout[*i])
+            .collect();
+        if healthy.is_empty() {
+            return self.pick_alive();
+        }
+        healthy[self.rng.pick(healthy.len())]
+    }
+
     /// The node currently owning `client_id`'s placement group, per the first
     /// alive node's ring (post-quiesce the oracle checks they all agree).
     fn owner_of(&self, client_id: &str) -> Option<usize> {
@@ -662,7 +685,16 @@ impl Stress {
     /// is never owed).
     async fn publish_step(&mut self) {
         let s = self.rng.pick(self.subs.len());
-        let node = self.pick_alive();
+        // The publisher lands on a node that is NOT browned out. This is not cosmetic:
+        // a browned-out node refuses NEW-session CONNECTs (T5 growth), so a fresh
+        // clean-session publisher dialing one never gets far enough to have a PUBLISH
+        // refused — which is why the brownout arm was structurally unreachable from this
+        // step before 0041-T12. From a healthy node the publish is FORWARDED to whichever
+        // node routes the subscriber's session, and when THAT node is browned out its
+        // refusal now travels back over the peer bus as a verdict and the publisher
+        // observes it. (With every node browned out there is nowhere healthy to dial; the
+        // step then behaves as before and the CONNECT refusal is an honest observation.)
+        let node = self.pick_alive_healthy();
         self.payload_counter += 1;
         let payload = format!("m-{}-{}", self.seed, self.payload_counter).into_bytes();
         let topic = self.subs[s].topic.clone();
@@ -696,24 +728,26 @@ impl Stress {
         if acked {
             // Every ack is a HARD obligation (0042-T9): acked means durable,
             // cluster-wide — whichever node the publish landed on, whatever the
-            // takeover state. ONE documented exception (ADR 0041 T5): under
-            // brownout an offline enqueue is REFUSED BUT ACKED — the explicit,
-            // loudly-counted availability trade — so an ack for an OFFLINE
-            // subscriber while any node is browned out is not owed.
-            let brownout_window = self.brownout.iter().any(|b| *b) && self.subs[s].conn.is_none();
-            if brownout_window {
-                self.note(format!(
-                    "publish #{} to {topic} via {}: ACKED (brownout window — \
-                     ADR 0041 documented trade, not owed)",
-                    self.payload_counter, self.nodes[node].node_id.0,
-                ));
-            } else {
-                self.acked.entry(topic.clone()).or_default().push(payload);
-                self.note(format!(
-                    "publish #{} to {topic} via {}: ACKED (obligation)",
-                    self.payload_counter, self.nodes[node].node_id.0,
-                ));
-            }
+            // takeover state, brownout included. Brownout used to be waived here
+            // (refused-but-acked, ADR 0041's old trade); since 0041-T11 / issue
+            // #238 a refused durable enqueue refuses the ACK, so this harness's
+            // v3.1.1 publisher observes the refusal as a close with no PUBACK and
+            // the branch below records it as a non-obligation BY OBSERVATION.
+            self.acked.entry(topic.clone()).or_default().push(payload);
+            self.note(format!(
+                "publish #{} to {topic} via {}: ACKED (obligation)",
+                self.payload_counter, self.nodes[node].node_id.0,
+            ));
+        } else if self.brownout.iter().any(|b| *b) {
+            // An unacked publish inside a brownout window is very likely the 0041-T11
+            // refusal — the observation the un-waived oracle depends on existing. Noted
+            // distinctly so the per-seed summary reports REFUSALS rather than mere
+            // toggles (the two are not the same claim, and conflating them was the
+            // defect in this harness's evidence sentence).
+            self.note(format!(
+                "publish #{} to {topic} via {}: REFUSED in a brownout window                  (no obligation)",
+                self.payload_counter, self.nodes[node].node_id.0
+            ));
         } else {
             self.note(format!(
                 "publish #{} to {topic} via {}: unacked (no obligation)",
@@ -851,10 +885,14 @@ impl Stress {
     }
 
     /// Toggle brownout on one alive node (ADR 0041 T5), as the store-size
-    /// watcher would on a watermark transition. Under brownout, offline
-    /// enqueues are REFUSED BUT ACKED — ADR 0041's explicit, loudly-counted
-    /// availability trade — so publishes acked while any node is browned out
-    /// are recorded as non-obligations (see `publish_step`).
+    /// watcher would on a watermark transition. Under brownout a `QoS` ≥ 1
+    /// publish needing a durable append is REFUSED — the publisher is not acked
+    /// (0041-T11, issue #238) — so no ack observed during a brownout window
+    /// needs waiving: the ledger records exactly what the wire said.
+    ///
+    /// A toggle is NOT a refusal: whether a schedule actually reaches one depends on
+    /// the browned-out node routing a subscriber the schedule then publishes to. See
+    /// the module header for what this step does and does not establish.
     fn brownout_step(&mut self) {
         let node = self.pick_alive();
         let on = !self.brownout[node];
@@ -1161,8 +1199,8 @@ async fn run_schedule(seed: u64) {
     let count = |needle: &str| stress.trace.iter().filter(|l| l.contains(needle)).count();
     eprintln!(
         "cluster_stress: seed {seed} schedule: {} publishes ({} owed), {} retained, \
-         {} kills, {} restarts, {} flaps, {} disk-fault toggles, {} brownout toggles, \
-         {} joins, {} decommissions",
+         {} kills, {} restarts, {} flaps, {} disk-fault toggles, {} brownout toggles \
+         ({} publishes refused in one), {} joins, {} decommissions",
         count("publish #"),
         count("ACKED (obligation)"),
         count("retained set #"),
@@ -1171,6 +1209,7 @@ async fn run_schedule(seed: u64) {
         count("SEVERED"),
         count("DISK FAULTS"),
         count("BROWNOUT"),
+        count("REFUSED in a brownout window"),
         count("JOINED"),
         count("DECOMMISSIONED "),
     );
@@ -2629,6 +2668,673 @@ async fn rolling_replacement_swaps_a_node_without_loss() {
     )
     .await;
     verify_retained(b.client_addr, "rr-probe", "rr/r", b"rr-retained").await;
+}
+
+/// Issue #238 / 0041-T12, and the DETERMINISTIC guard the seeded sweep cannot be: a
+/// publish whose only recipient's session lives on a BROWNED-OUT peer must not be acked.
+///
+/// This is the geometry the seeded schedule can only reach by luck, and the one the
+/// default deployment actually has: durable sessions are quorum-replicated, so for an
+/// offline persistent subscriber the session (and the interest that routes to it) usually
+/// lives on a node other than the publisher's. Before 0041-T12 the refusal collapsed to
+/// `PublishAck { ok: false }` at the origin; before 0041-T11 it was not a refusal at all
+/// but an ACK for a message stored nowhere — and THAT is what this test bites on. The
+/// refusal has TWO independent layers (`plan_refusal`'s decide-before-commit pass, and
+/// `durable_append`'s brownout arm behind it), so the pre-#238 state is the reversion of
+/// BOTH: `plan_refusal → None` plus `Appended::Refused → Appended::Dropped`. Under that
+/// combined mutation the owner takes the forward without refusing it and this test fails
+/// at the no-ack assertion (verified 2026-08-14; the arm-only mutation is absorbed by the
+/// plan pass, which is the layering working as intended, not the oracle going soft).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one straight-line two-node scenario; splitting it hides the shape
+async fn a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message() {
+    if std::env::var("MQTTD_STRESS_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node("bo-a", vec![], &dir("a")).await;
+    let b = start_stress_node("bo-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("bo-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+    let nodes = [&a, &b, &c];
+
+    // A persistent QoS 1 subscriber on its placement owner, then OFFLINE: everything it
+    // is owed must ride the disk on that owner.
+    let sub_id = "bo-sub";
+    let owner_idx = {
+        let owner = a.placement.read().unwrap().owner(sub_id);
+        nodes
+            .iter()
+            .position(|n| n.node_id == owner)
+            .expect("the owner is one of the three")
+    };
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut sub, present) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                nodes[owner_idx].client_addr,
+                sub_id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "subscriber never connected");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert!(!present, "brand-new session");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ack = sub.subscribe(1, "bo/t", QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|r| *r != 0x80) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        sub.disconnect().await;
+    }
+
+    // A publisher on a DIFFERENT, healthy node — so the refusal has to cross the peer bus
+    // to be observable at all.
+    let publisher_idx = (owner_idx + 1) % 3;
+    assert_ne!(publisher_idx, owner_idx);
+
+    // Wait until the publisher's node actually routes to the owner: the offline session's
+    // interest is materialized by the owner's inherited-session scan and gossiped from
+    // there, and a publish issued before that arrives has nothing to forward.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let acked_once = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the offline subscriber's interest never reached the publisher's node"
+        );
+        if let Some((mut p, _)) = common::Client::connect_v311_within(
+            nodes[publisher_idx].client_addr,
+            "bo-warm",
+            true,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            p.publish("bo/t", b"bo-warm", QoS::AtLeastOnce, Some(1), vec![])
+                .await;
+            if let common::Recv::Packet(Packet::PubAck(k)) =
+                p.recv_bounded(Duration::from_secs(12)).await
+            {
+                if k.pkid == 1 {
+                    break true;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(acked_once, "the healthy-cluster control must be acked");
+
+    // Brown out the OWNER, then publish from the healthy node. The append the offline
+    // subscriber is owed is refused there, the verdict travels back, and the v3.1.1
+    // publisher must see NO PUBACK and a close.
+    nodes[owner_idx]
+        .hub_tx
+        .send(mqttd::hub::HubCommand::SetBrownout {
+            axis: mqttd::hub::BrownoutAxis::Disk,
+            on: true,
+        })
+        .expect("the owner's hub is alive");
+
+    let (mut pubr, _) = common::Client::connect_v311_within(
+        nodes[publisher_idx].client_addr,
+        "bo-pub",
+        true,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("a healthy node accepts a new session");
+    pubr.publish("bo/t", b"bo-refused", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    match pubr.recv_bounded(Duration::from_secs(20)).await {
+        common::Recv::Closed => {}
+        other => panic!(
+            "a publish the session owner cannot durably take must NOT be acked \
+             (0041-T11/T12): got {other:?}"
+        ),
+    }
+
+    // Recovery: the same publish is acked again, and the subscriber's resume replays the
+    // acked payloads and NOT the refused one.
+    nodes[owner_idx]
+        .hub_tx
+        .send(mqttd::hub::HubCommand::SetBrownout {
+            axis: mqttd::hub::BrownoutAxis::Disk,
+            on: false,
+        })
+        .expect("the owner's hub is alive");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(Instant::now() < deadline, "recovery never restored the ack");
+        if let Some((mut p, _)) = common::Client::connect_v311_within(
+            nodes[publisher_idx].client_addr,
+            "bo-pub2",
+            true,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            p.publish("bo/t", b"bo-kept", QoS::AtLeastOnce, Some(1), vec![])
+                .await;
+            if let common::Recv::Packet(Packet::PubAck(k)) =
+                p.recv_bounded(Duration::from_secs(12)).await
+            {
+                if k.pkid == 1 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut sub, present) = loop {
+        if let Some(ok) = common::Client::connect_v311_within(
+            nodes[owner_idx].client_addr,
+            sub_id,
+            false,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            break ok;
+        }
+        assert!(Instant::now() < deadline, "subscriber never resumed");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(present, "the durable session must resume");
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain = Instant::now() + Duration::from_secs(20);
+    while got.len() < 2 && Instant::now() < drain {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    for payload in [b"bo-warm".as_slice(), b"bo-kept"] {
+        assert!(
+            got.contains(payload),
+            "every ACKED payload is owed: {:?} was lost",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    assert!(
+        !got.contains(b"bo-refused".as_slice()),
+        "a REFUSED publish was never stored, so it must not replay — an ack was \
+         correctly not given for it"
+    );
+}
+
+/// Issue #238 (C1) / 0041-T12 — THE HEADLINE CROSS-NODE CLAIM, end to end on a real mesh:
+/// a **v5** publisher on a healthy node is told `0x97` when the node owning the session
+/// refuses the append, and its connection SURVIVES.
+///
+/// This is the default deployment, not an edge case: durable sessions are quorum-replicated,
+/// so for an offline persistent subscriber the session — and the interest routing to it —
+/// usually lives on a node other than the publisher's. Before 0041-T12 the peer's refusal
+/// collapsed to `PublishAck { ok: false }`, `drop_pending` withheld the ack, and the v5
+/// publisher got the *v3.1.1* answer: a close with no PUBACK. So the reason code AND the
+/// still-open connection are both load-bearing here — the sibling deterministic test above
+/// covers the v3.1.1 close, and this one covers the claim the docs actually make for v5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one straight-line three-node scenario; splitting it hides the shape
+async fn a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_peer_refuses() {
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node("v5bo-a", vec![], &dir("a")).await;
+    let b = start_stress_node("v5bo-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("v5bo-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+    let nodes = [&a, &b, &c];
+
+    // An OFFLINE persistent QoS 1 subscriber: the only thing owed the message, and it is
+    // owed durably on its owner — the node whose refusal has to cross the bus.
+    let sub_id = "v5bo-sub";
+    let owner_idx = {
+        let owner = a.placement.read().unwrap().owner(sub_id);
+        nodes
+            .iter()
+            .position(|n| n.node_id == owner)
+            .expect("the owner is one of the three")
+    };
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut sub, _) = loop {
+            if let Some(ok) = common::Client::connect_v311_within(
+                nodes[owner_idx].client_addr,
+                sub_id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                break ok;
+            }
+            assert!(Instant::now() < deadline, "subscriber never connected");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ack = sub.subscribe(1, "v5bo/t", QoS::AtLeastOnce).await;
+            if ack.return_codes.iter().all(|r| *r != 0x80) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "durable SUBSCRIBE never granted");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        sub.disconnect().await;
+    }
+
+    let publisher_idx = (owner_idx + 1) % 3;
+    assert_ne!(publisher_idx, owner_idx);
+
+    // THE ANTI-OVER-REFUSAL CONTROL, and the routing warm-up in one: while the owner is
+    // healthy the very same v5 publish must be acked with reason 0. It also proves the
+    // publisher's node has learned the offline session's interest — a publish issued
+    // before that has nothing to forward and would pass for the wrong reason.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the offline subscriber's interest never reached the publisher's node"
+        );
+        let (mut p, ack) =
+            common::Client::connect_v5(nodes[publisher_idx].client_addr, "v5bo-warm", true, vec![])
+                .await;
+        if ack.code == 0 {
+            p.publish("v5bo/t", b"v5bo-warm", QoS::AtLeastOnce, Some(1), vec![])
+                .await;
+            if let common::Recv::Packet(Packet::PubAck(k)) =
+                p.recv_bounded(Duration::from_secs(12)).await
+            {
+                assert_eq!(
+                    k.reason, 0,
+                    "a healthy cluster must ACK, or the refusal below proves nothing"
+                );
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Brown out the OWNER only. The publisher's own node stays healthy, so its CONNECT
+    // and its session are unaffected — the refusal can only come from the peer.
+    nodes[owner_idx]
+        .hub_tx
+        .send(mqttd::hub::HubCommand::SetBrownout {
+            axis: mqttd::hub::BrownoutAxis::Disk,
+            on: true,
+        })
+        .expect("the owner's hub is alive");
+
+    let (mut pubr, ack) =
+        common::Client::connect_v5(nodes[publisher_idx].client_addr, "v5bo-pub", true, vec![])
+            .await;
+    assert_eq!(ack.code, 0, "a healthy node accepts the v5 publisher");
+    pubr.publish("v5bo/t", b"v5bo-refused", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    match pubr.recv_bounded(Duration::from_secs(20)).await {
+        common::Recv::Packet(Packet::PubAck(k)) => {
+            assert_eq!(k.pkid, 1);
+            assert_eq!(
+                k.reason, 0x97,
+                "the peer's refusal must reach a v5 publisher AS a refusal (0x97), not as \
+                 the withheld-ack close that predated 0041-T12"
+            );
+        }
+        other => panic!("expected PUBACK 0x97 from across the peer bus, got {other:?}"),
+    }
+    // The session survives: a refusal is a per-publish delivery error, and the v5 publisher
+    // can act on it — which is the whole reason for carrying the code instead of hanging up.
+    pubr.publish("v5bo/t", b"v5bo-again", QoS::AtLeastOnce, Some(2), vec![])
+        .await;
+    match pubr.recv_bounded(Duration::from_secs(20)).await {
+        common::Recv::Packet(Packet::PubAck(k)) => assert_eq!(
+            k.reason, 0x97,
+            "still refused, and still on the same open connection"
+        ),
+        other => panic!("the v5 publisher's connection must stay OPEN, got {other:?}"),
+    }
+
+    // Nothing refused was stored: the subscriber's resume replays the acked payload only.
+    nodes[owner_idx]
+        .hub_tx
+        .send(mqttd::hub::HubCommand::SetBrownout {
+            axis: mqttd::hub::BrownoutAxis::Disk,
+            on: false,
+        })
+        .expect("the owner's hub is alive");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut sub, present) = loop {
+        if let Some(ok) = common::Client::connect_v311_within(
+            nodes[owner_idx].client_addr,
+            sub_id,
+            false,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            break ok;
+        }
+        assert!(Instant::now() < deadline, "subscriber never resumed");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(present, "the durable session must resume");
+    let mut got: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let drain = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < drain {
+        match sub.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(p)) => {
+                if let Some(pkid) = p.pkid {
+                    sub.send(&Packet::PubAck(pkid.into())).await;
+                }
+                got.insert(p.payload.to_vec());
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    assert!(
+        got.contains(b"v5bo-warm".as_slice()),
+        "the ACKED payload is owed and must replay"
+    );
+    for refused in [b"v5bo-refused".as_slice(), b"v5bo-again"] {
+        assert!(
+            !got.contains(refused),
+            "a payload answered 0x97 was stored NOWHERE, so it must not replay: {:?}",
+            String::from_utf8_lossy(refused)
+        );
+    }
+}
+
+/// Issue #238 (R2) / 0041-T12 — a cross-node SHARED subscriber must never be bypassed by
+/// an ack: the message must not be simultaneously acknowledged and delivered to nobody.
+///
+/// This is the regression the change itself introduced and the one the old code did not
+/// have. `deliver_to_client` now returns `Refused` BEFORE `send_to_client`, so a
+/// browned-out member's node stores nothing AND sends nothing; while `SharedDeliver` was
+/// one-way and unacked, the origin acked regardless and nothing ever retried. Two
+/// scenarios, because the fix has two halves: the group is answerable (so a lone refusing
+/// member refuses the publisher) and it RE-SELECTS (so a healthy member takes the message
+/// instead of the publish failing cluster-wide).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one straight-line two-scenario scenario; splitting it hides the shape
+async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let a = start_stress_node("sh-a", vec![], &dir("a")).await;
+    let b = start_stress_node("sh-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("sh-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    wait_cluster_ready(&[&a, &b, &c]).await;
+    let nodes = [&a, &b, &c];
+
+    // A persistent session is served on its PLACEMENT OWNER (ADR 0005), so the member ids
+    // are chosen to land on the nodes this test needs them on rather than assumed: one
+    // member whose owner will be browned out, and one on a different, healthy node.
+    let owner_of = |id: &str| -> usize {
+        let owner = a.placement.read().unwrap().owner(id);
+        nodes
+            .iter()
+            .position(|n| n.node_id == owner)
+            .expect("the owner is one of the three")
+    };
+    let (refusing_id, refusing_idx, healthy_id, healthy_idx) = {
+        let mut found = None;
+        for i in 0..64 {
+            let first = format!("sh-mem-{i}");
+            let fi = owner_of(&first);
+            for j in 0..64 {
+                let second = format!("sh-mem-{}", 64 + j);
+                let si = owner_of(&second);
+                if si != fi {
+                    found = Some((first.clone(), fi, second, si));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        found.expect("two client ids owned by different nodes")
+    };
+    assert_ne!(refusing_idx, healthy_idx);
+
+    // The group's first member: ONLINE and PERSISTENT (a shared subscriber is a persistent
+    // subscriber, #164) on the node about to be browned out.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut member_b, _) = loop {
+        if let Some(ok) = common::Client::connect_v311_within(
+            nodes[refusing_idx].client_addr,
+            &refusing_id,
+            false,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            break ok;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "member never connected to its owner"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ack = member_b
+            .subscribe(1, "$share/g/sh/t", QoS::AtLeastOnce)
+            .await;
+        if ack.return_codes.iter().all(|r| *r != 0x80) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "shared SUBSCRIBE never granted");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // The publisher always lands on a HEALTHY node, so every refusal below has to cross the
+    // peer bus from the member's own node to be observable at all.
+    let publisher_idx = healthy_idx;
+
+    // Warm-up + control: the group member on the to-be-browned-out node receives, and the
+    // publisher is acked. This establishes that the origin routes the shared group there.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the shared group's interest never reached the publisher's node"
+        );
+        let (mut p, ack) =
+            common::Client::connect_v5(nodes[publisher_idx].client_addr, "sh-warm", true, vec![])
+                .await;
+        if ack.code == 0 {
+            p.publish("sh/t", b"sh-warm", QoS::AtLeastOnce, Some(1), vec![])
+                .await;
+            if let common::Recv::Packet(Packet::PubAck(k)) =
+                p.recv_bounded(Duration::from_secs(12)).await
+            {
+                assert_eq!(k.reason, 0, "the healthy control must be acked");
+                // And the member on the other node actually got it.
+                let mut delivered = false;
+                let drain = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < drain {
+                    match member_b.recv_bounded(Duration::from_secs(2)).await {
+                        common::Recv::Packet(Packet::Publish(pb)) => {
+                            if let Some(pkid) = pb.pkid {
+                                member_b.send(&Packet::PubAck(pkid.into())).await;
+                            }
+                            if pb.payload.as_ref() == b"sh-warm" {
+                                delivered = true;
+                                break;
+                            }
+                        }
+                        common::Recv::Packet(_) | common::Recv::Quiet => {}
+                        common::Recv::Closed => panic!("the member's connection died"),
+                    }
+                }
+                if delivered {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // SCENARIO 1 — the group's ONLY member is on a browned-out node. The message must not
+    // be both acked and delivered nowhere.
+    nodes[refusing_idx]
+        .hub_tx
+        .send(mqttd::hub::HubCommand::SetBrownout {
+            axis: mqttd::hub::BrownoutAxis::Disk,
+            on: true,
+        })
+        .expect("the member's hub is alive");
+
+    let (mut pubr, ack) =
+        common::Client::connect_v5(nodes[publisher_idx].client_addr, "sh-pub", true, vec![]).await;
+    assert_eq!(
+        ack.code, 0,
+        "the publisher's node is healthy and accepts it"
+    );
+    pubr.publish("sh/t", b"sh-refused", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    let answer = pubr.recv_bounded(Duration::from_secs(20)).await;
+    let acked = match answer {
+        common::Recv::Packet(Packet::PubAck(ref k)) if k.reason == 0 => true,
+        common::Recv::Packet(Packet::PubAck(ref k)) => {
+            assert_eq!(
+                k.reason, 0x97,
+                "a shared group that could not take the message must refuse the publisher"
+            );
+            false
+        }
+        ref other => panic!("expected a PUBACK from the healthy origin, got {other:?}"),
+    };
+    // The member is ONLINE, so if the broker took responsibility it had to deliver.
+    let mut member_saw_it = false;
+    let drain = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < drain {
+        match member_b.recv_bounded(Duration::from_secs(2)).await {
+            common::Recv::Packet(Packet::Publish(pb)) => {
+                if let Some(pkid) = pb.pkid {
+                    member_b.send(&Packet::PubAck(pkid.into())).await;
+                }
+                if pb.payload.as_ref() == b"sh-refused" {
+                    member_saw_it = true;
+                    break;
+                }
+            }
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => break,
+        }
+    }
+    // THE INVARIANT — `acked` IMPLIES `member_saw_it`. Acked-and-delivered-to-nobody is
+    // the #238 defect itself: either the broker refused (and owes nothing), or it acked
+    // and the online member has the message. There is no third honest outcome.
+    assert!(
+        !acked || member_saw_it,
+        "the publisher was ACKED for a shared message that reached NOBODY and that \
+         nothing will retry — issue #238's exact defect, on the shared path"
+    );
+    assert!(
+        !acked && !member_saw_it,
+        "with its only member on a browned-out node the group cannot take the message: \
+         expected a 0x97 refusal and no delivery"
+    );
+
+    // SCENARIO 2 — a second member on a HEALTHY node. Now the browned-out member's refusal
+    // must cause RE-SELECTION inside the group, not a cluster-wide publish failure: that is
+    // what a shared group is for.
+    let mut member_a = common::Client::connect_v311_within(
+        nodes[healthy_idx].client_addr,
+        &healthy_id,
+        false,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the healthy node accepts the second member")
+    .0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ack = member_a
+            .subscribe(1, "$share/g/sh/t", QoS::AtLeastOnce)
+            .await;
+        if ack.return_codes.iter().all(|r| *r != 0x80) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "shared SUBSCRIBE never granted");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Publish repeatedly: round-robin may pick the healthy member first, and either way the
+    // outcome must be "acked AND some member has it" — never acked with nobody holding it.
+    for n in 0..4u16 {
+        let payload = format!("sh-resel-{n}").into_bytes();
+        pubr.publish("sh/t", &payload, QoS::AtLeastOnce, Some(10 + n), vec![])
+            .await;
+        let reason = match pubr.recv_bounded(Duration::from_secs(20)).await {
+            common::Recv::Packet(Packet::PubAck(k)) => k.reason,
+            other => panic!("expected a PUBACK, got {other:?}"),
+        };
+        assert_eq!(
+            reason, 0,
+            "with a healthy member available the group must RE-SELECT onto it and ack, \
+             not refuse the publisher because one member's node is browned out"
+        );
+        // The ack means somebody durably took it; the healthy member is the only one that
+        // can have, so it must arrive there.
+        let mut seen = false;
+        let drain = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < drain {
+            match member_a.recv_bounded(Duration::from_secs(2)).await {
+                common::Recv::Packet(Packet::Publish(pb)) => {
+                    if let Some(pkid) = pb.pkid {
+                        member_a.send(&Packet::PubAck(pkid.into())).await;
+                    }
+                    if pb.payload.as_ref() == payload.as_slice() {
+                        seen = true;
+                        break;
+                    }
+                }
+                common::Recv::Packet(_) | common::Recv::Quiet => {}
+                common::Recv::Closed => panic!("the healthy member's connection died"),
+            }
+        }
+        assert!(
+            seen,
+            "the publisher was acked for {:?}, so a member must hold it — the re-selected \
+             healthy member is the only candidate that could have",
+            String::from_utf8_lossy(&payload)
+        );
+    }
 }
 
 /// Bring-up gate shared by the resize/restart tests: full membership + full

@@ -42,6 +42,9 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// first release this kind of raise is the MAJOR-release act described above,
 /// and additive changes ship as new frames under a raised [`PROTO_MAX`] with
 /// per-link gating.
+///
+/// Proto 7 (0041-T12, issue #238) is the first bump that took the **additive**
+/// route instead: it stays at this floor. See [`PROTO_MAX`].
 pub const PROTO_MIN: u32 = 6;
 /// The newest peer-bus protocol version this build can speak (ADR 0038). A link's
 /// negotiated version is `min(proto_max_a, proto_max_b)`.
@@ -50,7 +53,21 @@ pub const PROTO_MIN: u32 = 6;
 /// fields ship under the new proto while every proto back to [`PROTO_MIN`] is still
 /// spoken in full. A bump that stops speaking an old proto is really a `PROTO_MIN`
 /// raise: a MAJOR release.
-pub const PROTO_MAX: u32 = 6;
+///
+/// Pre-release history: proto 7 (0041-T12, issue #238) is the project's FIRST purely
+/// ADDITIVE bump — [`PublishVerdict`](PeerMessage::PublishVerdict) and
+/// [`SharedDeliverAcked`](PeerMessage::SharedDeliverAcked) appear under a raised
+/// ceiling with **per-link** gating, and [`PROTO_MIN`] stays at 6 so every proto-6
+/// peer is still spoken to in full. The earlier pre-release bumps (2, 5, 6) reshaped
+/// frames in place and raised the floor with the ceiling. That motion is no longer
+/// available here: ADR 0058 clause 2 promises a rolling upgrade holds in BOTH
+/// directions of the roll, with `cluster_upgrade.rs` as its named oracle, and a floor
+/// raise fails every baseline↔HEAD link closed at `Hello` for the whole mixed window
+/// — splitting the mesh precisely while acked cross-node forwards are outstanding,
+/// and repairable only by bumping `BASELINE_REF` past the reshape, which retires the
+/// guard that was supposed to catch it. The additive route needs no `BASELINE_REF`
+/// bump and is what a MINOR may do post-1.0 as well.
+pub const PROTO_MAX: u32 = 7;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -483,6 +500,86 @@ pub enum PeerMessage {
         /// The node (its id) to re-commit the key to.
         target: String,
     },
+    // ---------------------------------------------------------------------
+    // Proto 7 (0041-T12, issue #238). APPEND-ONLY from here down: postcard tags
+    // struct variants by POSITION, so a variant inserted anywhere but the end
+    // silently re-tags every later frame — two builds would both announce
+    // (6, 7), negotiate 7, and then read `RetainedCommit` as `ReplicaKeys` with
+    // no handshake signal at all. The
+    // `the_frozen_and_pinned_variant_indices_are_stable` test is the guard.
+    // ---------------------------------------------------------------------
+    /// The proto-7 superset of [`PublishAck`](PeerMessage::PublishAck): the
+    /// durability *verdict* for one forward, answering BOTH forward kinds
+    /// ([`PublishAcked`](PeerMessage::PublishAcked) and
+    /// [`SharedDeliverAcked`](PeerMessage::SharedDeliverAcked)).
+    ///
+    /// `PublishAck`'s bool cannot distinguish "I deliberately refused this under a
+    /// stated policy, and nothing was stored" from "something went wrong": the first
+    /// is an answer a v5 publisher can be TOLD (`0x97`), the second can only be a
+    /// withheld ack (0041-T11). Widening `PublishAck` was not an option — the codec
+    /// is strict, so an extra field would leave trailing bytes in a proto-6 decoder
+    /// and kill the link — hence a new frame, chosen per LINK by the negotiated
+    /// version. `PublishAck` remains the proto-6 answer and its bytes are frozen.
+    PublishVerdict {
+        /// The `seq` of the forward being answered.
+        seq: u64,
+        /// What the receiver did with it.
+        verdict: ForwardVerdict,
+    },
+    /// An **answerable** targeted shared delivery (ADR 0015, 0041-T12): a
+    /// [`SharedDeliver`](PeerMessage::SharedDeliver) plus a correlating `seq`, so
+    /// the origin's publisher ack is gated on the chosen member's node actually
+    /// taking the message. The answer is a
+    /// [`PublishVerdict`](PeerMessage::PublishVerdict).
+    ///
+    /// Sent instead of `SharedDeliver` only when the origin's publish is gated, the
+    /// delivered `QoS` is ≥ 1 and the link negotiated proto ≥ 7; otherwise nothing
+    /// is owed (`QoS` 0) or the link cannot carry the answer, and today's
+    /// fire-and-forget `SharedDeliver` still applies. Unanswered forwards are
+    /// retransmitted under the SAME `seq`; the receiver does not dedup — a duplicate
+    /// delivery is legal at `QoS` 1.
+    SharedDeliverAcked {
+        /// Per-sender monotonic forward sequence (correlates the verdict).
+        seq: u64,
+        /// The chosen group member on the receiving node.
+        client: String,
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Vec<u8>,
+        /// The already-downgraded delivery `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The publisher's Message Expiry Interval (seconds), if any.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: WireAppProps,
+    },
+}
+
+/// What a node did with a forward it was asked to take responsibility for
+/// (0041-T12, issue #238) — the payload of
+/// [`PublishVerdict`](PeerMessage::PublishVerdict).
+///
+/// The three arms are exactly the three things the origin can honestly tell its
+/// publisher: release the ack, tell it the stated refusal, or say nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardVerdict {
+    /// The receiver's local fan-out completed, durable enqueues included — the
+    /// origin may release the publisher's acknowledgement.
+    Stored,
+    /// A stated policy refused it and **nothing was stored** on the receiver, so the
+    /// origin can tell its publisher a reason it can act on. `code` is the refusal's
+    /// stable wire code (see the sender's `PublishRefusal::wire_code`); a code this
+    /// build does not know is treated as [`Failed`](Self::Failed) — an unknown
+    /// refusal must never become the positive claim "nothing was stored".
+    Refused {
+        /// The stable refusal code (1 = brownout, 2 = retained quota; 0 reserved).
+        code: u16,
+    },
+    /// A terminal failure, or an answer this build cannot interpret: the origin
+    /// withholds the acknowledgement. Weaker than `Refused` on purpose — it claims
+    /// nothing about what was or was not stored.
+    Failed,
 }
 
 /// The hand-rolled codec for the two ADR 0038 **frozen** bootstrap frames.
@@ -690,9 +787,9 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<PeerMessage>, PeerCodecError>
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, negotiate_proto, PeerCodecError, PeerMessage, ReplicaEntryWire,
-        RetainedWireEntry, SharedGroupWire, SharedMemberWire, WireAppProps, MAX_FRAME, PROTO_MAX,
-        PROTO_MIN,
+        decode, encode, negotiate_proto, ForwardVerdict, PeerCodecError, PeerMessage,
+        ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire, WireAppProps,
+        MAX_FRAME, PROTO_MAX, PROTO_MIN,
     };
     use bytes::BytesMut;
 
@@ -896,6 +993,119 @@ mod tests {
             props: WireAppProps::default(),
             expires_at: None,
         });
+    }
+
+    /// 0041-T12 / issue #238 — the proto-7 additive frames, and the guard that they
+    /// were APPENDED rather than inserted.
+    ///
+    /// postcard tags struct variants by position, so an inserted variant silently
+    /// re-tags every later frame: two builds would both announce `(6, 7)`, negotiate
+    /// 7, and then misread every frame after the insertion point with no handshake
+    /// signal at all. `PROTO_MIN` cannot catch that class, so the byte is pinned.
+    #[test]
+    fn publish_verdict_and_shared_deliver_acked_roundtrip_at_stable_variant_indices() {
+        for verdict in [
+            ForwardVerdict::Stored,
+            ForwardVerdict::Refused { code: 1 },
+            ForwardVerdict::Refused { code: 0xFFFF },
+            ForwardVerdict::Failed,
+        ] {
+            roundtrip(&PeerMessage::PublishVerdict { seq: 9, verdict });
+        }
+        roundtrip(&PeerMessage::SharedDeliverAcked {
+            seq: 4,
+            client: "c1".into(),
+            topic: "t/x".into(),
+            payload: b"hi".to_vec(),
+            qos: 1,
+            message_expiry: Some(30),
+            app: WireAppProps {
+                user_properties: vec![("k".into(), "v".into())],
+                ..Default::default()
+            },
+        });
+
+        // The postcard variant tag is the first body byte for every index < 128.
+        let tag = |msg: &PeerMessage| {
+            let mut out = Vec::new();
+            encode(msg, &mut out).unwrap();
+            out[4] // after the u32 length prefix
+        };
+        // Pinned: existing frames keep the indices they shipped with...
+        assert_eq!(
+            tag(&PeerMessage::Publish {
+                topic: "t".into(),
+                payload: Vec::new(),
+                qos: 0,
+                retain: false,
+                message_expiry: None,
+                app: WireAppProps::default(),
+            }),
+            2
+        );
+        assert_eq!(
+            tag(&PeerMessage::SharedDeliver {
+                client: "c".into(),
+                topic: "t".into(),
+                payload: Vec::new(),
+                qos: 0,
+                message_expiry: None,
+                app: WireAppProps::default(),
+            }),
+            7
+        );
+        assert_eq!(
+            tag(&PeerMessage::PublishAcked {
+                seq: 1,
+                topic: "t".into(),
+                payload: Vec::new(),
+                qos: 0,
+                retain: false,
+                message_expiry: None,
+                app: WireAppProps::default(),
+            }),
+            18
+        );
+        assert_eq!(tag(&PeerMessage::PublishAck { seq: 1, ok: true }), 19);
+        assert_eq!(
+            tag(&PeerMessage::ReplicaCatchUpTo {
+                key: "k".into(),
+                target: "n".into(),
+            }),
+            23
+        );
+        // ...and the proto-7 additions are the two positions AFTER the last of them.
+        assert_eq!(
+            tag(&PeerMessage::PublishVerdict {
+                seq: 1,
+                verdict: ForwardVerdict::Stored,
+            }),
+            24
+        );
+        assert_eq!(
+            tag(&PeerMessage::SharedDeliverAcked {
+                seq: 1,
+                client: "c".into(),
+                topic: "t".into(),
+                payload: Vec::new(),
+                qos: 0,
+                message_expiry: None,
+                app: WireAppProps::default(),
+            }),
+            25
+        );
+
+        // Per-link gating is what makes the addition safe: a proto-6 peer negotiates
+        // 6 and never sees a proto-7 frame. Asserted through THIS build's announced
+        // range — not literal tuples — so reverting `PROTO_MAX` to 6 (losing the
+        // verdict frames on every link) fails here rather than only in a live mesh.
+        assert_eq!(negotiate_proto((PROTO_MIN, PROTO_MAX), (6, 6)), Some(6));
+        assert_eq!(negotiate_proto((6, 6), (PROTO_MIN, PROTO_MAX)), Some(6));
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(7),
+            "this build must speak proto 7 to its peers"
+        );
     }
 
     /// ADR 0038 T4: the two **frozen** frames' encodings, pinned byte for byte.
