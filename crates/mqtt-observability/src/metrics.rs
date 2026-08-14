@@ -50,6 +50,14 @@ struct ListenerLabel {
     listener: String,
 }
 
+/// `{command}` label for `mqttd_hub_dispatch_seconds` (issue #242) — the COARSE hub
+/// command classes, a bounded 7-value set (`attach`, `publish`, `ack`, `subscribe`,
+/// `control`, `cluster`, `sweep`), never per-variant.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct CommandLabel {
+    command: String,
+}
+
 /// `{state}` label — the bounded SWIM member states: `alive`, `suspect`, `dead`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct StateLabel {
@@ -104,6 +112,8 @@ struct OtelInstruments {
     publish_delivered: OtelCounter<u64>,
     publish_dropped: OtelCounter<u64>,
     deliver_latency: OtelHistogram<f64>,
+    hub_dispatch: OtelHistogram<f64>,
+    append_lane_jobs: OtelGauge<i64>,
     sessions: OtelGauge<i64>,
     subscriptions: OtelGauge<i64>,
     retained_messages: OtelGauge<i64>,
@@ -164,6 +174,8 @@ impl OtelInstruments {
             publish_delivered: meter.u64_counter("publish_delivered").build(),
             publish_dropped: meter.u64_counter("publish_dropped").build(),
             deliver_latency: meter.f64_histogram("deliver_latency_seconds").build(),
+            hub_dispatch: meter.f64_histogram("hub_dispatch_seconds").build(),
+            append_lane_jobs: meter.i64_gauge("append_lane_jobs").build(),
             sessions: meter.i64_gauge("sessions").build(),
             subscriptions: meter.i64_gauge("subscriptions").build(),
             retained_messages: meter.i64_gauge("retained_messages").build(),
@@ -239,6 +251,8 @@ pub struct Metrics {
     publish_delivered_total: Family<QosLabel, Counter>,
     publish_dropped_total: Family<ReasonLabel, Counter>,
     deliver_latency_seconds: Histogram,
+    hub_dispatch_seconds: Family<CommandLabel, Histogram>,
+    append_lane_jobs: Gauge,
     sessions: Gauge,
     subscriptions: Gauge,
     retained_messages: Gauge,
@@ -406,13 +420,31 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed)",
         );
 
         let deliver_latency_seconds = register_latency_histogram(
             &mut registry,
             "deliver_latency_seconds",
-            "Publish-to-deliver latency",
+            "Publish-to-deliver latency (the hub's ON-LOOP fan-out: plan, lane \
+             submissions, peer forwards — the durable appends themselves run \
+             off-loop since issue #242 and are timed by durable_append_latency_seconds)",
+        );
+        let hub_dispatch_seconds = register_wide_latency_histogram_family(
+            &mut registry,
+            "hub_dispatch_seconds",
+            "Time the single-threaded hub loop spent inside one command dispatch, by \
+             coarse command class (issue #242). Every client on the node queues behind \
+             a long dispatch, so a sustained p99 above ~100ms means something is \
+             blocking the loop again — see docs/OPERATIONS.md",
+        );
+        let append_lane_jobs = register_gauge(
+            &mut registry,
+            "append_lane_jobs",
+            "Durable-append lane jobs admitted and not yet completed, summed over \
+             sessions (issue #242); sustained growth means a placement group's \
+             followers are not keeping up — the warning before \
+             publish_dropped{reason=\"append-backlog-full\"} fires",
         );
 
         let sessions = register_gauge(
@@ -701,6 +733,8 @@ impl Metrics {
             publish_delivered_total,
             publish_dropped_total,
             deliver_latency_seconds,
+            hub_dispatch_seconds,
+            append_lane_jobs,
             sessions,
             subscriptions,
             retained_messages,
@@ -843,6 +877,7 @@ impl Metrics {
     /// | `backlog-overflow` | the flow-control backlog hit `MAX_BACKLOG` (ADR 0012) |
     /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) |
     /// | `pending-cap` | the pending-publish table hit `PENDING_PUBLISH_CAP`, so the oldest unacknowledged publish was dropped and its publisher's ack withheld (ADR 0042 T9) |
+    /// | `append-backlog-full` | a session's durable-append lane hit `LANE_QUEUE_CAP` (issue #242): the NEWEST job was rejected at submit (reject-newest keeps the lane FIFO). An answerable publish is WITHHELD (fail closed, the publisher retries); an unanswerable one is a genuine drop. Watch `append_lane_jobs` for the pre-drop warning |
     /// | `brownout` | a durable copy lost above the watermark that NOBODY was told about: a `QoS` 0 offline enqueue (nothing was owed), or an UNGATED publish with no publisher to answer — a Will, a retained-window back-fill — whose live delivery still happens. A `QoS` >= 1 refusal a publisher IS told about is `quota_rejections_total{reason="brownout-publish"}` instead, because it was answered rather than lost (issue #238) |
     /// | `too-large` | the encoded packet exceeded that subscriber's Maximum Packet Size |
     pub fn publish_dropped(&self, reason: &str) {
@@ -860,6 +895,34 @@ impl Metrics {
     pub fn observe_deliver_latency(&self, seconds: f64) {
         self.deliver_latency_seconds.observe(seconds);
         self.otel.deliver_latency.record(seconds, &[]);
+    }
+
+    /// Observe one hub command dispatch's time on the single-threaded loop
+    /// (issue #242). `command` is a **bounded** class — `attach`, `publish`, `ack`,
+    /// `subscribe`, `control`, `cluster`, `sweep` — never a per-variant name.
+    ///
+    /// This is the regression tripwire for head-of-line blocking: the hub serves every
+    /// client on the node from one loop, so a dispatch that blocks (an inline store or
+    /// quorum await, the defect issue #242 removed) shows up here as tail mass. Alert:
+    /// p99 over ~100ms sustained for 5m (docs/OPERATIONS.md).
+    pub fn observe_hub_dispatch(&self, command: &str, seconds: f64) {
+        self.hub_dispatch_seconds
+            .get_or_create(&CommandLabel {
+                command: command.to_string(),
+            })
+            .observe(seconds);
+        self.otel
+            .hub_dispatch
+            .record(seconds, &[KeyValue::new("command", command.to_string())]);
+    }
+
+    /// Set the current count of admitted-but-uncompleted durable-append lane jobs,
+    /// summed over sessions (issue #242). Sustained growth = a placement group's
+    /// followers are not keeping up; the pre-drop warning for
+    /// `publish_dropped{reason="append-backlog-full"}`.
+    pub fn set_append_lane_jobs(&self, n: usize) {
+        self.append_lane_jobs.set(clamp_gauge(n));
+        self.otel.append_lane_jobs.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current session count (snapshot of an in-memory map; ADR 0020).
@@ -1389,6 +1452,25 @@ fn register_latency_histogram(
     h
 }
 
+/// Register a labelled latency histogram family with WIDE exponential buckets
+/// (~100µs..13s), so a dispatch parked on a full replication RPC timeout (5s,
+/// `mqtt-cluster/src/repl_net.rs`) is on-scale rather than clamped into the top
+/// bucket (issue #242).
+fn register_wide_latency_histogram_family<L>(
+    registry: &mut Registry,
+    name: &'static str,
+    help: &'static str,
+) -> Family<L, Histogram>
+where
+    L: Clone + std::hash::Hash + Eq + EncodeLabelSet + Send + Sync + std::fmt::Debug + 'static,
+{
+    let family = Family::<L, Histogram>::new_with_constructor(|| {
+        Histogram::new(exponential_buckets(0.0001, 2.0, 18))
+    });
+    registry.register(name, help, family.clone());
+    family
+}
+
 #[cfg(test)]
 mod tests {
     use super::Metrics;
@@ -1488,6 +1570,28 @@ mod tests {
         assert!(out.contains("mqttd_replication_desired 3"), "{out}");
         assert!(out.contains("mqttd_replication_min_actual 1"), "{out}");
         assert!(out.contains("mqttd_replication_write_floor 2"), "{out}");
+    }
+
+    /// Issue #242: the hub time-on-loop histogram and the append-lane gauge are the
+    /// head-of-line regression tripwires docs/OPERATIONS.md alerts on — their NAMES,
+    /// the bounded `{command}` label, and the fact that they are populated at all are
+    /// pinned here, where a rename or a dropped observation fails.
+    #[test]
+    fn hub_dispatch_and_append_lane_metrics_render() {
+        let m = Metrics::new("t");
+        m.observe_hub_dispatch("publish", 0.0004);
+        m.set_append_lane_jobs(3);
+        m.publish_dropped("append-backlog-full");
+        let out = m.render();
+        assert!(
+            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("mqttd_append_lane_jobs 3"), "{out}");
+        assert!(
+            out.contains("mqttd_publish_dropped_total{reason=\"append-backlog-full\"} 1"),
+            "{out}"
+        );
     }
 
     /// Cardinality guard (ADR 0020 §3): label *keys* are only ever from the fixed set; no

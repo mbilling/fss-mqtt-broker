@@ -150,6 +150,48 @@ fn a_bad_env_value_fails_check_config() {
     assert!(stderr.contains("lease_voters"), "stderr was: {stderr}");
 }
 
+/// Issue #243: the watermark cadence is a knob with a documented floor and ceiling, and
+/// `--check-config` is where a bad one must be caught — a broker that booted with a 0 s
+/// poll would spin, and one with a 1-hour poll would carry a watermark that cannot bound
+/// anything. Runs against the REAL binary, so it also proves the env var reaches
+/// `validate()` at all.
+#[test]
+fn check_config_rejects_a_watermark_poll_outside_its_range() {
+    for bad in ["0", "301"] {
+        let out = mqttd()
+            .arg("--check-config")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_WATERMARK_POLL", bad)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "MQTTD_WATERMARK_POLL={bad} must fail the check; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("watermark_poll_secs must be between 1 and 300"),
+            "the refusal must state the range; stderr was: {stderr}"
+        );
+    }
+    for good in ["1", "10", "300"] {
+        let out = mqttd()
+            .arg("--check-config")
+            .env("MQTTD_ALLOW_EPHEMERAL_DURABILITY", "1")
+            .env("MQTTD_WATERMARK_POLL", good)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "MQTTD_WATERMARK_POLL={good} must validate; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Issue #239: an *unsatisfiable* min-replicas floor (above the replication factor)
 /// would refuse every durable write forever. `--check-config` is the pre-rollout gate,
 /// so it must catch that here rather than deferring it to a broker that boots and then

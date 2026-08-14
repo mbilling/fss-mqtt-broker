@@ -11,6 +11,14 @@ network, fsync, and scheduling costs that dominate the microseconds below. What
 these numbers guarantee is that the broker's own CPU work is not the bottleneck
 and does not silently regress.
 
+For the end-to-end numbers — acked QoS 1/2 throughput and latency against a real
+quorum with the durable plane on — see
+[DURABLE-PATH.md](DURABLE-PATH.md). Reading the two together is the point: the
+durable path costs ~28 ms per message at p50 on the machine measured there, against
+the ~0.5 µs of codec work below, so **none** of what dominates end to end appears on
+this page. That document is single-host and dev-grade and says so in its first
+paragraph.
+
 ## Reference machine
 
 - 4× Intel Xeon @ 2.80GHz, Linux, `--release` (opt-level 3, thin LTO)

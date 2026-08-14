@@ -9,9 +9,11 @@ quota refuses loudly at the edge (ADR 0041 — reason codes and backpressure, ne
 silent drops). But connections, sessions, retained topics, and disk are all
 **uncapped until you cap them**, and the per-session offline queue defaults to 100 000
 messages. Memory has a **watermark** (`MQTTD_MEMORY_MAX_BYTES`) but no hard ceiling:
-crossing it degrades the broker to read-mostly, it does not stop memory rising. So the
-arithmetic on this page is still what sizes the machine — the watermark is what tells you
-the arithmetic was wrong, before the OOM killer does.
+crossing it degrades the broker to read-mostly, it does not stop memory rising — and
+because the mark is *sampled* rather than charged at each allocation, the overshoot is
+bounded only by `MQTTD_WATERMARK_POLL x your growth rate` (default 10 s; 1 s once within
+10% of the mark). So the arithmetic on this page is still what sizes the machine — the
+watermark is what tells you the arithmetic was wrong, before the OOM killer does.
 
 A ready-made preset with this page's numbers: [examples/bounded-node.toml](examples/bounded-node.toml).
 
@@ -39,12 +41,24 @@ backpressure — not a drop or disconnect).
 There is no `memory_limit` in the allocation-denial sense. Size RSS from the caps you set:
 
 ```
-RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection, measured dev-grade in bench/)
+RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection — see the note below)
     + connections × max_packet_size            (read buffering, worst case)
     + sessions × queued_messages × avg_msg     (offline queues — THE dominant term)
     + retained_topics × avg_retained_value
     + flow-control backlog: up to 10 000 msgs × avg_msg per slow live subscriber
 ```
+
+> **Where the base term comes from, honestly.** The ~70 MiB / ~15 KiB figures are from an
+> unpublished dev-grade run of `bench/` (its `results/` directory is untracked scratch), so
+> they are **not** reproducible from this repository — treat them as an order of magnitude
+> to size against, not a measured constant, and re-measure on your own host before they
+> matter. They have not been replaced with a number from
+> [benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) on purpose: that harness runs on
+> macOS, where `ps` RSS (compressed memory, shared pages) is not comparable to the Linux
+> `VmRSS` this formula is written against. For reference only, the same three broker
+> processes there sat at **10–20 MiB RSS each** while serving durable traffic — which says
+> the base term is dominated by whatever an idle deployment configures, not by the broker's
+> floor.
 
 The offline-queue term is why the 100 000-message default must be re-decided on a
 bounded node: it is sized for *one important session*, not for thousands. **The queue
@@ -60,6 +74,7 @@ arithmetic can include them):
 | Flow-control backlog per session | 10 000 msgs, drop-oldest |
 | Replay to a resuming session | 10 000 msgs |
 | Pending publishes awaiting durability | 4 096, ack withheld |
+| Durable-append lane per session (issue #242) | 256 jobs (appends and QoS 2 outbound-id records share the cap), reject-newest (ack withheld), plus 16 reserved control slots for detach-spill/discard jobs; payload bytes are refcounted clones of the pending entry's, so the added cost per job is the message envelope, not a second payload copy |
 | Retained mutations queued during heal (ADR 0037 §5) | 1 024, drop-oldest, counted |
 | Peer-link read buffer | 32 MiB per peer |
 | Peer frame / raft RPC / SWIM datagram | 16 MiB / 4 MiB / 64 KiB |
@@ -92,29 +107,80 @@ memory_max_bytes = 2147483648      # 2 GiB watermark…
 
 Three things it is not:
 
-- **Not a ceiling.** Nothing here can stop memory rising. A burst that outruns the 10 s
-  poll can still OOM. The container limit remains the hard bound; this buys you a metric,
-  a log line and a degraded mode *before* that, in the common case where pressure builds
-  over minutes.
-- **Not allocation denial.** Mosquitto's `memory_limit` fails allocations at a heap cap
-  and EMQX's `force_shutdown` kills the connection process. Both destroy standing state.
-  Brownout refuses new growth and keeps everything already promised.
+- **Not a ceiling — and here is the number.** Nothing here can stop memory rising. The
+  mark is checked when the watcher samples RSS, never charged at an allocation, so
+
+  ```
+  overshoot ≤ poll interval × peak allocation rate   (+ the allocation in flight)
+  ```
+
+  The interval is `MQTTD_WATERMARK_POLL` seconds (default **10**, range 1-300) and
+  `poll / 10` with a 1 s floor once RSS is **within 10% of the mark** — so at the defaults
+  the bound is ~1 s of allocation in the band that matters and ~10 s from a standing
+  start. Arithmetic on this page's own worked example, not a measurement: 2000
+  connections × 256 KiB read buffers is 0.5 GiB that can be allocated well inside one
+  10 s interval, which is why the container limit has to sit *above* the mark by more
+  than the overshoot.
+
+  **The mapping, as arithmetic.** Set the watermark to **75-85% of
+  `resources.limits.memory`** — i.e. 15-25% of the container limit *is* the overshoot
+  allowance. If `poll × your measured peak allocation rate` exceeds that gap, lower the
+  poll or lower the watermark; measure the rate with `bench/run.sh` while watching
+  `process_resident_bytes`. Deployment reality: the compose stack sets `memory: 1g` and
+  explains the pairing (`deploy/compose/compose.yaml`), but **the Helm chart ships
+  `resources: {}`** with the limits block commented out — set `resources.limits.memory`
+  yourself, the chart will not do it for you.
+- **Not allocation denial**, and that is a decision rather than a gap. Mosquitto's
+  `memory_limit` fails allocations at a heap cap; EMQX's `force_shutdown` kills the
+  connection process over a per-connection heap/mailbox bound. Both destroy standing
+  state, which is the one thing brownout exists to keep. Concretely, for this codebase:
+  allocation denial needs a custom global allocator and the workspace sets
+  `unsafe_code = "forbid"`, and Rust's OOM path aborts by default — the delivered
+  behaviour would be "abort somewhere" or "drop messages at malloc". A `force_shutdown`
+  equivalent would need per-connection accounting we do not have, and the memory that
+  actually dominates (offline queues, retained, hub maps) belongs to no connection, so it
+  would not bound the dominant term anyway. The cgroup limit is the ceiling, and an
+  OOM-kill under it is recoverable by design (acked state is on disk/quorum, ADR 0044).
 - **Not portable.** RSS is read from `/proc/self/status`. Released binaries are Linux-only;
   elsewhere the broker logs — loudly, at WARN, if you configured a watermark — that it is
   **not enforcing** one, rather than pretending.
 
-Watch it with `process_resident_bytes / memory_max_bytes`, and alert on
-`brownout{axis="memory"} == 1`.
+Watch it with `process_resident_bytes / memory_max_bytes`. Two rules, with numbers:
+
+- **page** on `mqttd_brownout{axis="memory"} == 1` — growth is being refused right now,
+  and `QoS` ≥ 1 publishers to topics with persistent subscribers are being refused with it;
+- **warn** on
+  `mqttd_process_resident_bytes / mqttd_memory_max_bytes > 0.9 and mqttd_memory_max_bytes > 0`
+  for 5m — the accelerated-poll band, i.e. the last warning you get before brownout. **The
+  `and` clause is load-bearing, not decoration:** with no watermark configured the gauge is
+  exported as a literal `0` (not absent), and PromQL follows IEEE 754, so the bare ratio is
+  `+Inf` and fires permanently on the default configuration. If you have no watermark,
+  alert against the container limit instead.
 
 ## Disk: the formula
 
 ```
-disk ≥ store_max_bytes + headroom (WAL/compaction slack + logs; ~20% is a sane start)
+disk ≥ store_max_bytes + headroom (WAL/compaction slack + logs)
+       headroom ≥ the overshoot bound below, and never less than ~20%
 ```
 
 `MQTTD_STORE_MAX_BYTES` is **one aggregate high-water mark** across the four stores
-(`sessions`, `retained`, `replicas`, `lease` — polled every 10 s, exported as
-`store_bytes{store}`). Crossing it triggers **brownout**, not a stop: growth writes
+(`sessions`, `retained`, `replicas`, `lease` — polled every `MQTTD_WATERMARK_POLL`
+seconds, default 10, and every `poll / 10` with a 1 s floor once the total is within 10%
+of the mark; exported as `store_bytes{store}`). The same overshoot bound as memory
+applies, for the same reason — the mark is scanned, not charged at the write:
+
+```
+disk overshoot ≤ poll interval × your store growth rate   (+ the write in flight)
+```
+
+Measure the rate rather than guess it: run `bench/run.sh` at your intended publish mix and
+watch `store_bytes` climb. As an *example* of the arithmetic (not a measured throughput —
+this repo publishes none): 500 durable writes/s at 4 KiB is ~2 MB/s, so a 10 s poll costs
+~20 MB of overshoot and a 1 s near-mark poll ~2 MB. If your rate makes that number
+uncomfortable next to your headroom, lower `MQTTD_WATERMARK_POLL`.
+
+Crossing it triggers **brownout**, not a stop: growth writes
 are refused: a new session (counted in `quota_rejections_total{reason="brownout"}`),
 a new retained topic (counted in `quota_rejections_total{reason="retained"}` — the
 same label the retained quota uses), and an offline enqueue — for which a
@@ -133,9 +199,30 @@ below disk-full, never at it.
 Past the headroom, actual disk-full **fails closed** by the same rule brownout now
 follows: a write that cannot be made durable withholds or refuses the publisher's ack
 (nothing is silently lost; re-delivery is the publishing application's decision). This is crash-tested in the harshest form — the kernel killing the process
-mid-write — with recovery and back-fill verified (ADR 0044 P2). The watermark is an
-**aggregate** over all four stores: there is no per-store quota yet, so one store can
-consume the whole budget and brown out the others (ADR 0041 amendment T9).
+mid-write — with recovery and back-fill verified (ADR 0044 P2).
+
+**Why the mark is an aggregate, and what closes the gap.** One store can consume the whole
+budget and brown out the others. That is enforced at the aggregate on purpose, not for lack
+of effort: the resource being protected is *one filesystem*, and two of the four stores have
+no client write to refuse — `replicas.redb` grows from other nodes' already-committed
+appends and `lease.redb` from consensus itself, so "refuse the writes to the over-share
+store" is undefinable for half the enumeration, and a follower refusing committed entries
+would be thinning its group's replica count (the `min_replicas` floor's job), not enforcing
+a watermark. What *was* missing is visibility, and that is now in the broker: when any
+single store passes **70% of the aggregate mark** it is named once in a WARN (clearing
+below 60%), before brownout rather than after. Alert on it too:
+`max by (store) (mqttd_store_bytes) / scalar(mqttd_store_max_bytes) > 0.6 and on() mqttd_store_max_bytes > 0`
+— `scalar()` is required because the left side carries a `store` label and the mark does
+not, so a bare vector-to-vector divide matches nothing and the rule is silently inert.
+Selective refusal for
+the two stores where it *is* definable (`sessions`, `retained`) remains ADR 0041 T9.
+
+**A browned-out node still grows `replicas.redb`.** The refusal is decided at the session's
+owner, so a node that merely *follows* a group keeps applying its peers' committed appends
+while browned out — and those are full message payloads, not metadata. On a cluster node
+(the default) the dominant store's growth is therefore not gated locally at all: headroom
+below the mark must cover peer-driven growth for the whole detect-and-recover window, not
+just this node's own clients.
 
 If `MQTTD_DATA_DIR` is unset, none of this applies — all state is in memory and the
 memory formula is the only budget. (Reaching that state now takes an explicit choice:
@@ -166,6 +253,53 @@ If a topic's subscribers do not need redelivery across a broker restart, connect
 with a clean session is the whole optimisation — there is no flag to turn durability off
 for a session that asked for it, by design.
 
+**Where a slow write is felt** (issue #242 / ADR 0061): these writes — the durable
+append AND the QoS 2 outbound-id record that precedes an online wire send, AND the
+once-per-1024-deliveries packet-id block reservation — run in per-session append lanes
+off the hub loop, so replication latency no longer sets the pace for other clients.
+The bounded worst case under a degraded follower set is per *session*: each of that
+session's lane jobs is bounded by the 5 s replication RPC timeout, FIFO in its lane
+(up to 256 queued jobs, shared between appends and outbound-id records — worst case
+~21 min of retrying backlog for one session before new publishes to it are withheld
+and retried by their publishers). Online QoS 2 delivery to a degraded group's
+subscriber is additionally serial per subscriber: one 5 s-bounded record write per
+message before its wire send (unchanged from the pre-ADR bound; the serialization
+moved from the shared loop to that session's lane). Publishes to other groups'
+sessions, connects, and subscribes are unaffected; hub dispatch time is independent
+of replication latency on the publish and delivery paths (residual store awaits stay
+in the ack/attach/control classes, ADR 0061), and `mqttd_hub_dispatch_seconds` /
+`mqttd_append_lane_jobs` are the observables (see
+[OPERATIONS](OPERATIONS.md#monitoring-for-the-operator-and-humans)).
+
+**Measured, not just claimed** (issue #244) — on **five broker processes sharing one
+8-core host**, which is the dominant caveat and is why the numbers are ratios rather than
+capacities: with two of five nodes' peer bus degraded so that one placement group's appends
+stall completely, publishes for sessions in *healthy* groups on the same node **kept
+flowing** while the degraded group's own publishes stopped (0.00–0.01× throughput), and the
+hub loop's own publish dispatch p99 never left ~0.2 ms.
+
+The healthy class was **not** unaffected, and the full picture matters more than the
+flattering half of it: its latency improved (p50 0.31–0.47×, p95 0.35–0.50× across 4 runs)
+*because* its throughput fell — **0.41–0.77×** in the same four runs. Fewer messages in
+flight is why each one went faster. So the honest claim is isolation of *failure*, not of
+*capacity*: a degraded group cannot stop or stall a healthy group's publishes, but on a
+shared host it does take a share of the throughput with it. Whether that share survives on
+separate hosts is exactly what the unrun multi-host lane would answer.
+
+Two further caveats belong beside those: the *tail beyond p95* could not be attributed on
+the measuring host (every phase, baseline included, carried unrelated 10–20 s stalls), and
+a client whose **own** group is degraded does pay the 5 s RPC bound on CONNECT — 24–29 s at
+p99 under the fault — so "connects are unaffected" holds for clients in healthy groups, not
+universally. Method, limits and the commands:
+[benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md).
+
+**And what the durable write costs per message** (same source, single-host and dev-grade):
+an acked QoS 1 publish to a persistent subscriber took ~28 ms at p50 against ~0.03 ms for
+the same publish to a clean session, and the node's durable append rate was pinned by the
+host's **per-volume** disk barrier (~215–240 flushes/s, shared by every store on the machine)
+rather than by CPU — which is the number to re-measure on your own hardware before sizing
+a write rate, because it is the one that decides it.
+
 ## Worked example — 4 GiB RAM / 20 GiB disk
 
 Target: leave ~1 GiB for OS/page cache; broker budget ~3 GiB RSS, 16 GiB store.
@@ -178,6 +312,9 @@ max_queued_messages= 500      → 5000 × 500 × 4 KiB avg      ≈ up to 9.8 Gi
                                 bounded in RAM by live-session working set; keep avg_msg honest
 max_retained       = 50000    → 50000 × 4 KiB               ≈ 0.2 GiB
 store_max_bytes    = 16 GB    → brownout at 16 GB, 4 GB headroom on the 20 GB disk
+memory_max_bytes   = 2.4 GiB  → 80% of a 3 GiB container limit; the other 20% is the
+                                overshoot allowance (see the formula above)
+watermark_poll_secs= 10       → both watchers; 1 s once within 10% of either mark
 ```
 
 The full commented preset: [examples/bounded-node.toml](examples/bounded-node.toml).
@@ -190,10 +327,10 @@ Printed here so nobody discovers it in production:
 
 | Axis | What bounds it today | Tracked by |
 |---|---|---|
-| Total process RSS **hard cap** | Watermark + brownout (`MQTTD_MEMORY_MAX_BYTES`, above); the container limit is still the ceiling | — by design |
+| Total process RSS **hard cap** | Watermark + brownout (`MQTTD_MEMORY_MAX_BYTES`, above), overshooting by up to `MQTTD_WATERMARK_POLL x allocation rate`; the container/cgroup limit is the ceiling. No in-process ceiling **by design** — allocation denial needs `unsafe` the workspace forbids, EMQX-style connection kills would not bound the dominant term, and both destroy standing state | — by design |
 | Offline queue **bytes** | Message count only (`MQTTD_MAX_QUEUED_MESSAGES`) | 0041-T6 |
 | Bridge-spool **bytes** | Message count only (default 10 000) | 0041-T7 |
-| Per-store disk share | Aggregate watermark only | 0041-T9 |
+| Per-store disk share | Aggregate watermark, plus a WARN naming any store over 70% of it and the `store_bytes{store}` gauge; no per-store *refusal* — and `replicas`/`lease` have no client write to refuse | 0041-T9 |
 | Per-connection **write** buffering | Two hard-coded count caps, neither in bytes and neither configurable: `MAX_BACKLOG` (10 000 messages, QoS 1/2, drop-oldest) and the outbound queue (10 000 packets, QoS 0, shed and counted) | 0041-T10 |
 
 The last row is the sharpest edge: a subscriber that stops reading can hold up to

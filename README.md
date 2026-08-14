@@ -116,12 +116,14 @@ in [**Limitations**](#limitations) rather than left to be discovered — the
 largest are that the total-memory watermark is backpressure rather than a hard
 ceiling (the container limit remains the real bound), the Kubernetes operator
 is not packaged for installation, and the horizontal scaling curve has not been
-measured.
+measured — the durable path's end-to-end throughput and latency now are, on one
+host, with their limits stated
+([docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)).
 
 See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (60 ADRs, per-task status).
+record of exactly what is built (61 ADRs, per-task status).
 
 ## The runnable map: mqttui
 
@@ -183,10 +185,12 @@ binary — are marked `-` in the list with the reason, rather than left to fail.
 - **Open == Enterprise.** One Apache-2.0 codebase, no gated features. Only
   support, SLAs, and certified builds are paid.
 - **Horizontal scalability by design.** Shared-nothing nodes; no coordinator on
-  the publish hot path. The *shape* of the scaling curve is not yet measured —
+  the publish hot path. The *shape* of the scaling curve is still not measured —
   doing so honestly needs multi-host hardware
-  ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this is a
-  statement about the architecture, not a benchmarked result.
+  ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this remains a
+  statement about the architecture, not a benchmarked result. What **is** measured
+  is a single fixed 3-node point on one host, with the limits printed beside every
+  number: [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md).
 - **Memory safety.** Rust, `#![forbid(unsafe_code)]` across crates.
 
 ## What's different about it
@@ -547,12 +551,12 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 
 The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
 and **VerneMQ** — including every cell we lose — is
-[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-13). The one-paragraph
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-14). The one-paragraph
 version:
 
 |  | mqttd's answer |
 |---|---|
-| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses), and covers a message **in flight to a connected subscriber** as well as one queued for a disconnected one — the durable append happens before the wire send ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124), reproduced against the real binary under SIGKILL). A group too thin to keep the promise **refuses** new durable writes by default (the min-replicas floor, `MQTTD_MIN_REPLICAS=majority`: a majority of the members the node knows about, capped at R) rather than acking on one copy; a node that has never known peers still serves fully. Above the (off-by-default) store or memory watermark the broker likewise **refuses the publisher** rather than acking a message it will not store — v5 gets `0x97 Quota exceeded`, v3.1.1 gets no ack and a close — including when the refusing session owner is a *peer* node: the refusal crosses the peer bus as a verdict (during a rolling upgrade, a link to an older build degrades to a withheld ack and a close). Nothing acked is lost; whether the message is re-sent is the *application's* decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle (no client library retransmits it) and a clean-session v3.1.1 publisher resends nothing (ADR 0041 §5/T11/T12, counted as `quota_rejections_total{reason="brownout-publish"}`). The arms that still ack-and-drop, stated where the claim is: the **default** `drop-oldest` offline-queue overflow, which truncates the oldest *already-acked* entries out of a session's durable queue at the cap (counted `publish_dropped{reason="queue-overflow"}`); its opt-in `reject-newest` sibling, which acks and sheds the newest; for retained *values* only, a v3.1.1 retained publish over the retained quota or under brownout (delivered live, not retained); and a publish for a durable session whose owner is gone, acked-and-dropped by the no-known-subscriber path. Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
+| Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses), and covers a message **in flight to a connected subscriber** as well as one queued for a disconnected one — the durable append happens before the wire send ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124), reproduced against the real binary under SIGKILL). Those appends — and the QoS 2 outbound-id records and packet-id reservations that precede an online wire send — run **off the hub loop** in per-session lanes (ADR 0061, issue #242): a placement group with a degraded follower set delays only its own sessions' publishes and deliveries (bounded by the 5 s replication RPC timeout per lane job, 256 queued jobs per session, then the newest publish is withheld and retried) — never other groups' publishes, connects, or subscribes, with the residuals named in the ADR (the *ack* path's store writes — truncation, QoS 2 phase advances, id clears — still run on-loop, watched by the dispatch histogram's `ack` class, as does one publish-path corner: the eviction truncate past a 10 000-entry per-session backlog) — and time-on-loop is exported as `mqttd_hub_dispatch_seconds` so a regression pages before 3 a.m. does. A group too thin to keep the promise **refuses** new durable writes by default (the min-replicas floor, `MQTTD_MIN_REPLICAS=majority`: a majority of the members the node knows about, capped at R) rather than acking on one copy; a node that has never known peers still serves fully. Above the (off-by-default) store or memory watermark the broker likewise **refuses the publisher** rather than acking a message it will not store — v5 gets `0x97 Quota exceeded`, v3.1.1 gets no ack and a close — including when the refusing session owner is a *peer* node: the refusal crosses the peer bus as a verdict (during a rolling upgrade, a link to an older build degrades to a withheld ack and a close). Nothing acked is lost; whether the message is re-sent is the *application's* decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle (no client library retransmits it) and a clean-session v3.1.1 publisher resends nothing (ADR 0041 §5/T11/T12, counted as `quota_rejections_total{reason="brownout-publish"}`). The arms that still ack-and-drop, stated where the claim is: the **default** `drop-oldest` offline-queue overflow, which truncates the oldest *already-acked* entries out of a session's durable queue at the cap (counted `publish_dropped{reason="queue-overflow"}`); its opt-in `reject-newest` sibling, which acks and sheds the newest; for retained *values* only, a v3.1.1 retained publish over the retained quota or under brownout (delivered live, not retained); and a publish for a durable session whose owner is gone, acked-and-dropped by the no-known-subscriber path. Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
 | Where we lose | No dashboard, rule engine, HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery — and the CONNACK says so (`0x29 = 0`), so clients fail fast rather than silently — and **no production track record**: the matrix says so in as many words. |
@@ -610,8 +614,11 @@ be found. Each is tracked; none is a silent surprise.
 - **Memory has a watermark, not a ceiling.** `MQTTD_MEMORY_MAX_BYTES` puts the
   broker into brownout above it — growth writes refused; subscriber acks, reads,
   deletes, expiry and resumes continue, while a publisher's `QoS` ≥ 1 ack is
-  refused, not granted — but nothing can stop RSS rising, so a burst that outruns the 10-second
-  poll can still OOM, and the container limit remains the hard bound. It needs
+  refused, not granted — but nothing can stop RSS rising. The mark is sampled, not charged
+  at each allocation, so RSS can overshoot it by `MQTTD_WATERMARK_POLL x the allocation rate`
+  (default 10 s; 1 s once within 10% of the mark) and a burst inside one interval can still
+  OOM. Keep the watermark at 75-85% of the container limit — that gap IS the overshoot
+  allowance — and the container limit remains the hard bound. It needs
   `/proc` (Linux); elsewhere the broker logs that it is **not** enforcing rather than
   pretending. Underneath, the per-subscriber queues are still bounded by message
   count and not by bytes: QoS 1/2 by `MAX_BACKLOG` (10 000, drop-oldest) and QoS 0 by
@@ -621,8 +628,14 @@ be found. Each is tracked; none is a silent surprise.
   `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full arithmetic and a bounded
   preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T10).
 - **Disk is bounded in aggregate, not per store.** One store can consume the whole
-  `MQTTD_STORE_MAX_BYTES` watermark and brown out the others (ADR 0041 T9).
-  Disk-full itself fails closed and is crash-tested mid-write.
+  `MQTTD_STORE_MAX_BYTES` watermark and brown out the others. The broker now WARNs once,
+  naming the store, above 70% of the mark (and `store_bytes{store}` is always exported),
+  but there is no per-store *refusal* — deliberately: the resource is one filesystem, and
+  `replicas.redb`/`lease.redb` grow from peers' committed appends and from consensus, with
+  no client write to refuse. Selective refusal for `sessions`/`retained` is tracked
+  (ADR 0041 T9). Relatedly, **a browned-out node keeps growing `replicas.redb`** for groups
+  it merely follows — the refusal is decided at the session's owner — so headroom must cover
+  peer-driven growth too. Disk-full itself fails closed and is crash-tested mid-write.
 - **The Kubernetes operator ships from the next release on.** It is packaged
   (ADR 0055 T8, issue #252): an install chart (`deploy/helm/mqttd-operator`,
   CRD included) and an operator image cut by the same signed/reproducible/SBOM
@@ -631,10 +644,19 @@ be found. Each is tracked; none is a silent surprise.
   The **Helm chart remains the fully-supported no-operator path**; the
   `MqttdCluster` CRD is `v1alpha1`, schema-pinned in CI against the operator's
   own types, and pre-1.0 may change with the release train.
-- **The horizontal scaling curve is unmeasured.** The architecture is
-  shared-nothing with no coordinator on the publish hot path, but measuring what
-  that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
-  as design intent.
+- **The horizontal scaling curve is unmeasured; the durable path itself now is,
+  on one host.** [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)
+  publishes end-to-end **acked** QoS 1/2 throughput and latency percentiles against
+  a real 3-node quorum with the durable plane on, from a harness whose multi-host
+  invocation is documented and parameterised. What that does **not** settle: it is
+  one developer machine (three broker processes and the driver sharing 8 cores and
+  **one** disk, loopback, no TLS), so it is dev-grade and is not a capacity claim;
+  and throughput-vs-node-count is still absent on purpose, because a single-host
+  curve scales *negatively* and would manufacture false evidence (ADR 0048 §2 and
+  the [2026-07-14 post-mortem](docs/postmortems/2026-07-14-ha-bridge-durable-refused.md)).
+  Treat **scaling** claims as design intent; treat the durable-path numbers as a
+  floor measured under stated, unflattering conditions. The multi-host run needs
+  hardware, and is the one thing standing between the two.
 - **Durability costs a write on the delivery path.** A QoS 1/2 message for a
   **persistent** subscriber is appended to that session's durable log before it
   goes on the wire — that is what makes the guarantee above hold. Clean sessions
@@ -1057,8 +1079,9 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | `MQTTD_MAX_RETAINED_MESSAGES` | Retained-topic cap (ADR 0041). A retained publish creating a **new** topic beyond it is refused (`0x97` v5; v3.1.1 is delivered live but not retained, counted); overwriting or clearing an existing topic always works — the cap stops growth, never maintenance. Unset = uncapped |
 | `MQTTD_MAX_SESSIONS` | Session cap (ADR 0041). A CONNECT creating a **new** session beyond it is refused (`0x97` v5, Server-unavailable v3.1.1); resuming an existing session is never refused — a full broker keeps serving its fleet and refuses only strangers. Unset = uncapped |
 | `MQTTD_MAX_PACKET_SIZE` | Inbound packet ceiling in bytes (default 1 MiB, floor 1 KiB), advertised to v5 clients as the MQTT 5 **Maximum Packet Size** — the transport cap and the advertised contract cannot drift apart. Outbound, a message larger than the *client's* advertised maximum is dropped for that subscriber only, per spec |
-| `MQTTD_STORE_MAX_BYTES` | Disk watermark over the node's on-disk stores, total bytes (ADR 0041; needs `MQTTD_DATA_DIR`). Above it the broker **browns out**: writes that *grow* durable state (new retained topics, new sessions, offline enqueues) are refused with the quota behaviors, while subscriber acks, reads, deletes, expiry and resumes continue — a publisher's `QoS` ≥ 1 ack is refused, not granted (v5 `0x97`, v3.1.1 no ack + close, cross-node as a peer-bus verdict — an answered refusal; re-sending is the application's decision) — read-mostly, never the disk-full cliff; dropping back under restores writes. Session metadata (SUBSCRIBEs, the `QoS` 2 dedup window, detach spills) is exempt and still grows slowly — set the mark with headroom (see SIZING). Per-store sizes are always exported as the `store_bytes{store}` gauge. Unset = no watermark |
-| `MQTTD_MEMORY_MAX_BYTES` | **Memory watermark** over this process's RSS, bytes (ADR 0041 T8). Above it the broker **browns out** exactly as the disk watermark does — growth writes refused; subscriber acks, reads, deletes, expiry and resumes continue, while a publisher's `QoS` ≥ 1 ack is refused, not granted — and dropping back under restores growth. Brownout is active while **either** axis is over; `brownout{axis="memory"}` and `process_resident_bytes` say which. A **watermark, not a ceiling**: nothing here stops RSS rising, so keep the container/cgroup limit as the hard bound. Needs `/proc` (Linux); elsewhere the broker logs at WARN that it is not enforcing, rather than pretending. Unset = off |
+| `MQTTD_STORE_MAX_BYTES` | Disk watermark over the node's on-disk stores, total bytes (ADR 0041; needs `MQTTD_DATA_DIR`). Above it the broker **browns out**: writes that *grow* durable state (new retained topics, new sessions, offline enqueues) are refused with the quota behaviors, while subscriber acks, reads, deletes, expiry and resumes continue — a publisher's `QoS` ≥ 1 ack is refused, not granted (v5 `0x97`, v3.1.1 no ack + close, cross-node as a peer-bus verdict — an answered refusal; re-sending is the application's decision) — read-mostly, never the disk-full cliff; dropping back under restores writes. Session metadata (SUBSCRIBEs, the `QoS` 2 dedup window, detach spills) is exempt and still grows slowly, and a browned-out node keeps applying peers' committed appends into `replicas.redb` for groups it merely follows — set the mark with headroom (see SIZING). Scanned every `MQTTD_WATERMARK_POLL` seconds, so the total can overshoot the mark by one interval's growth. The mark is **aggregate** over the four stores: per-store sizes are always exported as the `store_bytes{store}` gauge, and the broker WARNs once, naming the store, when any single store passes 70% of the mark. Unset = no watermark |
+| `MQTTD_MEMORY_MAX_BYTES` | **Memory watermark** over this process's RSS, bytes (ADR 0041 T8). Above it the broker **browns out** exactly as the disk watermark does — growth writes refused; subscriber acks, reads, deletes, expiry and resumes continue, while a publisher's `QoS` ≥ 1 ack is refused, not granted — and dropping back under restores growth. Brownout is active while **either** axis is over; `brownout{axis="memory"}` and `process_resident_bytes` say which. A **watermark, not a ceiling**: nothing here stops RSS rising — the mark is sampled, so RSS can overshoot it by `MQTTD_WATERMARK_POLL x the allocation rate` (plus the allocation in flight). Set it to 75-85% of `resources.limits.memory` and keep that container/cgroup limit as the hard bound (the Helm chart ships none — set it yourself). Needs `/proc` (Linux); elsewhere the broker logs at WARN that it is not enforcing, rather than pretending. Unset = off |
+| `MQTTD_WATERMARK_POLL` | How often **both** watermark watchers (disk, memory) sample their axis, seconds (`[limits] watermark_poll_secs`, ADR 0041 T14). Default 10; range **1-300** — outside it is a startup error. Within 10% of a mark the watchers re-check every `poll / 10` with a 1 s floor, which also bounds how long a *cleared* brownout takes to lift. This is the detection-lag knob: overshoot above a mark is bounded by `poll x growth rate`, so lower it to pay for a tighter bound. Read at startup only (a reload reports `limits` as requires-restart) |
 | `MQTTD_AUTH_TIMEOUT` | Per-round enhanced-auth reply timeout, seconds (ADR 0013; default `10`) |
 | `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store (an explicit choice: it needs no ephemeral opt-in). A node with no `MQTTD_SWIM_SEEDS` founds the lease group. On with no `MQTTD_DATA_DIR` → **REFUSED at startup** (issue #240) unless `MQTTD_ALLOW_EPHEMERAL_DURABILITY` is set |
 | `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); **unset with durable on → REFUSED at startup** (issue #240) unless the ephemeral opt-in below is set. With durable off, unset is plain in-memory |
@@ -1453,6 +1476,17 @@ not an end-to-end throughput claim; what they guarantee is that the broker is no
 bottleneck and does not silently regress. A per-PR **regression floor**
 (`cargo test -p mqtt-codec --test perf_gate`) fails the build on a gross slowdown, and the
 nightly tier re-runs the full benches ([ADR 0044](docs/adr/0044-release-readiness-assurance.md) P6).
+
+**End-to-end, with the durable plane on**, is a separate and much harder number, and it is
+published in [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md): acked
+QoS 1/QoS 2 throughput and p50/p95/p99 latency against a real 3-node quorum, measured
+through the production binary. Read its first paragraph before its tables. In one line:
+on the machine it was run on, an acked durable QoS 1 publish costs ~28 ms at p50 while
+the same publish to a **clean** session costs ~0.03 ms — the price of the guarantee — and
+the durable rate is pinned by that host's per-volume disk barrier, not by the broker's
+CPU. It is **single-host and dev-grade**: three broker processes and the load driver on
+8 cores and one disk. It is **not** the multi-host result, and it deliberately publishes
+no throughput-vs-node-count curve (ADR 0048 §2).
 
 ## Architecture decisions
 

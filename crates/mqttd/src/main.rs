@@ -580,14 +580,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => other,
         };
         if let Some(max) = max_bytes {
-            info!(max, "disk watermark active (ADR 0041): brownout above it");
+            info!(
+                max,
+                poll_secs = config.limits.watermark_poll_secs,
+                "disk watermark active (ADR 0041): brownout above it, sampled every \
+                 poll_secs (and every poll_secs/10, floor 1s, within 10% of the mark)"
+            );
         }
         tokio::spawn(mqttd::store_watch::watch(
             std::path::PathBuf::from(dir),
             max_bytes,
             hub_tx.clone(),
             Some(metrics.clone()),
-            None,
+            Some(mqttd::store_watch::WatermarkPoll::from_secs(
+                config.limits.watermark_poll_secs,
+            )),
             Some(store_snapshot.clone()),
         ));
     }
@@ -605,16 +612,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(max) = memory_max_bytes {
         info!(
             max,
+            poll_secs = config.limits.watermark_poll_secs,
             "memory watermark active (ADR 0041 T8): brownout above it. This is a \
-             watermark, not a ceiling — keep the container/cgroup memory limit as the \
-             hard bound"
+             watermark, not a ceiling — RSS can overshoot by poll_secs x the allocation \
+             rate, so keep the container/cgroup memory limit as the hard bound"
         );
     }
     tokio::spawn(mqttd::memory_watch::watch(
         memory_max_bytes,
         hub_tx.clone(),
         Some(metrics.clone()),
-        None,
+        Some(mqttd::store_watch::WatermarkPoll::from_secs(
+            config.limits.watermark_poll_secs,
+        )),
         None,
     ));
 

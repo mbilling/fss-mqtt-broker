@@ -37,7 +37,9 @@ decay_secs = 60
 # withholds the ack and closes instead; counted in
 # quota_rejections_total{reason="brownout-publish"}). Subscriber acks/reads/expiry
 # continue, recovery below the mark restores writes. It is a high-water
-# mark, not a hard wall: leave headroom (here 4 GB of the 20 GB disk).
+# mark, not a hard wall: leave headroom (here 4 GB of the 20 GB disk). The mark is
+# AGGREGATE, so one store can eat the whole budget — the broker WARNs once, naming the
+# store, above 70% of it, and `store_bytes{store}` is always exported.
 store_max_bytes = 16000000000
 
 [limits]
@@ -67,6 +69,18 @@ max_subscriptions_per_client = 1000
 # Per-connection publish rate; enforcement is TCP backpressure (pause), never a drop.
 max_publish_rate = 500
 
-# There is NO total-memory knob (see SIZING.md "What cannot be bounded today"):
-# run under a container memory limit sized by the SIZING.md formula — for these
-# numbers ~3 GiB RSS budget on the 4 GiB machine.
+# Process-memory WATERMARK (ADR 0041 T8): above it the broker browns out exactly as
+# the disk mark does — growth refused, subscriber acks/reads/expiry/resumes continue,
+# a QoS>=1 publisher refused rather than acked. 2.4 GiB is 80% of the ~3 GiB RSS
+# budget on this 4 GiB machine; set the container limit to that ~3 GiB.
+# NOT a ceiling: nothing here stops RSS rising. The mark is sampled, so RSS can
+# overshoot it by watermark_poll_secs x the allocation rate — the 20% gap between this
+# number and the container limit IS that allowance, and the container/cgroup limit
+# remains the hard bound. Needs /proc (Linux).
+memory_max_bytes = 2576980378
+
+# How often BOTH watermark watchers sample, seconds (range 1-300; outside = startup
+# error). Within 10% of either mark they re-check every poll/10, floor 1 s — which is
+# also how fast a cleared brownout lifts. Lower this to shrink overshoot on a tight
+# disk or memory budget; there is nothing to gain from raising it.
+watermark_poll_secs = 10

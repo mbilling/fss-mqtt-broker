@@ -51,6 +51,15 @@ impl Drop for Broker {
 async fn start_broker(
     memory_max: Option<u64>,
 ) -> (Broker, SocketAddr, SocketAddr, tempfile::TempDir) {
+    start_broker_with(memory_max, &[]).await
+}
+
+/// As [`start_broker`], plus extra `MQTTD_*` variables — the seam that lets a test prove a
+/// knob reaches the running broker rather than only reaching `Config`.
+async fn start_broker_with(
+    memory_max: Option<u64>,
+    extra_env: &[(&str, &str)],
+) -> (Broker, SocketAddr, SocketAddr, tempfile::TempDir) {
     let client: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
     let health: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
     let dir = tempfile::tempdir().expect("temp data dir");
@@ -69,6 +78,9 @@ async fn start_broker(
         .env("RUST_LOG", "off");
     if let Some(max) = memory_max {
         cmd.env("MQTTD_MEMORY_MAX_BYTES", max.to_string());
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     let child = cmd
         .stdout(Stdio::null())
@@ -171,6 +183,28 @@ async fn an_rss_over_the_watermark_browns_out_and_refuses_new_sessions() {
         connack_code(client, "newcomer").await,
         QUOTA_EXCEEDED,
         "under memory brownout a NEW session must be refused (ADR 0041)"
+    );
+}
+
+/// The cadence knob is wired the same way (issue #243): `MQTTD_WATERMARK_POLL=1` reaches
+/// the watcher through `[limits] watermark_poll_secs`, and a broker over its mark still
+/// browns out and still refuses a new session. No in-crate test can see this path — the
+/// unit tests inject a `WatermarkPoll` directly, so only the real binary proves the env
+/// var is read at all.
+#[tokio::test]
+async fn a_configured_watermark_poll_is_accepted_and_still_browns_out() {
+    let (_broker, client, health, _dir) =
+        start_broker_with(Some(1024), &[("MQTTD_WATERMARK_POLL", "1")]).await;
+    let body = metrics_until(health, |b| b.contains(MEM_BROWNOUT_ON)).await;
+    assert!(
+        body.contains(MEM_BROWNOUT_ON),
+        "a 1 s cadence must still drive the memory axis; metrics were:\n{}",
+        memory_lines(&body)
+    );
+    assert_eq!(
+        connack_code(client, "newcomer-fast-poll").await,
+        QUOTA_EXCEEDED,
+        "the refusal is unchanged by the cadence — only its latency is"
     );
 }
 

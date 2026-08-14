@@ -1,6 +1,6 @@
 # How mqttd compares — Mosquitto · EMQX · NanoMQ · VerneMQ
 
-**Dated 2026-08-13.** Versions compared: **mqttd** `v0.9.0` (released — signed,
+**Dated 2026-08-14.** Versions compared: **mqttd** `v0.9.0` (released — signed,
 reproducible, SBOM-attested) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
 differ) · **EMQX** 6.2.2 (documentation cells; the benchmark ran 5.8.6, the last
 Apache-licensed line — its results are **not yet published in-tree**, and issue #244
@@ -134,8 +134,8 @@ Packet-size enforcement is compared in the Protocol table above.
 | Publish rate limiting | ✅ token bucket + TCP backpressure — pause, not drop (`MQTTD_MAX_PUBLISH_RATE`) | ✖ | ✅ rate limiters | n/v | n/v |
 | Retained-store bound | ✅ topic count (`MQTTD_MAX_RETAINED_MESSAGES`); overwrite/clear always allowed | ✖ | ✅ retainer limits | n/v | n/v |
 | Sessions cap | ✅ `MQTTD_MAX_SESSIONS` (new refused; resume never refused) | ✖ | ✅ | n/v | n/v |
-| Disk bound / full-disk behavior | ⚠️ one aggregate high-water mark (`MQTTD_STORE_MAX_BYTES`) → **brownout**: growth writes refused — subscriber acks/reads/expiry continue, while a `QoS` ≥ 1 publisher is **refused** (v5 `0x97`, v3.1.1 no ack + close) rather than acked for a message the store will not take — cross-node too, as a peer-bus verdict; mid-rolling-upgrade an older link degrades to a withheld ack + close (issue #238); disk-full itself fails closed, crash-tested mid-write (ADR 0044 P2). ✖ no per-store quota (ADR 0041 amendment T9) | ⚠️ persistence file + autosave, no quota | n/v | n/v | n/v (node-local LevelDB) |
-| Total-memory limit | ⚠️ **watermark, not a ceiling**: `MQTTD_MEMORY_MAX_BYTES` → brownout (growth refused; subscriber acks/reads/expiry/resumes continue, while a `QoS` ≥ 1 publisher is refused — v5 `0x97`, v3.1.1 no ack + close, cross-node as a peer-bus verdict (older links mid-upgrade: withheld ack + close) — ADR 0041 T8/T11/T12). Cannot stop RSS rising — the container limit is still the hard bound, and it needs `/proc` (Linux) | ✅ `memory_limit` (hard heap cap) | ⚠️ per-connection `force_shutdown` (heap default 32 MiB + mailbox 1000) — kills the connection, not a broker-wide cap | n/v | n/v |
+| Disk bound / full-disk behavior | ⚠️ one aggregate high-water mark (`MQTTD_STORE_MAX_BYTES`) → **brownout**: growth writes refused — subscriber acks/reads/expiry continue, while a `QoS` ≥ 1 publisher is **refused** (v5 `0x97`, v3.1.1 no ack + close) rather than acked for a message the store will not take — cross-node too, as a peer-bus verdict; mid-rolling-upgrade an older link degrades to a withheld ack + close (issue #238); disk-full itself fails closed, crash-tested mid-write (ADR 0044 P2). Detection lag ≤ `MQTTD_WATERMARK_POLL` (**unreleased** — post-dates `v0.9.0`; default 10 s, 1 s within 10% of the mark), so the total can overshoot by one interval's growth. ✖ no per-store quota (ADR 0041 amendment T9) — the aggregate is the enforcement point **because** two of the four stores have no refusable client write (`replicas` grows from peers' committed appends, `lease` from consensus); a WARN naming any store above 70% of the mark is the visibility half | ⚠️ persistence file + autosave, no quota | n/v | n/v | n/v (node-local LevelDB) |
+| Total-memory limit | ⚠️ **watermark, not a ceiling**: `MQTTD_MEMORY_MAX_BYTES` → brownout (growth refused; subscriber acks/reads/expiry/resumes continue, while a `QoS` ≥ 1 publisher is refused — v5 `0x97`, v3.1.1 no ack + close, cross-node as a peer-bus verdict (older links mid-upgrade: withheld ack + close) — ADR 0041 T8/T11/T12). Cannot stop RSS rising: the mark is sampled, so overshoot ≤ `MQTTD_WATERMARK_POLL x allocation rate` (**unreleased** — post-dates `v0.9.0`; default 10 s, 1 s within 10% of the mark) — the container limit is still the hard bound, and it needs `/proc` (Linux). **A genuine loss against mosquitto**: it has a hard cap and we have none, by decision — though the cap is on mosquitto's own tracked allocations rather than on RSS, so it too leaves the container limit as the true bound; it pays for that with failing allocations (refused packets, lost messages), where brownout keeps standing state and tells the publisher | ✅ `memory_limit` (hard cap on its own TRACKED allocations — enforced in mosquitto's allocator wrappers, so it does not bound RSS: library allocations, stacks and fragmentation sit outside it; allocation failures are the cost) | ⚠️ per-connection `force_shutdown` (heap default 32 MiB + mailbox 1000) — kills the connection, not a broker-wide cap | n/v | n/v |
 | Per-connection write buffering | ⚠️ `MAX_BACKLOG`: **10 000 messages** per stalled subscriber, **hard-coded and not configurable** — bounded in count, not in bytes. With the 1 MiB default packet size that is ~10 GiB of worst-case headroom per connection; cap `MQTTD_MAX_PACKET_SIZE` to bound it. Accepted, tracked (ADR 0041 amendment T10) | ⚠️ bounded by `max_queued_bytes` | ⚠️ per-connection `force_shutdown` heap cap | n/v | n/v |
 | Auth-failure penalty | ✅ per-source threshold + decay, bounded table (`MQTTD_AUTH_PENALTY_*`; default off) | ✖ | ✅ flapping detect / banning | n/v | n/v |
 
@@ -181,9 +181,17 @@ below are limited to each vendor's own published positioning; no benchmark numbe
   document's own rules.
 - **Performance:** no cross-broker numbers are printed here, deliberately. The
   [benchmark harness](../bench/) runs all five brokers under disclosed postures;
-  numbers appear in [docs/benchmarks/](benchmarks/) only from dedicated, documented
-  hardware (ADR 0048's dev-grade/publishable line). Our own micro-baselines are in
-  [BASELINE.md](benchmarks/BASELINE.md).
+  cross-broker numbers appear in [docs/benchmarks/](benchmarks/) only from dedicated,
+  documented hardware (ADR 0048's dev-grade/publishable line), and none are published
+  yet. What **is** published, both about mqttd alone and both labelled with their
+  limits: our micro-baselines in [BASELINE.md](benchmarks/BASELINE.md), and the
+  end-to-end **durable-path** measurement in
+  [DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) — acked QoS 1/2 throughput and latency
+  against a real 3-node quorum, measured **single-host and dev-grade**, which states in
+  its first paragraph that it is not the multi-host result and carries the multi-host
+  invocation as documented-but-unrun. Read together they price the durability
+  guarantee this table's Durability rows describe: on that host a durable QoS 1 publish
+  costs ~28 ms at p50 against ~0.03 ms for the same publish to a clean session.
 
 ## Sources & staleness
 
@@ -198,6 +206,23 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 - 2026-08-14 — Kubernetes row: the operator is packaged (install chart + release-pipeline
   image, ADR 0055 T8 / issue #252); "built but not installable" removed.
+- 2026-08-14 — The durable path now has published numbers (issue #244): the Performance
+  bullet cites [DURABLE-PATH.md](benchmarks/DURABLE-PATH.md), a tracked artifact with
+  end-to-end acked QoS 1/2 throughput and latency against a real quorum, measured
+  single-host and labelled dev-grade in its first paragraph. Cross-broker numbers and
+  the scaling curve remain unpublished and unrun; the multi-host invocation is now
+  documented rather than merely owed. The citation guard in
+  `scripts/check-readme-facts.py` widened from this file alone to the README and every
+  `docs/benchmarks/*.md`.
+- 2026-08-14 — Governance rows rewritten for issue #243 (0041-T14): the *Disk bound* and
+  *Total-memory limit* cells gained the detection-lag numbers (`MQTTD_WATERMARK_POLL`,
+  default 10 s and 1 s near the mark) and the argument for why the disk mark is aggregate
+  **by design** (two of the four stores have no refusable client write), and the
+  memory row now states the missing ceiling as a decision with its cost rather than an
+  omission. Also narrowed on review: mosquitto's `memory_limit` caps its own *tracked*
+  allocations inside its allocator wrappers, not process RSS — the earlier wording
+  overstated a competitor's guarantee in the direction that flattered neither party
+  accurately. Both knob names post-date `v0.9.0`, so they are marked as unreleased below.
 - 2026-08-14 — Drift sweep from the 2026-08-13 panel (issue #253): the header's
   benchmark citation pointed at a results file under bench/results/ that is not
   tracked in this repository (that directory is gitignored) — the one document

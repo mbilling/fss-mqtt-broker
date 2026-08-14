@@ -25,11 +25,20 @@
 //! already promised — which is this ADR's founding principle, and the reason the disk
 //! axis is built the same way.
 //!
-//! It is a **watermark, not a ceiling.** Nothing here can stop memory rising: the broker
-//! can still be OOM-killed if a single burst outruns the poll interval. The container
-//! `MemoryMax` / cgroup limit remains the hard bound. What this buys is that the common
-//! case — pressure building over minutes — degrades to read-mostly with a metric and a
-//! log line, instead of arriving as an OOM kill with no warning.
+//! It is a **watermark, not a ceiling**, and the number that makes that sentence
+//! actionable is the overshoot bound: RSS can exceed the mark by
+//! `poll interval x peak allocation rate` plus the allocation already in flight, because
+//! the mark is checked on a sample and never charged at an allocation. The cadence is the
+//! shared [`WatermarkPoll`] policy (`MQTTD_WATERMARK_POLL`, default 10 s; `poll / 10`,
+//! floor 1 s, within 10% of the mark — see [`store_watch`](crate::store_watch), where it
+//! is stated once for both axes), so at the default the bound is one second of allocation
+//! near the mark and ten from a standing start. The container `MemoryMax` / cgroup limit
+//! therefore has to sit at least that far above the watermark — the 75-85%-of-limit advice
+//! in [SIZING](../../../docs/SIZING.md) is exactly that headroom, and if
+//! `poll x your measured peak allocation rate` exceeds it, one of the two must come down.
+//! The container limit remains the hard bound; what this buys is that the common case —
+//! pressure building over minutes — degrades to read-mostly with a metric and a log line,
+//! instead of arriving as an OOM kill with no warning.
 //!
 //! ## Where RSS comes from
 //!
@@ -39,15 +48,11 @@
 //! watcher **logs once and exits** rather than silently pretending to enforce a bound.
 
 use crate::hub::{BrownoutAxis, HubCommand};
+use crate::store_watch::WatermarkPoll;
 use mqtt_observability::metrics::Metrics;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-
-/// How often the watcher re-samples RSS. Matches the disk watcher's cadence: fast enough
-/// that pressure building over minutes is caught, slow enough to cost nothing.
-const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// This process's resident set size in bytes, or `None` where it cannot be read.
 ///
@@ -77,10 +82,10 @@ pub async fn watch(
     max_bytes: Option<u64>,
     hub: mpsc::UnboundedSender<HubCommand>,
     metrics: Option<Arc<Metrics>>,
-    poll: Option<Duration>,
+    poll: Option<WatermarkPoll>,
     sample: Option<Box<dyn Fn() -> Option<u64> + Send>>,
 ) {
-    let poll = poll.unwrap_or(POLL_INTERVAL);
+    let poll = poll.unwrap_or_default();
     let sample = sample.unwrap_or_else(|| Box::new(resident_bytes));
     let mut brownout = false;
 
@@ -122,7 +127,12 @@ pub async fn watch(
                 }
             }
         }
-        tokio::time::sleep(poll).await;
+        // Near the mark, sample sooner: that interval is the overshoot bound and, above
+        // the mark, the tail of the brownout after RSS falls back (issue #243).
+        tokio::time::sleep(
+            poll.interval(max_bytes.is_some_and(|max| WatermarkPoll::near(rss, max))),
+        )
+        .await;
     }
 }
 
@@ -130,6 +140,7 @@ pub async fn watch(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     /// The real format, verbatim from a Linux box — including the surrounding lines, so
     /// the parser is proven to pick the right one rather than the first number it sees.
@@ -176,7 +187,9 @@ Threads:\t8
             Some(100),
             tx,
             None,
-            Some(Duration::from_millis(20)),
+            Some(crate::store_watch::WatermarkPoll::new(
+                Duration::from_millis(20),
+            )),
             Some(Box::new(|| Some(RSS.load(Ordering::Relaxed)))),
         ));
 
@@ -213,6 +226,32 @@ Threads:\t8
         }
     }
 
+    /// The shared poll policy applies to RSS too: within 10% of the mark the next sample
+    /// comes at `poll / 10`, so a 20 s cadence still catches the crossing in seconds. The
+    /// other tests in this module keep their 10-20 ms injected cadences, which is the proof
+    /// that the 1 s floor never *lengthens* a configured interval.
+    #[tokio::test]
+    async fn nearing_the_watermark_shortens_the_poll() {
+        static RSS: AtomicU64 = AtomicU64::new(95); // 95 of a 100-byte mark: near, under
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watch = tokio::spawn(watch(
+            Some(100),
+            tx,
+            None,
+            Some(crate::store_watch::WatermarkPoll::from_secs(20)),
+            Some(Box::new(|| Some(RSS.load(Ordering::Relaxed)))),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        RSS.store(150, Ordering::Relaxed);
+        match tokio::time::timeout(Duration::from_secs(6), rx.recv()).await {
+            Ok(Some(HubCommand::SetBrownout {
+                axis: BrownoutAxis::Memory,
+                on: true,
+            })) => {}
+            other => panic!("expected an accelerated SetBrownout{{Memory, true}}, got {other:?}"),
+        }
+    }
+
     /// With no watermark the watcher still exports the gauge, and never browns out —
     /// so turning on memory *visibility* cannot accidentally turn on enforcement.
     #[tokio::test]
@@ -222,7 +261,9 @@ Threads:\t8
             None,
             tx,
             None,
-            Some(Duration::from_millis(10)),
+            Some(crate::store_watch::WatermarkPoll::new(
+                Duration::from_millis(10),
+            )),
             Some(Box::new(|| Some(u64::MAX))), // absurdly over any plausible bound
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -241,7 +282,9 @@ Threads:\t8
             Some(100),
             tx,
             None,
-            Some(Duration::from_millis(10)),
+            Some(crate::store_watch::WatermarkPoll::new(
+                Duration::from_millis(10),
+            )),
             Some(Box::new(|| None)),
         ));
         tokio::time::timeout(Duration::from_secs(2), handle)

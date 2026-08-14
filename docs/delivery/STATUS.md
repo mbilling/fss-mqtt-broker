@@ -48,14 +48,14 @@
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
 | [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
-| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [9/13 done](0041-resource-governance.md) | 4 open |
+| [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [10/14 done](0041-resource-governance.md) | 4 open |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [5/5 done](0043-elastic-cluster-resize.md) | — |
 | [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [8/9 done](0044-release-readiness-assurance.md) | 1 open |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Accepted | [6/6 done](0045-release-engineering-and-distribution.md) | — |
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [5/6 done](0046-file-based-configuration.md) | 1 open |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [13/13 done](0047-kubernetes-deployment.md) | — |
-| [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [2/4 done](0048-comparative-benchmarking.md) | 2 open |
+| [0048](../adr/0048-comparative-benchmarking.md) | Comparative performance benchmarking (published, reproducible, honest) | Accepted | [3/5 done](0048-comparative-benchmarking.md) | 2 open |
 | [0049](../adr/0049-voter-eligible-durable-ownership.md) | Durable ownership must be lease-eligible, and a degraded durable plane must be visible | Accepted | [3/3 done](0049-voter-eligible-durable-ownership.md) | — |
 | [0050](../adr/0050-oidc-token-authentication.md) | OIDC-integrated token authentication (discovery, JWKS rotation, proven against a real IdP) | Accepted | [5/5 done](0050-oidc-token-authentication.md) | — |
 | [0051](../adr/0051-evaluation-readiness.md) | Evaluation readiness: an assessable, comparable, migratable first release | Proposed | [12/16 done](0051-evaluation-readiness.md) | 4 open |
@@ -68,6 +68,7 @@
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [4/5 done](0058-one-dot-zero-stability-contract.md) | 1 open |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
 | [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/8 done](0060-bridge-durability-and-ack-contract.md) | 1 open |
+| [0061](../adr/0061-off-loop-durable-appends.md) | Off-loop durable appends: per-session lanes for the publish path | Accepted | [6/6 done](0061-off-loop-durable-appends.md) | — |
 
 ## Open and deferred work
 
@@ -125,7 +126,7 @@
 
 - `0041-T6` ⬜ planned: Per-session byte bound on the offline queue — MQTTD_MAX_QUEUED_BYTES beside the count bound, first-reached wins, same queue_overflow semantics, counted; SIZING.md updated (2026-08-04 amendment)
 - `0041-T7` ⬜ planned: Bridge-spool byte bound — max_bytes joins max_messages in the mqtt-bridge spool, drop-oldest, counted (2026-08-04 amendment)
-- `0041-T9` ⬜ planned: Per-store disk bound — a share of MQTTD_STORE_MAX_BYTES per redb store (sessions/retained/replicas/lease) so one store cannot consume the whole watermark and brown out the others; same T4 refusal behaviors, counted per store (2026-08-07 amendment)
+- `0041-T9` ⬜ planned: "Per-store disk REFUSAL, narrowed (issue #243): a share of MQTTD_STORE_MAX_BYTES for the two stores whose growth has a refusable client write — sessions and retained — with the same T4 behaviors counted per store; replicas and lease stay on the GLOBAL axis by decision (their growth is peers' committed appends and consensus, and refusing there would thin the group's replica count rather than enforce a watermark). The visibility half shipped under T14 (a WARN naming any store above 70% of the aggregate mark)" — "Blocked on a hub.rs change this lane deliberately did not make (another lane owns the file): (1) hub::BrownoutAxis must carry a store dimension while keeping brownout{axis} bounded-cardinality (ADR 0020 §3); (2) the CONSUMERS must stop reading the global OR — the plan pass / durable_append must ask 'is SESSIONS over?' and the retained-set path 'is RETAINED over?'; (3) the ADR must state that replicas/lease map to the global axis, or the semantics become 'some stores are enforceable and we did not say which'; (4) a hub test: sessions over its share and retained under => a new retained topic is accepted while a durable enqueue is refused. The store-watcher half (per-store marks -> per-store axis commands) is ~15 lines in store_watch.rs; all the cost and risk are in (2) and (3)."
 - `0041-T10` ⬜ planned: Per-connection write-buffer bound — MAX_BACKLOG (hub.rs, 10 000 messages per stalled subscriber) becomes byte-aware and configurable; today it is a hard-coded count, so a slow consumer's backlog is bounded in messages but unbounded in bytes and cannot be tuned (2026-08-07 amendment)
 
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
