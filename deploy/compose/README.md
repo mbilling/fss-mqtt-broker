@@ -13,15 +13,18 @@ read them, and writes `secrets/ca.pem` for clients on this host. It is idempoten
 later `up`s reuse the same PKI. Each node's key lands in its **own** volume, and the CA
 private key in one that no broker mounts.
 
-> **If your containers never go healthy** — `docker compose ps` showing all three
-> `unhealthy` forever, or `./bootstrap.sh` writing log lines into `secrets/mqttd-passwd` —
-> you are running the published `:latest` image, which is still **v0.9.0**. That build
-> predates `mqttd --hash-password` and the `--probe` fast path this file's healthcheck uses.
-> Tracked in **issue #263**. Until it is retagged, run against a broker built from this
-> repository: `MQTTD_IMAGE=<your-tag> docker compose up -d` (and export the same
-> `MQTTD_IMAGE` before `./bootstrap.sh`, which uses it for hashing). This is also why
-> `scripts/compose-smoke.sh` always sets `MQTTD_IMAGE`, and why nothing here claims the
-> default tag is tested.
+> **Which image this runs**: the default is **pinned** to
+> `ghcr.io/mbilling/fss-mqtt-broker:v0.9.1` — the oldest release whose binary has every
+> flag these artifacts use — never a floating `:latest` (issue #263 was that float
+> drifting behind the artifacts: v0.9.0 predates `mqttd --hash-password` and `--probe`,
+> so the healthcheck could not pass and `./bootstrap.sh` wrote log lines into
+> `secrets/mqttd-passwd`). Two gates hold the pin honest: a per-PR check that every flag
+> used here exists in the binary at the pinned tag, and a nightly lane that runs this
+> exact file against the published default with no override. To run a different broker:
+> `MQTTD_IMAGE=<your-tag> docker compose up -d` (export the same `MQTTD_IMAGE` before
+> `./bootstrap.sh`, which uses it for hashing). If you are on **v0.9.0** — say, a
+> mirrored copy — its containers never go healthy here; upgrade the image, don't patch
+> the healthcheck.
 
 Then, from `secrets/PASSWORDS.txt`:
 
@@ -69,9 +72,9 @@ openssl s_client -connect 127.0.0.1:8883 -CAfile secrets/ca.pem </dev/null
   broker denies by default and the compose file does not undo that.
 - **Deny-by-default topic ACLs** ([`acl.toml`](acl.toml)) scoping each device to its own
   subtree via `%i`.
-- **Real health checks**, on a broker newer than v0.9.0 (see the note above and issue #263).
-  `mqttd --probe /readyz` — the image is distroless (no shell, no curl), so the binary probes
-  itself. `/readyz` is majority-aware: a node that cannot see a quorum reports unhealthy
+- **Real health checks**: `mqttd --probe /readyz` — the image is distroless (no shell, no
+  curl), so the binary probes itself. `--probe` needs a broker newer than v0.9.0, which
+  the pinned default guarantees (issue #263; the per-PR pin gate keeps it true). `/readyz` is majority-aware: a node that cannot see a quorum reports unhealthy
   instead of serving clients from a store it cannot write. That holds for nodes 2 and 3 from
   the first boot and for **node 1 once you arm it** — it starts with a floor of 1 so the
   cluster can be founded at all, and stays exempt from the majority rule until you raise it
@@ -189,10 +192,11 @@ docker compose up -d init                            # restage it (prints what i
 docker compose kill -s HUP mqttd-1 mqttd-2 mqttd-3   # reload it in place
 ```
 
-`$MQTTD_IMAGE` — the same broker your cluster runs — and **not** the published `:latest`:
-v0.9.0 has no `--hash-password`, so that variant writes its startup log into the password
-file and every broker then refuses to load it (`duplicate username in password file`).
-Issue #263, same cause as the note at the top.
+`$MQTTD_IMAGE` — the same broker your cluster runs. (Unset, compose and `bootstrap.sh`
+both resolve the pinned default, which has `--hash-password`. A v0.9.0 image does not:
+that variant writes its startup log into the password file and every broker then refuses
+to load it (`duplicate username in password file`) — issue #263, same cause as the note
+at the top.)
 
 `acl.toml` already grants `device-*`, so `device-c` needs no policy edit.
 
@@ -255,12 +259,14 @@ re-trust the fresh `secrets/ca.pem`.
 
 ## Verifying this by hand
 
-`scripts/compose-smoke.sh` does all of this in CI — against an image built from this
-repository, never the default tag (issue #263) — and the same checks by hand:
+`scripts/compose-smoke.sh` does all of this in CI, twice nightly: once against an image
+built from this repository, and once (`MQTTD_SMOKE_DEFAULT_IMAGE=1`) against the pinned
+published default with no override — the reader's exact path (issue #263). The same
+checks by hand:
 
 ```sh
 cd deploy/compose
-export MQTTD_IMAGE=<a broker newer than v0.9.0>       # see the note at the top
+# optional: export MQTTD_IMAGE=<your-tag> to test a broker other than the pinned default
 ./bootstrap.sh && docker compose up -d
 docker compose ps                                     # three healthy
 docker compose logs | grep -i insecure                # must print NOTHING

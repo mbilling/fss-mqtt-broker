@@ -295,3 +295,12 @@ jobs:
       # the same file with `docker compose config` but never brings it up (issue #254).
       - name: compose reference deployment (TLS by default, real containers)
         run: ./scripts/compose-smoke.sh
+
+      # Issue #263: the same reference deployment, but resolving compose.yaml's PINNED
+      # DEFAULT tag with no override — the reader's exact path, `./bootstrap.sh &&
+      # docker compose up -d` against the image users actually pull. This is the lane
+      # whose absence let v0.9.0 ship as a default that could never pass its own
+      # healthcheck. Skips loudly (never silently green) while the pinned tag is not
+      # yet published; the per-PR pin gate proves that state is a forward pin.
+      - name: compose reference deployment (the PUBLISHED default image, no override)
+        run: MQTTD_SMOKE_DEFAULT_IMAGE=1 ./scripts/compose-smoke.sh

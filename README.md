@@ -1264,9 +1264,12 @@ recipe can rot — and proves the security posture (including that no node logs
 the overlay), cross-node routing, an acked QoS 1 message surviving `SIGKILL` of the node
 that accepted it, and the readiness floor. `scripts/compose-smoke.sh` then brings the
 actual `compose.yaml` up in containers on the nightly image lane, because a per-PR job that
-never runs `docker compose up` cannot tell you the file works — always against an image built
-from this repository, so `compose.yaml`'s published-`:latest` default is the one input those
-lanes do not cover (issue #263).
+never runs `docker compose up` cannot tell you the file works — twice: once against an
+image built from this repository, and once resolving `compose.yaml`'s **pinned default
+tag** with no override, the exact path a reader takes (issue #263: the default used to be
+a floating `:latest` that no lane exercised, and it drifted behind the artifacts). A
+per-PR gate (`scripts/check-deploy-image-pin.sh`) additionally proves every mqttd flag
+the compose artifacts use exists in the binary at the pinned tag.
 
 ## Resizing the cluster
 
