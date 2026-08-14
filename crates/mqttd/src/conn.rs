@@ -1540,14 +1540,18 @@ where
                         if let (Some(limiter), Packet::Publish(_)) = (&mut publish_rate, &packet) {
                             limiter.acquire().await;
                         }
-                        // Only a client DISCONNECT is graceful. A broker-initiated
-                        // close — protocol violation, hub gone, or a refusal v3.1.1
-                        // can only say by hanging up — is UNgraceful, so the Will
-                        // still fires (issue #238, [MQTT-3.14.4-3]).
+                        // Only a client DISCONNECT with reason 0x00 is graceful. A
+                        // broker-initiated close — protocol violation, hub gone, or
+                        // a refusal v3.1.1 can only say by hanging up — is
+                        // UNgraceful, so the Will still fires (issue #238,
+                        // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
+                        // reason, where the CLIENT asks for its Will (issue #265,
+                        // [MQTT-3.1.2-10]).
                         match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
                             PacketOutcome::Continue => {}
                             PacketOutcome::ClientDisconnect => return Ok(true),
-                            PacketOutcome::BrokerClose => return Ok(false),
+                            PacketOutcome::ClientDisconnectWithWill
+                            | PacketOutcome::BrokerClose => return Ok(false),
                         }
                     }
                 }
@@ -2023,9 +2027,17 @@ impl PublishRateLimiter {
 enum PacketOutcome {
     /// Keep serving.
     Continue,
-    /// The client asked to close (DISCONNECT): graceful, and the Will is discarded
-    /// [MQTT-3.14.4-3].
+    /// The client asked to close (DISCONNECT reason `0x00`): graceful, and the
+    /// Will is discarded [MQTT-3.14.4-3].
     ClientDisconnect,
+    /// The client asked to close AND asked for its Will (issue #265): a v5
+    /// DISCONNECT with a **non-zero** reason — `0x04 Disconnect with Will
+    /// Message` explicitly, and any error reason implicitly, since only reason
+    /// `0x00` discards the Will [MQTT-3.1.2-10]. The socket close is as clean as
+    /// [`ClientDisconnect`](Self::ClientDisconnect)'s, but the detach is
+    /// un-graceful so the Will fires. Unreachable on v3.1.1, whose DISCONNECT
+    /// has no reason byte and always decodes as `0`.
+    ClientDisconnectWithWill,
     /// The BROKER is closing: a protocol violation, a refusal this protocol version
     /// cannot say any other way, or a hub that went away. Un-graceful — the Will
     /// fires, exactly as for an EOF or a keepalive expiry.
@@ -2212,7 +2224,18 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             writer.send(&Packet::UnsubAck(u.pkid.into())).await?;
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
-        Packet::Disconnect(_) => return Ok(PacketOutcome::ClientDisconnect),
+        Packet::Disconnect(d) => {
+            // Only reason 0x00 discards the Will [MQTT-3.1.2-10]: 0x04 is an
+            // explicit "Disconnect with Will Message", and any other non-zero
+            // reason is an abnormal end the client is reporting — either way the
+            // Will fires (issue #265). v3.1.1's DISCONNECT has no reason byte and
+            // decodes as 0, so it always lands in the graceful arm.
+            return Ok(if d.reason == 0 {
+                PacketOutcome::ClientDisconnect
+            } else {
+                PacketOutcome::ClientDisconnectWithWill
+            });
+        }
         other => debug!(packet = ?other.packet_type(), "ignoring unexpected packet"),
     }
     Ok(PacketOutcome::Continue)
@@ -4206,6 +4229,125 @@ mod tests {
                 .expect("a Detach reaches the hub")
                 .expect("the channel is open"),
             "a client DISCONNECT discards the will [MQTT-3.14.4-3]"
+        );
+    }
+
+    /// Issue #265 — a v5 DISCONNECT with a **non-zero** reason is a will-firing
+    /// close: `0x04` is an explicit "Disconnect with Will Message", and any error
+    /// reason is an abnormal end, since only reason `0x00` discards the Will
+    /// [MQTT-3.1.2-10]. The detach must be un-graceful for both.
+    #[tokio::test]
+    async fn a_v5_disconnect_with_a_non_zero_reason_detaches_ungracefully_so_the_will_fires() {
+        for reason in [mqtt_codec::reason::DISCONNECT_WITH_WILL, 0x81] {
+            let (mut reader, mut writer, hub_rx) = v5_pipe();
+            let (_topics, mut detaches) = stub_hub_refusing_watching_detach(hub_rx, None);
+            writer.send(&connect_v5("willful", vec![])).await.unwrap();
+            assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+            writer
+                .send(&Packet::Disconnect(mqtt_codec::packet::Disconnect {
+                    reason,
+                    properties: mqtt_codec::Properties::new(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                !timeout(Duration::from_millis(500), detaches.recv())
+                    .await
+                    .expect("a Detach reaches the hub")
+                    .expect("the channel is open"),
+                "a v5 DISCONNECT with reason {reason:#04x} asks for its Will \
+                 [MQTT-3.1.2-10] — the detach must be un-graceful"
+            );
+        }
+    }
+
+    /// Issue #265 — a protocol-violation close (here: a wildcard PUBLISH topic) is
+    /// broker-initiated and must detach un-gracefully so the Will fires
+    /// [MQTT-3.14.4-3]. The refusal-close sibling is covered by the #238 test
+    /// above; this pins the violation class.
+    #[tokio::test]
+    async fn a_protocol_violation_close_detaches_ungracefully_so_the_will_fires() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let (_topics, mut detaches) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_packet("viol", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer
+            .send(&Packet::Publish(Publish {
+                properties: mqtt_codec::Properties::new(),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "a/#".to_string(),
+                pkid: None,
+                payload: bytes::Bytes::from_static(b"x"),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv(&mut reader).await,
+            None,
+            "the violation closes the conn"
+        );
+        assert!(
+            !timeout(Duration::from_millis(500), detaches.recv())
+                .await
+                .expect("a Detach reaches the hub")
+                .expect("the channel is open"),
+            "a broker-initiated protocol-violation close must fire the Will"
+        );
+    }
+
+    /// Issue #265 — an EOF without a DISCONNECT (the client vanished: power loss,
+    /// network drop, crash) is the canonical will-firing end [MQTT-3.14.4-3].
+    #[tokio::test]
+    async fn an_eof_without_disconnect_detaches_ungracefully_so_the_will_fires() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let (_topics, mut detaches) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_packet("gone", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // Drop both halves of the client socket: the broker sees a bare EOF.
+        drop(reader);
+        drop(writer);
+        assert!(
+            !timeout(Duration::from_millis(500), detaches.recv())
+                .await
+                .expect("a Detach reaches the hub")
+                .expect("the channel is open"),
+            "an EOF without DISCONNECT must fire the Will"
+        );
+    }
+
+    /// Issue #265 — a keepalive expiry is a will-firing end [MQTT-3.1.2-24 +
+    /// MQTT-3.14.4-3]: the client went silent, which is exactly what the Will
+    /// exists to report. Paused virtual time, as in the keepalive-close test.
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_expiry_detaches_ungracefully_so_the_will_fires() {
+        let (mut reader, mut writer, hub_rx) = start_conn();
+        let (_topics, mut detaches) = stub_hub_refusing_watching_detach(hub_rx, None);
+        let connect = Packet::Connect(Connect {
+            properties: mqtt_codec::Properties::new(),
+            protocol: V4,
+            clean_session: true,
+            keep_alive: 1,
+            client_id: "quiet".into(),
+            last_will: None,
+            username: None,
+            password: None,
+        });
+        writer.send(&connect).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        // Idle past the 1.5x grace; the auto-advancing clock fires the deadline.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !timeout(Duration::from_millis(500), detaches.recv())
+                .await
+                .expect("a Detach reaches the hub")
+                .expect("the channel is open"),
+            "a keepalive expiry must fire the Will"
         );
     }
 

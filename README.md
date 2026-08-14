@@ -244,7 +244,9 @@ dashboard** — operations are signals and files, on purpose
 - **Retained messages**: replayed (with the retain flag) on every new
   subscription, replaced by newer publishes, cleared by a zero-length payload.
 - **Last Will & Testament**: published on any ungraceful end (abrupt drop,
-  keepalive expiry, session takeover), discarded on a clean DISCONNECT.
+  keepalive expiry, session takeover, protocol-violation close) and on a v5
+  DISCONNECT with a non-zero reason (`0x04` Disconnect with Will Message);
+  discarded only on a clean DISCONNECT (reason `0x00`).
 - **Keepalive enforcement** (1.5× grace), and persistent sessions
   (`clean_session=0`) with offline queueing and replay.
 - Zero-trust wire codec with a `cargo-fuzz` harness.
