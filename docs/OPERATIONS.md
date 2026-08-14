@@ -276,8 +276,47 @@ ordinary replace motion — wipe its data dir and give it seeds so it JOINS
 RollingUpdate + PDB `maxUnavailable: 1`); each pod drains via `preStop` before its
 restart and rejoins behind the caught-up watermark. Version-skew rules are
 [ADR 0039](adr/0039-versioning-and-upgrade-policy.md) (pre-1.0: no cross-version
-compatibility is promised; post-1.0: adjacent releases negotiate). A roll currently
-pays the full drain on every pod — a known cost, recorded in the ADR 0047 amendment.
+compatibility is promised; post-1.0: adjacent releases negotiate). A roll still pays
+the decommission drain on every pod (the `preStop` hook cannot tell a roll from a
+shrink — the recorded operator-shaped follow-up, ADR 0047's 2026-08-04 amendment), but
+the cost is **measured, per-pod-local, and not a fleet-wide reconnect storm**
+(issue #248). `crates/mqttd/tests/roll_cost.rs` drives the chart's exact motion
+(SIGUSR1 drain → exit → restart over the same PV → rejoin) on every PR and prints
+these numbers; the nightly upgrade suite prints the same per-roll figures under
+two-binary skew.
+
+**What one rolled pod costs** (measured on a 3-node cluster under acked `QoS` 1
+load; the client-facing cost scales with the rolled pod's share, not the fleet):
+
+- **Reconnects: the sessions the pod hosted — nothing else.** Its
+  directly-connected clients plus the clients other nodes relocated to it at
+  CONNECT time ([ADR 0005](adr/0005-session-affinity.md)) — ≈ 1/N of the fleet
+  under even placement (measured: 4 of 9 clients when 1 of 3 nodes rolls; the
+  other clients kept their TCP connections through the whole roll and kept
+  receiving). A full N-pod roll therefore reconnects each client roughly **once,
+  spread across the roll** — not N fleet-wide storms.
+- **Drain-to-exit: sub-second when replicas are caught up** (measured 0.3–0.4 s).
+  The drain *verifies* rather than copies ([ADR 0043](adr/0043-elastic-cluster-resize.md)),
+  so it scales with replica lag, not data size — budget
+  `terminationGracePeriodSeconds` for the lagging-replica worst case.
+- **Restart-to-readmission: seconds** (measured 5–11 s to full membership + a
+  ready lease group on every node).
+- **`QoS` 1 publishes into a moving group are refused, never silently dropped:**
+  acks are withheld for a seconds-scale ownership-takeover window (measured
+  worst ≈ 5 s mid-roll) and publishers retry; everything acked is delivered.
+- **The straggler wart (issue #284):** a client that *resumes* in the seconds
+  around the rolled pod's readmission can be routed onto a stale owner and
+  receive nothing — acks toward it refused — until its keepalive fires and it
+  reconnects once more (measured: 1 of 9). Until #284 lands, keep client
+  reconnect backoff + jitter at least as long as the readmission time above, so
+  stragglers resume after placement settles.
+
+**Pacing.** The chart already enforces the safe motion — OrderedReady +
+RollingUpdate roll one pod at a time and the PDB (`maxUnavailable: 1`) stops a
+node drain from taking two. Keep it that way (never parallelize a roll), let each
+pod reach Ready before the next (the StatefulSet controller does this for you),
+and for very large fleets budget the LB and auth path for ≈ fleet/N reconnects
+per rolled pod rather than the whole fleet.
 
 A one-at-a-time roll does **not** trip the min-replicas write floor: with two of three
 members live the replica set holds two copies and the write quorum already required two
