@@ -751,6 +751,259 @@ impl Client {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RawClient — the byte-level client the codec suite needs.
+//
+// `Client` above speaks in typed `Packet`s, which is what makes it ergonomic and
+// also what makes it USELESS for suite WIRE: an encoder will not emit a 5-byte
+// remaining-length, an overlong UTF-8 sequence, or a reserved packet type. Those
+// frames have to be written as bytes. This client does that, and reads the
+// server's answer as bytes too — because "did the server close without sending
+// anything" and "did it send DISCONNECT(0x81) first" are different conformance
+// outcomes that a decoding reader flattens into the same `Err`.
+//
+// Everything here is deliberately dumb: no framing, no codec, no retry. The test
+// supplies the bytes and states the expected outcome exactly.
+// ---------------------------------------------------------------------------
+
+/// What the server did in response to bytes we wrote.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RawOutcome {
+    /// The server sent these bytes (at least one).
+    Bytes(Vec<u8>),
+    /// The server closed without sending anything — the required behaviour for a
+    /// Malformed Packet detected before a session exists (MQTT-3.1.4-1: no CONNACK
+    /// may be sent, so the only correct answer is a silent close).
+    ClosedSilently,
+    /// Nothing arrived and the connection stayed open.
+    Quiet,
+}
+
+/// A raw byte-level client: writes arbitrary bytes, reads raw bytes back.
+pub struct RawClient {
+    stream: TcpStream,
+}
+
+impl RawClient {
+    /// Open a TCP connection to the broker. Nothing is sent.
+    pub async fn open(addr: SocketAddr) -> Self {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        Self { stream }
+    }
+
+    /// Write bytes in one `write_all`. The kernel may still split them; use
+    /// [`send_fragmented`](Self::send_fragmented) when the split itself is the subject.
+    pub async fn send_bytes(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.stream.write_all(bytes).await.unwrap();
+        self.stream.flush().await.unwrap();
+    }
+
+    /// Write `bytes` in `chunk` -sized pieces, flushing and pausing `gap` between each,
+    /// so the broker's decoder genuinely sees a partial frame and must buffer it.
+    /// `TCP_NODELAY` is set so a small chunk is not coalesced by Nagle into the next.
+    pub async fn send_fragmented(&mut self, bytes: &[u8], chunk: usize, gap: Duration) {
+        use tokio::io::AsyncWriteExt;
+        self.stream.set_nodelay(true).unwrap();
+        for piece in bytes.chunks(chunk.max(1)) {
+            self.stream.write_all(piece).await.unwrap();
+            self.stream.flush().await.unwrap();
+            if !gap.is_zero() {
+                tokio::time::sleep(gap).await;
+            }
+        }
+    }
+
+    /// Write several packets as ONE write, so they arrive coalesced in a single
+    /// segment and the decoder must find every boundary itself.
+    pub async fn send_coalesced(&mut self, packets: &[&[u8]]) {
+        let joined: Vec<u8> = packets.concat();
+        self.send_bytes(&joined).await;
+    }
+
+    /// Read whatever the server sends within `window`, distinguishing a silent close
+    /// from a response from silence-with-the-connection-open. Reads once: enough for
+    /// the "what did the server answer" question, which is all suite WIRE asks.
+    pub async fn read_outcome(&mut self, window: Duration) -> RawOutcome {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 512];
+        match timeout(window, self.stream.read(&mut buf)).await {
+            Err(_) => RawOutcome::Quiet,
+            Ok(Ok(n)) if n > 0 => {
+                buf.truncate(n);
+                RawOutcome::Bytes(buf)
+            }
+            // Read of 0 is a clean FIN; an error here is a RST. Both mean "the
+            // server ended the connection without answering", which is the
+            // outcome under test — they are one case, not two.
+            Ok(_) => RawOutcome::ClosedSilently,
+        }
+    }
+
+    /// Assert the server closed the connection WITHOUT sending a packet — the
+    /// required response to a Malformed Packet before a session exists.
+    pub async fn expect_closed_silently(&mut self) {
+        match self.read_outcome(RECV_TIMEOUT).await {
+            RawOutcome::ClosedSilently => {}
+            other => panic!("expected a silent close, got {other:?}"),
+        }
+    }
+
+    /// Assert the server answered with a DISCONNECT carrying `reason`, checked on the
+    /// wire bytes: `0xE0`, remaining length, then the reason code. Used after a session
+    /// exists, where the spec requires the server to say why before closing.
+    pub async fn expect_disconnect_bytes(&mut self, reason: u8) {
+        match self.read_outcome(RECV_TIMEOUT).await {
+            RawOutcome::Bytes(b) => {
+                assert!(b.len() >= 3, "DISCONNECT is at least 3 bytes, got {b:02x?}");
+                assert_eq!(b[0], 0xE0, "expected DISCONNECT packet type, got {b:02x?}");
+                assert_eq!(
+                    b[2], reason,
+                    "expected DISCONNECT reason {reason:#04x}, got {:#04x} ({b:02x?})",
+                    b[2]
+                );
+            }
+            other => panic!("expected DISCONNECT({reason:#04x}), got {other:?}"),
+        }
+    }
+
+    /// Assert the server answered with a CONNACK carrying `reason` (byte 3 of
+    /// `0x20 len session_present reason`), and that `session_present` is 0 — which
+    /// MQTT-3.2.2-6 requires whenever the reason code is a failure.
+    pub async fn expect_connack_bytes(&mut self, reason: u8) {
+        match self.read_outcome(RECV_TIMEOUT).await {
+            RawOutcome::Bytes(b) => {
+                assert!(b.len() >= 4, "CONNACK is at least 4 bytes, got {b:02x?}");
+                assert_eq!(b[0], 0x20, "expected CONNACK packet type, got {b:02x?}");
+                assert_eq!(
+                    b[3], reason,
+                    "expected CONNACK reason {reason:#04x}, got {:#04x} ({b:02x?})",
+                    b[3]
+                );
+                if reason >= 0x80 {
+                    assert_eq!(
+                        b[2], 0x00,
+                        "a failure CONNACK must carry session_present = 0 [MQTT-3.2.2-6]"
+                    );
+                }
+            }
+            other => panic!("expected CONNACK({reason:#04x}), got {other:?}"),
+        }
+    }
+
+    /// Assert the server REFUSED the packet — either by closing silently, or by
+    /// sending `DISCONNECT(reason)` first.
+    ///
+    /// Both are conformant: [MQTT-4.13.2] makes closing the MUST and the
+    /// explanatory DISCONNECT a SHOULD. This broker currently takes the silent
+    /// path for codec-level errors (see `malformed_input_closes_without_a_disconnect`
+    /// in `tests/wire.rs`, which pins that policy). What must NOT happen — and what
+    /// this asserts against — is the packet being *accepted*.
+    pub async fn expect_refused(&mut self, reason: u8) {
+        match self.read_outcome(RECV_TIMEOUT).await {
+            RawOutcome::ClosedSilently => {}
+            RawOutcome::Bytes(b) if b[0] == 0xE0 => {
+                assert_eq!(
+                    b[2], reason,
+                    "refused, but with reason {:#04x} instead of {reason:#04x}",
+                    b[2]
+                );
+            }
+            other => panic!("expected the packet to be refused, got {other:?}"),
+        }
+    }
+
+    /// Assert nothing arrives within `window` and the connection stays open — for the
+    /// under-run case, where the server is legitimately still waiting for more bytes.
+    pub async fn expect_quiet(&mut self, window: Duration) {
+        match self.read_outcome(window).await {
+            RawOutcome::Quiet => {}
+            other => panic!("expected silence with the connection open, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Byte-level packet builders. These deliberately do NOT go through the codec:
+// a test that builds its malformed frame with the encoder under test proves
+// nothing. Each helper is the minimum hand-assembled bytes for a legal packet,
+// which individual tests then corrupt in exactly one way.
+// ---------------------------------------------------------------------------
+
+/// Encode a Variable Byte Integer per MQTT 1.5.5.
+#[must_use]
+pub fn vbi(mut value: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (value % 128) as u8;
+        value /= 128;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return out;
+        }
+    }
+}
+
+/// A length-prefixed UTF-8 string field (MQTT 1.5.4).
+#[must_use]
+pub fn mqtt_str(s: &str) -> Vec<u8> {
+    let mut out = u16::try_from(s.len()).unwrap().to_be_bytes().to_vec();
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+/// A length-prefixed field from raw bytes — for deliberately invalid UTF-8.
+#[must_use]
+pub fn mqtt_bytes(b: &[u8]) -> Vec<u8> {
+    let mut out = u16::try_from(b.len()).unwrap().to_be_bytes().to_vec();
+    out.extend_from_slice(b);
+    out
+}
+
+/// Wrap a variable header + payload in a fixed header with `first_byte`.
+#[must_use]
+pub fn frame(first_byte: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![first_byte];
+    out.extend_from_slice(&vbi(u32::try_from(body.len()).unwrap()));
+    out.extend_from_slice(body);
+    out
+}
+
+/// A minimal, VALID v5 CONNECT for `client_id`: clean start, keep-alive 0, no
+/// properties, no will. Tests corrupt one field of this to isolate one rule.
+#[must_use]
+pub fn connect_v5_bytes(client_id: &str) -> Vec<u8> {
+    let mut body = mqtt_str("MQTT");
+    body.push(5); // protocol version
+    body.push(0x02); // connect flags: clean start
+    body.extend_from_slice(&0u16.to_be_bytes()); // keep alive
+    body.push(0x00); // property length 0
+    body.extend_from_slice(&mqtt_str(client_id));
+    frame(0x10, &body)
+}
+
+/// A minimal, VALID v5 SUBSCRIBE for one filter at `QoS` 0, packet id 1.
+#[must_use]
+pub fn subscribe_v5_bytes(filter: &str) -> Vec<u8> {
+    let mut body = 1u16.to_be_bytes().to_vec(); // packet id
+    body.push(0x00); // property length 0
+    body.extend_from_slice(&mqtt_str(filter));
+    body.push(0x00); // subscription options: QoS 0
+    frame(0x82, &body)
+}
+
+/// A minimal, VALID v5 QoS-0 PUBLISH.
+#[must_use]
+pub fn publish_v5_bytes(topic: &str, payload: &[u8]) -> Vec<u8> {
+    let mut body = mqtt_str(topic);
+    body.push(0x00); // property length 0
+    body.extend_from_slice(payload);
+    frame(0x30, &body)
+}
+
 /// Helpers for the HMAC-SHA256 enhanced-authentication mechanism (ADR 0013): a
 /// broker policy configured with one subject ("alice"), the proof the client
 /// returns, and an AUTH-packet builder. Shared by the sunshine and darksky suites.

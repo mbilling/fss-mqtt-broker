@@ -413,6 +413,22 @@ where
 /// start plus an expiry of 0 (discard at disconnect) or `u32::MAX` (keep forever); v5
 /// carries clean start in the same flag and the Session Expiry Interval as a property
 /// (absent = 0).
+/// Whether a SUBSCRIBE filter is structurally subscribable [MQTT-4.7.1], looking
+/// through a `$share/<group>/` envelope to the filter it carries — the share
+/// wrapper's own validity is checked separately by `parse_shared`, and the rules
+/// about `#`/`+` placement apply to the inner filter, not to the envelope.
+fn subscribable_filter(path: &str) -> bool {
+    let inner = if is_shared_filter(path) {
+        match parse_shared(path) {
+            Some((_, filter)) => filter,
+            None => return false,
+        }
+    } else {
+        path
+    };
+    mqtt_core::valid_filter(inner)
+}
+
 fn session_policy(connect: &Connect) -> (bool, u32) {
     let clean_start = connect.clean_session;
     let session_expiry = match connect.protocol {
@@ -1690,11 +1706,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         retain,
         ..
     } = publish;
-    // [MQTT-3.3.2-2]: a PUBLISH topic name MUST NOT contain wildcards. This is
-    // a protocol violation, not an ACL decision — close the connection rather
-    // than letting a `+`/`#` topic reach routing or ACL matching.
-    if topic.contains(['+', '#']) {
-        warn!(client = %client.0, topic = %topic, "PUBLISH topic contains wildcards; closing connection");
+    // [MQTT-3.3.2-2] / [MQTT-4.7.3-1]: a PUBLISH topic name MUST NOT contain
+    // wildcards and MUST be at least one character. Both are protocol violations,
+    // not ACL decisions — close the connection rather than letting such a topic
+    // reach routing or ACL matching. (An interior `U+0000` is already refused a
+    // layer earlier, by the string decoder.)
+    if !mqtt_core::valid_topic_name(&topic) {
+        warn!(client = %client.0, topic = %topic, "invalid PUBLISH topic name; closing connection");
         return Ok(PacketOutcome::BrokerClose);
     }
     // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped before the
@@ -2152,6 +2170,18 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 if is_shared_filter(&f.path) && parse_shared(&f.path).is_none() {
                     debug!(client = %client.0, filter = %f.path, "malformed shared subscription");
                     return_codes.push(SUBACK_FAILURE);
+                } else if !subscribable_filter(&f.path) {
+                    // Structural filter validity [MQTT-4.7.1]: zero-length, `#` not
+                    // last, or a wildcard sharing its level with other characters.
+                    // Refused PER FILTER (0x8F) rather than by closing the
+                    // connection: the spec permits either, and the other filters in
+                    // the same SUBSCRIBE are well-formed and independently valid.
+                    //
+                    // Until this existed such a filter was GRANTED — it then matched
+                    // nothing, so the client saw a successful subscription that was
+                    // silently inert, which is the worst of both answers.
+                    debug!(client = %client.0, filter = %f.path, "invalid topic filter");
+                    return_codes.push(mqtt_codec::reason::TOPIC_FILTER_INVALID);
                 } else if policy
                     .authorizer()
                     .authorize_subscribe(principal, client, &f.path)
