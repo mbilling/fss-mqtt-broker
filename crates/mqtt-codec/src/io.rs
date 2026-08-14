@@ -84,10 +84,23 @@ impl Reader {
 
     /// Read a length-prefixed UTF-8 string (`u16` length + bytes).
     ///
+    /// Enforces BOTH rules the spec places on an MQTT UTF-8 Encoded String:
+    /// well-formed UTF-8 [MQTT-1.5.4-1] (which rejects encoded surrogates and
+    /// overlong forms), and **no `U+0000`** [MQTT-1.5.4-2]. The second is easy to
+    /// miss because a NUL byte *is* well-formed UTF-8, so `String::from_utf8`
+    /// alone accepts it — and a topic containing an interior NUL then flows
+    /// through matching, ACLs, and logs, where a C-string consumer downstream
+    /// would see it truncated. Rejecting at the decoder keeps the invariant in
+    /// one place.
+    ///
     /// # Errors
-    /// Returns [`CodecError::InvalidUtf8`] if the bytes are not valid UTF-8.
+    /// Returns [`CodecError::InvalidUtf8`] if the bytes are not valid UTF-8 or
+    /// contain a null character.
     pub fn read_string(&mut self) -> Result<String, CodecError> {
         let bytes = self.read_binary()?;
+        if bytes.contains(&0) {
+            return Err(CodecError::InvalidUtf8);
+        }
         String::from_utf8(bytes.to_vec()).map_err(|_| CodecError::InvalidUtf8)
     }
 
@@ -173,6 +186,45 @@ mod tests {
         out.extend_from_slice(&[0xFF, 0xFE]); // not valid UTF-8
         let mut r = Reader::new(Bytes::from(out));
         assert!(matches!(r.read_string(), Err(CodecError::InvalidUtf8)));
+    }
+
+    /// [MQTT-1.5.4-2]: `U+0000` is forbidden in an MQTT UTF-8 Encoded String.
+    ///
+    /// This one is easy to miss because a NUL byte IS well-formed UTF-8, so
+    /// `String::from_utf8` accepts it — which is exactly what this broker did
+    /// until the WIRE suite drove a topic containing one all the way through
+    /// routing without complaint.
+    #[test]
+    fn an_embedded_null_is_rejected_even_though_it_is_valid_utf8() {
+        for payload in [&b"\x00"[..], &b"a\x00b"[..], &b"ab\x00"[..]] {
+            assert!(
+                std::str::from_utf8(payload).is_ok(),
+                "precondition: {payload:02x?} is valid UTF-8, so from_utf8 alone would pass it"
+            );
+            let mut out = Vec::new();
+            put_u16(&mut out, u16::try_from(payload.len()).unwrap());
+            out.extend_from_slice(payload);
+            let mut r = Reader::new(Bytes::from(out));
+            assert!(
+                matches!(r.read_string(), Err(CodecError::InvalidUtf8)),
+                "a string containing U+0000 ({payload:02x?}) must be rejected"
+            );
+        }
+    }
+
+    /// Encoded surrogates and overlong forms are ill-formed UTF-8 [MQTT-1.5.4-1].
+    #[test]
+    fn surrogates_and_overlong_encodings_are_rejected() {
+        for bad in [&b"\xED\xA0\x80"[..], &b"\xC0\x80"[..], &b"\xE0\x80\x80"[..]] {
+            let mut out = Vec::new();
+            put_u16(&mut out, u16::try_from(bad.len()).unwrap());
+            out.extend_from_slice(bad);
+            let mut r = Reader::new(Bytes::from(out));
+            assert!(
+                matches!(r.read_string(), Err(CodecError::InvalidUtf8)),
+                "{bad:02x?} must be rejected"
+            );
+        }
     }
 
     #[test]

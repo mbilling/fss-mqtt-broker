@@ -5,32 +5,48 @@ sunshine/darksky scenario catalog the suite is working toward.
 
 ## Where we are
 
-Integration tests live in `crates/mqttd/tests/` (13 files, ~4.7k lines) and
-`crates/mqtt-cluster/tests/`. They start an **in-process broker over real TCP
-loopback** (`Hub::new()` + `conn::handle`/`handle_stream`) and drive it through
-sockets. Coverage of the **MQTT 3.1.1 + cluster** surface is solid:
+Integration tests live in `crates/mqttd/tests/` (41 suites),
+`crates/mqtt-cluster/tests/`, and `crates/mqtt-bridge/tests/` — ~25k lines in total.
+Most start an **in-process broker over real TCP loopback** (`Hub::new()` +
+`conn::handle`/`handle_stream`) and drive it through sockets; the harder suites drive
+the **real `mqttd` binary** out of process (`proc_common/`). The workspace runs ~1,180
+test functions.
+
+> These counts drift. They are derivable from the tree
+> (`ls crates/mqttd/tests/*.rs | wc -l`), and until a checker enforces them the way
+> `scripts/check-readme-facts.py` does for the README, treat them as indicative.
 
 | Area | Files |
 |---|---|
 | Core pub/sub, retained | `end_to_end`, `retained` |
 | QoS 1 / QoS 2 | `qos1`, `qos2` |
-| Sessions (offline queue, durability) | `end_to_end`, `durable_sessions` |
+| v5 protocol surface | `v5_protocol`, `protocol_violations` |
+| **Byte-level framing + codec conformance** | **`wire`** |
+| Sessions (offline queue, durability) | `end_to_end`, `durable_sessions`, `inflight_durability` |
 | Keepalive & wills | `keepalive_lwt` |
 | Security (auth, ACL, audit, TLS, gossip identity) | `auth`, `acl`, `audit`, `tls`, `peer_identity` |
 | Cluster (routing, SWIM, placement, relocation) | `cluster`, `swim_routing`, `swim_cluster` |
+| Cluster fault injection | `cluster_chaos`, `cluster_stress`, `cluster_proc`, `cluster_soak` |
+| Transports | `ws`, `quic`, `tls` |
+| Bridge | `mqtt-bridge/tests/{client,engine}` |
 
-### Two facts that shape this plan
+### The fact that shapes this plan
 
-1. **The client is the project's own codec** (`mqtt_net::FrameReader/Writer`). Every
-   test validates the broker against the same encoder/decoder it ships, so a codec
-   bug is invisible to both sides. There is no third-party-client interop.
-2. **Zero v5 integration coverage.** No integration test connects as
-   `ProtocolVersion::V5`. Everything from ADRs 0008–0013 — v5 codec, session/message
-   expiry, shared subscriptions, topic aliases, flow control, enhanced auth, re-auth —
-   is proven only at the unit / `conn`-module level. This is the largest gap: the
-   features with the most recent change have the least end-to-end proof.
+**Most tests speak through the project's own codec** (`mqtt_net::FrameReader/Writer`),
+so a codec bug would be invisible to both sides of the test. Two things answer that:
 
-Minor: the `start_broker`/`Client` harness is duplicated across all 13 files.
+1. **Foreign-client interop** — done (ADR 0034): the Eclipse Mosquitto CLI and Paho
+   Python drive the real binary in the `interop` CI job. Non-Rust oracles sharing zero
+   code with the broker, as external processes rather than `dev-dependencies`, so
+   nothing enters the supply chain.
+2. **The `wire` suite** — hand-assembled bytes on a raw socket
+   (`common::RawClient`), for the frames an encoder *cannot* emit: reserved packet
+   types, 5-byte variable byte integers, non-minimal length encodings, overlong and
+   surrogate UTF-8, properties on the wrong packet type. A conformant client library
+   will never send these, which is exactly why an implementation can be wrong about
+   them and stay green forever. It found three real defects on its first run (below).
+
+Still open: an independent conformance suite (`paho.mqtt.testing`) as a third oracle.
 
 ## Strategy
 
@@ -190,6 +206,52 @@ Legend: ☐ missing · ☑ covered (file).
   was not warmed before the inline replay, so a resumed session could skip delivering its
   queued messages until a later reconnect; the off-loop recovery now warms it (ADR 0017).
 
+## Byte-level conformance — suite `wire`
+
+`crates/mqttd/tests/wire.rs` writes hand-assembled bytes and asserts the server's
+exact answer, distinguishing three outcomes that are **not** interchangeable:
+
+- **silent close** — the only correct answer to a Malformed Packet detected before a
+  session exists; the server cannot answer a packet it could not parse
+  [MQTT-3.1.4-1].
+- **refused** — rejected once a session exists. [MQTT-4.13.2] makes *closing* the MUST
+  and the explanatory `DISCONNECT` a SHOULD, so both shapes are conformant.
+- **accepted** — the connection stays open and usable.
+
+Every test begins from a hand-built packet that a sanity test proves valid, then
+corrupts exactly one thing. Without that sanity pin, a broken builder would read as
+universal conformance.
+
+**Three defects it found on its first run**, all fixed alongside it:
+
+| Defect | Rule | Fix |
+|---|---|---|
+| An interior `U+0000` was accepted in topic names — a NUL byte *is* well-formed UTF-8, so `String::from_utf8` passed it | [MQTT-1.5.4-2] | `mqtt_codec::io::Reader::read_string` |
+| Payload Format Indicator of `2` was accepted and coerced | §3.3.2.3.2 | `bool_byte` in `mqtt-codec/src/properties.rs` |
+| A **zero-length topic filter was GRANTED** — as were `sport/tennis#`, `sport/#/ranking`, `sport+`. They then matched nothing, so the client held a successful subscription that was silently inert | [MQTT-4.7.1] | `mqtt_core::valid_filter` / `valid_topic_name`, refused per-filter with SUBACK `0x8F` |
+
+The third is the instructive one: filter *validity* is invisible at the matching
+layer, because `topic_matches` returns false for a malformed filter exactly as it
+does for a valid filter with no traffic. Only a test that asserts the **refusal**
+can see it.
+
+## Policy register
+
+Behaviours the spec leaves to the implementation, pinned by a test so they cannot
+drift silently. (The MQTT 5.0 spec has several hundred server-applicable normative
+statements; this register covers the choices, not the requirements.)
+
+| Choice | Our behaviour | Pinned by |
+|---|---|---|
+| Decode failure **after** CONNACK | Announced: `DISCONNECT(reason)` then close, satisfying both halves of [MQTT-4.13.2]. `0x81` when the bytes are not parseable as MQTT, `0x82` when they parse and say something illegal, `0x95` when over the advertised size (`conn.rs::codec_reason`) | `wire::malformed_input_after_connack_is_announced_then_closed`, `wire::malformed_and_protocol_errors_are_told_apart` |
+| Decode failure **before** CONNACK | Silence. [MQTT-3.14.0-1] forbids a server DISCONNECT before a success CONNACK, so the uniform "always announce" refactor is a spec violation | `wire::malformed_input_before_connack_is_met_with_silence` |
+| Property carried on a packet type that disallows it | Refused as `0x82` Protocol Error. §2.2.2.2 is arguably read as Malformed (`0x81`); the codec classifies it `ProtocolViolation` and we answer accordingly rather than re-classify on a contested reading. The *refusal* is not in doubt — only the code | `wire::a_property_from_another_packet_type_is_refused` |
+| Decode failure on a **QUIC** stream | Not announced — the QUIC mux (`mqtt-net/src/quic.rs`) ends its own read loop on a framing error, so it never reaches the announcing path. Known asymmetry, not yet closed | — |
+| Invalid topic filter | Refused **per filter** (SUBACK `0x8F`), not by closing the connection: the other filters in the same SUBSCRIBE are independently valid | `wire::a_hash_sharing_its_level_is_an_invalid_filter` |
+| `$SYS` topic tree | **Not implemented.** `$SYS` appears only as something the bridge refuses to bridge (`mqtt-bridge/src/config.rs`) | — |
+| Denied publish | Still ACKed, then dropped (no information leak about ACL shape) | `acl`, `audit` |
+| Offline-queue overflow | Drop-oldest, bounded | `resource_limits` |
+
 ## Conventions
 
 - One concern per test; name as `behaviour_under_condition`.
@@ -197,3 +259,5 @@ Legend: ☐ missing · ☑ covered (file).
 - Every test uses the shared harness; no new bespoke `start_broker` copies.
 - Tests must be deterministic — drive acks explicitly, use bounded `recv` timeouts,
   never sleep-and-hope.
+- A test that pins a *policy* says so, and says that a future change should make it
+  fail rather than be relaxed.

@@ -131,6 +131,47 @@ impl Message {
     }
 }
 
+/// Whether `filter` is a **structurally valid** topic filter [MQTT-4.7.1].
+///
+/// Validity is separate from matching: [`topic_matches`] answers "does this filter
+/// select that topic", and for a malformed filter the answer is simply "no" — which
+/// is why an unvalidated filter is invisible at the matching layer. It is accepted,
+/// stored, matches nothing, and the subscriber sees silence rather than a refusal.
+/// The rules:
+///
+/// - at least one character (a zero-length filter is never legal),
+/// - `#` is a whole level and must be the LAST level (`sport/#/x` and `sport/tennis#`
+///   are both invalid — the second because `#` shares its level with other characters),
+/// - `+` is a whole level (`sport+` is invalid),
+/// - no `U+0000` (the decoder also enforces this for every string field).
+///
+/// Shared filters (`$share/...`) are *not* unwrapped here; callers validate the share
+/// envelope first (see `parse_shared`) and pass the inner filter.
+#[must_use]
+pub fn valid_filter(filter: &str) -> bool {
+    if filter.is_empty() || filter.contains('\0') {
+        return false;
+    }
+    let mut levels = filter.split('/').peekable();
+    while let Some(level) = levels.next() {
+        let is_last = levels.peek().is_none();
+        if level.contains('#') && (level != "#" || !is_last) {
+            return false;
+        }
+        if level.contains('+') && level != "+" {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `topic` is a **structurally valid** topic NAME for a PUBLISH
+/// [MQTT-4.7.3-1]: at least one character, no wildcards, no `U+0000`.
+#[must_use]
+pub fn valid_topic_name(topic: &str) -> bool {
+    !topic.is_empty() && !topic.contains(['+', '#', '\0'])
+}
+
 /// Returns whether a wildcard topic `filter` matches a concrete `topic`.
 ///
 /// Implements MQTT topic-matching rules including `+`/`#` wildcards and the
@@ -241,7 +282,57 @@ pub fn filters_overlap(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_covers, filters_overlap, topic_matches};
+    use super::{filter_covers, filters_overlap, topic_matches, valid_filter, valid_topic_name};
+
+    /// [MQTT-4.7.1]: the structural filter rules. Each invalid case here was
+    /// GRANTED by the broker before `valid_filter` existed — and then matched
+    /// nothing, so the subscriber saw a successful subscription that was silently
+    /// inert. That is why validity is checked separately from matching: at the
+    /// matching layer a malformed filter is indistinguishable from a correct
+    /// filter with no traffic.
+    #[test]
+    fn filter_validity_follows_the_wildcard_placement_rules() {
+        for good in [
+            "a", "a/b", "#", "+", "/#", "a/#", "a/+", "a/+/b", "a//b", "+/+", "$SYS/#",
+        ] {
+            assert!(valid_filter(good), "{good:?} is a legal topic filter");
+        }
+        for bad in [
+            "",          // at least one character
+            "a#",        // `#` shares its level
+            "#/a",       // `#` is not last
+            "a/#/b",     // `#` is not last
+            "a+",        // `+` shares its level
+            "+a",        // `+` shares its level
+            "a/b+/c",    // `+` shares its level
+            "a/\u{0}/b", // U+0000 is never permitted
+        ] {
+            assert!(!valid_filter(bad), "{bad:?} is not a legal topic filter");
+        }
+    }
+
+    /// [MQTT-4.7.3-1] / [MQTT-3.3.2-2]: a PUBLISH topic name is non-empty and
+    /// carries no wildcards — a publisher names one destination, it does not select.
+    #[test]
+    fn topic_name_validity_rejects_wildcards_and_emptiness() {
+        for good in ["a", "a/b", "/a", "a/", "a//b", "$SYS/x"] {
+            assert!(valid_topic_name(good), "{good:?} is a legal topic name");
+        }
+        for bad in ["", "a/+", "a/#", "#", "+", "a/\u{0}/b"] {
+            assert!(!valid_topic_name(bad), "{bad:?} is not a legal topic name");
+        }
+    }
+
+    /// The two are not the same predicate: every valid topic NAME is a valid
+    /// filter, but not the reverse. Stating it stops a future refactor from
+    /// collapsing them into one function.
+    #[test]
+    fn every_valid_topic_name_is_also_a_valid_filter() {
+        for name in ["a", "a/b", "/a", "a/", "a//b", "$SYS/x"] {
+            assert!(valid_topic_name(name) && valid_filter(name), "{name:?}");
+        }
+        assert!(valid_filter("a/#") && !valid_topic_name("a/#"));
+    }
 
     #[test]
     fn exact_match() {

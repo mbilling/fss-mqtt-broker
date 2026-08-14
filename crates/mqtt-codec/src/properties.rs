@@ -161,10 +161,14 @@ impl Property {
     ///
     /// # Errors
     /// [`CodecError::MalformedPacket`] for an unknown identifier or a truncated
-    /// value; [`CodecError::InvalidUtf8`] for a non-UTF-8 string value.
+    /// value; [`CodecError::InvalidUtf8`] for a non-UTF-8 string value;
+    /// [`CodecError::ProtocolViolation`] for a single-byte flag property carrying
+    /// a value other than 0 or 1.
     pub fn decode(id: u8, r: &mut Reader) -> Result<Self, CodecError> {
         Ok(match id {
-            0x01 => Property::PayloadFormatIndicator(r.read_u8()?),
+            0x01 => {
+                Property::PayloadFormatIndicator(bool_byte(r.read_u8()?, "PayloadFormatIndicator")?)
+            }
             0x02 => Property::MessageExpiryInterval(r.read_u32()?),
             0x03 => Property::ContentType(r.read_string()?),
             0x08 => Property::ResponseTopic(r.read_string()?),
@@ -175,9 +179,15 @@ impl Property {
             0x13 => Property::ServerKeepAlive(r.read_u16()?),
             0x15 => Property::AuthenticationMethod(r.read_string()?),
             0x16 => Property::AuthenticationData(r.read_binary()?),
-            0x17 => Property::RequestProblemInformation(r.read_u8()?),
+            0x17 => Property::RequestProblemInformation(bool_byte(
+                r.read_u8()?,
+                "RequestProblemInformation",
+            )?),
             0x18 => Property::WillDelayInterval(r.read_u32()?),
-            0x19 => Property::RequestResponseInformation(r.read_u8()?),
+            0x19 => Property::RequestResponseInformation(bool_byte(
+                r.read_u8()?,
+                "RequestResponseInformation",
+            )?),
             0x1A => Property::ResponseInformation(r.read_string()?),
             0x1C => Property::ServerReference(r.read_string()?),
             0x1F => Property::ReasonString(r.read_string()?),
@@ -193,6 +203,17 @@ impl Property {
             0x2A => Property::SharedSubscriptionAvailable(r.read_u8()?),
             _ => return Err(CodecError::MalformedPacket("unknown property identifier")),
         })
+    }
+}
+
+/// A single-byte flag property carries **only** 0 or 1; any other value is a
+/// Protocol Error, not a "close enough to true" (spec §3.1.2.11.6, §3.1.2.11.7,
+/// §3.3.2.3.2). Coercing `2` to true would let two wire encodings mean the same
+/// thing, and a peer that round-trips the property would then alter it.
+fn bool_byte(v: u8, what: &'static str) -> Result<u8, CodecError> {
+    match v {
+        0 | 1 => Ok(v),
+        _ => Err(CodecError::ProtocolViolation(what)),
     }
 }
 
