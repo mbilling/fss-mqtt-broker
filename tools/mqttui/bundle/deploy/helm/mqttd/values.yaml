@@ -137,14 +137,15 @@ secrets:
   # whose ordinal has no leaf fails its init container with a message naming that command,
   # rather than crash-looping on a missing file. Scale-down needs nothing.
   #
-  # ROTATION needs a ROLLING RESTART (`kubectl rollout restart statefulset/<name>`): the
-  # peer-bus ca/cert/key are NOT in the broker's file-watch scope (only the peer CRL is),
-  # and the per-node gossip signing key — the same key file — is read once at startup and
-  # is not rebuilt even by SIGHUP. A renewed leaf that is only re-mounted keeps SIGNING
-  # gossip with the old key until the pod restarts; that still chain-verifies against the
-  # unchanged CA, so nothing fails until the OLD cert's notAfter — up to LEAF_DAYS later,
-  # with no correlating change to point at. Roll the pods when you rotate. An earlier
-  # version of this comment claimed rotation was hot; it was not (issue #262).
+  # ROTATION is HOT (issue #269; an earlier gap, #262, is closed): the peer-bus
+  # ca/cert/key are in the broker's file-watch scope, and the per-node gossip signing
+  # identity — the same key file — is rebuilt in the same validate-before-swap reload. A
+  # renewed leaf that is re-mounted (a Secret update, a cert-manager csi renewal) is
+  # picked up within a config_watch tick: served on the next peer handshake AND signing
+  # (and embedded in) the next outgoing gossip datagram. Rotating one node at a time is
+  # safe — verification is per-datagram against the CA, so mixed old/new leaves coexist.
+  # The one thing that still needs a rolling restart is replacing the CA ITSELF (the
+  # gossip verifier pins the startup CA); see docs/OPERATIONS.md.
   #
   # RESIDUAL on the bootstrap.sh path: one Secret holds every node's key, and Kubernetes
   # hands a pod the whole Secret — so every broker can read every other node's peer key.

@@ -1141,7 +1141,11 @@ The broker re-reads the configured files in place and swaps them on **live** con
 - **TLS material** (`MQTTD_TLS_CERT` / `…_KEY` / `…_CLIENT_CA` / `…_CRL`, and the peer-bus
   `MQTTD_PEER_TLS_*` trio) — a renewed certificate is served on the next handshake;
   in-flight TLS sessions of *non-revoked* certs are undisturbed (rotation never drops a
-  valid session).
+  valid session). The **gossip signing identity** — the same peer-bus leaf/key — swaps in
+  the same reload (issue #269): the rotated leaf signs, and is embedded in, the next
+  outgoing gossip datagram, and mixed old/new leaves coexist mid-rotation (verification is
+  per-datagram against the CA). Rotating the cluster **CA itself** still needs a rolling
+  restart.
 
 **Revocation reaches live state (ADR 0040).** A successful reload also **sweeps** what is
 already connected, with a two-tier rule — *who you are* revoked ends the session; *what you

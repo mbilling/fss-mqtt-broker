@@ -184,3 +184,25 @@ fully-verified certificates can reach).
 - **Distribute a generated shared key over the mTLS bus.** Solves provisioning ergonomics
   but keeps the symmetric "any key-holder can impersonate any node" ceiling — no added
   authentication. Rejected as not meeting the security goal.
+
+## Amendment (2026-08-14): the signing identity is hot-swappable (issue #269)
+
+The signer was a startup snapshot — the one piece of this plane the ADR 0032 reload never
+reached. After a peer-bus leaf rotation the node kept signing gossip with the old key and
+embedding the old certificate, which still chain-verified against the unchanged CA, so
+nothing failed until the *old* leaf's `notAfter` — up to a full leaf lifetime after the
+rotation, with no correlating change to point at.
+
+The signing identity now lives behind a swappable `SignerSlot` (`swim_auth`), read once per
+sealed datagram: the signer and its certificate fingerprint swap together (a
+fingerprint-form datagram can never reference a leaf other than the one that signed it),
+and the full-cert send counter resets on swap so the first post-rotation datagram primes
+peers with the complete new certificate instead of drawing recoverable `cert-miss` drops.
+The broker's reloader rebuilds the signer from the re-read leaf/key in the same atomic
+validate-before-swap reload as the peer-bus TLS contexts (ADR 0040 T4), and the peer-bus
+CA/cert/key joined the ADR 0033 file-watch scope. Mid-rotation coexistence needs no new
+mechanism: verification is per-datagram against the CA and the receiver cache is keyed by
+fingerprint, so old-leaf and new-leaf nodes accept each other while a fleet rolls one node
+at a time. Rotating the **CA itself** remains restart-bound (the verifier and the CRL
+check pin the startup CA). Delivered as 0022-T8; the deployment-facing account is in
+ADR 0047's 2026-08-14 amendment.

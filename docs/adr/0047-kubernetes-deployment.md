@@ -403,10 +403,11 @@ rejected — one Secret per pod cannot be mounted by ordinal (a pod template can
 Secret name per ordinal; `subPathExpr` could vary a path, but subPath-mounted Secrets never
 receive updates, foreclosing any future hot-rotation work), and an init container minting its
 own leaf requires the CA private key in every pod, which is precisely the custody rule this
-project states elsewhere. Rotation itself is **not hot** — the peer-bus CA/cert/key are not
-file-watched and the gossip signer is a startup snapshot even across SIGHUP, so a rotation is
-completed by a rolling restart; an earlier draft of this section claimed otherwise
-(issue #262, corrected in place; hot rotation is tracked as follow-up work).
+project states elsewhere. Rotation was **not hot** when this amendment landed — the peer-bus
+CA/cert/key were not file-watched and the gossip signer was a startup snapshot even across
+SIGHUP, so a rotation was completed by a rolling restart; an earlier draft of this section
+claimed otherwise (issue #262, corrected in place). Hot rotation has since been delivered —
+see the 2026-08-14 amendment below (issue #269).
 
 **Announcing a Secret now implies consuming it.** The chart derives
 `MQTTD_PEER_TLS_{CA,CERT,KEY}` and `MQTTD_SWIM_KEY_FILE` from the secret names, so the
@@ -458,3 +459,44 @@ own init script computes, that the render consumes what it mounts, and that a re
 boots on a minted leaf — with the original certificate as a **negative control** that must
 be refused; and the render-parity gate gained a third pass with the bus on, so the operator
 path (which had the same mounted-but-unread gap) cannot drift from the chart.
+
+## Amendment (2026-08-14): peer-bus certificate rotation is hot (issue #269)
+
+The previous amendment stated the residual honestly: rotating the cluster-bus leaf/key
+required a rolling restart, in a broker whose every other piece of security material —
+client TLS, ACL, passwords, JWT keys, both CRLs — already hot-reloaded. The gap had two
+independent halves, and the second was the trap: (1) the peer-bus CA/cert/key were missing
+from `watched_policy_paths`, so with a full bus configured the ADR 0033 watcher sat idle
+on them (SIGHUP *did* rebuild the TLS contexts); and (2) the **gossip signer was a startup
+snapshot** — `NodeGossipSigner` held owned cert/key bytes with no reload path — so even a
+signal-triggered reload left the node signing gossip with the old key and embedding the
+old cert. That still chain-verified against the unchanged CA, so nothing failed until the
+*old* leaf's `notAfter`, up to a full leaf lifetime after the rotation that caused it,
+with no correlating change to point at.
+
+Both halves are closed, inside the existing reload architecture rather than beside it
+(ADR 0032/0033): the three paths joined the watch scope, and the signing identity moved
+behind a swappable slot (`SignerSlot` in `mqtt_cluster::swim_auth`) the SWIM driver reads
+**per datagram** — signer and certificate fingerprint swapped together, so a
+fingerprint-form datagram never references a leaf other than the one that signed it. The
+reloader rebuilds the signer from the re-read leaf/key in the same atomic
+validate-before-swap reload as the peer TLS contexts: a bad file rejects the whole reload
+and the running identity stays in force. On a successful swap the full-cert send counter
+resets, so the first post-rotation datagram carries the complete new certificate — peers
+are primed instead of paying recoverable `cert-miss` drops. Mid-rotation coexistence holds
+by construction: verification is per-datagram against the CA and the peer cert cache is
+keyed by fingerprint, so old-leaf and new-leaf nodes accept each other while a fleet rolls
+one node at a time (the CA-side analogue of the ADR 0003 dual-key window; the shared HMAC
+key's `key_accept` procedure is unchanged and separate).
+
+Scope note, stated so the docs cannot over-claim again: rotating the **CA itself** is
+still restart-bound — the gossip verifier and the CRL check pin the startup CA. Leaf/key
+rotation, the routine cert-manager-driven operation, is hot; a CA migration is a planned
+event and keeps the rolling-restart procedure.
+
+Delivered as 0022-T8 (the signer belongs to ADR 0022's plane): proven by a rotate-under-a-
+running-mesh test (`a_rotated_signing_identity_is_embedded_in_live_gossip_without_a_restart`),
+an on-disk end-to-end test asserting the new leaf signs gossip within one watch tick
+(`a_leaf_rotated_on_disk_is_signing_gossip_within_one_watch_tick`), and reload/watch-scope
+unit tests — each mutation-checked. OPERATIONS.md and the chart's `values.yaml` now state
+the hot posture.

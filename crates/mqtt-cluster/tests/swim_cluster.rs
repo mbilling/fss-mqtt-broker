@@ -736,6 +736,93 @@ async fn a_dual_key_window_lets_nodes_on_different_primaries_converge() {
     n2.handle.abort();
 }
 
+/// Issue #269: rotating a node's signing identity under a RUNNING mesh takes effect on
+/// the next outgoing datagram — no restart. A probe joins a live signed node and opens
+/// what the node sends back: the failure domain its certificate attests flips from
+/// "before" to "after" as soon as the signer slot is swapped, proving the driver embeds
+/// and signs with the rotated leaf immediately (the signer used to be a startup
+/// snapshot, so a rotated node kept gossiping its old identity until restart).
+#[tokio::test]
+async fn a_rotated_signing_identity_is_embedded_in_live_gossip_without_a_restart() {
+    let key = 0x77;
+    let auth = attested_auth(key, "rotator", "before");
+    let slot = auth
+        .signer_slot()
+        .expect("the signed posture has a signer slot");
+    let (addr, node) = spawn_node("rotator", vec![], Some(auth)).await;
+
+    let prober = signed_auth(key, "probe");
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let join = Message {
+        from: "probe".into(),
+        from_addr: sock.local_addr().unwrap().to_string(),
+        from_peer_addr: String::new(),
+        from_domain: None,
+        from_generation: 1,
+        cluster_id: None,
+        kind: Kind::Join,
+        gossip: vec![],
+    };
+    let join = prober.seal(&postcard::to_allocvec(&join).unwrap(), true);
+
+    // Join, then read the node's replies until its certificate attests "before".
+    sock.send_to(&join, &addr).await.unwrap();
+    assert_eq!(
+        attested_domain_from(&sock, &prober, "rotator", "before", Duration::from_secs(5)).await,
+        Some("before".to_string()),
+        "the pre-rotation certificate must attest the original domain"
+    );
+
+    // Rotate: swap the slot under the running driver, exactly as the broker's
+    // security reloader does when the leaf/key files change on disk.
+    slot.swap(Arc::new(StubSigner::in_domain("rotator", "after")));
+
+    // A fresh Join forces a primed (full-cert) reply; the very next thing the node
+    // sends must embed the NEW certificate.
+    sock.send_to(&join, &addr).await.unwrap();
+    assert_eq!(
+        attested_domain_from(&sock, &prober, "rotator", "after", Duration::from_secs(5)).await,
+        Some("after".to_string()),
+        "the rotated certificate must be embedded in live gossip without a restart"
+    );
+
+    node.handle.abort();
+}
+
+/// Read datagrams from `sock` until one from `cn` attests `want` (returning it), or the
+/// window elapses (returning the last domain seen, if any). Unopenable datagrams (e.g. a
+/// fingerprint-form reference the probe has not cached) are skipped, not failures.
+async fn attested_domain_from(
+    sock: &UdpSocket,
+    opener: &SwimAuth,
+    cn: &str,
+    want: &str,
+    within: Duration,
+) -> Option<String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let deadline = Instant::now() + within;
+    let mut last = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return last;
+        }
+        let Ok(Ok((n, _))) = tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await else {
+            return last;
+        };
+        if let Ok(o) = opener.open(&buf[..n]) {
+            if o.identity.as_deref() == Some(cn) {
+                if let Some(d) = o.domain {
+                    if d == want {
+                        return Some(d);
+                    }
+                    last = Some(d);
+                }
+            }
+        }
+    }
+}
+
 /// ADR 0023: two nodes that sign **and sequence** their gossip converge — the per-sender
 /// replay window must accept the live monotonic stream without false-dropping it.
 #[tokio::test]
