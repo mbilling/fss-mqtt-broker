@@ -115,12 +115,20 @@ fn baseline_binary() -> PathBuf {
 /// mixed-binary window is exactly where upgrade bugs live.
 async fn roll(proc: &mut proc_common::Proc, i: usize, to: &std::path::Path, label: &str) {
     proc.publish_step().await;
+    let rolled_at = std::time::Instant::now();
     proc.nodes[i].terminate().await;
+    let stop_secs = rolled_at.elapsed().as_secs_f64();
+    // The roll's client cost, measured (issue #248): only the subscribers whose
+    // connection went THROUGH the rolled node lose it; everyone else's live
+    // connection is untouched by the roll.
+    let mut dropped = 0usize;
     for sub in &mut proc.subs {
         if sub.conn.is_some() && sub.via_node == i {
             sub.conn = None;
+            dropped += 1;
         }
     }
+    let kept = proc.subs.iter().filter(|s| s.conn.is_some()).count();
     proc.nodes[i].binary = to.to_path_buf();
     // Rejoin via the whole topology (the restarted-founder rule).
     proc.nodes[i].swim_seeds = proc
@@ -141,6 +149,15 @@ async fn roll(proc: &mut proc_common::Proc, i: usize, to: &std::path::Path, labe
     assert!(
         proc.wait_node_serving(i, Duration::from_secs(60)).await,
         "rolled node {id} never re-admitted ({label})"
+    );
+    // The per-roll numbers OPERATIONS.md cites (issue #248): graceful-stop
+    // time, stop-to-readmission time, and how many subscribers lost their
+    // connection (vs how many rode through untouched).
+    eprintln!(
+        "roll_cost({label}): {id}: stop={stop_secs:.1}s, \
+         stop-to-readmission={:.1}s, subscribers dropped={dropped}, \
+         untouched live connections={kept}",
+        rolled_at.elapsed().as_secs_f64(),
     );
 }
 

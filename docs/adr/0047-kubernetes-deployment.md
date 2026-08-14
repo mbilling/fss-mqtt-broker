@@ -500,3 +500,37 @@ an on-disk end-to-end test asserting the new leaf signs gossip within one watch 
 (`a_leaf_rotated_on_disk_is_signing_gossip_within_one_watch_tick`), and reload/watch-scope
 unit tests — each mutation-checked. OPERATIONS.md and the chart's `values.yaml` now state
 the hot posture.
+## Amendment (2026-08-14): the roll cost, measured — local reconnects, cheap drain, one named wart (issue #248)
+
+A review panel read this record's honest sentence — "a roll currently pays the full drain
+on every pod" — at fleet scale and concluded "a 4-node roll means mass client reconnects
+four times". That inference is now **measured instead of feared**, with the chart's exact
+motion (`preStop` SIGUSR1 drain → exit → restart over the same PV → rejoin) driven over
+real spawned processes on every PR (`crates/mqttd/tests/roll_cost.rs`), and the same
+per-roll figures printed by the nightly two-binary upgrade suite.
+
+What a rolled pod actually costs: **reconnects are the sessions the pod hosted, only** —
+its direct clients plus the clients other nodes relocated to it at CONNECT (ADR 0005) —
+≈ 1/N of the fleet under even placement (measured 4 of 9 on a 3-node roll; every other
+client's TCP connection rode through the roll untouched, still receiving). A full N-pod
+roll reconnects each client roughly once, spread across the roll — not N fleet-wide
+storms. The drain itself is **sub-second when replicas are caught up** (measured
+0.3–0.4 s; it verifies rather than copies, so it scales with replica lag, not data
+size); restart-to-readmission is seconds (5–11 s measured); and `QoS` 1 publishes into a
+group whose ownership is moving are **refused (acks withheld), never silently dropped**,
+for a measured ≈ 5 s takeover window.
+
+The measurement also surfaced one genuine defect the fear had been standing in front of:
+a client that *resumes* in the seconds around the rolled pod's readmission can be routed
+onto a stale owner and sit undeliverable — publishes toward it refused `NotOwner` — until
+its keepalive fires and it reconnects a second time. Filed as **issue #284** with the
+mechanism (a session placed across the ring/lease convergence split is never rehomed);
+the roll-cost test models the keepalive-driven second reconnect and counts it (1 of 9),
+and OPERATIONS.md states the client-backoff mitigation until it lands.
+
+Unchanged, deliberately: the `preStop` hook still cannot distinguish a roll from a
+shrink, so every roll pays the (cheap-when-caught-up) drain — that distinction remains
+the operator-shaped follow-up this record's 2026-08-04 amendment named, its trigger 3
+now armed with numbers rather than anecdote. ADR 0019 (graceful shutdown) and ADR 0043
+(decommission) behavior is untouched — this amendment records measurement and
+documentation, not a mechanism change.

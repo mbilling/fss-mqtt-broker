@@ -304,6 +304,39 @@ impl ProcNode {
         }
     }
 
+    /// Stop the process the KUBERNETES way (issue #248): `SIGUSR1` — exactly what
+    /// the chart's `preStop` hook (`mqttd --decommission`) sends — begins the
+    /// ADR 0043 decommission drain (verify every held key on its post-departure
+    /// replica set, then the ADR 0019 graceful leave), and this waits for the
+    /// process to exit, as `preStop` blocks the pod. Returns the wall-clock
+    /// drain-to-exit duration — the roll-cost number an operator budgets
+    /// `terminationGracePeriodSeconds` for.
+    pub async fn drain_stop(&mut self) -> Duration {
+        let started = Instant::now();
+        let Some(mut child) = self.child.take() else {
+            return started.elapsed();
+        };
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("kill")
+                .arg("-USR1")
+                .arg(pid.to_string())
+                .status();
+            if tokio::time::timeout(Duration::from_secs(90), child.wait())
+                .await
+                .is_ok()
+            {
+                return started.elapsed();
+            }
+            panic!(
+                "node {} did not finish its decommission drain within 90s",
+                self.id
+            );
+        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        started.elapsed()
+    }
+
     /// Stop the process the OPERATOR'S way: `SIGTERM` → the ADR 0019 graceful
     /// shutdown (drain, flush, SWIM leave), with a bounded wait and a `SIGKILL`
     /// escalation exactly as an init system would. The rolling-upgrade motion
