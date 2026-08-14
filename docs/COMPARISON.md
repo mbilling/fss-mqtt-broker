@@ -1,6 +1,6 @@
 # How mqttd compares — Mosquitto · EMQX · NanoMQ · VerneMQ
 
-**Dated 2026-08-13.** Versions compared: **mqttd** `v0.9.0` (released — signed,
+**Dated 2026-08-14.** Versions compared: **mqttd** `v0.9.0` (released — signed,
 reproducible, SBOM-attested) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
 differ) · **EMQX** 6.2.2 (documentation cells; the benchmark ran 5.8.6, the last
 Apache-licensed line — its results are **not yet published in-tree**, and issue #244
@@ -181,9 +181,17 @@ below are limited to each vendor's own published positioning; no benchmark numbe
   document's own rules.
 - **Performance:** no cross-broker numbers are printed here, deliberately. The
   [benchmark harness](../bench/) runs all five brokers under disclosed postures;
-  numbers appear in [docs/benchmarks/](benchmarks/) only from dedicated, documented
-  hardware (ADR 0048's dev-grade/publishable line). Our own micro-baselines are in
-  [BASELINE.md](benchmarks/BASELINE.md).
+  cross-broker numbers appear in [docs/benchmarks/](benchmarks/) only from dedicated,
+  documented hardware (ADR 0048's dev-grade/publishable line), and none are published
+  yet. What **is** published, both about mqttd alone and both labelled with their
+  limits: our micro-baselines in [BASELINE.md](benchmarks/BASELINE.md), and the
+  end-to-end **durable-path** measurement in
+  [DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) — acked QoS 1/2 throughput and latency
+  against a real 3-node quorum, measured **single-host and dev-grade**, which states in
+  its first paragraph that it is not the multi-host result and carries the multi-host
+  invocation as documented-but-unrun. Read together they price the durability
+  guarantee this table's Durability rows describe: on that host a durable QoS 1 publish
+  costs ~28 ms at p50 against ~0.03 ms for the same publish to a clean session.
 
 ## Sources & staleness
 
@@ -196,6 +204,14 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-08-14 — The durable path now has published numbers (issue #244): the Performance
+  bullet cites [DURABLE-PATH.md](benchmarks/DURABLE-PATH.md), a tracked artifact with
+  end-to-end acked QoS 1/2 throughput and latency against a real quorum, measured
+  single-host and labelled dev-grade in its first paragraph. Cross-broker numbers and
+  the scaling curve remain unpublished and unrun; the multi-host invocation is now
+  documented rather than merely owed. The citation guard in
+  `scripts/check-readme-facts.py` widened from this file alone to the README and every
+  `docs/benchmarks/*.md`.
 - 2026-08-14 — Governance rows rewritten for issue #243 (0041-T14): the *Disk bound* and
   *Total-memory limit* cells gained the detection-lag numbers (`MQTTD_WATERMARK_POLL`,
   default 10 s and 1 s near the mark) and the argument for why the disk mark is aggregate

@@ -41,12 +41,24 @@ backpressure — not a drop or disconnect).
 There is no `memory_limit` in the allocation-denial sense. Size RSS from the caps you set:
 
 ```
-RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection, measured dev-grade in bench/)
+RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection — see the note below)
     + connections × max_packet_size            (read buffering, worst case)
     + sessions × queued_messages × avg_msg     (offline queues — THE dominant term)
     + retained_topics × avg_retained_value
     + flow-control backlog: up to 10 000 msgs × avg_msg per slow live subscriber
 ```
+
+> **Where the base term comes from, honestly.** The ~70 MiB / ~15 KiB figures are from an
+> unpublished dev-grade run of `bench/` (its `results/` directory is untracked scratch), so
+> they are **not** reproducible from this repository — treat them as an order of magnitude
+> to size against, not a measured constant, and re-measure on your own host before they
+> matter. They have not been replaced with a number from
+> [benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) on purpose: that harness runs on
+> macOS, where `ps` RSS (compressed memory, shared pages) is not comparable to the Linux
+> `VmRSS` this formula is written against. For reference only, the same three broker
+> processes there sat at **10–20 MiB RSS each** while serving durable traffic — which says
+> the base term is dominated by whatever an idle deployment configures, not by the broker's
+> floor.
 
 The offline-queue term is why the 100 000-message default must be re-decided on a
 bounded node: it is sized for *one important session*, not for thousands. **The queue
@@ -258,6 +270,35 @@ of replication latency on the publish and delivery paths (residual store awaits 
 in the ack/attach/control classes, ADR 0061), and `mqttd_hub_dispatch_seconds` /
 `mqttd_append_lane_jobs` are the observables (see
 [OPERATIONS](OPERATIONS.md#monitoring-for-the-operator-and-humans)).
+
+**Measured, not just claimed** (issue #244) — on **five broker processes sharing one
+8-core host**, which is the dominant caveat and is why the numbers are ratios rather than
+capacities: with two of five nodes' peer bus degraded so that one placement group's appends
+stall completely, publishes for sessions in *healthy* groups on the same node **kept
+flowing** while the degraded group's own publishes stopped (0.00–0.01× throughput), and the
+hub loop's own publish dispatch p99 never left ~0.2 ms.
+
+The healthy class was **not** unaffected, and the full picture matters more than the
+flattering half of it: its latency improved (p50 0.31–0.47×, p95 0.35–0.50× across 4 runs)
+*because* its throughput fell — **0.41–0.77×** in the same four runs. Fewer messages in
+flight is why each one went faster. So the honest claim is isolation of *failure*, not of
+*capacity*: a degraded group cannot stop or stall a healthy group's publishes, but on a
+shared host it does take a share of the throughput with it. Whether that share survives on
+separate hosts is exactly what the unrun multi-host lane would answer.
+
+Two further caveats belong beside those: the *tail beyond p95* could not be attributed on
+the measuring host (every phase, baseline included, carried unrelated 10–20 s stalls), and
+a client whose **own** group is degraded does pay the 5 s RPC bound on CONNECT — 24–29 s at
+p99 under the fault — so "connects are unaffected" holds for clients in healthy groups, not
+universally. Method, limits and the commands:
+[benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md).
+
+**And what the durable write costs per message** (same source, single-host and dev-grade):
+an acked QoS 1 publish to a persistent subscriber took ~28 ms at p50 against ~0.03 ms for
+the same publish to a clean session, and the node's durable append rate was pinned by the
+host's **per-volume** disk barrier (~215–240 flushes/s, shared by every store on the machine)
+rather than by CPU — which is the number to re-measure on your own hardware before sizing
+a write rate, because it is the one that decides it.
 
 ## Worked example — 4 GiB RAM / 20 GiB disk
 

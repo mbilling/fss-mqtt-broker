@@ -49,8 +49,13 @@ elif [ "$MODE" = "saturate" ]; then
 	# INFLIGHT=100 pipelines qos1 publishing (DISCLOSED in env.txt): with the
 	# emqtt-bench default of 1, each publisher is serialized on its PUBACK round trip
 	# (~570 msg/s/publisher through the Docker VM — measured 2026-08-03), so the
-	# ladder measured ack latency, not capacity. This host sustains >=100k msg/s
-	# acked qos1 ingest and ~400k msg/s qos0 with the window open (same probe).
+	# ladder measured ack latency, not capacity. The same 2026-08-03 probe reached
+	# >=100k msg/s acked qos1 and ~400k msg/s qos0 with the window open — dev-grade
+	# on a laptop, unpublished, and NON-DURABLE by construction (compose runs mqttd
+	# with MQTTD_DURABLE_SESSIONS=0). Do not read them as durable-path numbers: the
+	# durable path is 3-4 orders of magnitude slower because a PUBACK waits on a
+	# quorum-durable record, and it is measured separately in
+	# docs/benchmarks/DURABLE-PATH.md.
 	DURATION=20 CONNS=0 CONN_RATE=0 PUBS=0 SUBS=0 INTERVAL_MS=1 SIZE=256 INFLIGHT=100
 	LADDER="50:50:5:10k 50:50:2:25k 50:50:1:50k 100:100:1:100k 200:200:1:200k"
 else

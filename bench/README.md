@@ -18,6 +18,26 @@ cd bench
 Raw output lands in `results/<stamp>/<broker>/` plus `env.txt` (versions, parameters,
 host). Raw logs are the record — `summarize.py` only extracts and links back to them.
 
+> **`results/` is untracked scratch, and nothing may cite it.** Its `.gitignore` is `*`,
+> so a path under it is unreachable for every reader but the person who ran it — which is
+> exactly the dangling-citation defect issue
+> [#244](https://github.com/mbilling/fss-mqtt-broker/issues/244) was filed about.
+> Published numbers go in **`docs/benchmarks/`**, and `scripts/check-readme-facts.py`
+> fails the build if the README, `docs/COMPARISON.md` or any `docs/benchmarks/*.md`
+> cites a path git does not track.
+
+## This harness measures the NON-durable, single-node path
+
+Worth being explicit, because it is easy to assume otherwise: the compose profiles run
+mqttd with `MQTTD_DURABLE_SESSIONS=0` on **one** node, for like-for-like comparison
+against brokers whose default sessions are not quorum-replicated. So this harness cannot
+produce a durable-path or cluster number at all.
+
+The durable path — acked QoS 1/2 throughput and latency against a real quorum — is
+measured by a different harness, `crates/mqttd/tests/durable_bench.rs`, and published in
+[`docs/benchmarks/DURABLE-PATH.md`](../docs/benchmarks/DURABLE-PATH.md). That one also
+carries the **multi-host** invocation (documented, not yet run).
+
 ## Scenarios (ADR 0048 T2 — the selection metrics)
 
 | Scenario | What it measures |

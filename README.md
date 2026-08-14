@@ -116,7 +116,9 @@ in [**Limitations**](#limitations) rather than left to be discovered — the
 largest are that the total-memory watermark is backpressure rather than a hard
 ceiling (the container limit remains the real bound), the Kubernetes operator
 is not packaged for installation, and the horizontal scaling curve has not been
-measured.
+measured — the durable path's end-to-end throughput and latency now are, on one
+host, with their limits stated
+([docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)).
 
 See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
@@ -183,10 +185,12 @@ binary — are marked `-` in the list with the reason, rather than left to fail.
 - **Open == Enterprise.** One Apache-2.0 codebase, no gated features. Only
   support, SLAs, and certified builds are paid.
 - **Horizontal scalability by design.** Shared-nothing nodes; no coordinator on
-  the publish hot path. The *shape* of the scaling curve is not yet measured —
+  the publish hot path. The *shape* of the scaling curve is still not measured —
   doing so honestly needs multi-host hardware
-  ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this is a
-  statement about the architecture, not a benchmarked result.
+  ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this remains a
+  statement about the architecture, not a benchmarked result. What **is** measured
+  is a single fixed 3-node point on one host, with the limits printed beside every
+  number: [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md).
 - **Memory safety.** Rust, `#![forbid(unsafe_code)]` across crates.
 
 ## What's different about it
@@ -547,7 +551,7 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 
 The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
 and **VerneMQ** — including every cell we lose — is
-[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-13). The one-paragraph
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-14). The one-paragraph
 version:
 
 |  | mqttd's answer |
@@ -635,10 +639,19 @@ be found. Each is tracked; none is a silent surprise.
 - **The Kubernetes operator is not installable.** It is built and end-to-end
   tested, but no image is published and its manifest is pinned to a kind-local
   tag. The **Helm chart is the supported path** (ADR 0055 T8).
-- **The horizontal scaling curve is unmeasured.** The architecture is
-  shared-nothing with no coordinator on the publish hot path, but measuring what
-  that yields needs multi-host hardware (ADR 0048 T3). Treat scaling claims here
-  as design intent.
+- **The horizontal scaling curve is unmeasured; the durable path itself now is,
+  on one host.** [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)
+  publishes end-to-end **acked** QoS 1/2 throughput and latency percentiles against
+  a real 3-node quorum with the durable plane on, from a harness whose multi-host
+  invocation is documented and parameterised. What that does **not** settle: it is
+  one developer machine (three broker processes and the driver sharing 8 cores and
+  **one** disk, loopback, no TLS), so it is dev-grade and is not a capacity claim;
+  and throughput-vs-node-count is still absent on purpose, because a single-host
+  curve scales *negatively* and would manufacture false evidence (ADR 0048 §2 and
+  the [2026-07-14 post-mortem](docs/postmortems/2026-07-14-ha-bridge-durable-refused.md)).
+  Treat **scaling** claims as design intent; treat the durable-path numbers as a
+  floor measured under stated, unflattering conditions. The multi-host run needs
+  hardware, and is the one thing standing between the two.
 - **Durability costs a write on the delivery path.** A QoS 1/2 message for a
   **persistent** subscriber is appended to that session's durable log before it
   goes on the wire — that is what makes the guarantee above hold. Clean sessions
@@ -1458,6 +1471,17 @@ not an end-to-end throughput claim; what they guarantee is that the broker is no
 bottleneck and does not silently regress. A per-PR **regression floor**
 (`cargo test -p mqtt-codec --test perf_gate`) fails the build on a gross slowdown, and the
 nightly tier re-runs the full benches ([ADR 0044](docs/adr/0044-release-readiness-assurance.md) P6).
+
+**End-to-end, with the durable plane on**, is a separate and much harder number, and it is
+published in [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md): acked
+QoS 1/QoS 2 throughput and p50/p95/p99 latency against a real 3-node quorum, measured
+through the production binary. Read its first paragraph before its tables. In one line:
+on the machine it was run on, an acked durable QoS 1 publish costs ~28 ms at p50 while
+the same publish to a **clean** session costs ~0.03 ms — the price of the guarantee — and
+the durable rate is pinned by that host's per-volume disk barrier, not by the broker's
+CPU. It is **single-host and dev-grade**: three broker processes and the load driver on
+8 cores and one disk. It is **not** the multi-host result, and it deliberately publishes
+no throughput-vs-node-count curve (ADR 0048 §2).
 
 ## Architecture decisions
 

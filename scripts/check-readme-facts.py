@@ -26,9 +26,18 @@ COMPARISON = ROOT / "docs" / "COMPARISON.md"
 
 
 def tracked_files() -> set[str]:
-    """Every path git tracks, repo-relative with forward slashes."""
+    """Every path that is in the repository, or on its way in.
+
+    `--cached` is the tracked set; `--others --exclude-standard` adds files that
+    exist and are **not** ignored — i.e. a file added in the same change but not yet
+    committed. That distinction is deliberate: in CI the checkout contains only
+    committed files, so `--others` is empty and the citation check is strict, while
+    locally it does not fail an author for citing the artifact they just wrote. What
+    it never admits is the defect this guards against — a path that is gitignored
+    (`bench/results/results.md`) or does not exist at all.
+    """
     out = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
         capture_output=True,
         check=True,
@@ -123,22 +132,30 @@ def main() -> int:
         if link not in anchors:
             problems.append(f"link to #{link} matches no heading in README.md")
 
-    # --- COMPARISON citations resolve to TRACKED files (issue #253) ------
+    # --- evidence citations resolve to TRACKED files (issues #253, #244) --
     # COMPARISON.md is the document that promises trust-through-checkability, and
     # it cited `bench/results/results.md` — a path its own .gitignore keeps out of
     # the repository. A citation of an untracked path is a claim the reader cannot
     # check, which is the one defect that file must not have. Both citation forms
     # are held to it: backticked file paths and relative markdown link targets.
-    # Resolution tries the file's own directory (docs/) then the repo root, since
-    # both conventions appear; a directory citation counts if any tracked file
-    # lives under it.
+    # Resolution tries the citing file's own directory, then docs/, then the repo
+    # root, since all three conventions appear; a directory citation counts if any
+    # tracked file lives under it.
+    #
+    # Issue #244 widened the guarded set from COMPARISON alone to the three
+    # surfaces where a dangling evidence citation is fatal rather than untidy:
+    # the README (the front door), COMPARISON (the migrator's comparison), and
+    # every published benchmark record (numbers with no reachable method are
+    # exactly the failure #244 was filed about). `docs/delivery/` is deliberately
+    # NOT in the set: those files are dated evidence prose about what was true
+    # when a task closed, and rewriting history to satisfy a path check would be
+    # the dishonest fix.
     tracked = tracked_files()
-    comparison_text = COMPARISON.read_text(encoding="utf-8")
 
-    def resolves_tracked(target: str) -> bool:
+    def resolves_tracked(target: str, own_dir: str) -> bool:
         import posixpath
 
-        for base in ("docs", ""):
+        for base in (own_dir, "docs", ""):
             candidate = posixpath.normpath(posixpath.join(base, target))
             if candidate in tracked:
                 return True
@@ -146,19 +163,29 @@ def main() -> int:
                 return True  # a directory with tracked contents
         return False
 
-    citations = set(
-        re.findall(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_.-]+\.[a-z]{2,4})`", comparison_text)
-    )
-    citations |= {
-        t for t in re.findall(r"\]\(([^)#\s]+)(?:#[^)]*)?\)", comparison_text)
-        if "://" not in t
-    }
-    for target in sorted(citations):
-        if not resolves_tracked(target):
-            problems.append(
-                f"docs/COMPARISON.md cites `{target}`, which is not a tracked file — "
-                "cite a tracked artifact or state that the evidence is unpublished"
-            )
+    cited_docs = [README, COMPARISON] + sorted((ROOT / "docs" / "benchmarks").glob("*.md"))
+    citation_count = 0
+    for doc in cited_docs:
+        doc_text = doc.read_text(encoding="utf-8")
+        rel = doc.relative_to(ROOT).as_posix()
+        own_dir = doc.parent.relative_to(ROOT).as_posix()
+        own_dir = "" if own_dir == "." else own_dir
+        citations = set(
+            re.findall(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_.-]+\.[a-z]{2,4})`", doc_text)
+        )
+        citations |= {
+            t for t in re.findall(r"\]\(([^)#\s]+)(?:#[^)]*)?\)", doc_text)
+            if "://" not in t
+        }
+        citation_count += len(citations)
+        for target in sorted(citations):
+            if not resolves_tracked(target, own_dir):
+                problems.append(
+                    f"{rel} cites `{target}`, which is not a tracked file — cite a "
+                    "tracked artifact or state that the evidence is unpublished"
+                )
+
+    comparison_text = COMPARISON.read_text(encoding="utf-8")
 
     # --- README's stated COMPARISON date matches the file header ---------
     # The README quoted a date the comparison's own header contradicted (#253
@@ -187,7 +214,8 @@ def main() -> int:
     print(
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
         f"{task_count} scripts, {len(anchors)} anchors, "
-        f"{len(citations)} COMPARISON citations, dates in sync — all match."
+        f"{citation_count} evidence citations across {len(cited_docs)} cited docs, "
+        f"dates in sync — all match."
     )
     return 0
 
