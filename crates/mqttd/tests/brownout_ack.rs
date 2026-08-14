@@ -23,7 +23,7 @@ use mqttd::hub::{BrownoutAxis, Hub, HubCommand};
 use tokio::net::TcpListener;
 
 /// MQTT 5.0 reason code 0x97 — the honest answer to "I cannot durably take this".
-const QUOTA_EXCEEDED: u8 = 0x97;
+use mqtt_codec::reason::QUOTA_EXCEEDED;
 
 struct Broker {
     addr: std::net::SocketAddr,

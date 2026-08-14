@@ -29,9 +29,14 @@ use tokio::net::{TcpListener, TcpStream};
 
 const V4: ProtocolVersion = ProtocolVersion::V311;
 /// MQTT 3.1.1 CONNACK codes (table 3.1).
-const ACCEPTED: u8 = 0x00;
-const BAD_CREDENTIALS: u8 = 0x04;
-const NOT_AUTHORIZED: u8 = 0x05;
+// MQTT 3.1.1 CONNACK **return codes** — a DIFFERENT code space from the MQTT 5
+// reason codes in `mqtt_codec::reason`, and the collision is not hypothetical:
+// here `V3_NOT_AUTHORIZED` is 0x05, while `reason::NOT_AUTHORIZED` is 0x87. The
+// `V3_` prefix keeps the space visible at the use site rather than in a header
+// comment nobody re-reads.
+const V3_ACCEPTED: u8 = 0x00;
+const V3_BAD_CREDENTIALS: u8 = 0x04;
+const V3_NOT_AUTHORIZED: u8 = 0x05;
 
 /// How a stub hook should answer.
 #[derive(Clone, Copy)]
@@ -165,7 +170,7 @@ async fn a_200_admits_the_client_and_the_hook_was_actually_asked() {
 
     assert_eq!(
         connack_code(addr, "c1", "alice", "s3cret").await,
-        ACCEPTED,
+        V3_ACCEPTED,
         "a 200 from the hook must admit the client"
     );
     assert!(
@@ -184,7 +189,7 @@ async fn a_401_refuses_the_client() {
 
     let code = connack_code(addr, "c1", "alice", "wrong").await;
     assert!(
-        code == BAD_CREDENTIALS || code == NOT_AUTHORIZED,
+        code == V3_BAD_CREDENTIALS || code == V3_NOT_AUTHORIZED,
         "a 401 from the hook must refuse the client; got CONNACK {code:#04x}"
     );
 }
@@ -198,7 +203,7 @@ async fn a_500_is_a_denial_not_an_acceptance() {
 
     let code = connack_code(addr, "c1", "alice", "s3cret").await;
     assert_ne!(
-        code, ACCEPTED,
+        code, V3_ACCEPTED,
         "a 5xx must never admit a client — an ambiguous answer is not a yes"
     );
 }
@@ -212,7 +217,7 @@ async fn an_unreachable_hook_denies() {
 
     let code = connack_code(addr, "c1", "alice", "s3cret").await;
     assert_ne!(
-        code, ACCEPTED,
+        code, V3_ACCEPTED,
         "an unreachable hook must fail CLOSED — it has not authenticated anybody"
     );
 }
@@ -233,7 +238,10 @@ async fn a_hanging_hook_is_cut_off_by_the_timeout_and_denies() {
     let code = connack_code(addr, "c1", "alice", "s3cret").await;
     let elapsed = started.elapsed();
 
-    assert_ne!(code, ACCEPTED, "a hook that never answered must not admit");
+    assert_ne!(
+        code, V3_ACCEPTED,
+        "a hook that never answered must not admit"
+    );
     assert!(
         elapsed < Duration::from_secs(15),
         "the 1s hook timeout must bound the CONNECT; it took {elapsed:?}"
@@ -250,7 +258,7 @@ async fn without_caching_every_connect_asks_the_hook() {
     for i in 0..3 {
         assert_eq!(
             connack_code(addr, &format!("c{i}"), "alice", "s3cret").await,
-            ACCEPTED
+            V3_ACCEPTED
         );
     }
     assert!(
@@ -274,7 +282,7 @@ async fn caching_spares_the_hook_a_repeat_of_the_same_credential() {
     for _ in 0..4 {
         assert_eq!(
             connack_code(addr, "same-client", "alice", "s3cret").await,
-            ACCEPTED
+            V3_ACCEPTED
         );
     }
     let calls = hits.load(Ordering::Relaxed);

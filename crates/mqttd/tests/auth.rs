@@ -20,8 +20,13 @@ use tokio::time::timeout;
 const V4: ProtocolVersion = ProtocolVersion::V311;
 
 /// CONNACK return codes under test (MQTT 3.1.1, table 3.1).
-const BAD_CREDENTIALS: u8 = 0x04;
-const NOT_AUTHORIZED: u8 = 0x05;
+// MQTT 3.1.1 CONNACK **return codes** — a DIFFERENT code space from the MQTT 5
+// reason codes in `mqtt_codec::reason`, and the collision is not hypothetical:
+// here `V3_NOT_AUTHORIZED` is 0x05, while `reason::NOT_AUTHORIZED` is 0x87. The
+// `V3_` prefix keeps the space visible at the use site rather than in a header
+// comment nobody re-reads.
+const V3_BAD_CREDENTIALS: u8 = 0x04;
+const V3_NOT_AUTHORIZED: u8 = 0x05;
 
 /// Spawn a broker whose accept loop injects the given transport identity
 /// (simulating an mTLS-verified client certificate) and authenticator into
@@ -189,7 +194,10 @@ async fn default_policy_rejects_anonymous_with_not_authorized() {
     let addr = start_broker(None, auth).await;
 
     let (mut client, ack) = Client::connect(addr, "anon", None, None).await;
-    assert_eq!(ack.code, NOT_AUTHORIZED, "anonymous must get CONNACK 0x05");
+    assert_eq!(
+        ack.code, V3_NOT_AUTHORIZED,
+        "anonymous must get CONNACK 0x05"
+    );
     assert!(!ack.session_present);
 
     // The connection must be closed without a session: a SUBSCRIBE gets no
@@ -245,7 +253,10 @@ async fn password_credentials_are_rejected_with_bad_credentials() {
 
     let (mut client, ack) =
         Client::connect(addr, "alice-conn", Some("alice"), Some(b"secret")).await;
-    assert_eq!(ack.code, BAD_CREDENTIALS, "password must get CONNACK 0x04");
+    assert_eq!(
+        ack.code, V3_BAD_CREDENTIALS,
+        "password must get CONNACK 0x04"
+    );
     assert!(!ack.session_present);
     assert_eq!(
         client.recv().await,

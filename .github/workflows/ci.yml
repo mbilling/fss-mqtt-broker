@@ -60,6 +60,11 @@ jobs:
       # in both directions, before this ran.
       - name: README states derivable facts correctly
         run: python3 scripts/check-readme-facts.py
+      # A reason code the broker can emit but no test provokes is a reason code
+      # nobody has ever seen it send. Twelve of thirteen were unaudited before
+      # this ran; the script explains any exemption it is carrying.
+      - name: Every emittable reason code has a test that provokes it
+        run: python3 scripts/check-reason-codes.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)
