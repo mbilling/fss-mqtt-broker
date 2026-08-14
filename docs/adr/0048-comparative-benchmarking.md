@@ -170,3 +170,47 @@ terms the honesty rules (§4) require:
 
 The set is now Mosquitto, EMQX, NanoMQ, VerneMQ; delivery rides the same 0051-T9 lane
 and 0048-T4 publication gate.
+
+### Amendment as delivered (2026-08-14): the durable-path lane, and what "never published" means (0048-T5)
+
+Issue [#244](https://github.com/mbilling/fss-mqtt-broker/issues/244) — the 2026-08-13
+review panel's strongest independent-agreement finding — exposed a gap this ADR's own
+structure had left: **§2 forbids the single-host scaling curve, §5 requires publication,
+and the dev-grade rule (delivery phase 2) says laptop numbers are "not published and
+never quoted"** — with the result that the durable path, the thing this product's
+guarantee actually costs, had **no end-to-end number anywhere**, and the one document
+claiming verifiability cited an untracked path for the numbers it did not have.
+
+Two clarifications, both narrowing rather than widening what may be claimed.
+
+**1. The dev-grade rule is about *comparison* and *capacity*, not about our own path.**
+Its purpose is that no unpinned, shared, noisy machine produces a "mqttd does N msg/s"
+or "mqttd beats X" claim. It was never a reason to have no measurement of our own
+durable path at all — and burying one in an untracked directory is what produced the
+dangling citation. So: **a measurement of mqttd alone, on a fully disclosed host, may be
+published in `docs/benchmarks/` provided it is labelled dev-grade at every point of use,
+states its limits in the same breath as its numbers, and is reproducible from a command
+in the document.** It supports no comparison and no capacity claim.
+[`docs/benchmarks/DURABLE-PATH.md`](../benchmarks/DURABLE-PATH.md) is the first such
+artifact: acked QoS 1/2 throughput and p50/p95/p99/p99.9 latency against a real 3-node
+quorum with the durable plane on, from `crates/mqttd/tests/durable_bench.rs`.
+
+**2. §2 stands unchanged, and is now enforced by construction.** A fixed-N point is not
+a curve. The published artifact prints **one** 3-node configuration and **no**
+throughput-versus-node-count series; the driver is parameterised for the multi-host lane
+(`MQTTD_BENCH_BROKERS` / `_HEALTH` / `_NODE_IDS` — nothing is spawned when they are set)
+and that invocation is documented in full, exercised as code by a preflight test, and
+**not run**. T3 stays *planned*: the curve needs one small host per node, as §2 says.
+
+What the lane bought beyond the numbers, and the reason to prefer measurement to
+argument: it found that the durable append path pays a device barrier per append with no
+group commit (so per-node durable throughput is `1 / commit_time` regardless of
+concurrency — ADR 0027's batching exists on the replica writer, not here), that inbound
+QoS 2 hangs silently when the publisher's own placement group is owned elsewhere, and
+that an idle healthy cluster produces occasional 5 s/10 s publish stalls at the
+replication RPC bound. None of those was visible from micro-benchmarks or from `bench/`,
+which measures a single non-durable node.
+
+Also as delivered: `scripts/check-readme-facts.py`'s tracked-citation guard widened from
+`docs/COMPARISON.md` alone to the README and every `docs/benchmarks/*.md`, so a published
+number whose method or harness is not reachable in the repository fails the build.
