@@ -83,10 +83,13 @@ docs; the load-bearing decisions:
   an allow then grants nothing, a deny refuses outright. See the T12 amendment below for
   why the two are not interchangeable.
 - **Enforcement:** SUBSCRIBE → per-filter 0x80, denied filters never reach the
-  hub (so retained replay is implicitly gated); PUBLISH → dropped but still
-  acknowledged per `QoS` (3.1.1 has no negative PUBACK; not acking strands
-  conforming publishers in retry), logged; will topic → 0x05 at CONNECT (a
-  will is a deferred publish — refuse it before accepting the session).
+  hub (so retained replay is implicitly gated); PUBLISH → dropped before the hub
+  and audited, with the answer per protocol version (issue #246 amendment below):
+  MQTT 5 `QoS` 1/2 is told `0x87 Not authorized` on the PUBACK/PUBREC, v3.1.1 is
+  still plainly acknowledged (it has no negative PUBACK; not acking strands
+  conforming publishers in retry), `QoS` 0 has nothing to answer; will topic →
+  0x05 at CONNECT (a will is a deferred publish — refuse it before accepting the
+  session).
 
 ### Auditing and peer binding
 
@@ -241,3 +244,30 @@ decision over already-loaded policy, on the publish hot path, and has no reason 
 An implementation that performs I/O owns its own deadline, and must **fail closed** when it
 expires: a hook that is unreachable has not authenticated anybody. This is stated on the
 trait method, because it is the part a third-party implementer will otherwise get wrong.
+
+## Amendment (2026-08-14): a denied MQTT 5 publish is told `0x87 Not authorized` (issue #246)
+
+As first delivered, an ACL-denied publish was dropped-but-acknowledged **as success** for
+both protocol versions — correct for v3.1.1, which has no per-publish reason code, but a
+lie for MQTT 5, which does. Since issue #246 the answer is per version, decided at the
+connection's ack arms (the ACL check runs in `conn.rs` before the publish ever reaches the
+hub):
+
+- **MQTT 5, `QoS` 1:** PUBACK with reason `0x87 Not authorized`.
+- **MQTT 5, `QoS` 2:** PUBREC `0x87`. A reason ≥ `0x80` ends the flow by spec, so the
+  inbound dedup record is released entirely: a DUP resend of the id is a **fresh**
+  decision (re-denied while the ACL still denies), and reuse of the id under a granted
+  topic is genuinely new.
+- **v3.1.1, `QoS` 1/2:** unchanged — the plain success ack stands (no negative PUBACK
+  exists, and a retry cannot change an ACL decision). The denied `QoS` 2 id keeps its
+  acknowledged dedup record, exactly as before.
+- **`QoS` 0:** nothing to answer in either version; the silent drop stands.
+
+In **both** versions the denial is still recorded as `acl.deny.publish` in the audit
+log — for v3.1.1 that remains the only place a denial is visible.
+
+Deliberately NOT a `PublishRefusal` variant: that enum is the **hub's** refusal
+vocabulary and each variant carries a peer-bus wire code (ADR 0041 T12). The ACL decision
+never crosses the hub or the bus, so a variant there would be a dead wire code; the
+refusal seam's per-version *shape* (v5 reason byte / v3.1.1 plain-ack-or-close) is reused
+conceptually, at the same ack arms, without widening the enum.

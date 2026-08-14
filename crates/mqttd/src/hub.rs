@@ -352,9 +352,11 @@ pub enum PublishOutcome {
 /// Each variant carries **two independent answers**: [`v5_reason`](Self::v5_reason)
 /// for MQTT 5, which has a reason byte on PUBACK/PUBREC, and [`v311`](Self::v311)
 /// for v3.1.1, which has none and must therefore choose between a plain ack and a
-/// close. Adding a refusal is exactly that: one variant plus its two answers (issue
-/// #246's ACL-denied publish becomes `NotAuthorized` → v5 `0x87`, v3.1.1
-/// [`Refusal311::PlainAck`], with one line in `conn.rs`'s ACL branch).
+/// close. Adding a *hub* refusal is exactly that: one variant plus its two answers.
+/// (Issue #246's ACL denial was delivered WITHOUT a variant here, on purpose: the
+/// ACL decides in `conn.rs` before the publish ever reaches the hub, and its answer
+/// — v5 `0x87 Not authorized`, v3.1.1 plain ack — is set right at `conn.rs`'s ack
+/// arms; a variant here would carry a dead wire code the peer bus never sends.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishRefusal {
     /// A watermark is exceeded, so the durable append a `QoS` ≥ 1 subscriber is

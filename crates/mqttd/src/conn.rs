@@ -1693,14 +1693,19 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         warn!(client = %client.0, topic = %topic, "PUBLISH topic contains wildcards; closing connection");
         return Ok(PacketOutcome::BrokerClose);
     }
-    // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped but still
-    // acknowledged — 3.1.1 has no negative PUBACK, and not acking would leave
-    // conforming publishers retrying forever.
+    // ACL gate (ADR 0004 step 3): an unauthorized publish is dropped before the
+    // hub ever sees it, and the denial is audited. What the publisher is TOLD is
+    // per version (issue #246): v5 has a reason byte, so its `QoS` 1/2 answer is
+    // `0x87 Not authorized` (set at each ack arm below, where `forward` returned
+    // `None`); v3.1.1 has no negative PUBACK, and not acking would leave a
+    // conforming publisher retrying forever — a retry cannot change an ACL
+    // decision — so it keeps the plain success ack. `QoS` 0 has nothing to answer
+    // in either version.
     //
-    // This is issue #246's seam: telling a v5 publisher `0x87 Not authorized` is
-    // one more `PublishRefusal` variant (`NotAuthorized` → v5 `0x87`, v3.1.1
-    // `Refusal311::PlainAck` — a retry cannot change an ACL decision) plus a line
-    // here that hands it to the same per-version mapping the refusal arms below use.
+    // This deliberately does NOT reuse `PublishRefusal`: that enum is the hub's
+    // refusal vocabulary and travels the peer bus under a wire code, while the ACL
+    // decision is made right here, before `forward` — it never crosses the hub or
+    // the bus, so a variant there would be dead weight in both.
     let authorized = policy
         .authorizer()
         .authorize_publish(principal, client, &topic);
@@ -1777,6 +1782,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                         }
                     }
                 }
+            } else if is_v5 {
+                // The ACL denied this publish (`forward` returned `None`) and v5
+                // can say so: PUBACK 0x87 Not authorized (issue #246). Per-publish,
+                // not a connection verdict — the connection stays open. v3.1.1
+                // falls through to the plain ack: it has no reason byte, and a
+                // retry cannot change an ACL decision.
+                ack.reason = mqtt_codec::reason::NOT_AUTHORIZED;
             }
             writer.send(&Packet::PubAck(ack)).await?;
         }
@@ -1869,6 +1881,13 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                             }
                         }
                     }
+                } else if is_v5 {
+                    // The ACL denied this publish and v5 can say so: PUBREC 0x87
+                    // Not authorized (issue #246). A reason >= 0x80 ends the flow
+                    // by spec, so this takes the release arm below — the id is
+                    // freed entirely and a DUP resend is a fresh (re-denied)
+                    // decision. v3.1.1 falls through to the plain PUBREC.
+                    rec.reason = mqtt_codec::reason::NOT_AUTHORIZED;
                 }
                 if rec.reason == 0 {
                     // Only a genuinely new id consumes a Receive-Maximum slot; a
@@ -3781,6 +3800,313 @@ mod tests {
         // routing.
         writer.send(&qos2_publish(1)).await.unwrap();
         assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+    }
+
+    /// An authorizer that denies publishing to exactly one topic (`"secret"`) and
+    /// allows everything else — the issue #246 seam: one connection can exercise
+    /// both the denied and the allowed path, so "the ACL still denies" and "the
+    /// same packet id works when allowed" are testable side by side.
+    #[derive(Debug)]
+    struct DenySecret;
+
+    impl mqtt_auth::Authorizer for DenySecret {
+        fn authorize_publish(
+            &self,
+            _id: &mqtt_auth::Identity,
+            _client: &mqtt_core::ClientId,
+            topic: &mqtt_core::TopicName,
+        ) -> bool {
+            topic != "secret"
+        }
+        fn authorize_subscribe(
+            &self,
+            _id: &mqtt_auth::Identity,
+            _client: &mqtt_core::ClientId,
+            _f: &mqtt_core::TopicFilter,
+        ) -> bool {
+            true
+        }
+    }
+
+    /// A connection at `version` whose policy DENIES publishes to `"secret"`,
+    /// records every audit event, and optionally carries a durable session store
+    /// (for the `QoS` 2 dedup assertions) — the issue #246 harness.
+    #[allow(clippy::type_complexity)]
+    fn conn_denying_secret(
+        version: ProtocolVersion,
+        store: Option<Arc<dyn mqtt_storage::SessionStore>>,
+    ) -> (
+        Reader,
+        Writer,
+        mpsc::UnboundedReceiver<HubCommand>,
+        Arc<mqtt_observability::RecordingAuditSink>,
+    ) {
+        let audit = Arc::new(mqtt_observability::RecordingAuditSink::new());
+        let (client, server) = tokio::io::duplex(4096);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(ConnPolicy {
+            auth: auth_handle(Arc::new(BasicAuthenticator {
+                allow_anonymous: true,
+            })),
+            authz: authz_handle(Arc::new(DenySecret)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
+            audit: audit.clone(),
+            proxy: None,
+            node: None,
+            store,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: None,
+        });
+        tokio::spawn(handle_stream(server, None, None, policy, hub_tx));
+        let (rh, wh) = tokio::io::split(client);
+        (
+            FrameReader::new(rh, version),
+            FrameWriter::new(wh, version),
+            hub_rx,
+            audit,
+        )
+    }
+
+    /// A PUBLISH to `topic` at `qos` — the topic-parameterised sibling of
+    /// [`qos1_publish`]/[`qos2_publish`], for the ACL tests that need both a
+    /// denied and an allowed topic on one connection.
+    fn publish_to(topic: &str, qos: QoS, id: Option<u16>, dup: bool) -> Packet {
+        Packet::Publish(Publish {
+            properties: mqtt_codec::Properties::new(),
+            dup,
+            qos,
+            retain: false,
+            topic: topic.to_string(),
+            pkid: id,
+            payload: Bytes::from_static(b"x"),
+        })
+    }
+
+    /// Issue #246 — an ACL-denied v5 `QoS` 1 publish is answered PUBACK `0x87 Not
+    /// authorized`, not acknowledged as success. The connection stays open (a
+    /// refusal is per-publish, never a connection verdict), the denial is still
+    /// audited, and the message never reaches the hub.
+    #[tokio::test]
+    async fn a_v5_qos1_publish_denied_by_the_acl_is_answered_puback_0x87() {
+        let (mut reader, mut writer, hub_rx, audit) = conn_denying_secret(V5, None);
+        let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_v5("acl1", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer
+            .send(&publish_to("secret", QoS::AtLeastOnce, Some(1), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(
+                    a.reason,
+                    mqtt_codec::reason::NOT_AUTHORIZED,
+                    "a denied v5 publish must be told 0x87, not acked as success"
+                );
+            }
+            other => panic!("expected PUBACK 0x87, got {other:?}"),
+        }
+        // Still open, and an allowed publish on the same connection works normally.
+        writer
+            .send(&publish_to("t", QoS::AtLeastOnce, Some(2), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => {
+                assert_eq!(a.pkid, 2);
+                assert_eq!(a.reason, 0);
+            }
+            other => panic!("the connection must stay open, got {other:?}"),
+        }
+        assert_eq!(
+            next_topic(&mut topics).await.as_deref(),
+            Some("t"),
+            "only the allowed publish reaches the hub"
+        );
+        assert!(
+            audit.kinds().iter().any(|k| k == "acl.deny.publish"),
+            "the denial stays audited"
+        );
+    }
+
+    /// Issue #246, the `QoS` 2 half — a denied v5 `QoS` 2 publish is answered
+    /// PUBREC `0x87`, which ends the flow BY SPEC: the dedup record is released
+    /// entirely, a DUP resend is a FRESH decision (re-denied while the ACL still
+    /// denies — never answered as a duplicate of a message nothing accepted), and
+    /// the same id under an allowed topic is genuinely new and reaches routing.
+    #[tokio::test]
+    async fn a_v5_qos2_publish_denied_by_the_acl_ends_the_flow_with_pubrec_0x87() {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let cid = mqtt_core::ClientId("aclq2".into());
+        let (mut reader, mut writer, hub_rx, audit) = conn_denying_secret(V5, Some(store.clone()));
+        let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_v5("aclq2", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer
+            .send(&publish_to("secret", QoS::ExactlyOnce, Some(1), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(
+                    a.reason,
+                    mqtt_codec::reason::NOT_AUTHORIZED,
+                    "a denied v5 QoS 2 publish is answered PUBREC 0x87"
+                );
+            }
+            other => panic!("expected PUBREC 0x87, got {other:?}"),
+        }
+        assert!(
+            store.received(&cid).await.unwrap().is_empty(),
+            "a PUBREC >= 0x80 ends the flow by spec: the id is released entirely"
+        );
+
+        // A DUP resend of the denied id is a FRESH decision: re-denied 0x87 while
+        // the ACL still denies, never a fabricated answer from a released window.
+        writer
+            .send(&publish_to("secret", QoS::ExactlyOnce, Some(1), true))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => {
+                assert_eq!(a.reason, mqtt_codec::reason::NOT_AUTHORIZED);
+            }
+            other => panic!("expected the DUP re-denied with PUBREC 0x87, got {other:?}"),
+        }
+        assert_eq!(
+            next_topic(&mut topics).await,
+            None,
+            "nothing denied ever reached the hub"
+        );
+
+        // The same id under an ALLOWED topic is genuinely new: success, and routed.
+        writer
+            .send(&publish_to("t", QoS::ExactlyOnce, Some(1), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => {
+                assert_eq!(
+                    a.reason, 0,
+                    "the allowed reuse of the id is a fresh success"
+                );
+            }
+            other => panic!("expected a success PUBREC, got {other:?}"),
+        }
+        assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+        assert!(audit.kinds().iter().any(|k| k == "acl.deny.publish"));
+    }
+
+    /// Issue #246 — v3.1.1 is UNCHANGED: it has no per-publish reason code, so a
+    /// denied publish stays drop-and-audit with a plain success ack (withholding
+    /// the ack would strand a conforming publisher in retry), the denied `QoS` 2
+    /// id keeps its #238-era ACKED dedup record (the broker DID acknowledge it,
+    /// so a DUP is honestly answerable as a duplicate), and the flow completes
+    /// normally.
+    #[tokio::test]
+    async fn a_v311_denied_publish_keeps_its_plain_ack_and_audit_for_both_qos_levels() {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let cid = mqtt_core::ClientId("acl311".into());
+        let (mut reader, mut writer, hub_rx, audit) = conn_denying_secret(V4, Some(store.clone()));
+        let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+        writer.send(&connect_packet("acl311", false)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+        writer
+            .send(&publish_to("secret", QoS::AtLeastOnce, Some(1), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubAck(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(
+                    a.reason, 0,
+                    "v3.1.1 has no reason byte: the plain ack stands"
+                );
+            }
+            other => panic!("expected a plain PUBACK, got {other:?}"),
+        }
+        writer
+            .send(&publish_to("secret", QoS::ExactlyOnce, Some(2), false))
+            .await
+            .unwrap();
+        match recv(&mut reader).await {
+            Some(Packet::PubRec(a)) => {
+                assert_eq!(a.pkid, 2);
+                assert_eq!(a.reason, 0);
+            }
+            other => panic!("expected a plain PUBREC, got {other:?}"),
+        }
+        // The plain PUBREC *was* an acknowledgement, so the id keeps its ACKED
+        // dedup record — v3.1.1's #238-era treatment, unchanged by #246 (only a
+        // v5 reason >= 0x80 ends a flow and releases the id).
+        assert_eq!(
+            store.record_received(&cid, 2).await.unwrap(),
+            mqtt_storage::InboundSighting::HeldAcked,
+            "a v3.1.1 denied QoS 2 id stays held-and-acked"
+        );
+        // The v3.1.1 QoS 2 flow still completes normally after the drop.
+        writer
+            .send(&Packet::PubRel(mqtt_codec::packet::Ack::from(2)))
+            .await
+            .unwrap();
+        assert_eq!(recv(&mut reader).await, Some(Packet::PubComp(2.into())));
+        assert_eq!(
+            next_topic(&mut topics).await,
+            None,
+            "denied publishes never reach the hub"
+        );
+        assert_eq!(
+            audit
+                .kinds()
+                .iter()
+                .filter(|k| k.as_str() == "acl.deny.publish")
+                .count(),
+            2,
+            "both denials are audited"
+        );
+    }
+
+    /// Issue #246 — `QoS` 0 has nothing to answer: a denied `QoS` 0 publish stays
+    /// a silent (audited) drop for v5 as for v3.1.1, and the connection stays open.
+    #[tokio::test]
+    async fn a_denied_qos0_publish_stays_a_silent_drop_in_both_versions() {
+        for version in [V5, V4] {
+            let (mut reader, mut writer, hub_rx, audit) = conn_denying_secret(version, None);
+            let (mut topics, _detach) = stub_hub_refusing_watching_detach(hub_rx, None);
+            if version == V5 {
+                writer.send(&connect_v5("aclq0", vec![])).await.unwrap();
+            } else {
+                writer.send(&connect_packet("aclq0", true)).await.unwrap();
+            }
+            assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+
+            writer
+                .send(&publish_to("secret", QoS::AtMostOnce, None, false))
+                .await
+                .unwrap();
+            // Nothing is answered for QoS 0; the next (allowed) publish proves the
+            // connection is open and that the denied one was dropped before the hub.
+            writer
+                .send(&publish_to("t", QoS::AtLeastOnce, Some(1), false))
+                .await
+                .unwrap();
+            match recv(&mut reader).await {
+                Some(Packet::PubAck(a)) => assert_eq!(a.pkid, 1),
+                other => panic!("expected the follow-up PUBACK, got {other:?}"),
+            }
+            assert_eq!(next_topic(&mut topics).await.as_deref(), Some("t"));
+            assert_eq!(next_topic(&mut topics).await, None);
+            assert!(audit.kinds().iter().any(|k| k == "acl.deny.publish"));
+        }
     }
 
     /// The pre-existing hub-gone hole, now guarded (issue #238): the `Err(_)` arm at the

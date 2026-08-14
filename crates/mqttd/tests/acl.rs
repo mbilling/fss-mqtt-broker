@@ -1,6 +1,8 @@
 //! ACL enforcement integration tests (ADR 0004 step 3): deny-by-default topic
-//! authorization at SUBSCRIBE (0x80 per filter), PUBLISH (dropped but acked),
-//! and the will topic at CONNECT (0x05).
+//! authorization at SUBSCRIBE (0x80 per filter), PUBLISH (dropped; these v3.1.1
+//! clients still get a plain ack — an MQTT 5 publisher is told `0x87 Not
+//! authorized` instead, covered by `conn::tests`, issue #246), and the will
+//! topic at CONNECT (0x05).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -143,8 +145,9 @@ impl Client {
         }
     }
 
-    /// Publish at `QoS` 1 and assert the broker acks it (denied publishes are
-    /// dropped but still acknowledged — 3.1.1 has no negative PUBACK).
+    /// Publish at `QoS` 1 and assert the broker acks it (these clients speak
+    /// v3.1.1, where denied publishes are dropped but still acknowledged —
+    /// 3.1.1 has no negative PUBACK; a v5 publisher would be told `0x87`).
     async fn publish_qos1(&mut self, topic: &str, pkid: u16, payload: &'static [u8]) {
         self.send(&Packet::Publish(Publish {
             properties: mqtt_codec::Properties::new(),
@@ -211,8 +214,10 @@ async fn denied_subscription_gets_0x80_and_no_delivery() {
     assert_eq!(sub.recv().await, None, "denied filter must deliver nothing");
 }
 
-/// A denied PUBLISH is dropped (no delivery) but still acknowledged, so
-/// spec-conforming `QoS` 1 publishers are not left retrying forever.
+/// A denied v3.1.1 PUBLISH is dropped (no delivery) but still acknowledged, so
+/// spec-conforming `QoS` 1 publishers are not left retrying forever. (v5 only:
+/// a denied publish is answered `0x87 Not authorized` instead — issue #246,
+/// covered in `conn::tests`.)
 #[tokio::test]
 async fn denied_publish_is_dropped_but_acked() {
     let (addr, ids) = start_acl_node(
