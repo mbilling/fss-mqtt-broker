@@ -360,6 +360,13 @@ Both protocol versions round-trip against two independent foreign clients
   `cargo-audit`.
 
 ### Clustering
+
+Want to *run* one, secured, without Kubernetes? The
+[secured three-node tutorial](docs/SECURED-CLUSTER-TUTORIAL.md) walks the shipped
+compose reference deployment end to end — TLS, mutual-TLS cluster bus, signed
+gossip, deny-by-default ACL, majority-aware readiness — including the founder
+rule and how the starter PKI maps to a real CA.
+
 - Shared-nothing nodes: a client connects to any node.
 - **SWIM gossip membership** (failure detection + anti-entropy), authenticated.
 - **Membership-driven mesh**: nodes discover each other via gossip and establish

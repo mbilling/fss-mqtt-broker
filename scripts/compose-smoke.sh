@@ -17,13 +17,19 @@
 #   2. after ./bootstrap.sh, `up -d` brings all three brokers to HEALTHY;
 #   3. a TLS subscriber on node 1 receives a QoS 1 publish made on node 3 (cross-node
 #      routing over TLS, through a mutually-authenticated cluster bus);
-#   4. a client with no --cafile is refused, and a wrong password is refused;
+#   4. a client with no --cafile is refused, a client verifying against the WRONG CA is
+#      refused at the TLS handshake, and a wrong password is refused;
 #   5. no container logs INSECURE, and each of the three logs signed per-node gossip;
 #   6. compose publishes no host port 1883 — and, when 1883 was free before this run, that
 #      nothing accepts a cleartext connection there afterwards either;
 #   7. each broker's /etc/mqttd/tls holds its OWN key and no other node's, and no CA key:
 #      the custody rule deploy/README.md states, checked on the running containers;
-#   8. with the explicit -f overlay, plaintext comes back on 127.0.0.1:1883 AND every
+#   8. the "arm the founder" step (deploy/compose/README.md; the tutorial in
+#      docs/SECURED-CLUSTER-TUTORIAL.md) works and buys what it claims: mqttd-1 re-renders
+#      with seeds + a floor of 2 and stays ready — and with mqttd-2/3 stopped it goes
+#      LIVE-BUT-NOT-READY (a minority pulls itself from rotation) and recovers when the
+#      majority returns;
+#   9. with the explicit -f overlay, plaintext comes back on 127.0.0.1:1883 AND every
 #      broker logs "INSECURE: starting PLAINTEXT MQTT listener" — checked PER BROKER, so
 #      one noisy container cannot satisfy it for the other two.
 #
@@ -58,7 +64,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>
   echo "SKIP — docker compose is not available; the compose reference deployment was NOT brought up"
   exit 0
 fi
-for tool in mosquitto_pub mosquitto_sub; do
+for tool in mosquitto_pub mosquitto_sub openssl; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FATAL: '$tool' not found on PATH"; exit 2; }
 done
 
@@ -256,6 +262,23 @@ if mosquitto_pub -h 127.0.0.1 -p 8883 -t 'devices/device-a/up/t' -m x \
 fi
 pass "a client that does not speak TLS is refused"
 
+# A client verifying against the WRONG CA (the tutorial's decoy-CA check): the TLS
+# handshake fails before MQTT is ever spoken. Distinct from the no-cafile case above —
+# this client DOES do TLS and DOES verify, against a trust anchor that never signed
+# this cluster's certificates.
+WRONG_CA_DIR="$(mktemp -d)"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout "$WRONG_CA_DIR/wrong-ca.key" -out "$WRONG_CA_DIR/wrong-ca.pem" \
+  -subj '/CN=not-this-cluster' >/dev/null 2>&1
+if mosquitto_pub -h 127.0.0.1 -p 8883 --cafile "$WRONG_CA_DIR/wrong-ca.pem" \
+     -t 'devices/device-a/up/t' -m x -u device-a -P "$DEVICE_A_PW" \
+     -i cs-wrongca >/dev/null 2>&1; then
+  rm -rf "$WRONG_CA_DIR"
+  fail "a client verifying the broker against a WRONG CA was accepted"
+fi
+rm -rf "$WRONG_CA_DIR"
+pass "a client verifying against the wrong CA is refused at the TLS handshake"
+
 if mosquitto_pub -h 127.0.0.1 -p 8883 --cafile "$CA" -t 'devices/device-a/up/t' -m x \
      -u device-a -P 'wrong-password' -i cs-badpw >/dev/null 2>&1; then
   fail "a WRONG password was accepted"
@@ -344,7 +367,62 @@ done
 pass "each broker's TLS volume holds only its own key, and none holds the CA private key"
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# 8. The opt-in overlay puts plaintext back, loudly.
+# 8. Arm the founder, then prove the majority rule it buys.
+# ─────────────────────────────────────────────────────────────────────────────────
+# The documented post-bring-up step (deploy/compose/README.md "After the first
+# bring-up"; docs/SECURED-CLUSTER-TUTORIAL.md steps 5–6). The reader appends
+# MQTTD_1_SEEDS + MQTTD_1_READY_MIN_MEMBERS=2 to .env; here the same two variables go
+# through the process environment — the identical compose interpolation path, without
+# writing into the reader's checkout. deploy/smoke asserts both RENDERINGS on every PR;
+# this asserts the behaviour in real containers:
+#   - re-upping mqttd-1 armed keeps it healthy and ready (it sees all three);
+#   - with mqttd-2/3 stopped, the armed founder goes LIVE-BUT-NOT-READY — the
+#     minority pulls itself from rotation instead of serving a store it cannot write;
+#   - when the majority returns, so does readiness.
+ARM_SEEDS="mqttd-2:7946,mqttd-3:7946"
+compose_armed() {
+  ( cd "$COMPOSE_DIR" && \
+    MQTTD_1_SEEDS="$ARM_SEEDS" MQTTD_1_READY_MIN_MEMBERS=2 \
+    docker compose -p "$PROJECT" "$@" )
+}
+probe1() { # <path> — ask mqttd-1's own health endpoint via the distroless-safe probe
+  compose exec -T mqttd-1 /usr/local/bin/mqttd --probe "$1" >/dev/null 2>&1
+}
+
+compose_armed up -d mqttd-1 >/dev/null 2>&1 \
+  || { compose logs --tail 40 mqttd-1; fail "re-upping the ARMED founder failed"; }
+deadline=$((SECONDS + 180))
+until probe1 /readyz; do
+  (( SECONDS < deadline )) || { compose logs --tail 40 mqttd-1; \
+    fail "the armed founder (seeds + floor 2) never became ready among three nodes"; }
+  sleep 3
+done
+pass "the founder re-ups ARMED (seeds + readiness floor 2) and is still ready — it sees 3"
+
+compose stop mqttd-2 mqttd-3 >/dev/null 2>&1 || fail "could not stop mqttd-2/mqttd-3"
+deadline=$((SECONDS + 120))
+while probe1 /readyz; do
+  (( SECONDS < deadline )) || { compose logs --tail 40 mqttd-1; \
+    fail "mqttd-1 still reports READY alone — the armed floor of 2 is not enforced"; }
+  sleep 3
+done
+probe1 /livez \
+  || { compose logs --tail 40 mqttd-1; \
+       fail "mqttd-1 stopped being LIVE in a minority — it should be live-but-not-ready"; }
+pass "alone, the armed founder is LIVE but NOT READY — a minority pulls itself from rotation"
+
+compose_armed up -d >/dev/null 2>&1 \
+  || { compose logs --tail 40; fail "restarting the stopped majority failed"; }
+deadline=$((SECONDS + 180))
+until probe1 /readyz; do
+  (( SECONDS < deadline )) || { compose logs --tail 40; \
+    fail "readiness did not return after the majority came back"; }
+  sleep 3
+done
+pass "readiness returns once the majority is back"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# 9. The opt-in overlay puts plaintext back, loudly.
 # ─────────────────────────────────────────────────────────────────────────────────
 if (( HOST_1883_BUSY )); then
   echo "  SKIP — something else is already listening on 127.0.0.1:1883; the plaintext"
