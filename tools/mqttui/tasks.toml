@@ -664,6 +664,18 @@ duration = "~1s"
 hidden = true
 
 [[task]]
+id = "check-reason-codes"
+group = "Internal"
+name = "Check every emittable reason code has a test"
+script = "scripts/check-reason-codes.py"
+# Audits the repo's own tests against the repo's own code.
+needs_checkout = true
+about = "Fails when the broker can emit an MQTT reason code no integration test provokes."
+requires = ["python3"]
+duration = "~2s"
+hidden = true
+
+[[task]]
 id = "check-readme-facts"
 group = "Internal"
 name = "Check the README's derivable facts"
