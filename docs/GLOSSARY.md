@@ -62,8 +62,22 @@ broker uses, and **mqttd** terms specific to this one's clustering and security 
 - **Voter / learner** — the lease consensus runs among a bounded **voter** set (default 5);
   every other node joins as a **learner** that still receives the lease log and can own and
   serve groups, so consensus cost stays fixed as the cluster grows.
-- **SWIM gossip** — the membership protocol nodes use to discover each other and detect
-  failures. Every datagram is HMAC-authenticated under a shared key (`MQTTD_SWIM_KEY`).
+- **SWIM gossip** — SWIM (Scalable Weakly-consistent Infection-style process-group
+  Membership) is the membership protocol nodes use to discover each other and detect
+  failures: each node periodically pings a random peer and spreads what it learns
+  epidemically ("gossip"). Every datagram is HMAC-authenticated under a shared key
+  (`MQTTD_SWIM_KEY`).
+- **HRW / rendezvous hashing** — HRW (Highest Random Weight) is how a session is
+  assigned an owner node: every node's id is hashed against the session's key and the
+  highest score wins. Deterministic (every node computes the same answer with no
+  coordinator), and when membership changes only the sessions whose winner changed
+  move — minimal rebalancing.
+- **CP / CAP** — the CAP theorem: during a network **P**artition a distributed store
+  must choose between **C**onsistency (every answer is the agreed one) and
+  **A**vailability (every request gets an answer). mqttd's durable plane chooses
+  **CP**: the side of a partition without a quorum refuses new durable writes and
+  serves last-committed values (staleness, never divergence) until the partition
+  heals.
 - **Founder / seed** — the first node (started with no seeds) *founds* the cluster; every
   other node *seeds* to an existing member to join. The `clusterEstablished` guard prevents
   a restarted founder whose volume was lost from founding a *second* cluster.
@@ -80,10 +94,51 @@ broker uses, and **mqttd** terms specific to this one's clustering and security 
   *covers* the topic (its filter matches); a `deny` applies if it *overlaps* (matches any
   part), so deny is deliberately broader than allow — the safe direction for authorization.
 
+## Security and PKI
+
+- **TLS / mTLS** — TLS (Transport Layer Security) encrypts and authenticates the
+  connection; the client verifies the server's certificate. **mTLS** (mutual TLS) adds
+  the reverse: the server also requires and verifies a *client* certificate, so the
+  connection itself proves who the client is. mqttd's cluster bus is always mTLS;
+  client listeners opt in via `MQTTD_TLS_CLIENT_CA`.
+- **CA / CN** — a CA (Certificate Authority) is the keypair that signs certificates;
+  trusting the CA is what makes a presented certificate mean something. The CN
+  (Common Name) is the certificate's subject name — mqttd's default source of a
+  client's identity, and the binding for a cluster node's id.
+- **ACL** — an Access Control List: the deny-by-default TOML policy mapping an
+  authenticated identity to the topics it may publish or subscribe to
+  (`MQTTD_ACL_FILE`).
+- **JWT / OIDC** — a JWT (JSON Web Token) is a signed token carrying identity claims,
+  verified against a static key (`MQTTD_JWT_*`). OIDC (OpenID Connect) is the
+  discovery layer on top: the broker fetches the issuer's published keys (JWKS) and
+  follows rotation live (`MQTTD_OIDC_*`).
+- **CRL / OCSP** — two ways to revoke a certificate before it expires. A CRL
+  (Certificate Revocation List) is a signed file listing revoked certificates,
+  published by the operator and hot-reloaded by mqttd; OCSP (Online Certificate
+  Status Protocol) asks a responder per handshake instead — not yet supported here.
+- **EKU / `clientAuth`** — Extended Key Usage, the X.509 field naming what a
+  certificate may be used for. rustls requires the `clientAuth` EKU on client
+  certificates (and `serverAuth` on server ones); a client certificate minted without
+  it is rejected at the handshake — see
+  [TROUBLESHOOTING](TROUBLESHOOTING.md#a-client-with-a-certificate-is-rejected-mtls).
+- **PSK** — a pre-shared key: TLS authenticated by a symmetric secret both sides
+  already hold, common on constrained devices. mqttd does not offer PSK cipher
+  suites; X.509 or token authentication is the path.
+- **HMAC** — a hash-based message authentication code: a keyed hash proving a message
+  was produced by a holder of the shared key and not altered. What authenticates
+  every SWIM gossip datagram (HMAC-SHA256).
+
 ## Supply chain
 
 - **cosign / SLSA / SBOM** — release-integrity tooling. **cosign** signs each artifact
   (keylessly, via GitHub OIDC); **SLSA provenance** attests what commit and workflow built
-  it; the **SBOM** (CycloneDX) lists every dependency. All three ship with each release and
-  are verifiable with `cosign verify-blob`. Skippable if you trust the source; there for
-  when you must prove it.
+  it; the **SBOM** (Software Bill of Materials, CycloneDX format) lists every dependency.
+  All three ship with each release and are verifiable with `cosign verify-blob`. Skippable
+  if you trust the source; there for when you must prove it.
+- **distroless** — a container base image containing no shell, package manager or libc —
+  nothing but the binary and CA certificates. Shrinks the attack surface (nothing to
+  exec) at the cost of no in-container debugging; it is why mqttd's health checks are a
+  broker subcommand (`mqttd --probe`) rather than `curl`.
+- **redb** — the embedded, pure-Rust, ACID key-value store (like SQLite in spirit,
+  key-value in shape) that `MQTTD_DATA_DIR` persistence is built on. In-process — no
+  database server to run.

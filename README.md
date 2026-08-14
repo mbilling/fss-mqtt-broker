@@ -4,15 +4,96 @@
 > broker available, designed to scale horizontally, with a 100% open feature
 > set.
 
-**Status:** MQTT **3.1.1 and 5.0** are served — over TCP, TLS 1.3, WebSocket
+## Start here
+
+Run the broker first; the claims about it can wait. The two-minute single node
+below needs only Docker, and the five-idea primer right after it defines every
+MQTT term the rest of this file leans on. Terms of art beyond those five — the
+clustering and security vocabulary — are defined at first use or in the
+[glossary](docs/GLOSSARY.md).
+
+### Try it in two minutes
+
+```sh
+docker run -d --name mqttd -p 1883:1883 \
+  -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
+  -e MQTTD_DATA_DIR=/var/lib/mqttd -v mqttd-data:/var/lib/mqttd \
+  ghcr.io/mbilling/fss-mqtt-broker:latest
+
+mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
+mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
+```
+
+That is **plaintext with anonymous clients** — a first look, never a deployment. The
+named volume is what makes it honest: durable sessions are on by default, and durable-on
+with no data dir **refuses to start** (issue #240) rather than silently keeping acked
+messages in RAM. (The volume outlives `docker rm -f mqttd`; `docker volume rm mqttd-data`
+removes the state too.)
+The broker says so in its own logs, loudly, every time. When you are ready for
+something real, the [secured quickstart](#single-node-secured-tls-13--mtls--acl)
+stands up TLS 1.3, mutual TLS and a deny-by-default ACL in about the same number
+of commands, and CI runs those exact commands on every push.
+
+### New to MQTT?
+
+Skip this if you already run a broker. **MQTT** itself — the name — is Message
+Queuing Telemetry Transport: a lightweight publish/subscribe protocol in which
+clients publish messages to named *topics* on a broker, and the broker delivers
+each message to whoever subscribed to a matching topic. Beyond that, these five
+ideas are what the rest of this file assumes, and nothing else here explains them.
+
+- **QoS 0 / 1 / 2** — how hard the broker tries to deliver. **0** is fire and
+  forget (fastest, may be lost). **1** is at-least-once (may arrive twice; the
+  usual choice). **2** is exactly-once (slowest, a four-packet handshake). You
+  pick per message, and the subscriber's subscription can only lower it.
+- **Retained message** — the broker keeps the *last* message on a topic and hands
+  it to anyone who subscribes later. "What is the current temperature?" without
+  waiting for the next reading. One per topic; publishing an empty payload clears
+  it.
+- **Session** — what the broker remembers about a client between connections: its
+  subscriptions and any messages queued while it was away. A *clean* session
+  forgets everything on disconnect; a *persistent* one does not, which is what
+  makes offline devices work.
+- **Last Will and Testament (LWT)** — a message the client registers at connect
+  time that the broker publishes **if the client dies without saying goodbye**.
+  How you detect a device dropping off, without polling.
+- **Shared subscription** (`$share/<group>/<topic>`) — several subscribers join a
+  named group and the broker gives each message to **exactly one** of them, so
+  work is split rather than duplicated. Ordinary subscriptions give *every*
+  subscriber a copy.
+
+Two things about this broker specifically that surprise people, both explained
+where they matter: a **two-node cluster is worse than one node** for write
+availability ([Resizing](#resizing-the-cluster)), and there is **no admin API or
+dashboard** — operations are signals and files, on purpose
+([Configuration](#configuration)).
+
+**Jump to:** [**Start here**](#start-here) ·
+[Try it in two minutes](#try-it-in-two-minutes) ·
+[New to MQTT?](#new-to-mqtt) · [Glossary](docs/GLOSSARY.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) ·
+[Where it stands](#where-it-stands) · [What works today](#what-works-today) ·
+[Security](#security) · [Clustering](#clustering) ·
+[Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
+[**Limitations**](#limitations) · [Install](#install) ·
+[Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
+[Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
+[Performance](#performance) · [Contributing](#contributing)
+
+## Where it stands
+
+MQTT **3.1.1 and 5.0** are served — over TCP, TLS 1.3, WebSocket
 (`ws://`/`wss://`), and QUIC. The v5 semantics are in place (session/message
 expiry, topic aliases, flow control, shared subscriptions, User Properties,
 enhanced `AUTH`), not just the wire codec. Transport security
 (TLS 1.3 + mutually-authenticated cluster bus), authenticated gossip membership
 with dynamic cross-node routing, and a full identity/authorization stack
-(mTLS-CN / password / JWT → topic ACLs → tamper-evident audit) are in place.
-**Durable, consensus-backed replicated session storage** (openraft lease group +
-epoch-fenced quorum replication) is **on by default** and proven over a real
+([mTLS](docs/GLOSSARY.md#security-and-pki)-CN / password /
+[JWT](docs/GLOSSARY.md#security-and-pki) → topic
+[ACLs](docs/GLOSSARY.md#security-and-pki) → tamper-evident audit) are in place.
+**Durable, consensus-backed replicated session storage** (an
+[openraft](https://github.com/databendlabs/openraft) lease group + epoch-fenced
+quorum replication — the [glossary](docs/GLOSSARY.md#mqttd-clustering-and-durability)
+defines lease, epoch and quorum) is **on by default** and proven over a real
 cluster, with **cross-node takeover** (a replica serves a session after its
 owner dies) and **data-safe elastic resize** (grow, shrink, and rolling
 replacement without losing an acknowledged fact). That covers a QoS 1/2 message
@@ -28,7 +109,8 @@ governance (connection caps, per-client quotas, publish-rate limits, bounded
 queues), and a continuous-assurance program (out-of-process fault/upgrade
 harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
 performance baselines, and two independent foreign-client conformance oracles)
-all ship. **v0.9.0 is released** — signed, reproducible, SBOM-attested — and the
+all ship. **v0.9.0 is released** — signed, reproducible,
+[SBOM](docs/GLOSSARY.md#supply-chain)-attested — and the
 known gaps are listed
 in [**Limitations**](#limitations) rather than left to be discovered — the
 largest are that the total-memory watermark is backpressure rather than a hard
@@ -41,19 +123,9 @@ See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
 record of exactly what is built (60 ADRs, per-task status).
 
-**Jump to:** [**Start here**](#start-here) ·
-[Try it in two minutes](#try-it-in-two-minutes) ·
-[New to MQTT?](#new-to-mqtt) · [Glossary](docs/GLOSSARY.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [What works today](#what-works-today) ·
-[Security](#security) · [Clustering](#clustering) ·
-[Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
-[**Limitations**](#limitations) · [Install](#install) ·
-[Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
-[Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
-[Performance](#performance) · [Contributing](#contributing)
+## The runnable map: mqttui
 
-## Start here
-
-**`mqttui`** is the front door to everything runnable in this repository — the demo
+**`mqttui`** is the map of everything runnable in this repository — the demo
 cluster, the Mosquitto migration converter, the secured quickstarts, the Kubernetes
 examples. It tells you what each task needs *before* it starts, instead of failing five
 minutes in ([ADR 0056](docs/adr/0056-mqttui.md)):
@@ -96,12 +168,10 @@ trust-the-branch download:
 cargo install --locked --git https://github.com/mbilling/fss-mqtt-broker mqttui
 ```
 
-**New to MQTT brokers?** Start with the
-[two-minute single node](#try-it-in-two-minutes), then the
-[five ideas the rest of this file assumes](#new-to-mqtt). When you want to see a real
-cluster, `mqttui --run demo-stack` starts seven nodes with Prometheus and Grafana
-dashboards on `localhost:3000` and a load generator so the panels move — it starts 25
-containers, and `mqttui` warns you before it does.
+Want to see a real cluster with dashboards? `mqttui --run demo-stack` starts seven
+nodes with Prometheus and Grafana dashboards on `localhost:3000` and a load
+generator so the panels move — it starts 25 containers, and `mqttui` warns you
+before it does.
 
 Tasks that need this repository — building it, or the fixtures that will not fit in a
 binary — are marked `-` in the list with the reason, rather than left to fail.
@@ -142,8 +212,9 @@ The full matrix — including every cell we lose — is
   or tighten a grant, and the *already-connected* client is cut — not left
   running until it happens to reconnect. No compared broker documents this.
 - **Clustering is not a paid feature.** Apache-2.0 including signed,
-  reproducible binaries. EMQX has been BSL 1.1 since 5.9 with clustering
-  commercial; VerneMQ's production binaries are EULA-paid.
+  reproducible binaries. EMQX has been BSL 1.1 (the source-available Business
+  Source License) since 5.9 with clustering commercial; VerneMQ's production
+  binaries are EULA-paid.
 - **The claims are checkable.** Every capability maps to a task with evidence in
   the [delivery dashboard](docs/delivery/STATUS.md), the numbers in this file are
   CI-guarded against the tree, and what is *missing* is listed in
@@ -175,61 +246,14 @@ The full matrix — including every cell we lose — is
               sessions, queues and retained state
 ```
 
+Two terms of art in that sketch: **SWIM** (Scalable Weakly-consistent
+Infection-style process-group Membership) is the gossip protocol nodes use to
+discover each other and detect failures, and the durable plane's vocabulary —
+lease, epoch, quorum, replica set — is defined in the
+[glossary](docs/GLOSSARY.md#mqttd-clustering-and-durability).
+
 Crossing into a **different** trust domain is a separate tool with its own
 process and credentials — see [Bridging](#bridging-to-other-security-zones).
-
-## Try it in two minutes
-
-```sh
-docker run -d --name mqttd -p 1883:1883 \
-  -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
-  -e MQTTD_DATA_DIR=/var/lib/mqttd -v mqttd-data:/var/lib/mqttd \
-  ghcr.io/mbilling/fss-mqtt-broker:latest
-
-mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
-mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
-```
-
-That is **plaintext with anonymous clients** — a first look, never a deployment. The
-named volume is what makes it honest: durable sessions are on by default, and durable-on
-with no data dir **refuses to start** (issue #240) rather than silently keeping acked
-messages in RAM. (The volume outlives `docker rm -f mqttd`; `docker volume rm mqttd-data`
-removes the state too.)
-The broker says so in its own logs, loudly, every time. When you are ready for
-something real, the [secured quickstart](#single-node-secured-tls-13--mtls--acl)
-stands up TLS 1.3, mutual TLS and a deny-by-default ACL in about the same number
-of commands, and CI runs those exact commands on every push.
-
-## New to MQTT?
-
-Skip this if you already run a broker. If you do not, these five ideas are what
-the rest of this file assumes, and nothing else here explains them.
-
-- **QoS 0 / 1 / 2** — how hard the broker tries to deliver. **0** is fire and
-  forget (fastest, may be lost). **1** is at-least-once (may arrive twice; the
-  usual choice). **2** is exactly-once (slowest, a four-packet handshake). You
-  pick per message, and the subscriber's subscription can only lower it.
-- **Retained message** — the broker keeps the *last* message on a topic and hands
-  it to anyone who subscribes later. "What is the current temperature?" without
-  waiting for the next reading. One per topic; publishing an empty payload clears
-  it.
-- **Session** — what the broker remembers about a client between connections: its
-  subscriptions and any messages queued while it was away. A *clean* session
-  forgets everything on disconnect; a *persistent* one does not, which is what
-  makes offline devices work.
-- **Last Will and Testament (LWT)** — a message the client registers at connect
-  time that the broker publishes **if the client dies without saying goodbye**.
-  How you detect a device dropping off, without polling.
-- **Shared subscription** (`$share/<group>/<topic>`) — several subscribers join a
-  named group and the broker gives each message to **exactly one** of them, so
-  work is split rather than duplicated. Ordinary subscriptions give *every*
-  subscriber a copy.
-
-Two things about this broker specifically that surprise people, both explained
-where they matter: a **two-node cluster is worse than one node** for write
-availability ([Resizing](#resizing-the-cluster)), and there is **no admin API or
-dashboard** — operations are signals and files, on purpose
-([Configuration](#configuration)).
 
 ## What works today
 
@@ -285,11 +309,13 @@ Both protocol versions round-trip against two independent foreign clients
   the whole build, [ADR 0053](docs/adr/0053-single-crypto-provider-aws-lc-rs.md)), optional
   per-listener client-certificate mTLS, **fleet-sized session resumption**
   (32k-entry cache by default, 24 h ceiling, `session_cache` to size or disable),
-  and a **hardened TLS 1.2 opt-in** for legacy fleets (strict ECDHE+AEAD
-  allowlist, Extended Master Secret required; see
+  and a **hardened TLS 1.2 opt-in** for legacy fleets (a strict ECDHE+AEAD —
+  forward-secret, authenticated-encryption-only — allowlist, Extended Master
+  Secret required; see
   [Limitations](#limitations)) — [ADR 0002](docs/adr/0002-transport-security.md).
   Server and client certificates: **ECDSA P-256** (what the test suite runs end
-  to end, including mTLS and CRL revocation) and RSA ≥ 2048. Also native
+  to end, including mTLS and [CRL](docs/GLOSSARY.md#security-and-pki)
+  (certificate-revocation-list) revocation) and RSA ≥ 2048. Also native
   **MQTT-over-WebSocket** (`ws://` / `wss://`, the latter sharing the same TLS 1.3 + mTLS),
   so browsers are first-class clients — [ADR 0035](docs/adr/0035-websocket-transport.md) —
   and **MQTT-over-QUIC** (UDP; TLS 1.3 + mTLS; **multi-stream** — one session across many QUIC
@@ -298,7 +324,7 @@ Both protocol versions round-trip against two independent foreign clients
   peer's node id is bound to its certificate Common Name
   ([ADR 0004](docs/adr/0004-identity-and-authentication.md)).
 - **Authenticated SWIM gossip**: every membership datagram carries an
-  HMAC-SHA256 tag under a cluster-shared key
+  [HMAC](docs/GLOSSARY.md#security-and-pki)-SHA256 tag under a cluster-shared key
   ([ADR 0003](docs/adr/0003-gossip-authentication.md)).
 - **Identity & authentication**: identity from the mTLS certificate CN; a
   deny-by-default CONNECT gate; pluggable Argon2id password, **remote HTTP
@@ -340,7 +366,8 @@ Both protocol versions round-trip against two independent foreign clients
   mTLS peer links automatically — no static peer list required.
 - **Interest-based routing**: a publish fans out only to peers whose gossiped
   subscription interest matches the topic.
-- **Session placement** (HRW rendezvous over live membership): every persistent
+- **Session placement** ([HRW](docs/GLOSSARY.md#mqttd-clustering-and-durability) —
+  Highest Random Weight, "rendezvous" hashing — over live membership): every persistent
   session has a deterministic owner node, and ownership rebalances minimally as
   the cluster changes ([ADR 0001](docs/adr/0001-session-durability.md)).
 - **Session relocation** ([ADR 0005](docs/adr/0005-session-affinity.md)): a
@@ -380,7 +407,10 @@ Both protocol versions round-trip against two independent foreign clients
   acknowledged write is ever silently discarded. Subscribe-time replay stays a local
   read; caches are warmed by the owner's post-commit fan-out and healed by
   token-aware back-fill on link-up (committed clears propagate as tombstones). The
-  **CP trade, explicitly**: during a partition the quorum-less side serves the last
+  **CP trade, explicitly** (in
+  [CAP terms](docs/GLOSSARY.md#mqttd-clustering-and-durability): consistency kept,
+  availability of new writes given up during a partition): during a partition the
+  quorum-less side serves the last
   *committed* value (staleness, never divergence) while its own retained writes
   **queue until heal** — bounded per node (1024), oldest dropped loudly
   (`retained_queue_dropped_total`) if the partition outlasts the queue. With durable
@@ -539,8 +569,11 @@ error? the [troubleshooting guide](docs/TROUBLESHOOTING.md).
   v3.1.1 fleet a misconfigured ACL looks like "missing data", not an error. The audit log
   is where every denial is visible, in both versions.
 - [ ] **Check your fleet's TLS and certificates.** TLS 1.3 is the default (1.2 is a
-  hardened opt-in), and client certificates **must** carry the `clientAuth` EKU or rustls
-  rejects them — a trap for fleets minted against OpenSSL brokers.
+  hardened opt-in), and client certificates **must** carry the `clientAuth` EKU
+  (Extended Key Usage — an X.509 field naming what a certificate may be used for) or
+  rustls rejects them — a trap for fleets minted against OpenSSL brokers. What that
+  looks like and how to check a certificate:
+  [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#a-client-with-a-certificate-is-rejected-mtls).
 - [ ] **Run ≥3 nodes for HA, never 2.** A two-node durable cluster has *worse* write
   availability than one node (write quorum is 2-of-2). Go from 1 to 3.
 
@@ -636,10 +669,12 @@ be found. Each is tracked; none is a silent surprise.
 - **Some auth and revocation mechanisms are deferred, by choice.** The MQTT 5
   enhanced-authentication (AUTH) framework is in place and an HMAC challenge
   example ships, but **SCRAM is not yet implemented**. Certificate revocation is
-  by **CRL** — hot-reloadable, enforced on both the client listener and the
-  cluster bus — with **OCSP not yet supported**. **PSK cipher suites** for
-  constrained devices are not offered: X.509 or token (JWT/OIDC) authentication
-  is the path today. Each is a planned fast-follow, not a design limit.
+  by **CRL** (a certificate-revocation *list* the operator publishes) —
+  hot-reloadable, enforced on both the client listener and the cluster bus — with
+  **OCSP** (the Online Certificate Status Protocol, revocation checked per
+  handshake against a responder) **not yet supported**. **PSK** (pre-shared-key)
+  **cipher suites** for constrained devices are not offered: X.509 or token
+  (JWT/OIDC) authentication is the path today. Each is a planned fast-follow, not a design limit.
 - **No production track record.** `v0.9.0` is released and verifiable, but nobody
   is running this in anger yet — there is no operational history behind it.
 
@@ -728,8 +763,9 @@ build provenance**, and ships with a **CycloneDX SBOM**. Full cut/verify runbook
 [RELEASING.md](RELEASING.md).
 
 ```sh
-# Container image — fully-static musl binary on distroless/static, non-root,
-# multi-arch (linux/amd64 + linux/arm64), nothing but the broker and a CA bundle:
+# Container image — fully-static musl binary on distroless/static (a base image
+# with no shell or package manager), non-root, multi-arch (linux/amd64 +
+# linux/arm64), nothing but the broker and a CA bundle:
 docker run --rm -e MQTTD_DATA_DIR=/var/lib/mqttd \
   ghcr.io/mbilling/fss-mqtt-broker:latest --check-config
 # → config OK: env overlay validates. (BARE defaults now REFUSE — durable-on needs a
@@ -968,7 +1004,7 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | `MQTTD_DURABLE_SESSIONS` | Durable, consensus-backed replicated session store (ADR 0006/0007) — **on by default** (ADR 0029); set `0`/`false`/`off`/`no` for the lightweight in-memory store (an explicit choice: it needs no ephemeral opt-in). A node with no `MQTTD_SWIM_SEEDS` founds the lease group. On with no `MQTTD_DATA_DIR` → **REFUSED at startup** (issue #240) unless `MQTTD_ALLOW_EPHEMERAL_DURABILITY` is set |
 | `MQTTD_DATA_DIR` | Directory for on-disk persistence (ADR 0018). With durable on (default) the lease group + replicated log are on-disk, surviving a full-cluster restart (recommended for production); **unset with durable on → REFUSED at startup** (issue #240) unless the ephemeral opt-in below is set. With durable off, unset is plain in-memory |
 | `MQTTD_ALLOW_EPHEMERAL_DURABILITY` | **Dev/tests only** (issue #240): any non-empty value (presence = on) permits durable-on with **no** data dir — replicated state in MEMORY only, so a correlated quorum restart loses acked messages. Without it that combination refuses to start (and fails `--check-config` and a live reload), naming both remedies. Loudly `EPHEMERAL durability`-warned on every start while active |
-| `MQTTD_LEASE_VOTERS` | Bounded lease-consensus voter set `N` (ADR 0021; default `5`, recommend odd). At most `N` members vote on lease ownership; every other member joins as a learner that still receives the lease log and can own/serve sessions — so consensus cost stays fixed (quorum `⌊N/2⌋+1`) as the cluster grows. `1` = no fault tolerance, `3` tolerates one voter loss, `5` two |
+| `MQTTD_LEASE_VOTERS` | Bounded lease-consensus [voter](docs/GLOSSARY.md#mqttd-clustering-and-durability) set `N` (ADR 0021; default `5`, recommend odd). At most `N` members vote on lease ownership; every other member joins as a learner that still receives the lease log and can own/serve sessions — so consensus cost stays fixed (quorum `⌊N/2⌋+1`) as the cluster grows. `1` = no fault tolerance, `3` tolerates one voter loss, `5` two |
 | `MQTTD_MIN_REPLICAS` | Min-replicas write floor (issues #167/#239; default `majority`). Replica sets shrink with membership — `min(R, alive)` — so without a floor a shrinking cluster silently trades the configured durability for availability, down to quorum-of-1. A group below the floor **refuses** durable writes instead (QoS≥1 acks withheld so sources redeliver, retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not). `majority` derives the floor from the members this node knows about — the quorum-committed durable roster (authoritative), falling back to the largest membership it has ever observed only before a roster exists, bounded below by `MQTTD_READY_MIN_MEMBERS` — capped at R: **no floor at all** while it has never known a peer (single-node stays fully operational) and **2** in a 3-node cluster, which the write quorum already needs. An integer sets an absolute floor; `1` disables it and accepts single-copy acks. Above R = rejected at startup (and by `--check-config`) |
 | `MQTTD_FAILURE_DOMAIN` | This node's own failure-domain label (ADR 0016 T5), e.g. `rack-a`. Advertised over the authenticated SWIM gossip so the topology **self-assembles** — the bounded voter set spreads across racks/zones (losing a whole domain can't take quorum) with each node setting only its own label. The preferred mechanism. Unset → this node is unlabelled unless a peer/static map supplies one. If the cluster-bus cert **attests** a label (ADR 0016 T6), the cert wins: this value must match it (or peers reject this node's gossip) and may be omitted |
 | `MQTTD_FAILURE_DOMAINS` | Static failure-domain topology (ADR 0016 T4): `node-id=domain` pairs (e.g. `n1=rack-a,n2=rack-a,n3=rack-b`). A cluster-uniform seed/fallback; per-node gossip labels (`MQTTD_FAILURE_DOMAIN`) override it. Unset → no static spread (id-ordered selection unless labels are gossiped) |
@@ -1160,7 +1196,9 @@ Naming those Secrets is all that is needed: the chart derives the paths the brok
 (`MQTTD_PEER_TLS_*` — each pod's **own** leaf — and `MQTTD_SWIM_KEY_FILE`) from the names, so
 material that is mounted is always material that is used.
 
-- **Per-pod PersistentVolume** (`volumeClaimTemplate`) for the redb data dir — a rescheduled pod
+- **Per-pod PersistentVolume** (`volumeClaimTemplate`) for the
+  [redb](https://github.com/cberner/redb) data dir (redb is the embedded,
+  pure-Rust key-value store the broker persists into) — a rescheduled pod
   reattaches its volume and recovers durable state, never the ephemeral-storage data-loss trap.
 - **Self-forming mesh:** pod-0 founds the lease group; pods 1..N seed to it over the headless
   Service. Node id = the stable pod name. (An init container renders the per-pod config, since the
@@ -1186,7 +1224,7 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 There are 28 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
 conformance suites, the Kubernetes end-to-end runs, the benchmark harness. `mqttui` is the
 one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and
-[Start here](#start-here) for installing it):
+[The runnable map: mqttui](#the-runnable-map-mqttui) for installing it):
 
 ```sh
 mqttui --list                 # every task, and what `-` / `!` mean
