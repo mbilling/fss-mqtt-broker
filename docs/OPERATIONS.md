@@ -10,7 +10,8 @@ and files are the control surface — there is deliberately no admin API
 ## Certificate / ACL / CRL rotation — automatic
 
 The chart sets `[runtime] config_watch_secs = 30`: the broker polls the mounted policy
-files (TLS cert/key/client-CA, ACL, CRLs, password/JWT files — [ADR 0033](adr/0033-config-file-watch-reload.md))
+files (TLS cert/key/client-CA, ACL, CRLs, password/JWT files, and the cluster-bus
+CA/cert/key — [ADR 0033](adr/0033-config-file-watch-reload.md))
 and reloads through the validate-before-swap path when any changes on disk.
 
 **Procedure:** update the Secret/ConfigMap (or let cert-manager renew it). The kubelet
@@ -70,14 +71,19 @@ peerTls Secret is set → the paths are not reaching the broker (the chart deriv
 hand-rolled `extraEnv` override may be shadowing them). A pod stuck in `Init:Error` whose
 init container says `no cluster-bus certificate for <pod>` → see Scaling, below.
 
-**Rotation needs a rolling restart** (`kubectl rollout restart statefulset/<name>`, or a
-per-host service restart on bare metal). The peer-bus CA/cert/key are **not** in the broker's
-file-watch scope, and the per-node gossip signing key — the same key file — is read once at
-startup and not rebuilt even by SIGHUP; a re-mounted leaf keeps signing gossip with the old
-key, which still chain-verifies against the unchanged CA, so nothing fails until the OLD
-cert's expiry — long after the rotation that caused it. Roll the pods when you rotate.
-The one hot piece is revocation: a revoked peer's established link is torn down when the
-cluster CRL (`MQTTD_PEER_TLS_CRL`) lands — the CRL *is* file-watched.
+**Rotation is hot** (issue #269): the peer-bus CA/cert/key are in the broker's file-watch
+scope, and the per-node gossip signing identity — the same key file — is rebuilt in the
+same validate-before-swap reload. Replace the files (or let cert-manager renew them) and,
+within a watch tick, the rotated leaf is served on the next peer handshake **and** signs
+(and is embedded in) the next outgoing gossip datagram. Mid-rotation is safe one node at a
+time: verification is per-datagram against the CA, so an already-rotated node and a
+not-yet-rotated one accept each other's gossip. `SIGHUP` triggers the same reload where the
+watcher is off; a rolling restart still works and remains the recovery path if a node's
+mounted material is wrong. Revocation is hot too: a revoked peer's established link is torn
+down when the cluster CRL (`MQTTD_PEER_TLS_CRL`) lands. Note the *shared gossip HMAC key*
+(`swim.key_file`) is a different procedure — see the next section; and rotating the **CA
+itself** is not hot (the gossip verifier pins the startup CA): plan a rolling restart for a
+CA change.
 
 ## SWIM gossip key rotation — three config rolls (manual by design)
 

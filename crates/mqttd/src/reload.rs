@@ -64,6 +64,13 @@ pub type ClientCrlBuildResult = Result<RevocationList, String>;
 /// string that aborts the swap.
 pub type PeerTlsBuildResult = Result<(TlsAcceptor, tokio_rustls::TlsConnector), String>;
 
+/// What a gossip-signer `build` closure returns (issue #269): a freshly-built signer over
+/// the re-read peer-bus leaf certificate + key, or an error string that aborts the swap.
+/// Swapped into the live [`SignerSlot`](mqtt_cluster::swim_auth::SignerSlot) the SWIM
+/// driver reads per datagram, so a rotated leaf signs — and is embedded in — the next
+/// outgoing gossip datagram.
+pub type GossipSignerBuildResult = Result<Arc<dyn mqtt_cluster::swim_auth::GossipSign>, String>;
+
 /// Whole-config hot reload (ADR 0046 T4). When a [`ConfigSource`] is attached, every
 /// [`Reloader::reload`] first re-loads the config file (defaults < file < `MQTTD_*` env),
 /// validates it, and swaps it into the shared `live` cell **before** the policy is rebuilt —
@@ -186,6 +193,12 @@ pub struct Reloader {
         watch::Sender<tokio_rustls::TlsConnector>,
     )>,
     peer_tls_build: Option<Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>>,
+    /// Set by [`attach_gossip_signer`](Self::attach_gossip_signer) (issue #269): the SWIM
+    /// driver's live signing identity, rebuilt from the re-read peer-bus leaf + key and
+    /// swapped in the same atomic reload — a rotated leaf is embedded in the next
+    /// outgoing gossip datagram instead of surviving as a startup snapshot.
+    gossip_signer: Option<Arc<mqtt_cluster::swim_auth::SignerSlot>>,
+    gossip_signer_build: Option<Box<dyn Fn() -> GossipSignerBuildResult + Send + Sync>>,
     /// Set by [`attach_config_source`](Self::attach_config_source) (ADR 0046 T4): the whole
     /// config is re-loaded, validated, and swapped ahead of the policy rebuild.
     config_source: Option<ConfigSource>,
@@ -235,6 +248,8 @@ impl Reloader {
                 client_crl_build: None,
                 peer_tls: None,
                 peer_tls_build: None,
+                gossip_signer: None,
+                gossip_signer_build: None,
                 config_source: None,
             },
             Handles {
@@ -314,6 +329,22 @@ impl Reloader {
         self.peer_tls_build = Some(build);
     }
 
+    /// Register the SWIM gossip signing identity for reload (issue #269, the second half
+    /// of hot peer-bus rotation): `build` re-reads the peer-bus leaf certificate + key and
+    /// constructs a fresh signer; on a successful reload it is swapped into `slot` — the
+    /// live cell the SWIM driver reads **per datagram** — so the rotated leaf signs, and
+    /// is embedded in, the very next outgoing gossip datagram. Folded into the same
+    /// atomic validate-before-swap reload: a bad leaf/key rejects the whole reload and
+    /// the running signer (like every other policy object) stays in force.
+    pub fn attach_gossip_signer(
+        &mut self,
+        slot: Arc<mqtt_cluster::swim_auth::SignerSlot>,
+        build: impl Fn() -> GossipSignerBuildResult + Send + Sync + 'static,
+    ) {
+        self.gossip_signer = Some(slot);
+        self.gossip_signer_build = Some(Box::new(build));
+    }
+
     /// Register the whole-config source for reload (ADR 0046 T4): each [`reload`](Self::reload)
     /// re-loads the config file, validates it, and swaps it into the shared `live` cell before
     /// the policy is rebuilt — so a config-file edit (a new ACL path, a changed quota) takes
@@ -374,6 +405,7 @@ impl Reloader {
         let crl = self.swim_crl_build.as_ref().map(|b| b());
         let client_crl = self.client_crl_build.as_ref().map(|b| b());
         let peer_tls = self.peer_tls_build.as_ref().map(|b| b());
+        let gossip_signer = self.gossip_signer_build.as_ref().map(|b| b());
         // A configured TLS or CRL build failed: reject the whole reload, swap nothing.
         if let Some(Err(e)) = &tls {
             rollback();
@@ -390,6 +422,10 @@ impl Reloader {
         if let Some(Err(e)) = &peer_tls {
             rollback();
             return self.reject(trigger, &format!("peer tls: {e}"));
+        }
+        if let Some(Err(e)) = &gossip_signer {
+            rollback();
+            return self.reject(trigger, &format!("gossip signer: {e}"));
         }
         match policy {
             // The ACL/authenticator build failed: reject, swap nothing.
@@ -415,6 +451,11 @@ impl Reloader {
                 {
                     let _ = acc_tx.send(acceptor);
                     let _ = conn_tx.send(connector);
+                }
+                // Gossip signing identity (issue #269): the SWIM driver reads the slot
+                // per datagram, so the rotated leaf is embedded on the next send.
+                if let (Some(slot), Some(Ok(signer))) = (&self.gossip_signer, gossip_signer) {
+                    slot.swap(signer);
                 }
                 // Revocation reaches live state (ADR 0040 T2/T3/T4): the hub
                 // re-evaluates every online session, subscription grant, and peer
@@ -588,6 +629,93 @@ mod tests {
             "a rejected reload must swap nothing"
         );
         drop(handles);
+    }
+
+    /// A stand-in gossip signer whose "certificate" is a recognizable byte string, so a
+    /// sealed datagram can be checked for which cert it embeds (issue #269).
+    struct TestSigner {
+        cert: Vec<u8>,
+    }
+    impl mqtt_cluster::swim_auth::GossipSign for TestSigner {
+        fn cert_der(&self) -> &[u8] {
+            &self.cert
+        }
+        fn sign(&self, _payload: &[u8]) -> Vec<u8> {
+            vec![0xAB]
+        }
+    }
+    struct NoVerify;
+    impl mqtt_cluster::swim_auth::GossipVerify for NoVerify {
+        fn verify(
+            &self,
+            _cert_der: &[u8],
+            _payload: &[u8],
+            _sig: &[u8],
+        ) -> Result<mqtt_cluster::swim_auth::VerifiedIdentity, mqtt_cluster::swim_auth::OpenReject>
+        {
+            Err(mqtt_cluster::swim_auth::OpenReject::Auth)
+        }
+    }
+
+    fn embeds(datagram: &[u8], cert: &[u8]) -> bool {
+        datagram.windows(cert.len()).any(|w| w == cert)
+    }
+
+    /// Issue #269: a successful reload rebuilds the gossip signer from the (re-read)
+    /// peer-bus leaf + key and swaps it into the live slot — the next sealed datagram
+    /// embeds the NEW certificate. A failing signer build rejects the WHOLE reload
+    /// (validate-before-swap): the slot keeps the running signer and nothing else swaps.
+    #[test]
+    fn a_reload_swaps_the_gossip_signer_and_a_bad_build_rejects_everything() {
+        use mqtt_cluster::swim_auth::{GossipSign, SwimAuth, KEY_LEN};
+
+        let auth_ctx = SwimAuth::new(&[7; KEY_LEN]).with_signing(
+            Arc::new(TestSigner {
+                cert: b"cert-OLD".to_vec(),
+            }),
+            Arc::new(NoVerify),
+        );
+        let slot = auth_ctx.signer_slot().expect("signed posture has a slot");
+        assert!(embeds(&auth_ctx.seal(b"x", true), b"cert-OLD"));
+
+        // Success: the freshly-built signer is live on the very next datagram.
+        let (mut reloader, _h) = Reloader::new(ok_auth_pair().unwrap(), audit(), ok_auth_pair);
+        reloader.attach_gossip_signer(slot.clone(), || {
+            Ok(Arc::new(TestSigner {
+                cert: b"cert-NEW".to_vec(),
+            }) as Arc<dyn GossipSign>)
+        });
+        assert!(reloader.reload("signal"));
+        assert!(
+            embeds(&auth_ctx.seal(b"x", true), b"cert-NEW"),
+            "the rotated leaf must be embedded in the next sealed datagram"
+        );
+
+        // Failure: an unreadable leaf/key rejects the whole reload — the signer keeps
+        // running and the ACL/authenticator are not swapped either (all-or-nothing).
+        let (mut reloader, handles) =
+            Reloader::new(ok_auth_pair().unwrap(), audit(), || -> BuildResult {
+                Ok((
+                    Arc::new(DenyAll) as Arc<dyn Authorizer>,
+                    Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                        allow_anonymous: false,
+                    }) as Arc<dyn Authenticator>,
+                ))
+            });
+        reloader.attach_gossip_signer(slot, || Err("peer key: unreadable".into()));
+        assert!(!reloader.reload("signal"), "a bad signer build must reject");
+        assert!(
+            embeds(&auth_ctx.seal(b"x", true), b"cert-NEW"),
+            "a rejected reload must leave the running signer in force"
+        );
+        assert!(
+            handles.authz.borrow().authorize_publish(
+                &id(),
+                &mqtt_core::ClientId("c".into()),
+                &"t".to_string()
+            ),
+            "the authorizer must not swap when the signer build fails (all-or-nothing)"
+        );
     }
 
     /// ADR 0040 T2: a successful reload hands the hub the freshly-published policy

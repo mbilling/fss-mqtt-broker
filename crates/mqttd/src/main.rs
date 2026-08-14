@@ -517,7 +517,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // SWIM gossip membership (opt-in): discovers peers and drives the peer mesh,
-    // replacing the need for a static MQTTD_PEERS list.
+    // replacing the need for a static MQTTD_PEERS list. Takes the reloader so the
+    // gossip signing identity joins the same validate-before-swap reload as the peer
+    // TLS contexts it is derived from (issue #269).
     start_swim(
         &config,
         &node_id,
@@ -531,6 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster_identity.clone(),
         swim_key_fps.clone(),
         foreign_cluster_seen.clone(),
+        &mut reloader,
     )
     .await?;
 
@@ -1121,6 +1124,14 @@ fn watched_policy_paths(config: &Config) -> Vec<std::path::PathBuf> {
         config.tls.key.as_ref(),
         config.tls.client_ca.as_ref(),
         config.tls.crl.as_ref(),
+        // The peer-bus material (issue #269): SIGHUP always rebuilt the TLS contexts, but
+        // these three were missing from the WATCH scope — a re-mounted (rotated) leaf sat
+        // inert until an operator manufactured a signal. Watched, a rotation lands within
+        // a poll tick: TLS contexts on the next peer handshake, and the gossip signing
+        // identity (same key file) on the next outgoing datagram.
+        config.cluster.peer_tls.ca.as_ref(),
+        config.cluster.peer_tls.cert.as_ref(),
+        config.cluster.peer_tls.key.as_ref(),
         config.cluster.peer_tls.crl.as_ref(),
     ]
     .into_iter()
@@ -2001,6 +2012,9 @@ async fn start_swim(
     // Set on the first FOREIGN-cluster datagram — the evidence the re-found
     // self-quarantine keys on (issue #92 follow-up).
     foreign_cluster_seen: Arc<std::sync::atomic::AtomicBool>,
+    // Attached when signed gossip is on (issue #269): the signing identity is rebuilt
+    // from the re-read leaf/key in the same atomic reload as the peer TLS contexts.
+    reloader: &mut reload::Reloader,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(bind) = config.cluster.swim.bind.clone() else {
         return Ok(());
@@ -2077,6 +2091,34 @@ async fn start_swim(
     let signed = signed_gossip_from_config(config, peer_tls.is_some(), auth.is_some())?;
     let auth = apply_signed_gossip(auth, peer_tls, signed)?;
     let (auth, seq_alloc) = apply_anti_replay(config, auth, signed)?;
+    // Hot rotation of the gossip signing identity (issue #269): the signer was a startup
+    // snapshot — after a leaf rotation the node kept signing with the OLD key and
+    // embedding the OLD cert, which still chain-verified against the unchanged CA, so
+    // nothing failed until the old cert's notAfter (up to LEAF_DAYS later) with no
+    // correlating change to point at. The driver now reads a swappable slot per datagram;
+    // the reloader rebuilds the signer from the re-read leaf + key in the same
+    // validate-before-swap reload that rotates the peer TLS contexts.
+    if let Some(slot) = auth.as_ref().and_then(SwimAuth::signer_slot) {
+        if let (Some(cert), Some(key)) = (
+            config.cluster.peer_tls.cert.clone(),
+            config.cluster.peer_tls.key.clone(),
+        ) {
+            reloader.attach_gossip_signer(slot, move || {
+                let cert_der = tls::first_cert_der(Path::new(&cert))
+                    .map_err(|e| format!("peer cert {cert}: {e}"))?;
+                let key_der = tls::private_key_der(Path::new(&key))
+                    .map_err(|e| format!("peer key {key}: {e}"))?;
+                let gossip_signer =
+                    mqtt_auth::signed_gossip::GossipSigner::from_pkcs8_der(&key_der)
+                        .map_err(|e| format!("gossip signing key {key}: {e}"))?;
+                Ok(Arc::new(NodeGossipSigner {
+                    cert_der,
+                    signer: gossip_signer,
+                })
+                    as Arc<dyn mqtt_cluster::swim_auth::GossipSign>)
+            });
+        }
+    }
     let socket = UdpSocket::bind(&bind).await?;
     let seeds: Vec<String> = config.cluster.swim.seeds.clone();
     info!(%bind, seeds = seeds.len(), authenticated = auth.is_some(), "starting SWIM gossip membership");
@@ -3361,10 +3403,36 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::{
         identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
-        resolve_write_floor, runtime_precheck, unknown_flags, wire_limits_from_config, WriteFloor,
+        resolve_write_floor, runtime_precheck, unknown_flags, watched_policy_paths,
+        wire_limits_from_config, WriteFloor,
     };
     use mqtt_config::{Config, MinReplicas};
     use mqtt_storage::OverflowPolicy;
+
+    /// Issue #269: the peer-bus CA/cert/key are IN the file-watch scope. Before this,
+    /// only the peer CRL was watched — with a full bus configured, a rotated leaf sat
+    /// inert on disk (and with nothing else configured the watcher logged itself idle)
+    /// until an operator manufactured a SIGHUP.
+    #[test]
+    fn the_peer_bus_tls_material_is_file_watched() {
+        let mut config = Config::default();
+        config.cluster.peer_tls.ca = Some("/pki/ca.crt".into());
+        config.cluster.peer_tls.cert = Some("/pki/node.crt".into());
+        config.cluster.peer_tls.key = Some("/pki/node.key".into());
+        config.cluster.peer_tls.crl = Some("/pki/bus.crl".into());
+        let paths = watched_policy_paths(&config);
+        for p in [
+            "/pki/ca.crt",
+            "/pki/node.crt",
+            "/pki/node.key",
+            "/pki/bus.crl",
+        ] {
+            assert!(
+                paths.contains(&std::path::PathBuf::from(p)),
+                "{p} must be in the watch scope (got {paths:?})"
+            );
+        }
+    }
 
     /// #169 self-guard: every double-dash flag this source compares against must be in
     /// `KNOWN_FLAGS`, or the strict-rejection check would refuse a flag the code accepts.

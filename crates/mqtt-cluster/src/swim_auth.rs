@@ -12,7 +12,7 @@
 use aws_lc_rs::{digest, hmac};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// Shared-key-only datagram (ADR 0003): `[1][tag][payload]`.
 const VERSION_V1: u8 = 1;
@@ -70,6 +70,54 @@ pub trait GossipSign: Send + Sync {
     fn cert_der(&self) -> &[u8];
     /// A signature over `payload` with this node's private key.
     fn sign(&self, payload: &[u8]) -> Vec<u8>;
+}
+
+/// The hot-swappable signing identity (issue #269): the current [`GossipSign`] with its
+/// precomputed certificate fingerprint, plus the outgoing-datagram counter that paces the
+/// periodic full-cert refresh (0022-T6). [`SwimAuth`] reads the current value **per sealed
+/// datagram**, and the broker's security reloader swaps a freshly-built signer in on a
+/// reload ([`swap`](Self::swap)) — so a rotated leaf certificate signs, and is embedded in,
+/// the very next outgoing datagram without a restart. Before this existed the signer was a
+/// startup snapshot: a rotated node kept signing with the old key until its old cert's
+/// `notAfter`, with no correlating change to point at.
+pub struct SignerSlot {
+    /// The signer and its cert's SHA-256 fingerprint, always swapped together so a
+    /// fingerprint-form datagram never references a cert other than the one that signed it.
+    cell: RwLock<(Arc<dyn GossipSign>, [u8; FP_LEN])>,
+    /// Outgoing-datagram counter driving the periodic full-cert refresh (0022-T6).
+    sends: AtomicU64,
+}
+
+impl SignerSlot {
+    fn new(signer: Arc<dyn GossipSign>) -> Self {
+        let fp = fingerprint(signer.cert_der());
+        Self {
+            cell: RwLock::new((signer, fp)),
+            sends: AtomicU64::new(0),
+        }
+    }
+
+    /// Swap in a freshly-built signer (a rotated leaf + key). The send counter is reset so
+    /// the **next** datagram carries the full new certificate — peers are primed with the
+    /// rotated leaf before any fingerprint-only reference to it, instead of paying up to
+    /// [`FULL_CERT_EVERY`] recoverable `cert-miss` drops.
+    pub fn swap(&self, signer: Arc<dyn GossipSign>) {
+        let fp = fingerprint(signer.cert_der());
+        *self.cell.write().unwrap_or_else(PoisonError::into_inner) = (signer, fp);
+        self.sends.store(0, Ordering::Relaxed);
+    }
+
+    /// The current signer + fingerprint, cloned out so sealing never holds the lock.
+    fn current(&self) -> (Arc<dyn GossipSign>, [u8; FP_LEN]) {
+        let cell = self.cell.read().unwrap_or_else(PoisonError::into_inner);
+        (cell.0.clone(), cell.1)
+    }
+}
+
+impl std::fmt::Debug for SignerSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerSlot").finish_non_exhaustive()
+    }
 }
 
 /// Why an inbound datagram was rejected — a **bounded** reason set the driver feeds its
@@ -171,18 +219,15 @@ pub struct SwimAuth {
     /// material: safe on the unauthenticated ops surface.
     key_fps: Vec<String>,
     /// When set, this node signs outgoing datagrams (v2/v3) and **requires** a verified
-    /// signature on every incoming one — an unsigned (v1) datagram is rejected.
-    signer: Option<Arc<dyn GossipSign>>,
+    /// signature on every incoming one — an unsigned (v1) datagram is rejected. The slot
+    /// holds the signer + its fingerprint + the full-cert send cadence, read per datagram
+    /// and hot-swappable on a security reload (issue #269).
+    signer: Option<Arc<SignerSlot>>,
     /// Verifies the inline certificate + signature on an incoming signed datagram.
     verifier: Option<Arc<dyn GossipVerify>>,
     /// When true (implies `signer` is set), this node is in the anti-replay posture: it
     /// sequences its outgoing datagrams (v3) and accepts **only** v3 (ADR 0023).
     sequenced: bool,
-    /// This node's certificate fingerprint, precomputed at
-    /// [`with_signing`](Self::with_signing) (0022-T6).
-    own_fp: Option<[u8; FP_LEN]>,
-    /// Outgoing-datagram counter driving the periodic full-cert refresh (0022-T6).
-    sends: AtomicU64,
     /// Verified peer certificates by fingerprint (0022-T6). Only certificates from
     /// datagrams that passed the **full** verification (chain, validity, revocation,
     /// signature) are inserted, so a key-holder cannot stuff the cache with garbage.
@@ -211,8 +256,6 @@ impl SwimAuth {
             signer: None,
             verifier: None,
             sequenced: false,
-            own_fp: None,
-            sends: AtomicU64::new(0),
             cert_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -270,10 +313,18 @@ impl SwimAuth {
         signer: Arc<dyn GossipSign>,
         verifier: Arc<dyn GossipVerify>,
     ) -> Self {
-        self.own_fp = Some(fingerprint(signer.cert_der()));
-        self.signer = Some(signer);
+        self.signer = Some(Arc::new(SignerSlot::new(signer)));
         self.verifier = Some(verifier);
         self
+    }
+
+    /// The hot-swap handle for this node's signing identity (issue #269), or `None` in the
+    /// unsigned posture. The broker's security reloader holds a clone and
+    /// [`SignerSlot::swap`]s a freshly-built signer in when the peer-bus leaf/key rotate
+    /// on disk — the next sealed datagram signs with, and embeds, the new certificate.
+    #[must_use]
+    pub fn signer_slot(&self) -> Option<Arc<SignerSlot>> {
+        self.signer.clone()
     }
 
     /// Add the anti-replay layer (ADR 0023): sequence outgoing datagrams (v3) and require a
@@ -310,13 +361,17 @@ impl SwimAuth {
     /// far beyond any real certificate, so this is a provisioning invariant, not input.
     #[must_use]
     pub fn seal(&self, payload: &[u8], prime: bool) -> Vec<u8> {
-        let Some(signer) = &self.signer else {
+        let Some(slot) = &self.signer else {
             return self.frame(VERSION_V1, payload);
         };
+        // One read of the slot per datagram (issue #269): the signature and the cert-ref
+        // always come from the SAME signer, so a concurrent rotation can never pair a new
+        // key's signature with the old certificate (or vice versa).
+        let (signer, fp) = slot.current();
         // v2 body: [cert_ref][sig_len][sig][payload], tag computed over the whole body.
         let sig = signer.sign(payload);
         let sig_len = u16::try_from(sig.len()).expect("signature fits u16");
-        let mut body = self.cert_ref(signer.as_ref(), prime);
+        let mut body = Self::cert_ref(slot, signer.as_ref(), &fp, prime);
         body.extend_from_slice(&sig_len.to_be_bytes());
         body.extend_from_slice(&sig);
         body.extend_from_slice(payload);
@@ -333,15 +388,17 @@ impl SwimAuth {
     /// Panics if the certificate or signature exceeds 64 KiB (a `u16` length field).
     #[must_use]
     pub fn seal_sequenced(&self, payload: &[u8], seq: u64, prime: bool) -> Vec<u8> {
-        let Some(signer) = &self.signer else {
+        let Some(slot) = &self.signer else {
             return self.seal(payload, prime);
         };
+        // Same single-read rule as `seal` (issue #269): signature and cert-ref from one signer.
+        let (signer, fp) = slot.current();
         // v3 body: [seq(8)][cert_ref][sig_len][sig][payload].
         let sig = signer.sign(payload);
         let sig_len = u16::try_from(sig.len()).expect("signature fits u16");
         let mut body = Vec::with_capacity(8);
         body.extend_from_slice(&seq.to_be_bytes());
-        body.extend_from_slice(&self.cert_ref(signer.as_ref(), prime));
+        body.extend_from_slice(&Self::cert_ref(slot, signer.as_ref(), &fp, prime));
         body.extend_from_slice(&sig_len.to_be_bytes());
         body.extend_from_slice(&sig);
         body.extend_from_slice(payload);
@@ -350,12 +407,18 @@ impl SwimAuth {
 
     /// The cert-ref field for an outgoing signed datagram (0022-T6): the full leaf
     /// certificate when `prime` is set or on every [`FULL_CERT_EVERY`]th send, else the
-    /// 32-byte SHA-256 fingerprint.
+    /// 32-byte SHA-256 fingerprint. `signer`/`fp` are the pair the caller read from
+    /// `slot` — passed in (not re-read) so they match the signature already computed.
     // `%`-and-compare, not `is_multiple_of`: that method is stable only since
     // Rust 1.87 and the MSRV floor is 1.85 — drop the allow when the floor rises.
     #[allow(clippy::manual_is_multiple_of)]
-    fn cert_ref(&self, signer: &dyn GossipSign, prime: bool) -> Vec<u8> {
-        let nth = self.sends.fetch_add(1, Ordering::Relaxed);
+    fn cert_ref(
+        slot: &SignerSlot,
+        signer: &dyn GossipSign,
+        fp: &[u8; FP_LEN],
+        prime: bool,
+    ) -> Vec<u8> {
+        let nth = slot.sends.fetch_add(1, Ordering::Relaxed);
         if prime || nth % FULL_CERT_EVERY == 0 {
             let cert = signer.cert_der();
             let cert_len = u16::try_from(cert.len()).expect("leaf certificate fits u16");
@@ -365,10 +428,6 @@ impl SwimAuth {
             out.extend_from_slice(cert);
             out
         } else {
-            let fp = self
-                .own_fp
-                .as_ref()
-                .expect("signer set implies fingerprint");
             let mut out = Vec::with_capacity(1 + FP_LEN);
             out.push(CERT_REF_FP);
             out.extend_from_slice(fp);
@@ -1013,6 +1072,103 @@ mod tests {
         let _burn = sender.seal(b"0", false); // counter now off the full slot
         let primed = sender.seal(b"1", true);
         assert_eq!(primed[1 + TAG_LEN], super::CERT_REF_FULL);
+    }
+
+    /// A CA-like verifier for rotation tests (issue #269): accepts any well-signed cert
+    /// and recovers the identity from the cert bytes — like the real chain verifier it
+    /// does not pin one leaf, so an old-leaf datagram and a new-leaf datagram both verify
+    /// mid-rotation (the property that lets a fleet rotate one node at a time).
+    struct AnyCertVerifier;
+    impl GossipVerify for AnyCertVerifier {
+        fn verify(
+            &self,
+            cert_der: &[u8],
+            payload: &[u8],
+            sig: &[u8],
+        ) -> Result<VerifiedIdentity, OpenReject> {
+            let expected: Vec<u8> = [b"SIG:".as_ref(), payload].concat();
+            if sig == expected {
+                Ok(VerifiedIdentity {
+                    cn: String::from_utf8_lossy(cert_der).into_owned(),
+                    failure_domain: None,
+                })
+            } else {
+                Err(OpenReject::Auth)
+            }
+        }
+    }
+
+    fn rotatable_auth(cert: &[u8]) -> SwimAuth {
+        SwimAuth::new(&[7; KEY_LEN]).with_signing(
+            Arc::new(FakeSigner {
+                cert: cert.to_vec(),
+            }),
+            Arc::new(AnyCertVerifier),
+        )
+    }
+
+    /// Issue #269: swapping the signer slot (what the broker's reloader does when the
+    /// peer-bus leaf/key rotate on disk) takes effect on the VERY NEXT datagram — the send
+    /// counter resets so the new certificate rides full-form (peers are primed, not
+    /// cert-missed), the fingerprint reference swaps with it, and a not-yet-rotated peer's
+    /// old-leaf datagram still verifies (mid-rotation coexistence).
+    #[test]
+    fn a_swapped_signer_embeds_and_signs_with_the_new_certificate_immediately() {
+        assert!(
+            auth(7).signer_slot().is_none(),
+            "the unsigned posture has no signer slot"
+        );
+
+        let sender = rotatable_auth(b"leaf-old");
+        let receiver = rotatable_auth(b"leaf-old");
+        // Burn sends so the counter sits mid-cycle: without a swap the next send
+        // would be fingerprint-form.
+        let _burn = sender.seal(b"0", false);
+        let _burn = sender.seal(b"1", false);
+
+        let slot = sender.signer_slot().expect("signed posture has a slot");
+        slot.swap(Arc::new(FakeSigner {
+            cert: b"leaf-new".to_vec(),
+        }));
+
+        // The very next datagram (no priming flag): full-form, embedding the NEW leaf.
+        let sealed = sender.seal(b"rotated", false);
+        assert_eq!(
+            sealed[1 + TAG_LEN],
+            super::CERT_REF_FULL,
+            "the send counter resets on swap — the first post-rotation datagram \
+             must carry the full new certificate"
+        );
+        let opened = receiver.open(&sealed).expect("chain-verifies");
+        assert_eq!(
+            opened.identity.as_deref(),
+            Some("leaf-new"),
+            "the NEW cert must be embedded, not the startup snapshot"
+        );
+
+        // Subsequent fingerprint-form datagrams reference the new cert.
+        let fp_form = sender.seal(b"after", false);
+        assert_eq!(fp_form[1 + TAG_LEN], super::CERT_REF_FP);
+        assert_eq!(
+            receiver
+                .open(&fp_form)
+                .expect("the new cert's fingerprint resolves via the just-primed cache")
+                .identity
+                .as_deref(),
+            Some("leaf-new")
+        );
+
+        // Mid-rotation coexistence: a not-yet-rotated peer's old leaf still verifies.
+        let laggard = rotatable_auth(b"leaf-old");
+        let old_form = laggard.seal(b"laggard", false);
+        assert_eq!(
+            receiver
+                .open(&old_form)
+                .expect("the old leaf still verifies mid-rotation")
+                .identity
+                .as_deref(),
+            Some("leaf-old")
+        );
     }
 
     /// The fingerprint path still runs the FULL verification per datagram: a tampered
