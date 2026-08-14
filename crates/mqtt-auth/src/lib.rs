@@ -1,8 +1,12 @@
 //! Authentication and authorization for the broker.
 //!
 //! Security posture: **deny by default**. Both authentication and authorization
-//! are pluggable via traits so operators can wire mTLS, password, JWT/OIDC, LDAP,
-//! or custom identity providers without forking the broker.
+//! are pluggable via traits. Shipped backends: mTLS identity, the Argon2id password
+//! file, JWT/OIDC, and the remote HTTP auth hook (ADR 0004 T16) — the hook is the
+//! supported path to LDAP-, database-, or OAuth2-backed user stores (one webhook in
+//! front of the backend; no broker integration per backend, and no LDAP module in
+//! this crate). The traits allow a custom in-process provider without forking the
+//! broker, but implementing one is an operator's code, not a shipped feature.
 
 pub mod acl;
 pub mod basic;

@@ -50,8 +50,10 @@ x-broker: &broker
   deploy:
     resources:
       limits:
-        # Sized for a small fleet. Raise deliberately, using docs/SIZING.md — the
-        # broker has no total-memory knob yet, so the container limit IS the bound.
+        # Sized for a small fleet. Raise deliberately, using docs/SIZING.md. The
+        # broker's memory knob (MQTTD_MEMORY_MAX_BYTES) is a brownout WATERMARK,
+        # not a ceiling — crossing it refuses growth, it does not stop RSS rising —
+        # so the container limit is still the hard bound.
         memory: 1g
       reservations:
         memory: 256m

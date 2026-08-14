@@ -77,8 +77,10 @@ openssl s_client -connect 127.0.0.1:8883 -CAfile secrets/ca.pem </dev/null
   cluster can be founded at all, and stays exempt from the majority rule until you raise it
   ("After the first bring-up", below).
   The health ports are published on **loopback only**, because `/metrics` is unauthenticated.
-- **Bounded memory.** `docs/SIZING.md` is explicit that the broker has no total-memory
-  knob yet, so the container limit *is* the bound. It is set, not left open.
+- **Bounded memory.** The broker's memory knob (`MQTTD_MEMORY_MAX_BYTES`) is a brownout
+  *watermark*, not a ceiling — `docs/SIZING.md` is explicit that crossing it degrades the
+  broker to read-mostly rather than stopping RSS — so the container limit is still the
+  hard bound. It is set, not left open.
 
 ## Plaintext, if you really want it (opt-in, insecure)
 
