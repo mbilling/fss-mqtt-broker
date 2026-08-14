@@ -94,7 +94,7 @@ node clusters under kill/partition/upgrade/soak harnesses.
 | TLS stack | rustls on aws-lc-rs, **TLS 1.3 by default**; hardened 1.2 opt-in (ECDHE+AEAD allowlist, EMS required, loudly logged) | OpenSSL | OTP ssl | mbedTLS (1.3 n/v) | OTP ssl |
 | mTLS client certs | ✅ identity from CN/SAN, no-fallback (ADR 0004) | ✅ | ✅ | ✅ | ✅ |
 | Built-in authentication | mTLS + Argon2id passwords + JWT + **OIDC with live JWKS rotation** | password file + dynamic-security plugin | extensive built-ins (DB, JWT, HTTP, LDAP, …) | password file + HTTP auth | files/DB via plugins; no built-in OIDC |
-| Authorization | deny-by-default TOML ACLs, `%i`/`%c`, connect ACL | `acl_file` + dynsec | built-in authz sources | HOCON ACL | `vmq_acl` file / DB plugins |
+| Authorization | deny-by-default TOML ACLs, `%i`/`%c`, connect ACL; a denied MQTT 5 publish is answered `0x87 Not authorized` | `acl_file` + dynsec | built-in authz sources | HOCON ACL | `vmq_acl` file / DB plugins |
 | Policy hot reload | ✅ validate-before-swap, **and the reload sweeps live state** — revoked cert/user/grant evicts running sessions and flows (ADR 0040) | ⚠️ SIGHUP reloads; live eviction not documented | n/v | ⚠️ HTTP `/reload`, subset | ⚠️ live reconfig via CLI; live eviction not documented |
 | Audit trail | ✅ hash-chained, tamper-evident | not documented | n/v | not documented | not documented |
 | Memory safety | Rust, `#![forbid(unsafe_code)]` | C | Erlang/BEAM | C | Erlang/BEAM |

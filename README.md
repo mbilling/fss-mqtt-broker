@@ -530,10 +530,12 @@ error? the [troubleshooting guide](docs/TROUBLESHOOTING.md).
   names the ways out; `MQTTD_ALLOW_EPHEMERAL_DURABILITY=1` is the development/test
   override, loudly warned while active — never production.
 - [ ] **Configure an ACL (`MQTTD_ACL_FILE`).** With none, every authenticated client may
-  publish and subscribe anywhere (logged as INSECURE at startup). And note: **a denied
-  publish is still acknowledged** — the message is dropped after the ACK, so a
-  misconfigured ACL looks like "missing data", not an error. The audit log is where denials
-  are visible.
+  publish and subscribe anywhere (logged as INSECURE at startup). And note the per-version
+  answer to a denied publish: an **MQTT 5** publisher is told `0x87 Not authorized` on the
+  PUBACK/PUBREC (issue #246), but a **v3.1.1** publisher is **still acknowledged** — the
+  message is dropped and the plain ACK stands (3.1.1 has no negative PUBACK), so with a
+  v3.1.1 fleet a misconfigured ACL looks like "missing data", not an error. The audit log
+  is where every denial is visible, in both versions.
 - [ ] **Check your fleet's TLS and certificates.** TLS 1.3 is the default (1.2 is a
   hardened opt-in), and client certificates **must** carry the `clientAuth` EKU or rustls
   rejects them — a trap for fleets minted against OpenSSL brokers.
@@ -863,12 +865,16 @@ mosquitto_sub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
 > nothing arrives. That is exactly what CI asserts, and it fails if the `%i` is
 > dropped from the rule.
 
-> **One behaviour to know before you rely on it:** a *denied publish* is dropped
-> but still **acknowledged** — MQTT 3.1.1 has no negative PUBACK, and withholding
-> the ack would leave a conforming publisher retrying forever. So a publisher
-> cannot tell that it was refused. The denial is recorded in the audit log as
-> `acl.deny.publish`; that, not the client's return code, is where you see it.
-> Denied *subscriptions* are refused visibly, with a per-filter reason code.
+> **One behaviour to know before you rely on it:** what a *denied publish* is told
+> depends on the protocol version. An **MQTT 5** publisher is refused visibly —
+> PUBACK/PUBREC reason `0x87 Not authorized` (issue #246), the connection staying
+> open. An **MQTT 3.1.1** publisher (this quickstart's clients) is dropped but
+> still **acknowledged** — 3.1.1 has no negative PUBACK, and withholding the ack
+> would leave a conforming publisher retrying forever — so it cannot tell that it
+> was refused. In both versions the denial is recorded in the audit log as
+> `acl.deny.publish`; for 3.1.1 that, not the client's return code, is where you
+> see it. Denied *subscriptions* are refused visibly in both versions, with a
+> per-filter reason code.
 
 ### Two-node cluster via gossip discovery (insecure, local testing)
 

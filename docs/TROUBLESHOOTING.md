@@ -38,11 +38,14 @@ CA and cert worked with another broker (e.g. Mosquitto).
 **Symptom:** a client publishes, gets no error (a QoS 1 PUBACK arrives), yet subscribers see
 nothing and there is no obvious failure.
 
-- **A denied publish is acknowledged.** This is correct MQTT behaviour: an ACL denial does
-  not fail the publish, it drops the message after acknowledging it. To a client debugging
-  "missing data" this is invisible. The place to look is the **audit log** — every
-  authorization decision is recorded there. Check the ACL (*allow-covers / deny-overlaps*):
-  a topic the publisher is not granted `write:` on is silently dropped.
+- **A denied v3.1.1 publish is acknowledged; an MQTT 5 one is told `0x87`.** An ACL denial
+  drops the message in both versions, but what the publisher sees differs: MQTT 5 gets
+  PUBACK/PUBREC `0x87 Not authorized` on QoS 1/2 — check the client's reason code first —
+  while MQTT 3.1.1 is acknowledged as success (the protocol has no negative PUBACK), so to
+  a 3.1.1 client debugging "missing data" the denial is invisible. In either version the
+  place denials are recorded is the **audit log** — every authorization decision lands
+  there. Check the ACL (*allow-covers / deny-overlaps*): a topic the publisher is not
+  granted `write:` on is dropped.
 - **No ACL configured is worse, not better:** with no `MQTTD_ACL_FILE` the broker runs
   permissive and logs an INSECURE warning at startup — every client may publish anywhere, so
   a *different* client's data may be landing where you don't expect.
