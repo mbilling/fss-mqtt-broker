@@ -16,11 +16,25 @@ Usage: scripts/check-readme-facts.py
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
+COMPARISON = ROOT / "docs" / "COMPARISON.md"
+
+
+def tracked_files() -> set[str]:
+    """Every path git tracks, repo-relative with forward slashes."""
+    out = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    return {p for p in out.split("\0") if p}
 
 
 def github_anchor(heading: str) -> str:
@@ -109,12 +123,71 @@ def main() -> int:
         if link not in anchors:
             problems.append(f"link to #{link} matches no heading in README.md")
 
+    # --- COMPARISON citations resolve to TRACKED files (issue #253) ------
+    # COMPARISON.md is the document that promises trust-through-checkability, and
+    # it cited `bench/results/results.md` — a path its own .gitignore keeps out of
+    # the repository. A citation of an untracked path is a claim the reader cannot
+    # check, which is the one defect that file must not have. Both citation forms
+    # are held to it: backticked file paths and relative markdown link targets.
+    # Resolution tries the file's own directory (docs/) then the repo root, since
+    # both conventions appear; a directory citation counts if any tracked file
+    # lives under it.
+    tracked = tracked_files()
+    comparison_text = COMPARISON.read_text(encoding="utf-8")
+
+    def resolves_tracked(target: str) -> bool:
+        import posixpath
+
+        for base in ("docs", ""):
+            candidate = posixpath.normpath(posixpath.join(base, target))
+            if candidate in tracked:
+                return True
+            if any(t.startswith(candidate.rstrip("/") + "/") for t in tracked):
+                return True  # a directory with tracked contents
+        return False
+
+    citations = set(
+        re.findall(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_.-]+\.[a-z]{2,4})`", comparison_text)
+    )
+    citations |= {
+        t for t in re.findall(r"\]\(([^)#\s]+)(?:#[^)]*)?\)", comparison_text)
+        if "://" not in t
+    }
+    for target in sorted(citations):
+        if not resolves_tracked(target):
+            problems.append(
+                f"docs/COMPARISON.md cites `{target}`, which is not a tracked file — "
+                "cite a tracked artifact or state that the evidence is unpublished"
+            )
+
+    # --- README's stated COMPARISON date matches the file header ---------
+    # The README quoted a date the comparison's own header contradicted (#253
+    # item 3); both values are mechanical, so the files must agree.
+    header = re.search(r"\*\*Dated (\d{4}-\d{2}-\d{2})\.\*\*", comparison_text)
+    stated = re.search(r"docs/COMPARISON\.md\)\s*\(dated (\d{4}-\d{2}-\d{2})\)", text)
+    if not header:
+        problems.append(
+            "docs/COMPARISON.md's '**Dated YYYY-MM-DD.**' header is gone — restore "
+            "it or update this script"
+        )
+    if not stated:
+        problems.append(
+            "the README's 'docs/COMPARISON.md) (dated YYYY-MM-DD)' phrase is gone — "
+            "restore it or update this script"
+        )
+    if header and stated and header.group(1) != stated.group(1):
+        problems.append(
+            f"README says COMPARISON is dated {stated.group(1)}; the file's own "
+            f"header says {header.group(1)}"
+        )
+
     if problems:
         fail(problems)
 
     print(
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
-        f"{task_count} scripts, {len(anchors)} anchors — all match."
+        f"{task_count} scripts, {len(anchors)} anchors, "
+        f"{len(citations)} COMPARISON citations, dates in sync — all match."
     )
     return 0
 

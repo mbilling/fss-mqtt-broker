@@ -510,7 +510,7 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 
 The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
 and **VerneMQ** — including every cell we lose — is
-[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-11). The one-paragraph
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-13). The one-paragraph
 version:
 
 |  | mqttd's answer |

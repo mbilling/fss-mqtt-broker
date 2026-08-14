@@ -3,7 +3,8 @@
 **Dated 2026-08-13.** Versions compared: **mqttd** `v0.9.0` (released — signed,
 reproducible, SBOM-attested) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
 differ) · **EMQX** 6.2.2 (documentation cells; the benchmark ran 5.8.6, the last
-Apache-licensed line — see `bench/results/results.md`) · **NanoMQ** 0.25.5 ·
+Apache-licensed line — its results are **not yet published in-tree**, and issue #244
+tracks the publishable multi-host run) · **NanoMQ** 0.25.5 ·
 **VerneMQ** 2.1.1.
 
 This document obeys [ADR 0048](adr/0048-comparative-benchmarking.md)'s honesty rules,
@@ -195,6 +196,16 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-08-14 — Drift sweep from the 2026-08-13 panel (issue #253): the header's
+  benchmark citation pointed at a results file under bench/results/ that is not
+  tracked in this repository (that directory is gitignored) — the one document
+  claiming verifiability had a dangling citation;
+  it now says plainly that the results are unpublished and points at issue #244. The
+  2026-08-11 changelog bullet below asserted "v0.9.0 shipped 2026-07-22", which is the
+  **RC** date — the release itself shipped 2026-08-07 (verified against the GitHub
+  release list); corrected in place. `scripts/check-readme-facts.py` now asserts this
+  file's citations resolve to tracked files and that the README's stated date matches
+  this header, so both classes fail CI instead of waiting for the next panel.
 - 2026-08-13 — The subscription-identifiers cell is rewritten (issue #245): it read
   "not delivered (codec-only; tracked)", which was true of the *feature* but omitted that
   the wire actively claimed the opposite — MQTT 5.0 §3.2.2.3.12 makes an absent CONNACK
@@ -203,7 +214,8 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
   ([MQTT-3.3.4-6]). Delivery itself remains unimplemented and is tracked by #266.
 - 2026-08-11 — Corrections from the review-panel re-run, which found this file stale in
   seven checkable places (all five reviewers hit at least one): release status
-  ("unreleased"/"first tag pending" — v0.9.0 shipped 2026-07-22), the date header, the
+  ("unreleased"/"first tag pending" — v0.9.0 shipped 2026-08-07; its RC on
+  2026-07-22), the date header, the
   assigned-client-id cell (the code ASSIGNS for clean sessions and refuses only
   persistent ones — the cell under-claimed against ourselves), the TLS cell (1.2
   hardened opt-in shipped), the overflow modes (`reject-newest`, not `disconnect`), and
