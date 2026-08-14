@@ -1,20 +1,21 @@
-# The operator's own deployment (ADR 0055 T7).
+# The operator's own deployment (ADR 0055 T7) — the DEVELOPMENT / e2e manifest.
 #
-# ⚠️  DEVELOPMENT / e2e ONLY — this manifest cannot start a pod outside kind.
-# It pins `image: mqttd-operator:e2e` with `imagePullPolicy: Never`, so on any
-# cluster that has not had that exact tag side-loaded (`kind load docker-image`)
-# every pod stays in ErrImageNeverPull forever. That is deliberate: there is no
-# published operator image yet, and a manifest that *looked* installable would
-# be the more expensive mistake. The supported production path is the Helm
-# chart under deploy/helm/mqttd. Packaging this for real is ADR 0055 T8.
+# ⚠️  This manifest cannot start a pod outside kind, deliberately: it pins
+# `image: mqttd-operator:e2e` with `imagePullPolicy: Never`, so on any cluster
+# that has not had that exact tag side-loaded (`kind load docker-image`) every
+# pod stays in ErrImageNeverPull forever. It exists so the nightly e2e installs
+# EXACTLY the permissions proven sufficient — no cluster-admin, no secret
+# access, no PVC delete.
+#
+# TO INSTALL THE OPERATOR, use the Helm chart (ADR 0055 T8, issue #252):
+# deploy/helm/mqttd-operator — the CRD packaged alongside, the same RBAC as
+# here, and the image the release pipeline publishes signed + SBOM-attested
+# (ghcr.io/mbilling/fss-mqtt-broker-operator). Keep the RBAC below in lockstep
+# with the chart's templates/rbac.yaml.
 #
 # Minimal and explicit: a ServiceAccount, NAMESPACED RBAC over exactly the
 # objects it owns and remediates, and a single-replica Deployment (the Lease
 # leader gate makes >1 safe, but one is enough until there is demand).
-#
-# T8 turns this into a chart with the CRD packaged alongside; until then this is
-# what the e2e installs, so the permissions below are the ones actually proven
-# to be sufficient — no cluster-admin, no secret access.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

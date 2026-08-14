@@ -24,6 +24,9 @@ env:
   # The bridge ships as its OWN image, not a second entrypoint into the broker's
   # (ADR 0025: separate process, separate identity, separate failure domain).
   BRIDGE_IMAGE_NAME: ${{ github.repository }}-bridge
+  # The Kubernetes operator likewise (ADR 0055 T8): a control-plane process with
+  # its own RBAC identity, packaged and signed like every other shipped artifact.
+  OPERATOR_IMAGE_NAME: ${{ github.repository }}-operator
 
 jobs:
   # ── Gate: the release commit must pass the same supply-chain audit CI runs ──
@@ -75,8 +78,9 @@ jobs:
 
       - name: Reproducible build
         # mqttui is named explicitly: it lives in its own workspace with its own lockfile
-        # (ADR 0056 §1), so it is not part of the default package set.
-        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui
+        # (ADR 0056 §1), so it is not part of the default package set. mqttd-operator is
+        # a workspace member (same lockfile) shipped as its own binary + image (0055-T8).
+        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator
 
       # Independent proof of byte-reproducibility: fully clean and rebuild from
       # the same tag, then assert the two binaries are identical.
@@ -88,6 +92,7 @@ jobs:
           paths() {
             echo "target/${{ matrix.target }}/release/mqttd"
             echo "target/${{ matrix.target }}/release/mqtt-bridge"
+            echo "target/${{ matrix.target }}/release/mqttd-operator"
             echo "tools/mqttui/target/${{ matrix.target }}/release/mqttui"
           }
           paths | while read -r b; do
@@ -105,7 +110,7 @@ jobs:
               exit 1
             fi
           done
-          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui
+          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator
           paths | while read -r b; do
             sha256sum "$b" | awk '{print $1}' >> second.sha256
           done
@@ -114,7 +119,7 @@ jobs:
             paste first.sha256 second.sha256
             exit 1
           fi
-          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttui\n') first.sha256
+          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttui\n') first.sha256
 
       - name: Stage artifact + checksum
         id: stage
@@ -123,6 +128,7 @@ jobs:
           NAME="mqttd-${VERSION}-${{ matrix.target }}"
           BRIDGE_NAME="mqtt-bridge-${VERSION}-${{ matrix.target }}"
           UI_NAME="mqttui-${VERSION}-${{ matrix.target }}"
+          OPERATOR_NAME="mqttd-operator-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
           cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
@@ -130,15 +136,19 @@ jobs:
           # UI for a human at a keyboard, and adding a TUI to the broker image would grow
           # the runtime attack surface for something nothing in the image can use.
           cp "tools/mqttui/target/${{ matrix.target }}/release/mqttui" "out/${UI_NAME}"
+          cp "target/${{ matrix.target }}/release/mqttd-operator" "out/${OPERATOR_NAME}"
           # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
           cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
+          cp "target/${{ matrix.target }}/release/mqttd-operator" dist/mqttd-operator
           ( cd out && sha256sum "${NAME}" > "${NAME}.sha256" )
           ( cd out && sha256sum "${BRIDGE_NAME}" > "${BRIDGE_NAME}.sha256" )
           ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
+          ( cd out && sha256sum "${OPERATOR_NAME}" > "${OPERATOR_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"
+          echo "operator_name=${OPERATOR_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # SLSA build provenance for the binary — what commit/workflow produced it.
@@ -149,6 +159,7 @@ jobs:
             out/${{ steps.stage.outputs.name }}
             out/${{ steps.stage.outputs.bridge_name }}
             out/${{ steps.stage.outputs.ui_name }}
+            out/${{ steps.stage.outputs.operator_name }}
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
@@ -189,11 +200,23 @@ jobs:
             VCS_REF=${{ github.sha }}
             VERSION=${{ steps.stage.outputs.version }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Build and push single-arch OPERATOR image by digest
+        id: push_operator
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.operator
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.stage.outputs.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
       - name: Record image digests
         run: |
-          mkdir -p digests bridge-digests
+          mkdir -p digests bridge-digests operator-digests
           echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.arch }}"
           echo "${{ steps.push_bridge.outputs.digest }}" > "bridge-digests/${{ matrix.arch }}"
+          echo "${{ steps.push_operator.outputs.digest }}" > "operator-digests/${{ matrix.arch }}"
       - name: Upload image digest
         uses: actions/upload-artifact@v4
         with:
@@ -205,6 +228,12 @@ jobs:
         with:
           name: bridge-digest-${{ matrix.arch }}
           path: bridge-digests/${{ matrix.arch }}
+          retention-days: 7
+      - name: Upload operator image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-digest-${{ matrix.arch }}
+          path: operator-digests/${{ matrix.arch }}
           retention-days: 7
 
   # ── Assemble the multi-arch manifest, SBOM, signatures, and the Release ──
@@ -256,6 +285,12 @@ jobs:
           pattern: bridge-digest-*
           path: bridge-digests
           merge-multiple: true
+      - name: Download operator image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: operator-digest-*
+          path: operator-digests
+          merge-multiple: true
 
       # ── Multi-arch manifest from the per-arch digests pushed by `build` ──
       - name: Create and push multi-arch manifest
@@ -296,6 +331,25 @@ jobs:
           DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${{ steps.v.outputs.version }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
+      - name: Create and push multi-arch OPERATOR manifest
+        id: operator_manifest
+        run: |
+          IMAGE="${REGISTRY}/${OPERATOR_IMAGE_NAME}"
+          TAGS=(--tag "${IMAGE}:${{ steps.v.outputs.version }}")
+          if [[ "${{ steps.v.outputs.prerelease }}" == "false" ]]; then
+            TAGS+=(--tag "${IMAGE}:latest")
+          fi
+          REFS=()
+          for f in operator-digests/*; do
+            REFS+=("${IMAGE}@$(cat "$f")")
+          done
+          if [ "${#REFS[@]}" -eq 0 ]; then
+            echo "::error title=Manifest::no per-arch operator digests found"; exit 1
+          fi
+          docker buildx imagetools create "${TAGS[@]}" "${REFS[@]}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${{ steps.v.outputs.version }}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
       # ── SBOM: CycloneDX for the broker binary, from the locked source graph ──
       - name: Generate CycloneDX SBOM
         run: |
@@ -314,7 +368,7 @@ jobs:
           # One SBOM per shipped binary: each carries only ITS transitive graph,
           # so the bridge's SBOM does not imply the broker's dependencies are in
           # the bridge image, or vice versa.
-          for pair in "mqttd:sbom" "mqtt-bridge:sbom-bridge"; do
+          for pair in "mqttd:sbom" "mqtt-bridge:sbom-bridge" "mqttd-operator:sbom-operator"; do
             crate="${pair%%:*}"; out="${pair##*:}"
             SBOM="$(find . -name "${crate}.cdx.json" -print -quit)"
             if [ -z "$SBOM" ]; then
@@ -392,6 +446,26 @@ jobs:
           sbom-path: assets/sbom-bridge-${{ steps.v.outputs.version }}.cdx.json
           push-to-registry: true
 
+      # The operator image completes the set — one unsigned shipped image would be
+      # the weak link in a supply chain the others take seriously (0055-T8).
+      - name: Sign operator image (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: cosign sign --yes "${REGISTRY}/${OPERATOR_IMAGE_NAME}@${{ steps.operator_manifest.outputs.digest }}"
+      - name: Attest operator image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }}
+          subject-digest: ${{ steps.operator_manifest.outputs.digest }}
+          push-to-registry: true
+      - name: Attest operator image SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }}
+          subject-digest: ${{ steps.operator_manifest.outputs.digest }}
+          sbom-path: assets/sbom-operator-${{ steps.v.outputs.version }}.cdx.json
+          push-to-registry: true
+
       # ── Publish the GitHub Release with all verifiable assets ──
       - name: Create GitHub Release
         env:
@@ -403,6 +477,7 @@ jobs:
             printf 'Reproducible, signed release of mqttd %s.\n\n' "$VERSION"
             printf '**Image:** `%s/%s:%s`\n' "$REGISTRY" "$IMAGE_NAME" "$VERSION"
             printf '(digest `%s`)\n\n' "$IMG_DIGEST"
+            printf '**Operator image:** `%s/%s:%s` — install via the `deploy/helm/mqttd-operator` chart.\n\n' "$REGISTRY" "$OPERATOR_IMAGE_NAME" "$VERSION"
             printf 'Every asset below is cosign-signed (keyless, transparency-logged)\n'
             printf 'and the binaries are byte-reproducible from this tag. See\n'
             printf 'RELEASING.md for the one-command verify path.\n'

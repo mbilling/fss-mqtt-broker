@@ -9,7 +9,7 @@ path).
 | **Helm chart** | [`helm/mqttd`](helm/mqttd) | You run Kubernetes | `helm lint` + kubeconform + [`scripts/k8s/peer-tls-check.sh`](../scripts/k8s/peer-tls-check.sh) + a kind end-to-end job with the cluster bus ON |
 | **Compose** | [`compose/`](compose) | One host, or a small fleet with Docker | [`scripts/deploy-smoke.sh`](../scripts/deploy-smoke.sh) per PR + [`scripts/compose-smoke.sh`](../scripts/compose-smoke.sh) (real containers, nightly) |
 | **systemd** | [`systemd/`](systemd) | Bare metal or VMs, no container runtime | [`scripts/deploy-smoke.sh`](../scripts/deploy-smoke.sh) |
-| **Operator** | [`operator/`](operator) | **Not installable yet** — no published image (ADR 0055 T8) | kind e2e only |
+| **Operator** | [`helm/mqttd-operator`](helm/mqttd-operator) | You run Kubernetes and want `MqttdCluster` CRD management (split-brain fencing, brownout remediation — opt-in, alert-only by default). Image publishes from release `v0.9.1` on (forward-pinned; gate-proven). [`operator/`](operator) is the dev/e2e manifest, not the install path | `helm lint` + kubeconform + the CRD schema pin + a nightly kind e2e (fence, GC, RBAC `auth can-i`) |
 
 The Helm chart is the most automated: it derives node identity, seed lists and the
 readiness floor from StatefulSet ordinals, so there is nothing per-node to maintain.

@@ -1,0 +1,63 @@
+# NAMESPACED RBAC over exactly the objects the operator owns and remediates —
+# the permission set proven sufficient by the nightly kind e2e (0055-T7/T11):
+# no cluster-admin, no Secret access, and NO delete on PVCs (that absence IS the
+# never-destroy-data guarantee; the e2e asserts it with `kubectl auth can-i`).
+# Keep this in lockstep with deploy/operator/operator.yaml (the dev/e2e manifest).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "mqttd-operator.fullname" . }}
+  labels:
+    {{- include "mqttd-operator.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "mqttd-operator.fullname" . }}
+  labels:
+    {{- include "mqttd-operator.labels" . | nindent 4 }}
+rules:
+  # The custom resource it reconciles.
+  - apiGroups: ["mqttd.io"]
+    resources: ["mqttdclusters", "mqttdclusters/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # The objects it renders and owns.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Observation (/statusz targets) + the T4 remediations. `delete` on pods is
+  # the split-brain fence; PVCs are patched (quarantine label, expansion) and
+  # NEVER deleted — the absence of `delete` here is the guarantee.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Leader election + Events.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: ["events.k8s.io", ""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "mqttd-operator.fullname" . }}
+  labels:
+    {{- include "mqttd-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "mqttd-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "mqttd-operator.fullname" . }}

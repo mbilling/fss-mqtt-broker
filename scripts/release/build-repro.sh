@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Reproducible release build of the shipped binaries — mqttd and mqtt-bridge (ADR 0045 T2).
+# Reproducible release build of the shipped binaries — mqttd, mqtt-bridge, mqttui,
+# and mqttd-operator (ADR 0045 T2; operator added by ADR 0055 T8).
 #
 # This is THE build recipe: the release workflow runs it, and a third party
 # verifying a release runs the *same* script against the same tag. Same tag +

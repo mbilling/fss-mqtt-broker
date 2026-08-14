@@ -212,6 +212,16 @@ jobs:
       # turning the shared-subscription HA pair into a reconnect loop.
       - name: Bridge chart (opt-in, per-replica client id, schema)
         run: ./scripts/k8s/check-bridge-chart.sh
+      # ADR 0055 T8 (issue #252): the operator's install chart — lint, render with the
+      # CRD included, schema-validate. The CRD's content is separately schema-pinned by
+      # the mqttd-operator golden tests (the chart copy must be byte-identical to the
+      # generated schema); kubeconform has no CRD meta-schema, so it skips that one
+      # document and validates the rest.
+      - name: Operator chart (lint + template + kubeconform)
+        run: |
+          helm lint deploy/helm/mqttd-operator
+          helm template mqttd-operator deploy/helm/mqttd-operator --include-crds | \
+            kubeconform -strict -summary -ignore-missing-schemas -schema-location default
 
       # ADR 0055 T2: the operator and the chart must render the SAME objects. Two
       # supported deployment paths that disagree are worse than one, so this diffs

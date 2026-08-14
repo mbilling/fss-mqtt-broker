@@ -115,7 +115,7 @@ logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
 | Rule engine | ✖ not planned — boundary bridge + standard integrations instead | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |
 | MQTT-SN / CoAP gateways | ✖ | ✖ (separate projects) | ✅ (SN, CoAP, LwM2M, …) | ✖ (DDS/SOME-IP/ZMQ instead) | ✖ |
-| Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing — ADR 0055) is built and end-to-end tested, but **not yet packaged for installation**: the chart is the supported path today | — | Operator + Helm | container | k8s discovery in image |
+| Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container | k8s discovery in image |
 | Config | TOML + env, strict schema, `--check-config`, whole-config hot reload | conf file, SIGHUP | HOCON + dashboard/API | HOCON + env, hot reload | conf file + env mapping, live reconfig |
 
 ## Operational limits & resource governance
@@ -196,6 +196,8 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-08-14 — Kubernetes row: the operator is packaged (install chart + release-pipeline
+  image, ADR 0055 T8 / issue #252); "built but not installable" removed.
 - 2026-08-14 — Drift sweep from the 2026-08-13 panel (issue #253): the header's
   benchmark citation pointed at a results file under bench/results/ that is not
   tracked in this repository (that directory is gitignored) — the one document
