@@ -136,6 +136,25 @@ failing mid-write. The disk-full failure paths are made uniformly fail-closed wh
 it (today a cross-node offline enqueue failure drops the message where the local ack
 path correctly refuses to ack).
 
+**As delivered — the cadence is a knob, and it bounds both overshoot and recovery
+(0041-T14, issue #243).** The watcher interval is no longer the hard-coded 10 s this section
+was first delivered with: `MQTTD_WATERMARK_POLL` / `[limits] watermark_poll_secs` (default
+10, range 1-300, refused in `validate()`) sets it for BOTH axes, and each watcher
+self-accelerates to `poll / 10` (floor 1 s, never longer than the configured value) while
+its last sample sat within 10% of the mark. So the overshoot the mechanism concedes is
+`interval x growth rate` plus the write in flight — a number the docs now print — and the
+same interval bounds RECOVERY: a browned-out node is by definition inside the band, so this
+is how long the T11 publish refusal outlives the pressure that caused it. The enumeration
+of what "refused" means is unchanged, but it gains a FOURTH non-airtight edge, and unlike
+the three above it can be full message payloads: a browned-out node keeps applying its
+peers' already-committed appends into `replicas.redb` for groups it merely FOLLOWS, because
+the refusal is decided at the group's session owner and `brownout` is consulted nowhere in
+`mqtt-cluster`. Refusing there would thin the group's replica count rather than enforce a
+watermark, which is `min_replicas`' business — so it stays, documented (`store_watch.rs`
+remains the authoritative list). Also delivered: an edge-triggered WARN naming any single
+store holding more than 70% of the aggregate mark (clearing below 60%), which is the
+visibility half of T9.
+
 **As delivered — the publisher's ack under brownout (0041-T11, issue #238).** The "acks …
 continue" above meant ack *processing* — subscriber PUBACKs, deletes, truncation, the
 things that **shrink** state. It was implemented as something else: a `QoS` ≥ 1 publisher
@@ -280,11 +299,60 @@ in the delivery doc and ships as its own reviewed feature work.
    bound): both destroy standing state or sessions; brownout refuses new growth,
    consistent with this ADR's founding principle. Operators who prefer a hard
    ceiling keep the container limit — the watermark's job is to make the limit
-   unnecessary in the common case.
+   unnecessary in the common case. (The issue-#243 amendment below puts a number on
+   "watermark, not a ceiling": overshoot ≤ the watcher interval × the allocation rate, so
+   the container limit must sit at least that far above the mark.)
 
 Reaffirmed as deferred: per-tenant/weighted quota classes, byte-*rate* bandwidth
 quotas (`rate × size` still bounds bandwidth; the additions above bound *state*, a
 distinct axis), and hot-reloadable limits (unchanged reasoning).
+
+## Amendment (2026-08-14): the watermarks' three conceded gaps, decided (issue #243)
+
+A review panel attacked resource governance on three fronts: the memory watermark is not a
+ceiling, the disk watermark is aggregate-only, and both watchers polled every 10 s. One ends
+in code, one splits, and one is refused on merit. Recorded here because two of the three are
+now *stated* limitations rather than tracked work, and a limitation with no argument behind
+it decays into an excuse.
+
+1. **The poll interval — fixed in code** (0041-T14). `MQTTD_WATERMARK_POLL`, default 10 s,
+   range 1-300 (`validate()` refuses outside it, per §6), one knob for both axes because a
+   `/proc/self/status` read and four `stat` calls cost the same nothing, plus near-mark
+   self-acceleration to `poll / 10` (floor 1 s). The overshoot bound
+   (`interval x growth rate + the write in flight`) and the recovery tail are now numbers in
+   SIZING and the README rather than the adjective "soft". Deliberately NOT done: charging
+   the mark at append time, which would bound overshoot by ONE write instead of one interval.
+   That is the correct mechanism for the residual and every decision point is in the hub's
+   append path; it is recorded as work, not as a claim.
+
+2. **No allocation ceiling for RSS — refused on merit.** Three mechanisms exist and all three
+   destroy the property this ADR was written to protect. (i) Allocation denial (mosquitto's
+   `memory_limit`) needs a custom `GlobalAlloc`, and the workspace sets
+   `unsafe_code = "forbid"`; even with it, Rust's OOM path aborts by default and fallible
+   allocation is unreachable across redb/tokio/rustls, so the delivered behaviour would be
+   "abort somewhere" or "drop messages at malloc". (ii) EMQX's `force_shutdown` bounds a
+   *per-connection* heap/mailbox; our dominant memory (offline queues, retained, hub maps)
+   belongs to no connection, so it would cost a supervisor and still not bound the dominant
+   term. (iii) The cgroup limit already IS the hard bound, and an OOM-kill under it is
+   recoverable by design (ADR 0044). The exit is therefore documentation — but only counts as
+   an exit because the docs now carry the arithmetic: the overshoot formula with worked
+   instantiations, the watermark = 75-85%-of-container-limit mapping (the remaining 15-25% IS
+   the overshoot allowance), two alert rules with thresholds, and the honest note that the
+   Helm chart ships `resources: {}` so nothing sets that limit for you.
+
+3. **The disk mark stays AGGREGATE — argued, with the visibility gap closed.** A per-store
+   *share of the budget* is not enforceable as "refuse the growth writes to the over-share
+   store" for half the enumeration: `retained` maps to a refusable client write, `sessions`
+   maps partially (three growth writes are already deliberately exempt), but `replicas.redb`
+   grows from other nodes' committed appends and `lease.redb` from consensus — a follower
+   refusing committed entries would silently thin its group's replica count, which is the
+   `min_replicas` floor's business, not a watermark's. Since the protected resource is one
+   filesystem, the aggregate is the honest enforcement point. What the operator actually
+   lacked — *which* store is eating the budget — is closed in code (the 70%/60% skew WARN)
+   and in the docs (a per-store alert rule with numbers). **T9 is narrowed** to selective
+   refusal for `sessions`/`retained` only, and blocked on giving `BrownoutAxis` a store
+   dimension in the hub; `replicas`/`lease` map to the global axis by decision, stated so
+   the semantics cannot become "some stores are enforceable and we never said which".
 
 ## Amendment (2026-08-14): a v5 DISCONNECT with a non-zero reason fires the Will (issue #265)
 

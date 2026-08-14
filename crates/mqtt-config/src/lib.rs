@@ -496,7 +496,7 @@ impl std::fmt::Display for MinReplicas {
 
 /// Resource-governance caps + quotas (ADR 0041). `None`/`0` generally means unbounded,
 /// matching the env behaviour.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
     /// Global connection cap (`MQTTD_MAX_CONNECTIONS`).
@@ -538,6 +538,42 @@ pub struct Limits {
     /// over minutes degrades to read-mostly with a metric and a log line, instead of
     /// arriving as an OOM kill.
     pub memory_max_bytes: Option<u64>,
+    /// How often BOTH watermark watchers sample their axis, seconds
+    /// (`MQTTD_WATERMARK_POLL`, ADR 0041 T14). Default 10; a value outside `1..=300`
+    /// is a startup error.
+    ///
+    /// This is the **detection-lag knob**, and it bounds the overshoot the watermark
+    /// mechanism cannot prevent: `overshoot <= poll x peak growth rate` plus the one
+    /// write already in flight. Within 10% of a mark the watchers re-check every
+    /// `poll / 10` (floor 1 s), which is also how long a *cleared* brownout takes to
+    /// lift — the publish outage above the mark outlives the pressure by at most that
+    /// interval.
+    ///
+    /// One knob for both axes on purpose: a `/proc/self/status` read and four `stat`
+    /// calls cost the same nothing, and no operator has a reason to sample disk and
+    /// memory at different rates. Read at startup only — a reload reports the `limits`
+    /// section as requires-restart (ADR 0041 §6).
+    pub watermark_poll_secs: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: None,
+            max_connections_per_ip: None,
+            max_packet_size: None,
+            max_publish_rate: None,
+            max_queued_messages: None,
+            max_retained_messages: None,
+            max_sessions: None,
+            max_subscriptions_per_client: None,
+            receive_maximum: None,
+            topic_alias_max: None,
+            queue_overflow: None,
+            memory_max_bytes: None,
+            watermark_poll_secs: 10,
+        }
+    }
 }
 
 /// Metrics export (ADR 0020).
@@ -1032,6 +1068,9 @@ impl Config {
         on!("MQTTD_MEMORY_MAX_BYTES", v, {
             self.limits.memory_max_bytes = Some(num("MQTTD_MEMORY_MAX_BYTES", &v)?);
         });
+        on!("MQTTD_WATERMARK_POLL", v, {
+            self.limits.watermark_poll_secs = num("MQTTD_WATERMARK_POLL", &v)?;
+        });
         on!("MQTTD_MAX_SESSIONS", v, {
             self.limits.max_sessions = Some(num("MQTTD_MAX_SESSIONS", &v)?);
         });
@@ -1102,6 +1141,18 @@ impl Config {
         if self.durable.min_replicas == MinReplicas::Count(0) {
             return Err(ConfigError::Invalid(
                 "durable.min_replicas must be >= 1 (1 = no floor) or \"majority\"".to_string(),
+            ));
+        }
+        // The watermark watchers' cadence (issue #243). Both ends are refusals of an
+        // instruction that cannot have been meant: 0 would spin, and a mark sampled
+        // less often than every five minutes cannot bound the overshoot the mechanism
+        // has already conceded (ADR 0041 §6 — a nonsensical value is a startup error).
+        if !(1..=300).contains(&self.limits.watermark_poll_secs) {
+            return Err(ConfigError::Invalid(
+                "limits.watermark_poll_secs must be between 1 and 300 seconds (default 10): \
+                 below 1 s the poll cannot bound overshoot the mechanism has already lost, \
+                 and a watermark sampled less often than every 5 minutes is decoration"
+                    .to_string(),
             ));
         }
         if self.observability.otlp_interval_secs == 0 {
@@ -1258,6 +1309,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TOPIC_ALIAS_MAX",
     "MQTTD_QUEUE_OVERFLOW",
     "MQTTD_MEMORY_MAX_BYTES",
+    "MQTTD_WATERMARK_POLL",
     "MQTTD_HTTP_AUTH_URL",
     "MQTTD_HTTP_AUTH_TIMEOUT",
     "MQTTD_HTTP_AUTH_CACHE_SECS",
@@ -1496,6 +1548,56 @@ mod tests {
         assert_eq!(c.durable.lease_voters, 5);
     }
 
+    /// The watermark poll is the operator's detection-lag knob (issue #243), so a
+    /// nonsensical value must be a startup error rather than a silently useless
+    /// watcher: `0` would spin, and a watermark sampled less often than every five
+    /// minutes is decoration. `validate()` is the single refusal point, which is what
+    /// makes it cover startup, `--check-config` and the reload precheck alike.
+    #[test]
+    fn the_watermark_poll_is_bounded_between_one_second_and_five_minutes() {
+        let toml = |v: &str| {
+            format!("[limits]\nwatermark_poll_secs = {v}\n[durable]\nallow_ephemeral = true\n")
+        };
+        for bad in ["0", "301", "86400"] {
+            let err = Config::from_toml(&toml(bad)).expect_err("must be refused");
+            assert!(
+                err.to_string()
+                    .contains("watermark_poll_secs must be between 1 and 300"),
+                "the error must name the field and the range: {err}"
+            );
+        }
+        for good in ["1", "10", "300"] {
+            assert!(
+                Config::from_toml(&toml(good)).is_ok(),
+                "{good} is inside the range"
+            );
+        }
+        assert_eq!(
+            Config::default().limits.watermark_poll_secs,
+            10,
+            "the default cadence is the one the docs and the ADR quote"
+        );
+    }
+
+    /// Env → config for the poll knob, plus the numeric-parse refusal. The count and
+    /// `distinct_value` companions live in the two sweep tests below; this one pins the
+    /// value itself.
+    #[test]
+    fn the_watermark_poll_overlays_from_the_environment() {
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_WATERMARK_POLL", "3")]))
+            .unwrap();
+        assert_eq!(c.limits.watermark_poll_secs, 3);
+        let mut c = Config::default();
+        let err = c
+            .overlay_from(getter(&[("MQTTD_WATERMARK_POLL", "soon")]))
+            .expect_err("a non-numeric cadence must not be ignored");
+        assert!(
+            err.to_string().contains("MQTTD_WATERMARK_POLL"),
+            "the error must name the variable: {err}"
+        );
+    }
+
     #[test]
     fn per_var_boolean_conventions_are_honoured() {
         // MQTTD_ALLOW_ANONYMOUS: *any* value means "on" (the footgun a naive flatten hits).
@@ -1633,6 +1735,7 @@ mod tests {
             | "MQTTD_RECEIVE_MAXIMUM"
             | "MQTTD_TOPIC_ALIAS_MAX"
             | "MQTTD_MEMORY_MAX_BYTES"
+            | "MQTTD_WATERMARK_POLL"
             | "MQTTD_HTTP_AUTH_TIMEOUT"
             | "MQTTD_HTTP_AUTH_CACHE_SECS"
             | "MQTTD_HTTP_AUTH_CACHE_MAX"
@@ -1729,7 +1832,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            74,
+            75,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
