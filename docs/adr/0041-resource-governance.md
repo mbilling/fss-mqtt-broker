@@ -285,3 +285,20 @@ in the delivery doc and ships as its own reviewed feature work.
 Reaffirmed as deferred: per-tenant/weighted quota classes, byte-*rate* bandwidth
 quotas (`rate × size` still bounds bandwidth; the additions above bound *state*, a
 distinct axis), and hot-reloadable limits (unchanged reasoning).
+
+## Amendment (2026-08-14): a v5 DISCONNECT with a non-zero reason fires the Will (issue #265)
+
+The T12 close-honesty seam (`PacketOutcome` — only a client DISCONNECT maps to a graceful
+detach, so every broker-initiated close fires the Will, [MQTT-3.14.4-3]) had one
+will-suppressing close left: the `Packet::Disconnect` arm ignored the v5 reason byte, so a
+client DISCONNECT with `0x04 Disconnect with Will Message` — the code whose entire purpose
+is "publish my Will" — or with any error reason was treated as reason `0x00` and its Will
+discarded. Per [MQTT-3.1.2-10] only reason `0x00` discards the Will.
+
+Since issue #265 the arm branches on the reason: `0x00` stays `ClientDisconnect`
+(graceful, Will discarded); any non-zero reason is the new
+`ClientDisconnectWithWill` — the socket close is equally clean, but the detach is
+un-graceful so the Will fires. v3.1.1 is untouched: its DISCONNECT has no reason byte and
+always decodes as `0`. The graceful-shutdown drain (ADR 0019) remains the one deliberate
+close that is graceful without a client DISCONNECT — the server is going away, not the
+client; the session is retained and the Will withheld.
