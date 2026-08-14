@@ -90,7 +90,10 @@ question ([ADR 0042](adr/0042-durable-plane-stress-harness.md)):
   cluster (production wiring + a severable relay per node) under seed-composed fault
   schedules — owner kills, restarts over surviving data dirs, asymmetric link flaps,
   disk write-fault injection, brownout entry/exit, client churn — against an
-  obligations ledger of **acked facts only**, judged post-quiesce by the catalog. The
+  obligations ledger of **acked facts only**, judged post-quiesce by the catalog. That
+  ledger is now unqualified: brownout acks used to be waived as ADR 0041's documented
+  ack-and-drop trade, and since 0041-T11 / issue #238 a brownout-refused publish is
+  simply never acked, so every ack observed is an obligation. The
   schedules also compose **resize** (ADR 0043 P4): seeded `join` steps grow the
   cluster mid-schedule and seeded `decommission` steps drain-then-leave (aborting
   honestly when the drain cannot converge under the running faults). Dedicated path

@@ -10,6 +10,15 @@
 //! certificate and the dialer verifies the server certificate, so possession of
 //! a cluster-CA-issued cert is what admits a node to the mesh. Plaintext links
 //! remain possible only when no context is configured (loudly logged in `main`).
+//!
+//! Version gating: the NEGOTIATED proto of each link is carried to the hub
+//! ([`HubCommand::PeerConnected`]'s `proto`), because frame choice must be per-link.
+//! The peer codec is strict — an unknown variant index, or trailing bytes from a field
+//! an older build does not know, is a decode error that `read_frame` reports as an
+//! `io::Error`, which tears the link down and redials. So "send the new frame and let
+//! old peers ignore it" is not available: it is a flap loop. Additive frames therefore
+//! ship under a raised `PROTO_MAX` and are sent only when the link negotiated it
+//! (0041-T12, issue #238).
 
 use crate::conn::ConnPolicy;
 use crate::hub::{HubCommand, PeerOutbound};
@@ -298,21 +307,28 @@ enum LinkOutcome {
     Redundant,
 }
 
-/// Whether the peer's announced protocol range overlaps ours (ADR 0038). A
-/// disjoint range is logged loudly and the link must be dropped — a node that
-/// cannot agree on a protocol version must not half-join the mesh.
-fn proto_compatible(node_id: &str, proto_min: u32, proto_max: u32) -> bool {
-    if peer::negotiate_proto((peer::PROTO_MIN, peer::PROTO_MAX), (proto_min, proto_max)).is_some() {
-        true
-    } else {
+/// The version this link speaks, or `None` when the peer's announced range does not
+/// overlap ours (ADR 0038) — logged loudly, and the link must then be dropped: a node
+/// that cannot agree on a protocol version must not half-join the mesh.
+///
+/// The negotiated value is KEPT rather than discarded (0041-T12, issue #238): the hub
+/// chooses per-link between a proto-6 and a proto-7 frame with it. That gating is forced
+/// by the codec, not a style preference — [`peer::decode`] is strict, so an unknown
+/// variant index (or trailing bytes from an added field) is a `Serde` error, which
+/// `read_frame` turns into an `io::Error`, which tears the link down and redials: a flap
+/// loop, not a graceful "old peers ignore what they do not know".
+fn negotiated_proto(node_id: &str, proto_min: u32, proto_max: u32) -> Option<u32> {
+    let negotiated =
+        peer::negotiate_proto((peer::PROTO_MIN, peer::PROTO_MAX), (proto_min, proto_max));
+    if negotiated.is_none() {
         warn!(
             peer = %node_id,
             ours = ?(peer::PROTO_MIN, peer::PROTO_MAX),
             theirs = ?(proto_min, proto_max),
             "peer speaks an incompatible peer-bus protocol range; dropping link (ADR 0038)"
         );
-        false
     }
+    negotiated
 }
 
 /// Run a single peer link: handshake, dedup, register, then pump until it closes.
@@ -350,7 +366,7 @@ where
     // The dialer announces itself first; the accept side reads first so it can
     // detect a session-proxy connection (ADR 0005) before announcing itself —
     // a proxied client expects raw MQTT back, not our peer Hello.
-    let remote = if initiated {
+    let (remote, proto) = if initiated {
         write_frame(
             &mut wh,
             &PeerMessage::Hello {
@@ -366,10 +382,10 @@ where
                 proto_min,
                 proto_max,
             }) => {
-                if !proto_compatible(&node_id, proto_min, proto_max) {
+                let Some(proto) = negotiated_proto(&node_id, proto_min, proto_max) else {
                     return Ok(LinkOutcome::Closed);
-                }
-                NodeId(node_id)
+                };
+                (NodeId(node_id), proto)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -402,9 +418,9 @@ where
             }) => {
                 // Reject BEFORE announcing ourselves: an incompatible build gets a
                 // clean close, not half a handshake.
-                if !proto_compatible(&node_id, proto_min, proto_max) {
+                let Some(proto) = negotiated_proto(&node_id, proto_min, proto_max) else {
                     return Ok(LinkOutcome::Closed);
-                }
+                };
                 write_frame(
                     &mut wh,
                     &PeerMessage::Hello {
@@ -414,7 +430,7 @@ where
                     },
                 )
                 .await?;
-                NodeId(node_id)
+                (NodeId(node_id), proto)
             }
             Some(_) => {
                 warn!("peer did not send Hello first; dropping link");
@@ -459,6 +475,7 @@ where
             conn_id,
             tx: out_tx,
             cert_serial,
+            proto,
         })
         .is_err()
     {
@@ -600,6 +617,33 @@ fn forward_inbound(
                 node: remote.clone(),
                 seq,
                 ok,
+            });
+        }
+        PeerMessage::PublishVerdict { seq, verdict } => {
+            let _ = hub.send(HubCommand::RemotePublishVerdict {
+                node: remote.clone(),
+                seq,
+                verdict,
+            });
+        }
+        PeerMessage::SharedDeliverAcked {
+            seq,
+            client,
+            topic,
+            payload,
+            qos,
+            message_expiry,
+            app,
+        } => {
+            let _ = hub.send(HubCommand::RemoteSharedDeliverAcked {
+                node: remote.clone(),
+                seq,
+                client: mqtt_core::ClientId(client),
+                topic,
+                payload: payload.into(),
+                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                message_expiry,
+                app: crate::hub::app_from_wire(app),
             });
         }
         PeerMessage::SharedInterest { groups } => {

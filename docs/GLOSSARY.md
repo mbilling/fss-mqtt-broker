@@ -68,9 +68,14 @@ broker uses, and **mqttd** terms specific to this one's clustering and security 
   other node *seeds* to an existing member to join. The `clusterEstablished` guard prevents
   a restarted founder whose volume was lost from founding a *second* cluster.
 - **Brownout** — a backpressure mode: above a disk or memory watermark, writes that **grow**
-  state (new sessions, new retained topics, offline enqueues) are refused while reads, acks,
-  deletes and resumes continue. It is a watermark, not a hard ceiling — the container limit
-  is still the real bound.
+  state (new sessions, new retained topics, offline enqueues) are refused while reads,
+  *subscriber* acks, deletes and resumes continue. The acks that continue are the ones that
+  shrink state; a **publisher's** `QoS` ≥ 1 ack is refused above the mark (v5 `0x97`,
+  v3.1.1 no ack and a close) rather than granted for a message the store will not take —
+  when the refusing session owner is a peer node the refusal crosses the peer bus as a
+  verdict (a link to an older build, mid-rolling-upgrade, withholds the ack and closes
+  instead). It is a watermark, not a hard ceiling — the container limit is still the real
+  bound.
 - **allow-covers / deny-overlaps** — the ACL matching rule. An `allow` grant applies if it
   *covers* the topic (its filter matches); a `deny` applies if it *overlaps* (matches any
   part), so deny is deliberately broader than allow — the safe direction for authorization.

@@ -522,8 +522,16 @@ pub struct Limits {
     /// Offline-queue overflow policy (`MQTTD_QUEUE_OVERFLOW`): `drop-oldest` or `reject-newest`.
     pub queue_overflow: Option<String>,
     /// Process-memory high-water mark in bytes (`MQTTD_MEMORY_MAX_BYTES`, ADR 0041 T8).
-    /// Above it the broker enters **brownout**: growth writes are refused while acks,
-    /// reads, deletes, expiry and resumes continue. Unset = off.
+    /// Above it the broker enters **brownout**: growth writes are refused while
+    /// *subscriber* acks, reads, deletes, expiry and resumes continue. A **publisher's**
+    /// `QoS` >= 1 ack is refused with the write it needed (v5 `0x97`, v3.1.1 no ack and a
+    /// close), never granted for a message that was not stored. Unset = off.
+    ///
+    /// In a cluster the refusing node may be a PEER (an offline persistent subscriber's
+    /// session usually lives on one); the refusal crosses the peer bus as a verdict, so
+    /// the same answer reaches the publisher once every node on the message's path runs
+    /// this release or newer. Mid-roll from an older build, a v5 publisher may still see
+    /// the older withheld-ack close instead of `0x97`.
     ///
     /// A watermark, not a ceiling: nothing here can stop memory rising, so the container
     /// or cgroup limit remains the hard bound. What it buys is that pressure building

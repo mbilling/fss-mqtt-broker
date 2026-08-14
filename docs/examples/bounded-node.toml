@@ -29,8 +29,14 @@ decay_secs = 60
 
 [durable]
 # Disk high-water mark, ONE aggregate bound over all four stores. Above it: brownout —
-# growth writes refused (counted in quota_rejections_total{kind="brownout"}), acks/
-# reads/expiry continue, recovery below the mark restores writes. It is a high-water
+# growth writes refused — a new session (counted in
+# quota_rejections_total{reason="brownout"}), a new retained topic (counted in
+# quota_rejections_total{reason="retained"}, the retained quota's label) and an offline
+# enqueue, for which a QoS>=1 publisher is REFUSED rather than acked (v5 0x97 / v3.1.1 no
+# ack + close; cross-node via a peer-bus verdict — mid-rolling-upgrade an older link
+# withholds the ack and closes instead; counted in
+# quota_rejections_total{reason="brownout-publish"}). Subscriber acks/reads/expiry
+# continue, recovery below the mark restores writes. It is a high-water
 # mark, not a hard wall: leave headroom (here 4 GB of the 20 GB disk).
 store_max_bytes = 16000000000
 
@@ -48,7 +54,10 @@ max_packet_size = 262144
 # max_packet_size (a byte-based cap is tracked as ADR 0041 amendment work).
 max_sessions = 5000
 max_queued_messages = 500
-queue_overflow = "drop-oldest"   # or "reject-newest" if senders must see the refusal
+# Both overflow policies ack-and-drop at the cap — senders are NEVER told (the
+# ack already happened, or is owed regardless). The choice is only WHICH message
+# is shed: the queue's oldest (default) or the arriving one.
+queue_overflow = "drop-oldest"   # or "reject-newest"
 
 # Retained: 50 000 × 4 KiB avg ≈ 0.2 GiB. New topics beyond the cap are refused
 # (0x97); overwriting or clearing an existing topic is always allowed.

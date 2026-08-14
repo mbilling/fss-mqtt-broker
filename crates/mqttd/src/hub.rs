@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
-use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
+use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{
@@ -334,14 +334,109 @@ pub struct Quotas {
 
 /// How the hub disposed of a publish, reported through the ack-gate channel
 /// (ADR 0018/0041): the connection releases the publisher's acknowledgement —
-/// or answers `0x97 Quota exceeded` — accordingly.
+/// or answers the refusal — accordingly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
     /// Fanned out (and durably appended where applicable) — ack normally.
     Accepted,
-    /// A v5 retained publish would have created a new retained topic beyond the
-    /// quota: nothing was delivered or retained — answer `0x97` (ADR 0041 T4).
-    RetainedQuotaExceeded,
+    /// Refused under a stated policy, with a reason the publisher can be TOLD.
+    /// Distinct from withholding (the sender is dropped, the connection closes
+    /// unacked), which is what a terminal *failure* still does because no reason
+    /// code covers "I do not know what happened".
+    Refused(PublishRefusal),
+}
+
+/// Why the hub refused a publish, and — because the two protocol versions have
+/// different vocabularies — how to say so in each.
+///
+/// Each variant carries **two independent answers**: [`v5_reason`](Self::v5_reason)
+/// for MQTT 5, which has a reason byte on PUBACK/PUBREC, and [`v311`](Self::v311)
+/// for v3.1.1, which has none and must therefore choose between a plain ack and a
+/// close. Adding a refusal is exactly that: one variant plus its two answers (issue
+/// #246's ACL-denied publish becomes `NotAuthorized` → v5 `0x87`, v3.1.1
+/// [`Refusal311::PlainAck`], with one line in `conn.rs`'s ACL branch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishRefusal {
+    /// A watermark is exceeded, so the durable append a `QoS` ≥ 1 subscriber is
+    /// owed was refused (ADR 0041 T5/T11, issue #238). Nothing was stored, so a
+    /// retry is the right move — "acked means durable" holds by not acking.
+    Brownout,
+    /// A retained publish would have created a NEW retained topic beyond the cap
+    /// (ADR 0041 T4): nothing was delivered or retained.
+    RetainedQuota,
+}
+
+impl PublishRefusal {
+    /// The MQTT 5.0 PUBACK/PUBREC reason code. A code ≥ 0x80 ends the flow: per
+    /// §4.9 and [MQTT-3.3.4-9] it releases the Receive-Maximum slot and makes the
+    /// packet id reusable, so a refusal costs O(1) and accumulates no state.
+    #[must_use]
+    pub fn v5_reason(self) -> u8 {
+        match self {
+            Self::Brownout | Self::RetainedQuota => mqtt_codec::reason::QUOTA_EXCEEDED,
+        }
+    }
+
+    /// The v3.1.1 disposition. See [`Refusal311`].
+    #[must_use]
+    pub fn v311(self) -> Refusal311 {
+        match self {
+            Self::Brownout => Refusal311::CloseNoAck,
+            Self::RetainedQuota => Refusal311::PlainAck,
+        }
+    }
+
+    /// The bounded metric/log label for this refusal.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Brownout => "brownout",
+            Self::RetainedQuota => "retained-quota",
+        }
+    }
+
+    /// The stable code this refusal travels under on the peer bus
+    /// ([`ForwardVerdict::Refused`], proto 7 — 0041-T12, issue #238).
+    ///
+    /// Exhaustive on purpose in both directions: a new refusal variant cannot ship
+    /// without picking a code, and a code cannot be reused. `0` is reserved so a
+    /// zero-initialised field is never mistaken for a real refusal.
+    #[must_use]
+    pub fn wire_code(self) -> u16 {
+        match self {
+            Self::Brownout => 1,
+            Self::RetainedQuota => 2,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code). `None` for a code this build
+    /// does not know — a NEWER peer's refusal. The caller must then WITHHOLD the
+    /// ack rather than invent a refusal: `Refused` makes the positive claim
+    /// "nothing was stored", which an answer we cannot read does not support.
+    #[must_use]
+    pub fn from_wire_code(code: u16) -> Option<Self> {
+        match code {
+            1 => Some(Self::Brownout),
+            2 => Some(Self::RetainedQuota),
+            _ => None,
+        }
+    }
+}
+
+/// How a refusal is said to an MQTT 3.1.1 publisher, which has no reason byte.
+///
+/// The choice is not cosmetic: it is whether the refusal is *sayable* as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal311 {
+    /// A deliberate, terminal disposal the publisher gains nothing by retrying —
+    /// the plain PUBACK is honest enough, because nothing is owed. (v3.1.1's
+    /// retained-quota answer: the message was delivered live, just not retained.)
+    PlainAck,
+    /// The broker could not take the message, so an ack would be a lie: send none
+    /// and close. The client resends on reconnect [MQTT-4.4.0-1], paced by its own
+    /// backoff, at zero per-attempt cost to the broker — the same shape as the
+    /// pre-existing store-error path.
+    CloseNoAck,
 }
 
 /// A currently-online client connection.
@@ -383,8 +478,10 @@ struct PendingOut {
     /// Where this message lives in the session's durable log, if it was recorded
     /// there before being put on the wire (#124). The log is truncated through it
     /// only once the subscriber acknowledges, so a crash mid-flight redelivers it.
-    /// `None` for a clean session, a retained replay, or a deliberate skip
-    /// (brownout) — none of which owe a redelivery.
+    /// `None` for a clean session, a retained replay, or a message the session queue
+    /// cap rejected under `reject-newest` — none of which owe a redelivery. (Brownout no
+    /// longer appears here: it refuses the publish rather than sending an unrecorded
+    /// copy — 0041-T11, issue #238.)
     offset: Option<Offset>,
 }
 
@@ -429,21 +526,75 @@ enum Appended {
     /// Recorded at this offset; the log is truncated through it once the subscriber
     /// acknowledges.
     At(Offset),
-    /// Deliberately not recorded — disk brownout, or the queue cap rejected it. Both are
-    /// counted and logged, and the publisher is still acknowledged: the message was
-    /// refused under a stated policy, not lost (ADR 0041 §5 — brownout refuses growth
-    /// writes while "acks, deletes, reads, expiry, and resumes … continue").
-    ///
-    /// The honest caveat (#203): for an **offline** persistent subscriber there is no live
-    /// delivery either, so that subscriber never receives this message even though the
-    /// publisher was acked. The refusal is counted (`publish_dropped{reason}`), the
-    /// watermark is off by default, and the README states it beside the durability claim —
-    /// but acking is only defensible because v3.1.1 has no way to say "received, not
-    /// accepted". Answering a **v5** publisher `0x97` instead is tracked as 0041-T11.
-    Skipped,
+    /// Refused under a stated policy, and the publisher is TOLD (0041-T11, issue #238):
+    /// the message was neither stored nor — for a `QoS` ≥ 1 delivery — sent live, so the
+    /// ack must not be released. It travels out as [`PublishOutcome::Refused`], which each
+    /// protocol version answers in its own vocabulary.
+    Refused(PublishRefusal),
+    /// The session queue cap under `reject-newest` rejected the newest message
+    /// (ADR 0001 §6). Counted and logged, and the publisher IS still acknowledged: this
+    /// cap is opt-in and its whole purpose is to shed rather than block, so the drop is
+    /// the stated policy rather than a failure to honour one.
+    Dropped,
     /// The write failed. The publisher's acknowledgement must be withheld so it retries
     /// (ADR 0041 T5).
     Failed,
+}
+
+/// The durability verdict of a fan-out, as it travels back to the ack gate.
+///
+/// MQTT's acknowledgement is per-PUBLISH, not per-subscriber: there is no way to tell
+/// a publisher "stored for two of your three subscribers". So ONE unmet obligation
+/// refuses the whole publish — which is why these compose with [`and`](Self::and)
+/// rather than being reported individually.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableOutcome {
+    /// Every obligation this fan-out took on is met: release the ack.
+    Ok,
+    /// Refused under a stated policy — answerable per protocol version.
+    Refused(PublishRefusal),
+    /// A terminal failure. `Failed` DOMINATES a refusal: no reason code honestly
+    /// covers it, so the ack is withheld (the connection closes) instead.
+    Failed,
+}
+
+impl DurableOutcome {
+    /// Combine two subscribers' verdicts. Precedence: `Failed` > `Refused` > `Ok`.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Refused(r), _) | (Self::Ok, Self::Refused(r)) => Self::Refused(r),
+            (Self::Ok, Self::Ok) => Self::Ok,
+        }
+    }
+
+    /// The peer-bus form of this verdict (proto 7, 0041-T12). Kept next to
+    /// [`from_verdict`](Self::from_verdict) so the answering and the receiving side
+    /// of the same wire cannot drift apart.
+    fn to_verdict(self) -> ForwardVerdict {
+        match self {
+            Self::Ok => ForwardVerdict::Stored,
+            Self::Refused(r) => ForwardVerdict::Refused {
+                code: r.wire_code(),
+            },
+            Self::Failed => ForwardVerdict::Failed,
+        }
+    }
+
+    /// Interpret a peer's verdict. An unknown refusal code degrades to
+    /// [`Failed`](Self::Failed) — withhold, never a fabricated refusal and never an
+    /// ack: `Failed` claims nothing about what the peer stored, which is the only
+    /// honest thing to say about an answer this build cannot read.
+    fn from_verdict(v: ForwardVerdict) -> Self {
+        match v {
+            ForwardVerdict::Stored => Self::Ok,
+            ForwardVerdict::Refused { code } => match PublishRefusal::from_wire_code(code) {
+                Some(r) => Self::Refused(r),
+                None => Self::Failed,
+            },
+            ForwardVerdict::Failed => Self::Failed,
+        }
+    }
 }
 
 /// Per-session outbound `QoS` bookkeeping. Survives disconnects so persistent
@@ -798,6 +949,9 @@ pub enum HubCommand {
         /// The remote leaf certificate's serial from the mTLS handshake
         /// (ADR 0040 T4); `None` on a plaintext mesh.
         cert_serial: Option<Vec<u8>>,
+        /// The peer-bus protocol version this link negotiated (ADR 0038), so the hub
+        /// can choose per-link between a proto-6 and a proto-7 frame (0041-T12).
+        proto: u32,
     },
     /// A peer node's link went down.
     PeerDisconnected {
@@ -993,6 +1147,42 @@ pub enum HubCommand {
         /// Whether the peer's local fan-out (durable appends included) succeeded.
         ok: bool,
     },
+    /// A peer's proto-7 answer to a forwarded publish OR a forwarded shared
+    /// delivery (0041-T12, issue #238): the superset of
+    /// [`RemotePublishAck`](Self::RemotePublishAck) that can also say "refused under
+    /// a stated policy, nothing stored", which the origin turns into an answer its
+    /// publisher can act on (`0x97`) instead of a withheld ack.
+    RemotePublishVerdict {
+        /// The peer that answered.
+        node: NodeId,
+        /// The forward sequence being answered.
+        seq: u64,
+        /// What the peer did with the forward.
+        verdict: ForwardVerdict,
+    },
+    /// An **answerable** targeted shared delivery from a peer (0041-T12, issue #238):
+    /// like [`RemoteSharedDeliver`](Self::RemoteSharedDeliver), but the outcome is
+    /// answered with a [`PeerMessage::PublishVerdict`] so the origin's publisher ack
+    /// is gated on this node actually taking the message. Arrives only from a proto-7
+    /// sender.
+    RemoteSharedDeliverAcked {
+        /// The peer the forward arrived from (where the verdict is sent).
+        node: NodeId,
+        /// The sender's forward sequence (correlates the verdict).
+        seq: u64,
+        /// The chosen local group member.
+        client: ClientId,
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Bytes,
+        /// Already-downgraded delivery `QoS`.
+        qos: QoS,
+        /// The publisher's Message Expiry Interval (seconds). `None` = no expiry.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
+    },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
         /// Destination topic.
@@ -1046,6 +1236,12 @@ pub enum HubCommand {
 struct Peer {
     conn_id: u64,
     tx: PeerOutbound,
+    /// The peer-bus protocol version this LINK negotiated (ADR 0038). Frame choice
+    /// is gated on it, not on what this build supports: the codec is strict, so
+    /// sending a variant the peer does not know leaves it with an unknown variant
+    /// index → `PeerCodecError::Serde` → `io::Error` → link teardown and redial, i.e.
+    /// a flap loop. See [`Hub::peer_proto`].
+    proto: u32,
     /// The remote leaf certificate's serial (big-endian bytes) from the link's
     /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
     /// (ADR 0040 T4). `None` on a plaintext mesh.
@@ -1239,8 +1435,17 @@ pub struct Hub {
     publish_ids: u64,
     /// Per-node monotonic forward sequence (ADR 0042 T9, exhibit ⑤).
     forward_seq: u64,
-    /// Forward seq → pending publish id, for ack resolution.
+    /// Forward seq → pending publish id, for answer resolution.
     forward_index: HashMap<u64, u64>,
+    /// Count of durable session appends this hub has completed successfully.
+    ///
+    /// Snapshotted around a gated fan-out so a pending publish can record whether it
+    /// is STORED anywhere (issue #238): only a publish stored NOWHERE may be answered
+    /// `Refused`, because that answer asserts "nothing was stored, retry" — a
+    /// falsehood for a message already durably owed to a subscriber, whose retry would
+    /// then duplicate it there. Safe as a plain counter because the hub is a
+    /// single-owner actor: no other command's appends interleave with one publish's.
+    durable_writes: u64,
     /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
     /// exhibit ⑥) — one at a time.
     inherited_scan_inflight: bool,
@@ -1383,6 +1588,17 @@ struct RetainedMutation {
 /// withheld, so the publisher retries (never an ack for an unowned message).
 const PENDING_PUBLISH_CAP: usize = 4096;
 
+/// The first peer-bus proto that can carry a forward VERDICT rather than a bool
+/// ([`PeerMessage::PublishVerdict`], [`PeerMessage::SharedDeliverAcked`] — 0041-T12,
+/// issue #238).
+///
+/// Frame choice is gated on the LINK's negotiated proto, never on what this build
+/// supports: the peer codec is strict, so an unknown variant index is a decode error →
+/// `io::Error` → link teardown and redial, i.e. a flap loop rather than a graceful
+/// degradation. A link whose proto is somehow unknown is treated as
+/// [`peer::PROTO_MIN`](mqtt_cluster::peer::PROTO_MIN) — fail safe toward the old frame.
+const PROTO_FORWARD_VERDICT: u32 = 7;
+
 /// Sweep ticks a pending publish waits after its forward target **died** with no
 /// current remote interest in the topic, before concluding the interest genuinely
 /// ended (session gone) rather than being mid-takeover: the dead owner's successor
@@ -1410,8 +1626,18 @@ struct PendingPublish {
     retain: bool,
     message_expiry: Option<u32>,
     app: AppProperties,
-    /// Outstanding forward acks: forward seq → target node.
-    awaiting: HashMap<u64, NodeId>,
+    /// Outstanding forward answers: forward seq → what was forwarded, and where.
+    awaiting: HashMap<u64, ForwardObligation>,
+    /// Whether this publish is known to be durably STORED somewhere — locally, or on
+    /// a peer that answered [`ForwardVerdict::Stored`].
+    ///
+    /// [`refuse_pending`](Hub::refuse_pending) consults it: `Refused` makes the
+    /// positive claim "nothing was stored, retry", so a publish that IS held for some
+    /// of its subscribers may only be WITHHELD (which claims nothing). Without this a
+    /// brownout entered during a takeover window would answer `0x97` for a message
+    /// already durably owed to a subscriber, and the application's retry would
+    /// duplicate it there (issue #238).
+    stored: bool,
     /// Peers whose durability ack already arrived — a takeover re-route never
     /// re-obligates them.
     acked_nodes: HashSet<NodeId>,
@@ -1431,6 +1657,39 @@ struct PendingPublish {
     /// publish re-delivers locally against the just-materialized subscriptions
     /// (exhibit ⑥'s ack-into-the-void window; duplicates are legal at `QoS` 1).
     awaiting_settle: bool,
+}
+
+/// One outstanding cross-node obligation of a gated publish (ADR 0042 T9 exhibit ⑤;
+/// 0041-T12 for the shared kind): where it went, and which frame answers it.
+#[derive(Debug, Clone)]
+struct ForwardObligation {
+    /// The node the forward went to.
+    node: NodeId,
+    /// Which frame this obligation is, so a retransmit re-sends the SAME kind.
+    kind: ForwardKind,
+}
+
+/// The two things a gated publish can owe a peer an answer for.
+#[derive(Debug, Clone)]
+enum ForwardKind {
+    /// An interest-driven fan-out forward ([`PeerMessage::PublishAcked`]): the peer
+    /// delivers to whichever of its own subscribers match.
+    Ordinary,
+    /// A shared-group delivery targeted at one named member
+    /// ([`PeerMessage::SharedDeliverAcked`], proto 7). A refusal here does not refuse
+    /// the publisher: a shared group exists so that one member's browned-out node
+    /// becomes a RE-SELECTION, not a cluster-wide publish refusal.
+    Shared {
+        /// The group this delivery belongs to (for the re-selection).
+        key: SharedKey,
+        /// The chosen member.
+        client: ClientId,
+        /// The already-downgraded delivery `QoS`.
+        qos: QoS,
+        /// Every candidate already tried for this publish, so a re-selection pass is
+        /// bounded: each candidate at most once, then the publisher is answered.
+        tried: Vec<(Option<NodeId>, ClientId)>,
+    },
 }
 
 /// The order-independent digest of a retained set (0014-T6 + ADR 0037 P1): the topic
@@ -1580,6 +1839,7 @@ impl Hub {
                 publish_ids: 0,
                 forward_seq: 0,
                 forward_index: HashMap::new(),
+                durable_writes: 0,
                 inherited_scan_inflight: false,
                 interest_authoritative: false,
                 interest_suppressed_ticks: 0,
@@ -1818,7 +2078,8 @@ impl Hub {
                     if v5 {
                         warn!(topic = %topic, "retained quota exceeded; publish refused 0x97 (ADR 0041)");
                         if let Some(done) = done {
-                            let _ = done.send(PublishOutcome::RetainedQuotaExceeded);
+                            let _ =
+                                done.send(PublishOutcome::Refused(PublishRefusal::RetainedQuota));
                         }
                         return;
                     }
@@ -1835,7 +2096,10 @@ impl Hub {
                 // Time the synchronous on-loop fan-out (local deliver + offline enqueue
                 // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
                 let started = Instant::now();
-                let durable_ok = self
+                // Snapshotted so a later refusal can tell "stored nowhere" (refusable)
+                // from "already stored for somebody" (withhold only) — issue #238.
+                let writes_before = self.durable_writes;
+                let durable = self
                     .publish(
                         &topic,
                         &payload,
@@ -1856,12 +2120,16 @@ impl Hub {
                 // completes right here). A failed durable append WITHHOLDS the ack
                 // instead (drop the entry): the publisher's connection closes
                 // unacked and it retries — fail closed, never an ack for a message
-                // a subscriber will never see (ADR 0041 T5).
+                // a subscriber will never see (ADR 0041 T5). A stated-policy
+                // REFUSAL (brownout) is told to the publisher instead of withheld,
+                // so it ends in an immediate, retryable error rather than a close
+                // (0041-T11, issue #238).
                 if let Some(id) = gate {
-                    if durable_ok {
-                        self.pending_local_done(id);
-                    } else {
-                        self.drop_pending(id);
+                    self.mark_stored_since(id, writes_before);
+                    match durable {
+                        DurableOutcome::Ok => self.pending_local_done(id),
+                        DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+                        DurableOutcome::Failed => self.drop_pending(id),
                     }
                 }
             }
@@ -1930,16 +2198,78 @@ impl Hub {
                 // the sender forwarded because interest said someone here is owed
                 // this, and "I found no one" is not yet a claim this node can stand
                 // behind — the refusal makes the publisher retry until it is.
-                let (durable_ok, matched) = self
-                    .deliver(&topic, &payload, qos, retain, message_expiry, &app, None)
+                //
+                // The answer is a VERDICT at proto ≥ 7 (0041-T12, issue #238), so a
+                // stated-policy REFUSAL on this node reaches the origin as one and its
+                // publisher is told `0x97` instead of being closed on unacked. At proto 6
+                // it collapses to `PublishAck { ok }` — today's behaviour verbatim, the
+                // rolling-upgrade skew residual. The fan-out is `answerable` either way:
+                // a verdict travels back, so a refusal must be effect-free here too.
+                let (durable, matched) = self
+                    .deliver(
+                        &topic,
+                        &payload,
+                        qos,
+                        retain,
+                        message_expiry,
+                        &app,
+                        None,
+                        true,
+                    )
                     .await;
-                let ok = durable_ok && !(matched == 0 && self.routing_unsettled());
-                if let Some(peer) = self.peers.get(&node) {
-                    let _ = peer.tx.send(PeerMessage::PublishAck { seq, ok });
-                }
+                // A fan-out that matched NOBODY mid-settle maps to FAILED, never
+                // `Refused`: the message may genuinely be owed and delivered once the
+                // view settles, so "nothing was stored, retry" would be a FALSE refusal
+                // — as much a defect as a false ack.
+                let verdict = if matched == 0 && self.routing_unsettled() {
+                    ForwardVerdict::Failed
+                } else {
+                    durable.to_verdict()
+                };
+                self.answer_forward(&node, seq, verdict);
             }
             HubCommand::RemotePublishAck { node, seq, ok } => {
-                self.forward_acked(&node, seq, ok);
+                // A proto-6 peer's boolean: `false` means only "not stored, reason
+                // unknown", which is exactly `Failed` — withhold.
+                let verdict = if ok {
+                    ForwardVerdict::Stored
+                } else {
+                    ForwardVerdict::Failed
+                };
+                self.forward_answered(&node, seq, verdict).await;
+            }
+            HubCommand::RemotePublishVerdict { node, seq, verdict } => {
+                self.forward_answered(&node, seq, verdict).await;
+            }
+            HubCommand::RemoteSharedDeliverAcked {
+                node,
+                seq,
+                client,
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+            } => {
+                // The answerable form of `RemoteSharedDeliver` (0041-T12, issue #238):
+                // the outcome is no longer discarded. A gated cross-node shared delivery
+                // is durability-gated on the OWNING node and answered, so the origin can
+                // re-select within the group instead of acking a message that reached
+                // nobody. Arrives only from a proto-7 sender, so a verdict can always be
+                // sent back.
+                let out = self
+                    .deliver_to_client(
+                        &client,
+                        &topic,
+                        &payload,
+                        qos,
+                        message_expiry,
+                        &app,
+                        false, // shared delivery clears RETAIN (#198)
+                        true,
+                    )
+                    .await;
+                self.answer_forward(&node, seq, out.to_verdict());
             }
             HubCommand::RemotePublish {
                 topic,
@@ -1954,8 +2284,20 @@ impl Hub {
                 // later local subscriber sees it (ADR 0014). The publisher's message
                 // expiry is carried over the link (ADR 0014 T9), so a queued cross-node
                 // copy keeps the same deadline. User Properties ride along (ADR 0030).
+                // Unanswerable: no publisher and no peer awaits an answer to a plain
+                // `Publish` forward, so a refused durable copy must not cost the live
+                // delivery (issue #238).
                 let _ = self
-                    .deliver(&topic, &payload, qos, retain, message_expiry, &app, None)
+                    .deliver(
+                        &topic,
+                        &payload,
+                        qos,
+                        retain,
+                        message_expiry,
+                        &app,
+                        None,
+                        false,
+                    )
                     .await;
             }
             HubCommand::PeerConnected {
@@ -1963,8 +2305,9 @@ impl Hub {
                 conn_id,
                 tx,
                 cert_serial,
+                proto,
             } => {
-                self.peer_connected(node.clone(), conn_id, tx, cert_serial);
+                self.peer_connected(node.clone(), conn_id, tx, cert_serial, proto);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -1978,7 +2321,7 @@ impl Hub {
                 self.peer_disconnected(&node, conn_id);
             }
             HubCommand::PeerDead { node } => {
-                self.peer_dead(&node);
+                self.peer_dead(&node).await;
                 // The takeover window (ADR 0042 T9, exhibit ⑥): reconcile inherited
                 // sessions eagerly for the next several sweep ticks so their
                 // subscriptions materialize within seconds of the owner's death.
@@ -2177,7 +2520,24 @@ impl Hub {
                 // deadline. Application properties ride along (ADR 0030).
                 // retain=false: a shared-subscription delivery clears the flag (RAP is applied
                 // on the ordinary-delivery path only, #198).
-                self.deliver_to_client(&client, &topic, &payload, qos, message_expiry, &app, false)
+                // Unanswered by construction: this frame is only sent when nothing is
+                // owed (`QoS` 0) or the link is proto 6 and cannot carry a verdict
+                // ([`RemoteSharedDeliverAcked`](HubCommand::RemoteSharedDeliverAcked) is
+                // the answerable form — 0041-T12). `answerable = false` is therefore the
+                // truth, and it is what keeps the live send when the durable copy is
+                // refused: nobody will be told and nobody will retry, so suppressing the
+                // delivery would destroy the message rather than defer it.
+                let _ = self
+                    .deliver_to_client(
+                        &client,
+                        &topic,
+                        &payload,
+                        qos,
+                        message_expiry,
+                        &app,
+                        false,
+                        false,
+                    )
                     .await;
             }
             // Client/session commands are handled in `dispatch`; they never route here.
@@ -2188,8 +2548,10 @@ impl Hub {
     /// Publish a locally-originated message: apply it on this node, then forward to
     /// peers (interested peers for live delivery; **all** peers for retained, so each
     /// node stores it for its future subscribers — ADR 0014).
-    /// Returns `false` when a durable offline enqueue failed — the dispatch then
-    /// withholds the publisher's ack (ADR 0041 T5).
+    /// Returns a non-`Ok` [`DurableOutcome`] when a durable enqueue failed — the
+    /// dispatch then withholds the publisher's ack (ADR 0041 T5) — or was refused
+    /// under a stated policy, which the dispatch turns into a reason the publisher
+    /// is told (0041-T11, issue #238).
     #[allow(clippy::too_many_arguments)]
     async fn publish(
         &mut self,
@@ -2201,19 +2563,48 @@ impl Hub {
         app: &AppProperties,
         gate: Option<u64>,
         publisher: Option<&ClientId>,
-    ) -> bool {
-        let (mut durable_ok, _matched) = self
-            .deliver(topic, payload, qos, retain, message_expiry, app, publisher)
+    ) -> DurableOutcome {
+        // PLAN, then COMMIT (issue #238). A refusal must be EFFECT-FREE, so it is
+        // decided before the first side effect of the whole publish — before
+        // `deliver`'s `retained.set`, before any append, before any live send, before
+        // `forward_to_peers`, before `route_retained_commit`. The SHARED half is
+        // planned here because `deliver` cannot see it, and it is peeked rather than
+        // selected so a refused publish does not consume a group member's turn.
+        let answerable = gate.is_some();
+        if answerable && self.shared_plan_owes_durable(topic, qos) {
+            if let Some(r) = self.plan_refusal(true) {
+                self.count_refusal(r);
+                return DurableOutcome::Refused(r);
+            }
+        }
+        let (mut durable, _matched) = self
+            .deliver(
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+                publisher,
+                answerable,
+            )
             .await;
+        // `deliver` refused before taking any side effect, so there is nothing to
+        // forward, nothing to commit and no member's turn to consume: return with the
+        // publish exactly as unobserved as if it had never arrived.
+        if let DurableOutcome::Refused(r) = durable {
+            return DurableOutcome::Refused(r);
+        }
         // Shared subscriptions are selected once cluster-wide by the originating
         // node (ADR 0015), so this runs only for locally-originated publishes. Its
         // durability gates the ack too (#164): a shared subscriber is a persistent
         // subscriber, and a failed enqueue for the chosen member must withhold the
         // publisher's ack exactly as an ordinary subscriber's would — otherwise the
         // publisher is told a message survived that was never recorded.
-        durable_ok &= self
-            .deliver_shared(topic, payload, qos, message_expiry, app)
-            .await;
+        durable = durable.and(
+            self.deliver_shared(topic, payload, qos, message_expiry, app, gate)
+                .await,
+        );
         self.forward_to_peers(topic, payload, qos, retain, message_expiry, app, gate);
         // Durable retained (ADR 0037): after the live fan-out — which stays undelayed —
         // route the retained mutation to its topic's group lease-owner for the
@@ -2228,13 +2619,18 @@ impl Hub {
             let expires_at = message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s));
             self.route_retained_commit(topic, payload, qos_num(qos), app, gate, expires_at);
         }
-        durable_ok
+        durable
     }
 
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
     /// will's own application properties (ADR 0030); a will never sets a message-expiry.
+    ///
+    /// UNGATED, and that is load-bearing (issue #238): there is no publisher to refuse
+    /// and nothing that will retry, so a Will whose durable copy a watermark refuses is
+    /// still delivered LIVE and counted as a genuine drop — never suppressed. A Will
+    /// suppressed under brownout is a device that stays "online" on every dashboard
+    /// through exactly the incident [MQTT-3.14.4-3] exists for.
     async fn publish_will(&mut self, w: &Message) {
-        // No publisher waits on a will, so nothing gates on its durability.
         self.publish(
             &w.topic, &w.payload, w.qos, w.retain, None, &w.app, None, None,
         )
@@ -2246,11 +2642,11 @@ impl Hub {
     /// for local publishes (via
     /// [`publish`](Self::publish)) and for publishes received from a peer, which must
     /// never be re-forwarded.
-    /// Returns `(durable_ok, matched)`: `durable_ok = false` when a durable
-    /// offline enqueue failed (ADR 0041 T5), and `matched` is how many local
-    /// ordinary subscribers the topic found — a gated forward answered from a
-    /// zero-match fan-out while the routing view is unsettled must refuse, not
-    /// OK (0043-P4 exhibit ②).
+    /// Returns `(durable, matched)`: `durable` is non-`Ok` when a durable enqueue
+    /// failed (ADR 0041 T5) or a stated policy refused one (0041-T11), and `matched`
+    /// is how many local ordinary subscribers the topic found — a gated forward
+    /// answered from a zero-match fan-out while the routing view is unsettled must
+    /// refuse, not OK (0043-P4 exhibit ②).
     #[allow(clippy::too_many_arguments)] // the delivery-path fields, plus the No Local publisher
     async fn deliver(
         &mut self,
@@ -2261,10 +2657,31 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         publisher: Option<&ClientId>,
-    ) -> (bool, usize) {
-        // Under durable retained (ADR 0037 §3) the cache is warmed exclusively by the
-        // owner's post-commit, token-carrying fan-out — applying the raw (uncommitted,
-        // untokened) flag here is exactly the everyday-race divergence the ADR removes.
+        answerable: bool,
+    ) -> (DurableOutcome, usize) {
+        // PLAN pass (issue #238): the recipients and their delivery terms are computed
+        // with no I/O, so the refusal can be decided BEFORE the retained mutation below
+        // — a publish answered "not accepted" must not already have overwritten a
+        // durable retained value that every future subscriber will now see. Also before
+        // any live send: an online clean-session or `QoS` 0 subscriber of a wholesale-
+        // refused publish receives nothing, because the publisher still owns the message
+        // and is expected to retry it (there is no way to say "delivered to two of your
+        // three subscribers" on one PUBACK).
+        let targets = self.ordinary_targets(topic, publisher, retain);
+        let matched = targets.len();
+        if answerable {
+            let owes = targets
+                .iter()
+                .any(|(c, granted, _)| self.owes_durable(c, min_qos(qos, *granted)));
+            if let Some(r) = self.plan_refusal(owes) {
+                self.count_refusal(r);
+                return (DurableOutcome::Refused(r), matched);
+            }
+        }
+        // COMMIT pass. Under durable retained (ADR 0037 §3) the cache is warmed
+        // exclusively by the owner's post-commit, token-carrying fan-out — applying the
+        // raw (uncommitted, untokened) flag here is exactly the everyday-race divergence
+        // the ADR removes.
         let mut retained_ok = true;
         if retain && self.durable_retained.is_none() {
             // A zero-length retained payload clears the retained message
@@ -2294,11 +2711,27 @@ impl Hub {
             }
         }
         // Live deliveries carry retain=0 [MQTT-3.3.1-9]. The retained-write outcome gates the
-        // publisher's ack alongside the live-delivery durability.
-        let (durable_ok, matched) = self
-            .deliver_local(topic, payload, qos, message_expiry, app, publisher, retain)
+        // publisher's ack alongside the live-delivery durability. A FAILED retained write
+        // stays a withhold rather than a reason code — the store errored, and no reason
+        // code honestly says "I do not know what happened" (`DurableOutcome::Failed`
+        // therefore dominates any refusal).
+        let (durable, _matched) = self
+            .deliver_local(
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+                targets,
+                answerable,
+            )
             .await;
-        (durable_ok && retained_ok, matched)
+        let durable = if retained_ok {
+            durable
+        } else {
+            durable.and(DurableOutcome::Failed)
+        };
+        (durable, matched)
     }
 
     /// Log when a persistent session is served on a node that is not its
@@ -3062,21 +3495,18 @@ impl Hub {
             .is_some_and(|fs| fs.iter().any(|f| mqtt_core::topic_matches(f, topic)))
     }
 
-    #[allow(clippy::too_many_arguments)] // the delivery fields, plus the two subscription options
-    async fn deliver_local(
-        &mut self,
+    /// The ordinary (non-shared) local recipients of `topic` and each one's delivery
+    /// terms: `(client, granted QoS, wire retain flag)`.
+    ///
+    /// Pure and I/O-free, so it can be computed in the PLAN pass — before any side
+    /// effect — and handed to the COMMIT pass unchanged (issue #238).
+    fn ordinary_targets(
+        &self,
         topic: &str,
-        payload: &Bytes,
-        qos: QoS,
-        message_expiry: Option<u32>,
-        app: &AppProperties,
         publisher: Option<&ClientId>,
         source_retain: bool,
-    ) -> (bool, usize) {
-        // Per-subscriber: No Local suppresses the publisher's own copy; Retain As Published
-        // decides whether this subscriber keeps the source RETAIN flag (#198).
-        let targets: Vec<(ClientId, QoS, bool)> = self
-            .table
+    ) -> Vec<(ClientId, QoS, bool)> {
+        self.table
             .matching_clients(topic)
             .into_iter()
             .filter(|c| !self.suppressed_by_no_local(c, topic, publisher))
@@ -3085,7 +3515,61 @@ impl Hub {
                 let retain = source_retain && self.keeps_retain_flag(&c, topic);
                 (c, granted, retain)
             })
-            .collect();
+            .collect()
+    }
+
+    /// Whether delivering to `client` at `delivered_qos` OWES a durable append: a
+    /// persistent session is promised redelivery of anything unacknowledged (#124),
+    /// and at-most-once is promised nothing. Both checks are in-memory.
+    fn owes_durable(&self, client: &ClientId, delivered_qos: QoS) -> bool {
+        self.is_persistent(client) && delivered_qos != QoS::AtMostOnce
+    }
+
+    /// PLAN, DECIDE, COMMIT (issue #238): the refusal a fan-out that owes a durable
+    /// append would hit, decided BEFORE the fan-out takes any side effect.
+    ///
+    /// This is what makes a refusal EFFECT-FREE, and therefore what makes the
+    /// publisher's retry idempotent: nothing is retained, nothing is appended, nothing
+    /// reaches a subscriber's wire and no peer forward leaves, so a resend (a v3.1.1
+    /// client's mandatory one included) re-decides a decision with no residue rather
+    /// than duplicating half a fan-out.
+    ///
+    /// Atomicity needs no new machinery: the hub is a single-owner actor and
+    /// `self.brownout` is written only by the `SetBrownout` handler, so no other
+    /// command interleaves with the awaits inside one publish — the decide pass and
+    /// the commit pass necessarily see the same flag and the same routing table.
+    /// Anything that later moves a fan-out off the hub loop, splits it across commands,
+    /// or lets a watcher write `brownout` directly breaks that silently; the
+    /// `debug_assert!` in [`durable_append`](Self::durable_append) is the tripwire.
+    fn plan_refusal(&self, owes_durable: bool) -> Option<PublishRefusal> {
+        (owes_durable && self.brownout).then_some(PublishRefusal::Brownout)
+    }
+
+    /// Count a refusal the publisher is TOLD about. Deliberately NOT
+    /// `publish_dropped`: the publisher can act on the answer, so counting it as a
+    /// loss would over-report losses that never happened (see the metric's own
+    /// rustdoc). A refusal nobody is told about is the opposite case, and
+    /// [`durable_append`](Self::durable_append) counts that one as the drop it is.
+    fn count_refusal(&self, r: PublishRefusal) {
+        if let Some(m) = &self.metrics {
+            match r {
+                PublishRefusal::Brownout => m.quota_rejected("brownout-publish"),
+                PublishRefusal::RetainedQuota => m.quota_rejected("retained"),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // the delivery fields, plus the two subscription options
+    async fn deliver_local(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+        targets: Vec<(ClientId, QoS, bool)>,
+        answerable: bool,
+    ) -> (DurableOutcome, usize) {
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
         let matched = targets.len();
         // #219: a delivery made here is one the apply path must not repeat — record
@@ -3100,15 +3584,15 @@ impl Hub {
                 &AppProps::from(app).encode(),
             )
         });
-        let mut all_durable = true;
+        let mut all_durable = DurableOutcome::Ok;
         for (c, granted, retain) in targets {
             if let Some(id) = window_id {
                 if let Some(w) = self.retained_windows.get_mut(&c) {
                     w.seen.insert(topic.to_string(), id);
                 }
             }
-            all_durable &= self
-                .deliver_to_client(
+            all_durable = all_durable.and(
+                self.deliver_to_client(
                     &c,
                     topic,
                     payload,
@@ -3116,8 +3600,10 @@ impl Hub {
                     message_expiry,
                     app,
                     retain,
+                    answerable,
                 )
-                .await;
+                .await,
+            );
         }
         (all_durable, matched)
     }
@@ -3126,10 +3612,23 @@ impl Hub {
     /// `QoS` > 0 in flight), else queued if the session is persistent, else dropped.
     /// The unit of both ordinary and shared (ADR 0015) delivery; `qos` is the
     /// already-downgraded delivery `QoS`.
-    /// Returns `false` when a durable offline enqueue failed terminally — the
-    /// caller withholds the publisher's ack so it retries (ADR 0041 T5).
+    /// Returns [`DurableOutcome::Failed`] when a durable enqueue failed terminally —
+    /// the caller withholds the publisher's ack so it retries (ADR 0041 T5) — and
+    /// [`DurableOutcome::Refused`] when a stated policy refused it, which the caller
+    /// turns into an answer the publisher can act on, per protocol version
+    /// (0041-T11, issue #238).
     /// `retain` is the flag to put on the wire — set only for a Retain As Published
     /// subscriber on the ordinary path (#198); every other path clears it [MQTT-3.3.1-9].
+    ///
+    /// `answerable` says whether SOMEBODY IS BEING TOLD about a refusal — a gated
+    /// publisher, or a peer awaiting a verdict. It is the whole justification for
+    /// suppressing the live send when the durable copy is refused: the message is not
+    /// lost, because its owner still holds it and will retry. With `answerable = false`
+    /// there is no such owner (a Will, a retained-window back-fill), so suppressing the
+    /// live delivery would destroy the message outright — and a Will suppressed during
+    /// an incident is the opposite of what [MQTT-3.14.4-3] is for. An UNANSWERABLE
+    /// refusal therefore delivers live anyway (recorded nowhere, so nothing is owed) and
+    /// is counted as the genuine drop it is (issue #238).
     #[allow(clippy::too_many_arguments)] // the delivery fields, plus the RAP retain flag
     async fn deliver_to_client(
         &mut self,
@@ -3140,7 +3639,23 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         retain: bool,
-    ) -> bool {
+        answerable: bool,
+    ) -> DurableOutcome {
+        // DECIDE BEFORE COMMITTING, for the single-target callers too (issue #238).
+        // `deliver`'s plan pass already decided for a local fan-out and returned before
+        // reaching here, so this fires only for the callers that arrive with ONE target
+        // and no plan pass of their own: a peer's answerable shared delivery
+        // (`RemoteSharedDeliverAcked`) and the settle-window re-delivery
+        // (`redeliver_pending`). Deciding here keeps a refusal effect-free on those paths
+        // as well — nothing appended, nothing sent — which is what lets the origin
+        // re-select within a shared group, and what keeps `durable_append`'s invariant
+        // assert a statement about the WHOLE hub rather than just the local publish path.
+        if answerable && self.owes_durable(client, qos) {
+            if let Some(r) = self.plan_refusal(true) {
+                self.count_refusal(r);
+                return DurableOutcome::Refused(r);
+            }
+        }
         let message = Message {
             topic: topic.to_string(),
             payload: payload.clone(),
@@ -3159,12 +3674,29 @@ impl Hub {
             // to resume into, and `QoS` 0 because at-most-once owes no redelivery.
             let mut offset = None;
             if persistent && qos != QoS::AtMostOnce {
-                match self.durable_append(client, &message, message_expiry).await {
+                match self
+                    .durable_append(client, &message, message_expiry, answerable)
+                    .await
+                {
                     Appended::At(o) => offset = Some(o),
-                    Appended::Skipped => {}
-                    // The publisher's ack is withheld, so it retries; delivering live
-                    // anyway would promise a redelivery the store cannot honour.
-                    Appended::Failed => return false,
+                    // Returns BEFORE the live send: delivering live with no durable
+                    // record promises a redelivery the store cannot honour, and the
+                    // publisher — which is about to be refused — would retry into a
+                    // duplicate carrying no DUP flag and no offset to truncate.
+                    Appended::Refused(r) if answerable => return DurableOutcome::Refused(r),
+                    // Fall through to the live send with `offset` staying `None`. Two
+                    // different situations that share one behaviour:
+                    //   `Dropped`  — the queue cap discarded the durable copy, but the
+                    //                publisher was acked, so the online subscriber
+                    //                should still see the message.
+                    //   `Refused`  — UNANSWERABLE (a Will, a retained-window back-fill):
+                    //                nobody will be told and nobody will retry, so the
+                    //                live send is the only way the message reaches its
+                    //                subscriber at all. `durable_append` already counted
+                    //                the lost durable copy as the genuine drop it is.
+                    // Neither promises a redelivery, hence no offset either way.
+                    Appended::Dropped | Appended::Refused(_) => {}
+                    Appended::Failed => return DurableOutcome::Failed,
                 }
             }
             self.send_to_client(client, &tx, &message, retain, message_expiry, offset)
@@ -3172,16 +3704,31 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
             }
-            return true;
+            return DurableOutcome::Ok;
         }
         if persistent {
             // Offline but persistent: queue for replay on reconnect.
-            return !matches!(
-                self.durable_append(client, &message, message_expiry).await,
-                Appended::Failed
-            );
+            return match self
+                .durable_append(client, &message, message_expiry, answerable)
+                .await
+            {
+                Appended::At(_) | Appended::Dropped => DurableOutcome::Ok,
+                // At-most-once owes no redelivery, so a refused enqueue for it is a
+                // genuine drop with nothing to refuse the publisher for — the same
+                // rule the online branch states by not appending at `QoS` 0 at all.
+                // (Reachable when a `QoS` ≥ 1 publish is downgraded to a `QoS` 0
+                // subscription, which is exactly the case that owes nothing.)
+                Appended::Refused(_) if qos == QoS::AtMostOnce => DurableOutcome::Ok,
+                // Unanswerable and offline: there is no live send to fall back on, so
+                // the message is genuinely gone. `durable_append` counted it; reporting
+                // a refusal to a caller that has nobody to refuse would only turn a
+                // drop into a spurious withhold of an unrelated publisher's ack.
+                Appended::Refused(_) if !answerable => DurableOutcome::Ok,
+                Appended::Refused(r) => DurableOutcome::Refused(r),
+                Appended::Failed => DurableOutcome::Failed,
+            };
         }
-        true
+        DurableOutcome::Ok
     }
 
     /// Append `message` to `client`'s durable session log — the write the publisher's
@@ -3194,17 +3741,37 @@ impl Hub {
         client: &ClientId,
         message: &Message,
         message_expiry: Option<u32>,
+        answerable: bool,
     ) -> Appended {
-        // Disk brownout (ADR 0041 T5): an enqueue GROWS the store — refused above the
-        // watermark, counted, like a queue overflow. An online subscriber still gets the
-        // message live; it is the durable copy that is refused, not the delivery.
+        // Brownout (ADR 0041 T5 disk / T8 memory): an enqueue GROWS the store, so it is
+        // refused above the watermark. The publisher is REFUSED with it (0041-T11, issue
+        // #238) rather than acked for a message that exists nowhere — "acked means
+        // durable" is the product claim, and QoS 0 / clean session is the spec-native way
+        // to ask for fire-and-forget.
         if self.brownout {
-            warn!(client = %client.0, topic = %message.topic,
-                  "brownout: durable enqueue refused (ADR 0041)");
+            // Debug, not warn: the brownout entry/exit EDGES already log at warn/info in
+            // `set_brownout_axis`, and a sustained brownout must not flood the very log
+            // the operator is diagnosing it from.
+            debug!(client = %client.0, topic = %message.topic,
+                   "brownout: durable enqueue refused (ADR 0041)");
+            // An ANSWERABLE fan-out never gets here: `plan_refusal` decided the refusal
+            // before this fan-out took any side effect, which is what makes a refusal
+            // effect-free and the publisher's retry idempotent (issue #238). Reaching
+            // here means a caller with NOBODY TO TELL — `publish_will`,
+            // `deliver_to_windowed_subscribers`, `redeliver_pending`'s ungated paths — so
+            // the lost durable copy is a genuine drop, counted as one. The assert is the
+            // tripwire for a future refusal axis, or a fan-out moved off the hub loop,
+            // that breaks the plan/commit invariant.
+            debug_assert!(
+                !answerable || message.qos == QoS::AtMostOnce,
+                "an answerable fan-out that OWED a durable append reached \
+                 durable_append's brownout arm: the plan/commit invariant behind an \
+                 effect-free refusal is broken (#238)"
+            );
             if let Some(m) = &self.metrics {
                 m.publish_dropped("brownout");
             }
-            return Appended::Skipped;
+            return Appended::Refused(PublishRefusal::Brownout);
         }
         let expiry_at = message_expiry.map(|secs| self.clock.now_epoch_secs() + u64::from(secs));
         // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
@@ -3230,6 +3797,9 @@ impl Hub {
                         m.publish_dropped("queue-overflow");
                     }
                 }
+                // The one place a durable copy comes into existence — so the one place
+                // that can honestly say a publish IS stored somewhere (issue #238).
+                self.durable_writes += 1;
                 Appended::At(offset)
             }
             Ok(Enqueued::Rejected) => {
@@ -3238,7 +3808,7 @@ impl Hub {
                 if let Some(m) = &self.metrics {
                     m.publish_dropped("queue-overflow");
                 }
-                Appended::Skipped
+                Appended::Dropped
             }
             Err(e) => {
                 if let Some(m) = &self.metrics {
@@ -3259,13 +3829,23 @@ impl Hub {
     /// deliver to it — locally, or via a targeted `SharedDeliver` to the member's
     /// node (ADR 0015). The originating node is the sole selector, so there is no
     /// double delivery.
-    /// Returns `false` when a chosen LOCAL member's durable enqueue failed — the same
-    /// contract as [`deliver_local`], and for the same reason: a shared subscriber is a
+    /// Returns a non-`Ok` [`DurableOutcome`] when a chosen LOCAL member's durable enqueue
+    /// failed or was refused — the same contract as [`deliver_local`](Self::deliver_local),
+    /// and for the same reason: a shared subscriber is a
     /// persistent subscriber owed redelivery, so an acked-but-unrecorded message is the
-    /// #124/#164 loss whether it arrived via an ordinary or a shared subscription. A
-    /// member chosen on a PEER is gated by that peer's own `deliver_to_client` there;
-    /// this node cannot observe its store and does not pretend to (the durability of a
-    /// cross-node shared delivery follows the owning node, ADR 0015).
+    /// #124/#164 loss whether it arrived via an ordinary or a shared subscription.
+    ///
+    /// A member chosen on a PEER is ANSWERABLE since 0041-T12 (issue #238): a gated
+    /// `QoS` ≥ 1 delivery to a proto-7 peer goes out as
+    /// [`PeerMessage::SharedDeliverAcked`] and becomes an obligation on the pending
+    /// publish — same seq space, same sweep retransmission, same cap — so the publisher's
+    /// ack waits for the owning node to actually take the message. It replaces a
+    /// four-state outcome with a three-state one: stored on the chosen member's node,
+    /// stored on a RE-SELECTED member, or nobody took it and the publisher still owns it.
+    /// The fourth state — nobody took it AND the publisher was acked — is the #238 defect
+    /// and no longer reachable. `QoS` 0 deliveries and proto-6 peers keep today's
+    /// fire-and-forget `SharedDeliver`: nothing is owed, or the link cannot carry the
+    /// answer (a documented rolling-upgrade skew residual).
     async fn deliver_shared(
         &mut self,
         topic: &str,
@@ -3273,8 +3853,10 @@ impl Hub {
         qos: QoS,
         message_expiry: Option<u32>,
         app: &AppProperties,
-    ) -> bool {
-        let mut all_durable = true;
+        gate: Option<u64>,
+    ) -> DurableOutcome {
+        let answerable = gate.is_some();
+        let mut all_durable = DurableOutcome::Ok;
         for (key, candidates) in self.shared_candidates(topic) {
             let Some(chosen) = self.select_shared(&key, &candidates) else {
                 debug!(topic = %topic, "shared group has no reachable member");
@@ -3283,8 +3865,8 @@ impl Hub {
             let delivered_qos = min_qos(qos, chosen.qos);
             match chosen.node {
                 None => {
-                    all_durable &= self
-                        .deliver_to_client(
+                    all_durable = all_durable.and(
+                        self.deliver_to_client(
                             &chosen.client,
                             topic,
                             payload,
@@ -3292,23 +3874,171 @@ impl Hub {
                             message_expiry,
                             app,
                             false, // shared delivery clears RETAIN (#198)
+                            answerable,
                         )
-                        .await;
+                        .await,
+                    );
                 }
                 Some(node) => {
-                    self.send_shared_to_peer(
-                        &node,
-                        &chosen.client,
-                        topic,
-                        payload,
-                        delivered_qos,
-                        message_expiry,
-                        app,
-                    );
+                    let answerable_remote = answerable
+                        && qos_num(delivered_qos) >= 1
+                        && self.peer_proto(&node) >= PROTO_FORWARD_VERDICT;
+                    match (answerable_remote, gate) {
+                        (true, Some(id)) => self.register_forward(
+                            id,
+                            ForwardObligation {
+                                node: node.clone(),
+                                kind: ForwardKind::Shared {
+                                    key: key.clone(),
+                                    client: chosen.client.clone(),
+                                    qos: delivered_qos,
+                                    tried: vec![(Some(node), chosen.client.clone())],
+                                },
+                            },
+                        ),
+                        _ => self.send_shared_to_peer(
+                            &node,
+                            &chosen.client,
+                            topic,
+                            payload,
+                            delivered_qos,
+                            message_expiry,
+                            app,
+                        ),
+                    }
                 }
             }
         }
         all_durable
+    }
+
+    /// Whether this publish's shared selection would land on a LOCAL member that owes a
+    /// durable append — the shared half of the PLAN pass (issue #238).
+    ///
+    /// PEEKS the selection rather than making it: `select_shared` advances the group's
+    /// round-robin cursor, and a publish that is about to be refused must not consume a
+    /// member's turn. Remote members are excluded because their durability is decided on
+    /// their own node, by its own plan pass.
+    fn shared_plan_owes_durable(&self, topic: &str, qos: QoS) -> bool {
+        self.shared_candidates(topic).into_iter().any(|(key, cs)| {
+            self.peek_shared(&key, &cs).is_some_and(|c| {
+                c.node.is_none() && self.owes_durable(&c.client, min_qos(qos, c.qos))
+            })
+        })
+    }
+
+    /// Re-select within a shared group after the chosen member's node refused
+    /// (0041-T12, issue #238).
+    ///
+    /// A shared group exists precisely so that one member being unable to take a message
+    /// is a re-balance, not a cluster-wide publish refusal. Each candidate is tried at
+    /// most once per publish (`tried`), so the pass is bounded; only an EXHAUSTED pass
+    /// answers the publisher, with the last refusal it saw — or a withhold when the last
+    /// answer claimed nothing.
+    async fn reselect_shared(
+        &mut self,
+        id: u64,
+        obligation: ForwardObligation,
+        last: DurableOutcome,
+    ) {
+        let ForwardKind::Shared {
+            key,
+            qos: _,
+            mut tried,
+            ..
+        } = obligation.kind
+        else {
+            return;
+        };
+        let mut last = last;
+        loop {
+            let Some(p) = self.pending_publishes.get(&id) else {
+                return; // already resolved (cap eviction, an earlier terminal answer)
+            };
+            let (topic, payload, qos, message_expiry, app) = (
+                p.topic.clone(),
+                p.payload.clone(),
+                p.qos,
+                p.message_expiry,
+                p.app.clone(),
+            );
+            let candidates: Vec<SharedCandidate> = self
+                .shared_candidates(&topic)
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, cs)| cs)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !tried.iter().any(|(n, cl)| *n == c.node && *cl == c.client))
+                .collect();
+            let Some(chosen) = self.select_shared(&key, &candidates) else {
+                debug!(
+                    publish = id, group = %key.0,
+                    "shared re-selection exhausted; answering the publisher"
+                );
+                match last {
+                    DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+                    _ => self.drop_pending(id),
+                }
+                return;
+            };
+            let delivered_qos = min_qos(qos, chosen.qos);
+            tried.push((chosen.node.clone(), chosen.client.clone()));
+            let Some(node) = chosen.node.clone() else {
+                let before = self.durable_writes;
+                let out = self
+                    .deliver_to_client(
+                        &chosen.client,
+                        &topic,
+                        &payload,
+                        delivered_qos,
+                        message_expiry,
+                        &app,
+                        false,
+                        true,
+                    )
+                    .await;
+                self.mark_stored_since(id, before);
+                match out {
+                    DurableOutcome::Ok => self.try_complete_pending(id),
+                    DurableOutcome::Failed => self.drop_pending(id),
+                    // This member cannot take it either: keep re-balancing.
+                    DurableOutcome::Refused(r) => {
+                        last = DurableOutcome::Refused(r);
+                        continue;
+                    }
+                }
+                return;
+            };
+            if qos_num(delivered_qos) >= 1 && self.peer_proto(&node) >= PROTO_FORWARD_VERDICT {
+                self.register_forward(
+                    id,
+                    ForwardObligation {
+                        node,
+                        kind: ForwardKind::Shared {
+                            key,
+                            client: chosen.client.clone(),
+                            qos: delivered_qos,
+                            tried,
+                        },
+                    },
+                );
+            } else {
+                // Nothing is owed (`QoS` 0), or the link cannot carry an answer: today's
+                // fire-and-forget delivery, and the obligation ends here.
+                self.send_shared_to_peer(
+                    &node,
+                    &chosen.client,
+                    &topic,
+                    &payload,
+                    delivered_qos,
+                    message_expiry,
+                    &app,
+                );
+                self.try_complete_pending(id);
+            }
+            return;
+        }
     }
 
     /// The shared groups matching `topic`, each with its global candidate list:
@@ -3368,6 +4098,34 @@ impl Hub {
         }
         let start = self.shared_cursor.get(key).copied().unwrap_or(0) % n;
         self.shared_cursor.insert(key.clone(), (start + 1) % n);
+        self.choose_shared(candidates, start)
+    }
+
+    /// [`select_shared`](Self::select_shared) without advancing the cursor — the PLAN
+    /// pass's view of who this publish would land on (issue #238). A publish that is
+    /// about to be refused must not consume a group member's turn.
+    fn peek_shared(
+        &self,
+        key: &SharedKey,
+        candidates: &[SharedCandidate],
+    ) -> Option<SharedCandidate> {
+        let n = candidates.len();
+        if n == 0 {
+            return None;
+        }
+        let start = self.shared_cursor.get(key).copied().unwrap_or(0) % n;
+        self.choose_shared(candidates, start)
+    }
+
+    /// The selection rule itself, shared by [`select_shared`](Self::select_shared) and
+    /// [`peek_shared`](Self::peek_shared) so a peek can never disagree with the
+    /// selection it is predicting.
+    fn choose_shared(
+        &self,
+        candidates: &[SharedCandidate],
+        start: usize,
+    ) -> Option<SharedCandidate> {
+        let n = candidates.len();
         let rotated = || candidates.iter().cycle().skip(start).take(n);
         // Immediately deliverable: any member online on its home node — local (our
         // `online`) or remote (its home node's gossiped liveness, ADR 0015 T8). Targeting a
@@ -3992,7 +4750,8 @@ impl Hub {
     /// of spilled: it is in the log already and stays *owed* there, so the truncation
     /// point cannot pass it and the reconnect replays it. Re-enqueuing it would put a
     /// second copy in the log. What still spills is the case the offset does not cover —
-    /// a message the store deliberately did not record (brownout).
+    /// a message the store deliberately did not record (the queue cap under
+    /// `reject-newest`).
     async fn flush_backlog_to_store(&mut self, client: &ClientId) {
         let backlog: Vec<Backlog> = match self.inflight.get_mut(client) {
             Some(inf) if !inf.backlog.is_empty() => inf
@@ -4311,11 +5070,17 @@ impl Hub {
     /// clients attached after the publish. Clients online since BEFORE the
     /// publish already received it live; re-sending would duplicate (dups are
     /// legal at `QoS` 1, but a boot-window re-send to a steady subscriber is a
-    /// gratuitous one — observed as duplicate bridge forwards). Returns `false`
-    /// on a terminal durable-append failure (the caller withholds).
-    async fn redeliver_pending(&mut self, id: u64) -> bool {
+    /// gratuitous one — observed as duplicate bridge forwards). Returns a non-`Ok`
+    /// [`DurableOutcome`] on a terminal durable-append failure (the caller withholds)
+    /// or a stated-policy refusal.
+    ///
+    /// A brownout entered DURING the takeover window can therefore refuse a publish
+    /// registered before it began — the publisher waited out the window and is then
+    /// told `0x97`. That is the same class as today's `Failed` → withhold, but with a
+    /// reason it can act on (0041-T11, issue #238).
+    async fn redeliver_pending(&mut self, id: u64) -> DurableOutcome {
         let Some(p) = self.pending_publishes.get(&id) else {
-            return true;
+            return DurableOutcome::Ok;
         };
         let (topic, payload, qos, expiry, app, since) = (
             p.topic.clone(),
@@ -4335,10 +5100,10 @@ impl Hub {
                 (c, granted)
             })
             .collect();
-        let mut all_durable = true;
+        let mut all_durable = DurableOutcome::Ok;
         for (c, granted) in targets {
-            all_durable &= self
-                .deliver_to_client(
+            all_durable = all_durable.and(
+                self.deliver_to_client(
                     &c,
                     &topic,
                     &payload,
@@ -4346,8 +5111,13 @@ impl Hub {
                     expiry,
                     &app,
                     false,
+                    // A gated publisher IS waiting on this id, so a refusal here is
+                    // answerable — but only as a WITHHOLD if the original fan-out
+                    // already stored the message, which `refuse_pending` enforces.
+                    true,
                 )
-                .await;
+                .await,
+            );
         }
         all_durable
     }
@@ -4376,10 +5146,22 @@ impl Hub {
         // the one observable-state predicate for all of it.
         let window_over = !self.routing_unsettled();
         for id in held {
-            if !self.redeliver_pending(id).await {
+            let writes_before = self.durable_writes;
+            let out = self.redeliver_pending(id).await;
+            self.mark_stored_since(id, writes_before);
+            match out {
+                DurableOutcome::Ok => {}
                 // The re-delivery's durable append failed terminally: withhold.
-                self.drop_pending(id);
-                continue;
+                DurableOutcome::Failed => {
+                    self.drop_pending(id);
+                    continue;
+                }
+                // A stated policy refused it (brownout entered during the window):
+                // tell the publisher rather than closing on it.
+                DurableOutcome::Refused(r) => {
+                    self.refuse_pending(id, r);
+                    continue;
+                }
             }
             // The successor may have materialized the subscriber on ANOTHER node
             // and advertised its interest since this publish's original fan-out
@@ -4660,7 +5442,7 @@ impl Hub {
             .iter()
             .filter(|(n, _)| {
                 !p.acked_nodes.contains(*n)
-                    && !p.awaiting.values().any(|v| v == *n)
+                    && !p.awaiting.values().any(|o| &o.node == *n)
                     && self
                         .remote_interest
                         .get(*n)
@@ -4673,16 +5455,35 @@ impl Hub {
     /// Send (or re-send, on re-route) one acked forward of pending publish `id` to
     /// `node`, recording the obligation (ADR 0042 T9, exhibit ⑤).
     fn send_acked_forward(&mut self, id: u64, node: &NodeId) {
+        self.register_forward(
+            id,
+            ForwardObligation {
+                node: node.clone(),
+                kind: ForwardKind::Ordinary,
+            },
+        );
+    }
+
+    /// Record `obligation` against pending publish `id` and send its frame (ADR 0042
+    /// T9 exhibit ⑤; 0041-T12). One registration path for both forward kinds, so the
+    /// seq space, the index, the cap and the sweep treat them identically.
+    ///
+    /// The frame is sent only when the link is up; a link-down (not dead) peer's
+    /// obligation is still RECORDED and the sweep sends it when the link returns —
+    /// which is also how the pre-0041-T12 `send_shared_to_peer` bug (a shared frame
+    /// silently dropped on a downed link, with the publisher acked anyway) is closed.
+    fn register_forward(&mut self, id: u64, obligation: ForwardObligation) {
         self.forward_seq += 1;
         let seq = self.forward_seq;
+        let node = obligation.node.clone();
         let Some(p) = self.pending_publishes.get_mut(&id) else {
             return;
         };
-        p.awaiting.insert(seq, node.clone());
+        let frame = forward_frame(p, seq, &obligation);
+        p.awaiting.insert(seq, obligation);
         self.forward_index.insert(seq, id);
-        debug!(publish = id, seq, target = %node.0, topic = %p.topic, "acked forward recorded");
-        let frame = publish_acked_frame(p, seq);
-        if let Some(peer) = self.peers.get(node) {
+        debug!(publish = id, seq, target = %node.0, "forward obligation recorded");
+        if let Some(peer) = self.peers.get(&node) {
             let _ = peer.tx.send(frame);
         }
     }
@@ -4728,6 +5529,7 @@ impl Hub {
                 message_expiry,
                 app: app.clone(),
                 awaiting: HashMap::new(),
+                stored: false,
                 acked_nodes: HashSet::new(),
                 awaiting_retained: false,
                 local_done: false,
@@ -4761,12 +5563,79 @@ impl Hub {
         self.try_complete_pending(id);
     }
 
+    /// The peer-bus proto this link negotiated, or
+    /// [`peer::PROTO_MIN`](mqtt_cluster::peer::PROTO_MIN) when there is no link — fail
+    /// safe toward the OLD frame, which every peer can decode (0041-T12).
+    fn peer_proto(&self, node: &NodeId) -> u32 {
+        self.peers
+            .get(node)
+            .map_or(mqtt_cluster::peer::PROTO_MIN, |p| p.proto)
+    }
+
+    /// Record that pending publish `id` gained a durable copy since `before`, so a
+    /// later refusal can only WITHHOLD (issue #238). See [`PendingPublish::stored`].
+    fn mark_stored_since(&mut self, id: u64, before: u64) {
+        if self.durable_writes > before {
+            if let Some(p) = self.pending_publishes.get_mut(&id) {
+                p.stored = true;
+            }
+        }
+    }
+
     /// Drop a pending publish, WITHHOLDING its acknowledgement (the sender side
     /// of fail-closed: the publisher's connection sees no ack and retries).
     fn drop_pending(&mut self, id: u64) {
         if self.pending_publishes.remove(&id).is_some() {
             self.forward_index.retain(|_, pid| *pid != id);
         }
+    }
+
+    /// REFUSE a pending publish (0041-T11, issue #238): unlike
+    /// [`drop_pending`](Self::drop_pending), the publisher is told *why* — the
+    /// connection turns `r` into `0x97` for v5, or a close for v3.1.1, which has no
+    /// reason byte to carry it.
+    ///
+    /// A refusal is only sayable for a publish stored NOWHERE. `Refused` carries the
+    /// positive claim "nothing was stored, so a retry is the right move"; for a publish
+    /// already durably owed to some subscriber that claim is false, and the application's
+    /// retry would duplicate it there. Such a publish is WITHHELD instead — which claims
+    /// nothing at all and is strictly weaker (issue #238). A false refusal is as much a
+    /// defect as a false ack.
+    ///
+    /// What remains is the asymmetry a withhold always had: for the local fan-out the
+    /// PLAN pass makes a refusal effect-free, but a peer forward already sent may store
+    /// the message on a peer that is not browned out and answer after this node has
+    /// refused, so the publisher's retry can duplicate on that peer's subscriber (and,
+    /// separately, a per-client store FAILURE mid-fan-out can leave earlier subscribers
+    /// with a copy). Duplicates are legal at `QoS` 1; an ack for a message this node did
+    /// not store would not be.
+    ///
+    /// One more named residual: `stored` tracks session-log appends and peer `Stored`
+    /// verdicts, NOT the retained authority — a retained publish whose retained commit
+    /// already landed cluster-wide can still be answered `Refused` when a later peer
+    /// verdict refuses. The retained value was durably replaced while the publisher
+    /// hears "nothing was stored". Tolerated because a retained retry is idempotent
+    /// (it re-writes the same value) and the reason code still drives the right client
+    /// action; folding retained commits into `stored` would withhold instead, trading
+    /// an honest reason for a silent close on an idempotent surface.
+    fn refuse_pending(&mut self, id: u64, r: PublishRefusal) {
+        let Some(p) = self.pending_publishes.remove(&id) else {
+            return;
+        };
+        self.forward_index.retain(|_, pid| *pid != id);
+        if p.stored {
+            warn!(
+                publish = id, topic = %p.topic, refusal = r.as_str(),
+                "a later fan-out pass was refused for a publish already stored durably; \
+                 ack WITHHELD rather than claiming nothing was stored (issue #238)"
+            );
+            return; // dropping `p.done` withholds
+        }
+        warn!(
+            publish = id, topic = %p.topic, refusal = r.as_str(),
+            "publish refused; the publisher is told rather than acked (ADR 0041 T11)"
+        );
+        let _ = p.done.send(PublishOutcome::Refused(r));
     }
 
     /// Release the publisher's acknowledgement iff every cluster-wide durability
@@ -4787,31 +5656,89 @@ impl Hub {
         }
     }
 
-    /// A peer's durability-gated answer to one acked forward (ADR 0042 T9,
-    /// exhibit ⑤). `ok = false` is a terminal durable failure on the peer: the
-    /// whole pending publish is dropped — ack withheld, publisher retries.
-    fn forward_acked(&mut self, node: &NodeId, seq: u64, ok: bool) {
+    /// Answer one forward we RECEIVED, choosing the frame by the LINK's negotiated
+    /// proto (0041-T12, issue #238).
+    ///
+    /// Gated on the negotiated version, not on "do I support 7": sending
+    /// `PublishVerdict` to a proto-6 origin would be an unknown variant index to its
+    /// strict codec and would kill the link. At proto 6 the verdict collapses to
+    /// `PublishAck { ok: verdict == Stored }` — which is today's behaviour exactly, so a
+    /// refusal reaches that origin as a withheld ack (the rolling-upgrade skew residual
+    /// the docs must name).
+    fn answer_forward(&self, node: &NodeId, seq: u64, verdict: ForwardVerdict) {
+        let Some(peer) = self.peers.get(node) else {
+            return; // link gone: the sender's sweep will retransmit
+        };
+        let frame = if peer.proto >= PROTO_FORWARD_VERDICT {
+            PeerMessage::PublishVerdict { seq, verdict }
+        } else {
+            PeerMessage::PublishAck {
+                seq,
+                ok: verdict == ForwardVerdict::Stored,
+            }
+        };
+        let _ = peer.tx.send(frame);
+    }
+
+    /// A peer's answer to one outstanding forward (ADR 0042 T9 exhibit ⑤; 0041-T12).
+    ///
+    /// The correlation is once-only (`forward_index.remove`), so a proto-6
+    /// `PublishAck` and a proto-7 `PublishVerdict` for the same `seq` cannot both
+    /// count. Composition is FIRST-TERMINAL-VERDICT-WINS rather than
+    /// [`DurableOutcome::and`]'s precedence: the publisher gets exactly one answer,
+    /// and both terminal answers (`Refused`, `Failed`) leave it unacked, so ordering
+    /// cannot turn a refusal into an ack. The asymmetry it inherits — peer X may have
+    /// stored a copy while peer Y refused, so the publisher hears `0x97` and its retry
+    /// duplicates on X — is the one [`refuse_pending`](Self::refuse_pending) already
+    /// documents; duplicates are legal at `QoS` 1, a false ack is not.
+    async fn forward_answered(&mut self, node: &NodeId, seq: u64, verdict: ForwardVerdict) {
         let Some(id) = self.forward_index.remove(&seq) else {
-            return; // stale ack (entry dropped or already resolved)
+            return; // stale answer (entry dropped or already resolved)
         };
         let Some(p) = self.pending_publishes.get_mut(&id) else {
             return;
         };
-        if p.awaiting.get(&seq) != Some(node) {
+        if p.awaiting.get(&seq).map(|o| &o.node) != Some(node) {
             return; // not the node this seq was sent to — ignore
         }
-        p.awaiting.remove(&seq);
-        if ok {
-            debug!(publish = id, seq, from = %node.0, "forward ack");
-            p.acked_nodes.insert(node.clone());
-            self.try_complete_pending(id);
-        } else {
-            warn!(
-                peer = %node.0,
-                "peer reported a terminal durable failure for a forwarded publish; \
-                 ack withheld (the publisher retries — ADR 0042 T9)"
-            );
-            self.drop_pending(id);
+        let obligation = p.awaiting.remove(&seq).expect("checked just above");
+        match DurableOutcome::from_verdict(verdict) {
+            DurableOutcome::Ok => {
+                debug!(publish = id, seq, from = %node.0, "forward stored");
+                p.stored = true;
+                p.acked_nodes.insert(node.clone());
+                self.try_complete_pending(id);
+            }
+            DurableOutcome::Failed => {
+                // Includes an unknown refusal code — a NEWER peer refusing for a
+                // reason this build cannot name. Withhold: `Failed` claims nothing
+                // about what the peer stored, which is the only honest reading of an
+                // answer we cannot interpret. Never `Accepted` (the one irreversible
+                // answer) and never a fabricated `Refused`.
+                if let ForwardVerdict::Refused { code } = verdict {
+                    warn!(
+                        peer = %node.0, code,
+                        "peer refused a forwarded publish with a refusal code this build \
+                         does not know; ack WITHHELD rather than claiming nothing was stored"
+                    );
+                } else {
+                    warn!(
+                        peer = %node.0,
+                        "peer reported a terminal durable failure for a forwarded publish; \
+                         ack withheld (the publisher retries — ADR 0042 T9)"
+                    );
+                }
+                self.drop_pending(id);
+            }
+            DurableOutcome::Refused(r) => match obligation.kind {
+                // A shared group's whole point: one member's browned-out node is a
+                // RE-BALANCE, not a cluster-wide publish refusal.
+                ForwardKind::Shared { .. } => {
+                    self.reselect_shared(id, obligation, DurableOutcome::Refused(r))
+                        .await;
+                }
+                ForwardKind::Ordinary => self.refuse_pending(id, r),
+            },
         }
     }
 
@@ -4829,13 +5756,13 @@ impl Hub {
         let ids: Vec<u64> = self.pending_publishes.keys().copied().collect();
         for id in ids {
             // Retransmit outstanding forwards over live links.
-            let outstanding: Vec<(u64, NodeId)> = self
+            let outstanding: Vec<(u64, ForwardObligation)> = self
                 .pending_publishes
                 .get(&id)
-                .map(|p| p.awaiting.iter().map(|(s, n)| (*s, n.clone())).collect())
+                .map(|p| p.awaiting.iter().map(|(s, o)| (*s, o.clone())).collect())
                 .unwrap_or_default();
-            for (seq, node) in &outstanding {
-                let Some(peer) = self.peers.get(node) else {
+            for (seq, obligation) in &outstanding {
+                let Some(peer) = self.peers.get(&obligation.node) else {
                     continue; // link down (not dead): wait for it to return
                 };
                 let Some(p) = self.pending_publishes.get(&id) else {
@@ -4844,8 +5771,10 @@ impl Hub {
                 // The SAME frame the original forward sent (only the seq is the
                 // outstanding one, so the receiver dedups): built by the shared
                 // constructor so a retransmitted copy can never drift semantically
-                // from the first send.
-                let _ = peer.tx.send(publish_acked_frame(p, *seq));
+                // from the first send — and, since 0041-T12, so a SHARED obligation
+                // retransmits `SharedDeliverAcked` rather than a fan-out
+                // `PublishAcked` that would deliver to the wrong subscribers.
+                let _ = peer.tx.send(forward_frame(p, *seq, obligation));
             }
             // Re-route after a target death (grace engaged by peer_dead).
             let Some(p) = self.pending_publishes.get(&id) else {
@@ -4888,9 +5817,19 @@ impl Hub {
                     publish = id,
                     "re-route grace expired; final local re-delivery"
                 );
-                if !self.redeliver_pending(id).await {
-                    self.drop_pending(id);
-                    continue;
+                let writes_before = self.durable_writes;
+                let out = self.redeliver_pending(id).await;
+                self.mark_stored_since(id, writes_before);
+                match out {
+                    DurableOutcome::Ok => {}
+                    DurableOutcome::Failed => {
+                        self.drop_pending(id);
+                        continue;
+                    }
+                    DurableOutcome::Refused(r) => {
+                        self.refuse_pending(id, r);
+                        continue;
+                    }
                 }
                 if let Some(p) = self.pending_publishes.get_mut(&id) {
                     p.reroute_grace = None;
@@ -5350,8 +6289,21 @@ impl Hub {
         conn_id: u64,
         tx: PeerOutbound,
         cert_serial: Option<Vec<u8>>,
+        proto: u32,
     ) {
-        info!(local = %self.node_id.0, peer = %node.0, "peer link established");
+        info!(local = %self.node_id.0, peer = %node.0, proto, "peer link established");
+        // Operator-visible rolling-upgrade skew (0041-T12, issue #238): a proto-6 link
+        // cannot carry a refusal, so a cross-node publish refusal reaches this peer's
+        // publishers as a WITHHELD ack (v3.1.1's answer) rather than `0x97`. Once per
+        // LINK, not per publish, so it cannot flood.
+        if proto < PROTO_FORWARD_VERDICT {
+            warn!(
+                peer = %node.0, proto, need = PROTO_FORWARD_VERDICT,
+                "peer speaks an older peer-bus proto: cross-node publish REFUSALS will be \
+                 answered to its publishers as a withheld ack and a close, not 0x97 \
+                 (rolling-upgrade skew — 0041-T12)"
+            );
+        }
         // Send our current interest + shared membership so the peer can route to us
         // immediately (ordinary fan-out and cluster-wide shared selection, ADR 0015)
         // — unless this hub is fresh and its boot scan has not yet landed: an EMPTY
@@ -5378,6 +6330,7 @@ impl Hub {
                 tx,
                 cert_serial,
                 interest_synced: false,
+                proto,
             },
         );
         // A link (re)forming while gated publishes are held: schedule a scan so
@@ -5413,33 +6366,53 @@ impl Hub {
     ///
     /// Removing the peer entry also drops its outbound sender, which closes the
     /// link's pump on whichever side still holds the socket open.
-    fn peer_dead(&mut self, node: &NodeId) {
+    async fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
         let had_interest = self.remote_interest.remove(node).is_some();
         self.remote_shared.remove(node);
         // Acked forwards to the dead node re-route to its successor once it
         // advertises the inherited interest (ADR 0042 T9, exhibit ⑤ + ⑥): drop
         // the dead obligations and engage the sweep's re-route grace.
+        //
+        // A SHARED obligation is different (0041-T12): its target was one NAMED member
+        // on that node, not "whoever there is interested", so the interest-based
+        // re-route grace cannot substitute for it. It re-selects within its group
+        // immediately — the same rebalance a refusal triggers.
         let mut dead_seqs: Vec<u64> = Vec::new();
-        for p in self.pending_publishes.values_mut() {
+        let mut dead_shared: Vec<(u64, ForwardObligation)> = Vec::new();
+        for (id, p) in &mut self.pending_publishes {
             let seqs: Vec<u64> = p
                 .awaiting
                 .iter()
-                .filter(|(_, n)| *n == node)
+                .filter(|(_, o)| &o.node == node)
                 .map(|(s, _)| *s)
                 .collect();
             if seqs.is_empty() {
                 continue;
             }
+            let mut had_ordinary = false;
             for seq in seqs {
-                p.awaiting.remove(&seq);
+                let Some(o) = p.awaiting.remove(&seq) else {
+                    continue;
+                };
+                match o.kind {
+                    ForwardKind::Shared { .. } => dead_shared.push((*id, o)),
+                    ForwardKind::Ordinary => had_ordinary = true,
+                }
                 dead_seqs.push(seq);
             }
-            debug!(peer = %node.0, topic = %p.topic, "forward target died; re-route grace engaged");
-            p.reroute_grace = Some(REROUTE_GRACE_TICKS);
+            if had_ordinary {
+                debug!(peer = %node.0, topic = %p.topic, "forward target died; re-route grace engaged");
+                p.reroute_grace = Some(REROUTE_GRACE_TICKS);
+            }
         }
         for seq in dead_seqs {
             self.forward_index.remove(&seq);
+        }
+        for (id, obligation) in dead_shared {
+            // `Failed`, not a refusal: a dead node says nothing about what it stored.
+            self.reselect_shared(id, obligation, DurableOutcome::Failed)
+                .await;
         }
         if had_link || had_interest {
             info!(peer = %node.0, "peer declared dead; routing state dropped");
@@ -6159,8 +7132,20 @@ impl Hub {
             let delivery_qos = min_qos(QoS::from_u8(qos).unwrap_or(QoS::AtMostOnce), granted);
             // A failed enqueue leaves the value in the cache for the next
             // subscribe's replay — the replay's own posture (#124).
+            // Unanswerable (issue #238): this back-fill has no publisher behind it, so a
+            // refused durable copy must not cost the live delivery too — the message
+            // would simply be gone, with nobody to retry it.
             let _ = self
-                .deliver_to_client(&c, topic, payload, delivery_qos, remaining, app, retain)
+                .deliver_to_client(
+                    &c,
+                    topic,
+                    payload,
+                    delivery_qos,
+                    remaining,
+                    app,
+                    retain,
+                    false,
+                )
                 .await;
             if let Some(w) = self.retained_windows.get_mut(&c) {
                 w.seen.insert(topic.to_string(), id);
@@ -6193,20 +7178,36 @@ impl Hub {
     }
 }
 
-/// The `PublishAcked` peer frame for a pending gated publish (ADR 0042 T9), under
-/// `seq`. The ONLY constructor of this frame: the original forward and the sweep's
-/// retransmission both build here, so a change to what the frame carries (an expiry
+/// The peer frame for one outstanding obligation of a pending gated publish
+/// (ADR 0042 T9; 0041-T12 for the shared kind), under `seq`.
+///
+/// The ONLY constructor of these frames: the original forward and the sweep's
+/// retransmission both build here, so a change to what a frame carries (an expiry
 /// decrement, a RAP flag, a new field's semantics) applies to first sends and
-/// retransmits identically — the two paths can never drift.
-fn publish_acked_frame(p: &PendingPublish, seq: u64) -> PeerMessage {
-    PeerMessage::PublishAcked {
-        seq,
-        topic: p.topic.clone(),
-        payload: p.payload.to_vec(),
-        qos: p.qos as u8,
-        retain: p.retain,
-        message_expiry: p.message_expiry,
-        app: app_to_wire(&p.app),
+/// retransmits identically — the two paths can never drift. That now includes the
+/// KIND: a shared obligation must retransmit `SharedDeliverAcked` targeted at its
+/// chosen member, never a fan-out `PublishAcked` (which the receiver would deliver to
+/// every matching ordinary subscriber instead).
+fn forward_frame(p: &PendingPublish, seq: u64, obligation: &ForwardObligation) -> PeerMessage {
+    match &obligation.kind {
+        ForwardKind::Ordinary => PeerMessage::PublishAcked {
+            seq,
+            topic: p.topic.clone(),
+            payload: p.payload.to_vec(),
+            qos: p.qos as u8,
+            retain: p.retain,
+            message_expiry: p.message_expiry,
+            app: app_to_wire(&p.app),
+        },
+        ForwardKind::Shared { client, qos, .. } => PeerMessage::SharedDeliverAcked {
+            seq,
+            client: client.0.clone(),
+            topic: p.topic.clone(),
+            payload: p.payload.to_vec(),
+            qos: *qos as u8,
+            message_expiry: p.message_expiry,
+            app: app_to_wire(&p.app),
+        },
     }
 }
 
@@ -6381,16 +7382,16 @@ mod tests {
 
     use super::{
         Admission, AttachOutcome, AuthMethod, Backlog, BrownoutAxis, Hub, HubCommand, Inflight,
-        Outbound, PeerOutbound, ProtocolVersion, RemoteSharedGroup, EXPIRY_RECONCILE_EVERY,
-        MAX_BACKLOG, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+        Outbound, PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup,
+        EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
     };
     use bytes::Bytes;
-    use mqtt_cluster::peer::{PeerMessage, RetainedWireEntry};
+    use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
     use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
     use mqtt_cluster::swim::MemberState;
     use mqtt_cluster::NodeId;
     use mqtt_codec::{Packet, QoS};
-    use mqtt_core::{AppProperties, ClientId};
+    use mqtt_core::{AppProperties, ClientId, Message};
     use mqtt_storage::app_props::AppProps;
     use mqtt_storage::repl::InMemoryReplicatedLog;
     use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits, SessionStore};
@@ -6695,8 +7696,16 @@ mod tests {
             &self,
             client: &ClientId,
             packet_id: u16,
-        ) -> Result<bool, mqtt_storage::StorageError> {
+        ) -> Result<mqtt_storage::InboundSighting, mqtt_storage::StorageError> {
             self.inner.record_received(client, packet_id).await
+        }
+
+        async fn ack_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_received(client, packet_id).await
         }
 
         async fn clear_received(
@@ -6836,6 +7845,35 @@ mod tests {
             }
         };
         (out_rx, session_present)
+    }
+
+    /// [`attach`] with a Will, for the ungraceful-detach paths (issue #238, R3).
+    async fn attach_with_will(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+        clean_start: bool,
+        will: Message,
+    ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+        let (out_tx, out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.into()),
+            admission: admission(client),
+            conn_id,
+            clean_start,
+            session_expiry: if clean_start { 0 } else { u32::MAX },
+            receive_maximum: u16::MAX,
+            will: Some(will),
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        let present = matches!(reply_rx.await.unwrap(), AttachOutcome::Present(true));
+        (out_rx, present)
     }
 
     fn detach(tx: &HubTx, client: &str, conn_id: u64) {
@@ -7078,6 +8116,30 @@ mod tests {
             conn_id,
             tx: peer_tx,
             cert_serial: None,
+            // The current ceiling: a test peer speaks what this build speaks, so the
+            // proto-7 frames are exercised by default and the proto-6 collapse is opted
+            // into explicitly (see `connect_peer_at_proto`).
+            proto: mqtt_cluster::peer::PROTO_MAX,
+        })
+        .unwrap();
+        peer_rx
+    }
+
+    /// [`connect_peer`] on a link that negotiated `proto` — the seam for the
+    /// rolling-upgrade skew case (0041-T12): a proto-6 peer cannot be sent a verdict.
+    fn connect_peer_at_proto(
+        tx: &HubTx,
+        node: &str,
+        conn_id: u64,
+        proto: u32,
+    ) -> mpsc::UnboundedReceiver<PeerMessage> {
+        let (peer_tx, peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+        tx.send(HubCommand::PeerConnected {
+            node: NodeId(node.into()),
+            conn_id,
+            tx: peer_tx,
+            cert_serial: None,
+            proto,
         })
         .unwrap();
         peer_rx
@@ -7119,6 +8181,51 @@ mod tests {
             }],
         })
         .unwrap();
+    }
+
+    /// As [`remote_shared_interest`], but each member carries a granted `QoS` — needed
+    /// wherever the DELIVERED `QoS` decides behaviour (0041-T12: only a `QoS` ≥ 1 shared
+    /// delivery is owed anything, so only it becomes an answerable obligation).
+    fn remote_shared_interest_qos(
+        tx: &HubTx,
+        node: &str,
+        group: &str,
+        filter: &str,
+        members: &[(&str, QoS)],
+    ) {
+        tx.send(HubCommand::RemoteSharedInterest {
+            node: NodeId(node.into()),
+            groups: vec![RemoteSharedGroup {
+                group: group.into(),
+                filter: filter.into(),
+                members: members
+                    .iter()
+                    .map(|(c, q)| (ClientId((*c).into()), *q, true))
+                    .collect(),
+            }],
+        })
+        .unwrap();
+    }
+
+    /// The next frame on a peer link that is part of the forward/answer protocol,
+    /// skipping the interest snapshots that ride alongside every gossip.
+    async fn next_forward_answer(rx: &mut mpsc::UnboundedReceiver<PeerMessage>) -> PeerMessage {
+        loop {
+            let msg = timeout(Duration::from_millis(600), rx.recv())
+                .await
+                .expect("a peer message within the deadline")
+                .expect("the link is open");
+            if matches!(
+                msg,
+                PeerMessage::PublishAck { .. }
+                    | PeerMessage::PublishVerdict { .. }
+                    | PeerMessage::PublishAcked { .. }
+                    | PeerMessage::SharedDeliver { .. }
+                    | PeerMessage::SharedDeliverAcked { .. }
+            ) {
+                return msg;
+            }
+        }
     }
 
     /// The next `SharedDeliver` from a peer, skipping interest snapshots.
@@ -8582,6 +9689,136 @@ mod tests {
         );
     }
 
+    /// Issue #238 — the LOCAL shared-member composition site: a gated publish whose
+    /// only recipient is a local shared-group member owed a durable append is REFUSED
+    /// under brownout (not acked over a discarded outcome, and not withheld), and
+    /// recovery both acks and durably enqueues for the member.
+    ///
+    /// The refusal is enforced by two layers calling `plan_refusal` — `publish`'s
+    /// shared plan peek (which also keeps a refused publish from consuming the group's
+    /// round-robin turn) and `deliver_to_client`'s decide-before-commit gate behind it
+    /// — so the reversion that reddens this test is the same two-layer pre-#238
+    /// mutation the deterministic cluster oracle bites on (`plan_refusal` → `None`
+    /// plus `durable_append`'s brownout arm → `Appended::Dropped`); either layer
+    /// alone is absorbed by the other, by design. The outcome-DISCARD reversion
+    /// (`deliver_shared` ignoring `deliver_to_client`'s result, the original #164
+    /// defect) is pinned by `a_failed_shared_enqueue_withholds_the_publishers_ack`.
+    #[tokio::test]
+    async fn a_local_shared_member_under_brownout_refuses_the_publisher() {
+        let tx = start_hub();
+        // The ONLY match: an offline, persistent, QoS 1 shared-group member.
+        let (_rx, _) = attach(&tx, "m", 1, false).await;
+        subscribe_qos(&tx, "m", "$share/g/lb/t", QoS::AtLeastOnce);
+        detach(&tx, "m", 1);
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        assert_eq!(
+            publish_gated(&tx, "lb/t", b"no", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "a shared subscriber is a persistent subscriber (#164): its refused \
+             durable enqueue refuses the publisher"
+        );
+
+        // Recovery: the publish is acked and the member's queue replays exactly it.
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: false,
+        })
+        .unwrap();
+        assert_eq!(
+            publish_gated(&tx, "lb/t", b"yes", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        let (mut resumed, _) = attach(&tx, "m", 2, false).await;
+        assert_eq!(
+            payload_of(&recv_packet(&mut resumed).await.expect("the replayed copy")),
+            b"yes",
+            "only the ACKED payload was ever stored"
+        );
+        assert!(
+            recv_packet(&mut resumed).await.is_none(),
+            "the refused payload must not replay"
+        );
+    }
+
+    /// Issue #238 — the DISTINCT effect of `publish`'s shared plan peek, which the
+    /// test above cannot see: a refused publish must not consume the shared group's
+    /// round-robin turn. With the peek disabled, `deliver_to_client`'s gate still
+    /// refuses the publisher (so the test above stays green), but `select_shared` has
+    /// already advanced the cursor — and the next accepted publish lands on the SAME
+    /// member as the last one instead of rotating. Two members, publishes one/two with
+    /// a refused attempt between them: each member must receive exactly one.
+    #[tokio::test]
+    async fn a_refused_shared_publish_does_not_consume_the_groups_round_robin_turn() {
+        let tx = start_hub();
+        // Two offline, persistent, QoS 1 members of the same group: every accepted
+        // publish owes a durable append, and selection rotates between them.
+        for m in ["rr-a", "rr-b"] {
+            let (_rx, _) = attach(&tx, m, 1, false).await;
+            subscribe_qos(&tx, m, "$share/g/rr/t", QoS::AtLeastOnce);
+            detach(&tx, m, 1);
+        }
+
+        assert_eq!(
+            publish_gated(&tx, "rr/t", b"one", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        assert_eq!(
+            publish_gated(&tx, "rr/t", b"refused", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout)
+        );
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: false,
+        })
+        .unwrap();
+        assert_eq!(
+            publish_gated(&tx, "rr/t", b"two", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+
+        // Ordering-agnostic: whichever member got "one", rotation gives "two" to the
+        // other. A consumed turn skips a member, and one of them replays BOTH.
+        let mut per_member = Vec::new();
+        for m in ["rr-a", "rr-b"] {
+            let (mut resumed, _) = attach(&tx, m, 2, false).await;
+            let mut got = Vec::new();
+            while let Some(p) = recv_packet(&mut resumed).await {
+                got.push(payload_of(&p).to_vec());
+            }
+            per_member.push(got);
+        }
+        for got in &per_member {
+            assert_eq!(
+                got.len(),
+                1,
+                "a refused publish consumed a round-robin turn: {per_member:?}"
+            );
+        }
+        let mut all: Vec<Vec<u8>> = per_member.into_iter().flatten().collect();
+        all.sort();
+        assert_eq!(all, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
     /// ADR 0041 T5 — brownout: above the disk watermark, growth writes are
     /// refused (new retained topics, new sessions, offline enqueues) while
     /// maintenance continues (resume, retained overwrite), and recovery below
@@ -8594,7 +9831,9 @@ mod tests {
         // Pre-existing state: a persistent session with a QoS 1 subscription
         // (asleep through the brownout), and one retained topic.
         let (_rx, _) = attach(&tx, "sleeper", 1, false).await;
-        subscribe(&tx, "sleeper", "b/q");
+        // QoS 1, so the offline enqueue is an obligation the publisher's ack is
+        // gated on — the whole point of the refusal below (#238).
+        subscribe_qos(&tx, "sleeper", "b/q", QoS::AtLeastOnce);
         detach(&tx, "sleeper", 1);
         let retained_publish = |topic: &str, payload: &'static [u8]| {
             let (done_tx, done_rx) = oneshot::channel();
@@ -8626,7 +9865,7 @@ mod tests {
         // Growth refused: a NEW retained topic...
         assert_eq!(
             retained_publish("b/r2", b"nope").await.unwrap(),
-            super::PublishOutcome::RetainedQuotaExceeded,
+            super::PublishOutcome::Refused(super::PublishRefusal::RetainedQuota),
             "a new retained topic must be refused under brownout"
         );
         // ...and a NEW session...
@@ -8637,9 +9876,16 @@ mod tests {
             ),
             "a new session must be refused under brownout"
         );
-        // ...and an offline enqueue (silently dropped, counted): this message
-        // must NOT replay after recovery.
-        publish_qos1(&tx, "b/q", b"browned-out");
+        // ...and an offline enqueue, which is REFUSED, not acked (#238): the
+        // publisher is told `Brownout` and this message must NOT replay after
+        // recovery, because it was never stored.
+        assert_eq!(
+            publish_gated(&tx, "b/q", b"browned-out", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            super::PublishOutcome::Refused(super::PublishRefusal::Brownout),
+            "a refused offline enqueue must refuse the publisher's ack (#238)"
+        );
 
         // Maintenance continues: an overwrite of the existing retained topic...
         assert_eq!(
@@ -8684,6 +9930,712 @@ mod tests {
         assert!(
             recv_packet(&mut rx).await.is_none(),
             "the browned-out message must not have been queued"
+        );
+    }
+
+    /// A gated `QoS` publish: the ack-gate receiver, so a test can observe the
+    /// exact [`PublishOutcome`] the hub released (or its withholding).
+    fn publish_gated(
+        tx: &HubTx,
+        topic: &str,
+        payload: &'static [u8],
+        qos: QoS,
+        v5: bool,
+    ) -> oneshot::Receiver<PublishOutcome> {
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            done: Some(done_tx),
+            v5,
+            publisher: None,
+        })
+        .unwrap();
+        done_rx
+    }
+
+    /// Issue #238 / 0041-T11 — the acceptance criterion. Under brownout a `QoS` 1
+    /// publish whose only recipient is an OFFLINE persistent subscriber is never
+    /// enqueued anywhere, so the publisher must not be acked: it is REFUSED, with
+    /// a reason the connection can turn into `0x97` (v5) or a close (v3.1.1).
+    #[tokio::test]
+    async fn brownout_refuses_the_publishers_ack_for_an_offline_persistent_subscriber() {
+        let tx = start_hub();
+
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "b/q", QoS::AtLeastOnce);
+        detach(&tx, "p", 1);
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            publish_gated(&tx, "b/q", b"x", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "a QoS 1 publish the store refuses to enqueue must not be acked (#238)"
+        );
+    }
+
+    /// Issue #238 — the ONLINE persistent subscriber has the same answer, and the
+    /// live send is withheld too: delivering live with no durable record promises a
+    /// redelivery the store cannot honour (the rule `Appended::Failed` already
+    /// follows).
+    #[tokio::test]
+    async fn brownout_refuses_the_ack_and_the_live_send_for_an_online_persistent_subscriber() {
+        let tx = start_hub();
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "b/q", QoS::AtLeastOnce);
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            publish_gated(&tx, "b/q", b"x", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "an online persistent subscriber's durable record is owed too (#238)"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "nothing may reach the wire for a message with no durable record"
+        );
+    }
+
+    /// The anti-over-refusal guard (#238): brownout costs exactly the growth write
+    /// it refuses. A publish that owes NO durable record — a clean session, or
+    /// `QoS` 0 — is still delivered and still acked while browned out.
+    #[tokio::test]
+    async fn a_publish_owing_no_durability_is_still_acked_under_brownout() {
+        let tx = start_hub();
+
+        // A clean-session subscriber (nothing to resume into) and a persistent,
+        // offline one (owed a queue only for QoS > 0).
+        let (mut clean_rx, _) = attach(&tx, "clean", 1, true).await;
+        subscribe_qos(&tx, "clean", "nb/clean", QoS::AtLeastOnce);
+        let (_p_rx, _) = attach(&tx, "p", 2, false).await;
+        subscribe_qos(&tx, "p", "nb/off", QoS::AtLeastOnce);
+        detach(&tx, "p", 2);
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            publish_gated(&tx, "nb/clean", b"live", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted,
+            "a clean session owes no redelivery, so brownout refuses nothing"
+        );
+        assert_eq!(
+            payload_of(&recv_packet(&mut clean_rx).await.unwrap()),
+            b"live",
+            "and the live delivery still happens"
+        );
+        assert_eq!(
+            publish_gated(&tx, "nb/off", b"fnf", QoS::AtMostOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted,
+            "QoS 0 owes no redelivery either — at-most-once is the spec-native \
+             fire-and-forget"
+        );
+    }
+
+    /// The semantic split an operator alerts on (#238): a refusal the publisher is
+    /// TOLD about is a quota rejection, not a loss. Only the `QoS` 0 offline
+    /// enqueue — where nothing was owed and nothing is acked — is a drop.
+    #[tokio::test]
+    async fn a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("h".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "bm/q", QoS::AtLeastOnce);
+        detach(&tx, "p", 1);
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        let _ = publish_gated(&tx, "bm/q", b"refused", QoS::AtLeastOnce, true).await;
+        let out = metrics.render();
+        assert!(
+            out.contains("mqttd_quota_rejections_total{reason=\"brownout-publish\"} 1"),
+            "a refused QoS 1 publish is a quota rejection:\n{out}"
+        );
+        assert!(
+            !out.contains("mqttd_publish_dropped_total{reason=\"brownout\"}"),
+            "a refusal the publisher is told about is not a loss:\n{out}"
+        );
+
+        // QoS 0 to the same offline subscriber IS a drop: nothing was owed, and
+        // nothing is acked, so there is no retry to over-count.
+        assert_eq!(
+            publish_gated(&tx, "bm/q", b"dropped", QoS::AtMostOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        for _ in 0..200 {
+            if metrics
+                .render()
+                .contains("mqttd_publish_dropped_total{reason=\"brownout\"} 1")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "a QoS 0 offline enqueue above the watermark is a drop:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// THE HOIST (issue #238): a refusal must be EFFECT-FREE. Under brownout a publish
+    /// one of whose recipients owes a refused durable append is refused WHOLESALE —
+    /// including the live copy for a subscriber that owed no durability at all.
+    ///
+    /// That is the correct reading of a per-PUBLISH acknowledgement: there is no way to
+    /// say "delivered to two of your three subscribers", and the publisher still owns the
+    /// message and is expected to retry it. It is also what makes the retry idempotent —
+    /// a refused attempt leaves nothing behind to duplicate, which is the whole basis of
+    /// the `QoS` 2 half of this fix.
+    #[tokio::test]
+    async fn a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability() {
+        let tx = start_hub();
+
+        // X: online CLEAN session, QoS 1 — owes no durable record, so it is the witness
+        // that survived the refusal path before the hoist.
+        let (mut x_rx, _) = attach(&tx, "x", 1, true).await;
+        subscribe_qos(&tx, "x", "h/t", QoS::AtLeastOnce);
+        // Y: persistent, offline, QoS 1 — the recipient whose append brownout refuses.
+        let (_y_rx, _) = attach(&tx, "y", 2, false).await;
+        subscribe_qos(&tx, "y", "h/t", QoS::AtLeastOnce);
+        detach(&tx, "y", 2);
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            publish_gated(&tx, "h/t", b"refused", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout)
+        );
+        assert!(
+            recv_packet(&mut x_rx).await.is_none(),
+            "a refused publish must reach NOBODY: the clean-session subscriber's live \
+             copy is a side effect of a publish the broker did not accept"
+        );
+
+        // Recovery: the same publish now reaches X exactly once and is owed to Y.
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: false,
+        })
+        .unwrap();
+        assert_eq!(
+            publish_gated(&tx, "h/t", b"kept", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut x_rx)
+                    .await
+                    .expect("delivered after recovery")
+            ),
+            b"kept"
+        );
+        assert!(
+            recv_packet(&mut x_rx).await.is_none(),
+            "exactly once — the refused attempt left nothing to duplicate"
+        );
+    }
+
+    /// Issue #238 — the retained-overwrite ordering. A publish answered "not accepted"
+    /// must not already have mutated durable retained state that every future subscriber
+    /// will see. `retained_quota_exceeded` returns false for a topic that already exists,
+    /// so an OVERWRITE proceeds under brownout unless the refusal is decided first.
+    #[tokio::test]
+    async fn a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact() {
+        let tx = start_hub();
+
+        let retained_publish = |topic: &'static str, payload: &'static [u8]| {
+            let (done_tx, done_rx) = oneshot::channel();
+            tx.send(HubCommand::Publish {
+                topic: topic.into(),
+                payload: Bytes::from_static(payload),
+                qos: QoS::AtLeastOnce,
+                retain: true,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: Some(done_tx),
+                v5: true,
+                publisher: None,
+            })
+            .unwrap();
+            done_rx
+        };
+
+        // `ro/t` already retained with A, and an offline persistent QoS 1 subscriber on it
+        // — so the publish below owes a durable append the brownout will refuse.
+        assert_eq!(
+            retained_publish("ro/t", b"A").await.unwrap(),
+            PublishOutcome::Accepted
+        );
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "ro/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+        // The reader attaches BEFORE the watermark is crossed — a browned-out broker
+        // refuses NEW sessions (T5 growth), which would prove nothing about the retained
+        // value. Its SUBSCRIBE (and the retained replay it triggers) comes after.
+        let (mut fresh_rx, _) = attach(&tx, "fresh", 2, true).await;
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        assert_eq!(
+            retained_publish("ro/t", b"B").await.unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout)
+        );
+
+        // The retained replay must still see A: `0x97` says the message was NOT accepted,
+        // and a publish that permanently changed broker state was.
+        subscribe_qos(&tx, "fresh", "ro/t", QoS::AtLeastOnce);
+        assert_eq!(
+            payload_of(&recv_packet(&mut fresh_rx).await.expect("a retained replay")),
+            b"A",
+            "the refused retain=1 publish must not have overwritten the retained value"
+        );
+    }
+
+    /// Issue #238 — an UNGATED publish has nobody to refuse, so a refused durable copy
+    /// must not cost the LIVE delivery. The Will is the case that matters: suppressing it
+    /// under brownout leaves every device "online" on the dashboard through exactly the
+    /// incident [MQTT-3.14.4-3] exists for.
+    #[tokio::test]
+    async fn a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop() {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("h".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        // A monitoring client: ONLINE and PERSISTENT at QoS 1, so its copy of the will
+        // owes a durable record — the append brownout refuses.
+        let (mut watcher_rx, _) = attach(&tx, "watcher", 1, false).await;
+        subscribe_qos(&tx, "watcher", "dev/+/status", QoS::AtLeastOnce);
+
+        // A device with a will, then an UNGRACEFUL end while browned out.
+        let (_dev_rx, _) = attach_with_will(
+            &tx,
+            "dev42",
+            2,
+            false,
+            Message {
+                topic: "dev/42/status".into(),
+                payload: Bytes::from_static(b"offline"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+                expires_at: None,
+            },
+        )
+        .await;
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        tx.send(HubCommand::Detach {
+            client: ClientId("dev42".into()),
+            conn_id: 2,
+            graceful: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher_rx)
+                    .await
+                    .expect("the will must still be delivered live")
+            ),
+            b"offline",
+            "an ungated publish has no publisher to refuse, so suppressing its live \
+             delivery would destroy the message rather than defer it"
+        );
+        // And the lost durable copy is counted as the DROP it is — not as a refusal the
+        // publisher can retry, because there is no publisher.
+        for _ in 0..200 {
+            let out = metrics.render();
+            if out.contains("mqttd_publish_dropped_total{reason=\"brownout\"} 1") {
+                assert!(
+                    !out.contains("mqttd_quota_rejections_total{reason=\"brownout-publish\"}"),
+                    "nobody was told, so this is a loss and not a retryable refusal:\n{out}"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "a will's refused durable copy must be counted as a drop:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// Issue #238 — the MEMORY axis (ADR 0041 T8) answers the publisher exactly as the
+    /// disk axis does. Every other brownout-ack test drives `BrownoutAxis::Disk`, so the
+    /// axis-agnostic claim was asserted nowhere.
+    #[tokio::test]
+    async fn the_memory_axis_refuses_the_publishers_ack_just_as_the_disk_axis_does() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "ma/q", QoS::AtLeastOnce);
+        detach(&tx, "p", 1);
+
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Memory,
+            on: true,
+        })
+        .unwrap();
+        assert_eq!(
+            publish_gated(&tx, "ma/q", b"x", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "the refusal follows the brownout FLAG, not the axis that raised it"
+        );
+    }
+
+    /// Issue #238 — 0041-T12's wire choice, both directions. A refusal is a verdict on a
+    /// proto-7 link and collapses to today's boolean on a proto-6 one, and each link sees
+    /// exactly one of the two frames.
+    #[tokio::test]
+    async fn a_proto_6_peer_is_answered_with_the_boolean_and_a_proto_7_peer_with_the_verdict() {
+        let tx = start_hub();
+        let mut old = connect_peer_at_proto(&tx, "old", 1, 6);
+        let mut new = connect_peer_at_proto(&tx, "new", 2, 7);
+
+        // One offline persistent QoS 1 subscriber, so a forwarded publish owes a durable
+        // append here — which brownout refuses.
+        let (_rx, _) = attach(&tx, "s", 9, false).await;
+        subscribe_qos(&tx, "s", "pv/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 9);
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        for (node, seq) in [("old", 1u64), ("new", 2u64)] {
+            tx.send(HubCommand::RemotePublishAcked {
+                node: NodeId(node.into()),
+                seq,
+                topic: "pv/t".into(),
+                payload: Bytes::from_static(b"x"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+            })
+            .unwrap();
+        }
+
+        match next_forward_answer(&mut old).await {
+            PeerMessage::PublishAck { seq, ok } => {
+                assert_eq!((seq, ok), (1, false), "proto 6 can only say 'not stored'");
+            }
+            other => panic!("a proto-6 link must never be sent a verdict, got {other:?}"),
+        }
+        match next_forward_answer(&mut new).await {
+            PeerMessage::PublishVerdict { seq, verdict } => assert_eq!(
+                (seq, verdict),
+                (
+                    2,
+                    ForwardVerdict::Refused {
+                        code: PublishRefusal::Brownout.wire_code()
+                    }
+                ),
+                "proto 7 carries WHY, so the origin can tell its publisher 0x97"
+            ),
+            other => panic!("expected a PublishVerdict, got {other:?}"),
+        }
+    }
+
+    /// Issue #238 (C1) — a peer's REFUSAL refuses the publisher rather than closing on it.
+    /// Partnered with the withhold direction in the same test, because the two answers
+    /// must stay distinguishable: `Failed` (and an unknown refusal code) still drops the
+    /// gate.
+    #[tokio::test]
+    async fn a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate() {
+        let tx = start_hub();
+        let _peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["cv/t"]);
+
+        // Refused → the publisher is TOLD.
+        let done = publish_gated(&tx, "cv/t", b"a", QoS::AtLeastOnce, true);
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq: 1,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            done.await.unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "a peer's stated refusal must reach the publisher as one (0041-T12)"
+        );
+
+        // Failed → withheld, exactly as before.
+        let done = publish_gated(&tx, "cv/t", b"b", QoS::AtLeastOnce, true);
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq: 2,
+            verdict: ForwardVerdict::Failed,
+        })
+        .unwrap();
+        assert!(
+            done.await.is_err(),
+            "a terminal failure still withholds: no reason code honestly covers it"
+        );
+
+        // A proto-6 peer's `ok: false` is the same withhold — the skew fallback.
+        let done = publish_gated(&tx, "cv/t", b"c", QoS::AtLeastOnce, true);
+        tx.send(HubCommand::RemotePublishAck {
+            node: NodeId("n2".into()),
+            seq: 3,
+            ok: false,
+        })
+        .unwrap();
+        assert!(done.await.is_err(), "the boolean can only mean 'withhold'");
+    }
+
+    /// Issue #238 — an unknown refusal code (a NEWER peer refusing for a reason this
+    /// build cannot name) WITHHOLDS. It must never become an ack, and never a fabricated
+    /// refusal either: `Refused` asserts "nothing was stored", which an answer we cannot
+    /// read does not support.
+    #[tokio::test]
+    async fn an_unknown_refusal_code_withholds_and_never_acks() {
+        let tx = start_hub();
+        let _peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["uv/t"]);
+
+        let done = publish_gated(&tx, "uv/t", b"a", QoS::AtLeastOnce, true);
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq: 1,
+            verdict: ForwardVerdict::Refused { code: 0xFFFF },
+        })
+        .unwrap();
+        match done.await {
+            Err(_) => {}
+            Ok(other) => panic!("an unreadable refusal must withhold, got {other:?}"),
+        }
+
+        // Non-vacuity: a code this build DOES know resolves as a refusal.
+        let done = publish_gated(&tx, "uv/t", b"b", QoS::AtLeastOnce, true);
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq: 2,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            done.await.unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout)
+        );
+    }
+
+    /// Issue #238 (R2) — a cross-node shared delivery is ANSWERABLE, and a refusing
+    /// member's node causes a RE-SELECTION within the group rather than a lost message.
+    ///
+    /// Before this, `deliver_shared`'s remote branch fired one unacked `SharedDeliver` and
+    /// released the ack: the receiving node refused the append, skipped the wire send too,
+    /// and the message reached nobody while the publisher was told it was stored.
+    #[tokio::test]
+    async fn a_cross_node_shared_delivery_is_answered_and_reselects_before_refusing() {
+        // Case A — the group's only member lives on a proto-7 peer.
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "sh/t", &[("m1", QoS::AtLeastOnce)]);
+
+        let done = publish_gated(&tx, "sh/t", b"a", QoS::AtLeastOnce, true);
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, client, .. } => {
+                assert_eq!(client, "m1");
+                seq
+            }
+            other => panic!("a gated QoS 1 shared delivery must be answerable, got {other:?}"),
+        };
+        assert!(
+            timeout(Duration::from_millis(200), &mut Box::pin(async {}))
+                .await
+                .is_ok(),
+            "sanity"
+        );
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            done.await.unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "with no other candidate the group's refusal reaches the publisher"
+        );
+
+        // Case B — a second member exists LOCALLY (offline persistent): the peer's
+        // refusal re-balances onto it and the publisher IS acked.
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "sh/t", &[("m1", QoS::AtLeastOnce)]);
+        let (_rx, _) = attach(&tx, "local", 2, false).await;
+        subscribe_qos(&tx, "local", "$share/g/sh/t", QoS::AtLeastOnce);
+        detach(&tx, "local", 2);
+
+        let done = publish_gated(&tx, "sh/t", b"b", QoS::AtLeastOnce, true);
+        let seq = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, .. } => seq,
+            other => panic!("expected SharedDeliverAcked, got {other:?}"),
+        };
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            done.await.unwrap(),
+            PublishOutcome::Accepted,
+            "one member's node refusing is a re-balance, not a cluster-wide refusal"
+        );
+        // And the re-selection actually enqueued for the local member.
+        let (mut resumed, _) = attach(&tx, "local", 3, false).await;
+        assert_eq!(
+            payload_of(&recv_packet(&mut resumed).await.expect("the replayed copy")),
+            b"b"
+        );
+
+        // Case C — a proto-6 peer member keeps today's unacked SharedDeliver, and the ack
+        // releases: the link cannot carry an answer, so nothing is owed on it.
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 6);
+        remote_shared_interest_qos(&tx, "n2", "g", "sh/t", &[("m1", QoS::AtLeastOnce)]);
+        let done = publish_gated(&tx, "sh/t", b"c", QoS::AtLeastOnce, true);
+        match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliver { client, .. } => assert_eq!(client, "m1"),
+            other => panic!("a proto-6 link must keep the unacked frame, got {other:?}"),
+        }
+        assert_eq!(done.await.unwrap(), PublishOutcome::Accepted);
+    }
+
+    /// Issue #238 — an unanswered shared obligation HOLDS the ack and retransmits the
+    /// SHARED frame under the same seq. The single-constructor invariant across kinds: a
+    /// retransmit that ignored the obligation's kind would fan a `PublishAcked` out to
+    /// every matching ordinary subscriber on the peer instead of the chosen member.
+    #[tokio::test]
+    async fn an_unanswered_shared_forward_holds_the_ack_and_retransmits_the_shared_frame() {
+        let tx = start_hub();
+        let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "sh/t", &[("m1", QoS::AtLeastOnce)]);
+
+        let mut done = publish_gated(&tx, "sh/t", b"a", QoS::AtLeastOnce, true);
+        let first = match next_forward_answer(&mut peer).await {
+            PeerMessage::SharedDeliverAcked { seq, .. } => seq,
+            other => panic!("expected SharedDeliverAcked, got {other:?}"),
+        };
+        // Several sweep ticks with no answer: the frame repeats under the SAME seq and
+        // the ack never releases.
+        for _ in 0..3 {
+            tokio::time::sleep(super::SESSION_SWEEP_INTERVAL + Duration::from_millis(50)).await;
+            match next_forward_answer(&mut peer).await {
+                PeerMessage::SharedDeliverAcked { seq, client, .. } => {
+                    assert_eq!(
+                        (seq, client.as_str()),
+                        (first, "m1"),
+                        "same seq, same member"
+                    );
+                }
+                other => panic!("a shared obligation must retransmit its OWN frame, got {other:?}"),
+            }
+            assert!(
+                done.try_recv().is_err(),
+                "the ack must not release while the obligation is unanswered"
+            );
+        }
+    }
+
+    /// Issue #238 — only a genuinely UNSTORED publish may be refused. A brownout entered
+    /// during a takeover window must not answer `0x97` ("not accepted") for a message the
+    /// original fan-out already stored durably: the ack is WITHHELD instead, which claims
+    /// nothing, because an application retry would duplicate it for the subscriber that
+    /// already holds it.
+    #[tokio::test]
+    async fn a_publish_already_stored_is_withheld_not_refused_when_a_later_pass_is_refused() {
+        let tx = start_hub();
+        let _peer = connect_peer_at_proto(&tx, "n2", 1, 7);
+        remote_interest(&tx, "n2", &["rp/t"]);
+
+        // Local offline persistent subscriber: the first fan-out DOES store a copy.
+        let (_rx, _) = attach(&tx, "s", 2, false).await;
+        subscribe_qos(&tx, "s", "rp/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 2);
+
+        let done = publish_gated(&tx, "rp/t", b"a", QoS::AtLeastOnce, true);
+        // The peer then refuses its half — a refusal arriving for a publish that IS held.
+        tx.send(HubCommand::RemotePublishVerdict {
+            node: NodeId("n2".into()),
+            seq: 1,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        })
+        .unwrap();
+        assert!(
+            done.await.is_err(),
+            "a publish already stored durably may only be WITHHELD: `Refused` asserts \
+             'nothing was stored', and a retry on that basis duplicates it"
         );
     }
 

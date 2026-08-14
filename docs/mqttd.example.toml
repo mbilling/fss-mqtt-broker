@@ -146,7 +146,10 @@ enabled = true
 # SINGLE host is fsync-bound (see the demo sizing note / ADR 0049).
 lease_voters = 5
 # Disk high-water cap over the on-disk stores, bytes (needs [node] data_dir). Above it the broker
-# browns out growth-writes while acks/deletes/resumes continue. Unset = no watermark.
+# browns out growth-writes while subscriber acks/deletes/resumes continue; a QoS>=1 publisher is
+# REFUSED (v5 0x97 / v3.1.1 no ack + close; cross-node via a peer-bus verdict — mid-rolling-upgrade
+# an older link withholds the ack and closes instead) — an answered refusal, never a silent drop;
+# re-sending is the application's decision. Unset = no watermark.
 # store_max_bytes = 10737418240
 # Min-replicas write floor (issues #167, #239). Replica sets shrink with membership —
 # min(R, alive) — so without a floor a shrinking cluster silently trades the configured
@@ -200,8 +203,11 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # receive_maximum = 256              # v5 Receive Maximum (default 256, floor 1)
 # topic_alias_max = 16               # v5 Topic Alias Maximum (default 16; 0 disables)
 # Process-memory high-water mark, bytes (ADR 0041 T8). Above it the broker enters BROWNOUT:
-# growth writes (new sessions, new retained topics, offline enqueues) are refused while acks,
-# reads, deletes, expiry and resumes continue. Unset = off.
+# growth writes (new sessions, new retained topics, offline enqueues) are refused while subscriber
+# acks, reads, deletes, expiry and resumes continue; a QoS>=1 publisher is REFUSED (v5 0x97 /
+# v3.1.1 no ack + close; cross-node via a peer-bus verdict — mid-rolling-upgrade an older link
+# withholds the ack and closes instead) — an answered refusal; re-sending is the application's
+# decision. Unset = off.
 # A watermark, NOT a ceiling: nothing here stops memory rising, so keep the container/cgroup
 # memory limit as the hard bound. This buys warning instead of an OOM kill.
 # Requires /proc (Linux); elsewhere the broker logs that it is not enforcing and carries on.
