@@ -470,6 +470,13 @@ enum OutState {
     AwaitingPubRec,
     /// `QoS` 2: PUBREL sent, waiting for PUBCOMP.
     AwaitingPubComp,
+    /// `QoS` 2 with a durable offset, staged (issue #242 finding A): the packet id
+    /// is allocated (this entry pins it and reserves Receive-Maximum quota) but the
+    /// PUBLISH has NOT been sent — its ADR 0057 outbound-id record is being written
+    /// in the session's lane. Acks for this id are ignored (the client never saw
+    /// it), and the entry is dropped at detach/takeover: the durable copy owns
+    /// delivery on reattach.
+    AwaitingIdRecord,
 }
 
 /// An unacknowledged outbound message.
@@ -522,17 +529,18 @@ impl BrownoutAxis {
     }
 }
 
-/// The outcome of a durable append to a session's log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Appended {
+/// The outcome an append lane reports back to the loop (issue #242 / ADR 0061).
+///
+/// Deliberately has **no `Refused` variant**: a refusal is a POLICY decision, and policy
+/// is decided only on-loop, at the plan/submit freeze point, before a job exists
+/// (issue #238). A lane worker can only report what the store did — this type is the
+/// #238 tripwire's structural successor: a refusal decided off-loop cannot even be
+/// expressed.
+#[derive(Debug, Clone, Copy)]
+pub enum LaneOutcome {
     /// Recorded at this offset; the log is truncated through it once the subscriber
     /// acknowledges.
-    At(Offset),
-    /// Refused under a stated policy, and the publisher is TOLD (0041-T11, issue #238):
-    /// the message was neither stored nor — for a `QoS` ≥ 1 delivery — sent live, so the
-    /// ack must not be released. It travels out as [`PublishOutcome::Refused`], which each
-    /// protocol version answers in its own vocabulary.
-    Refused(PublishRefusal),
+    Stored(Offset),
     /// The session queue cap under `reject-newest` rejected the newest message
     /// (ADR 0001 §6). Counted and logged, and the publisher IS still acknowledged: this
     /// cap is opt-in and its whole purpose is to shed rather than block, so the drop is
@@ -541,6 +549,220 @@ enum Appended {
     /// The write failed. The publisher's acknowledgement must be withheld so it retries
     /// (ADR 0041 T5).
     Failed,
+    /// A [`LaneWork::Passthrough`] job: no store write was owed — the lane was used
+    /// purely so this send cannot overtake an earlier append's post-durable live send.
+    Passed,
+}
+
+/// The on-loop continuation an [`AppendDone`](HubCommand::AppendDone) runs — WHO is
+/// owed what once the store answered. Frozen into the job at submit time.
+#[derive(Debug, Clone)]
+pub enum AppendThen {
+    /// A gated publish's obligation: decrement its `appends_outstanding`, then
+    /// complete (or, on `Failed`, withhold) via the pending-publish table.
+    Gate(u64),
+    /// A peer awaits a durability verdict for forward `seq` (0041-T12): resolve this
+    /// job in the `(node, seq)` aggregate and answer when its last job lands.
+    Peer(NodeId, u64),
+    /// Nobody is owed an answer (a Will, an unanswerable forward, a `QoS` 0 order mark).
+    Ungated,
+}
+
+/// The store work a lane job carries.
+#[derive(Debug)]
+pub enum LaneWork {
+    /// The durable append itself: `enqueue_with_expiry` with the absolute deadline
+    /// FROZEN at plan time from the hub clock (ADR 0009 §3 receipt-time semantics).
+    Append {
+        /// Absolute expiry deadline (Unix epoch seconds), if the publisher set one.
+        expiry_at: Option<u64>,
+    },
+    /// No store work: a `QoS` 0 send routed through a busy lane purely for per-client
+    /// wire order (it must not overtake an earlier append's post-durable live send).
+    Passthrough,
+    /// The SECOND lane stage (issue #242 finding A): ADR 0057's outbound-id write
+    /// for a `QoS` 2 delivery with a durable offset. Staged at send time — the
+    /// pending entry parks in [`OutState::AwaitingIdRecord`] — and the completion,
+    /// holding the store's own outcome, is the only site that puts the packet on
+    /// the wire.
+    RecordOutbound {
+        /// The packet id being made durable (pinned in the in-flight table).
+        pkid: u16,
+        /// The delivery's durable log offset.
+        offset: Offset,
+    },
+    /// The detach-time backlog spill (issue #242 finding C): the persistent
+    /// session's never-recorded (`offset == None`) flow-control backlog, enqueued
+    /// off-loop and — because it rides the lane — strictly BEHIND every in-flight
+    /// append, which is exactly the pre-motion order (the inline spill followed
+    /// all previously admitted appends).
+    Spill {
+        /// `(message, absolute expiry deadline)` per spilled entry, frozen at
+        /// detach time from the hub clock (ADR 0009 §3).
+        entries: Vec<(Message, Option<u64>)>,
+    },
+}
+
+/// One unit of off-loop durable-append work (issue #242 / ADR 0061).
+///
+/// **The off-loop contract:** a lane worker may read ONLY this job's own (owned,
+/// immutable) fields, the store `Arc`, the metrics `Arc`, and the hub's command sender.
+/// It must never see `Hub` state — no brownout flag, no routing table, no shared
+/// cursor, no pending-publish table. Every decision is frozen in here at submit time,
+/// on-loop, inside the same dispatch that planned the fan-out (issue #238); the worker
+/// only executes. All fields are private so only the hub can construct one.
+#[derive(Debug)]
+pub struct AppendJob {
+    /// The subscriber session the append belongs to (the lane key).
+    client: ClientId,
+    /// The message, with `expires_at` already computed at plan time.
+    message: Message,
+    /// What the worker does with the message.
+    work: LaneWork,
+    /// The on-loop continuation.
+    then: AppendThen,
+    /// The `conn_id` of the online connection this delivery was planned against;
+    /// `None` when the target was planned offline. The completion handler live-sends
+    /// only to this exact connection — or, after a reconnect, only when the attach
+    /// replay provably did not cover the stored offset.
+    planned_conn: Option<u64>,
+    /// The RETAIN flag for the wire send (Retain As Published, #198).
+    retain: bool,
+    /// The remaining message-expiry interval to forward on the wire, if any.
+    message_expiry: Option<u32>,
+}
+
+/// What a lane worker receives: append/passthrough work, or a clean-start discard
+/// serialized BEHIND every already-admitted append for the session, so a late append
+/// can never re-create a queue the discard was supposed to empty (issue #242).
+#[derive(Debug)]
+pub enum LaneJob {
+    /// Run the job's store work and post [`HubCommand::AppendDone`].
+    Deliver(Box<AppendJob>),
+    /// Run the clean-start durable discard (`store.remove`) and post
+    /// `SessionRecovered::Cleaned`, exactly like the spawned path (ADR 0017) — plus a
+    /// bookkeeping `AppendDone` so the lane's outstanding count drains.
+    Discard(Box<PendingAttach>),
+    /// Run the durable session discard (`store.remove`) for a zero-expiry detach or
+    /// the expiry sweep, serialized BEHIND the session's admitted appends (issue
+    /// #242 finding C) — a direct remove racing an in-flight append would let the
+    /// append land after it and re-create the queue with a ghost message. Posts a
+    /// bookkeeping `AppendDone` so the lane's outstanding count drains.
+    Remove {
+        /// The discarded session.
+        client: ClientId,
+    },
+}
+
+/// One session's append lane: a bounded FIFO queue to a dedicated worker task. Keyed
+/// by SUBSCRIBER session (never by topic or placement group): all of one session's
+/// durable keys live in one group, so per-session lanes give exact failure-domain
+/// isolation AND make per-session append order structural (issue #242 / ADR 0061).
+#[derive(Debug)]
+struct AppendLane {
+    /// Bounded sender ([`LANE_QUEUE_CAP`]); `try_send` only — the loop never awaits it.
+    tx: mpsc::Sender<LaneJob>,
+    /// Jobs admitted and not yet completed. Maintained purely on-loop (submit
+    /// increments, `AppendDone` decrements), so reads need no synchronization.
+    outstanding: usize,
+}
+
+/// A peer verdict aggregate: one `RemotePublishAcked`/`RemoteSharedDeliverAcked`
+/// fan-out's lane jobs, keyed `(origin, seq)`. The verdict is answered only when the
+/// last job lands — a peer is never told `Stored` before the store actually stored
+/// (issue #242).
+#[derive(Debug)]
+struct RemoteAppendGate {
+    /// Lane jobs still unresolved for this forward.
+    awaiting: usize,
+    /// The composed verdict so far ([`DurableOutcome::and`] precedence).
+    worst: DurableOutcome,
+}
+
+/// Bound on jobs queued in one session's append lane (issue #242). At the cap the
+/// NEWEST job is rejected at submit time — evicting an older job would break the
+/// lane's FIFO order and orphan another publish's gate. An answerable rejection
+/// withholds the publisher's ack (it retries: fail closed, ADR 0041 T5) and is
+/// counted as `publish_dropped{reason="append-backlog-full"}`. Outbound-id record
+/// jobs (issue #242 finding A) SHARE this cap with appends — a `QoS` 2-heavy
+/// session spends up to half its headroom on records.
+const LANE_QUEUE_CAP: usize = 256;
+
+/// Extra lane-channel slots beyond [`LANE_QUEUE_CAP`] reserved for CONTROL jobs —
+/// a lane-serialized discard ([`LaneJob::Discard`]/[`LaneJob::Remove`]) or the
+/// detach spill ([`LaneWork::Spill`]) (issue #242 finding C). Delivery jobs are
+/// capped by `outstanding` before touching the channel, so a saturated lane still
+/// admits the control job whose whole purpose is to serialize behind that
+/// saturation; only a pile-up beyond this headroom falls back to the loud,
+/// documented fallbacks.
+const LANE_CONTROL_HEADROOM: usize = 16;
+
+/// WHO is told about this fan-out's outcome — threaded from each entry point down to
+/// [`Hub::deliver_to_client`], where it becomes the submitted job's [`AppendThen`].
+/// Replaces the old bare `answerable` flag: with appends completing asynchronously
+/// (issue #242) the fan-out must carry its continuation, not just a bool.
+#[derive(Debug, Clone)]
+enum AppendGate {
+    /// A locally-gated publish: the pending-publish id whose ack awaits every append.
+    Pending(u64),
+    /// A peer awaiting a durability verdict for forward `seq` (0041-T12).
+    Peer {
+        /// The origin node.
+        node: NodeId,
+        /// Its forward sequence.
+        seq: u64,
+    },
+    /// Nobody is told (a Will, a plain forward, a retained-window back-fill): a
+    /// refused durable copy is a counted drop and the live delivery still happens
+    /// (issue #238).
+    None,
+}
+
+impl AppendGate {
+    /// Whether SOMEBODY IS BEING TOLD about a refusal (the old `answerable` flag).
+    fn answerable(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// The on-loop continuation a job submitted under this gate carries.
+    fn then(&self) -> AppendThen {
+        match self {
+            Self::Pending(id) => AppendThen::Gate(*id),
+            Self::Peer { node, seq } => AppendThen::Peer(node.clone(), *seq),
+            Self::None => AppendThen::Ungated,
+        }
+    }
+}
+
+/// What [`Hub::submit_append`] decided ON-loop, at the freeze point (issue #242).
+/// The store's own outcome arrives later, as [`HubCommand::AppendDone`].
+#[derive(Debug, Clone, Copy)]
+enum Submitted {
+    /// Admitted into the session's lane; the obligation is recorded.
+    Queued,
+    /// Refused under a stated policy (brownout) — decided before any effect, so the
+    /// refusal is effect-free and the publisher's retry idempotent (issue #238).
+    Refused(PublishRefusal),
+    /// The lane is at [`LANE_QUEUE_CAP`] (reject-newest): fail closed — the caller
+    /// withholds the publisher's ack exactly as for a failed store write.
+    Full,
+}
+
+/// What [`Hub::send_qos_publish`] did with one `QoS` > 0 delivery (issue #242
+/// finding A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QosSend {
+    /// On the wire (pending entry registered).
+    Sent,
+    /// Consumed, but NOT on the wire yet: its ADR 0057 outbound-id record is staged
+    /// in the session's lane ([`OutState::AwaitingIdRecord`]); the record's
+    /// completion sends it and re-drains. The caller must stop draining — a later
+    /// send would overtake the staged delivery.
+    Staged,
+    /// Not consumed: pushed back to the backlog FRONT (ordering holds) — the
+    /// packet-id block is spent (reserve running off-loop) or the lane rejected the
+    /// record job. The next drain retries.
+    Deferred,
 }
 
 /// The durability verdict of a fan-out, as it travels back to the ack gate.
@@ -626,6 +848,21 @@ struct Inflight {
     /// The last offset already handed to [`SessionStore::ack`], so an advance that would
     /// not move the truncation point costs no store write.
     acked_through: Offset,
+    /// Outbound-id record jobs staged in the session's lane and not yet completed
+    /// (issue #242 finding A). While non-zero, every `QoS` > 0 send diverts into the
+    /// backlog and the drain halts, so nothing overtakes the staged delivery.
+    /// Incremented at stage time, decremented ONLY by the record job's completion —
+    /// never reset — so the gate is exactly balanced even across reconnects (a stale
+    /// completion still drains it).
+    records_pending: usize,
+    /// A durably-reserved packet-id block base banked by
+    /// [`PkidBlockReserved`](HubCommand::PkidBlockReserved) and not yet adopted
+    /// (ADR 0007 T9, reserved off-loop since issue #242). `Some(0)` means "refill the
+    /// in-memory cursor without adopting" — no durable session, or the reserve
+    /// failed: today's fallback semantics, verbatim.
+    banked_base: Option<u16>,
+    /// A single-flight `reserve_packet_ids` task is in flight for this session.
+    reserve_outstanding: bool,
 }
 
 impl Default for Inflight {
@@ -639,6 +876,9 @@ impl Default for Inflight {
             outstanding: BTreeSet::new(),
             high_water: 0,
             acked_through: 0,
+            records_pending: 0,
+            banked_base: None,
+            reserve_outstanding: false,
         }
     }
 }
@@ -807,6 +1047,27 @@ pub enum HubCommand {
         pending: PendingAttach,
         /// The authoritative recovery result (or `Unavailable`).
         recovery: SessionRecovery,
+    },
+    /// Internal: a session append lane finished one job (issue #242 / ADR 0061); run
+    /// its on-loop continuation — durable-writes bookkeeping, the post-durable live
+    /// send, and the gate/verdict resolution. Not sent by connections — lane workers
+    /// post it to the hub.
+    AppendDone {
+        /// The job as submitted (all decisions frozen at plan time).
+        job: Box<AppendJob>,
+        /// What the store did.
+        outcome: LaneOutcome,
+    },
+    /// Internal: the off-loop packet-id block reservation finished (ADR 0007 T9 /
+    /// issue #242 finding A) — bank the base and drain the deliveries deferred on
+    /// it. Not sent by connections — the spawned single-flight reserve task posts
+    /// it to the hub.
+    PkidBlockReserved {
+        /// The session the block was reserved for.
+        client: ClientId,
+        /// The store's answer: the persisted high-water before the reservation
+        /// (0 = no durable session), or the error the in-memory fallback absorbs.
+        result: Result<u16, mqtt_storage::StorageError>,
     },
     /// Add subscriptions (filter + granted `QoS`) for a client.
     Subscribe {
@@ -1233,6 +1494,32 @@ pub enum HubCommand {
     },
 }
 
+impl HubCommand {
+    /// The COARSE `{command}` label for `mqttd_hub_dispatch_seconds` (issue #242):
+    /// a bounded ~6-value class, never per-variant (cardinality discipline,
+    /// ADR 0020 §3). `AppendDone` counts as `publish` — it is the publish path's
+    /// completion half, and any store await smuggled back into it must show up in
+    /// the same series operators alert on.
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Attach { .. } | Self::SessionRecovered { .. } => "attach",
+            Self::Publish { .. } | Self::AppendDone { .. } | Self::PkidBlockReserved { .. } => {
+                "publish"
+            }
+            Self::PubAck { .. } | Self::PubRec { .. } | Self::PubComp { .. } => "ack",
+            Self::Subscribe { .. } | Self::Unsubscribe { .. } => "subscribe",
+            Self::SetQuotas(_)
+            | Self::SetBrownout { .. }
+            | Self::Detach { .. }
+            | Self::Evict { .. }
+            | Self::SweepIdentities(_)
+            | Self::AttachAuthorizer(_)
+            | Self::Ping { .. } => "control",
+            _ => "cluster",
+        }
+    }
+}
+
 /// A connected peer node's link.
 #[derive(Debug)]
 struct Peer {
@@ -1440,13 +1727,12 @@ pub struct Hub {
     /// Forward seq → pending publish id, for answer resolution.
     forward_index: HashMap<u64, u64>,
     /// Count of durable session appends this hub has completed successfully.
-    ///
-    /// Snapshotted around a gated fan-out so a pending publish can record whether it
-    /// is STORED anywhere (issue #238): only a publish stored NOWHERE may be answered
-    /// `Refused`, because that answer asserts "nothing was stored, retry" — a
-    /// falsehood for a message already durably owed to a subscriber, whose retry would
-    /// then duplicate it there. Safe as a plain counter because the hub is a
-    /// single-owner actor: no other command's appends interleave with one publish's.
+    /// Incremented only by the `AppendDone` handler (issue #242) — the one place a
+    /// lane append's outcome re-enters the loop — which also sets the completing
+    /// publish's [`PendingPublish::stored`] directly (issue #238): only a publish
+    /// stored NOWHERE may be answered `Refused`, because that answer asserts
+    /// "nothing was stored, retry" — a falsehood for a message already durably owed
+    /// to a subscriber, whose retry would then duplicate it there.
     durable_writes: u64,
     /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
     /// exhibit ⑥) — one at a time.
@@ -1501,6 +1787,38 @@ pub struct Hub {
     /// to the latest `conn_id` (ADR 0017). A `SessionRecovered` whose `conn_id` no longer
     /// matches was superseded by a newer connect and is dropped (last-writer-wins).
     connecting: HashMap<ClientId, u64>,
+    /// Per-session durable-append lanes (issue #242 / ADR 0061): the publish path's
+    /// store writes run in these workers, off the command loop, so one placement
+    /// group's degraded followers stall only its own sessions' appends — never every
+    /// client on the node. Spawned on first submission; reaped by the sweep when idle.
+    append_lanes: HashMap<ClientId, AppendLane>,
+    /// The lane workers themselves, owned by the hub so their lifetime is the hub's.
+    ///
+    /// This ownership is load-bearing, not tidiness. A worker holds an `Arc` of the
+    /// session store, and a redb store is exclusive-locked by its handle, so a worker
+    /// that outlives the node keeps the data dir locked and the next start fails with
+    /// "Database already open. Cannot acquire lock."
+    ///
+    /// A node always stops by having its hub task ABORTED (or by the process exiting):
+    /// the loop's `None` arm cannot fire, because the hub holds a clone of its own
+    /// command sender. Aborting drops `self`, and dropping a
+    /// [`JoinSet`](tokio::task::JoinSet) aborts every task in it — so every store
+    /// handle is released at once, exactly as the OS reclaims a killed process's files.
+    /// An in-flight append is abandoned, which is honest: its publisher's ack was
+    /// withheld, so nothing was falsely promised, and the alternative (finishing a
+    /// quorum append that cannot reach quorum, up to the 5s RPC bound) is what leaked
+    /// the lock past the stop and broke restarts.
+    ///
+    /// Before ADR 0061 the append was awaited INLINE on the loop, so an abort killed it
+    /// for free; moving it off-loop is what made this ownership explicit. Found by CI:
+    /// `cluster_stress::a_full_cluster_stop_start_recovers_every_acked_fact` restarts a
+    /// stopped cluster over the same data dirs and failed on the held lock, where every
+    /// local run had won the race.
+    owned_tasks: tokio::task::JoinSet<()>,
+    /// Peer verdict aggregates for forwards whose fan-out submitted lane jobs
+    /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
+    /// answered. Entries drain via [`HubCommand::AppendDone`].
+    remote_append_pending: HashMap<(NodeId, u64), RemoteAppendGate>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// Shared brownout state for the `/statusz` body (ADR 0054), flipped alongside
@@ -1645,8 +1963,14 @@ struct PendingPublish {
     acked_nodes: HashSet<NodeId>,
     /// Whether the retained authority commit is still outstanding (exhibit ⑦).
     awaiting_retained: bool,
-    /// Set once the on-loop local fan-out (durable appends included) completed OK.
+    /// Set once the on-loop local fan-out pass completed OK — every owed durable
+    /// append SUBMITTED to its lane (issue #242) and counted below.
     local_done: bool,
+    /// Lane appends submitted for this publish and not yet completed (issue #242 /
+    /// ADR 0061). Incremented synchronously at submission, inside the same dispatch
+    /// that created the gate; decremented only by the `AppendDone` handler after a
+    /// real store outcome. The ack releases only at zero.
+    appends_outstanding: usize,
     /// When the publish first fanned out — the cutoff for re-delivery (only
     /// clients attached or materialized AFTER this can have missed it).
     created_at: Instant,
@@ -1803,6 +2127,9 @@ impl Hub {
                 rx,
                 self_tx: tx.clone(),
                 connecting: HashMap::new(),
+                append_lanes: HashMap::new(),
+                owned_tasks: tokio::task::JoinSet::new(),
+                remote_append_pending: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
                 session_expiry: HashMap::new(),
@@ -1975,10 +2302,21 @@ impl Hub {
         loop {
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
-                    Some(cmd) => self.dispatch(cmd).await,
+                    Some(cmd) => {
+                        // Time-on-loop per dispatch (issue #242): the regression
+                        // tripwire for any await smuggled back onto the single-
+                        // threaded loop. Coarse command class, never per-variant.
+                        let class = cmd.class();
+                        let started = Instant::now();
+                        self.dispatch(cmd).await;
+                        if let Some(m) = &self.metrics {
+                            m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
+                        }
+                    }
                     None => break,
                 },
                 _ = sweep.tick() => {
+                    let started = Instant::now();
                     self.sweep_expired_sessions().await;
                     self.refresh_gauges().await;
                     // Retransmit an unanswered retained handoff (T8 — same seq, the
@@ -1990,6 +2328,17 @@ impl Hub {
                     // Retransmit / re-route acked publish forwards (ADR 0042 T9,
                     // exhibit ⑤); no-op when none are pending.
                     self.sweep_pending_forwards().await;
+                    // Reap idle append lanes (issue #242): dropping the sender ends
+                    // the worker; a later submission re-spawns one. Only with zero
+                    // outstanding jobs, so no completion is ever orphaned.
+                    self.append_lanes.retain(|_, lane| lane.outstanding > 0);
+                    // Reap the reaped lanes' finished workers too: a JoinSet holds a
+                    // completed task's slot until polled, so without this the set grows
+                    // by one per lane ever spawned.
+                    while self.owned_tasks.try_join_next().is_some() {}
+                    if let Some(m) = &self.metrics {
+                        m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
+                    }
                 }
             }
         }
@@ -2095,12 +2444,11 @@ impl Hub {
                 let gate = done.map(|done| {
                     self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
                 });
-                // Time the synchronous on-loop fan-out (local deliver + offline enqueue
-                // + peer forward) as the hub's per-publish delivery latency (ADR 0020-T4).
+                // Time the synchronous on-loop fan-out (plan + lane submissions +
+                // peer forward) as the hub's per-publish on-loop latency (ADR
+                // 0020-T4; since issue #242 the durable appends themselves run
+                // off-loop and are timed by `durable_append_latency_seconds`).
                 let started = Instant::now();
-                // Snapshotted so a later refusal can tell "stored nowhere" (refusable)
-                // from "already stored for somebody" (withhold only) — issue #238.
-                let writes_before = self.durable_writes;
                 let durable = self
                     .publish(
                         &topic,
@@ -2116,24 +2464,30 @@ impl Hub {
                 if let Some(m) = &self.metrics {
                     m.observe_deliver_latency(started.elapsed().as_secs_f64());
                 }
-                // The LOCAL fan-out (and its durable appends) is complete: resolve
-                // that obligation — the ack releases once every cluster-wide
-                // obligation has (ADR 0018 + ADR 0042 T9; the local-only publish
-                // completes right here). A failed durable append WITHHOLDS the ack
-                // instead (drop the entry): the publisher's connection closes
-                // unacked and it retries — fail closed, never an ack for a message
-                // a subscriber will never see (ADR 0041 T5). A stated-policy
-                // REFUSAL (brownout) is told to the publisher instead of withheld,
-                // so it ends in an immediate, retryable error rather than a close
-                // (0041-T11, issue #238).
+                // The LOCAL fan-out pass is complete: every owed durable append is
+                // now SUBMITTED to its session's lane (issue #242), counted in the
+                // gate's `appends_outstanding` — so `pending_local_done` can fire
+                // here while the ack still waits for every append's `AppendDone`
+                // (ADR 0018 + ADR 0042 T9). A submission the lane REJECTED (full)
+                // or a failed retained write WITHHOLDS the ack (drop the entry):
+                // the publisher's connection closes unacked and it retries — fail
+                // closed, never an ack for a message a subscriber will never see
+                // (ADR 0041 T5). A stated-policy REFUSAL (brownout) was decided at
+                // the plan pass, before any submission, and is told to the
+                // publisher instead of withheld (0041-T11, issue #238).
                 if let Some(id) = gate {
-                    self.mark_stored_since(id, writes_before);
                     match durable {
                         DurableOutcome::Ok => self.pending_local_done(id),
                         DurableOutcome::Refused(r) => self.refuse_pending(id, r),
                         DurableOutcome::Failed => self.drop_pending(id),
                     }
                 }
+            }
+            HubCommand::AppendDone { job, outcome } => {
+                self.append_done(*job, outcome).await;
+            }
+            HubCommand::PkidBlockReserved { client, result } => {
+                self.pkid_block_reserved(&client, result);
             }
             HubCommand::PubAck { client, pkid } => self.pub_ack(&client, pkid).await,
             HubCommand::PubRec { client, pkid } => self.pub_rec(&client, pkid).await,
@@ -2216,19 +2570,26 @@ impl Hub {
                         message_expiry,
                         &app,
                         None,
-                        true,
+                        &AppendGate::Peer {
+                            node: node.clone(),
+                            seq,
+                        },
                     )
                     .await;
                 // A fan-out that matched NOBODY mid-settle maps to FAILED, never
                 // `Refused`: the message may genuinely be owed and delivered once the
                 // view settles, so "nothing was stored, retry" would be a FALSE refusal
                 // — as much a defect as a false ack.
-                let verdict = if matched == 0 && self.routing_unsettled() {
-                    ForwardVerdict::Failed
+                let sync = if matched == 0 && self.routing_unsettled() {
+                    DurableOutcome::Failed
                 } else {
-                    durable.to_verdict()
+                    durable
                 };
-                self.answer_forward(&node, seq, verdict);
+                // Answered now if no lane job was submitted; otherwise folded into
+                // the `(node, seq)` aggregate and answered when the last `AppendDone`
+                // lands — a peer is never told `Stored` before the store actually
+                // stored (issue #242).
+                self.finish_peer_verdict(&node, seq, sync);
             }
             HubCommand::RemotePublishAck { node, seq, ok } => {
                 // A proto-6 peer's boolean: `false` means only "not stored, reason
@@ -2268,10 +2629,14 @@ impl Hub {
                         message_expiry,
                         &app,
                         false, // shared delivery clears RETAIN (#198)
-                        true,
+                        &AppendGate::Peer {
+                            node: node.clone(),
+                            seq,
+                        },
                     )
                     .await;
-                self.answer_forward(&node, seq, out.to_verdict());
+                // Answered now, or at the append's `AppendDone` (issue #242).
+                self.finish_peer_verdict(&node, seq, out);
             }
             HubCommand::RemotePublish {
                 topic,
@@ -2298,7 +2663,7 @@ impl Hub {
                         message_expiry,
                         &app,
                         None,
-                        false,
+                        &AppendGate::None,
                     )
                     .await;
             }
@@ -2538,7 +2903,7 @@ impl Hub {
                         message_expiry,
                         &app,
                         false,
-                        false,
+                        &AppendGate::None,
                     )
                     .await;
             }
@@ -2572,8 +2937,8 @@ impl Hub {
         // `forward_to_peers`, before `route_retained_commit`. The SHARED half is
         // planned here because `deliver` cannot see it, and it is peeked rather than
         // selected so a refused publish does not consume a group member's turn.
-        let answerable = gate.is_some();
-        if answerable && self.shared_plan_owes_durable(topic, qos) {
+        let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
+        if append_gate.answerable() && self.shared_plan_owes_durable(topic, qos) {
             if let Some(r) = self.plan_refusal(true) {
                 self.count_refusal(r);
                 return DurableOutcome::Refused(r);
@@ -2588,7 +2953,7 @@ impl Hub {
                 message_expiry,
                 app,
                 publisher,
-                answerable,
+                &append_gate,
             )
             .await;
         // `deliver` refused before taking any side effect, so there is nothing to
@@ -2659,7 +3024,7 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         publisher: Option<&ClientId>,
-        answerable: bool,
+        gate: &AppendGate,
     ) -> (DurableOutcome, usize) {
         // PLAN pass (issue #238): the recipients and their delivery terms are computed
         // with no I/O, so the refusal can be decided BEFORE the retained mutation below
@@ -2671,7 +3036,7 @@ impl Hub {
         // three subscribers" on one PUBACK).
         let targets = self.ordinary_targets(topic, publisher, retain);
         let matched = targets.len();
-        if answerable {
+        if gate.answerable() {
             let owes = targets
                 .iter()
                 .any(|(c, granted, _)| self.owes_durable(c, min_qos(qos, *granted)));
@@ -2718,15 +3083,7 @@ impl Hub {
         // code honestly says "I do not know what happened" (`DurableOutcome::Failed`
         // therefore dominates any refusal).
         let (durable, _matched) = self
-            .deliver_local(
-                topic,
-                payload,
-                qos,
-                message_expiry,
-                app,
-                targets,
-                answerable,
-            )
+            .deliver_local(topic, payload, qos, message_expiry, app, targets, gate)
             .await;
         let durable = if retained_ok {
             durable
@@ -2773,7 +3130,45 @@ impl Hub {
             self.discard_session_local(&pending.client);
             self.connecting
                 .insert(pending.client.clone(), pending.conn_id);
-            tokio::spawn(discard_session(
+            // Appends for this session still in flight in its lane (issue #242): route
+            // the discard THROUGH the lane so it serializes AFTER them — a late append
+            // landing post-remove would silently re-create the queue with a ghost
+            // message. A full lane falls back to the spawn (the ghost residual is
+            // accepted there, loudly), so the CONNACK can never wedge on a lane.
+            if self
+                .append_lanes
+                .get(&pending.client)
+                .is_some_and(|l| l.outstanding > 0)
+            {
+                let lane = self
+                    .append_lanes
+                    .get_mut(&pending.client)
+                    .expect("checked just above");
+                match lane.tx.try_send(LaneJob::Discard(Box::new(pending))) {
+                    Ok(()) => {
+                        lane.outstanding += 1;
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "append lane full at clean-start discard; falling back to \
+                             the spawned discard (issue #242)"
+                        );
+                        let (mpsc::error::TrySendError::Full(job)
+                        | mpsc::error::TrySendError::Closed(job)) = e;
+                        let LaneJob::Discard(pending) = job else {
+                            unreachable!("the job sent just above is a Discard");
+                        };
+                        self.spawn_owned(discard_session(
+                            self.store.clone(),
+                            self.self_tx.clone(),
+                            *pending,
+                        ));
+                        return;
+                    }
+                }
+            }
+            self.spawn_owned(discard_session(
                 self.store.clone(),
                 self.self_tx.clone(),
                 pending,
@@ -2788,7 +3183,7 @@ impl Hub {
         self.note_session_ownership(&pending.client);
         self.connecting
             .insert(pending.client.clone(), pending.conn_id);
-        tokio::spawn(recover_session(
+        self.spawn_owned(recover_session(
             self.store.clone(),
             self.self_tx.clone(),
             pending,
@@ -2899,7 +3294,7 @@ impl Hub {
                 // the client cannot observe the refusal and reconnect into a
                 // half-removed session.
                 let store = self.store.clone();
-                tokio::spawn(async move {
+                self.spawn_owned(async move {
                     let _ = store.remove(&client).await;
                     let _ = reply.send(AttachOutcome::QuotaExceeded);
                 });
@@ -3018,12 +3413,24 @@ impl Hub {
         // same messages a second time. The set is empty after a broker restart — the
         // in-flight table is memory — which is exactly when the replay must carry them.
         let mut resumed_offsets: HashSet<Offset> = HashSet::new();
+        // Entries still staged behind an outbound-id record (issue #242 finding A)
+        // never reached any wire, so there is nothing to DUP-resume: drop them —
+        // this attach's replay below delivers their durable copies fresh (their
+        // offsets stayed owed, so truncation never passed them). Covers the
+        // takeover-without-detach path; a plain reconnect already dropped them at
+        // detach.
+        if let Some(inf) = self.inflight.get_mut(&client) {
+            inf.pending
+                .retain(|_, p| p.state != OutState::AwaitingIdRecord);
+        }
         if let Some(inf) = self.inflight.get(&client) {
             for (pkid, p) in &inf.pending {
                 if let Some(offset) = p.offset {
                     resumed_offsets.insert(offset);
                 }
                 let packet = match p.state {
+                    // Dropped just above; nothing staged can appear here.
+                    OutState::AwaitingIdRecord => continue,
                     OutState::AwaitingPubAck | OutState::AwaitingPubRec => publish_packet(
                         &p.message.topic,
                         p.message.payload.clone(),
@@ -3536,13 +3943,22 @@ impl Hub {
     /// client's mandatory one included) re-decides a decision with no residue rather
     /// than duplicating half a fan-out.
     ///
-    /// Atomicity needs no new machinery: the hub is a single-owner actor and
-    /// `self.brownout` is written only by the `SetBrownout` handler, so no other
-    /// command interleaves with the awaits inside one publish — the decide pass and
-    /// the commit pass necessarily see the same flag and the same routing table.
-    /// Anything that later moves a fan-out off the hub loop, splits it across commands,
-    /// or lets a watcher write `brownout` directly breaks that silently; the
-    /// `debug_assert!` in [`durable_append`](Self::durable_append) is the tripwire.
+    /// Atomicity: the decision is FROZEN across the plan-and-submit span — this
+    /// `self.brownout` read through the last lane submission
+    /// ([`Hub::submit_append`], issue #242) — because the whole span runs inside ONE
+    /// dispatch: `run()` awaits each dispatch to completion, so its internal awaits
+    /// never interleave another command, and `self.brownout` is written only by the
+    /// `SetBrownout` handler, i.e. by another command. The off-loop half executes
+    /// only data frozen into its [`AppendJob`], against a worker that structurally
+    /// cannot read hub state, and reports in a vocabulary ([`LaneOutcome`]) that
+    /// cannot even express a refusal. A flag flip queued behind this dispatch
+    /// therefore governs the NEXT publish, never this one's admitted jobs — every
+    /// interleaving linearizes to "publish committed first, then the flag flipped".
+    /// Anything that splits the span across commands, lets a watcher write
+    /// `brownout` directly, or lets a lane decide policy breaks this silently; the
+    /// `debug_assert!` in [`submit_append`](Self::submit_append) and
+    /// [`AppendDone`](HubCommand::AppendDone) being the ONLY writer of completion
+    /// state are the tripwires.
     fn plan_refusal(&self, owes_durable: bool) -> Option<PublishRefusal> {
         (owes_durable && self.brownout).then_some(PublishRefusal::Brownout)
     }
@@ -3570,7 +3986,7 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         targets: Vec<(ClientId, QoS, bool)>,
-        answerable: bool,
+        gate: &AppendGate,
     ) -> (DurableOutcome, usize) {
         debug!(topic = %topic, ordinary = targets.len(), "local delivery");
         let matched = targets.len();
@@ -3602,7 +4018,7 @@ impl Hub {
                     message_expiry,
                     app,
                     retain,
-                    answerable,
+                    gate,
                 )
                 .await,
             );
@@ -3641,8 +4057,9 @@ impl Hub {
         message_expiry: Option<u32>,
         app: &AppProperties,
         retain: bool,
-        answerable: bool,
+        gate: &AppendGate,
     ) -> DurableOutcome {
+        let answerable = gate.answerable();
         // DECIDE BEFORE COMMITTING, for the single-target callers too (issue #238).
         // `deliver`'s plan pass already decided for a local fan-out and returned before
         // reaching here, so this fires only for the callers that arrive with ONE target
@@ -3650,7 +4067,7 @@ impl Hub {
         // (`RemoteSharedDeliverAcked`) and the settle-window re-delivery
         // (`redeliver_pending`). Deciding here keeps a refusal effect-free on those paths
         // as well — nothing appended, nothing sent — which is what lets the origin
-        // re-select within a shared group, and what keeps `durable_append`'s invariant
+        // re-select within a shared group, and what keeps `submit_append`'s invariant
         // assert a statement about the WHOLE hub rather than just the local publish path.
         if answerable && self.owes_durable(client, qos) {
             if let Some(r) = self.plan_refusal(true) {
@@ -3667,41 +4084,88 @@ impl Hub {
             expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
         };
         let persistent = self.is_persistent(client);
-        if let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) {
+        if let Some(online) = self.online.get(client) {
+            let (conn_id, tx) = (online.conn_id, online.tx.clone());
             // Durability follows the SESSION, not the connection (#124). A persistent
             // subscriber is owed redelivery of anything unacknowledged, so the record
             // has to exist before the packet reaches the wire — otherwise a crash in
             // between loses a message the publisher was already acked for, and there is
             // no trace of it anywhere. A clean session is skipped because it has nothing
             // to resume into, and `QoS` 0 because at-most-once owes no redelivery.
-            let mut offset = None;
+            //
+            // Since issue #242 the append runs OFF-loop, in this session's lane; the
+            // live send moves with it into the `AppendDone` handler, which is what
+            // keeps the durable-before-wire ordering structural: the send site
+            // literally receives the offset from the completion.
             if persistent && qos != QoS::AtMostOnce {
-                match self
-                    .durable_append(client, &message, message_expiry, answerable)
-                    .await
-                {
-                    Appended::At(o) => offset = Some(o),
-                    // Returns BEFORE the live send: delivering live with no durable
+                return match self.submit_append(
+                    client,
+                    &message,
+                    message_expiry,
+                    gate,
+                    Some(conn_id),
+                ) {
+                    Submitted::Queued => DurableOutcome::Ok,
+                    // Returns BEFORE any live send: delivering live with no durable
                     // record promises a redelivery the store cannot honour, and the
                     // publisher — which is about to be refused — would retry into a
                     // duplicate carrying no DUP flag and no offset to truncate.
-                    Appended::Refused(r) if answerable => return DurableOutcome::Refused(r),
-                    // Fall through to the live send with `offset` staying `None`. Two
-                    // different situations that share one behaviour:
-                    //   `Dropped`  — the queue cap discarded the durable copy, but the
-                    //                publisher was acked, so the online subscriber
-                    //                should still see the message.
-                    //   `Refused`  — UNANSWERABLE (a Will, a retained-window back-fill):
-                    //                nobody will be told and nobody will retry, so the
-                    //                live send is the only way the message reaches its
-                    //                subscriber at all. `durable_append` already counted
-                    //                the lost durable copy as the genuine drop it is.
-                    // Neither promises a redelivery, hence no offset either way.
-                    Appended::Dropped | Appended::Refused(_) => {}
-                    Appended::Failed => return DurableOutcome::Failed,
-                }
+                    Submitted::Refused(r) if answerable => DurableOutcome::Refused(r),
+                    // UNANSWERABLE refusal (a Will, a retained-window back-fill):
+                    // nobody will be told and nobody will retry, so the live send is
+                    // the only way the message reaches its subscriber at all.
+                    // `submit_append` already counted the lost durable copy as the
+                    // genuine drop it is. No offset: nothing promises a redelivery.
+                    // If earlier appends for this SAME client are still in flight, a
+                    // direct send would OVERTAKE their post-durable live sends — the
+                    // exact rule the `QoS` 0 branch below states — so it rides the
+                    // lane as a passthrough instead; a saturated lane sheds it
+                    // (already counted at submit): an unanswerable refusal accepts
+                    // loss by definition, and reordering is what nothing permits.
+                    Submitted::Refused(_) => {
+                        if self
+                            .append_lanes
+                            .get(client)
+                            .is_some_and(|l| l.outstanding > 0)
+                        {
+                            let _ = self.submit_passthrough(
+                                client,
+                                &message,
+                                message_expiry,
+                                Some(conn_id),
+                            );
+                            return DurableOutcome::Ok;
+                        }
+                        self.send_to_client(client, &tx, &message, retain, message_expiry, None)
+                            .await;
+                        if let Some(m) = &self.metrics {
+                            m.publish_delivered(qos_num(qos));
+                        }
+                        DurableOutcome::Ok
+                    }
+                    // The lane is full: fail closed exactly like a failed store write
+                    // (the caller withholds the publisher's ack so it retries).
+                    Submitted::Full => DurableOutcome::Failed,
+                };
             }
-            self.send_to_client(client, &tx, &message, retain, message_expiry, offset)
+            // No append owed (`QoS` 0, or a clean session). If earlier appends for
+            // this SAME client are still in flight, a direct send would overtake
+            // their post-durable live sends — route it through the lane as a
+            // passthrough job so per-client wire order survives the motion
+            // (issue #242). The common case (no lane, or an idle one) stays a
+            // direct on-loop send with zero added latency.
+            if self
+                .append_lanes
+                .get(client)
+                .is_some_and(|l| l.outstanding > 0)
+            {
+                // `Queued` delivers in order at completion. A saturated lane sheds
+                // instead: at-most-once permits dropping (already counted), and
+                // sending directly would REORDER, which nothing permits.
+                let _ = self.submit_passthrough(client, &message, message_expiry, Some(conn_id));
+                return DurableOutcome::Ok;
+            }
+            self.send_to_client(client, &tx, &message, retain, message_expiry, None)
                 .await;
             if let Some(m) = &self.metrics {
                 m.publish_delivered(qos_num(qos));
@@ -3710,41 +4174,52 @@ impl Hub {
         }
         if persistent {
             // Offline but persistent: queue for replay on reconnect.
-            return match self
-                .durable_append(client, &message, message_expiry, answerable)
-                .await
-            {
-                Appended::At(_) | Appended::Dropped => DurableOutcome::Ok,
+            return match self.submit_append(client, &message, message_expiry, gate, None) {
+                Submitted::Queued => DurableOutcome::Ok,
                 // At-most-once owes no redelivery, so a refused enqueue for it is a
                 // genuine drop with nothing to refuse the publisher for — the same
                 // rule the online branch states by not appending at `QoS` 0 at all.
                 // (Reachable when a `QoS` ≥ 1 publish is downgraded to a `QoS` 0
                 // subscription, which is exactly the case that owes nothing.)
-                Appended::Refused(_) if qos == QoS::AtMostOnce => DurableOutcome::Ok,
+                Submitted::Refused(_) if qos == QoS::AtMostOnce => DurableOutcome::Ok,
                 // Unanswerable and offline: there is no live send to fall back on, so
-                // the message is genuinely gone. `durable_append` counted it; reporting
+                // the message is genuinely gone. `submit_append` counted it; reporting
                 // a refusal to a caller that has nobody to refuse would only turn a
                 // drop into a spurious withhold of an unrelated publisher's ack.
-                Appended::Refused(_) if !answerable => DurableOutcome::Ok,
-                Appended::Refused(r) => DurableOutcome::Refused(r),
-                Appended::Failed => DurableOutcome::Failed,
+                Submitted::Refused(_) if !answerable => DurableOutcome::Ok,
+                Submitted::Refused(r) => DurableOutcome::Refused(r),
+                Submitted::Full => DurableOutcome::Failed,
             };
         }
         DurableOutcome::Ok
     }
 
-    /// Append `message` to `client`'s durable session log — the write the publisher's
-    /// `QoS` ≥ 1 acknowledgement is gated on (ADR 0001).
+    /// Submit `message` for append to its subscriber's durable session lane — the
+    /// write the publisher's `QoS` ≥ 1 acknowledgement is gated on (ADR 0001), now run
+    /// OFF the command loop (issue #242 / ADR 0061) so a degraded placement group
+    /// stalls only its own sessions' appends, never every client on the node.
     ///
-    /// The absolute deadline (ADR 0009 §3) is receipt time plus the interval. The queue
-    /// is bounded (ADR 0001 §6); a cap that drops messages is logged and counted.
-    async fn durable_append(
+    /// **The #238 freeze point.** Everything decision-shaped happens HERE, on-loop,
+    /// inside the same dispatch that ran the plan pass — and a dispatch's internal
+    /// awaits never interleave another command, so the plan pass's `self.brownout`
+    /// read and this submission observe one consistent state: the brownout arm below,
+    /// the absolute expiry deadline (receipt time plus interval, ADR 0009 §3 — frozen
+    /// from `self.clock`, already inside `message.expires_at`), the target, and the
+    /// continuation. The lane worker executes only frozen data and can report only
+    /// what the store did ([`LaneOutcome`] has no `Refused` variant, by construction).
+    /// A `SetBrownout` that lands after this dispatch therefore affects the NEXT
+    /// publish, never this one's admitted jobs — every interleaving linearizes to
+    /// "publish committed first, then the flag flipped", exactly as it did when the
+    /// append was awaited inline.
+    fn submit_append(
         &mut self,
         client: &ClientId,
         message: &Message,
         message_expiry: Option<u32>,
-        answerable: bool,
-    ) -> Appended {
+        gate: &AppendGate,
+        planned_conn: Option<u64>,
+    ) -> Submitted {
+        let answerable = gate.answerable();
         // Brownout (ADR 0041 T5 disk / T8 memory): an enqueue GROWS the store, so it is
         // refused above the watermark. The publisher is REFUSED with it (0041-T11, issue
         // #238) rather than acked for a message that exists nowhere — "acked means
@@ -3762,68 +4237,472 @@ impl Hub {
             // here means a caller with NOBODY TO TELL — `publish_will`,
             // `deliver_to_windowed_subscribers`, `redeliver_pending`'s ungated paths — so
             // the lost durable copy is a genuine drop, counted as one. The assert is the
-            // tripwire for a future refusal axis, or a fan-out moved off the hub loop,
+            // tripwire for a future refusal axis, or an await slipped between the plan
+            // pass and this submission (the decide/commit freeze span, issue #242),
             // that breaks the plan/commit invariant.
             debug_assert!(
                 !answerable || message.qos == QoS::AtMostOnce,
                 "an answerable fan-out that OWED a durable append reached \
-                 durable_append's brownout arm: the plan/commit invariant behind an \
+                 submit_append's brownout arm: the plan/commit invariant behind an \
                  effect-free refusal is broken (#238)"
             );
             if let Some(m) = &self.metrics {
                 m.publish_dropped("brownout");
             }
-            return Appended::Refused(PublishRefusal::Brownout);
+            return Submitted::Refused(PublishRefusal::Brownout);
         }
-        let expiry_at = message_expiry.map(|secs| self.clock.now_epoch_secs() + u64::from(secs));
-        // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
-        // The latency histogram is only meaningful when the store is the replicated
-        // one, so gate it on durable mode; a failure reason is recorded either way.
-        let durable = self.durable_plane.is_some();
-        let started = Instant::now();
-        let result = self
-            .store
-            .enqueue_with_expiry(client, message, expiry_at)
-            .await;
-        if durable {
-            if let Some(m) = &self.metrics {
-                m.observe_durable_append_latency(started.elapsed().as_secs_f64());
-            }
+        let job = AppendJob {
+            client: client.clone(),
+            message: message.clone(),
+            work: LaneWork::Append {
+                // Frozen at plan time (ADR 0009 §3): the same receipt-time deadline
+                // `message.expires_at` carries, never re-read off-loop.
+                expiry_at: message
+                    .expires_at
+                    .or_else(|| message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s))),
+            },
+            then: gate.then(),
+            planned_conn,
+            retain: message.retain,
+            message_expiry,
+        };
+        self.submit_lane_job(job)
+    }
+
+    /// Route a no-append send through `client`'s busy lane so it cannot overtake an
+    /// earlier append's post-durable live send (issue #242). Never refused — no store
+    /// growth is involved — but subject to the same lane bound.
+    fn submit_passthrough(
+        &mut self,
+        client: &ClientId,
+        message: &Message,
+        message_expiry: Option<u32>,
+        planned_conn: Option<u64>,
+    ) -> Submitted {
+        let job = AppendJob {
+            client: client.clone(),
+            message: message.clone(),
+            work: LaneWork::Passthrough,
+            then: AppendThen::Ungated,
+            planned_conn,
+            retain: message.retain,
+            message_expiry,
+        };
+        self.submit_lane_job(job)
+    }
+
+    /// This session's append lane, spawning it (bounded channel + worker) on first use.
+    fn lane_for(&mut self, client: &ClientId) -> &mut AppendLane {
+        if !self.append_lanes.contains_key(client) {
+            // The channel holds LANE_CONTROL_HEADROOM slots beyond the delivery cap
+            // (enforced on `outstanding` below) so a discard/spill control job is
+            // admitted even at the cap — see LANE_CONTROL_HEADROOM.
+            let (tx, rx) = mpsc::channel(LANE_QUEUE_CAP + LANE_CONTROL_HEADROOM);
+            // Spawned INTO the hub's own JoinSet, never bare: the worker holds the
+            // store's exclusive handle, so its lifetime must not outlive the hub's
+            // (see `owned_tasks`).
+            self.owned_tasks.spawn(append_lane_worker(
+                self.store.clone(),
+                self.self_tx.clone(),
+                rx,
+                self.metrics.clone(),
+                self.durable_plane.is_some(),
+            ));
+            self.append_lanes
+                .insert(client.clone(), AppendLane { tx, outstanding: 0 });
         }
-        match result {
-            Ok(Enqueued::Stored { offset, evicted }) => {
-                if evicted > 0 {
-                    warn!(client = %client.0, evicted, topic = %message.topic,
-                          "session queue full: evicted oldest message(s)");
-                    if let Some(m) = &self.metrics {
-                        m.publish_dropped("queue-overflow");
-                    }
+        self.append_lanes
+            .get_mut(client)
+            .expect("just inserted above")
+    }
+
+    /// Spawn a task that holds an `Arc` of the session store, OWNED by the hub.
+    ///
+    /// Never `tokio::spawn` such a task bare. The store's redb handle is an exclusive
+    /// lock, so a task holding it past the node's stop keeps the data dir locked and the
+    /// next start fails with "Database already open. Cannot acquire lock." — and at a
+    /// full-cluster stop every store call blocks for the replication bound, so "it
+    /// finishes quickly" is exactly the assumption that does not hold. Spawning into
+    /// `owned_tasks` makes the abort that stops the node cascade here too (see
+    /// [`Hub::owned_tasks`]).
+    fn spawn_owned<F>(&mut self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.owned_tasks.spawn(fut);
+    }
+
+    /// Admit one job into its session's lane (spawning the lane on first use), record
+    /// the gate obligation, and return. `try_send` only: the loop NEVER awaits lane
+    /// capacity — at the cap the NEWEST job is rejected (reject-newest keeps the
+    /// lane's FIFO order intact) and the caller fails closed.
+    fn submit_lane_job(&mut self, job: AppendJob) -> Submitted {
+        let client = job.client.clone();
+        // A rejected append/passthrough is LOST or withheld — counted as a drop. A
+        // rejected record job is only DEFERRED (its message is already durable at
+        // its offset; the caller requeues it at the backlog front), so counting it
+        // as dropped would be a lie the operator alerts on.
+        let deferred_only = matches!(job.work, LaneWork::RecordOutbound { .. });
+        let then = job.then.clone();
+        let admitted = {
+            let lane = self.lane_for(&client);
+            // Delivery jobs are admitted only while channel occupancy is under
+            // LANE_QUEUE_CAP — the remaining LANE_CONTROL_HEADROOM slots belong to
+            // control jobs (discard/spill), which bypass this check.
+            lane.tx.capacity() > LANE_CONTROL_HEADROOM
+                && lane.tx.try_send(LaneJob::Deliver(Box::new(job))).is_ok()
+        };
+        if !admitted {
+            warn!(
+                client = %client.0, cap = LANE_QUEUE_CAP,
+                "append lane full: rejecting the newest job (ack withheld / drop / \
+                 deferral) — this session's placement group is not keeping up \
+                 (issue #242)"
+            );
+            if !deferred_only {
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("append-backlog-full");
                 }
+            }
+            return Submitted::Full;
+        }
+        self.lane_for(&client).outstanding += 1;
+        // Record the obligation SYNCHRONOUSLY, inside the same dispatch that
+        // created the gate, so no interleaved command can observe the gate
+        // with obligations not yet registered (ACK-AFTER-DURABLE, #124).
+        match then {
+            AppendThen::Gate(id) => {
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.appends_outstanding += 1;
+                }
+            }
+            AppendThen::Peer(node, seq) => {
+                self.remote_append_pending
+                    .entry((node, seq))
+                    .or_insert(RemoteAppendGate {
+                        awaiting: 0,
+                        worst: DurableOutcome::Ok,
+                    })
+                    .awaiting += 1;
+            }
+            AppendThen::Ungated => {}
+        }
+        Submitted::Queued
+    }
+
+    /// Handle one lane job's completion (issue #242 / ADR 0061): the on-loop second
+    /// half of a durable append. Runs on the single-threaded loop like every dispatch,
+    /// so all pending-publish, in-flight, and lane mutation stays race-free —
+    /// ADR 0017's argument, applied to appends.
+    async fn append_done(&mut self, job: AppendJob, outcome: LaneOutcome) {
+        if let Some(lane) = self.append_lanes.get_mut(&job.client) {
+            lane.outstanding = lane.outstanding.saturating_sub(1);
+        }
+        // The second lane stage — ADR 0057's outbound-id record (issue #242
+        // finding A) — has its own completion contract: the post-record wire send.
+        if let LaneWork::RecordOutbound { pkid, offset } = job.work {
+            return self.outbound_record_done(job, pkid, offset, outcome);
+        }
+        let offset = match outcome {
+            LaneOutcome::Stored(o) => {
                 // The one place a durable copy comes into existence — so the one place
                 // that can honestly say a publish IS stored somewhere (issue #238).
                 self.durable_writes += 1;
-                Appended::At(offset)
+                Some(o)
             }
-            Ok(Enqueued::Rejected) => {
-                warn!(client = %client.0, topic = %message.topic,
-                      "session queue full: dropped message (reject-newest)");
+            LaneOutcome::Dropped | LaneOutcome::Failed | LaneOutcome::Passed => None,
+        };
+        // The post-durable live send (ACK-AFTER-DURABLE's wire half, #124): the packet
+        // structurally cannot reach the conn channel before the store answered —
+        // this is the only send site for a lane-routed delivery, and it holds the
+        // store's own offset. Sent to the exact connection the delivery was planned
+        // against; after a reconnect, only when the attach replay provably did not
+        // cover the stored offset (every replayed entry raises the session's
+        // high-water, and offsets are monotone) — otherwise the durable copy is (or
+        // was) the replay's to deliver, and sending again would duplicate. While a
+        // connect is mid-recovery (`connecting`), nothing is sent: the old connection
+        // is being replaced and the new one's replay owns delivery.
+        let mut send = !self.connecting.contains_key(&job.client)
+            && match outcome {
+                LaneOutcome::Failed => false,
+                // No durable copy exists (queue-cap drop) or none was owed
+                // (passthrough): the live send is delivery itself, valid only for
+                // the exact planned connection.
+                LaneOutcome::Dropped | LaneOutcome::Passed => self
+                    .online
+                    .get(&job.client)
+                    .is_some_and(|o| Some(o.conn_id) == job.planned_conn),
+                LaneOutcome::Stored(o) => match self.online.get(&job.client) {
+                    None => false, // offline: the durable copy replays on reconnect
+                    Some(online) if Some(online.conn_id) == job.planned_conn => true,
+                    Some(_) => {
+                        // (Re)attached mid-flight: deliver only what the replay
+                        // could not have seen, into a still-persistent session.
+                        self.is_persistent(&job.client)
+                            && self
+                                .inflight
+                                .get(&job.client)
+                                .is_none_or(|i| o > i.high_water)
+                    }
+                },
+            };
+        if send && self.park_ordering_gated_qos0(&job).await {
+            send = false;
+        }
+        if send {
+            if let Some(tx) = self.online.get(&job.client).map(|s| s.tx.clone()) {
+                self.send_to_client(
+                    &job.client,
+                    &tx,
+                    &job.message,
+                    job.retain,
+                    job.message_expiry,
+                    offset,
+                )
+                .await;
                 if let Some(m) = &self.metrics {
-                    m.publish_dropped("queue-overflow");
+                    m.publish_delivered(qos_num(job.message.qos));
                 }
-                Appended::Dropped
-            }
-            Err(e) => {
-                if let Some(m) = &self.metrics {
-                    m.durable_append_failed(durable_failure_reason(&e));
-                }
-                warn!(client = %client.0, error = %e,
-                      "failed to enqueue message; withholding the publisher's ack (ADR 0041 T5)");
-                // Fail closed like the local ack path (ADR 0018): the caller withholds
-                // the publisher's acknowledgement so it retries, instead of acking a
-                // message a subscriber will never see.
-                Appended::Failed
             }
         }
+        match job.then {
+            AppendThen::Gate(id) => {
+                if let Some(p) = self.pending_publishes.get_mut(&id) {
+                    p.appends_outstanding = p.appends_outstanding.saturating_sub(1);
+                    if offset.is_some() {
+                        // Event-driven successor of the old durable-writes snapshot
+                        // trick: a refusal for this publish may now only WITHHOLD
+                        // (issue #238).
+                        p.stored = true;
+                    }
+                }
+                match outcome {
+                    // Fail closed like the inline path did (ADR 0041 T5): withhold.
+                    LaneOutcome::Failed => self.drop_pending(id),
+                    _ => self.try_complete_pending(id),
+                }
+            }
+            AppendThen::Peer(node, seq) => {
+                let out = match outcome {
+                    LaneOutcome::Failed => DurableOutcome::Failed,
+                    _ => DurableOutcome::Ok,
+                };
+                if let Some(g) = self.remote_append_pending.get_mut(&(node.clone(), seq)) {
+                    g.awaiting = g.awaiting.saturating_sub(1);
+                    g.worst = g.worst.and(out);
+                    if g.awaiting == 0 {
+                        if let Some(g) = self.remote_append_pending.remove(&(node.clone(), seq)) {
+                            self.answer_forward(&node, seq, g.worst.to_verdict());
+                        }
+                    }
+                }
+            }
+            AppendThen::Ungated => {}
+        }
+    }
+
+    /// A `QoS` 0 passthrough completion must not slip past a delivery that is
+    /// ADMITTED but momentarily parked off the wire — an outbound-id record staged
+    /// after the passthrough was queued (issue #242 finding A), a packet-id block
+    /// reservation in flight, or anything already waiting in the backlog. Returns
+    /// `true` after parking such a completion in the backlog — the one per-client
+    /// ordering buffer — so the gate's completion drains it in exact FIFO order
+    /// (delaying a `QoS` 0 is always legal; overtaking is what nothing permits).
+    /// `QoS` > 0 passthroughs need no re-check: their send runs through
+    /// `send_to_client`, whose backlog gate already diverts them.
+    async fn park_ordering_gated_qos0(&mut self, job: &AppendJob) -> bool {
+        let gated = matches!(job.work, LaneWork::Passthrough)
+            && job.message.qos == QoS::AtMostOnce
+            && self.inflight.get(&job.client).is_some_and(|i| {
+                i.records_pending > 0 || i.reserve_outstanding || !i.backlog.is_empty()
+            });
+        if !gated {
+            return false;
+        }
+        let inf = self.inflight.entry(job.client.clone()).or_default();
+        let evicted = inf.push_backlog(Backlog {
+            message: job.message.clone(),
+            retain: job.retain,
+            message_expiry: job.message_expiry,
+            offset: None,
+        });
+        if let Some(evicted) = evicted {
+            if let Some(offset) = evicted.offset {
+                inf.release(offset);
+            }
+            warn!(client = %job.client.0, cap = MAX_BACKLOG,
+                  "flow-control backlog full: evicted oldest message");
+            if let Some(m) = &self.metrics {
+                m.publish_dropped("backlog-overflow");
+            }
+            self.truncate_acked(&job.client).await;
+        }
+        true
+    }
+
+    /// Completion of one staged outbound-id record (issue #242 finding A): the ONLY
+    /// send site for a `QoS` 2 delivery with a durable offset — it holds the record
+    /// write's own outcome, so the packet structurally cannot reach the wire before
+    /// the store answered. ADR 0057's ordering, relocated, not weakened.
+    fn outbound_record_done(
+        &mut self,
+        job: AppendJob,
+        pkid: u16,
+        offset: Offset,
+        outcome: LaneOutcome,
+    ) {
+        if let Some(inf) = self.inflight.get_mut(&job.client) {
+            inf.records_pending = inf.records_pending.saturating_sub(1);
+        }
+        // The exact-conn fence (the same rule the append completion applies): a
+        // reconnect never re-sends — the staged entry was dropped at
+        // detach/takeover and the durable copy is the replay's to deliver; while a
+        // connect is mid-recovery, the new connection's replay owns delivery.
+        let fence = !self.connecting.contains_key(&job.client)
+            && self
+                .online
+                .get(&job.client)
+                .is_some_and(|o| Some(o.conn_id) == job.planned_conn);
+        match outcome {
+            LaneOutcome::Stored(_) if fence => {
+                // Recorded durably: the handshake may now start under this id.
+                if let Some(p) = self
+                    .inflight
+                    .get_mut(&job.client)
+                    .and_then(|inf| inf.pending.get_mut(&pkid))
+                {
+                    p.state = OutState::AwaitingPubRec;
+                }
+                if let Some(tx) = self.online.get(&job.client).map(|o| o.tx.clone()) {
+                    let _ = tx.send(publish_packet(
+                        &job.message.topic,
+                        job.message.payload.clone(),
+                        job.message.qos,
+                        Some(pkid),
+                        false,
+                        job.retain,
+                        job.message_expiry,
+                        &job.message.app,
+                    ));
+                    if let Some(m) = &self.metrics {
+                        m.publish_delivered(qos_num(job.message.qos));
+                    }
+                }
+                // The gate is open again: release anything it diverted, in order.
+                self.drain_backlog(&job.client);
+            }
+            LaneOutcome::Stored(_) => {
+                // Fence failed (reconnect / mid-connect): nothing is sent — the
+                // durable copy replays. Clean up a leftover staged entry,
+                // state-checked so a replay's rebuilt entry under the same id is
+                // never touched; the offset stays owed, holding truncation.
+                self.drop_staged_entry(&job.client, pkid);
+                self.drain_backlog(&job.client);
+            }
+            LaneOutcome::Failed | LaneOutcome::Dropped | LaneOutcome::Passed => {
+                // The record write failed — ADR 0057's failure arm, relocated
+                // verbatim: the PUBLISH is withheld, not sent under an id that
+                // would not survive. The message is already durable at `offset`,
+                // so nothing is lost — back to the FRONT of the backlog (ordering
+                // holds); the next drain retries. Deliberately NO drain here:
+                // retrying in this same completion would spin against a store
+                // that just refused.
+                self.drop_staged_entry(&job.client, pkid);
+                warn!(client = %job.client.0, pkid,
+                      "outbound QoS2 id could not be made durable; delivery deferred");
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("outbound-id-write-failed");
+                }
+                if fence {
+                    self.inflight
+                        .entry(job.client.clone())
+                        .or_default()
+                        .backlog
+                        .push_front(Backlog {
+                            message: job.message,
+                            retain: job.retain,
+                            message_expiry: job.message_expiry,
+                            offset: Some(offset),
+                        });
+                }
+                // Fence failed: the entry is simply dropped — the offset stays
+                // owed and the reattach replay owns delivery, the same rule the
+                // detach spill applies to offset-carrying backlog entries.
+            }
+        }
+    }
+
+    /// Remove `pkid`'s pending entry only while it is still `AwaitingIdRecord` — a
+    /// stale completion must never disturb an entry the attach replay rebuilt under
+    /// the same id (ADR 0057's restored table re-inserts original ids).
+    fn drop_staged_entry(&mut self, client: &ClientId, pkid: u16) {
+        if let Some(inf) = self.inflight.get_mut(client) {
+            if inf
+                .pending
+                .get(&pkid)
+                .is_some_and(|p| p.state == OutState::AwaitingIdRecord)
+            {
+                inf.pending.remove(&pkid);
+            }
+        }
+    }
+
+    /// The off-loop packet-id block reservation answered (ADR 0007 T9 / issue #242
+    /// finding A): bank the base — `0` (no durable session) and an error both bank
+    /// a bare refill, today's in-memory fallback verbatim — and drain the
+    /// deliveries that deferred on it.
+    fn pkid_block_reserved(
+        &mut self,
+        client: &ClientId,
+        result: Result<u16, mqtt_storage::StorageError>,
+    ) {
+        let inf = self.inflight.entry(client.clone()).or_default();
+        inf.reserve_outstanding = false;
+        inf.banked_base = Some(match result {
+            // base = persisted high-water before the reservation; resume from it.
+            Ok(base) => base,
+            Err(e) => {
+                debug!(client = %client.0, error = %e,
+                       "packet-id reservation failed; in-memory fallback");
+                0
+            }
+        });
+        self.drain_backlog(client);
+    }
+
+    /// The packet-id block is spent and nothing is banked (issue #242 finding A):
+    /// park `entry` at the backlog FRONT (ordering holds — the delivery waits in
+    /// the backlog, not the loop) and run the durable block reservation in a
+    /// spawned single-flight task owning only `(client, store, self_tx)` — the
+    /// off-loop contract. [`PkidBlockReserved`](HubCommand::PkidBlockReserved)
+    /// banks the result and drains.
+    fn defer_for_pkid_block(&mut self, client: &ClientId, entry: Backlog) {
+        let inf = self.inflight.entry(client.clone()).or_default();
+        inf.backlog.push_front(entry);
+        if inf.reserve_outstanding {
+            return;
+        }
+        inf.reserve_outstanding = true;
+        let store = self.store.clone();
+        let self_tx = self.self_tx.clone();
+        let client = client.clone();
+        self.spawn_owned(async move {
+            let result = store.reserve_packet_ids(&client, PKID_BLOCK).await;
+            let _ = self_tx.send(HubCommand::PkidBlockReserved { client, result });
+        });
+    }
+
+    /// Answer a peer's forward verdict — immediately when its fan-out submitted no
+    /// lane job, otherwise by folding this on-loop half into the `(node, seq)`
+    /// aggregate that the last [`AppendDone`](HubCommand::AppendDone) completes
+    /// (issue #242). Either way the peer hears `Stored` only after every owed append
+    /// actually stored.
+    fn finish_peer_verdict(&mut self, node: &NodeId, seq: u64, sync: DurableOutcome) {
+        if let Some(g) = self.remote_append_pending.get_mut(&(node.clone(), seq)) {
+            g.worst = g.worst.and(sync);
+            return;
+        }
+        self.answer_forward(node, seq, sync.to_verdict());
     }
 
     /// Route a message to the shared subscriptions matching `topic`: for each group,
@@ -3858,6 +4737,7 @@ impl Hub {
         gate: Option<u64>,
     ) -> DurableOutcome {
         let answerable = gate.is_some();
+        let append_gate = gate.map_or(AppendGate::None, AppendGate::Pending);
         let mut all_durable = DurableOutcome::Ok;
         for (key, candidates) in self.shared_candidates(topic) {
             let Some(chosen) = self.select_shared(&key, &candidates) else {
@@ -3876,7 +4756,7 @@ impl Hub {
                             message_expiry,
                             app,
                             false, // shared delivery clears RETAIN (#198)
-                            answerable,
+                            &append_gate,
                         )
                         .await,
                     );
@@ -3987,7 +4867,6 @@ impl Hub {
             let delivered_qos = min_qos(qos, chosen.qos);
             tried.push((chosen.node.clone(), chosen.client.clone()));
             let Some(node) = chosen.node.clone() else {
-                let before = self.durable_writes;
                 let out = self
                     .deliver_to_client(
                         &chosen.client,
@@ -3997,11 +4876,12 @@ impl Hub {
                         message_expiry,
                         &app,
                         false,
-                        true,
+                        &AppendGate::Pending(id),
                     )
                     .await;
-                self.mark_stored_since(id, before);
                 match out {
+                    // `Ok` = the append is SUBMITTED (issue #242): the obligation is
+                    // in `appends_outstanding`, so this releases nothing early.
                     DurableOutcome::Ok => self.try_complete_pending(id),
                     DurableOutcome::Failed => self.drop_pending(id),
                     // This member cannot take it either: keep re-balancing.
@@ -4211,8 +5091,12 @@ impl Hub {
         // deferred `QoS` 2 delivery (outbound-id write failed, requeued at the front)
         // broke that invariant, and sending fresh traffic directly would let it OVERTAKE
         // the deferred message — per-client ordering is part of the contract.
+        // `records_pending > 0` ALSO diverts (issue #242 finding A): a delivery is
+        // staged behind its off-loop outbound-id record, and sending fresh traffic
+        // directly would overtake it — the backlog is the per-client ordering
+        // buffer, and the record's completion drains it.
         let inf = self.inflight.entry(client.clone()).or_default();
-        let must_queue = inf.quota_full() || !inf.backlog.is_empty();
+        let must_queue = inf.quota_full() || !inf.backlog.is_empty() || inf.records_pending > 0;
         if must_queue {
             // The backlog is bounded (ADR 0012); drop-oldest on overflow so a stalled
             // consumer cannot force unbounded memory.
@@ -4243,12 +5127,10 @@ impl Hub {
                 .get(client)
                 .is_some_and(|inf| !inf.quota_full());
             if quota_free {
-                self.drain_backlog(client).await;
+                self.drain_backlog(client);
             }
         } else {
-            let _ = self
-                .send_qos_publish(client, tx, message, retain, message_expiry, offset)
-                .await;
+            let _ = self.send_qos_publish(client, tx, message, retain, message_expiry, offset);
         }
     }
 
@@ -4257,36 +5139,25 @@ impl Hub {
     /// (ADR 0012).
     /// Allocate an outbound packet id for `client` (1..=65535, never 0, skipping ids still
     /// in flight). Ids come from a durably-reserved block (ADR 0007 T9): when the block is
-    /// spent, the next block is reserved with one store write that advances the persisted
-    /// high-water, so a takeover resumes past it. A reservation failure (or a non-durable /
-    /// clean session, which returns base 0) degrades to a free-running in-memory counter
-    /// rather than blocking delivery.
-    async fn alloc_pkid(&mut self, client: &ClientId) -> u16 {
+    /// spent, the next block's reservation — one store write advancing the persisted
+    /// high-water, so a takeover resumes past it — runs OFF-loop (issue #242 finding A,
+    /// reserve-at-spent): `None` means "spent, nothing banked yet"; the caller defers the
+    /// delivery to the backlog front and submits the single-flight reserve via
+    /// [`defer_for_pkid_block`](Self::defer_for_pkid_block). An id therefore reaches the
+    /// wire only under a durably reserved high-water. A reservation failure (or a
+    /// non-durable / clean session, base 0) banks a bare refill: the free-running
+    /// in-memory counter, exactly as before.
+    fn alloc_pkid(&mut self, client: &ClientId) -> Option<u16> {
         loop {
-            let spent = self
-                .inflight
-                .get(client)
-                .is_none_or(|i| i.block_remaining == 0);
-            if spent {
-                match self.store.reserve_packet_ids(client, PKID_BLOCK).await {
-                    // base = persisted high-water before the reservation; resume from it.
-                    Ok(base) if base != 0 => {
-                        let inf = self.inflight.entry(client.clone()).or_default();
-                        inf.next_pkid = base;
-                    }
-                    // No durable session (clean / non-durable store) or a failed reserve:
-                    // keep the in-memory cursor and just refill the local block.
-                    Ok(_) => {}
-                    Err(e) => {
-                        debug!(client = %client.0, error = %e, "packet-id reservation failed; in-memory fallback");
-                    }
-                }
-                self.inflight
-                    .entry(client.clone())
-                    .or_default()
-                    .block_remaining = PKID_BLOCK;
-            }
             let inf = self.inflight.entry(client.clone()).or_default();
+            if inf.block_remaining == 0 {
+                // Spent: adopt the banked reservation, or tell the caller to defer.
+                let base = inf.banked_base.take()?;
+                if base != 0 {
+                    inf.next_pkid = base;
+                }
+                inf.block_remaining = PKID_BLOCK;
+            }
             inf.next_pkid = inf.next_pkid.wrapping_add(1);
             if inf.next_pkid == 0 {
                 inf.next_pkid = 1; // packet id 0 is invalid
@@ -4294,15 +5165,16 @@ impl Hub {
             inf.block_remaining = inf.block_remaining.saturating_sub(1);
             let id = inf.next_pkid;
             if !inf.pending.contains_key(&id) {
-                return id;
+                return Some(id);
             }
         }
     }
 
-    /// Returns whether the PUBLISH went on the wire. `false` means the delivery was
-    /// requeued (front of the backlog, so ordering holds) because its outbound id could
-    /// not be made durable — see below.
-    async fn send_qos_publish(
+    /// See [`QosSend`] for what each return means to the caller's drain loop. This is
+    /// the single choke point every `QoS` > 0 wire send passes through — the
+    /// completion-handler live send, the ack-triggered drain, and the attach replay —
+    /// so the staging below covers all three.
+    fn send_qos_publish(
         &mut self,
         client: &ClientId,
         tx: &Outbound,
@@ -4310,39 +5182,61 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         offset: Option<Offset>,
-    ) -> bool {
-        let pkid = self.alloc_pkid(client).await;
+    ) -> QosSend {
+        // A `QoS` 0 parked in the backlog purely for wire order (issue #242
+        // finding A — reachable only from the drain): no packet id, no pending
+        // entry, no quota — it goes straight out in its FIFO slot.
+        if message.qos == QoS::AtMostOnce {
+            let _ = tx.send(publish_packet(
+                &message.topic,
+                message.payload.clone(),
+                QoS::AtMostOnce,
+                None,
+                false,
+                retain,
+                message_expiry,
+                &message.app,
+            ));
+            if let Some(m) = &self.metrics {
+                m.publish_delivered(0);
+            }
+            return QosSend::Sent;
+        }
+        let Some(pkid) = self.alloc_pkid(client) else {
+            // The durable packet-id block is spent (ADR 0007 T9): defer to the
+            // backlog front and reserve the next block OFF-loop (issue #242
+            // finding A) — the loop must not park for the reservation's quorum
+            // write, and the message waits in the backlog exactly as long as it
+            // used to wait in the inline await.
+            self.defer_for_pkid_block(
+                client,
+                Backlog {
+                    message: message.clone(),
+                    retain,
+                    message_expiry,
+                    offset,
+                },
+            );
+            return QosSend::Deferred;
+        };
         // ADR 0057: a `QoS` 2 delivery backed by a durable offset records its packet id
         // BEFORE the packet reaches the wire — the same ordering as #124, because an id
         // recorded after the send is an id a crash can orphan, and an orphaned id is how
-        // exactly-once quietly becomes at-least-once across a restart. `QoS` 1 is not
-        // recorded (a fresh-id DUP redelivery is what at-least-once means); a delivery
-        // with no offset has no durable message to resume, so an id would be pointless.
+        // exactly-once quietly becomes at-least-once across a restart. Since issue #242
+        // the record itself is a SECOND LANE STAGE: staged here, written off-loop,
+        // sent only by its completion. `QoS` 1 is not recorded (a fresh-id DUP
+        // redelivery is what at-least-once means); a delivery with no offset has no
+        // durable message to resume, so an id would be pointless.
         if message.qos == QoS::ExactlyOnce {
             if let Some(off) = offset {
-                if let Err(e) = self.store.record_outbound(client, pkid, off).await {
-                    // Fail closed: the PUBLISH is withheld, not sent under an id that
-                    // would not survive. The message is already durable at `off`, so
-                    // nothing is lost — it goes back to the FRONT of the backlog
-                    // (ordering holds) and the next drain retries, by which time the
-                    // store has recovered or the same failure repeats harmlessly.
-                    warn!(client = %client.0, pkid, error = %e,
-                          "outbound QoS2 id could not be made durable; delivery deferred");
-                    if let Some(m) = &self.metrics {
-                        m.publish_dropped("outbound-id-write-failed");
-                    }
-                    self.inflight
-                        .entry(client.clone())
-                        .or_default()
-                        .backlog
-                        .push_front(Backlog {
-                            message: message.clone(),
-                            retain,
-                            message_expiry,
-                            offset,
-                        });
-                    return false;
-                }
+                return self.stage_outbound_record(
+                    client,
+                    message,
+                    retain,
+                    message_expiry,
+                    pkid,
+                    off,
+                );
             }
         }
         let inf = self.inflight.entry(client.clone()).or_default();
@@ -4369,37 +5263,99 @@ impl Hub {
             message_expiry,
             &message.app,
         ));
-        true
+        QosSend::Sent
+    }
+
+    /// Stage ADR 0057's outbound-id record in the session's lane (issue #242
+    /// finding A): the pending entry parks in [`OutState::AwaitingIdRecord`] —
+    /// reserving Receive-Maximum quota and pinning the pkid against reuse —
+    /// `records_pending` diverts every later `QoS` > 0 send into the backlog, and
+    /// the lane worker performs the store write off-loop. This function has NO
+    /// send: only [`outbound_record_done`](Self::outbound_record_done), holding
+    /// the store's own Ok behind the conn fence, puts the packet on the wire
+    /// (ack-after-durable, #124/ADR 0057, made structural).
+    fn stage_outbound_record(
+        &mut self,
+        client: &ClientId,
+        message: &Message,
+        retain: bool,
+        message_expiry: Option<u32>,
+        pkid: u16,
+        off: Offset,
+    ) -> QosSend {
+        let planned_conn = self.online.get(client).map(|o| o.conn_id);
+        let inf = self.inflight.entry(client.clone()).or_default();
+        inf.pending.insert(
+            pkid,
+            PendingOut {
+                message: message.clone(),
+                state: OutState::AwaitingIdRecord,
+                offset: Some(off),
+            },
+        );
+        inf.records_pending += 1;
+        let job = AppendJob {
+            client: client.clone(),
+            message: message.clone(),
+            work: LaneWork::RecordOutbound { pkid, offset: off },
+            then: AppendThen::Ungated,
+            planned_conn,
+            retain,
+            message_expiry,
+        };
+        match self.submit_lane_job(job) {
+            Submitted::Queued => QosSend::Staged,
+            // The lane is at cap: fail closed exactly like a failed id write —
+            // the message is already durable at `off`, nothing is lost; back to
+            // the FRONT (ordering holds) and the next drain retries.
+            Submitted::Refused(_) | Submitted::Full => {
+                let inf = self.inflight.entry(client.clone()).or_default();
+                inf.pending.remove(&pkid);
+                inf.records_pending = inf.records_pending.saturating_sub(1);
+                inf.backlog.push_front(Backlog {
+                    message: message.clone(),
+                    retain,
+                    message_expiry,
+                    offset: Some(off),
+                });
+                QosSend::Deferred
+            }
+        }
     }
 
     /// Drain backlogged `QoS` > 0 messages onto the wire while the client is online and
-    /// quota is available (ADR 0012). Called after a PUBACK/PUBCOMP frees a slot.
-    async fn drain_backlog(&mut self, client: &ClientId) {
+    /// quota is available (ADR 0012). Called after a PUBACK/PUBCOMP frees a slot, and
+    /// by the two off-loop completions that re-open their gates (issue #242 finding A:
+    /// an outbound-id record landing, a packet-id block arriving).
+    fn drain_backlog(&mut self, client: &ClientId) {
         let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) else {
             return;
         };
         loop {
             let inf = self.inflight.entry(client.clone()).or_default();
-            if inf.quota_full() {
+            // A staged outbound-id record halts the drain (issue #242 finding A):
+            // its delivery owns the wire next; the record's completion sends it
+            // and re-enters here.
+            if inf.quota_full() || inf.records_pending > 0 {
                 break;
             }
             let Some(entry) = inf.backlog.pop_front() else {
                 break;
             };
-            if !self
-                .send_qos_publish(
-                    client,
-                    &tx,
-                    &entry.message,
-                    entry.retain,
-                    entry.message_expiry,
-                    entry.offset,
-                )
-                .await
-            {
-                // The entry went back to the backlog's front; retrying in this same
-                // loop would spin against a store that just refused.
-                break;
+            match self.send_qos_publish(
+                client,
+                &tx,
+                &entry.message,
+                entry.retain,
+                entry.message_expiry,
+                entry.offset,
+            ) {
+                QosSend::Sent => {}
+                // Staged: the entry is consumed, but nothing further may pass the
+                // staged record. Deferred: the entry went back to the front;
+                // retrying in this same loop would spin against a store that just
+                // refused.
+                QosSend::Staged | QosSend::Deferred => break,
             }
         }
     }
@@ -4410,7 +5366,7 @@ impl Hub {
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubAck);
         if completed {
             self.truncate_acked(client).await;
-            self.drain_backlog(client).await;
+            self.drain_backlog(client);
         }
     }
 
@@ -4489,6 +5445,18 @@ impl Hub {
     /// PUBCOMP: completes a `QoS` 2 delivery, freeing a quota slot (ADR 0012) and
     /// releasing the message's durable log entry (#124).
     async fn pub_comp(&mut self, client: &ClientId, pkid: u16) {
+        // An id still in `AwaitingIdRecord` was never sent (issue #242 finding A):
+        // a PUBCOMP for it can only be a confused or malicious client, and clearing
+        // the durable record below would race the lane's in-flight `record_outbound`
+        // for the very same id. Ignore it; the entry's own completion owns cleanup.
+        if self
+            .inflight
+            .get(client)
+            .and_then(|inf| inf.pending.get(&pkid))
+            .is_some_and(|p| p.state == OutState::AwaitingIdRecord)
+        {
+            return;
+        }
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubComp);
         // ADR 0057: release the durable id UNCONDITIONALLY, not only when an in-memory
         // entry completed. A PUBCOMP with no pending entry is how an ORPHANED table entry
@@ -4502,7 +5470,7 @@ impl Hub {
         }
         if completed {
             self.truncate_acked(client).await;
-            self.drain_backlog(client).await;
+            self.drain_backlog(client);
         }
     }
 
@@ -4709,6 +5677,16 @@ impl Hub {
             return;
         }
         let departed = self.online.remove(client);
+        // Deliveries still staged behind an outbound-id record never reached this
+        // connection's wire (issue #242 finding A): drop them — the durable copy
+        // owns delivery on reattach, and their offsets stay owed (untouched in
+        // `outstanding`) so the log cannot truncate past them. The stale lane
+        // completion cleans up after itself (conn fence) and drains
+        // `records_pending`.
+        if let Some(inf) = self.inflight.get_mut(client) {
+            inf.pending
+                .retain(|_, p| p.state != OutState::AwaitingIdRecord);
+        }
         // Any end other than a clean DISCONNECT publishes the will
         // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
         if !graceful {
@@ -4721,17 +5699,17 @@ impl Hub {
         // session indefinitely; a finite interval schedules expiry for the sweep.
         match self.session_expiry.get(client).copied() {
             None | Some(0) => {
-                self.discard_session(client).await;
+                self.discard_session(client);
                 info!(client = %client.0, "client detached (session discarded)");
                 // Our local interest may have shrunk; let peers know.
                 self.gossip_interest();
             }
             Some(SESSION_EXPIRY_NEVER) => {
-                self.flush_backlog_to_store(client).await;
+                self.flush_backlog_to_store(client);
                 info!(client = %client.0, "client detached (session retained)");
             }
             Some(secs) => {
-                self.flush_backlog_to_store(client).await;
+                self.flush_backlog_to_store(client);
                 // Absolute wall-clock deadline, persisted durably so a new owner expires the
                 // session at the right time after a takeover instead of restarting the clock
                 // (ADR 0009 §3).
@@ -4754,24 +5732,52 @@ impl Hub {
     /// second copy in the log. What still spills is the case the offset does not cover —
     /// a message the store deliberately did not record (the queue cap under
     /// `reject-newest`).
-    async fn flush_backlog_to_store(&mut self, client: &ClientId) {
-        let backlog: Vec<Backlog> = match self.inflight.get_mut(client) {
-            Some(inf) if !inf.backlog.is_empty() => inf
-                .backlog
-                .drain(..)
-                .filter(|e| e.offset.is_none())
-                .collect(),
+    ///
+    /// The spill rides the session's append LANE as one [`LaneWork::Spill`] job
+    /// (issue #242 finding C): the store writes run OFF-loop — a direct enqueue
+    /// here parked the loop for up to `MAX_BACKLOG` quorum writes — and the lane
+    /// FIFO puts them strictly BEHIND every in-flight append, which is exactly the
+    /// pre-motion order (the inline spill followed all previously admitted
+    /// appends; racing them inverts replay order).
+    fn flush_backlog_to_store(&mut self, client: &ClientId) {
+        let entries: Vec<(Message, Option<u64>)> = match self.inflight.get_mut(client) {
+            Some(inf) if !inf.backlog.is_empty() => {
+                let now = self.clock.now_epoch_secs();
+                inf.backlog
+                    .drain(..)
+                    // At-most-once owes no redelivery: a `QoS` 0 parked here for
+                    // wire order (issue #242 finding A) dies with the connection,
+                    // exactly like one sitting in the closed conn channel.
+                    .filter(|e| e.offset.is_none() && e.message.qos != QoS::AtMostOnce)
+                    .map(|e| {
+                        let expiry_at = e.message_expiry.map(|s| now + u64::from(s));
+                        (e.message, expiry_at)
+                    })
+                    .collect()
+            }
             _ => return,
         };
-        let now = self.clock.now_epoch_secs();
-        for entry in backlog {
-            let expiry_at = entry.message_expiry.map(|s| now + u64::from(s));
-            if let Err(e) = self
-                .store
-                .enqueue_with_expiry(client, &entry.message, expiry_at)
-                .await
-            {
-                warn!(client = %client.0, error = %e, "failed to spill backlog to store");
+        if entries.is_empty() {
+            return;
+        }
+        let count = entries.len();
+        let job = AppendJob::control(client.clone(), LaneWork::Spill { entries });
+        // A control job: admitted into the LANE_CONTROL_HEADROOM slots even at the
+        // delivery cap, so a saturated lane still serializes the spill behind its
+        // own backlog.
+        let lane = self.lane_for(client);
+        if lane.tx.try_send(LaneJob::Deliver(Box::new(job))).is_ok() {
+            lane.outstanding += 1;
+            return;
+        }
+        // Beyond cap + headroom: shed, loudly. These entries are queue-cap
+        // reject-newest survivors — a shed-accepting policy — and parking
+        // the loop to save them is the defect this path used to be.
+        warn!(client = %client.0, count,
+              "append lane full at detach spill; shedding the spilled backlog");
+        if let Some(m) = &self.metrics {
+            for _ in 0..count {
+                m.publish_dropped("append-backlog-full");
             }
         }
     }
@@ -4783,11 +5789,50 @@ impl Hub {
     }
 
     /// Discard a session entirely: routing subscriptions, in-flight state, the stored
-    /// queue/metadata, and all expiry bookkeeping. Used by Clean Start, a zero-expiry
-    /// disconnect, and the expiry sweep.
-    async fn discard_session(&mut self, client: &ClientId) {
+    /// queue/metadata, and all expiry bookkeeping. Used by a zero-expiry disconnect
+    /// and the expiry sweep (Clean Start has its own lane-serialized path in
+    /// [`attach`](Self::attach), gated on the CONNACK).
+    ///
+    /// The durable `remove` is serialized through the session's append lane when
+    /// jobs are in flight (issue #242 finding C): a direct remove racing an admitted
+    /// append lets the append land AFTER it and silently re-create the queue with a
+    /// ghost message that resurrects the discarded session on a later persistent
+    /// reconnect. An idle lane (or none) has nothing to race, so the remove is
+    /// simply spawned off-loop — it was previously awaited INLINE here, the same
+    /// class of loop stall the #242 motion exists to remove.
+    fn discard_session(&mut self, client: &ClientId) {
         self.discard_session_local(client);
-        let _ = self.store.remove(client).await;
+        if self
+            .append_lanes
+            .get(client)
+            .is_some_and(|l| l.outstanding > 0)
+        {
+            let lane = self
+                .append_lanes
+                .get_mut(client)
+                .expect("checked just above");
+            // A control job: admitted into the LANE_CONTROL_HEADROOM slots even at
+            // the delivery cap.
+            if lane
+                .tx
+                .try_send(LaneJob::Remove {
+                    client: client.clone(),
+                })
+                .is_ok()
+            {
+                lane.outstanding += 1;
+                return;
+            }
+            warn!(client = %client.0,
+                  "append lane full at session discard; falling back to a spawned \
+                   remove — a still-in-flight append may re-create the queue \
+                   (issue #242)");
+        }
+        let store = self.store.clone();
+        let client = client.clone();
+        self.spawn_owned(async move {
+            let _ = store.remove(&client).await;
+        });
     }
 
     /// The in-memory half of discarding a session (routing, in-flight, expiry state).
@@ -4903,7 +5948,7 @@ impl Hub {
             return;
         }
         for client in &expired {
-            self.discard_session(client).await;
+            self.discard_session(client);
             info!(client = %client.0, "session expired and discarded");
         }
         // Interest may have shrunk now that expired subscriptions are gone.
@@ -4924,7 +5969,7 @@ impl Hub {
         let store = self.store.clone();
         let tx = self.self_tx.clone();
         debug!("inherited-session scan started");
-        tokio::spawn(async move {
+        self.spawn_owned(async move {
             let scan = match store.all_sessions().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -5115,8 +6160,9 @@ impl Hub {
                     false,
                     // A gated publisher IS waiting on this id, so a refusal here is
                     // answerable — but only as a WITHHOLD if the original fan-out
-                    // already stored the message, which `refuse_pending` enforces.
-                    true,
+                    // already stored the message (or still might, via an in-flight
+                    // lane append), which `refuse_pending` enforces.
+                    &AppendGate::Pending(id),
                 )
                 .await,
             );
@@ -5148,9 +6194,7 @@ impl Hub {
         // the one observable-state predicate for all of it.
         let window_over = !self.routing_unsettled();
         for id in held {
-            let writes_before = self.durable_writes;
             let out = self.redeliver_pending(id).await;
-            self.mark_stored_since(id, writes_before);
             match out {
                 DurableOutcome::Ok => {}
                 // The re-delivery's durable append failed terminally: withhold.
@@ -5286,6 +6330,9 @@ impl Hub {
         m.set_sessions(self.online.len() + offline_persistent);
         m.set_subscriptions(self.subs_by_client.values().map(HashMap::len).sum());
         m.set_inflight_messages(self.inflight.values().map(|i| i.pending.len()).sum());
+        // Append-lane saturation (issue #242): sustained growth here is the warning
+        // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
+        m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
         if let Ok(n) = self.retained.count().await {
             m.set_retained_messages(n);
         }
@@ -5535,6 +6582,7 @@ impl Hub {
                 acked_nodes: HashSet::new(),
                 awaiting_retained: false,
                 local_done: false,
+                appends_outstanding: 0,
                 created_at: Instant::now(),
                 reroute_grace: None,
                 // During a takeover window the routing table may not yet hold the
@@ -5572,16 +6620,6 @@ impl Hub {
         self.peers
             .get(node)
             .map_or(mqtt_cluster::peer::PROTO_MIN, |p| p.proto)
-    }
-
-    /// Record that pending publish `id` gained a durable copy since `before`, so a
-    /// later refusal can only WITHHOLD (issue #238). See [`PendingPublish::stored`].
-    fn mark_stored_since(&mut self, id: u64, before: u64) {
-        if self.durable_writes > before {
-            if let Some(p) = self.pending_publishes.get_mut(&id) {
-                p.stored = true;
-            }
-        }
     }
 
     /// Drop a pending publish, WITHHOLDING its acknowledgement (the sender side
@@ -5625,11 +6663,18 @@ impl Hub {
             return;
         };
         self.forward_index.retain(|_, pid| *pid != id);
-        if p.stored {
+        // An append still IN FLIGHT in a lane (issue #242) may yet store a copy, so
+        // "nothing was stored" cannot be claimed either — withhold, which claims
+        // nothing and is always safe. The named trade: a v5 publisher racing a peer
+        // refusal against its own in-flight local append loses the actionable 0x97
+        // and sees a close instead; a false refusal would be a defect, a withhold
+        // is not (ADR 0061).
+        if p.stored || p.appends_outstanding > 0 {
             warn!(
                 publish = id, topic = %p.topic, refusal = r.as_str(),
-                "a later fan-out pass was refused for a publish already stored durably; \
-                 ack WITHHELD rather than claiming nothing was stored (issue #238)"
+                "a later fan-out pass was refused for a publish already stored durably \
+                 (or with an append still in flight); ack WITHHELD rather than claiming \
+                 nothing was stored (issue #238)"
             );
             return; // dropping `p.done` withholds
         }
@@ -5645,6 +6690,7 @@ impl Hub {
     fn try_complete_pending(&mut self, id: u64) {
         let complete = self.pending_publishes.get(&id).is_some_and(|p| {
             p.local_done
+                && p.appends_outstanding == 0
                 && !p.awaiting_retained
                 && !p.awaiting_settle
                 && p.awaiting.is_empty()
@@ -5819,9 +6865,7 @@ impl Hub {
                     publish = id,
                     "re-route grace expired; final local re-delivery"
                 );
-                let writes_before = self.durable_writes;
                 let out = self.redeliver_pending(id).await;
-                self.mark_stored_since(id, writes_before);
                 match out {
                     DurableOutcome::Ok => {}
                     DurableOutcome::Failed => {
@@ -7146,7 +8190,7 @@ impl Hub {
                     remaining,
                     app,
                     retain,
-                    false,
+                    &AppendGate::None,
                 )
                 .await;
             if let Some(w) = self.retained_windows.get_mut(&c) {
@@ -7283,6 +8327,173 @@ fn publish_packet(
 /// Recover a persistent session off the hub command loop and post the result back as
 /// [`HubCommand::SessionRecovered`] (ADR 0017). Run in a spawned task so the bounded
 /// lease/quorum wait never blocks the single-threaded hub.
+impl AppendJob {
+    /// A CONTROL job (no delivery of its own): the detach spill, or the no-op mark
+    /// below. `planned_conn: None` guarantees its completion never sends.
+    fn control(client: ClientId, work: LaneWork) -> Self {
+        Self {
+            client,
+            message: Message {
+                topic: String::new(),
+                payload: Bytes::new(),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: AppProperties::default(),
+                expires_at: None,
+            },
+            work,
+            then: AppendThen::Ungated,
+            planned_conn: None,
+            retain: false,
+            message_expiry: None,
+        }
+    }
+
+    /// A no-op job a lane worker posts after a lane-serialized discard, purely to
+    /// drain the lane's outstanding count on-loop (issue #242).
+    fn discard_mark(client: ClientId) -> Self {
+        Self::control(client, LaneWork::Passthrough)
+    }
+}
+
+/// One session's append-lane worker (issue #242 / ADR 0061): a pure FIFO executor.
+/// Pop a job, run its store call, post the completion back to the loop. It holds ONLY
+/// the store, the hub's command sender, and metrics — it can read no hub state by
+/// construction, so every policy decision provably stayed on-loop (issue #238). It
+/// retries nothing and decides nothing; and it always runs an accepted job to a real
+/// store outcome, even if the hub is already gone (the completion send then no-ops and
+/// the publisher's pending entry died withheld — fail closed).
+async fn append_lane_worker(
+    store: Arc<dyn SessionStore>,
+    self_tx: mpsc::UnboundedSender<HubCommand>,
+    mut rx: mpsc::Receiver<LaneJob>,
+    metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    durable: bool,
+) {
+    while let Some(job) = rx.recv().await {
+        match job {
+            LaneJob::Deliver(job) => {
+                let outcome = run_lane_job(&store, &job, metrics.as_ref(), durable).await;
+                let _ = self_tx.send(HubCommand::AppendDone { job, outcome });
+            }
+            LaneJob::Discard(pending) => {
+                // The clean-start durable discard (ADR 0017), serialized BEHIND every
+                // admitted append for this session so a late append cannot re-create
+                // the queue it just emptied (issue #242). Best-effort like the
+                // spawned path; the in-memory wipe already happened on-loop.
+                let client = pending.client.clone();
+                let _ = store.remove(&client).await;
+                let _ = self_tx.send(HubCommand::SessionRecovered {
+                    pending: *pending,
+                    recovery: SessionRecovery::Cleaned,
+                });
+                let _ = self_tx.send(HubCommand::AppendDone {
+                    job: Box::new(AppendJob::discard_mark(client)),
+                    outcome: LaneOutcome::Passed,
+                });
+            }
+            LaneJob::Remove { client } => {
+                // The zero-expiry-detach / expiry-sweep durable discard (issue
+                // #242 finding C), serialized BEHIND every admitted append for
+                // this session so a late append cannot re-create the queue it
+                // just emptied. Best-effort like the spawned path; the in-memory
+                // wipe already happened on-loop.
+                let _ = store.remove(&client).await;
+                let _ = self_tx.send(HubCommand::AppendDone {
+                    job: Box::new(AppendJob::discard_mark(client)),
+                    outcome: LaneOutcome::Passed,
+                });
+            }
+        }
+    }
+}
+
+/// The off-loop half of one durable append: exactly the store call, timing, and
+/// failure classification (ADR 0020-T6) the loop used to run inline, moved verbatim
+/// off it (issue #242). Reads ONLY the job and the store — no hub state, by
+/// construction (see [`AppendJob`]).
+async fn run_lane_job(
+    store: &Arc<dyn SessionStore>,
+    job: &AppendJob,
+    metrics: Option<&Arc<mqtt_observability::metrics::Metrics>>,
+    durable: bool,
+) -> LaneOutcome {
+    let expiry_at = match &job.work {
+        LaneWork::Passthrough => return LaneOutcome::Passed,
+        // The second lane stage (issue #242 finding A): ADR 0057's outbound-id
+        // write, exactly the store call the loop used to await inline at send
+        // time. The completion handler owns the wire send and the failure arm.
+        LaneWork::RecordOutbound { pkid, offset } => {
+            return match store.record_outbound(&job.client, *pkid, *offset).await {
+                Ok(()) => LaneOutcome::Stored(*offset),
+                Err(e) => {
+                    warn!(client = %job.client.0, pkid, error = %e,
+                          "outbound QoS2 id write failed in the session lane");
+                    LaneOutcome::Failed
+                }
+            };
+        }
+        // The detach spill (issue #242 finding C): the loop's old inline loop,
+        // moved here verbatim — same per-entry best-effort posture.
+        LaneWork::Spill { entries } => {
+            for (message, expiry_at) in entries {
+                if let Err(e) = store
+                    .enqueue_with_expiry(&job.client, message, *expiry_at)
+                    .await
+                {
+                    warn!(client = %job.client.0, error = %e,
+                          "failed to spill backlog to store");
+                }
+            }
+            return LaneOutcome::Passed;
+        }
+        LaneWork::Append { expiry_at } => *expiry_at,
+    };
+    // Durable (quorum) append: time it and classify any failure (ADR 0020-T6).
+    // The latency histogram is only meaningful when the store is the replicated
+    // one, so gate it on durable mode; a failure reason is recorded either way.
+    let started = Instant::now();
+    let result = store
+        .enqueue_with_expiry(&job.client, &job.message, expiry_at)
+        .await;
+    if durable {
+        if let Some(m) = metrics {
+            m.observe_durable_append_latency(started.elapsed().as_secs_f64());
+        }
+    }
+    match result {
+        Ok(Enqueued::Stored { offset, evicted }) => {
+            if evicted > 0 {
+                warn!(client = %job.client.0, evicted, topic = %job.message.topic,
+                      "session queue full: evicted oldest message(s)");
+                if let Some(m) = metrics {
+                    m.publish_dropped("queue-overflow");
+                }
+            }
+            LaneOutcome::Stored(offset)
+        }
+        Ok(Enqueued::Rejected) => {
+            warn!(client = %job.client.0, topic = %job.message.topic,
+                  "session queue full: dropped message (reject-newest)");
+            if let Some(m) = metrics {
+                m.publish_dropped("queue-overflow");
+            }
+            LaneOutcome::Dropped
+        }
+        Err(e) => {
+            if let Some(m) = metrics {
+                m.durable_append_failed(durable_failure_reason(&e));
+            }
+            warn!(client = %job.client.0, error = %e,
+                  "failed to enqueue message; withholding the publisher's ack (ADR 0041 T5)");
+            // Fail closed like the local ack path (ADR 0018): the completion withholds
+            // the publisher's acknowledgement so it retries, instead of acking a
+            // message a subscriber will never see.
+            LaneOutcome::Failed
+        }
+    }
+}
+
 async fn recover_session(
     store: Arc<dyn SessionStore>,
     self_tx: mpsc::UnboundedSender<HubCommand>,
@@ -14161,6 +15372,1388 @@ mod tests {
         assert!(
             matches!(still_present, AttachOutcome::Present(true)),
             "the session survives a stale connection's detach; got {still_present:?}"
+        );
+    }
+
+    // --- issue #242 / ADR 0061: off-loop durable appends -----------------------------
+
+    /// A [`SessionStore`] whose durable append for named clients PARKS until the test
+    /// releases it — the deterministic stand-in for a placement group whose follower
+    /// set cannot form quorum (the 5 s replication RPC bound, issue #242). Everything
+    /// else delegates to an in-memory store. Completed store operations are logged in
+    /// order so ordering tests can assert what the store actually observed.
+    #[derive(Debug)]
+    struct ParkingStore {
+        inner: MemorySessionStore,
+        /// client id → release gate: an enqueue for a client present here awaits `true`.
+        gates:
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+        /// Store operations in completion order: `(op, "client payload")`.
+        ops: std::sync::Mutex<Vec<(String, String)>>,
+        /// client id → delay applied to that client's FIRST enqueue only — the
+        /// "two lanes of different speed" lever for ordering tests.
+        slow_first: std::sync::Mutex<std::collections::HashMap<String, Duration>>,
+        /// client id → release gate for `record_outbound` (issue #242 finding A):
+        /// the stand-in for a degraded group stalling ADR 0057's outbound-id write.
+        outbound_gates:
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+        /// client id → release gate for `reserve_packet_ids` (issue #242 finding A).
+        reserve_gates:
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+        /// client id → number of upcoming enqueues to answer `Rejected` (the
+        /// queue-cap reject-newest model, for the detach-spill tests).
+        reject_next: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    }
+
+    impl ParkingStore {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: MemorySessionStore::new(),
+                gates: std::sync::Mutex::new(std::collections::HashMap::new()),
+                ops: std::sync::Mutex::new(Vec::new()),
+                slow_first: std::sync::Mutex::new(std::collections::HashMap::new()),
+                outbound_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
+                reserve_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
+                reject_next: std::sync::Mutex::new(std::collections::HashMap::new()),
+            })
+        }
+
+        /// Delay `client`'s FIRST enqueue by `delay`; later ones run at full speed.
+        fn slow_first(&self, client: &str, delay: Duration) {
+            self.slow_first.lock().unwrap().insert(client.into(), delay);
+        }
+
+        /// Park every future `enqueue_with_expiry` for `client`; the returned sender
+        /// releases them all with `send(true)`.
+        fn park(&self, client: &str) -> tokio::sync::watch::Sender<bool> {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            self.gates.lock().unwrap().insert(client.into(), rx);
+            tx
+        }
+
+        /// Park every future `record_outbound` for `client` (issue #242 finding A).
+        fn park_outbound(&self, client: &str) -> tokio::sync::watch::Sender<bool> {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            self.outbound_gates
+                .lock()
+                .unwrap()
+                .insert(client.into(), rx);
+            tx
+        }
+
+        /// Park every future `reserve_packet_ids` for `client` (issue #242 finding A).
+        fn park_reserve(&self, client: &str) -> tokio::sync::watch::Sender<bool> {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            self.reserve_gates.lock().unwrap().insert(client.into(), rx);
+            tx
+        }
+
+        /// Answer `client`'s next `n` enqueues with `Rejected` (the session queue
+        /// cap under reject-newest, ADR 0001 §6).
+        fn reject_next_enqueue(&self, client: &str, n: usize) {
+            self.reject_next.lock().unwrap().insert(client.into(), n);
+        }
+
+        /// Await the release gate in `map` for `client`, if one is set.
+        async fn await_gate(
+            map: &std::sync::Mutex<
+                std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>,
+            >,
+            client: &ClientId,
+        ) {
+            let gate = map.lock().unwrap().get(&client.0).cloned();
+            if let Some(mut rx) = gate {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break; // sender dropped: released
+                    }
+                }
+            }
+        }
+
+        /// The completed operations, in store order.
+        fn ops(&self) -> Vec<(String, String)> {
+            self.ops.lock().unwrap().clone()
+        }
+
+        fn log(&self, op: &str, detail: String) {
+            self.ops.lock().unwrap().push((op.to_string(), detail));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::SessionStore for ParkingStore {
+        async fn ensure_session(
+            &self,
+            client: &ClientId,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            self.inner.ensure_session(client).await
+        }
+        async fn set_subscriptions(
+            &self,
+            client: &ClientId,
+            subscriptions: &[mqtt_core::Subscription],
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_subscriptions(client, subscriptions).await
+        }
+        async fn subscriptions(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_core::Subscription>, mqtt_storage::StorageError> {
+            self.inner.subscriptions(client).await
+        }
+        async fn enqueue_with_expiry(
+            &self,
+            client: &ClientId,
+            message: &mqtt_core::Message,
+            expiry_at: Option<u64>,
+        ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+            let gate = self.gates.lock().unwrap().get(&client.0).cloned();
+            if let Some(mut rx) = gate {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break; // sender dropped: released
+                    }
+                }
+            }
+            let delay = self.slow_first.lock().unwrap().remove(&client.0);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            // The queue-cap reject-newest model (issue #242 finding C): the next
+            // `n` enqueues are answered `Rejected` — a live-only delivery whose
+            // backlog entry carries no offset, the one shape the detach spill owes.
+            let reject = {
+                let mut m = self.reject_next.lock().unwrap();
+                match m.get_mut(&client.0) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if reject {
+                self.log(
+                    "reject",
+                    format!(
+                        "{} {}",
+                        client.0,
+                        String::from_utf8_lossy(message.payload.as_ref())
+                    ),
+                );
+                return Ok(mqtt_storage::Enqueued::Rejected);
+            }
+            let out = self
+                .inner
+                .enqueue_with_expiry(client, message, expiry_at)
+                .await;
+            if out.is_ok() {
+                self.log(
+                    "enqueue",
+                    format!(
+                        "{} {}",
+                        client.0,
+                        String::from_utf8_lossy(message.payload.as_ref())
+                    ),
+                );
+            }
+            out
+        }
+        async fn pending(
+            &self,
+            client: &ClientId,
+            after: mqtt_storage::Offset,
+            limit: usize,
+        ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+            self.inner.pending(client, after, limit).await
+        }
+        async fn ack(
+            &self,
+            client: &ClientId,
+            up_to: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack(client, up_to).await
+        }
+        async fn record_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<mqtt_storage::InboundSighting, mqtt_storage::StorageError> {
+            self.inner.record_received(client, packet_id).await
+        }
+        async fn ack_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_received(client, packet_id).await
+        }
+        async fn clear_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_received(client, packet_id).await
+        }
+        async fn received(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<u16>, mqtt_storage::StorageError> {
+            self.inner.received(client).await
+        }
+        async fn record_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+            offset: mqtt_storage::Offset,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            Self::await_gate(&self.outbound_gates, client).await;
+            let out = self.inner.record_outbound(client, packet_id, offset).await;
+            if out.is_ok() {
+                self.log("record", format!("{} {packet_id}", client.0));
+            }
+            out
+        }
+        async fn advance_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.advance_outbound(client, packet_id).await
+        }
+        async fn reserve_packet_ids(
+            &self,
+            client: &ClientId,
+            count: u16,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            Self::await_gate(&self.reserve_gates, client).await;
+            let out = self.inner.reserve_packet_ids(client, count).await;
+            if out.is_ok() {
+                self.log("reserve", client.0.clone());
+            }
+            out
+        }
+        async fn clear_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            let out = self.inner.clear_outbound(client, packet_id).await;
+            if out.is_ok() {
+                self.log("clear", format!("{} {packet_id}", client.0));
+            }
+            out
+        }
+        async fn outbound(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            self.inner.outbound(client).await
+        }
+        async fn next_packet_id(
+            &self,
+            client: &ClientId,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.next_packet_id(client).await
+        }
+        async fn remove(&self, client: &ClientId) -> Result<(), mqtt_storage::StorageError> {
+            let out = self.inner.remove(client).await;
+            if out.is_ok() {
+                self.log("remove", client.0.clone());
+            }
+            out
+        }
+    }
+
+    /// Issue #242 — the head-of-line acceptance criterion (RED before the fix): a
+    /// durable append stalled on one placement group's degraded follower set must not
+    /// delay a publish whose subscriber lives only in a healthy group, nor a CONNECT.
+    /// Before the fix the hub awaited the stalled append INLINE in its single dispatch
+    /// loop, so every queued command waited the full stall behind it.
+    #[tokio::test]
+    async fn a_stalled_group_a_append_does_not_delay_a_group_b_publish() {
+        let store = ParkingStore::new();
+        let release_a = store.park("a");
+        let tx = start_hub_with_arc(store.clone());
+
+        // Two offline persistent QoS 1 subscribers in different "groups" (per-session
+        // stores, so per-client parking is exactly a one-group stall).
+        let (_a_rx, _) = attach(&tx, "a", 1, false).await;
+        subscribe_qos(&tx, "a", "ga/t", QoS::AtLeastOnce);
+        detach(&tx, "a", 1);
+        let (_b_rx, _) = attach(&tx, "b", 2, false).await;
+        subscribe_qos(&tx, "b", "gb/t", QoS::AtLeastOnce);
+        detach(&tx, "b", 2);
+
+        // Group A stalls: this publish's durable append parks in the store.
+        let a_done = publish_gated(&tx, "ga/t", b"held", QoS::AtLeastOnce, true);
+
+        // Group B must not queue behind it (issue #242).
+        let b_done = publish_gated(&tx, "gb/t", b"fast", QoS::AtLeastOnce, true);
+        let b_out = timeout(Duration::from_millis(500), b_done)
+            .await
+            .expect("a group-B publish must not wait behind group A's stalled append (#242)")
+            .unwrap();
+        assert_eq!(b_out, PublishOutcome::Accepted);
+
+        // A CONNECT during the stall completes too.
+        let connect = timeout(Duration::from_secs(1), attach(&tx, "c", 3, true)).await;
+        assert!(
+            connect.is_ok(),
+            "a CONNECT must not wait behind a stalled append (#242)"
+        );
+
+        // The stalled publish is deferred, not lost: releasing the group completes it.
+        release_a.send(true).unwrap();
+        let a_out = timeout(Duration::from_secs(1), a_done)
+            .await
+            .expect("the released append must complete the held publish")
+            .unwrap();
+        assert_eq!(a_out, PublishOutcome::Accepted);
+    }
+
+    /// PER-SESSION ORDERING (issue #242): two publishes matching the same offline
+    /// subscriber append in arrival order even when the first is much slower — the
+    /// lane is one FIFO per session, so the store call for message k+1 starts only
+    /// after message k's returned. A spawn-per-append motion (the naive off-loop
+    /// port) inverts this.
+    #[tokio::test]
+    async fn two_publishes_to_one_offline_subscriber_append_in_arrival_order() {
+        let store = ParkingStore::new();
+        store.slow_first("s", Duration::from_millis(200));
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "o/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        let d1 = publish_gated(&tx, "o/t", b"first", QoS::AtLeastOnce, true);
+        let d2 = publish_gated(&tx, "o/t", b"second", QoS::AtLeastOnce, true);
+        assert_eq!(d1.await.unwrap(), PublishOutcome::Accepted);
+        assert_eq!(d2.await.unwrap(), PublishOutcome::Accepted);
+
+        let enqueues: Vec<String> = store
+            .ops()
+            .into_iter()
+            .filter(|(op, _)| op == "enqueue")
+            .map(|(_, detail)| detail)
+            .collect();
+        assert_eq!(
+            enqueues,
+            vec!["s first".to_string(), "s second".to_string()],
+            "arrival order is durable-queue order, whatever the appends' speeds (#242)"
+        );
+    }
+
+    /// #238 PLAN/COMMIT ATOMICITY across the off-loop motion: a brownout flipped
+    /// while an admitted append is still in flight must neither refuse the committed
+    /// publish (its decision was frozen at the plan pass) nor admit the next one
+    /// (the flip governs it). Never acked-and-dropped, never a false refusal.
+    #[tokio::test]
+    async fn brownout_flipped_mid_append_neither_refuses_the_committed_publish_nor_admits_the_next()
+    {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "bo/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        // P1 is planned and admitted while brownout is OFF; its append parks.
+        let p1 = publish_gated(&tx, "bo/t", b"pre-flip", QoS::AtLeastOnce, true);
+
+        // The flip lands while P1 is still in flight (the loop is free — #242).
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        // P2, planned AFTER the flip, is refused effect-free.
+        let p2 = publish_gated(&tx, "bo/t", b"post-flip", QoS::AtLeastOnce, true);
+        assert_eq!(
+            timeout(Duration::from_millis(500), p2)
+                .await
+                .expect("a refusal is decided on-loop, without waiting on any lane")
+                .unwrap(),
+            PublishOutcome::Refused(PublishRefusal::Brownout),
+            "the flip governs the NEXT publish (#238)"
+        );
+
+        // P1 runs to its real store outcome under its frozen decision: Accepted.
+        release.send(true).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), p1).await.unwrap().unwrap(),
+            PublishOutcome::Accepted,
+            "an admitted append is never un-decided by a later flip (#238)"
+        );
+
+        // Exactly one durable copy exists: P1's. P2's refusal was effect-free.
+        let enqueues: Vec<String> = store
+            .ops()
+            .into_iter()
+            .filter(|(op, _)| op == "enqueue")
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(enqueues, vec!["s pre-flip".to_string()]);
+    }
+
+    /// ACK-AFTER-DURABLE's wire half (#124), post-motion: an ONLINE persistent
+    /// subscriber's PUBLISH packet reaches the conn channel only after its durable
+    /// append resolved — the live send now lives in the `AppendDone` handler and
+    /// carries the store's own offset.
+    #[tokio::test]
+    async fn an_online_persistent_subscriber_receives_the_wire_send_only_after_the_append_resolves()
+    {
+        let store = ParkingStore::new();
+        let release = store.park("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "w/t", QoS::AtLeastOnce);
+
+        let mut done = publish_gated(&tx, "w/t", b"gated", QoS::AtLeastOnce, true);
+
+        // While the append is parked: nothing on the wire, no ack.
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "no packet may reach the wire before the durable record exists (#124)"
+        );
+        assert!(
+            done.try_recv().is_err(),
+            "the publisher's ack must wait for the append too"
+        );
+
+        release.send(true).unwrap();
+        let packet = recv_packet(&mut rx).await.expect("delivered after durable");
+        assert_eq!(payload_of(&packet), b"gated");
+        assert_eq!(
+            timeout(Duration::from_secs(1), done)
+                .await
+                .unwrap()
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+
+    /// Backpressure (issue #242): a saturated lane rejects the NEWEST job — the
+    /// publisher is withheld (never falsely acked, never falsely refused), the
+    /// accepted jobs keep FIFO order, and every accepted publish still completes.
+    #[tokio::test]
+    async fn a_full_append_lane_withholds_the_publisher_and_reorders_nothing() {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "cap/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        // Overfill: the lane admits at most LANE_QUEUE_CAP queued jobs (plus the one
+        // the parked worker holds); the rest are rejected at submit.
+        let total = super::LANE_QUEUE_CAP + 40;
+        let payloads: Vec<String> = (0..total).map(|i| format!("m{i:04}")).collect();
+        let mut dones = Vec::new();
+        for p in &payloads {
+            let (done_tx, done_rx) = oneshot::channel();
+            tx.send(HubCommand::Publish {
+                topic: "cap/t".into(),
+                payload: Bytes::from(p.clone().into_bytes()),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: AppProperties::default(),
+                done: Some(done_tx),
+                v5: true,
+                publisher: None,
+            })
+            .unwrap();
+            dones.push(done_rx);
+        }
+        // Barrier: every submission is processed (and the overflow rejected) BEFORE
+        // the stalled group is released — the loop is free to do this (#242).
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        timeout(Duration::from_secs(1), ping_rx)
+            .await
+            .expect("the loop must not be parked with the appends")
+            .unwrap();
+        release.send(true).unwrap();
+
+        let mut outcomes = Vec::new();
+        for done in dones {
+            outcomes.push(timeout(Duration::from_secs(5), done).await.unwrap());
+        }
+        let accepted: Vec<usize> = outcomes
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| matches!(o, Ok(PublishOutcome::Accepted)))
+            .map(|(i, _)| i)
+            .collect();
+        let withheld = outcomes.iter().filter(|o| o.is_err()).count();
+        assert!(withheld > 0, "overfilling the lane must withhold, loudly");
+        assert!(
+            !accepted.is_empty(),
+            "the admitted prefix must still complete"
+        );
+        // Reject-NEWEST: the accepted set is exactly a prefix of submission order.
+        assert_eq!(
+            accepted,
+            (0..accepted.len()).collect::<Vec<_>>(),
+            "rejecting anything but the newest would break FIFO admission (#242)"
+        );
+        // And the store observed the accepted jobs in submission order.
+        let enqueues: Vec<String> = store
+            .ops()
+            .into_iter()
+            .filter(|(op, _)| op == "enqueue")
+            .map(|(_, d)| d)
+            .collect();
+        let expected: Vec<String> = accepted
+            .iter()
+            .map(|i| format!("s {}", payloads[*i]))
+            .collect();
+        assert_eq!(enqueues, expected, "lane order is store order (#242)");
+    }
+
+    /// A subscriber that ATTACHES while its append is in flight still receives the
+    /// message exactly once (issue #242): the attach replay reads the queue before
+    /// the append lands, so the completion handler delivers it — but only because the
+    /// replayed high-water provably excludes the new offset; had the replay seen it,
+    /// the completion would stay silent.
+    #[tokio::test]
+    async fn attach_during_inflight_append_delivers_the_message_exactly_once() {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "mid/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        let done = publish_gated(&tx, "mid/t", b"inflight", QoS::AtLeastOnce, true);
+
+        // The subscriber reattaches while the append is parked; its replay sees an
+        // empty queue. The CONNACK is not held hostage by the stalled group.
+        let (mut rx2, present) = timeout(Duration::from_secs(1), attach(&tx, "s", 2, false))
+            .await
+            .expect("a reattach must not wait behind the session's stalled append");
+        assert!(present, "the persistent session resumes");
+
+        release.send(true).unwrap();
+        let packet = recv_packet(&mut rx2)
+            .await
+            .expect("the in-flight append must be delivered to the reattached session (#242)");
+        assert_eq!(payload_of(&packet), b"inflight");
+        assert!(
+            recv_packet(&mut rx2).await.is_none(),
+            "exactly once: no duplicate from replay plus completion"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), done)
+                .await
+                .unwrap()
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+
+    /// A publisher that disconnects mid-append (its `done` receiver dropped) must not
+    /// panic the hub, and the obligation still resolves: the store write lands and
+    /// the loop keeps serving.
+    #[tokio::test]
+    async fn publisher_disconnect_mid_append_resolves_the_obligation_without_panic() {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "gone/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        let done = publish_gated(&tx, "gone/t", b"orphan", QoS::AtLeastOnce, true);
+        drop(done); // the publisher's connection is gone
+
+        release.send(true).unwrap();
+
+        // The loop keeps serving (no panic), and the durable copy exists.
+        let (_c_rx, _) = timeout(Duration::from_secs(1), attach(&tx, "c", 2, true))
+            .await
+            .expect("the hub must survive an orphaned publish completion");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let stored = store
+                .ops()
+                .iter()
+                .any(|(op, d)| op == "enqueue" && d == "s orphan");
+            if stored {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the admitted append must still run to a real store outcome"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A CRASH STOP RELEASES THE STORE (issue #242 / ADR 0061 §8). A node stops by
+    /// having its hub task aborted — the loop's `None` arm cannot fire, since the hub
+    /// holds a clone of its own command sender — and a lane worker holds an `Arc` of
+    /// the session store whose redb handle is an exclusive lock. So the abort MUST
+    /// cascade to the lanes: the hub owns them in a `JoinSet`, and dropping `self`
+    /// aborts them, releasing every handle at once, as the OS would for a killed
+    /// process.
+    ///
+    /// This is the regression CI caught and no local run did
+    /// (`cluster_stress::a_full_cluster_stop_start_recovers_every_acked_fact`, which
+    /// restarts a stopped cluster over the same data dirs): at a full-cluster stop an
+    /// in-flight append cannot reach quorum, so it parks for the 5s replication bound
+    /// holding the handle, and the restart arrives first with
+    /// "Database already open. Cannot acquire lock." Before the off-loop motion the
+    /// append was awaited on the loop, so the abort killed it for free.
+    ///
+    /// Abandoning that write is the honest trade, not a loss: the publisher's ack was
+    /// WITHHELD (asserted below), so nothing was falsely promised, and a crash is
+    /// exactly the event whose torn writes the durable plane already recovers from
+    /// (ADR 0044). Pinned at the unit tier because the stop/start tier makes it a race.
+    #[tokio::test]
+    async fn a_crashed_hub_releases_the_store_so_the_node_can_restart() {
+        let store = ParkingStore::new();
+        let _release = store.park("s");
+        let arc = store.clone() as std::sync::Arc<dyn mqtt_storage::SessionStore>;
+        let before = std::sync::Arc::strong_count(&arc);
+        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), arc.clone());
+        let hub_task = tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "shut/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        let done = publish_gated(&tx, "shut/t", b"parked", QoS::AtLeastOnce, true);
+        // Barrier: the job is ADMITTED and parked in the lane before the crash, so a
+        // worker is genuinely holding the store when the abort lands.
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        timeout(Duration::from_secs(1), ping_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::sync::Arc::strong_count(&arc) > before,
+            "the lane worker must be holding the store for this test to mean anything"
+        );
+
+        // The crash: abort the hub task, exactly as the node teardown does.
+        hub_task.abort();
+        let _ = hub_task.await;
+
+        // The store handle must come back WITHOUT waiting out the parked append (the
+        // park is never released here — that is the point).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::sync::Arc::strong_count(&arc) == before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a lane worker outlived the crashed hub and still holds the session \
+                 store: redb stays locked and the next start over this data dir fails \
+                 with \"Database already open\" (issue #242)"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // And the publisher was WITHHELD, never falsely acked.
+        assert!(
+            timeout(Duration::from_secs(1), done)
+                .await
+                .unwrap()
+                .is_err(),
+            "with the hub gone the ack is withheld (fail closed), never fabricated"
+        );
+    }
+
+    /// Mixed-QoS per-client wire order survives the off-loop motion (issue #242): a
+    /// `QoS` 0 delivery to a client whose lane holds an in-flight `QoS` 1 append is
+    /// routed through the lane as a passthrough, so it cannot overtake the earlier
+    /// message's post-durable live send.
+    #[tokio::test]
+    async fn a_qos0_send_behind_a_busy_lane_does_not_overtake_the_pending_qos1_delivery() {
+        let store = ParkingStore::new();
+        let release = store.park("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "ord/#", QoS::AtLeastOnce);
+
+        let done = publish_gated(&tx, "ord/a", b"first-qos1", QoS::AtLeastOnce, true);
+        publish(&tx, "ord/b", b"second-qos0");
+
+        // While the QoS 1 append is parked, the QoS 0 message must NOT arrive first.
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a QoS 0 send overtook an in-flight QoS 1 delivery to the same client (#242)"
+        );
+
+        release.send(true).unwrap();
+        let p1 = recv_packet(&mut rx).await.expect("QoS 1 first");
+        assert_eq!(payload_of(&p1), b"first-qos1");
+        let p2 = recv_packet(&mut rx).await.expect("QoS 0 second");
+        assert_eq!(payload_of(&p2), b"second-qos0");
+        assert_eq!(
+            timeout(Duration::from_secs(1), done)
+                .await
+                .unwrap()
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+
+    /// The time-on-loop tripwire is EXPORTED and stays flat while a store is parked
+    /// (issue #242): the publish dispatch is plan + submit only, so a stalled append
+    /// contributes nothing to `mqttd_hub_dispatch_seconds{command="publish"}`.
+    #[tokio::test]
+    async fn hub_dispatch_time_is_exported_and_stays_flat_while_a_store_is_parked() {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("test"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            store.clone() as std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "m/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        let done = publish_gated(&tx, "m/t", b"timed", QoS::AtLeastOnce, true);
+        // Prove the loop already recorded the publish dispatch (it is NOT waiting on
+        // the parked append) by round-tripping a later command...
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        timeout(Duration::from_millis(500), ping_rx)
+            .await
+            .expect("the loop must not be parked with the append")
+            .unwrap();
+        // ...then assert the exposition carries the publish observation, with every
+        // recorded dispatch under the stall bound (the park is 30s-equivalent; any
+        // inline await would land in the top buckets).
+        let out = metrics.render();
+        assert!(
+            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\"} 1"),
+            "the publish dispatch must be observed exactly once while its append is \
+             still parked:\n{out}"
+        );
+        // The whole distribution sits in the sub-100ms buckets: the +Inf count equals
+        // the 0.1s-bucket cumulative count for the publish class.
+        let le_100ms = bucket_count(&out, "publish", "0.1024");
+        let total = bucket_count(&out, "publish", "+Inf");
+        assert_eq!(
+            le_100ms, total,
+            "a publish dispatch exceeded 100ms while its append was parked — an \
+             inline await is back on the loop (#242):\n{out}"
+        );
+
+        release.send(true).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), done)
+                .await
+                .unwrap()
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+
+    /// Parse one cumulative bucket count from the exposition.
+    fn bucket_count(exposition: &str, command: &str, le: &str) -> u64 {
+        let needle =
+            format!("mqttd_hub_dispatch_seconds_bucket{{le=\"{le}\",command=\"{command}\"}} ");
+        exposition
+            .lines()
+            .find_map(|l| l.strip_prefix(&needle))
+            .unwrap_or_else(|| panic!("bucket le={le} missing for {command}:\n{exposition}"))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    // --- issue #242, round 2: the online-delivery half (findings A/B/C) --------------
+
+    /// Poll the store's op log until `pred` holds (bounded), for ordering asserts on
+    /// off-loop completions.
+    async fn await_ops(
+        store: &std::sync::Arc<ParkingStore>,
+        pred: impl Fn(&[(String, String)]) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if pred(&store.ops()) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "store ops never reached the expected state: {:?}",
+                store.ops()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Issue #242 finding B: an UNANSWERABLE brownout-refused delivery (here a
+    /// Will) to an online persistent subscriber must not be live-sent past the
+    /// subscriber's in-flight appends — it rides the lane as a passthrough, exactly
+    /// like the `QoS` 0 branch, because "sending directly would REORDER, which
+    /// nothing permits".
+    #[tokio::test]
+    async fn a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append() {
+        let store = ParkingStore::new();
+        let release = store.park("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "ord/#", QoS::AtLeastOnce);
+
+        // The will-carrying client attaches BEFORE the brownout (a new session
+        // would be refused under it).
+        let will = Message {
+            topic: "ord/z".into(),
+            payload: Bytes::from_static(b"the-will"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            app: AppProperties::default(),
+            expires_at: None,
+        };
+        let (_w_rx, _) = attach_with_will(&tx, "w", 7, true, will).await;
+
+        // p's QoS 1 append parks in its lane.
+        let done = publish_gated(&tx, "ord/a", b"first-qos1", QoS::AtLeastOnce, true);
+
+        // Brownout flips on; the will fires (ungraceful detach). Its durable copy
+        // is refused — unanswerable — and its live send must queue BEHIND the
+        // in-flight append to the same subscriber.
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+        tx.send(HubCommand::Detach {
+            client: ClientId("w".into()),
+            conn_id: 7,
+            graceful: false,
+        })
+        .unwrap();
+
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the refused will overtook an in-flight QoS 1 append to the same \
+             subscriber (#242 finding B)"
+        );
+
+        release.send(true).unwrap();
+        let p1 = recv_packet(&mut rx).await.expect("the QoS 1 message first");
+        assert_eq!(payload_of(&p1), b"first-qos1");
+        let p2 = recv_packet(&mut rx).await.expect("the will second");
+        assert_eq!(payload_of(&p2), b"the-will");
+        assert_eq!(
+            timeout(Duration::from_secs(1), done)
+                .await
+                .unwrap()
+                .unwrap(),
+            PublishOutcome::Accepted,
+            "the pre-flip publish keeps its frozen decision (#238)"
+        );
+    }
+
+    /// Issue #242 finding C: the detach-time backlog spill runs OFF the loop —
+    /// through the session's lane — so a parked store neither wedges the hub nor
+    /// lets the spill overtake the session's in-flight appends (which would invert
+    /// replay order relative to the pre-motion behaviour).
+    #[tokio::test]
+    async fn a_detach_spill_rides_the_lane_keeping_the_loop_live_and_replay_order() {
+        let store = ParkingStore::new();
+        let tx = start_hub_with_arc(store.clone());
+
+        // Receive Maximum 1: the first delivery occupies the only quota slot, so
+        // later ones park in the flow-control backlog.
+        let (mut rx, _) = attach_full(&tx, "s", 1, false, u32::MAX, 1).await;
+        subscribe_qos(&tx, "s", "sp/t", QoS::AtLeastOnce);
+
+        // M0 takes the quota slot (and is never acked).
+        assert_eq!(
+            publish_gated(&tx, "sp/t", b"m0", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.expect("m0 delivered")),
+            b"m0"
+        );
+
+        // M1 is REJECTED by the queue cap (reject-newest): no durable copy, so its
+        // backlog entry carries offset=None — the one shape the spill owes a write.
+        store.reject_next_enqueue("s", 1);
+        assert_eq!(
+            publish_gated(&tx, "sp/t", b"m1", QoS::AtLeastOnce, true)
+                .await
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+
+        // M2's durable append parks in s's lane.
+        let release = store.park("s");
+        let m2_done = publish_gated(&tx, "sp/t", b"m2", QoS::AtLeastOnce, true);
+
+        // Detach: the spill of M1 must not run inline on the loop — s's store is
+        // parked, and an inline spill would wedge every client on the node.
+        detach(&tx, "s", 1);
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        timeout(Duration::from_millis(500), ping_rx)
+            .await
+            .expect("the detach spill parked the hub loop (#242 finding C)")
+            .unwrap();
+
+        release.send(true).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), m2_done)
+                .await
+                .unwrap()
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        // The spill serialized BEHIND the in-flight append: store order is the
+        // pre-motion (replay) order — m2 then m1, never inverted.
+        await_ops(&store, |ops| {
+            ops.iter().filter(|(op, _)| op == "enqueue").count() == 3
+        })
+        .await;
+        let enqueues: Vec<String> = store
+            .ops()
+            .into_iter()
+            .filter(|(op, _)| op == "enqueue")
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(
+            enqueues,
+            vec!["s m0".to_string(), "s m2".to_string(), "s m1".to_string()],
+            "the detach spill must land AFTER the in-flight append (#242 finding C)"
+        );
+    }
+
+    /// Issue #242 finding C: a session discarded (zero-expiry detach here; the
+    /// expiry sweep shares the same `discard_session`) while one of its appends is
+    /// still in flight must not be resurrected by that append — the durable remove
+    /// serializes BEHIND it in the lane, so a later persistent attach finds nothing.
+    #[tokio::test]
+    async fn a_discard_with_an_inflight_append_leaves_no_ghost_queue() {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "gh/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        // The append parks in s's lane.
+        let done = publish_gated(&tx, "gh/t", b"ghost", QoS::AtLeastOnce, true);
+
+        // The client reattaches declaring expiry 0 (the session no longer survives
+        // a disconnect), then detaches: a zero-expiry discard while the append is
+        // still in flight.
+        let (_rx2, _) = attach_v5(&tx, "s", 2, false, 0).await;
+        detach(&tx, "s", 2);
+        // Barrier: the discard is DISPATCHED (racing the still-parked append)
+        // before the store is released — the exact window of the ghost race.
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        timeout(Duration::from_secs(1), ping_rx)
+            .await
+            .expect("the discard must not park the loop either (#242 finding C)")
+            .unwrap();
+
+        release.send(true).unwrap();
+        // Both the admitted append and the discard run to real store outcomes...
+        await_ops(&store, |ops| {
+            ops.iter().any(|(op, d)| op == "remove" && d == "s")
+                && ops.iter().any(|(op, d)| op == "enqueue" && d == "s ghost")
+        })
+        .await;
+        // ...and the discard ran AFTER the admitted append — never before.
+        let ops = store.ops();
+        let enq = ops
+            .iter()
+            .position(|(op, d)| op == "enqueue" && d == "s ghost")
+            .expect("the admitted append still ran to a store outcome");
+        let rem = ops
+            .iter()
+            .position(|(op, d)| op == "remove" && d == "s")
+            .expect("the discard ran");
+        assert!(
+            enq < rem,
+            "the discard overtook an in-flight append — ghost-queue window \
+             (#242 finding C): {ops:?}"
+        );
+        // The publisher's obligation still resolved (the append landed, then the
+        // discard emptied the queue — discard beats delivery, as it always has).
+        let _ = timeout(Duration::from_secs(1), done).await.unwrap();
+
+        // The acid test: a later persistent attach replays NOTHING.
+        let (mut rx3, _) = attach(&tx, "s", 3, false).await;
+        assert!(
+            recv_packet(&mut rx3).await.is_none(),
+            "a ghost message resurrected a deliberately-discarded session \
+             (#242 finding C)"
+        );
+    }
+
+    /// Issue #242 finding A — the head-of-line acceptance criterion for the ONLINE
+    /// delivery half: a `QoS` 2 delivery whose ADR 0057 outbound-id record stalls on
+    /// one placement group must not delay a publish whose subscriber lives only in
+    /// a healthy group. The record is a second lane stage; the loop stays live.
+    #[tokio::test]
+    async fn a_stalled_record_outbound_does_not_delay_a_group_b_publish() {
+        let store = ParkingStore::new();
+        let release = store.park_outbound("a");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut a_rx, _) = attach(&tx, "a", 1, false).await;
+        subscribe_qos(&tx, "a", "ga/t", QoS::ExactlyOnce);
+        let (_b_rx, _) = attach(&tx, "b", 2, false).await;
+        subscribe_qos(&tx, "b", "gb/t", QoS::AtLeastOnce);
+        detach(&tx, "b", 2);
+
+        // Group A's QoS 2 delivery: the append lands (publisher acked), the
+        // outbound-id record parks in a's lane, the PUBLISH is withheld.
+        let a_done = publish_gated(&tx, "ga/t", b"held", QoS::ExactlyOnce, true);
+        assert_eq!(
+            timeout(Duration::from_millis(500), a_done)
+                .await
+                .expect("the publisher's ack gates on the APPEND, not the record")
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        assert!(
+            recv_packet(&mut a_rx).await.is_none(),
+            "no PUBLISH before its outbound id is durable (ADR 0057)"
+        );
+
+        // Group B's full publish round-trip completes while the record is parked.
+        let b_done = publish_gated(&tx, "gb/t", b"fast", QoS::AtLeastOnce, true);
+        assert_eq!(
+            timeout(Duration::from_millis(500), b_done)
+                .await
+                .expect(
+                    "a group-B publish must not wait behind group A's stalled \
+                     outbound-id record (#242 finding A)"
+                )
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+
+        // Deferred, not lost: releasing the group releases the delivery.
+        release.send(true).unwrap();
+        let p = recv_packet(&mut a_rx)
+            .await
+            .expect("the deferred QoS 2 delivery is released");
+        assert_eq!(payload_of(&p), b"held");
+    }
+
+    /// ACK-AFTER-DURABLE across the record motion (#124 / ADR 0057, issue #242
+    /// finding A): the `QoS` 2 PUBLISH reaches the conn channel only after the
+    /// store holds its outbound-id record — the completion handler is the only
+    /// send site and it carries the store's own Ok.
+    #[tokio::test]
+    async fn a_qos2_packet_reaches_the_wire_only_after_its_outbound_id_is_durable() {
+        let store = ParkingStore::new();
+        let release = store.park_outbound("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "w2/t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "w2/t", b"gated2");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the PUBLISH went on the wire while its outbound-id record was still \
+             pending (ADR 0057 broken by the motion)"
+        );
+
+        release.send(true).unwrap();
+        let packet = recv_packet(&mut rx).await.expect("delivered after durable");
+        assert_eq!(payload_of(&packet), b"gated2");
+        let pkid = pkid_of(&packet);
+        let outbound = store.outbound(&ClientId("p".into())).await.unwrap();
+        assert!(
+            outbound.iter().any(|e| e.packet_id == pkid),
+            "the wire pkid {pkid} is durably recorded before the send"
+        );
+    }
+
+    /// Issue #242 finding A: while a `QoS` 2 delivery is staged behind its
+    /// outbound-id record, a later `QoS` 1 send to the same client diverts into the
+    /// backlog — the `records_pending` gate — so per-subscriber wire order holds.
+    #[tokio::test]
+    async fn a_qos1_send_does_not_overtake_a_pending_qos2_record_to_the_same_client() {
+        let store = ParkingStore::new();
+        let release = store.park_outbound("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "ord2/#", QoS::ExactlyOnce);
+
+        // Warm the durable packet-id block first, so the staging below runs with
+        // an empty backlog — the gate under test is `records_pending`, alone.
+        publish_qos1(&tx, "ord2/warm", b"m0-warm");
+        assert_eq!(
+            payload_of(&recv_packet(&mut rx).await.expect("warm-up delivered")),
+            b"m0-warm"
+        );
+
+        // M1 (QoS 2) then M2 (QoS 1), back to back: M1's record parks — M1 is
+        // staged — and M2's completion must divert into the backlog, not overtake.
+        publish_qos2(&tx, "ord2/a", b"m1-qos2");
+        publish_qos1(&tx, "ord2/b", b"m2-qos1");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a QoS 1 send overtook a staged QoS 2 record to the same client \
+             (#242 finding A)"
+        );
+
+        release.send(true).unwrap();
+        let p1 = recv_packet(&mut rx).await.expect("M1 first");
+        assert_eq!(payload_of(&p1), b"m1-qos2");
+        let p2 = recv_packet(&mut rx).await.expect("M2 second");
+        assert_eq!(payload_of(&p2), b"m2-qos1");
+    }
+
+    /// ADR 0057's failure arm, relocated with the record stage (issue #242 finding
+    /// A): a failed outbound-id write withholds the PUBLISH (never sent under an
+    /// unsurvivable id), counts `outbound-id-write-failed`, parks the delivery at
+    /// the backlog FRONT, and the next traffic-driven drain delivers it exactly
+    /// once, in order.
+    #[tokio::test]
+    async fn a_failed_outbound_id_write_is_counted_and_the_next_drain_retries() {
+        let store = FlakyStore::new(0);
+        store
+            .fail_outbound
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("test"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            store.clone() as std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        );
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "f/t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "f/t", b"deferred");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "never sent under an id the store refused (ADR 0057)"
+        );
+        assert!(
+            metrics
+                .render()
+                .contains("mqttd_publish_dropped_total{reason=\"outbound-id-write-failed\"} 1"),
+            "the deferral is counted under its stated reason"
+        );
+
+        // Heal; the next publish is the retry clock, and order holds.
+        store
+            .fail_outbound
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        publish_qos2(&tx, "f/t", b"fresh");
+        let a = recv_packet(&mut rx).await.expect("the deferred one first");
+        assert_eq!(payload_of(&a), b"deferred");
+        let b = recv_packet(&mut rx).await.expect("then the fresh one");
+        assert_eq!(payload_of(&b), b"fresh");
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "exactly once: the deferred delivery is not duplicated"
+        );
+    }
+
+    /// Issue #242 finding A: a stalled durable packet-id block reservation
+    /// (ADR 0007 T9) defers the delivery to the backlog — the loop stays live for
+    /// other groups — and the released reservation still resumes past the durable
+    /// high-water (the block invariant survives the off-loop motion).
+    #[tokio::test]
+    async fn a_stalled_packet_id_reservation_does_not_park_the_loop() {
+        let store = ParkingStore::new();
+        // Seed a prior owner's reservation BEFORE parking the reserve path.
+        let a = ClientId("a".into());
+        store.ensure_session(&a).await.unwrap();
+        store.reserve_packet_ids(&a, 5000).await.unwrap();
+        let release = store.park_reserve("a");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut a_rx, _) = attach(&tx, "a", 1, false).await;
+        subscribe_qos(&tx, "a", "ra/t", QoS::AtLeastOnce);
+        let (_b_rx, _) = attach(&tx, "b", 2, false).await;
+        subscribe_qos(&tx, "b", "rb/t", QoS::AtLeastOnce);
+        detach(&tx, "b", 2);
+
+        // a's first delivery spends the (empty) local block: the reserve parks,
+        // the delivery defers, the PUBLISH is withheld.
+        let a_done = publish_gated(&tx, "ra/t", b"blocked", QoS::AtLeastOnce, true);
+        assert_eq!(
+            timeout(Duration::from_millis(500), a_done)
+                .await
+                .expect("the publisher's ack gates on the append, not the reserve")
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+        assert!(
+            recv_packet(&mut a_rx).await.is_none(),
+            "no id goes on the wire without a durably reserved block (ADR 0007 T9)"
+        );
+
+        // The loop is live: a group-B publish completes during the stall.
+        let b_done = publish_gated(&tx, "rb/t", b"fast", QoS::AtLeastOnce, true);
+        assert_eq!(
+            timeout(Duration::from_millis(500), b_done)
+                .await
+                .expect(
+                    "a group-B publish must not wait behind group A's stalled \
+                     packet-id reservation (#242 finding A)"
+                )
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+
+        release.send(true).unwrap();
+        let p = recv_packet(&mut a_rx).await.expect("the deferred delivery");
+        assert_eq!(payload_of(&p), b"blocked");
+        assert!(
+            pkid_of(&p) > 5000,
+            "packet id {} resumed past the inherited durable high-water",
+            pkid_of(&p)
+        );
+    }
+
+    /// Issue #242 finding A, the ack-handler guard: a PUBCOMP for a packet id that
+    /// is still `AwaitingIdRecord` names a PUBLISH the client has never seen — only
+    /// a confused or malicious client can send it — and its unconditional
+    /// `clear_outbound` would race the lane's in-flight `record_outbound` for the
+    /// very same id. It must be ignored; the staged delivery proceeds untouched.
+    #[tokio::test]
+    async fn a_pubcomp_for_a_staged_unsent_id_is_ignored() {
+        let store = ParkingStore::new();
+        let release = store.park_outbound("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "ig/t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "ig/t", b"staged");
+        assert!(recv_packet(&mut rx).await.is_none(), "staged, not sent");
+
+        // A fresh session's first allocation is pkid 1 — the id now staged.
+        // The forged PUBCOMP must not reach the store's clear path.
+        pub_comp(&tx, "p", 1);
+        // Barrier: the PUBCOMP dispatch has run.
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        timeout(Duration::from_secs(1), ping_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store.ops().iter().any(|(op, _)| op == "clear"),
+            "a PUBCOMP for an unsent staged id reached clear_outbound — it races \
+             the in-flight record for the same id (#242 finding A): {:?}",
+            store.ops()
+        );
+
+        // The staged delivery is untouched: it completes normally.
+        release.send(true).unwrap();
+        let p = recv_packet(&mut rx)
+            .await
+            .expect("the staged delivery survives");
+        assert_eq!(payload_of(&p), b"staged");
+        assert_eq!(pkid_of(&p), 1);
+    }
+
+    /// Issue #242 finding A, the reconnect fence: a record completion planned
+    /// against a dead connection never sends — the reattach replay owns the durable
+    /// copy, so the new connection sees the message exactly once.
+    #[tokio::test]
+    async fn a_reconnect_mid_record_never_sends_to_the_new_connection() {
+        let store = ParkingStore::new();
+        let release = store.park_outbound("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx1, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "rc/t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "rc/t", b"mid-record");
+        assert!(
+            recv_packet(&mut rx1).await.is_none(),
+            "staged behind the parked record"
+        );
+
+        // Reconnect while the record is parked: conn 1 dies, conn 2 replays.
+        detach(&tx, "p", 1);
+        let (mut rx2, present) = attach(&tx, "p", 2, false).await;
+        assert!(present, "the persistent session resumes");
+
+        release.send(true).unwrap();
+        let packet = recv_packet(&mut rx2)
+            .await
+            .expect("the durable copy reaches the new connection");
+        assert_eq!(payload_of(&packet), b"mid-record");
+        assert!(
+            recv_packet(&mut rx2).await.is_none(),
+            "exactly once: the stale completion (planned for conn 1) must not \
+             also send (#242 finding A)"
+        );
+    }
+
+    /// Issue #242 finding A: a `QoS` 0 passthrough completion must not slip past a
+    /// delivery admitted before it went on the wire — a staged record or a deferred
+    /// backlog entry. It parks in the same backlog and drains in FIFO order.
+    #[tokio::test]
+    async fn a_qos0_passthrough_completion_does_not_overtake_a_staged_record() {
+        let store = ParkingStore::new();
+        let release = store.park_outbound("p");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (mut rx, _) = attach(&tx, "p", 1, false).await;
+        subscribe_qos(&tx, "p", "ord3/#", QoS::ExactlyOnce);
+
+        // M1 and M2 (QoS 2) stage/queue behind the parked record; M3 (QoS 0) rides
+        // the busy lane as a passthrough and must come out LAST.
+        publish_qos2(&tx, "ord3/a", b"m1");
+        publish_qos2(&tx, "ord3/b", b"m2");
+        publish(&tx, "ord3/c", b"m3-qos0");
+
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "nothing may reach the wire while the first record is parked — least \
+             of all the QoS 0 (#242 finding A)"
+        );
+
+        release.send(true).unwrap();
+        let order: Vec<Vec<u8>> = [
+            recv_packet(&mut rx).await.expect("m1"),
+            recv_packet(&mut rx).await.expect("m2"),
+            recv_packet(&mut rx).await.expect("m3"),
+        ]
+        .iter()
+        .map(|p| payload_of(p).to_vec())
+        .collect();
+        assert_eq!(
+            order,
+            vec![b"m1".to_vec(), b"m2".to_vec(), b"m3-qos0".to_vec()],
+            "admission order is wire order — the QoS 0 never overtakes a staged \
+             QoS 2 (#242 finding A)"
         );
     }
 }

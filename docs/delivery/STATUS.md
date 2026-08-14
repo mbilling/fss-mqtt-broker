@@ -68,6 +68,7 @@
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [4/5 done](0058-one-dot-zero-stability-contract.md) | 1 open |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
 | [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/8 done](0060-bridge-durability-and-ack-contract.md) | 1 open |
+| [0061](../adr/0061-off-loop-durable-appends.md) | Off-loop durable appends: per-session lanes for the publish path | Accepted | [6/6 done](0061-off-loop-durable-appends.md) | — |
 
 ## Open and deferred work
 

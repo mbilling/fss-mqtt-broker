@@ -13,6 +13,14 @@
 > This record states the decision only. How it is being built and how far along it is live
 > in the [delivery doc](../delivery/0017-durable-attach-readiness.md).
 
+> **As delivered (2026-08-14, issue #242):** the publish path's durable appends now
+> follow this ADR's off-loop pattern too — per-session append lanes with an
+> `AppendDone` completion command, the same spawn → typed-command → fast on-loop
+> handler shape §2 established for recovery. The decision/freeze-point argument, the
+> #238 plan/commit atomicity restatement, and the residual on-loop store paths (ack
+> truncation, QoS 2 phase advances, replay reads) are recorded in
+> [ADR 0061](0061-off-loop-durable-appends.md).
+
 ## Context
 
 After a takeover, a *persistent* client reconnecting to the **new owner** comes up
