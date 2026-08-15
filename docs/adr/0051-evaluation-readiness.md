@@ -94,14 +94,16 @@ claims dated, losing dimensions stated as prominently as winning ones.
 ### 3. Migration is tooling, not prose
 
 Each comparison target gets a migration guide **and a small converter script**
-(`scripts/migrate/from-{mosquitto,emqx,nanomq}.py` — Python 3, already a repo tool
+(`scripts/migrate/from-{mosquitto,emqx,hivemq,nanomq}.py` — Python 3, already a repo tool
 dependency; zero new Rust dependencies). The scripts convert what is mappable
 (listeners, TLS material paths, auth modes, ACLs, bridge topology → `mqtt-bridge` rules)
 into an ADR 0046 TOML config, under three rules that mirror the broker's own posture:
 
-- **Nothing is silently dropped.** Every unmappable directive is listed in a loud
-  end-of-run report with *why* (no equivalent / by-design absence / needs a human).
-  A migration that cannot be expressed is reported, never swallowed.
+- **Nothing a converter READS is silently dropped.** Every unmappable directive it reads is
+  listed in a loud end-of-run report with *why* (no equivalent / by-design absence / needs a
+  human). A migration that cannot be expressed is reported, never swallowed. The qualifier is
+  load-bearing and is stated in rule 8 below: a construct never seen cannot be reported, and a
+  construct read but MISUNDERSTOOD is reported as translated.
 - **Secrets are never transformed.** Password hashes cannot be converted between schemes
   (Mosquitto's PBKDF2 is not Argon2id); the script says so and points at re-enrollment
   rather than pretending.
@@ -111,6 +113,138 @@ into an ADR 0046 TOML config, under three rules that mirror the broker's own pos
 
 The scripts are best-effort by declared design — a bounded common-subset mapping with an
 honest failure mode, not a compatibility promise.
+
+**Amended 2026-08-14 (issue #250, T7/T17/T18).** Two changes to this section, both from
+the 2026-08-13 review panel, where migration tooling was the top non-benchmark adoption
+blocker for two reviewers whose brokers had no converter:
+
+1. **HiveMQ joins the converter set.** The list above named
+   `from-{mosquitto,emqx,nanomq}.py`; HiveMQ appeared in this ADR only as an evaluator's
+   broker. It is now `from-{mosquitto,emqx,hivemq,nanomq}.py`.
+2. **A converter is not enough on its own, so the guide is now a named deliverable.**
+   mqttd cannot import another broker's session state, so a config converter leaves the
+   operator with the harder half of the problem — moving live traffic. The migration guide
+   promised per target is therefore consolidated into one document,
+   [`docs/MIGRATION.md`](../MIGRATION.md), which carries the per-broker mapping tables
+   **and** a dual-run cutover playbook written against what `mqtt-bridge` actually
+   supports (ADR 0025): bridge both brokers, move clients in cohorts, verify, cut, with
+   rollback being "re-widen the rule, the incumbent is still live".
+
+A fourth rule, learned from the 2026-08-11 panel finding that mapping Mosquitto's
+`cafile` onto `client_ca` silently converted cert-optional TLS into mandatory mTLS
+(#162), is now stated explicitly rather than left as a bug fix: **a mapping that changes
+security posture is not a mapping.** Where a source setting is permissive and its nearest
+mqttd equivalent is mandatory (or the reverse), the converter emits the candidate line
+**commented out** beside a `TODO(migrate)` explaining the choice, and never picks for the
+operator. The same rule governs ACL translation: an EMQX condition or a HiveMQ permission
+qualifier that mqttd cannot express means the affected rule is **not emitted**, because a
+rule that silently widens or narrows a policy is worse than a reported gap.
+
+**Amended 2026-08-14, second pass on the same issue (#250).** Rule 4 needed one clause and
+a fifth rule needed writing down, both learned from an independent verification of the EMQX
+and HiveMQ converters that found the *same* defect in both, in the fail-open direction:
+
+- **Rule 4 is decided across every listener that shares the target setting, not per
+  listener.** mqttd has one `[tls]` table serving `tls_bind`, `wss_bind` *and* `quic_bind`,
+  so a source broker's per-listener mTLS posture collapses onto a single node-wide gate.
+  Reading the posture off the *first* TLS listener in document order — which both
+  converters did — silently discards a mandate on any other one. A posture mapping is
+  therefore a decision over the **set**: unanimous, map it; **mixed**, emit the candidate
+  commented with a TODO naming which listeners demanded certificates and which did not.
+  Any per-listener setting that cannot be expressed in the single-bind-per-protocol shape
+  must appear as a TODO naming the listener it came from.
+- **Rule 5: an equivalence must be same-direction.** Two settings with similar names are
+  not a mapping if they bound opposite flows. EMQX's `mqtt.max_inflight` (broker→client) is
+  not mqttd's `[limits] receive_maximum` (the inbound window granted to clients), and
+  mapping them would have cut every stock conversion's window from 256 to 32. Where the
+  nearest-looking equivalent runs the other way, the converter states the flip in a TODO
+  and offers a commented candidate — it does not present it as an equivalence.
+
+**Amended 2026-08-15, third pass on the same issue (#250), and this amendment is about the
+*shape* of the guard rather than a new mapping rule.** Two adversarial rounds each fixed the
+named sites of a defect and left the class alive elsewhere — round 2's blocking finding was
+round 1's blocking finding, surviving in the third converter because nobody was told to look
+at it. Rules 1–5 were all in force and all three converters still shipped instances of them.
+The reason is structural: the fixture tests are **example-based**, one input each and a list
+of greps, so they can only see a defect at the place a reviewer already looked. Each
+converter's harness had only ever fed it *one ordering of one listener set*, which is exactly
+why the same first-listener defect could hide three times.
+
+- **Rule 6: every rule above is enforced over GENERATED inputs, not only over fixtures.**
+  `scripts/migrate/property_sweep.py` builds each converter's inputs from a cross product —
+  listener **order** permutations, `enable` flags, unanimous and mixed mTLS postures, both
+  `no_match` postures, truststore present and absent — and asserts one invariant per defect
+  class on every case: every security-relevant input **value** appears in the output
+  (translated or named in a `TODO`/`NOTE`); nothing the source **disabled** is a live bind,
+  URL or rule; no `deny`/`allow` claim contradicts the `default` the same document writes;
+  every numbered step the output cites is a step the output printed; and `mqttd
+  --check-config` accepts every generated config. All three `test-from-*.sh` scripts run it,
+  so it is CI-gated, and each invariant is mutation-proved. A fixture test pins provenance and
+  exact wording, which a property test cannot; a property test finds the instance nobody
+  thought to write a fixture for. Both, or neither is trustworthy.
+- **A corollary that cost this lane a whole round: a sentence about what the output WILL DO
+  must be derived from the value being emitted.** Both zero-rule ACL TODOs asserted
+  "fail-closed … `default = "deny"`" as a constant while the renderer wrote
+  `authorization.no_match`, so a wide-open policy could carry a comment saying it denied
+  everything. Prose that states a computed outcome is code, and is written as code.
+
+**Amended 2026-08-15, fourth and fifth passes on the same issue (#250).** Rules 1-6 were all in
+force and the finding count still went up, so two more rules — the first about the *mechanism*,
+the second about what no mechanism can reach.
+
+- **Rule 7: PROVENANCE OR NOTHING. A security-relevant value is emitted through one gate that
+  takes the value AND the input key it came from, and refuses to write a live line without one.**
+  Every finding of rounds 1-3 that mattered was the same shape — a live setting the tool had not
+  derived from the input (a bind fabricated as `0.0.0.0:1883`, a mandate taken from the wrong
+  listener, `allow_anonymous true` carried off a retired listener). Fixing those one at a time is
+  unbounded work, because the set of vendor constructs nobody has looked at is unbounded; so the
+  shape is made impossible instead. `SECURITY_FIELDS` names the fields whose value decides who may
+  connect and what they may do, `Provenance.line`/`Conversion.set` is the only way to write one,
+  and a field with no source comes out commented beside a TODO naming the decision. Every live
+  security-relevant line therefore carries `# from: <input key>`, which invariants **F** and **G**
+  of the property sweep check on the output, and **H** extends to the one property `--check-config`
+  cannot see: that a live bind is an address the broker can actually bind.
+- **Rule 8, and it is a LIMIT rather than a guarantee: the gate closes FABRICATION, not
+  MISREADING, and the difference is stated wherever the gate is claimed.** A value derived from a
+  real input key whose *meaning* the converter got wrong is live, honest-looking and wrong: a
+  Mosquitto TLS-PSK listener emitted as a plaintext bind (the field encodes the transport; the
+  gate only validates the value), an ACL block the vendor scopes to anonymous clients emitted as a
+  grant to everyone, `message_size_limit 0` — the vendor's spelling of *no limit* — emitted as a
+  1 KiB ceiling. No invariant over the output can see any of them, because the output is
+  consistent with the input. So rule 1 is scoped to **every construct a converter READS**, and
+  every construct known to be misread or unhandled is enumerated in `docs/MIGRATION.md`'s KNOWN
+  GAPS table with what the operator must check by hand. A gap in a table beats a promise that does
+  not hold: the alternative — implying the class is closed because the mechanism is sound — is the
+  claim this ADR's whole migration section rests on not making.
+
+Honesty limit recorded here because it bounds what these scripts can claim: the EMQX and
+HiveMQ converters were built from each vendor's own shipped example configuration at a
+pinned tag, and **no live EMQX or HiveMQ broker was ever run**. The Mosquitto converter has
+no vendor fixture at all — its mappings are derived from `mosquitto.conf(5)` at a pinned tag,
+which is weaker still, and its `--help` says so. The fixtures, all three converters'
+`--help`, `mqttui --help`, and `docs/MIGRATION.md` state the same version scope in the same
+words, because a caveat that lives only in a document is a caveat a hurried operator skips.
+
+One further honesty rule about the fixtures themselves, added 2026-08-14 after a
+verification pass found a fixture header claiming "fetched verbatim … every KEY and VALUE
+as the vendor ships it" for a file with nine changed values: **a fixture is either verbatim
+or composed, it says which in its own header, and a composed one lists every deviation from
+the vendor's file and why that deviation exists.** Both kinds are needed and neither is
+second-class — a vendor's stock defaults take the *refusing* branch of nearly every security
+mapping, so verbatim fixtures prove the refusals while composed ones prove the mappings —
+but calling the second kind the first is the class of claim this ADR's whole migration
+section rests on not doing. `docs/MIGRATION.md` states which fixtures are which and what
+each one proves.
+
+And one rule about the *other* half of a migration document, learned the same day from the
+same review: **a claim about an observable — a metric series, an exit code, a log line — is
+scraped or run before it is written down, and named exactly as the binary emits it.** The
+playbook had told operators to alert on five bridge metrics that do not exist (the real
+series carry the `fss_` registry prefix, and broker series carry `mqttd_` plus a counter's
+`_total`), so the two signals that matter most during a cutover would have been silently
+unmonitored while the dashboard looked healthy. A converter's own output is subject to the
+same rule: it cites metric names too. Where a harness asserts such a name it must match it
+**anchored**, because a substring match on `bridge_` is what let the wrong names survive.
 
 ### 4. The secure path is the first path
 

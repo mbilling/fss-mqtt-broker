@@ -20,7 +20,7 @@ projects the new content into the mounted volume (allow up to ~a minute of kubel
 — the new policy **sweeps live state** (a CRL'd client's session ends, a removed grant
 stops its flow).
 
-**Verify:** `security_reloads_total{trigger="watch"}` increments; the reload is
+**Verify:** `mqttd_security_reloads_total{trigger="watch"}` increments; the reload is
 audit-logged. A malformed file is rejected and the running policy kept — fix the file
 and the watcher retries on the next poll.
 
@@ -423,6 +423,38 @@ the demo dashboard's "Operator signals" row):
 | **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | A session's placement group is not keeping up (degraded follower set: each append or QoS 2 outbound-id record is bounded by the 5s replication RPC timeout, FIFO per session — 256 queued jobs max per session, then the NEWEST publish is withheld so its publisher retries; a detach spill past the cap+headroom sheds into this same counter). Only that group's sessions are affected — connects, subscribes and other groups' publishes keep flowing (issue #242). The degraded-group signals are per-session ones: this gauge/counter pair, `rate(mqttd_publish_dropped_total{reason="outbound-id-write-failed"}[5m])` (a QoS 2 outbound-id record write failed; the delivery is re-queued and retried on the next drain), and end-to-end QoS 2 delivery latency to that group's subscribers — NOT hub dispatch tails, which stay flat by design. Find the degraded group's followers: `mqttd_replica_groups_tracked - mqttd_replica_groups_current`, `mqttd_durable_append_failures_total`, and the *Durable writes refused* row |
 
 `curl <pod>:8080/statusz` is the human-readable superset of all of it.
+
+## Migrating onto mqttd
+
+Day 0, not day 2, but it belongs beside these procedures because it *is* one: converting a
+Mosquitto / EMQX / HiveMQ configuration ([`scripts/migrate/`](../scripts/migrate/), every
+unmapped setting emitted as a `TODO(migrate)` in the file you are about to deploy) and then
+moving live traffic across.
+
+The second part is the one with a trap in it: **mqttd cannot import another broker's session
+state.** A moved client loses its offline queue, its subscriptions and any in-flight QoS 2
+exchange, and must resubscribe. Retained state *does* cross, by itself, through the bridge.
+So cutover is a **dual run** — bridge both brokers, move clients in cohorts, verify, cut,
+and roll back by re-widening the bridge rule because the incumbent is still live.
+
+**That retained sync has a hazard, and this page is where you will hit it.** The re-sync runs
+in **both** directions on every reconnect, so a retained value deleted on one side while the
+bridge is down is **resurrected** from the other: the surviving copy wins, a tombstone is not
+idempotent under this scheme, and nothing logs the resurrection. Reproduced on the playbook's
+exact `both`/no-remap shape — value crossed to mqttd, bridge stopped, cleared on the incumbent
+with `mosquitto_pub -r -n` and confirmed gone, bridge restarted, value **back** on the
+incumbent. So when the brownout rows under
+[Monitoring for the operator](#monitoring-for-the-operator-and-humans) tell you to prune retained
+state during a dual run, **prune with the bridge running and then check both sides** (measured:
+gone on both, and still gone after a bridge restart). Full write-up in
+[MIGRATION.md](MIGRATION.md#step-3--bridge-them) and [BRIDGE.md](BRIDGE.md).
+
+The converters, the per-broker mapping tables, and that playbook — written against
+`mqtt-bridge`'s actual refusals, with its bridge step exercised against a real third-party
+broker and every untested step marked — are the
+[migration guide](MIGRATION.md). Start with `scripts/migrate/cert-audit.sh`: mqttd refuses a
+client certificate without the `clientAuth` extended key usage at the handshake, which
+OpenSSL-based brokers tolerated, so a migrating fleet otherwise discovers it by outage.
 
 ## Bare-metal equivalents
 

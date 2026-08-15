@@ -94,6 +94,33 @@ jobs:
       - name: Mosquitto migration converter (output boots the broker)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-mosquitto.sh
 
+      # ADR 0051 T7/T17: the same bar for the EMQX and HiveMQ converters, plus the two
+      # assertions the Mosquitto harness never made — `mqttd --check-config` on the
+      # converted config (ADR 0051 §3's third rule) and expected-TODO-marker greps, so a
+      # mapping that quietly stopped emitting cannot pass. The EMQX lane also needs
+      # mqtt-bridge, because its bridge output is validated by the real bridge binary.
+      - name: Build mqtt-bridge (the EMQX converter's bridge output is validated by it)
+        run: cargo build --quiet -p mqtt-bridge
+      - name: EMQX migration converter (output validates, boots the broker, bridges)
+        run: |
+          MQTTD_BIN=target/debug/mqttd MQTT_BRIDGE_BIN=target/debug/mqtt-bridge \
+            ./scripts/migrate/test-from-emqx.sh
+      - name: HiveMQ migration converter (output validates and boots the broker)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-hivemq.sh
+
+      # ADR 0051 T18: docs/MIGRATION.md's dual-run cutover playbook is only worth having if
+      # its bridge config actually works, so the document's own shape is run against mqttd +
+      # mqtt-bridge + a REAL third-party broker. Needs the mosquitto BROKER, not just the
+      # clients this job already installs; the script exits 2 (not 1) if it is missing.
+      - name: Install the mosquitto broker (incumbent stand-in for the cutover smoke)
+        run: |
+          sudo apt-get install -y mosquitto
+          sudo systemctl stop mosquitto || true
+      - name: Dual-run cutover smoke (mqttd <-> Mosquitto through mqtt-bridge)
+        run: |
+          MQTTD_BIN=target/debug/mqttd MQTT_BRIDGE_BIN=target/debug/mqtt-bridge \
+            ./scripts/migrate/dual-run-smoke.sh
+
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 

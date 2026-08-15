@@ -216,8 +216,8 @@ not by preference:
 
 | | |
 |---|---|
-| **Standalone** — ships inside the binary | the demo stack, the Kubernetes examples (chart + CRDs), the compose reference deployment, and the Mosquitto migration converter |
-| **Checkout-only, permanently** | anything that operates *on the repository*: `release/build-repro.sh` builds it, `k8s/render-parity.sh` and `render-parity-one.sh` diff the chart against the operator, `k8s/kind-smoke.sh` and `k8s/operator-e2e.sh` build images from source, `migrate/test-from-mosquitto.sh` boots a broker it does not build, and `gen-status.py` / `check-readme-facts.py` / `gen-bridge-dashboard.py` read and rewrite the repo's own documents — **nine in all** |
+| **Standalone** — ships inside the binary | the demo stack, the Kubernetes examples (chart + CRDs), the compose reference deployment, and the Mosquitto / EMQX / HiveMQ migration converters |
+| **Checkout-only, permanently** | anything that operates *on the repository*: `release/build-repro.sh` builds it, `k8s/render-parity.sh` and `render-parity-one.sh` diff the chart against the operator, `k8s/kind-smoke.sh` and `k8s/operator-e2e.sh` build images from source, `migrate/test-from-mosquitto.sh`, `migrate/test-from-emqx.sh`, `migrate/test-from-hivemq.sh` and `migrate/dual-run-smoke.sh` boot brokers they do not build, and `gen-status.py` / `check-readme-facts.py` / `gen-bridge-dashboard.py` read and rewrite the repo's own documents — **twelve in all** (nine until 2026-08-14, when ADR 0051 T7/T17/T18 added the EMQX and HiveMQ fixture tests and the dual-run cutover smoke) |
 | **Checkout-only for now** | `bench/run.sh` (embeddable later; its 12 MB is generated `results/`, the harness is ~50 KB), the interop suites, the OIDC fixture, and the smoke tests that `cargo build` a broker — including **`quickstart-smoke.sh`**, which an earlier draft of this table wrongly listed as standalone: it builds `mqttd` from source when `MQTTD_BIN` is unset, so it cannot run beside a binary with no toolchain and no source |
 
 `mqttui` **detects whether it is inside a checkout**: standalone it offers the embedded
@@ -226,8 +226,17 @@ A tool that silently showed a subset would be the same defect as a manifest that
 went stale (§3).
 
 **"Everything possible" is not everything**, and this record says so rather than letting it
-be discovered. Nine tasks operate on the repository itself and cannot be freed from it by
+be discovered. Twelve tasks operate on the repository itself and cannot be freed from it by
 any amount of embedding.
+
+**Amended 2026-08-14 (ADR 0051 T7/T17/T18).** The converters added for EMQX and HiveMQ are
+standalone like the Mosquitto one — they read the *user's* config, so they need no checkout.
+Their fixture tests and the dual-run cutover smoke are not: they boot `target/debug/mqttd`
+(and `mqtt-bridge`) without building it, which is the same classification
+`test-from-mosquitto.sh` already had. Decision D is unchanged and deliberately so: **only
+Mosquitto has a Rust twin** (`mqttui migrate mosquitto`), so a user with no `python3` cannot
+run the EMQX or HiveMQ converters. `docs/MIGRATION.md` states that rather than implying
+parity; widening the twin is not tracked.
 
 **Availability is declared, not inferred** — the same rule as §2, and for the same reason.
 Implementation first inferred it from whether the script had been embedded, which put
