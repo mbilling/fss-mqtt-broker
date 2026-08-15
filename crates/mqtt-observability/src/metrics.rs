@@ -77,6 +77,15 @@ struct OutcomeLabel {
     trigger: String,
 }
 
+/// `{outcome}` label for `mqttd_backup_runs_total` (ADR 0062): a bounded pair — `ok` for
+/// an export renamed into place, `error` for a run that wrote nothing (an incomplete
+/// session scan, an unwritable directory). A run counted `error` deliberately does NOT
+/// advance `backup_last_success_timestamp_seconds`, so the RPO alert fires.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RunOutcomeLabel {
+    outcome: String,
+}
+
 /// `{axis}` label for resource-watermark state gauges (ADR 0054): a bounded set —
 /// `disk` today, `memory` when the ADR 0041 amendment's RSS watermark lands.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -159,6 +168,10 @@ struct OtelInstruments {
     cluster_info: OtelGauge<i64>,
     founder: OtelGauge<i64>,
     refound_quarantine: OtelGauge<i64>,
+    backup_runs: OtelCounter<u64>,
+    backup_last_success_timestamp_seconds: OtelGauge<i64>,
+    backup_duration_ms: OtelGauge<i64>,
+    restore_state: OtelGauge<i64>,
     foundings: OtelCounter<u64>,
     config_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
@@ -228,6 +241,12 @@ impl OtelInstruments {
             cluster_info: meter.i64_gauge("cluster_info").build(),
             founder: meter.i64_gauge("founder").build(),
             refound_quarantine: meter.i64_gauge("refound_quarantine").build(),
+            backup_runs: meter.u64_counter("backup_runs").build(),
+            backup_last_success_timestamp_seconds: meter
+                .i64_gauge("backup_last_success_timestamp_seconds")
+                .build(),
+            backup_duration_ms: meter.i64_gauge("backup_duration_ms").build(),
+            restore_state: meter.i64_gauge("restore_state").build(),
             foundings: meter.u64_counter("foundings").build(),
             config_info: meter.i64_gauge("config_info").build(),
             swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
@@ -337,6 +356,10 @@ pub struct Metrics {
     /// 1 when this node is the cluster founder (started seedless), else 0.
     founder: Gauge,
     refound_quarantine: Gauge,
+    backup_runs_total: Family<RunOutcomeLabel, Counter>,
+    backup_last_success_timestamp_seconds: Gauge,
+    backup_duration_ms: Gauge,
+    restore_state: Gauge,
     /// Founding events: this process minted a NEW cluster identity. Exactly one,
     /// ever, on a healthy cluster's first boot — any increment after day one is
     /// the split-brain alarm.
@@ -742,6 +765,34 @@ impl Metrics {
              ITSELF out of rotation (it will not become ready again without the \
              documented wipe-and-rejoin), else 0",
         );
+        // Backup + restore (ADR 0062). `backup_last_success_timestamp_seconds` is the
+        // series the RPO alert reads: an unconfigured backup exports a literal 0, so every
+        // rule over it needs the `> 0` guard clause the watermark rules taught.
+        let backup_runs_total = register_family(
+            &mut registry,
+            "backup_runs",
+            "Online backup runs, by outcome (ok = an export was fsynced and renamed into \
+             place; error = the run wrote nothing, e.g. an incomplete session scan)",
+        );
+        let backup_last_success_timestamp_seconds = register_gauge(
+            &mut registry,
+            "backup_last_success_timestamp_seconds",
+            "Unix time the newest SUCCESSFUL export started (ADR 0062); 0 = no backup has \
+             ever succeeded in this process. Its age bounds the RPO",
+        );
+        let backup_duration_ms = register_gauge(
+            &mut registry,
+            "backup_duration_ms",
+            "Wall-clock milliseconds the last export took. An UPPER BOUND on the \
+             consistency window, not the window itself — the window is the span the records \
+             were actually read over, exported separately (ADR 0062)",
+        );
+        let restore_state = register_gauge(
+            &mut registry,
+            "restore_state",
+            "Restore-from-backup state (ADR 0062): 0 none, 1 in progress (the node is \
+             NotReady and has bound no client listener), 2 completed, 3 failed",
+        );
         let foundings_total = register_counter(
             &mut registry,
             "foundings",
@@ -840,6 +891,10 @@ impl Metrics {
             cluster_info,
             founder,
             refound_quarantine,
+            backup_runs_total,
+            backup_last_success_timestamp_seconds,
+            backup_duration_ms,
+            restore_state,
             foundings_total,
             config_info,
             config_info_prev: std::sync::Mutex::new(None),
@@ -1327,6 +1382,37 @@ impl Metrics {
         self.otel
             .refound_quarantine
             .record(i64::from(quarantined), &[]);
+    }
+
+    /// Record a finished online-backup run (ADR 0062). `outcome` is `"ok"` or `"error"`;
+    /// `duration_ms` is the run's wall clock. Only an `ok` run advances the last-success
+    /// timestamp — `started_unix` is the export's OWN start, not now, because the RPO the
+    /// operator alerts on is measured from the instant the cut began.
+    pub fn backup_run(&self, outcome: &str, duration_ms: u64, started_unix: Option<u64>) {
+        self.backup_runs_total
+            .get_or_create(&RunOutcomeLabel {
+                outcome: outcome.to_string(),
+            })
+            .inc();
+        self.otel
+            .backup_runs
+            .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
+        let ms = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+        self.backup_duration_ms.set(ms);
+        self.otel.backup_duration_ms.record(ms, &[]);
+        if let Some(started) = started_unix {
+            let at = i64::try_from(started).unwrap_or(i64::MAX);
+            self.backup_last_success_timestamp_seconds.set(at);
+            self.otel
+                .backup_last_success_timestamp_seconds
+                .record(at, &[]);
+        }
+    }
+
+    /// Publish the restore state (ADR 0062): 0 none, 1 in progress, 2 completed, 3 failed.
+    pub fn set_restore_state(&self, state: i64) {
+        self.restore_state.set(state);
+        self.otel.restore_state.record(state, &[]);
     }
 
     /// A founding event: this process minted a new cluster identity.

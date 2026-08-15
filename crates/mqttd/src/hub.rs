@@ -1136,6 +1136,18 @@ pub struct PendingAttach {
     reply: oneshot::Sender<AttachOutcome>,
 }
 
+/// One atomic cut of this node's retained state for an export (ADR 0062): every retained
+/// topic's message, paired with the `(epoch, offset)` convergence token it was applied from
+/// (`None` under durable-off). An empty payload is a live tombstone.
+pub type RetainedExportCut = Vec<(Message, Option<(u64, u64)>)>;
+
+/// The hub's answer to [`HubCommand::RetainedExportSnapshot`]: the cut, or the reason there
+/// is none. An error must NOT read as "this node holds no retained state" — that would ship
+/// an export with every retained topic silently missing, which is the half-true backup the
+/// whole feature exists not to produce. The exporter fails the run on `Err` and writes
+/// nothing, so the last-success timestamp does not move and the RPO alert fires.
+pub type RetainedExportAnswer = Result<RetainedExportCut, String>;
+
 /// A message from a connection task to the hub.
 #[derive(Debug)]
 pub enum HubCommand {
@@ -1272,6 +1284,53 @@ pub enum HubCommand {
         /// **No Local** subscriptions. `None` for internally-generated publishes (a Will, a
         /// peer-forwarded message) — those have no local publisher to exclude.
         publisher: Option<ClientId>,
+    },
+    /// Write one **restored** retained value as retained state (ADR 0062, issue #249):
+    /// commit it through the topic's group lease-owner and warm the caches, with **no
+    /// ordinary fan-out to subscribers**.
+    ///
+    /// This exists because `Publish { retain: true }` is the wrong tool for a restore. A
+    /// publish is *two* facts — "this is the topic's retained value" and "deliver this to
+    /// every matching subscriber now" — and a restore only owns the first. The second
+    /// reaches durable OFFLINE sessions, whose queues the hub appends to with no client
+    /// listener bound at all, so a restore that re-published its retained set gave every
+    /// restored session one spurious queued message per matching retained topic per node —
+    /// messages that were in no export, at whatever `QoS` the subscription granted. This
+    /// command carries only the first fact: the durable authority commit (ADR 0037 §1/§5),
+    /// then the token-carrying fan-out to peer CACHES. Restored sessions are untouched, and
+    /// "the restored queues equal the exported queues" becomes an equality a test can state.
+    ///
+    /// With durable retained off (ADR 0014 best-effort) it writes the node-local retained
+    /// store directly — every node imports the same set, so the caches still converge.
+    RestoreRetained {
+        /// Destination topic.
+        topic: String,
+        /// The retained payload (empty = a clear, MQTT-3.3.1-10).
+        payload: Bytes,
+        /// The `QoS` the value was published at.
+        qos: QoS,
+        /// MQTT 5.0 Message Expiry Interval in seconds, if the exported value had a
+        /// remaining deadline.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties (ADR 0030).
+        app: AppProperties,
+        /// Signalled once the value is durably the topic's retained state (or refused).
+        done: oneshot::Sender<PublishOutcome>,
+    },
+    /// Snapshot every retained topic this node holds **with its `(epoch, offset)`
+    /// convergence token**, for an online export (ADR 0062).
+    ///
+    /// Taken here rather than off the `RetainedStore` handle because the value and its token
+    /// live in two places — the cache and the hub's token map — and pairing a value from one
+    /// instant with a token from another would produce a file whose ordering evidence is
+    /// wrong, which is worse than a file with none. The hub is a single-threaded actor, so
+    /// one dispatch cannot interleave with a retained mutation: this IS the atomic cut the
+    /// export claims. Live tombstones are included as empty-payload entries, so a topic
+    /// cleared after another node's export is not resurrected by the union.
+    RetainedExportSnapshot {
+        /// Each retained topic's message and its committed token, when there is one — or
+        /// the reason the snapshot could not be taken.
+        done: oneshot::Sender<RetainedExportAnswer>,
     },
     /// A subscriber acknowledged a `QoS` 1 delivery.
     PubAck {
@@ -1464,6 +1523,9 @@ pub enum HubCommand {
         publish: Option<u64>,
         /// The absolute expiry deadline the commit carried (issue #227).
         expires_at: Option<u64>,
+        /// Whether the mutation came from a RESTORE — see [`RetainedMutation::restore`]:
+        /// the committed value warms every cache as usual, and NOTHING is delivered.
+        restore: bool,
     },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
@@ -1786,8 +1848,10 @@ pub struct Hub {
     /// The durable-plane endpoint (consensus + replication), when durable sessions
     /// are enabled (ADR 0007). `None` for the single-node / non-durable default.
     durable_plane: Option<DurablePlane>,
-    /// Retained message storage.
-    retained: Box<dyn RetainedStore>,
+    /// Retained message storage. An `Arc` (not a `Box`) so the online backup task can
+    /// hold a READ handle on the same store the hub writes (ADR 0062) — one redb handle,
+    /// borrowed, never a second open on a dir this process already locks (ADR 0061).
+    retained: Arc<dyn RetainedStore>,
     /// The durable retained keyspace (ADR 0037), when durable sessions are on: the
     /// owner-routed, quorum-committed **authority** for retained state, written in
     /// addition to the local cache above. `None` (durable off) keeps ADR 0014
@@ -2074,6 +2138,15 @@ struct RetainedMutation {
     /// Absolute expiry deadline (Unix epoch seconds; issue #227), committed with
     /// the value. `None` = never.
     expires_at: Option<u64>,
+    /// Set when this mutation came from a RESTORE (ADR 0062), not from a publish.
+    ///
+    /// It suppresses the one delivery an ordinary commit still makes — the
+    /// window-scoped back-fill to a subscription younger than the interest horizon
+    /// (issue #219). During a restore that delivery has no legitimate recipient: no
+    /// client listener is bound, and a session's own export already accounts for every
+    /// message it was owed, so anything delivered here would be a message the backup
+    /// did not contain. Retained state is written; nothing is delivered.
+    restore: bool,
 }
 
 /// The bound on publishes whose acknowledgement awaits cluster-wide durability
@@ -2321,7 +2394,7 @@ impl Hub {
                 inflight: HashMap::new(),
                 store,
                 durable_plane: None,
-                retained: Box::new(MemoryRetainedStore::new()),
+                retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
                 brownout: false,
@@ -2390,7 +2463,7 @@ impl Hub {
     /// Replace the retained-message store before [`run`](Self::run) — used to swap the
     /// in-memory default for the on-disk store when persistence is enabled (ADR 0018
     /// phase 4).
-    pub fn attach_retained_store(&mut self, retained: Box<dyn RetainedStore>) {
+    pub fn attach_retained_store(&mut self, retained: Arc<dyn RetainedStore>) {
         self.retained = retained;
     }
 
@@ -2669,6 +2742,21 @@ impl Hub {
                         DurableOutcome::Failed => self.drop_pending(id),
                     }
                 }
+            }
+            HubCommand::RestoreRetained {
+                topic,
+                payload,
+                qos,
+                message_expiry,
+                app,
+                done,
+            } => {
+                self.restore_retained(topic, payload, qos, message_expiry, app, done)
+                    .await;
+            }
+            HubCommand::RetainedExportSnapshot { done } => {
+                let snapshot = self.retained_export_snapshot().await;
+                let _ = done.send(snapshot);
             }
             HubCommand::AppendDone { job, outcome } => {
                 self.append_done(*job, outcome).await;
@@ -2979,6 +3067,7 @@ impl Hub {
                 reply,
                 publish,
                 expires_at,
+                restore,
             } => {
                 self.retained_commit_inflight = false;
                 if let Some((epoch, offset)) = token {
@@ -2992,13 +3081,15 @@ impl Hub {
                     // converges via the P5 back-fill on the next link-up), and drive
                     // the next queued mutation. Application properties travel with
                     // the value everywhere (ADR 0038 T3).
-                    self.apply_retained_update(
+                    self.apply_committed_retained(
                         &topic,
                         &payload,
                         qos,
                         &app,
                         (epoch, offset),
                         expires_at,
+                        // A restore delivers to nobody (see `RetainedMutation::restore`).
+                        !restore,
                     )
                     .await;
                     for peer in self.peers.values() {
@@ -3038,6 +3129,7 @@ impl Hub {
                         reply,
                         publish,
                         expires_at,
+                        restore,
                     });
                 }
             }
@@ -3171,7 +3263,7 @@ impl Hub {
             // cache expires it at the same instant and a replay can send the
             // remaining interval.
             let expires_at = message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s));
-            self.route_retained_commit(topic, payload, qos_num(qos), app, gate, expires_at);
+            self.route_retained_commit(topic, payload, qos_num(qos), app, gate, expires_at, false);
         }
         durable
     }
@@ -8283,6 +8375,7 @@ impl Hub {
     /// commits (per-node order holds even for rapid same-topic publishes) and lets a
     /// mutation that cannot reach its owner wait for a heal instead of being dropped.
     /// At the bound the **oldest** is dropped, loudly.
+    #[allow(clippy::too_many_arguments)] // the mutation's fields, plus the gate
     fn route_retained_commit(
         &mut self,
         topic: &str,
@@ -8291,6 +8384,7 @@ impl Hub {
         app: &AppProperties,
         gate: Option<u64>,
         expires_at: Option<u64>,
+        restore: bool,
     ) {
         if self.durable_retained.is_none() {
             return; // durable off: ADR 0014 behaviour, unchanged (ADR 0037 §6)
@@ -8311,8 +8405,112 @@ impl Hub {
             reply: None,
             publish: gate,
             expires_at,
+            restore,
         });
         self.kick_retained_queue();
+    }
+
+    /// Write one restored retained value as retained state, with NO subscriber fan-out
+    /// (ADR 0062 — see [`HubCommand::RestoreRetained`] for why a publish cannot be used).
+    ///
+    /// Durable retained ON: the ordinary authority route (owner-routed, quorum-committed),
+    /// with the caller's completion hung on the SAME gate a gated publish uses for its
+    /// retained obligation — so the answer means "durably the topic's retained value
+    /// cluster-wide", and a mutation dropped at the queue bound withholds it (the restore
+    /// then fails loudly rather than reporting a value it did not store).
+    ///
+    /// Durable retained OFF: the node-local cache, write-through, answered directly.
+    ///
+    /// Either way the only outward traffic is the token-carrying fan-out to peer CACHES that
+    /// `RetainedCommitDone` already performs. No session queue is touched.
+    async fn restore_retained(
+        &mut self,
+        topic: String,
+        payload: Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: AppProperties,
+        done: oneshot::Sender<PublishOutcome>,
+    ) {
+        let expires_at = message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s));
+        if self.durable_retained.is_some() {
+            // Reuse the gate machinery, then correct the two fields that only make sense
+            // for a publish: there is no local fan-out to complete (`local_done`) and no
+            // takeover window to wait for (`awaiting_settle`) — a restore runs before any
+            // listener binds, and holding the answer for a settle that no publish will
+            // trigger would stall the restore for nothing.
+            let id = self.register_pending(done, &topic, &payload, qos, true, message_expiry, &app);
+            if let Some(p) = self.pending_publishes.get_mut(&id) {
+                p.local_done = true;
+                p.awaiting_settle = false;
+            }
+            self.route_retained_commit(
+                &topic,
+                &payload,
+                qos_num(qos),
+                &app,
+                Some(id),
+                expires_at,
+                true,
+            );
+            return;
+        }
+        let message = Message {
+            topic,
+            payload,
+            qos,
+            retain: true,
+            app,
+            expires_at,
+        };
+        self.retained_may_expire |= message.expires_at.is_some();
+        match self.retained.set(&message).await {
+            Ok(()) => {
+                let _ = done.send(PublishOutcome::Accepted);
+            }
+            Err(e) => {
+                warn!(topic = %message.topic, error = %e, "restore: retained write failed");
+                // Dropping `done` withholds: the importer reports "never answered" and the
+                // restore fails. A restore that silently skipped a retained value would be
+                // the half-true backup this feature exists not to be.
+            }
+        }
+    }
+
+    /// Every retained topic this node holds, paired with its convergence token — the
+    /// export's atomic cut (ADR 0062; see [`HubCommand::RetainedExportSnapshot`]).
+    ///
+    /// Tombstones are included as empty-payload entries: the cache drops a cleared topic, so
+    /// the clear exists only as a token here, and without it a value another node still
+    /// caches would be resurrected by the restore's union.
+    async fn retained_export_snapshot(&mut self) -> RetainedExportAnswer {
+        let values = self.retained.all().await.map_err(|e| {
+            warn!(error = %e, "retained export snapshot failed; the export will fail rather \
+                  than report an empty retained set");
+            format!("backup: the retained store could not be read: {e}")
+        })?;
+        let mut out: RetainedExportCut = values
+            .into_iter()
+            .map(|m| {
+                let token = self.retained_tokens.get(&m.topic).copied();
+                (m, token)
+            })
+            .collect();
+        for topic in self.retained_tombstone_observed_at.keys() {
+            let token = self.retained_tokens.get(topic).copied();
+            out.push((
+                Message {
+                    topic: topic.clone(),
+                    payload: Bytes::new(),
+                    qos: QoS::AtMostOnce,
+                    retain: true,
+                    app: AppProperties::default(),
+                    expires_at: None,
+                },
+                token,
+            ));
+        }
+        Ok(out)
     }
 
     /// Admit a mutation to the bounded queue, dropping the **oldest** loudly at the
@@ -8384,6 +8582,10 @@ impl Hub {
             reply: Some((node, seq)),
             publish: None,
             expires_at,
+            // A peer-routed mutation is a publish on its origin node; the origin's own
+            // restore suppresses its own delivery, and this node has no window to serve
+            // for a value it never subscribed to.
+            restore: false,
         });
         self.kick_retained_queue();
     }
@@ -8508,6 +8710,7 @@ impl Hub {
             reply,
             publish,
             expires_at,
+            restore,
         } = mutation;
         tokio::spawn(async move {
             let result = if payload.is_empty() {
@@ -8543,6 +8746,7 @@ impl Hub {
                 reply,
                 publish,
                 expires_at,
+                restore,
             });
         });
     }
@@ -8685,6 +8889,7 @@ impl Hub {
                         &AppProperties::default(),
                         None,
                         None,
+                        false,
                     );
                 } else {
                     // Not ours to commit: keep watching until the owner's clear
@@ -8784,6 +8989,31 @@ impl Hub {
         token: (u64, u64),
         expires_at: Option<u64>,
     ) {
+        self.apply_committed_retained(topic, payload, qos, app, token, expires_at, true)
+            .await;
+    }
+
+    /// The body of [`apply_retained_update`], with the window-scoped delivery (issue #219)
+    /// made a CHOICE — `deliver_windowed = false` for a mutation a RESTORE originated.
+    ///
+    /// The cache write, the token fence and the tombstone bookkeeping are identical either
+    /// way: a restored value is ordinary committed retained state. What a restore must not
+    /// do is *deliver*. The window back-fill exists for a subscription so fresh that its
+    /// interest had not reached the publish's landing node — a live-client situation with no
+    /// analogue during a restore, where no listener is bound and every session's own export
+    /// already accounts for what it was owed. Delivering there would add messages to a
+    /// restored queue that were in no backup, which is the one thing a restore may never do.
+    #[allow(clippy::too_many_arguments)] // the committed record's fields, plus the choice
+    async fn apply_committed_retained(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: u8,
+        app: &AppProperties,
+        token: (u64, u64),
+        expires_at: Option<u64>,
+        deliver_windowed: bool,
+    ) {
         if self.retained_is_stale(topic, token).await {
             debug!(topic = %topic, ?token, "stale/duplicate retained update skipped");
             return;
@@ -8835,8 +9065,10 @@ impl Hub {
         // delivery the forward structurally cannot make is to a subscription so
         // fresh that its interest had not reached the publish's landing node: for
         // exactly those (open windows, ledger-deduped), this apply IS the vehicle.
-        self.deliver_to_windowed_subscribers(topic, payload, qos, app, expires_at)
-            .await;
+        if deliver_windowed {
+            self.deliver_to_windowed_subscribers(topic, payload, qos, app, expires_at)
+                .await;
+        }
     }
 
     /// Deliver a just-applied committed retained value to local subscribers whose
@@ -11307,7 +11539,7 @@ mod tests {
             Arc::new(MemorySessionStore::new()),
             None,
         );
-        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_retained_store(Arc::new(store.clone()));
         tokio::spawn(hub.run());
 
         // Healthy: a retained publish is acked normally (the fix must not break the happy path).
@@ -13583,23 +13815,61 @@ mod tests {
     fn start_hub_with_durable_retained(
         peers: &[&str],
     ) -> (HubTx, TestDurableRetained, Arc<RwLock<Placement>>) {
+        start_hub_with_durable_retained_store(peers, Arc::new(MemorySessionStore::new()))
+    }
+
+    /// As above, over a session store the CALLER holds — so a test can read the offline
+    /// queues the hub wrote and compare them, rather than infer them from deliveries.
+    fn start_hub_with_durable_retained_store(
+        peers: &[&str],
+        store: Arc<dyn mqtt_storage::SessionStore>,
+    ) -> (HubTx, TestDurableRetained, Arc<RwLock<Placement>>) {
         let local = NodeId("hub-test".into());
         let mut p = Placement::new(local.clone(), DEFAULT_REPLICAS);
         for n in peers {
             p.observe(&NodeId((*n).into()), MemberState::Alive, "peer:7000", None);
         }
         let placement = Arc::new(RwLock::new(p));
-        let (mut hub, tx) = Hub::with_config_and_placement(
-            local,
-            Arc::new(MemorySessionStore::new()),
-            Some(placement.clone()),
-        );
+        let (mut hub, tx) = Hub::with_config_and_placement(local, store, Some(placement.clone()));
         let handle = Arc::new(mqtt_storage::retained_log::ReplicatedRetained::new(
             InMemoryReplicatedLog::new(),
         ));
         hub.attach_durable_retained(handle.clone());
         tokio::spawn(hub.run());
         (tx, handle, placement)
+    }
+
+    /// Write one retained value the way a RESTORE does (ADR 0062) and wait for the answer.
+    async fn restore_retained(tx: &HubTx, topic: &str, payload: &'static [u8]) -> PublishOutcome {
+        let (done, rx) = oneshot::channel();
+        tx.send(HubCommand::RestoreRetained {
+            topic: topic.into(),
+            payload: Bytes::from_static(payload),
+            qos: QoS::ExactlyOnce,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the restore's retained write must be answered")
+            .expect("the hub must not drop the answer")
+    }
+
+    /// The payloads in `client`'s offline queue, in order — the queue as a restore would
+    /// have to reproduce it.
+    async fn queued_payloads(
+        store: &Arc<dyn mqtt_storage::SessionStore>,
+        client: &str,
+    ) -> Vec<Vec<u8>> {
+        store
+            .pending(&ClientId(client.into()), 0, 256)
+            .await
+            .expect("the offline queue reads")
+            .into_iter()
+            .map(|q| q.message.payload.to_vec())
+            .collect()
     }
 
     /// Poll the durable keyspace until `topic`'s committed entry satisfies `pred`
@@ -13650,6 +13920,94 @@ mod tests {
         publish_retained(&tx, "dev/1/state", b"");
         let e = wait_durable_retained(&durable, "dev/1/state", |e| e.tombstone).await;
         assert_eq!(e.token(), (0, 2));
+    }
+
+    /// **A restore writes retained state; it does not publish** (ADR 0062, issue #249).
+    ///
+    /// The bug this pins was not a missing feature but an invented one: the restore
+    /// re-published every exported retained value as `Publish { retain: true }`, and a
+    /// publish fans out. An offline DURABLE session needs no connected listener to receive
+    /// one — the hub appends straight to its queue — so every restored session whose
+    /// restored subscription matched a retained topic gained one message per topic PER NODE
+    /// that were in no export, at whatever `QoS` the subscription granted (an exactly-once
+    /// violation introduced by the recovery tool itself, at `QoS` 2).
+    ///
+    /// So the assertion is an EQUALITY, not a presence check: the offline queue after the
+    /// retained restore must be **byte-for-byte the queue before it**, while the retained
+    /// values are nonetheless durably committed with their tokens and replay to a new
+    /// subscriber. Count-based or set-based checks cannot see this defect — the injected
+    /// copies are duplicates of a value that legitimately exists elsewhere.
+    #[tokio::test]
+    async fn a_restored_retained_value_is_retained_state_and_never_touches_a_restored_queue() {
+        let store: Arc<dyn mqtt_storage::SessionStore> = Arc::new(MemorySessionStore::new());
+        let (tx, durable, _placement) = start_hub_with_durable_retained_store(&[], store.clone());
+
+        // A restored durable session: subscribed to `cfg/#` (the wildcard a config-topic
+        // deployment really uses), offline, holding exactly the queue its export carried.
+        let (_rx, _) = attach(&tx, "psub", 1, false).await;
+        subscribe(&tx, "psub", "cfg/#");
+        detach(&tx, "psub", 1);
+        publish(&tx, "cfg/a", b"from-the-export");
+        let exported = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let q = queued_payloads(&store, "psub").await;
+                if q.len() == 1 || tokio::time::Instant::now() >= deadline {
+                    break q;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        assert_eq!(
+            exported,
+            vec![b"from-the-export".to_vec()],
+            "the queue this test compares against must be the one the export carried"
+        );
+
+        // The restore's retained writes, on topics the restored subscription MATCHES —
+        // and on the very topic one queued message came from.
+        for (topic, payload) in [
+            ("cfg/a", b"retained-a" as &'static [u8]),
+            ("cfg/b", b"retained-b"),
+        ] {
+            assert_eq!(
+                restore_retained(&tx, topic, payload).await,
+                PublishOutcome::Accepted,
+                "a restored retained value must be answered only once it is durably the \
+                 topic's retained state"
+            );
+        }
+
+        // (1) The queue is untouched — the whole point.
+        assert_eq!(
+            queued_payloads(&store, "psub").await,
+            exported,
+            "the restored session's queue must EQUAL the exported queue exactly; a restore \
+             that fans its retained set out injects one message per matching topic per node"
+        );
+
+        // (2) And the retained state is really there: committed with a token, and replayed
+        // to a subscriber that arrives afterwards.
+        for topic in ["cfg/a", "cfg/b"] {
+            let e = wait_durable_retained(&durable, topic, |_| true).await;
+            assert!(!e.tombstone, "{topic} must hold a value, not a clear");
+            assert!(e.token() > (0, 0), "{topic} must carry a convergence token");
+        }
+        let (mut fresh, _) = attach(&tx, "reader", 9, true).await;
+        subscribe(&tx, "reader", "cfg/#");
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        while let Some(p) = recv_packet(&mut fresh).await {
+            seen.push(payload_of(&p).to_vec());
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![b"retained-a".to_vec(), b"retained-b".to_vec()],
+            "a subscriber must see the restored values as RETAINED state"
+        );
     }
 
     /// A retained publish for a topic whose group a PEER owns routes the mutation to
@@ -14412,7 +14770,7 @@ mod tests {
             None,
         );
         let store = FailingRetainedStore::new();
-        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_retained_store(Arc::new(store.clone()));
         hub.attach_durable_retained(durable.clone());
         tokio::spawn(hub.run());
 
@@ -14485,7 +14843,7 @@ mod tests {
             Arc::new(MemorySessionStore::new()),
             None,
         );
-        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_retained_store(Arc::new(store.clone()));
         hub.attach_durable_retained(durable);
         tokio::spawn(hub.run());
         (tx, store)
@@ -14574,7 +14932,7 @@ mod tests {
             None,
         );
         let peer_store = FailingRetainedStore::new();
-        hub.attach_retained_store(Box::new(peer_store.clone()));
+        hub.attach_retained_store(Arc::new(peer_store.clone()));
         hub.attach_durable_retained(durable);
         tokio::spawn(hub.run());
         peer_tx
@@ -14654,7 +15012,7 @@ mod tests {
             None,
         );
         let store = FailingRetainedStore::new();
-        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_retained_store(Arc::new(store.clone()));
         hub.attach_durable_retained(durable);
         tokio::spawn(hub.run());
 
@@ -14743,7 +15101,7 @@ mod tests {
             None,
         );
         let peer_store = FailingRetainedStore::new();
-        hub.attach_retained_store(Box::new(peer_store.clone()));
+        hub.attach_retained_store(Arc::new(peer_store.clone()));
         hub.attach_durable_retained(peer_durable);
         tokio::spawn(hub.run());
         peer_tx
@@ -15324,7 +15682,7 @@ mod tests {
             Arc::new(MemorySessionStore::new()),
             None,
         );
-        hub.attach_retained_store(Box::new(store.clone()));
+        hub.attach_retained_store(Arc::new(store.clone()));
         tokio::spawn(hub.run());
 
         // A committed retained update arrives while the store is refusing writes.

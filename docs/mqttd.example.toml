@@ -290,3 +290,50 @@ ready_min_members = 1
 # is set, typos are ignored too: prefer setting it only for the skew window, and keep the
 # check-config gate strict.
 # config_unknown_keys = "refuse"
+
+[backup]
+# ONLINE backup + restore (ADR 0062, issue #249). Taken from the LIVE node: nothing stops,
+# no client is disconnected, no second store handle is opened. What it guarantees is a
+# WINDOW, not an instant — every fact committed before the export started is present, facts
+# committed during it may be, facts after it are not (both instants are in every file).
+#
+# A per-node export is NOT a cluster snapshot: a cluster backup is the set of every node's
+# export, and a restore from an incomplete set is refused, naming what is missing.
+#
+# Where exports go. MUST be a volume SEPARATE from node.data_dir — --check-config refuses a
+# path inside it, because exports there grow the volume the disk watermark protects while
+# being counted by nothing. --check-config validates the SETTING, not the volume: a missing
+# or unwritable directory passes it and fails at the first run (the path and the OS error
+# land in the log, /statusz's backup.last_error and backup_runs_total{outcome="error"}), so
+# take one backup by hand after configuring it. NEITHER the Helm chart NOR the systemd unit
+# mounts such a volume by default — docs/OPERATIONS.md has the opt-in for each. The file is
+# data-plane content (every retained payload, every queued message): it is created 0600, and
+# encrypting it at rest is yours.
+# dir = "/var/backups/mqttd"
+# Seconds between scheduled exports. 0 (the default) = on demand only, via `mqttd --backup`
+# (SIGUSR2 to the running broker). This is the RPO's cadence: alert on the age of
+# mqttd_backup_last_success_timestamp_seconds — with its `> 0` guard clause, since an
+# unconfigured backup exports a literal 0.
+every_secs = 0
+# Exports kept PER NODE ID before the oldest is deleted, so a shared directory cannot have
+# one node's rotation delete another's backups. Several generations in one restore directory
+# are fine: a restore reads the NEWEST export of each node and logs the rest as superseded.
+keep = 7
+# A backup FILE or DIRECTORY to import at startup, before any client listener binds.
+# ⚠️ Only into a FRESH node: no store files in the data dir, or the node refuses. It never
+# merges into a serving cluster, and an interrupted restore is not resumable. Put EVERY
+# node's export in one directory — ONE cluster's, since a set naming two cluster_ids is
+# refused — and set runtime.ready_min_members to your node count, so each node imports
+# against the assembled ring.
+# LEAVE IT SET afterwards: a completed restore writes a `restored-from` stamp, and a later
+# start reads it, reports the setting INERT and boots normally on the data it already holds.
+# restore_from = "/restore"
+# Seconds a restore waits for the durable plane to become ready before giving up.
+restore_timeout_secs = 300
+# ⚠️ FORFEITS DATA. Lets a restore proceed from a set that does NOT cover the cluster,
+# instead of refusing — for the one disaster where a node's data AND its export are both
+# permanently gone, which would otherwise make the SURVIVING nodes' backups unrestorable
+# too. Every missing node and forfeited session is named at startup, in /statusz's
+# restore.detail, and permanently in the `restored-from` stamp. Only 1/true/on/yes turns it
+# on (a data-forfeiting switch is not armed by a stray value). Read docs/OPERATIONS.md first.
+restore_partial_accept_data_loss = false

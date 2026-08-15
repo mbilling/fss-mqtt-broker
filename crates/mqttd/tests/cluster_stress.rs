@@ -342,7 +342,7 @@ async fn start_stress_node_in_zone(
     // data dir (main.rs): after a full-cluster stop/start every in-memory
     // cache is gone, and this reopened copy is what serves retained state
     // until fan-out/back-fill warm it again (ADR 0018 phase 4).
-    hub.attach_retained_store(Box::new(
+    hub.attach_retained_store(std::sync::Arc::new(
         mqtt_storage::persistent_retained::PersistentRetainedStore::open(
             data_dir.join("retained.redb"),
         )

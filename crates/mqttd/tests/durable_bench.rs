@@ -370,6 +370,7 @@ async fn build_bench_topology(seed: u64, root: &std::path::Path, n: usize) -> Ve
             relay,
             _relay_abort: relay_abort,
             file_size_limit_blocks: None,
+            extra_env: Vec::new(),
             binary: PathBuf::from(env!("CARGO_BIN_EXE_mqttd")),
         });
     }
