@@ -776,33 +776,39 @@ impl Proc {
                 return;
             };
             match conn.recv_bounded(Duration::from_millis(700)).await {
-                common::Recv::Packet(Packet::Publish(p)) => match p.pkid {
-                    Some(pkid) => {
-                        if let Some(c) = self.subs[i].conn.as_mut() {
-                            c.puback(pkid).await;
-                            if self.subs[i].received.insert(p.payload.to_vec()) {
-                                let ev = history_check::Event::Deliver {
-                                    at_ms: self.at_ms(),
-                                    client: self.subs[i].id.clone(),
-                                    topic: p.topic.clone(),
-                                    payload: String::from_utf8_lossy(&p.payload).into_owned(),
-                                };
-                                self.record(ev);
+                common::Recv::Packet(Packet::Publish(p)) => {
+                    // A QoS 1 delivery counts only once its PUBACK is written (see
+                    // above), so ack FIRST and record after. If the connection went
+                    // away between the receive and here, nothing was acknowledged
+                    // and nothing is recorded.
+                    let acked = match p.pkid {
+                        Some(pkid) => match self.subs[i].conn.as_mut() {
+                            Some(c) => {
+                                c.puback(pkid).await;
+                                true
                             }
-                        }
+                            None => false,
+                        },
+                        None => true,
+                    };
+                    if acked {
+                        // EVERY delivery is recorded, repeats included. The set is
+                        // still populated because three other call sites read it,
+                        // but it no longer GATES the recording: a history that
+                        // silently drops duplicates cannot support any counting
+                        // promise, which is what `check_redelivery_marked` needs.
+                        self.subs[i].received.insert(p.payload.to_vec());
+                        let ev = history_check::Event::Deliver {
+                            at_ms: self.at_ms(),
+                            client: self.subs[i].id.clone(),
+                            topic: p.topic.clone(),
+                            payload: String::from_utf8_lossy(&p.payload).into_owned(),
+                            dup: p.dup,
+                            qos: p.qos as u8,
+                        };
+                        self.record(ev);
                     }
-                    None => {
-                        if self.subs[i].received.insert(p.payload.to_vec()) {
-                            let ev = history_check::Event::Deliver {
-                                at_ms: self.at_ms(),
-                                client: self.subs[i].id.clone(),
-                                topic: p.topic.clone(),
-                                payload: String::from_utf8_lossy(&p.payload).into_owned(),
-                            };
-                            self.record(ev);
-                        }
-                    }
-                },
+                }
                 common::Recv::Packet(_) => {}
                 common::Recv::Closed => {
                     self.subs[i].conn = None;

@@ -47,6 +47,16 @@ EXEMPT: dict[int, str] = {
         "provocations only. TODO: drive a drain from the in-process harness so "
         "the code is observed on a real socket, then delete this entry."
     ),
+    0x9C: (
+        "USE_ANOTHER_SERVER — sent to a v5 session this node no longer owns after "
+        "a placement roll, so the client reconnects and lands on the owner "
+        "(hub.rs::rehome_misplaced_sessions, #284). Covered by eight hub unit "
+        "tests via `await_rehome_disconnect`, which asserts this exact code — but "
+        "they drive an mpsc channel, and this gate counts integration provocations "
+        "only. Provoking it on a socket needs placement to MOVE under a live "
+        "connection, so it belongs to the out-of-process cluster harness. TODO: "
+        "provoke it there, then delete this entry."
+    ),
     0x88: (
         "SERVER_UNAVAILABLE — emitted when durable-session recovery passes its "
         "deadline during a lease handoff (conn.rs, via hub::recover_until_ready). "
