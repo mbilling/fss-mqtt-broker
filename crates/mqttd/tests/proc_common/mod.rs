@@ -102,6 +102,12 @@ pub async fn pump(
         }
         let current = *mode.borrow(); // copy out: the Ref must not span the await
         if let LinkMode::Slow(ms) = current {
+            // SETTLE(relay-slow-link-fault): the delay IS the fault. `LinkMode::Slow` models a
+            // degraded network hop, so the relay must genuinely hold each segment for the
+            // configured time — there is nothing to observe, because the observation would be
+            // the very latency being injected. The duration comes from the caller's schedule,
+            // and a slow machine only makes the injected hop slower, which is still a valid
+            // instance of the fault.
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
         if to.write_all(&buf[..n]).await.is_err() {
@@ -1009,6 +1015,12 @@ impl Proc {
             acked
         });
 
+        // SETTLE(nemesis-kill-offset): `delay_ms` is drawn from the run's seed and IS the
+        // nemesis schedule — killing the victim at a reproducible offset INTO a publish stream
+        // is the whole point, so there is no condition to poll for (polling would pin the kill
+        // to a state boundary and destroy the interleaving the seed exists to explore). The
+        // seed is printed with every run, so any schedule that finds a bug is replayable; a
+        // slow machine explores a different, equally valid interleaving.
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         self.nodes[victim].kill().await;
         self.alive[victim] = false;
@@ -1101,7 +1113,10 @@ impl Proc {
         let ready = self.wait_node_serving(dead, Duration::from_secs(60)).await;
         if !ready {
             self.nodes[dead].kill().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // No grace for file handles: `kill()` awaits `child.wait()`, so the process has
+            // been reaped and the kernel has closed its descriptors before this returns. And
+            // the respawned broker's store opens retry lock contention for ~3 s anyway
+            // (`mqtt_storage::open::create_with_lock_retry`).
             self.nodes[dead].spawn();
             assert!(
                 self.wait_node_serving(dead, Duration::from_secs(60)).await,

@@ -162,6 +162,13 @@ async fn pinging_client_stays_connected_past_keepalive() {
     for _ in 0..7 {
         client.send(&Packet::PingReq).await;
         assert_eq!(client.recv().await, Packet::PingResp);
+        // SETTLE(keepalive-ping-cadence): the wait IS the subject. [MQTT-3.1.2-24] fires only
+        // when the server receives nothing for 1.5x the keepalive, so what is being tested is
+        // that traffic spaced 500 ms apart inside a 1.5 s grace keeps the connection up. There
+        // is nothing to poll for: the state is the ABSENCE of a disconnect over real time. A
+        // slow machine lengthens the gaps, which pushes toward the grace window and makes the
+        // test more likely to catch a too-eager reaper, never less; and the loop then asserts
+        // `start.elapsed() >= 3s`, so a fast machine cannot shorten the coverage either.
         sleep(Duration::from_millis(500)).await;
     }
     assert!(
@@ -181,8 +188,13 @@ async fn zero_keepalive_is_never_idle_disconnected() {
     let addr = start_broker().await;
     let mut client = Client::connect_with(addr, "ka-zero", 0, None).await;
 
-    // Idle well past what a small keepalive's 1.5x grace would allow, then
-    // prove the connection is still alive with a ping round-trip.
+    // SETTLE(keepalive-zero-idle-window): this proves a NEGATIVE — that the server never
+    // disconnects a `keep_alive=0` client for idleness — and a negative over time needs a
+    // window. The number is anchored, not arbitrary: the smallest keepalive a client can ask
+    // for is 1 s, whose grace is 1.5x = 1.5 s, so 2500 ms is past any deadline the mechanism
+    // could impose if it were wrongly armed. "The server decided not to disconnect" has no
+    // observable; only the passage of an idle window followed by a live round-trip shows it. A
+    // slow machine makes the idle period longer in broker time, which strengthens the test.
     sleep(Duration::from_millis(2500)).await;
     client.send(&Packet::PingReq).await;
     assert_eq!(client.recv().await, Packet::PingResp);
@@ -242,7 +254,10 @@ async fn graceful_disconnect_discards_will() {
     // (erroneous) will publication would have happened before we check.
     client_a.expect_closed_within(Duration::from_secs(2)).await;
     drop(client_a);
-    sleep(Duration::from_millis(500)).await;
+    // No settling wait: `expect_closed_within` already awaited the teardown, and the PINGREQ /
+    // PINGRESP round-trip below is itself the flush — a wrongly published will would be ahead
+    // of the PINGRESP in the subscriber's ordered stream. The 500 ms that used to sit here
+    // added nothing that ordering does not already guarantee.
 
     // A ping round-trip flushes the subscriber's ordered stream: if a will had
     // been (wrongly) published, it would arrive before the PINGRESP.

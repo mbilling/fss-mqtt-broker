@@ -123,40 +123,107 @@ async fn an_over_rate_publisher_is_throttled_without_loss_or_disconnect() {
     sub.subscribe(1, "r/#", QoS::AtMostOnce).await;
 
     // A publisher pumps 12 `QoS` 1 messages as fast as acks allow (rate cap: 5/s).
+    // "Mid-throttle" is a STATE, so the pump reports reaching it rather than the test guessing
+    // at a duration — but WHICH ack proves the state is the whole question.
+    //
+    // `PublishRateLimiter::new(rate)` (crates/mqttd/src/conn.rs) starts with a FULL bucket of
+    // `rate` tokens, so the first five publishes are served out of the burst with no pause at
+    // all and the first read-pause happens on the SIXTH. An earlier version signalled on the
+    // third ack and called that "the read-pause is engaged": measured, acks 1-5 land inside a
+    // millisecond and ack 6 at ~203 ms, so the second client was being served entirely inside
+    // the burst — `free_at < 12` was satisfied by an unthrottled broker, which is the one
+    // configuration in which it says nothing. The sixth ack is the earliest observable that
+    // *cannot* exist unless a read-pause has already happened, so that is the signal, and the
+    // elapsed time it reports is asserted below rather than assumed.
+    let burst: u16 = 5; // = the configured rate; see PublishRateLimiter::new
+    let (mid_tx, mid_rx) = tokio::sync::oneshot::channel::<Duration>();
     let pump = tokio::spawn(async move {
         let mut a = Client::connect(addr, "rate-a").await;
         let started = Instant::now();
+        let mut mid = Some(mid_tx);
         for i in 1..=12u16 {
             a.publish("r/a", b"tick", QoS::AtLeastOnce, Some(i), vec![])
                 .await;
             assert_eq!(a.recv().await, Packet::PubAck(i.into()), "no drops");
+            if i == burst + 1 {
+                if let Some(tx) = mid.take() {
+                    let _ = tx.send(started.elapsed());
+                }
+            }
         }
         (a, started.elapsed())
     });
 
     // Mid-throttle, a second client is unimpeded.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mid_at = mid_rx
+        .await
+        .expect("the throttled publisher never got past its burst, so the throttle never engaged");
+    // Non-vacuity: the ack that released this test must itself have waited on the throttle. A
+    // slow machine can only make this longer, never shorter, so the bound is one-sided.
+    assert!(
+        mid_at >= Duration::from_millis(150),
+        "ack {} arrived after only {mid_at:?}: the read-pause had not engaged, so what follows \
+         would be measuring an unthrottled broker",
+        burst + 1
+    );
+    // The second client publishes FIVE `QoS` 1 messages and waits for each PUBACK. One
+    // message would only show whether it was served at all; five round trips through the
+    // broker's inbound path — the path the read-pause lives on — measure whether connection
+    // A's pause costs connection B anything.
+    let free = 5usize;
     let mut b = Client::connect(addr, "rate-b").await;
-    b.publish("r/b", b"free", QoS::AtMostOnce, None, vec![])
-        .await;
+    let b_started = Instant::now();
+    for i in 1..=free {
+        let pkid = u16::try_from(i).unwrap();
+        b.publish("r/b", b"free", QoS::AtLeastOnce, Some(pkid), vec![])
+            .await;
+        assert_eq!(
+            b.recv().await,
+            Packet::PubAck(pkid.into()),
+            "the unthrottled client's publish was not acknowledged"
+        );
+    }
+    let free_latency = b_started.elapsed();
 
-    // The subscriber sees ALL 13 messages: 12 throttled ticks plus the free one
-    // (which must arrive interleaved, not after the whole throttled stream).
+    // The subscriber sees ALL 17: 12 throttled ticks plus the 5 free ones, the first of which
+    // must arrive interleaved rather than after the whole throttled stream.
     let mut ticks = 0;
+    let mut frees = 0;
     let mut free_at = None;
-    for n in 0..13 {
+    for n in 0..(12 + free) {
         let p = sub.expect_publish().await;
         match p.topic.as_str() {
             "r/a" => ticks += 1,
-            "r/b" => free_at = Some(n),
+            "r/b" => {
+                frees += 1;
+                free_at = free_at.or(Some(n));
+            }
             other => panic!("unexpected topic {other}"),
         }
     }
     assert_eq!(ticks, 12, "the throttle must not drop messages");
+    assert_eq!(frees, free, "every free publish reached the subscriber");
     let free_at = free_at.expect("the unthrottled client's message arrived");
     assert!(
         free_at < 12,
-        "the second client must not wait for the throttled stream to finish"
+        "the second client must not wait for the throttled stream to finish; its first message \
+         was delivered at position {free_at} of {}, i.e. after every throttled tick — a \
+         read-pause on connection A blocked a different connection",
+        12 + free
+    );
+
+    // Two independent readings of the same property, because position alone is coarse. Five
+    // round trips on an unthrottled connection, taken while another connection is mid-pause,
+    // cost about 0.1 ms when the pause is backpressure on its own connection. If the pause
+    // gated anything shared, each round trip would wait out part of A's 200 ms quantum
+    // instead: measured at ~600 ms with the limiter put behind a broker-wide gate, so this
+    // bound sits three orders of magnitude above the healthy figure and six times below the
+    // regression.
+    assert!(
+        free_latency < Duration::from_millis(100),
+        "{free} round trips on an unthrottled connection took {free_latency:?} while another \
+         connection was throttled: a read-pause must be backpressure on ITS OWN connection, \
+         not something a second client waits behind"
     );
 
     let (mut a, elapsed) = pump.await.unwrap();

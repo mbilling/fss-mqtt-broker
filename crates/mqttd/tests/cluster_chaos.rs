@@ -109,9 +109,26 @@ async fn partition_severs_delivery_and_heal_reconverges() {
     // Route is up: a publish on B reaches the subscriber on A.
     let _ = route(&mut pubr, &mut sub, "t", b"before", QoS::AtMostOnce).await;
 
-    // Partition: sever the link and let the teardown propagate.
+    // Partition: sever the link, then wait for the teardown to be OBSERVABLE rather than for a
+    // duration. The route was just proven warm — the `before` publish crossed — so "a probe
+    // publish no longer arrives inside `try_recv`'s window" is real evidence that A has dropped
+    // B's routing, and this exits the moment it becomes true. Two consecutive quiet windows are
+    // required, which also consumes any straggler that would otherwise be sitting in the socket
+    // for the silence assertion below to trip over.
     live.sever();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        pubr.publish("t", b"probe", QoS::AtMostOnce, None, vec![])
+            .await;
+        if sub.try_recv().await.is_none() && sub.try_recv().await.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the severed peer link kept delivering, so no partition was ever in effect and the \
+             silence assertion below would have proved nothing"
+        );
+    }
 
     // During the partition, publishes on B do not reach A.
     for _ in 0..5 {

@@ -12,6 +12,8 @@
 //! is what it compares against, and a test that quietly passed without running it would be
 //! claiming agreement it never checked.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -95,13 +97,18 @@ fn the_rust_converter_agrees_with_the_python_one() {
     let root = repo_root();
     let script = root.join("scripts/migrate/from-mosquitto.py");
     let Some(python) = python3() else {
-        // Loud, not silent: this test's whole value is the comparison.
-        eprintln!("SKIP: python3 is not on PATH, so the differential comparison did NOT run");
-        return;
+        crate::skip_locally_or_fail_in_ci!(
+            "python3 is not on PATH, so the Rust-vs-Python converter comparison did NOT run \
+             — install python3 (every CI runner has it, and ci.yml's mqttui job relies on \
+             that, so this is fatal there)"
+        );
     };
     if !script.is_file() {
-        eprintln!("SKIP: {} is absent; not in a checkout", script.display());
-        return;
+        crate::skip_locally_or_fail_in_ci!(
+            "{} is absent, so there is no Python converter to compare against — this is not a \
+             checkout of the repository (in CI the checkout always contains it)",
+            script.display()
+        );
     }
 
     let dir = std::env::temp_dir().join(format!("mqttui-diff-{}", std::process::id()));

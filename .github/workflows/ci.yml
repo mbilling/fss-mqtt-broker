@@ -47,6 +47,20 @@ jobs:
               | sed 's/^/::error title=Panic::/' || true
           fi
           exit "$code"
+      # Issue #260: `cargo test` cannot report a test that is NOT THERE. A `#[cfg]` that
+      # excluded it, a file that compiled to zero tests, a deletion inside a large diff — each
+      # leaves a green run over a smaller suite, and no rule over source text sees that
+      # reliably. This compares the tests the binaries actually contain against a checked-in
+      # inventory (regenerate with `check-test-hygiene.py --write-inventory`).
+      - name: The test binaries contain the tests the inventory says they do
+        run: python3 scripts/check-test-hygiene.py --check-inventory --only root
+      # And the tests that actually RAN AND PASSED are those same ones. `#[ignore]` removes a
+      # test from every run while the binary still lists it, and one `std::process::exit(0)`
+      # inside a test discards EVERY result in its binary — `running 6 tests` and then no
+      # summary at all, with `cargo test` exiting 0. Both are invisible above and obvious in the
+      # log the step above already tee'd, so this reads that log rather than re-running anything.
+      - name: The tests that ran and passed are the ones the inventory accounts for
+        run: python3 scripts/check-test-hygiene.py --check-results test-output.txt --only root
 
   docs:
     name: delivery dashboard
@@ -65,6 +79,11 @@ jobs:
       # this ran; the script explains any exemption it is carrying.
       - name: Every emittable reason code has a test that provokes it
         run: python3 scripts/check-reason-codes.py
+      # Issue #260: a test that returns early instead of asserting, and a wall-clock sleep that
+      # is not a bounded poll, are the two ways this suite silently stops testing — and neither
+      # shows up in a `cargo test` result. Both are build failures now.
+      - name: Test hygiene (no naked sleeps, no silent self-skips)
+        run: python3 scripts/check-test-hygiene.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)
@@ -181,6 +200,12 @@ jobs:
       # T10: two converters that disagree are worse than one).
       - name: Test (manifest completeness guard + the converter differential)
         run: cargo test --manifest-path tools/mqttui/Cargo.toml
+      # The other half of the test inventory (issue #260): mqttui is a separate workspace, so
+      # its test binaries are listed in the job that builds them.
+      - name: The test binaries contain the tests the inventory says they do
+        run: python3 scripts/check-test-hygiene.py --check-inventory --only mqttui
+      - name: The tests that ran and passed are the ones the inventory accounts for
+        run: python3 scripts/check-test-hygiene.py --check-results --only mqttui
       - name: The manifest covers every script
         run: cargo run --quiet --manifest-path tools/mqttui/Cargo.toml -- --check
       # tools/mqttui/bundle/ is a GENERATED copy of demo/, deploy/, scripts/migrate/ and

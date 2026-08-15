@@ -77,6 +77,8 @@ if [[ -e "$PW_FILE" ]]; then
   echo "  printf %s '<password>' | mqttd --hash-password <username> >> $PW_FILE"
   echo "  docker compose up -d init                          # restage the file for the brokers"
   echo "  docker compose kill -s HUP mqttd-1 mqttd-2 mqttd-3 # reload it in place"
+  # NOT-A-SKIP: refusing to overwrite an existing password file is this script's job, and it
+  # says so above. Nothing was checked and nothing was meant to be: bootstrap is idempotent.
   exit 0
 fi
 

@@ -96,6 +96,51 @@ sustained mixed load watching RSS, file descriptors, and tail latency against de
 drift watermarks (the ADR 0041 caps and ADR 0020 gauges make "no drift" checkable). A
 nightly failure is triaged with the same exhibit-ledger discipline as ADR 0042.
 
+> **As delivered (issue #260, 0044-P11).** The tiers were the right shape and had a hole
+> underneath them: *a green tier and a tier that did not run look identical*. Two mechanisms
+> produced that, and neither showed up in a `cargo test` result — a test returning early
+> because the environment was missing something (a live one: `mqttui`'s only
+> signature-refusal test self-skipped on **every** CI run, because no job installs `cosign`),
+> and a wall-clock `sleep` standing in for a condition. Both are now build failures via
+> `scripts/check-test-hygiene.py`, a third repo gate beside `gen-status.py` and
+> `check-readme-facts.py` in the `docs` job. A skip is allowed locally and asserts under
+> `CI=true`; every wait in test code must be a bounded poll, a `start_paused` virtual-clock
+> advance, or a settling delay whose reason is written at the site and listed in
+> `docs/test-settling-delays.md`. The taxonomy and the bar a settling delay must clear live in
+> [TEST-PLAN § Conventions](../TEST-PLAN.md#conventions).
+>
+> **As delivered (2026-08-15, second pass).** The gate was then attacked, and eleven working
+> bypasses were found and closed — including one that made its own CI-fatality check vacuous
+> (it searched raw text, so a comment quoting the deleted assertion satisfied it). Two lessons
+> are now structural rather than remembered: every check reads a comment- and string-stripped
+> view of the source, and text rules are no longer the only mechanism. `cargo test -- --list`
+> enumerates the tests each binary actually contains, compared in CI against a generated
+> [test inventory](../test-inventory.md) — which catches a test `cfg`-gated out of existence, a
+> file that compiled to zero tests, and a silent deletion, none of which a rule over source
+> text can see reliably.
+>
+> **As delivered (2026-08-15, third pass).** Attacked again; eight more bypasses closed, and two
+> of them turned out to be one missing mechanism rather than two missed patterns. `#[ignore]`
+> takes a test out of every run while the binary still *lists* it, and a single
+> `std::process::exit(0)` inside one test discards **every** result in its binary — `running 6
+> tests`, then no per-test lines and no summary, with `cargo test` exiting 0. Neither is visible
+> to any rule over source text, and both are plain in the run's own output, so the run's own
+> output is now checked (`--check-results`): per binary, a complete summary, no failures, nothing
+> filtered out, the passed count the inventory accounts for on this host, and an ignored set that
+> matches an allowlist whose declared tier is *verified* against `.github/workflows/`. It reads
+> the log the test job already tees, so it costs the job nothing. The first thing it surfaced is
+> a real gap rather than a hypothetical one: five `durable_bench` benchmarks are `#[ignore]`d and
+> run by **no** tier — per-PR, nightly or release — which is coverage that exists only on paper,
+> now declared and printed rather than invisible.
+>
+> What the gate detects and what it cannot is a two-part table in
+> [TEST-PLAN § What this gate detects, and what it cannot](../TEST-PLAN.md#what-this-gate-detects-and-what-it-cannot):
+> every "detected" row was proven by reintroducing the bypass and watching the gate name it, and
+> every "not detected" row by running that shape green. A limit that is not written down gets
+> trusted past, and a claim that outruns its check is worse than the gap it hides — which is why
+> the gate's success line now enumerates what it verified instead of asserting that no self-skip
+> can pass.
+
 ### 5. Security assurance runs continuously
 
 Every parser that consumes attacker-reachable bytes gets a fuzz target with an in-repo
@@ -160,6 +205,15 @@ judgement call. All hold as of ADR acceptance (2026-07-17):
       per-PR throughput floor, nightly comparison (P6).
 - [x] **Two independent foreign-client oracles green** (Mosquitto CLI + Paho
       Python), and the **README quickstart executes verbatim** (P7).
+- [x] **No test can report success without running** (P11, issue #260): an environmental
+      self-skip is fatal under `CI`, a `#![cfg]`-gated suite that compiled to nothing is
+      fatal under `CI`, every wall-clock wait in test code is a bounded poll, a
+      virtual-clock advance, or a documented settling delay, and the tests that actually
+      **ran and passed** are compared against a checked-in inventory — including the ones
+      `#[ignore]` would have retired in silence. Checked by `scripts/check-test-hygiene.py`
+      in the `docs` job (text rules), and by `--check-inventory` / `--check-results` in the
+      jobs that build and run. Its known limits are tabled in TEST-PLAN; the open one worth
+      naming here is five ignored `durable_bench` benchmarks that no tier runs.
 - [ ] **Adjacent-release skew smoke in CI** (0039-T3): the machinery exists (P3);
       the test itself needs two released versions — impossible before 1.0 by
       definition. This is the one gate that opens *at* 1.0, not before.

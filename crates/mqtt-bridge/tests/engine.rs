@@ -60,6 +60,108 @@ async fn subscribe(c: &mut MqttClient, filter: &str) {
     }
 }
 
+/// How long a bounded poll in this file will wait before failing. Generous, because the
+/// number is not the test's subject: a slow machine must not fail, and a broken bridge must
+/// not pass. That is the whole trade a bounded poll makes over a fixed sleep — it costs
+/// nothing when the state arrives in 20 ms and it still fails, by name, when it never does.
+const POLL_LIMIT: Duration = Duration::from_secs(20);
+
+/// Poll the bridge's OWN metric surface until `pred` accepts the render.
+///
+/// `fss_bridge_connected`, `fss_bridge_spool_depth` and `fss_bridge_spool_capacity` make
+/// "the local side is up" and "five messages are spooled" observable facts, so this file
+/// no longer has to guess at a duration for them. On failure the render at the deadline is
+/// printed: the point of a bounded poll over a sleep is that the failure says what never
+/// happened, and the gauges are exactly that answer.
+async fn await_metrics(bridge: &Bridge, what: &str, pred: impl Fn(&str) -> bool) {
+    let deadline = tokio::time::Instant::now() + POLL_LIMIT;
+    loop {
+        let render = bridge.metrics().render();
+        if pred(&render) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} (waited {POLL_LIMIT:?}). The bridge's own metrics at the deadline:\n{render}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until `side` reports `fss_bridge_connected 1`.
+async fn await_connected(bridge: &Bridge, side: &str) {
+    let needle = format!("fss_bridge_connected{{side=\"{side}\"}} 1");
+    await_metrics(
+        bridge,
+        &format!("bridge side `{side}` never reported connected"),
+        |r| r.contains(&needle),
+    )
+    .await;
+}
+
+fn spool_depth(render: &str, side: &str) -> Option<u64> {
+    let prefix = format!("fss_bridge_spool_depth{{side=\"{side}\"}} ");
+    render
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str())?.trim().parse().ok())
+}
+
+/// Wait until `side`'s spool holds at least `n` messages.
+async fn await_spool_depth(bridge: &Bridge, side: &str, n: u64) {
+    await_metrics(
+        bridge,
+        &format!("side `{side}`'s spool never reached {n} message(s)"),
+        |r| spool_depth(r, side).is_some_and(|d| d >= n),
+    )
+    .await;
+}
+
+/// Read everything already queued for `c` and throw it away, so a later collection window
+/// sees only what was published after this returns. Bounded by `POLL_LIMIT` overall and by
+/// a quiet window per read — "the stream has gone quiet" is the observable, and it is one
+/// the receiving client can answer directly.
+async fn drain(c: &mut MqttClient) {
+    let deadline = tokio::time::Instant::now() + POLL_LIMIT;
+    while (tokio::time::timeout(Duration::from_millis(200), c.next_event()).await).is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the subscriber never went quiet, so no collection window can be trusted"
+        );
+    }
+}
+
+/// Wait until `topic` is in the broker's retained store at `addr`.
+///
+/// "Stored" is observable rather than a duration to guess at: a SUBSCRIBE gets the value back
+/// as a retained replay with `retain=1`, and each fresh SUBSCRIBE triggers a fresh replay — so
+/// re-subscribing in a loop polls the store itself.
+async fn await_retained(addr: SocketAddr, filter: &str, topic: &str) {
+    let mut probe = client(addr, "retained-probe").await;
+    let deadline = tokio::time::Instant::now() + POLL_LIMIT;
+    loop {
+        probe.subscribe(1, filter, QoS::AtMostOnce).await.unwrap();
+        let mut replayed = false;
+        while let Ok(Ok(ev)) =
+            tokio::time::timeout(Duration::from_millis(150), probe.next_event()).await
+        {
+            if let Event::Publish(p) = ev {
+                if p.retain && p.topic == topic {
+                    replayed = true;
+                    break;
+                }
+            }
+        }
+        if replayed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the broker never replayed {topic} as retained, so there was nothing in its store"
+        );
+    }
+    probe.disconnect().await;
+}
+
 fn hop_count(p: &mqtt_codec::packet::Publish) -> Option<String> {
     p.properties.0.iter().find_map(|prop| match prop {
         Property::UserProperty(k, v) if k == "fss-bridge-hop-count" => Some(v.clone()),
@@ -224,8 +326,7 @@ async fn a_retained_message_crosses_the_boundary_and_lands_retained() {
         .await
         .unwrap();
 
-    // Let the local broker store the retained value before the bridge subscribes.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    await_retained(local, "sensors/#", "sensors/room/temp").await;
 
     // A live upstream subscriber, connected before the bridge, to confirm the value crosses
     // at all (separate from whether it lands retained).
@@ -430,11 +531,43 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
     let mut up_sub = client(upstream, "ha-up-sub").await;
     subscribe(&mut up_sub, "telemetry/#").await;
 
-    // Let both instances connect and register their shared subscription.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // BOTH instances must be forwarding before the batch, and the 1.5 s sleep this replaces
+    // only hoped for that. It mattered: if just one instance's shared subscription had come
+    // up, "no duplicate forward" would hold vacuously — a single forwarder cannot duplicate,
+    // so the test would pass while proving nothing. Publish warm-up messages until each
+    // instance's OWN forward counter is non-zero. Round-robin over the `$share` group means
+    // two accepted messages suffice, and the observable is per-instance, so this is strictly
+    // stronger than any duration.
+    let mut local_pub = client(local, "ha-local-pub").await;
+    let deadline = tokio::time::Instant::now() + POLL_LIMIT;
+    let mut warm = 0u32;
+    while b1.metrics().forwarded_out_count() == 0 || b2.metrics().forwarded_out_count() == 0 {
+        local_pub
+            .publish(
+                "telemetry/warmup",
+                Bytes::from(format!("w{warm}")),
+                QoS::AtMostOnce,
+                false,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        warm += 1;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "after {warm} warm-up publishes only one instance had ever forwarded \
+             (a={}, b={}): the HA pair never both joined the shared subscription, and a \
+             duplicate-forward test with a single forwarder cannot fail",
+            b1.metrics().forwarded_out_count(),
+            b2.metrics().forwarded_out_count()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The warm-up traffic must not land in the collection window below.
+    drain(&mut up_sub).await;
 
     // Publish a batch of uniquely-payloaded messages on the local side.
-    let mut local_pub = client(local, "ha-local-pub").await;
     for n in 0..20u32 {
         local_pub
             .publish(
@@ -447,7 +580,6 @@ async fn two_bridge_instances_do_not_duplicate_forwarding() {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Collect for a window; every payload must appear at most once (no duplicate forward).
@@ -509,11 +641,41 @@ async fn two_partitioned_instances_deliver_each_inbound_message_exactly_once() {
     let mut local_sub = client(local, "part-local-sub").await;
     subscribe(&mut local_sub, "cmd/#").await;
 
-    // Let both instances connect and subscribe on the upstream.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // BOTH instances must be forwarding before the batch. If only one were live, every
+    // message would still arrive exactly once — via the surviving instance — and the test
+    // would pass while the partitioning it exists to check had never been exercised. So warm
+    // up over varying topics (ownership is by topic, so one topic only wakes one owner) until
+    // each instance's OWN inbound forward counter is non-zero.
+    let mut up_pub = client(upstream, "part-up-pub").await;
+    let deadline = tokio::time::Instant::now() + POLL_LIMIT;
+    let mut warm = 0u32;
+    while b1.metrics().forwarded_in_count() == 0 || b2.metrics().forwarded_in_count() == 0 {
+        up_pub
+            .publish(
+                &format!("cmd/warmup/{warm}"),
+                Bytes::from(format!("w{warm}")),
+                QoS::AtMostOnce,
+                false,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        warm += 1;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "after {warm} warm-up publishes across distinct topics only one instance had ever \
+             forwarded inbound (a={}, b={}): both partitions were never live, so an \
+             exactly-once result would say nothing about partitioning",
+            b1.metrics().forwarded_in_count(),
+            b2.metrics().forwarded_in_count()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The warm-up traffic must not land in the collection window below.
+    drain(&mut local_sub).await;
 
     // Publish on many DIFFERENT topics so ownership spreads across both instances.
-    let mut up_pub = client(upstream, "part-up-pub").await;
     for n in 0..30u32 {
         let topic = format!("cmd/{n}");
         up_pub
@@ -527,7 +689,6 @@ async fn two_partitioned_instances_deliver_each_inbound_message_exactly_once() {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Every payload must arrive EXACTLY once — not twice (double-deliver) nor zero (a gap).
@@ -545,11 +706,13 @@ async fn two_partitioned_instances_deliver_each_inbound_message_exactly_once() {
             String::from_utf8_lossy(payload)
         );
     }
+    // Count only the batch's payloads: a warm-up message that slipped past the drain would
+    // otherwise inflate this, while the exactly-once assertion above still holds for it
+    // (partitioning owes exactly-once for every topic, warm-ups included).
+    let batch = seen.keys().filter(|p| p.starts_with(b"c")).count();
     assert_eq!(
-        seen.len(),
-        30,
-        "every one of the 30 messages must arrive exactly once (got {} distinct)",
-        seen.len()
+        batch, 30,
+        "every one of the 30 messages must arrive exactly once (got {batch} distinct)"
     );
 
     b1.shutdown();
@@ -592,23 +755,56 @@ async fn a_full_spool_must_not_shed_a_message_the_bridge_already_accepted() {
     ))
     .unwrap();
     let bridge = Bridge::start(cfg);
-    tokio::time::sleep(Duration::from_secs(1)).await; // local connects; upstream stays down
+    // The local side must be up (and the upstream must still be down) before publishing.
+    await_connected(&bridge, "local").await;
 
-    // FIRST is accepted into the one-slot spool; SECOND arrives with the spool full.
+    // FIRST is accepted into the one-slot spool; SECOND arrives with the spool full. The
+    // ORDER is the whole subject, so "FIRST is in the spool" is asserted rather than waited
+    // out: the spool-depth gauge answers it directly, and a 200 ms sleep that lost the race
+    // would have silently tested the reverse case.
     let mut local_pub = client(local, "shed-pub").await;
-    for (n, payload) in [(1u16, &b"FIRST"[..]), (2, &b"SECOND"[..])] {
-        local_pub
-            .publish(
-                "t/x",
-                Bytes::copy_from_slice(payload),
-                QoS::AtLeastOnce,
-                false,
-                Some(n),
-                Properties::new(),
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    local_pub
+        .publish(
+            "t/x",
+            Bytes::from_static(b"FIRST"),
+            QoS::AtLeastOnce,
+            false,
+            Some(1),
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+    await_spool_depth(&bridge, "down", 1).await;
+    local_pub
+        .publish(
+            "t/x",
+            Bytes::from_static(b"SECOND"),
+            QoS::AtLeastOnce,
+            false,
+            Some(2),
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+    // SETTLE(bridge-spool-refusal): SECOND's *refusal* is deliberately not counted anywhere —
+    // spool.rs documents that an `Overflow::Refuse` rejection is not a loss and so must not
+    // land in `fss_bridge_dropped_total`. That decision is right for operators and it leaves
+    // this test with no positive observable for "SECOND has been offered to a full spool", so
+    // the depth gauge is sampled over a bounded window instead of polled to a target. The
+    // window is not load-bearing for correctness: every sample asserts, so a spool that sheds
+    // FIRST or accepts both fails here immediately. On a slow machine the risk is the milder
+    // one — the window can expire before SECOND is offered, which makes the check vacuous
+    // rather than wrong, and the replay assertion below still pins the ordering. Closing that
+    // last gap needs a `fss_bridge_spool_refused_total` counter; issue #260 records the ask.
+    for _ in 0..50 {
+        let depth = spool_depth(&bridge.metrics().render(), "down");
+        assert_eq!(
+            depth,
+            Some(1),
+            "the one-slot spool moved off its cap after SECOND arrived: it either shed the \
+             already-acked FIRST or accepted both"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // Bring the upstream up; the spool replays on reconnect.
@@ -672,8 +868,8 @@ async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
     .unwrap();
     let bridge = Bridge::start(cfg);
 
-    // Let the local side connect; the upstream keeps failing (down).
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The local side must be up before publishing (the upstream keeps failing — it is down).
+    await_connected(&bridge, "local").await;
 
     // Publish while the upstream is down → the router spools these for it.
     let mut local_pub = client(local, "spool-pub").await;
@@ -690,7 +886,10 @@ async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
             .await
             .unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // All five must be IN the spool before the upstream returns; otherwise a message that
+    // was still in flight would take the live path and the replay this test checks would
+    // never be exercised. The spool-depth gauge says so directly.
+    await_spool_depth(&bridge, "down", 5).await;
 
     // Bring the upstream up on the reserved address, and subscribe before the bridge's
     // backoff fires its reconnect (which replays the spool).
@@ -751,8 +950,9 @@ async fn a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit() {
     let bridge = Bridge::start(cfg);
     let metrics = bridge.metrics();
 
-    // Let both sides connect and subscribe (both directions of the `both` rule).
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // No pre-wait for the sides to connect: the republish loop below IS the readiness poll —
+    // it keeps publishing until the drop registers and fails with a name if it never does, so
+    // a fixed 1.5 s head start was pure duplication of a condition already being polled.
 
     // A message that has ALREADY traversed the hop limit must be dropped at the crossing —
     // the backstop for a multi-broker cycle (A→B→C→A) that No Local cannot catch. The trivial

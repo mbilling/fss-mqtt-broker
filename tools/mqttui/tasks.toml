@@ -716,6 +716,24 @@ duration = "~1s"
 hidden = true
 
 [[task]]
+id = "check-test-hygiene"
+group = "Internal"
+name = "Check test hygiene (no naked sleeps, no silent self-skips)"
+script = "scripts/check-test-hygiene.py"
+# Reads the repository's own test sources, scripts and workflows.
+needs_checkout = true
+about = """
+Issue #260. Two ways a test suite silently stops testing, made into build failures: a test
+that returns early instead of asserting (a skip that reports success), and a wall-clock
+sleep that is not a bounded poll on observable state. Every wait in test code must be a
+bounded poll, a virtual-clock advance under start_paused, or a documented settling delay
+listed in docs/test-settling-delays.md. `--audit` prints the full classification.
+"""
+requires = ["python3"]
+duration = "~1s"
+hidden = true
+
+[[task]]
 id = "vendor-examples"
 group = "Internal"
 name = "Refresh the vendored example bundle inside the mqttui package"

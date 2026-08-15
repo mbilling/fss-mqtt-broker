@@ -301,6 +301,263 @@ starts passing — so the list cannot decay into an ignore list.
 - Darksky tests assert the **specific** reason code / close, not just "an error".
 - Every test uses the shared harness; no new bespoke `start_broker` copies.
 - Tests must be deterministic — drive acks explicitly, use bounded `recv` timeouts,
-  never sleep-and-hope.
+  never sleep-and-hope. That rule was folklore until issue #260; it is now a build
+  failure. See **Waiting** and **Skipping** below.
 - A test that pins a *policy* says so, and says that a future change should make it
   fail rather than be relaxed.
+
+### Waiting: the four shapes, and the only one that is banned
+
+`scripts/check-test-hygiene.py` classifies every wall-clock wait it can see in test code — under
+`crates/*/tests/`, `tools/mqttui/tests/`, and inside any `#[cfg(test)]` module — and fails
+CI on the fourth shape. Production timers under `src/` are out of scope: a retry backoff in
+`main.rs` is not a test wait.
+
+"Every wait it can see" is deliberate wording. The gate knows the calls that *block on a clock*:
+`sleep`, `sleep_until`, `park_timeout`, `recv_timeout`, `recv_deadline`, `interval().tick()`,
+`timeout(d, pending())`, any rename of `sleep` (resolved repo-wide, so a `pub use … as settle` in
+a helper module does not hide one), and a loop whose only exit is temporal and whose body does
+nothing but yield. It is a list, and a list of ways to burn time is never complete — see the
+boundary table at the end of this section.
+
+| | shape | what makes it acceptable | annotation |
+|---|---|---|---|
+| **(a)** | **bounded poll** | a loop with a state-dependent exit **and** a bound (deadline, iteration range, or an incremented counter compared to a limit). It stops the moment the condition holds, and when the condition never holds it fails **naming what never happened** | none — the shape is the argument |
+| **(d)** | **virtual-clock advance** | inside `#[tokio::test(start_paused = true)]`. Paused time only advances when every task is idle, so `sleep(X)` means "let the system settle, then move on by exactly X" — deterministic, and free | none |
+| **(b)** | **deliberate settling delay** | a real wall-clock wait kept on purpose. Requires a reason a skeptic would accept, and it is listed in [docs/test-settling-delays.md](test-settling-delays.md) | `// SETTLE(<slug>): <reason>` at the site, ≥60 chars, plus a census row |
+| **(c)** | **naked wait** | nothing. This is the defect | — |
+
+A **(b)** must answer three questions, or it is a **(c)** wearing a label — and a mislabelled
+wait is worse than an unlabelled one, because the next reviewer trusts the label:
+
+1. **What state is being settled?** Not "let things settle" — which subsystem, reaching which
+   condition.
+2. **Why does no observable condition exist for it?** The legitimate answers seen so far are:
+   the state is the *absence* of an event (proving a negative); observing it would *destroy the
+   subject* (probing a pending session expiry cancels it); the wait *is* the stimulus (an
+   injected fault, a fragmented write, a benchmark's measurement boundary); or there is no
+   clock seam and real time must pass (`std::time::Instant` is reachable by neither
+   `crate::clock` nor tokio's paused clock).
+3. **What happens on a slow machine?** State the direction. A one-sided failure mode — slower
+   makes the check *stronger* — is acceptable. A wait whose expiry would make the test **pass
+   vacuously** is not, and must be paired with an assertion that turns that case into a loud
+   failure. `cluster.rs`'s `PartitionProbe` and `reload_acl.rs`'s surviving-grant control are
+   both there for exactly that reason.
+
+Two further rules: `thread::sleep` inside an `async` test body is rejected outright (it parks
+a runtime worker, so the thing being waited for may be the very task that now cannot run), and
+one `SETTLE` slug vouches for exactly one wait.
+
+**Prefer, in order:** (a) a bounded poll on an observable → (d) a paused clock → (b) a
+documented delay. When no observable exists, the right move is often to add one — but say so
+and ask, rather than widening production surface inside a test lane. Open asks are recorded on
+issue #260.
+
+### Skipping: allowed locally, fatal in CI
+
+A test that returns early instead of asserting reports **success**. `cargo test` prints `ok`,
+the summary counts it, and nothing says the coverage did not run — which is invisible in
+exactly the place it matters, on the green check of the pull request that removed it.
+
+Skipping is still right *locally*: `127.0.0.2` is not bindable on stock macOS (issue #217).
+It is never right on the platform that gates merges. So:
+
+- **Rust:** `skip_locally_or_fail_in_ci!("<what is missing and how to get it>")`
+  (`crates/mqttd/tests/common/skip.rs`, byte-identical copies elsewhere and diff-checked).
+  It asserts `CI` is unset, then returns. GitHub Actions sets `CI=true` on every runner, so
+  this needs no workflow wiring. Its guard must **be** the `CI` check and nothing else — no
+  disjunct, no `cfg!`, no extra term — because a condition that can be satisfied another way is
+  not a guard: `|| cfg!(debug_assertions)` is true in every `cargo test` profile, and one such
+  disjunct made the macro non-fatal everywhere while the gate reported success.
+
+  The gate rejects any other bare early `return` in a test function — in every spelling,
+  including `if cond { return }`, `let … else { return };` and `return Ok(())` — any `println!`
+  announcing a skip, a `return` hidden inside a `macro_rules!` body, a test whose every statement
+  sits inside an `if` that can simply not be taken (a skip with no `return` and no message at
+  all), an assertion inside the right operand of a `&&`/`||`, and `process::exit`/`abort` in test
+  code (which ends the whole *binary*, discarding every result in it). Two exemptions exist and
+  are named in the code: a bounded poll's success exit — a `return` inside a loop whose
+  exhaustion **fails loudly** — and a `return` inside a task handed to `spawn`. A trivial loop
+  does not buy the first one: `for _ in 0..1 { if probe() { return } … }` is rejected.
+- **Shell:** `skip_or_fail "<reason>"` in the CI-run scripts — fatal when `CI=true`. Its
+  counterpart `skip_permitted "<reason>"` is the one deliberate exception, for a lane that
+  genuinely cannot run in CI (the forward-looking compose image pin, `compose-smoke.sh`).
+  The gate's scope is *derived* from `.github/workflows/`, so adding a script to a job brings
+  it under the rule automatically.
+
+  The rule is not a list of probe spellings — it was, and a `have() { command -v "$1"; }` helper
+  used far below, an unset-variable test, a `uname` test and seven lines of distance each got a
+  gate to report success having run nothing. So it is stated from the other side: **a top-level
+  `exit 0` before the end of a CI-run script must be a declared skip** (`skip_or_fail` /
+  `skip_permitted` immediately above) **or carry a `# NOT-A-SKIP: <why>` annotation** of 30+
+  characters. Two real ones do: `bootstrap.sh`'s refusal to overwrite an existing password file,
+  and `vendor-mqttui-examples.sh --check`'s success. One level of shell-function indirection is
+  also resolved, so a helper that probes makes its call sites probes.
+- **Compile-time gates:** a `#![cfg(…)]` at the top of a test file is the one vanishing a
+  runtime check can never see — off-platform the file compiles to zero tests and the run is
+  green, and an assertion inside it would be excluded by the same `cfg`. Every such file has a
+  mirrored predicate in `crates/mqttd/tests/platform_coverage.rs`, which always compiles, and
+  the gate fails if one is missing. The same applies to a `#[cfg(…)]` on an
+  individual test: one character less, and a whole suite of tests reports `0 passed … ok`.
+
+### The inventory: what the binaries actually contain
+
+Everything above reads source text, and text is porous by construction — a rule can only see a
+shape someone thought of, and this gate has three times been shown shapes its author had not. So
+two checks are not text rules at all. The first asks the compiled binaries what they contain:
+
+    scripts/check-test-hygiene.py --write-inventory   # regenerate after adding a test
+    scripts/check-test-hygiene.py --check-inventory   # CI, in the jobs that build
+
+`cargo test -- --list` reports the tests each binary really contains (and `--list --ignored` the
+ones it will not run); they are compared against
+[docs/test-inventory.md](test-inventory.md). That catches what no pattern over source reliably
+can: **a test that is not there.** A `cfg` that excluded it, a file that compiled to zero
+tests, a rename, a deletion inside a large diff, an `#[ignore]` that retired it. Tests that exist
+only on some platforms are recorded with their predicate, so one inventory serves a laptop and
+the Linux runner alike.
+
+Adding a test costs one regeneration, the way `gen-status.py` costs one — and the diff *is*
+the review: a line disappearing from that file is a test disappearing from CI.
+
+### The results: what actually ran and passed
+
+The inventory answers *what does the binary contain*. Two ways of losing coverage answer that
+question identically before and after, and both were demonstrated against this gate:
+
+- **`#[ignore]`.** The test stays in the binary, `--list` still prints it, and it runs nowhere.
+  One attribute, no artifact changed, `cargo test` green over a smaller suite.
+- **`std::process::exit(0)` inside one test.** The harness leaves mid-suite: `running 6 tests`
+  and then *nothing* — no per-test lines, no `test result:` summary — and `cargo test` exits 0.
+  One test's line discards **every** result in its binary.
+
+Neither is visible to any rule over source text, and both are obvious in the run's own output.
+So the run's own output is checked:
+
+    scripts/check-test-hygiene.py --check-results test-output.txt --only root
+
+For every binary the inventory says this host has, the run must show a **complete summary**, no
+failures, **nothing filtered out**, the recorded **passed** count under this host's `cfg`
+evaluation, and an **ignored set** that matches the inventory. It consumes the log CI already
+tees, so it costs the test job nothing; given no log it runs the suite itself.
+
+`#[ignore]` is now first-class rather than out of scope. The inventory records it (asked of the
+binary, via `--list --ignored`), and every ignored test must be declared in `IGNORE_ALLOWLIST`
+in the gate with a reason **and the tier that runs it** — where the tier is *verified* against
+`.github/workflows/`, not believed. Two are so declared and so verified (`cluster_upgrade`,
+`cluster_soak`, both nightly). Five are declared with **no tier at all**:
+
+| `#[ignore]`d, run by no tier | why |
+|---|---|
+| `durable_bench::durable_path_floor` | macro-benchmark, minutes long, `--release` only |
+| `durable_bench::degraded_group_does_not_delay_other_groups` | as above |
+| `durable_bench::store_append_floor` | micro-benchmark, `--release` only |
+| `durable_bench::device_barrier_floor` | micro-benchmark of the host's durability barrier |
+| `durable_bench::multi_host_preflight` | needs an operator-provisioned multi-host cluster |
+
+Those five are **coverage that exists only on paper**: not per-PR, not nightly, not release.
+`--check-results` prints them on every successful run, and wiring the four runnable ones into a
+release-gated lane is a follow-up. The point of the allowlist is that this is a declared,
+reviewable fact instead of five attributes nobody re-reads.
+
+
+### What this gate detects, and what it cannot
+
+**Round 4 (2026-08-15) closed four more bypasses and left one class open; read the additions
+below before trusting a row further down.** Every one of these was found by an adversary given
+the source and told to get a vacuous test past the gate, and each is recorded with what
+actually changed:
+
+- **`--check-results` could not have passed in CI at all.** It anchors on `^\s+Running`, and
+  `.github/workflows/ci.yml` sets `CARGO_TERM_COLOR: always` at file scope, so the tee'd log
+  carries SGR escapes and every anchored pattern matched nothing — the flagship mechanism would
+  have failed a fully green run. Escapes are now stripped before parsing, rather than the
+  anchors loosened (an anchor that tolerates junk before `Running` would also accept a line
+  that merely mentions it).
+- **The CI-fatal guard was verified in text but never RUN.** B3 proved the condition is exactly
+  the `CI` check, and both reviewers then defeated it by wrapping the assertion in
+  `if false { … }`, which leaves the condition byte-identical. Two things changed: B3 now also
+  rejects a guard nested inside a conditional (position, not text — a condition cannot reveal
+  that it never runs), and `platform_coverage::the_skip_macro_is_fatal_under_ci` now *executes*
+  the macro in a subprocess with `CI=true` and observes the panic, and with `CI` unset observes
+  the skip. That is the residual the previous version could only name, and it is closed by
+  running the thing rather than reading it.
+- **The no-op rule was a menu of literal spellings**, so `let _unused = 0u8;`, `= "";` and
+  `= 1.0;` were still silent self-skips. It now matches the *class* — any literal — while a
+  call (`let _ = probe();`) stays a real statement.
+- **The loop exemption accepted any assertion anywhere after the loop**, so
+  `for _ in 0..1 { if probe() { return } } assert_eq!(a, b);` was exempt: the test's ordinary
+  assertion was read as an exhaustion check. Exhaustion must now be **unconditionally** fatal
+  and adjacent — a `panic!`, not an `assert_eq!` that could pass. Note the intermediate
+  attempt that was not enough: requiring adjacency alone still passed the fig leaf, because
+  that assertion *is* adjacent.
+
+**Still open, and deliberately named rather than papered over:** the shell and text rules
+remain vocabularies, and an adversary with source access can keep finding spellings — round 4
+demonstrated three more in check C and one in check A5 (`std::time::Instant::now()` qualified
+rather than bare). The mechanisms that do *not* have this property are the inventory and the
+results check, because they ask the compiled binaries what they contain and what ran; prefer
+extending those over adding another pattern. The load-sensitivity of the integration suites is
+a separate open item: quiet, the workspace is 1294 passed / 1 failed / 7 ignored, but under
+four concurrent cargo jobs roughly one run in six fails, and *which* test fails varies — it is
+the shared per-test broker-plus-stub harness with fixed bounds, it reproduces identically on
+`origin/main`, and it is filed rather than fixed here.
+
+
+A gate whose limits are unwritten gets trusted past them — that is how the first version of
+check B3 came to be satisfied by a comment quoting the assertion it no longer made, and it is
+why three rounds of adversarial review went into this file rather than one. The table below is
+derived from what was actually *tried*: every "detected" row was proven by reintroducing the
+bypass and watching the gate name it by `file:line`, and every "not detected" row was proven the
+other way — the shape ran green with the gate reporting success.
+
+**Detected** (each mutation-proven, in this repository, at the check named):
+
+| shape | check |
+|---|---|
+| a naked wall-clock wait: `sleep`, `sleep_until`, `park_timeout`, `recv_timeout`, `recv_deadline`, `interval().tick()`, `timeout(d, pending())` | A3 |
+| the same, renamed — `use tokio::time::sleep as pause`, including a `pub use` rename in *another* file | A3 |
+| a temporal loop that only burns: `while Instant::now() < deadline { yield_now().await }` | A5 |
+| `while start.elapsed() < D { sleep }` — a duration wearing a poll's clothes | A3 |
+| a wait inside a `macro_rules!` body, whose call site carries no wait token at all | A3 |
+| a marked helper's wait acquiring further call sites (the census counts them; growth is a diff line) | census |
+| `thread::sleep` in an `async` test body | A4 |
+| a bare early `return` in a test, in every spelling (`return;`, `if c { return }`, `let … else { return }`, `return Ok(())`, a match arm) | B1 |
+| a bare early `return` inside a loop that is not a poll — `for _ in 0..1 { … }`, `while let Some(()) = once.take() { … }` | B1 |
+| a bare early `return` inside any *other* `macro_rules!` — a self-skip generator | B1 |
+| a `println!`/`eprintln!` announcing a skip, message on any continuation line | B2 |
+| a test whose every statement sits inside an `if` that can simply not be taken | B5 |
+| the same chain "closed" by a branch that does nothing (`else { let _unused = (); }`, `else { () }`) | B5 |
+| an assertion inside the right operand of a `&&`/`\|\|` — an `if` written as an expression, inside a binding | B7 |
+| `process::exit` / `process::abort` in test code | B6 |
+| the skip macro losing its `CI` guard — deleted, commented out, `debug_assert!`ed, or weakened with an always-true disjunct (`\|\| cfg!(debug_assertions)`, `\|\| true`, an extra `&&` term) | B3 |
+| any copy of the skip macro drifting from the canonical one | B3 |
+| a whole test file, or a single test, vanishing off-platform via `#[cfg]` with no mirrored assertion | B4 |
+| a shell gate announcing a skip — any case, mid-line, or through a one-line `note` wrapper | C |
+| a shell gate exiting 0 early for **any** reason: `command -v … \|\| exit 0`, a `have()` helper used far below, an unset-variable test, a `uname` test, a probe seven lines up | C |
+| a Python gate whose probe reaches a success exit — `shutil.which`, `os.access`, `os.environ.get`, `except ImportError` → `sys.exit(0)` / `raise SystemExit(0)` | C |
+| a test deleted, renamed, or `cfg`-gated out of existence; a file that compiled to zero tests; a whole binary leaving the build | inventory |
+| a test retired with `#[ignore]`, and an ignored test whose declared tier no longer runs it | inventory + allowlist |
+| a binary whose results vanished mid-run (no `test result:` summary) — what `process::exit(0)` in one test does to all of them | results |
+| a run that passed fewer tests than the inventory accounts for, or was filtered | results |
+
+**Not detected.** Each of these was run against the finished gate and passed green, or is a
+known limit of the mechanism:
+
+| shape | why it is left, and what would close it |
+|---|---|
+| **A wait behind a helper call.** `settle(250)` where `fn settle` is elsewhere is classified at its definition, and one `SETTLE` marker covers every caller. | The census names the helper and counts its call sites, so a new caller is a regenerated line — but the gate cannot re-judge whether the *reason* still holds for that caller. Only review can. |
+| **A closure that asserts and is never called.** `let check = \|\| assert_eq!(1, 2, "…"); let _ = &check;` | Every statement is a binding, and B5 deliberately does not look inside bindings (most tests bind their subject first). Closing it needs reasoning about where a closure is invoked; the shape has zero instances here. |
+| **A `match`-shaped skip.** B5 is rigorous for `if`, approximate for `match`. | An exhaustive `match` with a panicking arm is how checks are written here, so treating a `match` as skippable would flag correct code — the failure mode that gets a gate worked around rather than obeyed. |
+| **A `return` taken on a probe *failure* inside a real poll.** `for i in 0..50 { if !probe() { return } … assert!(i < 49, "…") }` | B1 exempts a return whose loop fails loudly on exhaustion, because that is what all twelve real polls in this tree look like. Telling "returned because the state arrived" from "returned because the environment is missing" needs meaning, not structure. |
+| **A busy-wait that computes.** A5 covers a temporal loop that only yields; one doing arithmetic burns the same time and is not flagged. | A duration-bounded loop that does real work is a load generator — `roll_cost.rs` has one, correctly — so the rule cannot widen without flagging it. The wait *vocabulary* is likewise a list, and a list is never complete: the gate now prints "wall-clock wait sites classified", not "every wait in this tree". |
+| **A loop whose state-dependent exit can never be true.** | It fails loudly at its deadline rather than passing vacuously — the acceptable half of this. |
+| **An empty collection.** `for case in cases { assert!(…) }` with `cases` empty asserts nothing. | A vacuity of a different family from waits and skips; not checked. |
+| **A test that runs and proves nothing.** | No rule here reads what an assertion *means*. `quic.rs`'s fan-out test passed with fan-out disabled outright until it was given an observable that distinguishes the two paths; `quotas.rs`'s isolation claim passed against an unthrottled broker. Only a mutation finds these, and mutations are a reviewer's tool, not this script's. |
+| **The skip macro's *behaviour*.** B3 proves the guard is exactly the `CI` check, in code, in every copy — structurally. | Nothing in this repository runs the macro with `CI=true` and observes the failure. A self-exec test (re-run the test binary with `CI=1`, assert a non-zero exit and the FATAL message) would close it, and is drafted as a follow-up. |
+| **Shell indirection deeper than one level.** A helper that calls a helper that probes is not resolved. | The success-exit rule covers the general case from the other side: whatever led there, an early `exit 0` needs `skip_or_fail`/`skip_permitted` or a `# NOT-A-SKIP: <why>` annotation. A helper *function* that exits 0 mid-script is not covered — only top-level exits are, because a `return 0` inside `wait_ready` is ordinary shell. |
+| **Python gates' skip *messages*.** Only the probe→success-exit hole is checked. | No rule can separate a gate's own prose about skipping from an actual skip, and this gate's own source is full of the former. (Its own literals no longer trip it: the Python view is tokenized and strings are blanked, the same rule as everywhere else here.) |
+| **Skips in a script CI does not run.** Check C's scope is derived from `.github/workflows/`. | Deliberate: adding a script to a job brings it under the rule, and a user-facing tool's documented per-certificate skips stay out of a rule written for gates. |
+| **Coverage that runs nowhere.** Five `durable_bench` benchmarks are `#[ignore]`d and run by no tier at all. | Now *declared*, and printed on every `--check-results` run instead of being invisible — but the gate cannot make a tier exist. Follow-up. |
+| **Production coverage that a test rewrite displaces.** The inventory compares test *names*; a suite that stops exercising a production entry point changes no name. | This happened for real: `mqtt_net::quic::connect_mux` was left exercised by nothing after the fan-out rewrite, and one test now connects through it. Nothing in this gate would have caught it — region-level coverage tooling would, and this repository has none. |
+| **A test that is wrong.** | Out of scope, and worth saying: this gate makes a suite that *stopped testing* visible. It has nothing to say about a suite that tests the wrong thing. |

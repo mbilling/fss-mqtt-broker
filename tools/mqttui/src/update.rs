@@ -173,7 +173,18 @@ fn install_unverified_main() -> Result<String, String> {
 /// of this module — verification has no configuration surface, because a configurable
 /// verifier is a disableable one.
 fn verify(work: &Path) -> Result<(), String> {
-    let out = Command::new("cosign")
+    verify_with(work, "cosign")
+}
+
+/// The verifier, with the verifying program named.
+///
+/// [`verify`] pins it to `cosign`; the parameter exists so the **refusal** path can be tested
+/// without a cosign install. It could not be, and so the module's only refusal test guarded
+/// itself with `if !on_path("cosign") { return; }` — and because no CI job installs cosign,
+/// that guard fired on every CI run. The test reported success without running for the whole
+/// life of the file (issue #260). One parameter buys back the coverage.
+fn verify_with(work: &Path, program: &str) -> Result<(), String> {
+    let out = Command::new(program)
         .args(["verify-blob", "--certificate"])
         .arg(work.join("examples.tar.gz.pem"))
         .arg("--signature")
@@ -309,10 +320,6 @@ mod tests {
     /// an error, so the caller's `?` stops anything after it — unpacking included.
     #[test]
     fn a_bad_signature_is_an_error() {
-        if !crate::preflight::on_path("cosign") {
-            eprintln!("SKIP: cosign is not on PATH, so the verification gate did NOT run");
-            return;
-        }
         let work = std::env::temp_dir().join(format!("mqttui-verify-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).expect("temp dir");
@@ -320,11 +327,73 @@ mod tests {
         std::fs::write(work.join("examples.tar.gz.sig"), b"bm90IGEgc2ln").unwrap();
         std::fs::write(work.join("examples.tar.gz.pem"), b"not a certificate").unwrap();
 
-        let err = verify(&work).expect_err("garbage must never verify");
+        // No environmental skip. This test used to begin `if !on_path("cosign") { return; }`,
+        // and no CI job installs cosign — so the module's only refusal test reported success
+        // without running on every CI run (issue #260). What is being checked is mqttui's, not
+        // cosign's cryptography: a verifier that refuses must produce an error whose text says
+        // so, and a verifier that is ABSENT must be an error too, never a pass. `require()`
+        // states the second in prose ("a missing verifier must never mean 'skip verification'");
+        // here it is asserted.
+        let absent = work.join("no-such-verifier");
+        let err = verify_with(&work, &absent.display().to_string())
+            .expect_err("a missing verifier must never verify");
         assert!(
-            err.contains("FAILED"),
-            "the error must say what happened: {err}"
+            err.contains("could not run"),
+            "the error must name the missing verifier: {err}"
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let stub = |name: &str, body: &str| {
+                let p = work.join(name);
+                std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                p.display().to_string()
+            };
+            let refuser = stub("refuser", "echo 'stub: signature refused' >&2\nexit 1\n");
+            let err = verify_with(&work, &refuser).expect_err("garbage must never verify");
+            assert!(
+                err.contains("FAILED"),
+                "the error must say what happened: {err}"
+            );
+            // Non-vacuity: without this, every assertion above would also hold for a
+            // `verify_with` that can only ever fail — including one that never runs the
+            // verifier at all.
+            //
+            // And the accepter asserts its OWN ARGV, because "the verifier ran and said yes" is
+            // the cheap half of the property: WHO is trusted to sign is the security-relevant
+            // half, and a stub that ignores argv leaves the pins untested — mutating
+            // `IDENTITY_REGEXP` to `.*` and `OIDC_ISSUER` to an attacker's issuer kept the whole
+            // suite green (issue #260 round 2, finding 9). The pinned values are written out
+            // here in full, deliberately: a test that read them from the constants it is
+            // checking would agree with any mutation of them.
+            let accepter = stub(
+                "accepter",
+                r#"case " $* " in
+  *" --certificate-identity-regexp ^https://github.com/mbilling/fss-mqtt-broker/ "*) ;;
+  *) echo "stub: releases must be pinned to this repository's signing identity: $*" >&2
+     exit 3 ;;
+esac
+case " $* " in
+  *" --certificate-oidc-issuer https://token.actions.githubusercontent.com "*) ;;
+  *) echo "stub: the OIDC issuer must be pinned to GitHub Actions: $*" >&2
+     exit 3 ;;
+esac
+exit 0
+"#,
+            );
+            verify_with(&work, &accepter)
+                .expect("a verifier that accepts must verify — and be handed both pins");
+        }
+
+        // The strong form, when the environment allows it: the REAL cosign must refuse the
+        // same garbage. Added on top of assertions that always run, so nothing is skipped
+        // when cosign is absent — the coverage above does not depend on it.
+        if crate::preflight::on_path("cosign") {
+            let err = verify(&work).expect_err("cosign must never verify garbage");
+            assert!(err.contains("FAILED"), "{err}");
+        }
         let _ = std::fs::remove_dir_all(&work);
     }
 

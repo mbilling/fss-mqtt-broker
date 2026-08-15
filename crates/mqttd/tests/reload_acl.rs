@@ -62,6 +62,28 @@ clients = ["*"]
 
 /// A subscribe-tightened ACL: publishing to `room/#` stays allowed, but the
 /// subscribe grant is gone — existing subscriptions lose their grant (ADR 0040 T3).
+/// This test's own pair: `keep/#` stays fully granted across the reload, so a session that was
+/// genuinely registered offline has something that MUST come back — the control that keeps
+/// `an_offline_sessions_revoked_grant_does_not_replay_its_queue_on_resume` from passing when
+/// nothing was queued at all. Kept local to that test so the shared fixtures above stay exactly
+/// as tight as the tests using them expect.
+const PERMISSIVE_PLUS_KEEP: &str = r#"
+[[rules]]
+actions = ["publish", "subscribe"]
+topics = ["room/#", "keep/#"]
+"#;
+
+/// [`PERMISSIVE_PLUS_KEEP`] with the `room/#` SUBSCRIBE grant revoked and `keep/#` untouched.
+const PUBLISH_ONLY_KEEPING_KEEP: &str = r#"
+[[rules]]
+actions = ["publish"]
+topics = ["room/#"]
+
+[[rules]]
+actions = ["publish", "subscribe"]
+topics = ["keep/#"]
+"#;
+
 const PUBLISH_ONLY: &str = r#"
 [[rules]]
 actions = ["publish"]
@@ -492,29 +514,53 @@ topics = ["room/%c"]
 /// that grant admits is NOT replayed, and re-subscribing is denied.
 #[tokio::test]
 async fn an_offline_sessions_revoked_grant_does_not_replay_its_queue_on_resume() {
-    let acl = AclFile::new(PERMISSIVE);
+    let acl = AclFile::new(PERMISSIVE_PLUS_KEEP);
     let (addr, ids, reloader) = start_reloadable_node(acl.path.clone()).await;
 
-    // A persistent subscriber at QoS 1 (so missed messages queue), then it sleeps.
+    // A persistent subscriber at QoS 1 (so missed messages queue), then it sleeps. It holds TWO
+    // grants: `room/1`, which the reload below revokes, and `keep/1`, which survives. The second
+    // one is a CONTROL — see the assertion at the end of this test for why it has to exist.
     ids.send(identity("sleeper")).unwrap();
     let mut sleeper = Client::connect_with(addr, "c-sleeper", false).await;
     assert_eq!(sleeper.subscribe("room/1", QoS::AtLeastOnce).await, vec![1]);
+    assert_eq!(sleeper.subscribe("keep/1", QoS::AtLeastOnce).await, vec![1]);
     drop(sleeper);
+    // SETTLE(acl-detach-offline): the state being settled is "the hub has processed the socket
+    // EOF and moved the session offline", so that the writer's publish QUEUES rather than being
+    // handed to a dying connection. The only wire-level way to ask is to connect with the same
+    // client id, which TAKES OVER the session and destroys the subject. A too-short wait here
+    // used to make the whole test vacuous — the message would go live to a dead socket, nothing
+    // would be queued, and "the revoked grant's queue did not replay" would hold trivially — so
+    // the `keep/1` control below turns that failure into a loud one instead. On a slow machine the
+    // wait is the same but the control assertion is what protects the test, not the duration.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // A message queues for the sleeping session; then the grant is revoked.
+    // Messages queue for the sleeping session; then the `room/#` subscribe grant is revoked
+    // while `keep/#` is left intact.
     ids.send(identity("writer")).unwrap();
     let mut writer = Client::connect(addr, "c-writer").await;
     writer.publish_qos1("room/1", 1, b"missed").await;
-    acl.write(PUBLISH_ONLY);
+    writer.publish_qos1("keep/1", 2, b"kept").await;
+    acl.write(PUBLISH_ONLY_KEEPING_KEEP);
     assert!(reloader.reload("signal"), "the tightened ACL should reload");
 
-    // On resume: no replay of the revoked grant's queue, and no re-subscribe.
+    // On resume: the surviving grant's message replays, the revoked grant's does not, and
+    // re-subscribing to the revoked filter is denied.
     ids.send(identity("sleeper")).unwrap();
     let mut resumed = Client::connect_with(addr, "c-sleeper", false).await;
+    let mut replayed: Vec<String> = Vec::new();
+    while let Some(Packet::Publish(p)) = resumed.recv().await {
+        replayed.push(p.topic);
+    }
     assert!(
-        resumed.recv().await.is_none(),
-        "the revoked grant's queued message must not replay on resume"
+        replayed.contains(&"keep/1".to_string()),
+        "the SURVIVING grant's queued message did not replay ({replayed:?}). Either the grant \
+         sweep took too much, or the session was never registered offline and nothing was ever \
+         queued — in which case this test proves nothing about the revoked grant either"
+    );
+    assert!(
+        !replayed.contains(&"room/1".to_string()),
+        "the revoked grant's queued message replayed on resume ({replayed:?})"
     );
     assert_eq!(
         resumed.subscribe("room/1", QoS::AtLeastOnce).await,

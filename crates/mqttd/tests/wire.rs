@@ -271,6 +271,12 @@ async fn a_split_between_the_type_byte_and_the_length_is_parsed() {
 
     let bytes = connect_v5_bytes("wire-split");
     c.send_bytes(&bytes[..1]).await;
+    // SETTLE(wire-split-read-events): the state being settled is "the broker has read byte 1
+    // and is waiting for more", which is unobservable by construction — the decoder's internal
+    // buffer is not on the wire and any packet the broker sent to report it would defeat the
+    // test. The gap forces two distinct read events across the type-byte/length boundary, which
+    // is the defect class this covers. The failure mode is strictly one-sided: a slower machine
+    // makes the split MORE certain, never less, so this cannot become vacuous under load.
     tokio::time::sleep(Duration::from_millis(50)).await;
     c.send_bytes(&bytes[1..]).await;
     c.expect_connack_bytes(0x00).await;

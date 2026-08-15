@@ -789,9 +789,12 @@ mod tests {
         // database handles), so it must drop too before the files can reopen.
         drop(retained);
         drop(plane);
-        // The last `Database` handle drops synchronously above; give any in-flight
-        // blocking apply a moment to release before reopening the same files.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // No grace for the file locks: every store open in this crate goes through
+        // `mqtt_storage::open::create_with_lock_retry`, which retries for ~3 s (30 x 100 ms)
+        // precisely because a fast reopen over a just-released data dir is the production case
+        // (a rolling restart). A 100 ms sleep here was 30x shorter than the retry it duplicated,
+        // so it could only turn a real lock-release lag into a spurious failure — and it hid
+        // whether the retry works at all.
 
         // --- lifetime #2: a fresh node over the SAME directory recovers and re-leads ---
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));

@@ -405,9 +405,17 @@ mod tests {
         );
         gate.record_auth_failure(Some(ip(1)));
         gate.record_auth_failure(Some(ip(1)));
-        // After ~2 decay periods the level is below the threshold again. A slow
-        // machine sleeps LONGER, which only decays further — so this assertion
-        // cannot be broken by load, unlike the one above.
+        // The strikes decay: after ~2 decay periods the level drops below the threshold and
+        // the address is admitted again.
+        // SETTLE(admission-penalty-decay): the decay is computed from `std::time::Instant`, and
+        // there is no monotonic clock seam to inject — `crate::clock` deliberately covers only
+        // wall-clock epoch seconds (message expiry), and tokio's paused clock virtualizes
+        // `tokio::time::Instant`, not `std::time::Instant`. So real time has to pass. 120 ms is
+        // about two of this gate's configured decay periods, and the failure mode is one-sided:
+        // on a slow machine MORE decay has happened, so the address is more certainly admitted
+        // again — a too-short wait produces a false FAILURE, never a false pass. Making this
+        // deterministic means giving `AdmissionGate` a monotonic clock seam; issue #260 records
+        // the ask, and it is a production change this lane deliberately did not make.
         std::thread::sleep(Duration::from_millis(120));
         assert!(
             gate.try_admit(Some(ip(1))).is_some(),

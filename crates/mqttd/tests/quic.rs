@@ -179,9 +179,17 @@ impl Client<QuicStream> {
 }
 
 impl Client<mqtt_net::quic::QuicMux> {
-    /// Connect over the symmetric multi-stream mux: signals capability and accepts broker-opened
-    /// data streams, so the broker may fan its deliveries back across streams.
-    async fn connect_mux(endpoint: &quinn::Endpoint, addr: SocketAddr, id: &str) -> Self {
+    /// Connect through the **production client-side mux**, `mqtt_net::quic::connect_mux`.
+    ///
+    /// Every other client in this file is hand-rolled, for reasons each states — the fan-out
+    /// probe needs per-packet provenance, which the mux deliberately erases. The consequence,
+    /// once the last `connect_mux` caller was rewritten, was that a pub entry point of
+    /// `mqtt-net` was exercised by nothing in the repository (issue #260 round 2, finding 8):
+    /// the client half of the symmetric mux could regress and no test would notice, while the
+    /// gate this change adds could not see the loss (no test NAME changed). So one test
+    /// connects this way, and what it proves is the smallest true thing: a session established
+    /// and a broker→client delivery received through the real mux.
+    async fn connect_via_mux(endpoint: &quinn::Endpoint, addr: SocketAddr, id: &str) -> Self {
         let conn = endpoint
             .connect(addr, "127.0.0.1")
             .unwrap()
@@ -189,7 +197,7 @@ impl Client<mqtt_net::quic::QuicMux> {
             .expect("QUIC connect");
         let mux = mqtt_net::quic::connect_mux(&conn)
             .await
-            .expect("connect mux");
+            .expect("the client-side mux opens its control stream");
         Self::handshake(conn, mux, id).await
     }
 }
@@ -304,17 +312,129 @@ fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A subscriber mux that remembers **which stream** each packet arrived on.
+///
+/// `mqtt_net::quic::connect_mux` merges the control stream and every accepted data stream into
+/// one packet source. That is the correct shape for the engine — and it makes outbound fan-out
+/// unobservable from a test, because a delivery on a broker-opened data stream and one on the
+/// control stream are the same `recv()`. This probe is the same wiring with the provenance
+/// kept: `None` means the control stream, `Some(n)` the n-th stream the broker opened.
+struct FanoutProbe {
+    conn: quinn::Connection,
+    writer: mqtt_net::FrameWriter<quinn::SendStream>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(Option<usize>, Packet)>,
+}
+
+impl FanoutProbe {
+    async fn connect(endpoint: &quinn::Endpoint, addr: SocketAddr, id: &str) -> Self {
+        let conn = endpoint
+            .connect(addr, "127.0.0.1")
+            .unwrap()
+            .await
+            .expect("QUIC connect");
+        let (ctrl_send, ctrl_recv) = conn.open_bi().await.expect("open control stream");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self::spawn_reader(ctrl_recv, None, tx.clone());
+
+        let accept_conn = conn.clone();
+        tokio::spawn(async move {
+            // Hold the send halves: dropping one resets the stream the broker is writing on.
+            let mut keep = Vec::new();
+            let mut n = 0usize;
+            while let Ok((send, recv)) = accept_conn.accept_bi().await {
+                keep.push(send);
+                Self::spawn_reader(recv, Some(n), tx.clone());
+                n += 1;
+            }
+        });
+
+        let mut probe = FanoutProbe {
+            conn,
+            writer: mqtt_net::FrameWriter::new(ctrl_send, V4),
+            rx,
+        };
+        probe
+            .writer
+            .send(&Packet::Connect(Connect {
+                properties: mqtt_codec::Properties::new(),
+                protocol: V4,
+                clean_session: true,
+                keep_alive: 30,
+                client_id: id.to_string(),
+                last_will: None,
+                username: None,
+                password: None,
+            }))
+            .await
+            .unwrap();
+        match probe.recv().await {
+            Some((_, Packet::ConnAck(ack))) if ack.code == 0 => probe,
+            other => panic!("expected CONNACK 0x00 over the fan-out probe, got {other:?}"),
+        }
+    }
+
+    fn spawn_reader(
+        recv: quinn::RecvStream,
+        from: Option<usize>,
+        tx: tokio::sync::mpsc::UnboundedSender<(Option<usize>, Packet)>,
+    ) {
+        tokio::spawn(async move {
+            let mut reader = mqtt_net::FrameReader::new(recv, V4);
+            while let Ok(Some(packet)) = reader.next_packet().await {
+                if tx.send((from, packet)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn subscribe(&mut self, filter: &str) {
+        self.writer
+            .send(&Packet::Subscribe(Subscribe {
+                properties: mqtt_codec::Properties::new(),
+                pkid: 1,
+                filters: vec![SubscribeFilter {
+                    options: mqtt_codec::SubscriptionOptions::default(),
+                    path: filter.to_string(),
+                    qos: QoS::AtMostOnce,
+                }],
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(self.recv().await, Some((_, Packet::SubAck(_)))));
+    }
+
+    async fn open_data_stream(&self) -> quinn::SendStream {
+        let (send, _recv) = self.conn.open_bi().await.expect("open data stream");
+        send
+    }
+
+    async fn recv(&mut self) -> Option<(Option<usize>, Packet)> {
+        timeout(Duration::from_millis(800), self.rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
 // --- tests -------------------------------------------------------------------
 
 /// A pub/sub round-trip over QUIC with mTLS: the client presents a cert, the control stream
 /// carries the MQTT session, and a publish reaches a subscriber.
+///
+/// The subscriber is the production client mux (`mqtt_net::quic::connect_mux`) and the publisher
+/// is a plain single-stream client, so this one test covers both client shapes the broker has to
+/// serve — and it is the only exercise `connect_mux` has (see `Client::connect_via_mux`). A
+/// subscriber that opens no data stream never signals multi-stream capability, so its delivery
+/// arrives on the control stream: the single-stream fallback that
+/// `quic_outbound_fans_publishes_across_streams` distinguishes fan-out from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_mtls_pubsub_roundtrip() {
     let pki = mint_pki("rt");
     let addr = start_quic_node(&pki.cert, &pki.key, &pki.ca);
     let client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
 
-    let mut sub = Client::connect(&client, addr, "quic-sub").await;
+    let mut sub = Client::connect_via_mux(&client, addr, "quic-sub").await;
     sub.subscribe("quic/+/data").await;
 
     let mut publ = Client::connect(&client, addr, "quic-pub").await;
@@ -386,41 +506,74 @@ async fn quic_multistream_demux_no_head_of_line_blocking() {
 }
 
 /// Outbound multi-stream fan-out (ADR 0036 §3a): a capability-signalling subscriber (the
-/// symmetric mux) receives **every** broker→client delivery — fanned across broker-opened QUIC
-/// data streams and re-merged by the subscriber's mux. (A plain single-stream client is never
-/// stranded — it gets its publishes on the control stream, see `quic_mtls_pubsub_roundtrip`.)
+/// symmetric mux) receives every broker→client delivery **on broker-opened QUIC data streams**,
+/// topic-hashed across the pool — not on the control stream. (A plain single-stream client is
+/// never stranded — it gets its publishes on the control stream, see `quic_mtls_pubsub_roundtrip`.)
+///
+/// The subscriber here is a hand-rolled mux rather than `mqtt_net::quic::connect_mux`, and that
+/// is the whole point: `connect_mux` merges the control stream and every accepted data stream
+/// into one packet source — exactly right for the engine, and useless for a test that must tell
+/// the two apart. An earlier version of this test used it and asserted only that six payloads
+/// arrived, which held with outbound fan-out disabled outright (`let slot = if false && …` in
+/// `mqtt-net/src/quic.rs`): it could not distinguish the path it exists to distinguish. This
+/// probe keeps each packet's provenance, so the assertions below fail if fan-out stops
+/// happening.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_outbound_fans_publishes_across_streams() {
     let pki = mint_pki("out");
     let addr = start_quic_node(&pki.cert, &pki.key, &pki.ca);
     let client = quic_client(&pki.ca, Some((&pki.cert, &pki.key)));
 
-    let mut sub = Client::connect_mux(&client, addr, "out-sub").await;
+    let mut sub = FanoutProbe::connect(&client, addr, "out-sub").await;
     sub.subscribe("t/#").await;
     // Signal multi-stream capability AFTER connect (CONNECT must be the first packet): open a
     // data stream and send a PINGREQ. The broker then fans this subscriber's deliveries across
-    // data streams (and the subscriber's mux accepts those broker-opened streams).
+    // data streams (and this probe accepts those broker-opened streams).
     let mut sig = sub.open_data_stream().await;
     sig.write_all(&[0xC0, 0x00]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for the PINGRESP that signal produces, not for a duration: it is the broker's own
+    // acknowledgement that it has READ the data stream, and reading it is what sets the
+    // capability flag. A fixed 200 ms could elapse first on a loaded machine, and the publishes
+    // below would then be served on the control stream — a failure of this test's own setup
+    // rather than of the broker.
+    let signal_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match sub.recv().await {
+            Some((_, Packet::PingResp)) => break,
+            Some((_, other)) => panic!("expected the capability signal's PINGRESP, got {other:?}"),
+            None => assert!(
+                std::time::Instant::now() < signal_deadline,
+                "the broker never answered the multi-stream capability signal, so it never \
+                 registered the data stream and no fan-out could be observed"
+            ),
+        }
+    }
 
     let mut publ = Client::connect(&client, addr, "out-pub").await;
+    // These six topics hash onto ALL FOUR slots of the outbound pool (FNV-1a mod
+    // OUTBOUND_POOL=4: a→3, b→2, c→1, d→0, e→3, f→2), so "fanned across streams" is an
+    // observable count here, not a hope.
     let topics = ["t/a", "t/b", "t/c", "t/d", "t/e", "t/f"];
     for t in topics {
         publ.publish(t, b"payload").await;
     }
 
-    // Every publish must arrive intact at the subscriber — proving the broker fanned them across
-    // data streams and the subscriber's mux re-merged them (a delivery on an unaccepted stream
-    // would be lost). The PINGRESP from the capability signal is skipped.
     let mut got = std::collections::HashSet::new();
+    let mut on_control = Vec::new();
+    let mut streams = std::collections::HashSet::new();
     for _ in 0..(topics.len() + 3) {
         match sub.recv().await {
-            Some(Packet::Publish(p)) => {
+            Some((from, Packet::Publish(p))) => {
                 assert_eq!(&p.payload[..], b"payload");
+                match from {
+                    Some(stream) => {
+                        streams.insert(stream);
+                    }
+                    None => on_control.push(p.topic.clone()),
+                }
                 got.insert(p.topic);
             }
-            Some(Packet::PingResp) => {}
+            Some((_, Packet::PingResp)) => {}
             None => break,
             other => panic!("unexpected packet over the outbound mux: {other:?}"),
         }
@@ -431,7 +584,21 @@ async fn quic_outbound_fans_publishes_across_streams() {
     assert_eq!(
         got.len(),
         topics.len(),
-        "every fanned-out publish arrives intact via the symmetric mux"
+        "every fanned-out publish arrives intact via the symmetric mux (got {got:?})"
+    );
+    assert!(
+        on_control.is_empty(),
+        "a capable subscriber's PUBLISHes must be fanned onto broker-opened data streams, but \
+         {} of them came back on the CONTROL stream ({on_control:?}) — the single-stream \
+         fallback, which is what this test exists to distinguish fan-out from",
+        on_control.len()
+    );
+    assert_eq!(
+        streams.len(),
+        4,
+        "the six topics hash onto all four outbound pool slots, so four distinct broker-opened \
+         streams must carry them; saw {} — fan-out that always picks one stream is not fan-out",
+        streams.len()
     );
 }
 

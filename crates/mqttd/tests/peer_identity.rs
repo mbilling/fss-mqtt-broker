@@ -496,8 +496,14 @@ async fn a_cluster_crl_reload_tears_down_the_revoked_nodes_link() {
     crl_active.store(true, Ordering::SeqCst);
     assert!(reloader.reload("signal"), "the CRL reload should apply");
 
-    // Cross-node traffic stops, and B cannot re-handshake (both directions are
-    // gated on the live CRL) — give the dialers ample time to try.
+    // SETTLE(crl-redial-attempt-window): half of this is a negative (the link must STAY torn
+    // down), and half wants evidence that a re-handshake was attempted and refused. The second
+    // half has no observable today: a refused peer handshake is logged, not counted, so there is
+    // no series to poll for "at least one revoked dialer was turned away". 2 s covers several
+    // `dial_forever` backoff cycles, so the dialers do retry inside it. A slow machine gives the
+    // dialers MORE attempts within the window, which strengthens the check rather than weakening
+    // it. Turning this into a bounded poll needs a
+    // `mqttd_peer_handshake_rejected_total{reason="revoked"}` counter; issue #260 records the ask.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
         never_crosses(&mut sub_a, &mut pub_b, "evict/y").await,

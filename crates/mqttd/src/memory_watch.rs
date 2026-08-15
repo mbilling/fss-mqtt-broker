@@ -179,7 +179,11 @@ Threads:\t8
     /// The watcher is edge-triggered: crossing the watermark sends one
     /// `SetBrownout{on:true}`, dropping back under sends one `{on:false}`, and steady
     /// states send nothing — otherwise a busy broker would spam the hub every poll.
-    #[tokio::test]
+    // Virtual clock (`start_paused`): every wait in this test is then an exact number of the
+    // watcher's own injected poll cycles rather than a wall-clock guess, and it costs no real
+    // time. Tokio advances to the next timer only when the runtime is idle, so "N cycles have
+    // happened" becomes deterministic — which is what a test about poll cadence needs.
+    #[tokio::test(start_paused = true)]
     async fn the_watcher_drives_brownout_on_watermark_transitions() {
         static RSS: AtomicU64 = AtomicU64::new(10);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -230,7 +234,11 @@ Threads:\t8
     /// comes at `poll / 10`, so a 20 s cadence still catches the crossing in seconds. The
     /// other tests in this module keep their 10-20 ms injected cadences, which is the proof
     /// that the 1 s floor never *lengthens* a configured interval.
-    #[tokio::test]
+    // Virtual clock (`start_paused`): every wait in this test is then an exact number of the
+    // watcher's own injected poll cycles rather than a wall-clock guess, and it costs no real
+    // time. Tokio advances to the next timer only when the runtime is idle, so "N cycles have
+    // happened" becomes deterministic — which is what a test about poll cadence needs.
+    #[tokio::test(start_paused = true)]
     async fn nearing_the_watermark_shortens_the_poll() {
         static RSS: AtomicU64 = AtomicU64::new(95); // 95 of a 100-byte mark: near, under
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -254,7 +262,11 @@ Threads:\t8
 
     /// With no watermark the watcher still exports the gauge, and never browns out —
     /// so turning on memory *visibility* cannot accidentally turn on enforcement.
-    #[tokio::test]
+    // Virtual clock (`start_paused`): every wait in this test is then an exact number of the
+    // watcher's own injected poll cycles rather than a wall-clock guess, and it costs no real
+    // time. Tokio advances to the next timer only when the runtime is idle, so "N cycles have
+    // happened" becomes deterministic — which is what a test about poll cadence needs.
+    #[tokio::test(start_paused = true)]
     async fn without_a_watermark_nothing_is_ever_browned_out() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let _watch = tokio::spawn(watch(

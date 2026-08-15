@@ -320,13 +320,12 @@ async fn repeated_auth_failures_penalize_the_source_address_then_decay() {
     // environmental impossibility. CI is Linux, so coverage there is unconditional;
     // `sudo ifconfig lo0 alias 127.0.0.2 up` runs it on a Mac.
     if std::net::TcpListener::bind(("127.0.0.2", 0)).is_err() {
-        eprintln!(
-            "SKIPPED repeated_auth_failures_penalize_the_source_address_then_decay: \
-             127.0.0.2 is not bindable on this host (stock macOS loopback carries \
-             only 127.0.0.1 — issue #217; `sudo ifconfig lo0 alias 127.0.0.2 up` \
-             enables the test locally)"
+        crate::skip_locally_or_fail_in_ci!(
+            "127.0.0.2 is not bindable on this host, so per-source-address isolation cannot \
+             be exercised (stock macOS loopback carries only 127.0.0.1 — issue #217; \
+             `sudo ifconfig lo0 alias 127.0.0.2 up` enables the test locally). CI runs on \
+             Linux, which has all of 127/8 on lo, so this must never be taken there."
         );
-        return;
     }
     let salt = SaltString::encode_b64(b"penalty-salt-b").unwrap();
     let phc = Argon2::default()

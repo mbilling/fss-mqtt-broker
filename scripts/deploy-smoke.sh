@@ -57,6 +57,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# --- CI-fatal skips (issue #260) -------------------------------------------------------
+# A skip that prints a note and exits 0 is indistinguishable from a pass, so coverage can
+# vanish on the platform that gates merges without anything going red. Allowed locally,
+# fatal under CI (GitHub Actions sets CI=true on every runner). `skip_permitted` is the one
+# deliberate exception: a lane that genuinely cannot run in CI stays green and says why.
+skip_or_fail() {
+  if [ "${CI:-}" = "true" ]; then
+    echo "FATAL: environmental skip taken under CI — coverage would silently vanish: $1" >&2
+    exit 1
+  fi
+  echo "  SKIP (local only; fatal under CI) — $1"
+}
+skip_permitted() { echo "  SKIP (permitted in CI by design) — $1"; }
+
 # openssl: the shipped init.sh mints the PKI with it. The interop job already installs it
 # (scripts/quickstart-smoke.sh requires it too), so this is not a new CI dependency.
 for tool in mosquitto_pub mosquitto_sub python3 openssl; do
@@ -65,7 +79,7 @@ done
 
 MQTTD_BIN="${MQTTD_BIN:-}"
 if [[ -z "$MQTTD_BIN" ]]; then
-  echo "building mqttd (set MQTTD_BIN to skip)…"
+  echo "building mqttd (set MQTTD_BIN to reuse an existing build)…"
   cargo build --quiet -p mqttd
   MQTTD_BIN="target/debug/mqttd"
 fi
@@ -702,7 +716,7 @@ PY
   pass "each broker mounts only its own TLS volume, the CA key only reaches init, and the \
 founder's floor is 1 by default and 2 once armed"
 else
-  echo "  SKIP — docker compose not available; compose.yaml was NOT validated here"
+  skip_or_fail "docker compose not available; compose.yaml was NOT validated here"
 fi
 
 if command -v systemd-analyze >/dev/null 2>&1; then
@@ -720,7 +734,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
   fi
   pass "deploy/systemd/mqttd.service passes systemd-analyze verify"
 else
-  echo "  SKIP — systemd-analyze not available; the unit was NOT verified here"
+  skip_or_fail "systemd-analyze not available; the unit was NOT verified here"
 fi
 
 echo

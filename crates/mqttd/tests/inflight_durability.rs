@@ -209,8 +209,11 @@ async fn an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash() {
     // 5. Restart on the same data directory and resume the session.
     let mut restarted = Broker::spawn(addr, data_dir.path(), "restarted");
     restarted.wait_until_listening(addr).await;
-    // Give the durable plane a moment to recover its state before resuming.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // No pre-wait for the durable plane. Recovery is the BROKER's promise, not the test's to
+    // arrange: `hub.rs`'s attach path retries store recovery under `ATTACH_RECOVERY_TIMEOUT`
+    // before answering CONNECT. A 2 s sleep here was asserting that promise on the broker's
+    // behalf, which means the promise itself was never tested — and if it does not hold, the
+    // `session_present` assertion below is the right place to find out (issue #260).
 
     let (mut resumed, session_present) = Client::connect_v311(addr, "inflight-sub", false).await;
     assert!(
@@ -302,7 +305,8 @@ async fn an_acked_qos2_past_pubrec_resumes_with_pubrel_under_the_same_id() {
     // 5. Restart on the same data directory and resume the session.
     let mut restarted = Broker::spawn(addr, data_dir.path(), "restarted");
     restarted.wait_until_listening(addr).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // As above: attach recovery is the broker's promise (`ATTACH_RECOVERY_TIMEOUT`), so it is
+    // tested rather than pre-arranged with a sleep.
 
     let (mut resumed, session_present) = Client::connect_v311(addr, "q2-sub", false).await;
     assert!(
@@ -373,7 +377,8 @@ async fn an_acked_qos2_before_pubrec_republishes_dup_under_the_same_id() {
 
     let mut restarted = Broker::spawn(addr, data_dir.path(), "restarted");
     restarted.wait_until_listening(addr).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // As above: attach recovery is the broker's promise (`ATTACH_RECOVERY_TIMEOUT`), so it is
+    // tested rather than pre-arranged with a sleep.
 
     let (mut resumed, session_present) = Client::connect_v311(addr, "q2b-sub", false).await;
     assert!(
