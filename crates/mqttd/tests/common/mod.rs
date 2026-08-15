@@ -739,6 +739,18 @@ impl Client {
         self.expect_closed().await;
     }
 
+    /// A clean DISCONNECT carrying properties — the v5 way to change a session's
+    /// terms on the way out (§3.14.2.2.2 lets a Session Expiry Interval here
+    /// override the one agreed at CONNECT).
+    pub async fn disconnect_with(&mut self, properties: Vec<mqtt_codec::Property>) {
+        self.send(&Packet::Disconnect(mqtt_codec::packet::Disconnect {
+            reason: 0,
+            properties: mqtt_codec::Properties(properties),
+        }))
+        .await;
+        self.expect_closed().await;
+    }
+
     /// The next packet expected to be a PUBLISH.
     pub async fn expect_publish(&mut self) -> Publish {
         match self.recv().await {

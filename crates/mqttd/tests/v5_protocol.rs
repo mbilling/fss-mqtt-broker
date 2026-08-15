@@ -269,6 +269,97 @@ async fn v5_session_expires_after_interval() {
     assert!(!ack.session_present, "the session expired and was swept");
 }
 
+/// §3.14.2.2.2: a Session Expiry Interval on the DISCONNECT **overrides** the one
+/// agreed at CONNECT.
+///
+/// This is the documented way for a client to say "I connected expecting to be
+/// brief, but hold my session — I will be back". Ignoring it fails silently: the
+/// client gets a clean DISCONNECT and only discovers the loss on reconnect, with
+/// its subscriptions and queued messages gone. Found by the Eclipse
+/// `paho.mqtt.testing` oracle (`test_session_expiry`, issue #298).
+#[tokio::test]
+async fn v5_disconnect_session_expiry_overrides_the_connect_value() {
+    let addr = start_broker().await;
+    let (mut sub, _) = Client::connect_v5(
+        addr,
+        "extends-on-exit",
+        false,
+        vec![Property::SessionExpiryInterval(1)],
+    )
+    .await;
+    sub.subscribe(1, "t", QoS::AtMostOnce).await;
+    // Connected for 1s, leaving for 300 — the session must survive on the 300.
+    sub.disconnect_with(vec![Property::SessionExpiryInterval(300)])
+        .await;
+
+    // Past the CONNECT's 1s and the 1s sweep, with margin for a loaded runner. The
+    // same generous fixed wait as `v5_session_expires_after_interval`, and for the
+    // same reason: reconnecting earlier would cancel the pending expiry outright,
+    // so the wait has to straddle the window rather than probe it.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let (_sub, ack) = Client::connect_v5(
+        addr,
+        "extends-on-exit",
+        false,
+        vec![Property::SessionExpiryInterval(300)],
+    )
+    .await;
+    assert!(
+        ack.session_present,
+        "the DISCONNECT raised the expiry to 300s, so the session must outlive \
+         the 1s agreed at CONNECT [MQTT-3.14.2.2.2]"
+    );
+}
+
+/// The other half of §3.14.2.2.2, and the half that is easy to skip: if the
+/// CONNECT's interval was **0**, a non-zero one on the DISCONNECT is a Protocol
+/// Error. A session that was never meant to outlive its connection cannot be
+/// resurrected on the way out.
+#[tokio::test]
+async fn v5_disconnect_cannot_raise_an_expiry_the_connect_set_to_zero() {
+    let addr = start_broker().await;
+    let (mut sub, _) = Client::connect_v5(
+        addr,
+        "zero-then-nonzero",
+        false,
+        vec![Property::SessionExpiryInterval(0)],
+    )
+    .await;
+    sub.subscribe(1, "t", QoS::AtMostOnce).await;
+    sub.send(&mqtt_codec::Packet::Disconnect(
+        mqtt_codec::packet::Disconnect {
+            reason: 0,
+            properties: mqtt_codec::Properties(vec![Property::SessionExpiryInterval(300)]),
+        },
+    ))
+    .await;
+    // Announced, not merely closed: this is post-CONNACK, so [MQTT-4.13.2] wants
+    // the reason on the wire before the close.
+    match sub.recv().await {
+        mqtt_codec::Packet::Disconnect(d) => assert_eq!(
+            d.reason,
+            mqtt_codec::reason::PROTOCOL_ERROR,
+            "raising a zero expiry on DISCONNECT is a Protocol Error [MQTT-3.14.2.2.2]"
+        ),
+        other => panic!("expected a server DISCONNECT(0x82), got {other:?}"),
+    }
+
+    // And the refusal must not have applied the override: the session is still
+    // expiry-0, so it is gone.
+    let (_sub, ack) = Client::connect_v5(
+        addr,
+        "zero-then-nonzero",
+        false,
+        vec![Property::SessionExpiryInterval(300)],
+    )
+    .await;
+    assert!(
+        !ack.session_present,
+        "the refused override must not have been applied"
+    );
+}
+
 // --- message expiry (ADR 0009 phase 2) --------------------------------------
 
 #[tokio::test]

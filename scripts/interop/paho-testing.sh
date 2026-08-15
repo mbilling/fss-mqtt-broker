@@ -11,7 +11,7 @@
 #
 # ## The expected-failure list is a ledger, not a mute button
 #
-# Five of the suite's 27 tests do not pass, for three different reasons, and every one is
+# Four of the suite's 27 tests do not pass, for three different reasons, and every one is
 # named in EXPECTED below with its reason. The script fails if:
 #
 #   * a test outside that list fails      — a regression, or a new deviation
@@ -125,12 +125,6 @@ import re, subprocess, sys
 # name -> why it does not pass. Each entry is a claim that must stay true. The script
 # fails if one of these PASSES, so an entry cannot quietly outlive its reason.
 EXPECTED = {
-    "test_session_expiry": (
-        "REAL DEVIATION (filed): a DISCONNECT's Session Expiry Interval must override "
-        "the CONNECT's [MQTT-3.14.2.2.2]. conn.rs's DISCONNECT arm reads only `d.reason` "
-        "and drops the properties, so a client that extends its expiry on the way out "
-        "loses the session anyway. Delete this entry when the override lands."
-    ),
     "test_will_delay": (
         "REAL GAP (filed): Will Delay Interval is decoded (mqtt-codec properties 0x18) "
         "but never honoured — the Will publishes immediately instead of after the delay "

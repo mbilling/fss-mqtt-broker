@@ -737,6 +737,9 @@ where
     // per-connection alias maps (ADR 0011, ADR 0012).
     let (mut connack_props, mut inbound_aliases, mut outbound_aliases) =
         negotiate_v5_properties(connect.protocol, &connect.properties);
+    // Set only if the client's DISCONNECT overrides the interval agreed above
+    // (§3.14.2.2.2, issue #298); read once, when the `Detach` is sent.
+    let mut session_expiry_override: Option<u32> = None;
     // MQTT 5.0 §3.2.2.3.7: a client that connects with a zero-length id MUST be told
     // the id the server picked — otherwise it cannot correlate its own session, and
     // anything it reads back (audit, `%c` ACL substitution, our logs) names an
@@ -782,6 +785,8 @@ where
             .flatten(),
         &mut inbound_aliases,
         &mut outbound_aliases,
+        session_expiry,
+        &mut session_expiry_override,
     )
     .await;
     count_connection_closed(policy);
@@ -797,6 +802,7 @@ where
         client,
         conn_id,
         graceful,
+        session_expiry_override,
     });
     result.map(|_| ())
 }
@@ -1545,6 +1551,12 @@ async fn serve<R, W>(
     client_max_packet: Option<u32>,
     inbound_aliases: &mut InboundAliases,
     outbound_aliases: &mut OutboundAliases,
+    // The interval agreed at CONNECT (ADR 0009).
+    session_expiry: u32,
+    // Written when a DISCONNECT overrides it (§3.14.2.2.2, issue #298). An
+    // out-param rather than a richer return type because every `return Ok(..)` in
+    // this loop would otherwise have to carry a value only one of them can set.
+    session_expiry_override: &mut Option<u32>,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
@@ -1628,7 +1640,7 @@ where
                         // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
                         // reason, where the CLIENT asks for its Will (issue #265,
                         // [MQTT-3.1.2-10]).
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, is_v5, inbound_aliases, session_expiry, session_expiry_override).await? {
                             PacketOutcome::Continue => {}
                             PacketOutcome::ClientDisconnect => return Ok(true),
                             PacketOutcome::ClientDisconnectWithWill
@@ -2146,6 +2158,12 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     qos2_inflight: &mut usize,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
+    // The interval agreed at CONNECT, needed to spot the zero-to-non-zero
+    // Protocol Error below (§3.14.2.2.2).
+    session_expiry: u32,
+    // Set when a DISCONNECT overrides that interval; read by the caller when it
+    // sends the `Detach`.
+    session_expiry_override: &mut Option<u32>,
 ) -> Result<PacketOutcome, NetError> {
     match packet {
         Packet::Publish(publish) => {
@@ -2324,6 +2342,26 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
         Packet::Disconnect(d) => {
+            // §3.14.2.2.2: a Session Expiry Interval HERE overrides the one agreed
+            // at CONNECT — the documented way to say "hold my session, I'll be
+            // back" (issue #298). Two rules, and the second is the one that is easy
+            // to miss: a session that agreed to expiry 0 cannot be resurrected on
+            // the way out, and asking is a Protocol Error rather than a no-op.
+            if let Some(requested) = d.properties.session_expiry_interval() {
+                if session_expiry == 0 && requested != 0 {
+                    warn!(
+                        client = %client.0, requested,
+                        "DISCONNECT raises a session expiry the CONNECT set to 0"
+                    );
+                    // Post-CONNACK, so announce before closing [MQTT-4.13.2]. The
+                    // override is NOT applied — the session still expires at once.
+                    if is_v5 {
+                        let _ = disconnect(writer, reason::PROTOCOL_ERROR).await;
+                    }
+                    return Ok(PacketOutcome::BrokerClose);
+                }
+                *session_expiry_override = Some(requested);
+            }
             // Only reason 0x00 discards the Will [MQTT-3.1.2-10]: 0x04 is an
             // explicit "Disconnect with Will Message", and any other non-zero
             // reason is an abnormal end the client is reporting — either way the

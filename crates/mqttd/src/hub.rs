@@ -1362,6 +1362,11 @@ pub enum HubCommand {
         /// `true` for a clean DISCONNECT (the will is discarded); `false` for
         /// any other end (the will is published) [MQTT-3.14.4-3].
         graceful: bool,
+        /// A Session Expiry Interval carried on the client's DISCONNECT, which
+        /// overrides the one agreed at CONNECT (§3.14.2.2.2, issue #298). `None`
+        /// leaves the agreed interval in force — which is every other way a
+        /// connection can end.
+        session_expiry_override: Option<u32>,
     },
     /// Terminate a client's live session server-side (ADR 0040 T1): the eviction
     /// primitive the policy-reload sweeps drive. A v5 client is told why
@@ -2771,8 +2776,10 @@ impl Hub {
                 client,
                 conn_id,
                 graceful,
+                session_expiry_override,
             } => {
-                self.detach(&client, conn_id, graceful).await;
+                self.detach(&client, conn_id, graceful, session_expiry_override)
+                    .await;
             }
             HubCommand::Evict { client, reason } => {
                 self.evict(&client, &reason).await;
@@ -6006,10 +6013,16 @@ impl Hub {
             }));
         }
         let conn_id = online.conn_id;
-        self.detach(client, conn_id, false).await;
+        self.detach(client, conn_id, false, None).await;
     }
 
-    async fn detach(&mut self, client: &ClientId, conn_id: u64, graceful: bool) {
+    async fn detach(
+        &mut self,
+        client: &ClientId,
+        conn_id: u64,
+        graceful: bool,
+        session_expiry_override: Option<u32>,
+    ) {
         // Only act if this is still the current connection; a stale detach from a
         // connection that was already taken over must not disturb the new one.
         if self.online.get(client).map(|s| s.conn_id) != Some(conn_id) {
@@ -6032,6 +6045,19 @@ impl Hub {
             if let Some(w) = departed.and_then(|o| o.will) {
                 info!(client = %client.0, topic = %w.topic, "publishing will (ungraceful disconnect)");
                 self.publish_will(&w).await;
+            }
+        }
+        // §3.14.2.2.2 (issue #298): a Session Expiry Interval on the DISCONNECT
+        // replaces the one agreed at CONNECT, for this detach AND for the stored
+        // session — a client that reconnects without naming an interval should get
+        // the terms it last asked for, not the ones it has since revised. `conn.rs`
+        // has already refused the zero-to-non-zero case, so anything arriving here
+        // is legal to apply.
+        if let Some(secs) = session_expiry_override {
+            if secs == 0 {
+                self.session_expiry.remove(client);
+            } else {
+                self.session_expiry.insert(client.clone(), secs);
             }
         }
         // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
@@ -6823,7 +6849,7 @@ impl Hub {
             // is the named follow-up; until then the cost (one LWT per rehomed session,
             // paced by REHOME_CLOSES_PER_TICK) is documented in OPERATIONS and
             // TROUBLESHOOTING and locked by a test.
-            self.detach(&client, conn_id, false).await;
+            self.detach(&client, conn_id, false, None).await;
             // ...and NOTHING else. The close ends the CONNECTION; the session's routing,
             // its gossiped interest and the settle machinery are left exactly as they
             // were, so the session becomes an ordinary offline persistent session on a
@@ -10045,6 +10071,7 @@ mod tests {
             client: ClientId(client.into()),
             conn_id,
             graceful: true,
+            session_expiry_override: None,
         })
         .unwrap();
     }
@@ -10482,6 +10509,7 @@ mod tests {
             client: ClientId("c".into()),
             conn_id: 1,
             graceful: false,
+            session_expiry_override: None,
         })
         .unwrap();
         publish(&tx, "t", b"still-live");
@@ -10801,6 +10829,7 @@ mod tests {
             client: ClientId("sleeper".into()),
             conn_id: 1,
             graceful: true,
+            session_expiry_override: None,
         })
         .unwrap();
 
@@ -12455,6 +12484,7 @@ mod tests {
             client: ClientId("dev42".into()),
             conn_id: 2,
             graceful: false,
+            session_expiry_override: None,
         })
         .unwrap();
 
@@ -18932,6 +18962,7 @@ mod tests {
             client: ClientId("w".into()),
             conn_id: 7,
             graceful: false,
+            session_expiry_override: None,
         })
         .unwrap();
 
