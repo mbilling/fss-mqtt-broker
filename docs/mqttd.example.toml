@@ -213,9 +213,40 @@ min_replicas = "majority"
 # max_subscriptions_per_client = 1000
 # max_retained_messages = 100000
 # max_publish_rate = 10000            # msgs/sec per connection; over-rate = socket backpressure
-max_queued_messages = 100000         # per-session offline queue (default 100000)
+max_queued_messages = 100000         # per-session offline queue on DISK (default 100000)
 queue_overflow = "drop-oldest"       # or "reject-newest"
 # max_packet_size = 1048576          # inbound ceiling, bytes (default 1 MiB, floor 1 KiB)
+# --- What ONE stalled subscriber may hold in RAM (issue #241, ADR 0041 T10). These bound
+# memory per online subscriber per node; they bound NO disk (that is max_queued_messages
+# above and [durable].store_max_bytes). Read at startup only — a reload reports [limits] as
+# requires-restart. Unset, the three structures allow
+# (65 535 + 10 000 + 10 000) x max_packet_size ~= 84 GiB per stalled subscriber at the 1 MiB
+# default; watch mqttd_backlog_bytes to see the real number before capping.
+#
+# Ceiling on the EFFECTIVE outbound Receive Maximum: the broker keeps at most
+# min(client Receive Maximum, this) unacked QoS>0 publishes per subscriber. Unset = the
+# client's own value, i.e. 65 535 for every v3.1.1 client and any v5 client that sends no
+# property. Range 1-65535. This is the LOSS-FREE lever — a pure gate, the surplus waits in
+# the backlog and nothing is dropped — so reach for it before the byte cap below. It costs
+# throughput for a subscriber that legitimately keeps thousands in flight. NOT the same as
+# receive_maximum above, which is the INBOUND grant advertised to publishers.
+# max_inflight_messages = 64
+# Flow-control backlog, messages (default 10000; range 1-10000000, 0 is REFUSED — ADR 0012
+# requires this structure be bounded, so there is no "unbounded" setting).
+# max_backlog_messages = 10000
+# The same backlog in BYTES, exactly accounted (unset = OFF, which is the pre-#241
+# behaviour; minimum 4096). A message counts as 256 + topic + payload + forwarded MQTT 5
+# application-property bytes. WARNING: drop-oldest at this bound truncates messages that
+# were already stored and ACKED, and the publisher is NOT told — the same ack-and-drop arm
+# as queue_overflow, reached earlier and counted as
+# publish_dropped{reason="backlog-overflow"} (the WARN names which bound fired). Keep it
+# above max_packet_size — the broker warns otherwise — or one large message evicts the whole
+# backlog and the eviction's on-loop store truncate becomes a per-publish cost.
+# max_backlog_bytes = 134217728      # 128 MiB
+# Bytes that may sit unwritten in one client's outbound socket channel before QoS 0 is shed
+# (unset = off, minimum 4096). The fixed 10 000-PACKET cap applies either way, and only the
+# at-most-once class is shed — control packets and QoS 1/2 always flow.
+# max_outbound_bytes = 33554432      # 32 MiB
 # receive_maximum = 256              # v5 Receive Maximum (default 256, floor 1)
 # topic_alias_max = 16               # v5 Topic Alias Maximum (default 16; 0 disables)
 # Process-memory high-water mark, bytes (ADR 0041 T8). Above it the broker enters BROWNOUT:

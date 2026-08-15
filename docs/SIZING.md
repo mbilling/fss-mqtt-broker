@@ -19,7 +19,7 @@ A ready-made preset with this page's numbers: [examples/bounded-node.toml](examp
 
 ## The minimum decisions
 
-Eight numbers bound a node. Everything else has a safe default.
+Nine numbers bound a node. Everything else has a safe default.
 
 | Decision | Knob (env / TOML `[limits]` unless noted) | Ships as |
 |---|---|---|
@@ -28,13 +28,21 @@ Eight numbers bound a node. Everything else has a safe default.
 | Concurrent connections | `MQTTD_MAX_CONNECTIONS` (+ `_PER_IP`) | unset = **uncapped** |
 | Largest packet | `MQTTD_MAX_PACKET_SIZE` | 1 MiB (floor 1 KiB) |
 | Sessions the node will remember | `MQTTD_MAX_SESSIONS` | unset = **uncapped** |
-| Offline queue depth per session | `MQTTD_MAX_QUEUED_MESSAGES` + `MQTTD_QUEUE_OVERFLOW` (`drop-oldest` / `reject-newest`) | 100 000 / `drop-oldest` |
+| Offline queue depth per session (**disk**) | `MQTTD_MAX_QUEUED_MESSAGES` + `MQTTD_QUEUE_OVERFLOW` (`drop-oldest` / `reject-newest`) | 100 000 / `drop-oldest` |
+| What one stalled subscriber holds (**RAM**) | `MQTTD_MAX_BACKLOG_MESSAGES` + `MQTTD_MAX_BACKLOG_BYTES`, and `MQTTD_MAX_INFLIGHT_MESSAGES` (a wire-window gate, not loss-free — see below) | 10 000 messages / byte bound **off** / in-flight window **65 535** |
 | Retained topics | `MQTTD_MAX_RETAINED_MESSAGES` | unset = **uncapped** |
 | Brute-force cost | `MQTTD_AUTH_PENALTY_THRESHOLD` (+ `_DECAY_SECS`) | unset = **unlimited attempts** |
 
 Two more worth a conscious pass: `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` (uncapped) and
 `MQTTD_MAX_PUBLISH_RATE` (unlimited; enforcement is a socket-read pause — TCP
 backpressure — not a drop or disconnect).
+
+**Take the per-subscriber row in this order.** `MQTTD_MAX_INFLIGHT_MESSAGES` first: it is a
+pure gate on the in-flight window — the surplus waits in the backlog and **nothing is
+dropped** — and unset it is the largest of the three structures at 65 535 entries.
+`MQTTD_MAX_BACKLOG_BYTES` second, and knowingly: at that bound the broker truncates
+already-acked messages out of a slow subscriber's backlog and **does not tell the
+publisher**. Read `mqttd_backlog_bytes_max` before choosing a number (the largest single subscriber's backlog — `mqttd_backlog_bytes` is the node-wide SUM and would size the cap far too high).
 
 ## Memory: the formula
 
@@ -45,8 +53,22 @@ RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection — see the note below)
     + connections × max_packet_size            (read buffering, worst case)
     + sessions × queued_messages × avg_msg     (offline queues — THE dominant term)
     + retained_topics × avg_retained_value
-    + flow-control backlog: up to 10 000 msgs × avg_msg per slow live subscriber
+    + per slow live subscriber (RAM, issue #241 — all three now lowerable):
+        flow-control backlog:  max_backlog_bytes + 2 × (max_packet_size + 256)   [byte cap set]
+                             = max_backlog_messages × (avg_msg + 256)           [byte cap unset]
+        in-flight window:      min(client Receive Maximum, max_inflight_messages) × avg_msg
+                               [65 535 × avg_msg when the ceiling is unset]
+        outbound channel:      max_outbound_bytes, else up to 10 000 packets × avg_msg
 ```
+
+The three per-subscriber terms **over**-count rather than under-count: payloads are
+refcounted, so a message counted in both the in-flight table and the outbound channel holds
+one allocation. The `+ 256` is the per-entry envelope the byte accounting charges, and the
+`2 ×` in the byte-capped row is the one entry that may exceed the whole cap (kept so
+delivery still progresses) plus one already-admitted re-parked entry. `max_backlog_bytes` is
+a bound on *message bytes held for one subscriber* — the sum of `256 + topic + payload +
+forwarded application properties` over the resident entries — not an RSS measurement, which
+is why this formula keeps its own slack rather than treating the cap as a ceiling.
 
 > **Where the base term comes from, honestly.** The ~70 MiB / ~15 KiB figures are from an
 > unpublished dev-grade run of `bench/` (its `results/` directory is untracked scratch), so
@@ -61,17 +83,25 @@ RSS ≈ base (~70 MiB idle + ~15 KiB per idle connection — see the note below)
 > floor.
 
 The offline-queue term is why the 100 000-message default must be re-decided on a
-bounded node: it is sized for *one important session*, not for thousands. **The queue
-caps are message counts, not bytes** — the byte a message costs is whatever
-`max_packet_size` allows, so the two knobs only bound memory *together* (a byte-based
-cap, `max_queued_bytes`, is accepted work — ADR 0041 amendment T6).
+bounded node: it is sized for *one important session*, not for thousands. **The offline
+queue's cap is a message count, not bytes** — the byte a message costs is whatever
+`max_packet_size` allows, so those two knobs only bound *disk* together (a byte-based cap
+for the offline queue, mosquitto's `max_queued_bytes`, is still accepted work — ADR 0041
+amendment T6; issue #241 deliberately did not claim it, because getting it exact needs a
+*persisted* per-session counter and a counter that drifts fires the cap at the wrong time).
+The **in-memory** flow-control backlog is bounded in bytes as of issue #241
+(`MQTTD_MAX_BACKLOG_BYTES`): that knob bounds RAM per online subscriber, per node, and
+bounds **no disk** — though a byte eviction does release its entry's offset and truncate, so
+it shrinks the durable log *earlier*.
 
 Fixed internal bounds you get for free (hard-coded, not configurable — listed so your
-arithmetic can include them):
+arithmetic can include them). The flow-control backlog left this table in issue #241: it is
+two knobs now (`MQTTD_MAX_BACKLOG_MESSAGES`, `MQTTD_MAX_BACKLOG_BYTES`), and the outbound
+channel's *packet* count stays here while its *bytes* became `MQTTD_MAX_OUTBOUND_BYTES`:
 
 | Internal bound | Value |
 |---|---|
-| Flow-control backlog per session | 10 000 msgs, drop-oldest |
+| Outbound socket channel per connection, **packets** | 10 000; `QoS` 0 over it is shed and counted (`publish_dropped{reason="outbound-full"}`), control packets and `QoS` 1/2 always flow. Its *bytes* are `MQTTD_MAX_OUTBOUND_BYTES` |
 | Replay to a resuming session | 10 000 msgs |
 | Pending publishes awaiting durability | 4 096, ack withheld |
 | Durable-append lane per session (issue #242) | 256 jobs (appends and QoS 2 outbound-id records share the cap), reject-newest (ack withheld), plus 16 reserved control slots for detach-spill/discard jobs; payload bytes are refcounted clones of the pending entry's, so the added cost per job is the message envelope, not a second payload copy |
@@ -331,11 +361,28 @@ Printed here so nobody discovers it in production:
 | Offline queue **bytes** | Message count only (`MQTTD_MAX_QUEUED_MESSAGES`) | 0041-T6 |
 | Bridge-spool **bytes** | Message count only (default 10 000) | 0041-T7 |
 | Per-store disk share | Aggregate watermark, plus a WARN naming any store over 70% of it and the `store_bytes{store}` gauge; no per-store *refusal* — and `replicas`/`lease` have no client write to refuse | 0041-T9 |
-| Per-connection **write** buffering | Two hard-coded count caps, neither in bytes and neither configurable: `MAX_BACKLOG` (10 000 messages, QoS 1/2, drop-oldest) and the outbound queue (10 000 packets, QoS 0, shed and counted) | 0041-T10 |
+| Per-connection **write** buffering: the outbound channel's **packet** count | Still the hard-coded 10 000 packets (its *bytes* are `MQTTD_MAX_OUTBOUND_BYTES` since issue #241) | 0041-T10 |
+| Refusing a **publisher** instead of shedding acked entries at the backlog byte bound | Nothing — the bound sheds, and the publisher is not told | 0041-T15 |
 
-The last row is the sharpest edge: a subscriber that stops reading can hold up to
-10 000 messages, and at the 1 MiB default packet size that is ~10 GiB of headroom per
-connection that no setting can lower. Cap `MQTTD_MAX_PACKET_SIZE` to bound it in
-practice — the product of the two is the real worst case.
+**The per-subscriber write path, corrected (issue #241).** The earlier "~10 GiB per
+connection that no setting can lower" counted **one** of three per-subscriber in-memory
+structures. Unset, a stalled subscriber can hold the in-flight window (**65 535** entries —
+every v3.1.1 client and any v5 client that sends no Receive Maximum gets `u16::MAX`), the
+flow-control backlog (10 000), and the outbound channel (10 000 packets): at the 1 MiB
+default packet size that is `(65 535 + 10 000 + 10 000) x max_packet_size` ≈ **84 GiB**, not
+10 GiB. All three are lowerable now — `MQTTD_MAX_INFLIGHT_MESSAGES` (a gate on the wire window — it drops
+nothing itself, but the surplus it holds back waits in the drop-oldest backlog, so it is not
+loss-free),
+`MQTTD_MAX_BACKLOG_MESSAGES` / `MQTTD_MAX_BACKLOG_BYTES` (drop-oldest), and
+`MQTTD_MAX_OUTBOUND_BYTES` (`QoS` 0 shed) — and capping `MQTTD_MAX_PACKET_SIZE` still
+multiplies through every term.
 
-All five are recorded losses in [COMPARISON.md](COMPARISON.md).
+Two things to know before setting the byte bound low. It sheds messages that were already
+**stored and acked**, without telling the publisher — the same ack-and-drop arm the
+offline-queue cap has, reached earlier. And each eviction runs one on-loop store truncate,
+so a bound below `max_packet_size` turns a rare path into a per-publish one and shows up in
+`mqttd_hub_dispatch_seconds`'s `publish` class (startup warns when you configure that;
+routing the truncate through the session's append lane is the ADR 0061 residual that fixes
+it).
+
+All of these are recorded losses in [COMPARISON.md](COMPARISON.md).

@@ -118,6 +118,8 @@ struct OtelInstruments {
     subscriptions: OtelGauge<i64>,
     retained_messages: OtelGauge<i64>,
     inflight_messages: OtelGauge<i64>,
+    backlog_bytes: OtelGauge<i64>,
+    backlog_bytes_max: OtelGauge<i64>,
     cluster_members: OtelGauge<i64>,
     peer_links: OtelGauge<i64>,
     replication_desired: OtelGauge<i64>,
@@ -183,6 +185,8 @@ impl OtelInstruments {
             subscriptions: meter.i64_gauge("subscriptions").build(),
             retained_messages: meter.i64_gauge("retained_messages").build(),
             inflight_messages: meter.i64_gauge("inflight_messages").build(),
+            backlog_bytes: meter.i64_gauge("backlog_bytes").build(),
+            backlog_bytes_max: meter.i64_gauge("backlog_bytes_max").build(),
             cluster_members: meter.i64_gauge("cluster_members").build(),
             peer_links: meter.i64_gauge("peer_links").build(),
             replication_desired: meter.i64_gauge("replication_desired").build(),
@@ -263,6 +267,8 @@ pub struct Metrics {
     subscriptions: Gauge,
     retained_messages: Gauge,
     inflight_messages: Gauge,
+    backlog_bytes: Gauge,
+    backlog_bytes_max: Gauge,
     cluster_members: Gauge,
     replication_desired: Gauge,
     replication_min_actual: Gauge,
@@ -475,6 +481,19 @@ impl Metrics {
             &mut registry,
             "inflight_messages",
             "Unacknowledged QoS>0 messages outstanding to clients",
+        );
+        let backlog_bytes = register_gauge(
+            &mut registry,
+            "backlog_bytes",
+            "Accounted bytes held in flow-control backlogs across sessions (sampled on the \
+             session sweep, not live)",
+        );
+        let backlog_bytes_max = register_gauge(
+            &mut registry,
+            "backlog_bytes_max",
+            "Accounted bytes held by the LARGEST single session's flow-control backlog \
+             (sampled on the session sweep, not live) — the number to size a PER-SUBSCRIBER \
+             cap against, since backlog_bytes sums every session",
         );
         let cluster_members = register_gauge(
             &mut registry,
@@ -779,6 +798,8 @@ impl Metrics {
             subscriptions,
             retained_messages,
             inflight_messages,
+            backlog_bytes,
+            backlog_bytes_max,
             cluster_members,
             peer_links,
             replication_desired,
@@ -917,8 +938,8 @@ impl Metrics {
     /// |---|---|
     /// | `no-subscriber` | nothing matched the topic |
     /// | `queue-overflow` | the durable session queue hit its cap (ADR 0001 §6) |
-    /// | `backlog-overflow` | the flow-control backlog hit `MAX_BACKLOG` (ADR 0012) |
-    /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) |
+    /// | `backlog-overflow` | the flow-control backlog hit one of its configured bounds — `MQTTD_MAX_BACKLOG_MESSAGES` or `MQTTD_MAX_BACKLOG_BYTES` (ADR 0012, 0041-T10, issue #241). Already-acked entries are truncated and the publisher is NOT told; the WARN line names which bound fired (`bound="messages"`, `"bytes"`, or `"messages+bytes"` when one arrival tripped both) and how many entries went. A byte bound below `MQTTD_MAX_PACKET_SIZE` makes this routine |
+    /// | `outbound-full` | a `QoS` 0 shed for a subscriber that stopped reading (#123) — at the fixed 10 000-packet cap or at `MQTTD_MAX_OUTBOUND_BYTES`; the WARN line names which |
     /// | `pending-cap` | the pending-publish table hit `PENDING_PUBLISH_CAP`, so the oldest unacknowledged publish was dropped and its publisher's ack withheld (ADR 0042 T9) |
     /// | `append-backlog-full` | a session's durable-append lane hit `LANE_QUEUE_CAP` (issue #242): the NEWEST job was rejected at submit (reject-newest keeps the lane FIFO). An answerable publish is WITHHELD (fail closed, the publisher retries); an unanswerable one is a genuine drop. Watch `append_lane_jobs` for the pre-drop warning |
     /// | `brownout` | a durable copy lost above the watermark that NOBODY was told about: a `QoS` 0 offline enqueue (nothing was owed), or an UNGATED publish with no publisher to answer — a Will, a retained-window back-fill — whose live delivery still happens. A `QoS` >= 1 refusal a publisher IS told about is `quota_rejections_total{reason="brownout-publish"}` instead, because it was answered rather than lost (issue #238) |
@@ -990,6 +1011,34 @@ impl Metrics {
     pub fn set_inflight_messages(&self, n: usize) {
         self.inflight_messages.set(clamp_gauge(n));
         self.otel.inflight_messages.record(clamp_gauge(n), &[]);
+    }
+
+    /// Set the accounted bytes currently held in flow-control backlogs, summed across
+    /// sessions (issue #241).
+    ///
+    /// **Sampled on the session sweep**, not live: it is a sizing and capacity-planning
+    /// signal — the number an operator reads *before* choosing `MQTTD_MAX_BACKLOG_BYTES`
+    /// and watches after — not an alerting edge. "Accounted" is the size definition in
+    /// `mqttd::backpressure`: the per-entry envelope plus topic, payload and forwarded
+    /// application properties; it is a sum of message bytes, not a heap measurement, so
+    /// real RSS is somewhat higher.
+    pub fn set_backlog_bytes(&self, n: usize) {
+        self.backlog_bytes.set(clamp_gauge(n));
+        self.otel.backlog_bytes.record(clamp_gauge(n), &[]);
+    }
+
+    /// Set the LARGEST single session's accounted backlog bytes.
+    ///
+    /// This exists because [`set_backlog_bytes`](Self::set_backlog_bytes) is a node-wide SUM,
+    /// and the cap an operator sizes from it — `MQTTD_MAX_BACKLOG_BYTES` — is **per
+    /// subscriber**. On a node with many sessions the sum is arbitrarily larger than what any
+    /// one subscriber holds, so sizing a per-subscriber cap from it yields a number far too
+    /// large (found in review: four documents told the operator to do exactly that). The max
+    /// is the honest input to that decision; the sum still answers "how much RAM is in
+    /// backlogs on this node".
+    pub fn set_backlog_bytes_max(&self, n: usize) {
+        self.backlog_bytes_max.set(clamp_gauge(n));
+        self.otel.backlog_bytes_max.record(clamp_gauge(n), &[]);
     }
 
     /// Set the current count of placement-eligible cluster members (ADR 0020-T6).

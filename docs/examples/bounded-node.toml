@@ -52,8 +52,8 @@ max_packet_size = 262144
 # RAM/disk driver #2 — THE dominant term: sessions × queued × message size.
 # The default (100 000/session) is sized for one important session, not thousands.
 # 5000 sessions × 500 msgs × 4 KiB avg ≈ 9.8 GiB durable worst case, inside the
-# store mark above. NOTE these are COUNT caps: they bound bytes only together with
-# max_packet_size (a byte-based cap is tracked as ADR 0041 amendment work).
+# store mark above. NOTE this is a COUNT cap on DISK: it bounds bytes only together
+# with max_packet_size (a byte cap for the OFFLINE queue is still ADR 0041 T6).
 max_sessions = 5000
 max_queued_messages = 500
 # Both overflow policies ack-and-drop at the cap — senders are NEVER told (the
@@ -64,6 +64,24 @@ queue_overflow = "drop-oldest"   # or "reject-newest"
 # Retained: 50 000 × 4 KiB avg ≈ 0.2 GiB. New topics beyond the cap are refused
 # (0x97); overwriting or clearing an existing topic is always allowed.
 max_retained_messages = 50000
+
+# RAM driver #3 — what ONE stalled subscriber holds in memory (issue #241). Unset,
+# these three structures allow (65 535 + 10 000 + 10 000) × max_packet_size ≈ 21 GiB
+# per stalled subscriber at the 256 KiB packet size above. Set here to ~0.15 GiB:
+#
+#   in-flight window   64 × 256 KiB      = 16 MiB   (a GATE: nothing is dropped)
+#   backlog byte cap                       128 MiB  (drop-oldest — see the warning)
+#   outbound channel                       32 MiB   (QoS 0 shed only)
+#
+# Take max_inflight_messages FIRST: it is loss-free. max_backlog_bytes evicts entries
+# that were already stored and ACKED, and the publisher is not told — the same
+# ack-and-drop arm as queue_overflow, reached earlier. Keep it above max_packet_size
+# (the broker warns otherwise) or one large message evicts the whole backlog and the
+# eviction's on-loop truncate becomes a per-publish cost.
+max_inflight_messages = 64
+max_backlog_messages = 10000
+max_backlog_bytes = 134217728
+max_outbound_bytes = 33554432
 
 max_subscriptions_per_client = 1000
 # Per-connection publish rate; enforcement is TCP backpressure (pause), never a drop.
