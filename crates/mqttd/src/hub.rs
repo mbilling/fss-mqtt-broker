@@ -10107,7 +10107,11 @@ mod tests {
     /// which was true for `QoS 1/2` and false here.
     ///
     /// The receiver is deliberately never drained — that is the whole scenario.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_qos0_subscriber_is_shed_not_queued_without_limit() {
         let tx = start_hub();
         // Held and never read from: this client has stopped consuming.
@@ -11699,7 +11703,11 @@ mod tests {
     /// #198: **Retain Handling** (MQTT 5 §3.8.3.1) — `2` never replays retained at subscribe,
     /// `1` replays only for a NEW subscription, `0` (default) always replays. A re-forwarder
     /// (the boundary bridge) uses `2` to avoid a retained replay storm on every reconnect.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn retain_handling_controls_the_replay_at_subscribe() {
         let tx = start_hub();
         // Seed a retained value.
@@ -12738,7 +12746,11 @@ mod tests {
     /// SHARED frame under the same seq. The single-constructor invariant across kinds: a
     /// retransmit that ignored the obligation's kind would fan a `PublishAcked` out to
     /// every matching ordinary subscriber on the peer instead of the chosen member.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn an_unanswered_shared_forward_holds_the_ack_and_retransmits_the_shared_frame() {
         let tx = start_hub();
         let mut peer = connect_peer_at_proto(&tx, "n2", 1, 7);
@@ -14754,7 +14766,11 @@ mod tests {
     /// This models the restart directly: a fresh hub (empty `retained_tokens`, as after a
     /// process start) with the durable record already holding the committed TOMBSTONE, then
     /// a peer snapshot offering the stale pre-clear value.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_cleared_retained_topic_is_not_resurrected_after_a_restart() {
         let durable = Arc::new(FlakyRetained::default());
         durable.heal();
@@ -15310,7 +15326,11 @@ mod tests {
     /// once the window has closed, the apply path never delivers — the
     /// interest-forward path is the only vehicle, so established subscribers see
     /// each retained update exactly once. The value still applies to the cache.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn the_apply_path_stays_silent_once_the_window_has_closed() {
         let (tx, _durable, _placement) = start_hub_with_durable_retained(&[]);
         let (mut sub, _) = attach(&tx, "settled", 1, true).await;
@@ -15453,7 +15473,11 @@ mod tests {
     /// blocks the reap indefinitely. The fence outlives every possible stale
     /// holder; that is the whole point of gating on the durable roster instead of
     /// live gossip.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn an_unconverged_or_unnameable_roster_member_blocks_the_reap() {
         let (tx, durable, clock, placement) = start_durable_hub_with_clock();
         set_roster_on(&placement, &["hub-test", "n"], 0);
@@ -15492,7 +15516,11 @@ mod tests {
     /// Issue #229: a value re-taking a cleared topic ends the tombstone's
     /// discharge bookkeeping — the fence is a value token again and is never
     /// reaped as if it were a clear.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_recreated_topic_leaves_the_discharge_clock() {
         let (tx, durable, clock, placement) = start_durable_hub_with_clock();
         set_roster_on(&placement, &["hub-test"], 0); // roster of one: vacuously converged
@@ -15674,7 +15702,11 @@ mod tests {
     ///
     /// So the assertion is not merely "the write failed": it is that the topic is still
     /// REPAIRABLE afterwards, by the two paths that were previously fenced out.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_failed_retained_store_write_leaves_the_topic_repairable() {
         let store = FailingRetainedStore::new();
         let (mut hub, tx) = Hub::with_config_and_placement(
@@ -16899,7 +16931,11 @@ mod tests {
     /// sweep tick and comes straight back (assigner rebalance, leader change) must
     /// NOT cost a live client its connection — that churn is ordinary convergence,
     /// not a session placed across an ownership move.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_transient_ownership_blip_does_not_close_a_live_session() {
         let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
         let client = "blip-284";
@@ -16938,7 +16974,11 @@ mod tests {
     /// ring/lease split the 2026-07-20 post-mortem describes. The data path is right
     /// to fail closed on it; DISRUPTING a live client on it would close healthy
     /// sessions during ordinary convergence.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_group_with_no_committed_lease_is_never_rehomed() {
         let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
         // A client the HRW ring hands to the remote node, with no lease anywhere.
@@ -16979,7 +17019,11 @@ mod tests {
     /// an unbounded close/reconnect loop. The session stays (still undeliverable),
     /// and says so through `session_rehomes{reason="unrelocatable"}` and the
     /// misplaced-sessions gauge.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn an_unrelocatable_owner_is_counted_not_closed() {
         // Eligible remote member, no address learned.
         let (tx, placement, remote, metrics) = start_rehome_hub("").await;
@@ -17014,7 +17058,11 @@ mod tests {
     /// returning it there) is not closed again immediately — otherwise the fix is a
     /// close loop, and a will-publish loop with it. The suppressed repeat is
     /// counted so a standing flap is loud rather than silent.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_rehomed_session_is_not_closed_again_within_the_cooldown() {
         let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
         let client = "flapper-284";
@@ -17602,7 +17650,11 @@ mod tests {
     /// only arises when a lease moves. Gated on the placement's ownership version, a
     /// steady-state tick does no scanning at all — and (the half that could silently break)
     /// a lease that DOES move is still noticed on the very next tick.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn the_rehome_scan_is_skipped_while_ownership_has_not_moved() {
         let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
         let client = "epoch-284";
@@ -17651,7 +17703,11 @@ mod tests {
     ///
     /// The trigger is seeded at the attach instead of by deleting the skip: one committed
     /// -owner read per persistent attach, nothing per tick.
-    #[tokio::test]
+    // Virtual clock (issue #260): the waits in this test are exact advances of the
+    // hub's own intervals, not wall-clock guesses. Paused time only advances when
+    // every task is idle, so "the hub has settled, now move on" is deterministic
+    // and free — which is strictly stronger than sleeping and hoping.
+    #[tokio::test(start_paused = true)]
     async fn a_session_that_becomes_misplaced_by_attaching_is_rehomed() {
         let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
         let client = "latecomer-284";
@@ -18145,6 +18201,11 @@ mod tests {
             }
             let delay = self.slow_first.lock().unwrap().remove(&client.0);
             if let Some(delay) = delay {
+                // SETTLE(store-slow-first-enqueue): the delay IS the fault. `slow_first` makes
+                // one enqueue slow so a caller racing it can be observed, and there is nothing
+                // to poll for — the observation would be the latency being injected. The value
+                // comes from the test that armed it, and a slow machine only makes the injected
+                // store slower, which is still a valid instance of the fault.
                 tokio::time::sleep(delay).await;
             }
             // The queue-cap reject-newest model (issue #242 finding C): the next

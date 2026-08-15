@@ -1428,7 +1428,15 @@ async fn durable_path_floor() {
                 }
             );
             all[ai].1.push(st);
-            tokio::time::sleep(Duration::from_secs(2)).await; // let the stores settle
+            // SETTLE(bench-inter-arm-quiesce): a MEASUREMENT boundary, not a wait for a state.
+            // Rep N's redb write amplification and compaction continue after its last ack, and
+            // charging that tail to rep N+1 is how a benchmark reports a regression that is
+            // really its own predecessor. No observable exists for "the store has finished
+            // catching up" — that is precisely what a storage engine does not expose — so the
+            // arms are separated by a fixed quiesce instead. On a slow machine 2 s covers
+            // proportionally less of the tail, which biases the numbers PESSIMISTIC (worse, not
+            // better), and every run prints its own verdict rather than comparing across runs.
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
@@ -1757,8 +1765,27 @@ async fn degraded_group_does_not_delay_other_groups() {
             }
         }
         if name == "healed" {
-            // Let the replication backlog drain before measuring the recovery.
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            // The backlog has drained when the owner's own metrics say every replica group is
+            // back at its write floor — `mqttd_replication_min_actual >= write_floor` is the
+            // series this whole file is built on, and it is the exact condition a 15 s sleep was
+            // hoping for. Polling it means the recovery phase starts when recovery has HAPPENED,
+            // so the measurement is of a healed cluster rather than of whatever state 15 s
+            // produced on this particular machine.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let s = Scrape::of(owner_health).await;
+                if s.get("mqttd_replication_min_actual") >= s.get("mqttd_replication_write_floor") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the replication backlog never drained after the heal: min_actual {} stayed \
+                     below write_floor {} for 120s, so no 'healed' measurement is meaningful",
+                    s.get("mqttd_replication_min_actual"),
+                    s.get("mqttd_replication_write_floor")
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
         let r = isolation_phase(
             owner_addr,
@@ -2112,7 +2139,10 @@ async fn isolation_phase(
 async fn multi_host_preflight() {
     let cfg = Cfg::from_env();
     if std::env::var("MQTTD_BENCH_BROKERS").is_err() {
-        println!(
+        // Fatal under CI: if a job ever runs this with `--ignored`, a preflight that reports
+        // success without contacting a single broker is exactly the vacuous pass issue #260
+        // is about — the lane must be visibly UNRUN, not quietly OK.
+        crate::skip_locally_or_fail_in_ci!(
             "\n# Multi-host lane: NOT RUN (no MQTTD_BENCH_BROKERS)\n\n\
              This is the lane ADR 0048 §2 requires for any scaling or capacity claim, and it\n\
              has no numbers in this repository. To produce them, provision one broker per host\n\
@@ -2126,7 +2156,6 @@ async fn multi_host_preflight() {
              \x20   -- --ignored --nocapture\n\n\
              The driver is the same code either way: with these set, nothing is spawned."
         );
-        return;
     }
     let mut cl = cluster(&cfg).await;
     println!(

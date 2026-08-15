@@ -295,6 +295,12 @@ async fn lease_group_forms_and_is_stable_under_slow_durable_commits() {
 
     // And the leader holds: the term does not keep climbing over the window.
     let term_before = nodes.iter().map(|n| n.plane.lease_role().1).max().unwrap();
+    // SETTLE(lease-term-stability-window): the property is a NEGATIVE — the term does not keep
+    // climbing — and a negative about the future needs a window to observe. There is no event
+    // meaning "it has stopped re-electing"; only an interval with no term advance shows it. 5 s
+    // is many raft election timeouts under the injected slow-commit knob. On a slow machine the
+    // window covers MORE election opportunities, so the failure mode is one-sided: it can fail
+    // a genuinely unstable group more readily, never pass one falsely.
     tokio::time::sleep(Duration::from_secs(5)).await;
     let term_after = nodes.iter().map(|n| n.plane.lease_role().1).max().unwrap();
     let leaders = nodes.iter().filter(|n| n.plane.lease_role().0).count();

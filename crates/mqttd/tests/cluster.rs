@@ -389,6 +389,77 @@ async fn retained_on(addr: SocketAddr, id: &str, topic: &str) -> Option<Vec<u8>>
     }
 }
 
+/// A probe that can tell whether a peer link is actually down.
+///
+/// Severing a link has no positive observable in this harness: `sever` aborts the dial tasks,
+/// the far peer learns of it when its socket reads EOF and then drops its routing, and nothing
+/// the test can reach reports that — the hub's `peer_links` gauge is a process-global registry
+/// and one test binary runs several in-process nodes into it, so a count there cannot be
+/// attributed to two particular nodes. What this DOES remove is the vacuity a bare wait leaves
+/// behind: if the link were still up, every assertion about the partition would hold for a
+/// cluster that was never partitioned, and the test would pass having checked nothing.
+///
+/// It must be **armed before the sever**, and that is not incidental. Cross-node routing is
+/// interest-gossip driven, so a subscription registered *after* the partition would never reach
+/// the far node and "nothing crossed" would say nothing about the link. Arming proves the probe
+/// crosses while the link is up, which is what makes a later non-crossing evidence.
+///
+/// Ordinary (non-retained) publishes are used deliberately. A retained write needs a quorum
+/// commit, so on a partitioned cluster it cannot land even on its own node — the first version
+/// of this probe used one and failed for exactly that reason, which is the CP behaviour these
+/// tests exist to assert.
+struct PartitionProbe {
+    watcher: Client,
+    src: Client,
+    topic: String,
+}
+
+impl PartitionProbe {
+    /// Subscribe on `watch_on`, publish from `publish_on`, and do not return until the probe
+    /// has crossed at least once.
+    async fn arm(watch_on: SocketAddr, publish_on: SocketAddr, tag: &str) -> Self {
+        let topic = format!("partition-probe/{tag}");
+        let mut watcher = Client::connect(watch_on, &format!("pp-w-{tag}")).await;
+        watcher.subscribe(&topic).await;
+        let mut src = Client::connect(publish_on, &format!("pp-s-{tag}")).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            src.publish(&topic, b"probe").await;
+            if watcher.recv().await.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the partition probe never crossed while the link was UP, so it could not \
+                 detect a partition afterwards"
+            );
+        }
+        Self {
+            watcher,
+            src,
+            topic,
+        }
+    }
+
+    /// Assert the link is now down: the probe no longer crosses.
+    async fn assert_severed(&mut self) {
+        // Stragglers from the arming phase would read as "still crossing".
+        for _ in 0..20 {
+            if self.watcher.recv().await.is_none() {
+                break;
+            }
+        }
+        for _ in 0..3 {
+            self.src.publish(&self.topic, b"probe").await;
+        }
+        assert!(
+            self.watcher.recv().await.is_none(),
+            "a publish crossed the severed link: no partition was in effect, so every \
+             assertion about one below would have been vacuous"
+        );
+    }
+}
+
 /// The retained (payload, properties) a fresh **MQTT 5** subscriber replays for
 /// `topic` on the node at `addr`, or `None` if that node's cache holds nothing.
 /// `id` must be unique per call.
@@ -488,10 +559,20 @@ async fn retained_mqtt5_properties_replay_from_any_nodes_cache() {
 
     // 3: sever, commit an update with DIFFERENT properties on the owner, heal —
     // the non-owner must converge to the new payload AND the new properties.
+    let mut probe = PartitionProbe::arm(cli_b, cli_a, "props").await;
     for d in dials {
         d.abort();
     }
+    // SETTLE(cluster-sever-eof-props): the state being settled is "the far peer has read the
+    // EOF from the aborted dial and dropped its routing". There is no observable for it here
+    // (see `assert_partitioned`), and the peer's own view is not reachable from a test binary
+    // that runs several in-process nodes into one process-global metric registry. A FIN on a
+    // loopback socket is kernel-fast rather than load-dependent, so a slow machine delays only
+    // the far hub's handling of it — which this wait absorbs, and which `assert_partitioned`
+    // then verifies rather than assumes. Closing this properly needs a hub inspection command
+    // (`peer_links` for THIS hub); issue #260 records the ask.
     tokio::time::sleep(Duration::from_millis(400)).await;
+    probe.assert_severed().await;
 
     let props_v2 = mqtt_codec::Properties(vec![
         Property::ContentType("text/plain".into()),
@@ -605,10 +686,19 @@ async fn divergent_retained_writes_across_a_partition_converge_after_heal() {
     }
 
     // PARTITION: sever the mesh; give both sides a moment to observe the EOFs.
+    let mut probe = PartitionProbe::arm(cli_a, cli_b, "divergent").await;
     for d in dials {
         d.abort();
     }
+    // SETTLE(cluster-sever-eof-divergent): as above — "the far peer has read the EOF and
+    // dropped its routing" has no observable in this harness, the process-global `peer_links`
+    // gauge cannot be attributed to two of the several nodes this binary runs, and a loopback
+    // FIN is kernel-fast so a slow machine only delays the far hub's handling of it. The wait
+    // absorbs that; `assert_partitioned` then proves the partition rather than trusting it,
+    // which is what matters here — a write from B that still reached the owner would make the
+    // "B is stale, not divergent" assertion below pass with no partition at all.
     tokio::time::sleep(Duration::from_millis(400)).await;
+    probe.assert_severed().await;
 
     // Divergent writes: A's commits on the majority side; B's cannot reach the
     // owner and queues (ADR 0037 §5) — B keeps serving the last committed value.

@@ -349,7 +349,11 @@ mod tests {
     /// Approaching the mark shortens the next scan, so the crossing is caught an order
     /// of magnitude inside the configured cadence — this is the whole overshoot bound
     /// the docs quote (issue #243).
-    #[tokio::test]
+    // Virtual clock (`start_paused`): every wait in this test is then an exact number of the
+    // watcher's own injected poll cycles rather than a wall-clock guess, and it costs no real
+    // time. Tokio advances to the next timer only when the runtime is idle, so "N cycles have
+    // happened" becomes deterministic — which is what a test about poll cadence needs.
+    #[tokio::test(start_paused = true)]
     async fn nearing_the_watermark_shortens_the_poll_so_overshoot_is_bounded() {
         let dir = temp_dir("near");
         let _ = std::fs::remove_dir_all(&dir);
@@ -491,7 +495,11 @@ mod tests {
     /// The watcher is edge-triggered: crossing the watermark sends
     /// `SetBrownout(true)`, dropping back under it sends `SetBrownout(false)`,
     /// and steady states send nothing further.
-    #[tokio::test]
+    // Virtual clock (`start_paused`): every wait in this test is then an exact number of the
+    // watcher's own injected poll cycles rather than a wall-clock guess, and it costs no real
+    // time. Tokio advances to the next timer only when the runtime is idle, so "N cycles have
+    // happened" becomes deterministic — which is what a test about poll cadence needs.
+    #[tokio::test(start_paused = true)]
     async fn the_watcher_drives_brownout_on_watermark_transitions() {
         let dir = temp_dir("edge");
         std::fs::write(dir.join("sessions.redb"), vec![0u8; 10]).unwrap();

@@ -62,6 +62,19 @@ cleanup() {
 trap cleanup EXIT
 
 pass() { echo "  ok   — $1"; }
+# --- CI-fatal skips (issue #260) -------------------------------------------------------
+# A skip that prints a note and exits 0 is indistinguishable from a pass, so coverage can
+# vanish on the platform that gates merges without anything going red. Allowed locally,
+# fatal under CI (GitHub Actions sets CI=true on every runner). `skip_permitted` is the one
+# deliberate exception: a lane that genuinely cannot run in CI stays green and says why.
+skip_or_fail() {
+  if [ "${CI:-}" = "true" ]; then
+    echo "FATAL: environmental skip taken under CI — coverage would silently vanish: $1" >&2
+    exit 1
+  fi
+  echo "  SKIP (local only; fatal under CI) — $1"
+}
+skip_permitted() { echo "  SKIP (permitted in CI by design) — $1"; }
 fail() { echo "  FAIL — $1"; exit 1; }
 
 # The broker's tracing output carries ANSI escapes even when redirected to a file, and they
@@ -75,7 +88,7 @@ logshow() { sed $'s/\033\\[[0-9;]*m//g' "$1"; }
 
 MQTTD_BIN="${MQTTD_BIN:-}"
 if [ -z "$MQTTD_BIN" ]; then
-  echo "building mqttd (set MQTTD_BIN to skip)…"
+  echo "building mqttd (set MQTTD_BIN to reuse an existing build)…"
   cargo build --quiet -p mqttd --manifest-path "$REPO_ROOT/Cargo.toml"
   MQTTD_BIN="$REPO_ROOT/target/debug/mqttd"
 fi
@@ -262,7 +275,7 @@ if command -v kubeconform >/dev/null 2>&1; then
     < "$WORK/render.yaml" >/dev/null || fail "the bus-on render is not schema-valid"
   pass "the bus-on render passes kubeconform"
 else
-  echo "  SKIP — kubeconform not installed (CI installs it; schema check not run here)"
+  skip_or_fail "kubeconform not installed, so the bus-on render was NOT schema-validated"
 fi
 
 # The preflight must actually fire for an ordinal with no leaf — the scale-up case.
@@ -383,12 +396,12 @@ pass "a broker refuses to start on the RSA leaf (\"gossip signing key\"), exit $
 # ─────────────────────────────────────────────────────────────────────────────────
 echo "── 6. two nodes link and reach a 2-member readiness floor ──"
 if [ "$REPLICAS" -lt 2 ]; then
-  echo "  SKIP — REPLICAS=$REPLICAS, nothing to link"
+  skip_or_fail "REPLICAS=$REPLICAS, so the two-node link and the readiness floor were NOT exercised"
 elif ! sudo -n true 2>/dev/null; then
-  echo "  SKIP LOUDLY — no passwordless sudo, so the pod FQDNs cannot be pointed at"
-  echo "                loopback in /etc/hosts. Rules 1 and 2 are checked statically in"
-  echo "                section 2 and end-to-end by scripts/k8s/kind-smoke.sh (nightly),"
-  echo "                which has real per-pod DNS. CI runs this section."
+  skip_or_fail "no passwordless sudo, so the pod FQDNs cannot be pointed at loopback in \
+/etc/hosts and rules 1 and 2 were NOT exercised end-to-end here (they are checked \
+statically in section 2 and end-to-end by scripts/k8s/kind-smoke.sh in nightly, which has \
+real per-pod DNS). CI has passwordless sudo, so this is fatal there."
 else
   {
     printf '127.0.0.1 %s # mqttd-peer-tls-check\n' "${ADV[0]%:*}"

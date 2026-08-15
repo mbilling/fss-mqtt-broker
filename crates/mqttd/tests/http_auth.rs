@@ -80,7 +80,13 @@ async fn stub_hook(answer: Answer) -> (SocketAddr, Arc<AtomicUsize>) {
                         b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
                     }
                     Answer::Hang => {
-                        // Never answer. The broker's own timeout must end this.
+                        // SETTLE(http-auth-hang-stub): this is not a wait for anything — it IS
+                        // the fault being injected. `Answer::Hang` models an upstream that never
+                        // answers, so the stub must hold the connection open and produce
+                        // nothing; 60 s is simply "longer than the broker's own auth timeout",
+                        // which is what ends the test. Nothing here can be polled, because the
+                        // absence of a response is the stimulus. A slow machine cannot shorten
+                        // it below the broker's timeout, so the fault stays faithful.
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         return;
                     }
@@ -156,9 +162,32 @@ async fn connack_code(addr: SocketAddr, client_id: &str, user: &str, pass: &str)
         }))
         .await
         .expect("send CONNECT");
-    match tokio::time::timeout(Duration::from_secs(20), reader.next_packet()).await {
-        Ok(Ok(Some(Packet::ConnAck(ack)))) => ack.code,
-        other => panic!("expected a CONNACK, got {other:?}"),
+    // The failure text matters more than the bound here. This helper is shared by every test
+    // in the file, so when the machine is saturated (several cargo jobs at once) whichever
+    // test happens to be running fails with it — and `expected a CONNACK, got Err(Elapsed)`
+    // told the next reader nothing about which of the three possibilities they had hit.
+    // Measured on this branch: quiet, the whole workspace is 1294 passed / 1 failed / 7
+    // ignored and this file is 7/7 across eight consecutive runs; under four concurrent
+    // `cargo build` jobs, one run in six fails here. That is a property of the harness (a
+    // broker plus an HTTP stub spawned per test, waiting on fixed bounds), not of the broker,
+    // and it is tracked rather than papered over — see the follow-up named in
+    // docs/TEST-PLAN.md § What this gate detects, and what it cannot.
+    let Ok(received) = tokio::time::timeout(Duration::from_secs(20), reader.next_packet()).await
+    else {
+        panic!(
+            "no CONNACK within 20s for client {client_id:?} — the broker did not answer. \
+             Under heavy machine load this is the harness, not the broker: a broker and an \
+             HTTP stub are spawned per test and the bound is fixed. Re-run on a quiet machine \
+             before treating it as a defect"
+        );
+    };
+    match received {
+        Ok(Some(Packet::ConnAck(ack))) => ack.code,
+        Ok(None) => panic!(
+            "the connection CLOSED before any CONNACK for client {client_id:?} — that is a \
+             broker-side refusal to answer, not a timeout, and it is a real defect"
+        ),
+        other => panic!("expected a CONNACK for client {client_id:?}, got {other:?}"),
     }
 }
 

@@ -77,7 +77,10 @@ fn persistent(dir: &std::path::Path) -> (Arc<dyn SessionStore>, Arc<dyn Retained
     clippy::cast_possible_truncation
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "measurement: tens of thousands of fsync'd writes; nightly tier"]
+#[ignore = "measurement: tens of thousands of fsync'd writes; run it by hand with \
+              `cargo test -p mqttd --release --test backup_bench -- --ignored`. NO CI tier runs \
+              this: nightly drives --ignored for cluster_upgrade and cluster_soak only, and \
+              saying otherwise here made a number look defended that nothing re-measures."]
 async fn export_and_restore_wall_clock_at_stated_fixtures() {
     let n_sessions = knob("MQTTD_BACKUP_BENCH_SESSIONS", 1000);
     let n_queued = knob("MQTTD_BACKUP_BENCH_QUEUED", 10);

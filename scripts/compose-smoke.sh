@@ -60,8 +60,22 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# --- CI-fatal skips (issue #260) -------------------------------------------------------
+# A skip that prints a note and exits 0 is indistinguishable from a pass, so coverage can
+# vanish on the platform that gates merges without anything going red. Allowed locally,
+# fatal under CI (GitHub Actions sets CI=true on every runner). `skip_permitted` is the one
+# deliberate exception: a lane that genuinely cannot run in CI stays green and says why.
+skip_or_fail() {
+  if [ "${CI:-}" = "true" ]; then
+    echo "FATAL: environmental skip taken under CI — coverage would silently vanish: $1" >&2
+    exit 1
+  fi
+  echo "  SKIP (local only; fatal under CI) — $1"
+}
+skip_permitted() { echo "  SKIP (permitted in CI by design) — $1"; }
+
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
-  echo "SKIP — docker compose is not available; the compose reference deployment was NOT brought up"
+  skip_or_fail "docker compose is not available; the compose reference deployment was NOT brought up"
   exit 0
 fi
 for tool in mosquitto_pub mosquitto_sub openssl; do
@@ -106,9 +120,13 @@ if [[ "${MQTTD_SMOKE_DEFAULT_IMAGE:-0}" == 1 ]]; then
   DEFAULT_REF="$(grep -oE 'MQTTD_IMAGE:-[^}]+' "$COMPOSE_DIR/compose.yaml" | head -1 | cut -d- -f2-)"
   [[ -n "$DEFAULT_REF" ]] || { echo "FATAL: no MQTTD_IMAGE default in compose.yaml"; exit 2; }
   if ! docker manifest inspect "$DEFAULT_REF" >/dev/null 2>&1; then
-    echo "SKIP — the pinned default image $DEFAULT_REF is not published yet; the"
-    echo "       default-image lane engages on the first nightly after that release tag"
-    echo "       is pushed (the per-PR pin gate proves the pin is forward-looking)."
+    # PERMITTED in CI by design, and documented at scripts/check-deploy-image-pin.sh:91:
+    # the compose default is a FORWARD-looking pin, so between cutting the pin and pushing
+    # the tag there is no image to pull. This is the one skip class that must stay green in
+    # CI, which is why it is a distinct helper rather than the fatal one.
+    skip_permitted "the pinned default image $DEFAULT_REF is not published yet; the \
+default-image lane engages on the first nightly after that release tag is pushed (the \
+per-PR pin gate proves the pin is forward-looking)"
     exit 0
   fi
   echo "image under test: $DEFAULT_REF — compose.yaml's OWN default, no override (issue #263)"
@@ -425,8 +443,8 @@ pass "readiness returns once the majority is back"
 # 9. The opt-in overlay puts plaintext back, loudly.
 # ─────────────────────────────────────────────────────────────────────────────────
 if (( HOST_1883_BUSY )); then
-  echo "  SKIP — something else is already listening on 127.0.0.1:1883; the plaintext"
-  echo "         overlay was NOT exercised (it would test that broker, not this one)"
+  skip_or_fail "something else is already listening on 127.0.0.1:1883, so the plaintext \
+overlay was NOT exercised (it would test that broker, not this one)"
 else
   compose_plain up -d >/dev/null 2>&1 || { compose_plain logs --tail 40; \
     fail "the plaintext overlay failed to bring the cluster up"; }

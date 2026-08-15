@@ -22,7 +22,7 @@ done
 
 MQTTD_BIN="${MQTTD_BIN:-}"
 if [[ -z "$MQTTD_BIN" ]]; then
-  echo "building mqttd (set MQTTD_BIN to skip)…"
+  echo "building mqttd (set MQTTD_BIN to reuse an existing build)…"
   cargo build --quiet -p mqttd
   MQTTD_BIN="target/debug/mqttd"
 fi

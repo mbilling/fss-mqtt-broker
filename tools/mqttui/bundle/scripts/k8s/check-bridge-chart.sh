@@ -14,6 +14,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# --- CI-fatal skips (issue #260) -------------------------------------------------------
+# A skip that prints a note and exits 0 is indistinguishable from a pass, so coverage can
+# vanish on the platform that gates merges without anything going red. Allowed locally,
+# fatal under CI (GitHub Actions sets CI=true on every runner). `skip_permitted` is the one
+# deliberate exception: a lane that genuinely cannot run in CI stays green and says why.
+skip_or_fail() {
+  if [ "${CI:-}" = "true" ]; then
+    echo "FATAL: environmental skip taken under CI — coverage would silently vanish: $1" >&2
+    exit 1
+  fi
+  echo "  SKIP (local only; fatal under CI) — $1"
+}
+skip_permitted() { echo "  SKIP (permitted in CI by design) — $1"; }
+
 CHART=deploy/helm/mqttd
 fail() { echo "  FAIL — $*"; exit 1; }
 
@@ -76,7 +90,7 @@ if command -v kubeconform >/dev/null 2>&1; then
   kubeconform -strict -summary -ignore-missing-schemas -schema-location default \
     < /tmp/bridge-render.yaml
 else
-  echo "  (kubeconform not installed — skipping schema validation)"
+  skip_or_fail "kubeconform not installed, so the rendered bridge manifests were NOT schema-validated"
 fi
 
 echo "BRIDGE CHART OK"

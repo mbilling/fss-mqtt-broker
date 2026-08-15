@@ -23,7 +23,19 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 const V4: ProtocolVersion = ProtocolVersion::V311;
-const RECV_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long to wait for an answer the broker OWES — a CONNACK, a PINGRESP, or a close.
+///
+/// Generous on purpose, and it bounds only the failure path, so a large value costs nothing on
+/// a green run. This was 300 ms and served two opposite jobs at once — waiting for an owed
+/// answer AND watching for something that must not arrive — which is a defect, not untidiness:
+/// no single number can be both long enough for the slowest legitimate answer and short enough
+/// to make asserting silence cheap. Every CONNECT here is verified against a real Argon2id
+/// hash, which in a debug build takes tens of milliseconds and much longer on a contended
+/// runner, so the verifications lost the race and three of this file's four tests failed with
+/// `expected CONNACK, got Elapsed` — reproduced at roughly one run in two, 2026-08-15 (issue
+/// #260). Nothing in this file needs a quiet window any more: the one assertion that read like
+/// one was inferring a session close from an elapsed timeout, and now asserts the close.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Produce a real Argon2id PHC hash for `password` (fixed salt → deterministic test).
 fn hash(password: &str) -> String {
@@ -132,7 +144,7 @@ async fn connect_code(addr: SocketAddr, username: &str, password: &str) -> u8 {
         }))
         .await
         .unwrap();
-    match timeout(RECV_TIMEOUT, reader.next_packet()).await {
+    match timeout(ANSWER_TIMEOUT, reader.next_packet()).await {
         Ok(Ok(Some(Packet::ConnAck(ack)))) => ack.code,
         other => panic!("expected CONNACK, got {other:?}"),
     }
@@ -219,19 +231,24 @@ async fn removing_a_password_user_evicts_their_live_session() {
     pw.write(&format!("alice:{}", hash("alice-pw")));
     assert!(reloader.reload("signal"), "the rotated file should reload");
 
-    assert!(
-        timeout(RECV_TIMEOUT, bob.reader.next_packet())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .is_none(),
-        "the removed user's live session must be closed by the sweep"
-    );
+    // The sweep must CLOSE bob's connection, and "closed" is asserted rather than inferred
+    // from a timeout. As written before, `timeout(...).ok().and_then(...).flatten().is_none()`
+    // treated an ELAPSED window as a close, so a sweep that never ran — or simply had not run
+    // yet — passed this test. It is the timeout equivalent of a naked sleep (issue #260): the
+    // wait is generous, and running out of it is a named failure rather than the success case.
+    match timeout(ANSWER_TIMEOUT, bob.reader.next_packet()).await {
+        // A clean EOF and a transport reset are the same thing from this client's chair.
+        Ok(Ok(None) | Err(_)) => {}
+        Ok(Ok(Some(p))) => panic!("the removed user's session kept flowing, got {p:?}"),
+        Err(elapsed) => panic!(
+            "the removed user's live session was still open after {ANSWER_TIMEOUT:?} \
+             ({elapsed}): the identity sweep never evicted it"
+        ),
+    }
 
     // Alice still holds a working session: a PINGREQ gets a PINGRESP.
     alice.writer.send(&Packet::PingReq).await.unwrap();
-    match timeout(RECV_TIMEOUT, alice.reader.next_packet()).await {
+    match timeout(ANSWER_TIMEOUT, alice.reader.next_packet()).await {
         Ok(Ok(Some(Packet::PingResp))) => {}
         other => panic!("the surviving user must keep flowing, got {other:?}"),
     }
@@ -264,7 +281,7 @@ async fn connected_session(addr: SocketAddr, username: &str, password: &str) -> 
         }))
         .await
         .unwrap();
-    match timeout(RECV_TIMEOUT, s.reader.next_packet()).await {
+    match timeout(ANSWER_TIMEOUT, s.reader.next_packet()).await {
         Ok(Ok(Some(Packet::ConnAck(ack)))) if ack.code == 0 => s,
         other => panic!("expected CONNACK 0x00, got {other:?}"),
     }
@@ -289,7 +306,7 @@ async fn a_removed_user_cannot_resume_their_durable_session() {
         let mut bob = connected_session_with(addr, "bob", "bob-pw", false).await;
         bob.writer.send(&Packet::PingReq).await.unwrap(); // session is live
         assert!(matches!(
-            timeout(RECV_TIMEOUT, bob.reader.next_packet()).await,
+            timeout(ANSWER_TIMEOUT, bob.reader.next_packet()).await,
             Ok(Ok(Some(Packet::PingResp)))
         ));
     } // dropped: bob is offline, his durable session retained
@@ -335,7 +352,7 @@ async fn connected_session_with(
         }))
         .await
         .unwrap();
-    match timeout(RECV_TIMEOUT, s.reader.next_packet()).await {
+    match timeout(ANSWER_TIMEOUT, s.reader.next_packet()).await {
         Ok(Ok(Some(Packet::ConnAck(ack)))) if ack.code == 0 => s,
         other => panic!("expected CONNACK 0x00, got {other:?}"),
     }

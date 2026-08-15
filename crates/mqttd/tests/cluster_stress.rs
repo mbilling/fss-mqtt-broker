@@ -849,11 +849,11 @@ impl Stress {
             self.publish_step().await; // nothing to restart: schedule density
             return;
         };
-        // `kill()` released the plane's redb handles; the hub task holding the
-        // store handle was aborted then too. A short grace lets any in-flight
-        // blocking apply drop its file handle before the same dir reopens (the
-        // single-node restart test's teardown discipline).
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // No wait for the old redb handles to drop: `mqtt_storage::open::create_with_lock_retry`
+        // already retries every production store open for ~3 s (30 x 100 ms), which is the same
+        // window a real rolling restart depends on. A 200 ms sleep here was both redundant with
+        // that and six times shorter than it — it could only make a genuine lock-release lag look
+        // like a broken store, and it charged 200 ms to every green run of the schedule.
         let id = self.nodes[dead].node_id.0.clone();
         let dir = self.nodes[dead].data_dir.clone();
         let seeds: Vec<String> = self
@@ -1502,7 +1502,10 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
     a.kill().await;
     b.kill().await;
     c.kill().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // No wait before reopening the dirs: every production store open retries lock contention
+    // for ~3 s (`mqtt_storage::open::create_with_lock_retry`), which is exactly the window a
+    // real fast restart over a just-released data dir relies on. Sleeping here tested nothing
+    // that retry does not already cover, and hid whether it covers it.
 
     // The restart, over the same dirs.
     let a = start_stress_node("fc-a", vec![], &dir("a")).await;

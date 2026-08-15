@@ -922,6 +922,15 @@ async fn sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death() {
             .expect("send SIGUSR2")
             .success();
         assert!(ok, "kill -USR2 failed");
+        // SETTLE(sigusr2-default-disposition-is-death): this asserts a NEGATIVE — that the
+        // signal did not kill the broker — and a negative has no state to poll for. The
+        // failure it guards is instant and unmistakable when it happens (SIGUSR2's default
+        // disposition is Term, so an uninstalled handler ends the process on delivery), so
+        // the only question is whether enough time passed for delivery and reaping. 600 ms is
+        // roughly three orders of magnitude more than signal delivery needs, and the failure
+        // mode is one-sided: waiting LONGER only gives a dying process more time to die, so a
+        // too-short wait produces a false PASS — which is why the loop sends twice and the
+        // aliveness assertion is made after both, rather than trusting one delivery.
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
 

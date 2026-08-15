@@ -719,10 +719,25 @@ async fn the_default_write_floor_arms_itself_and_refuses_the_single_copy_promise
         Duration::from_secs(45),
     )
     .await;
-    let after = proc.nodes[survivor]
-        .metric(FLOOR_REFUSALS)
-        .await
-        .unwrap_or(0);
+    // The refusal is LOGGED by the connection task and COUNTED by the hub, so the two are not
+    // simultaneous. Reading the counter once, immediately after the last attempt, therefore
+    // measures scheduler luck as much as the broker: this test failed twice inside a full
+    // `cargo test --all` on a loaded machine (`0 -> 0`) and passed 2/2 in isolation, which is
+    // the signature of that race rather than of a broken counter. Poll it, bounded — the
+    // assertion below is unchanged in strength (a counter that never moves still fails, and
+    // still says the alertable surface is broken), it just no longer depends on which task the
+    // scheduler ran first. Issue #260's own rule, applied to the test that needed it.
+    let mut after = before;
+    for _ in 0..40 {
+        after = proc.nodes[survivor]
+            .metric(FLOOR_REFUSALS)
+            .await
+            .unwrap_or(0);
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     let log = std::fs::read_to_string(&proc.nodes[survivor].log_path).unwrap_or_default();
     let refusal = log.lines().find(|l| {
         l.contains("withholding the publisher's ack")

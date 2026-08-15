@@ -17,6 +17,8 @@
 //! tokenises to a path that exists nowhere. A guard nobody has watched fail is a guard that
 //! reports what you hoped for.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 /// Ways a script reaches for the repository it lives in. Not exhaustive by construction;
@@ -105,8 +107,10 @@ fn walk(
 fn tasks_offered_standalone_do_not_reach_for_the_repository() {
     let root = repo_root();
     if !root.join("Cargo.toml").is_file() {
-        eprintln!("SKIP: not in a checkout, so there are no scripts to read");
-        return;
+        crate::skip_locally_or_fail_in_ci!(
+            "not in a checkout, so there are no scripts to read and the needs_checkout claims \
+             went unchecked — in CI the checkout is always present, so this is fatal there"
+        );
     }
     let manifest = read_manifest(&root);
 
@@ -157,8 +161,10 @@ fn tasks_offered_standalone_do_not_reach_for_the_repository() {
 fn the_guard_is_not_vacuous() {
     let root = repo_root();
     if !root.join("Cargo.toml").is_file() {
-        eprintln!("SKIP: not in a checkout");
-        return;
+        crate::skip_locally_or_fail_in_ci!(
+            "not in a checkout, so the non-vacuity guard for the needs_checkout claims went \
+             unchecked — which would make a vacuity check itself vacuous"
+        );
     }
     let manifest = read_manifest(&root);
 

@@ -9,6 +9,11 @@
 
 #![allow(dead_code)] // each test crate uses only part of the harness
 
+/// The CI-fatal environmental skip (issue #260). `#[macro_export]` puts
+/// `skip_locally_or_fail_in_ci!` at each test binary's crate root, so a suite reaches it as
+/// `crate::skip_locally_or_fail_in_ci!(…)` with no `#[macro_use]` ordering to get wrong.
+pub mod skip;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -809,6 +814,12 @@ impl RawClient {
             self.stream.write_all(piece).await.unwrap();
             self.stream.flush().await.unwrap();
             if !gap.is_zero() {
+                // SETTLE(wire-fragment-gap): the caller's `gap` exists to make the peer see a
+                // PARTIAL frame, and "the decoder is holding an incomplete packet" is not
+                // observable from the wire — it is precisely the state that produces no output.
+                // `TCP_NODELAY` is set above so Nagle cannot coalesce the pieces back together.
+                // One-sided failure mode: a slower machine makes the fragmentation more certain,
+                // so this cannot silently stop testing what it exists for.
                 tokio::time::sleep(gap).await;
             }
         }

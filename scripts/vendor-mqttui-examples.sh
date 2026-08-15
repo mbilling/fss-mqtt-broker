@@ -72,6 +72,8 @@ if [ "$CHECK" = "1" ]; then
   fi
   count=$(find "$DEST" -type f | wc -l | tr -d ' ')
   echo "vendored examples are current ($count files)"
+  # NOT-A-SKIP: --check ran the whole comparison and it passed; the diff above is the failure
+  # path. This success is the check's result, not a check that did not run.
   exit 0
 fi
 

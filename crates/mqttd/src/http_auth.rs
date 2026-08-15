@@ -430,6 +430,12 @@ mod tests {
         auth.remember(k1, &id);
         assert!(auth.cached(&k1).is_some(), "a fresh acceptance is served");
 
+        // SETTLE(http-auth-cache-ttl): the cache entry's `until` is a `std::time::Instant`, which
+        // neither `crate::clock` (epoch seconds only) nor tokio's paused clock can move, so the
+        // 50 ms TTL configured above has to expire in real time. 80 ms is 1.6x it. One-sided
+        // failure mode: on a slow machine more time has passed, so the entry is more certainly
+        // expired — too short gives a false FAILURE, never a false pass. Deterministic form
+        // needs a monotonic clock seam on `HttpAuthenticator`; issue #260 records the ask.
         std::thread::sleep(Duration::from_millis(80));
         assert!(auth.cached(&k1).is_none(), "an expired acceptance is not");
 
