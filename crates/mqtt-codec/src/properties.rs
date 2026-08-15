@@ -300,6 +300,20 @@ impl Properties {
         })
     }
 
+    /// The Will Delay Interval (`0x18`) in seconds, if present (MQTT 5.0 §3.1.3.2.2).
+    ///
+    /// Absent means zero — publish the Will as soon as the network connection ends —
+    /// which is also every v3.1.1 client's behaviour. Issue #299: this property used to
+    /// round-trip in the codec with no reader anywhere, so a client asking for a delay
+    /// got an immediate "offline" announcement on every brief blip.
+    #[must_use]
+    pub fn will_delay_interval(&self) -> Option<u32> {
+        self.0.iter().find_map(|p| match p {
+            Property::WillDelayInterval(v) => Some(*v),
+            _ => None,
+        })
+    }
+
     /// The Message Expiry Interval (`0x02`) in seconds, if present (MQTT 5.0).
     #[must_use]
     pub fn message_expiry_interval(&self) -> Option<u32> {

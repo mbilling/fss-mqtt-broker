@@ -112,6 +112,19 @@ fn entry_bounds(key: &str, after: Offset) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
+/// Decode the logical key out of an entry key (`len(key) ++ key ++ offset_be`), or `None`
+/// if the bytes are not shaped like one — a foreign row must be skipped, never guessed at.
+fn decode_logical_key(entry_key: &[u8]) -> Option<String> {
+    let len = usize::try_from(u32::from_be_bytes(entry_key.get(..4)?.try_into().ok()?)).ok()?;
+    // 4 length bytes + the key + the 8-byte offset suffix, exactly.
+    if entry_key.len() != 4 + len + 8 {
+        return None;
+    }
+    std::str::from_utf8(entry_key.get(4..4 + len)?)
+        .ok()
+        .map(ToString::to_string)
+}
+
 /// Decode the offset suffix (last 8 bytes) of an entry key.
 fn decode_offset(entry_key: &[u8]) -> Offset {
     let n = entry_key.len();
@@ -229,6 +242,58 @@ impl ReplicatedLog for PersistentLog {
             }
             txn.commit().map_err(backend)?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Every logical key this file holds a non-empty log for.
+    ///
+    /// **This override is load-bearing, and its absence was a silent hole** (issue #299):
+    /// [`ReplicatedSessionStore::all_sessions`](crate::logged::ReplicatedSessionStore) and
+    /// `expiring_sessions` enumerate through here, so a backend that takes the trait's
+    /// empty default makes every INHERIT path inert — ADR 0009 §3's persisted session
+    /// expiry deadline and issue #299's persisted pending Will alike. In this mode (ADR
+    /// 0018 phase 1: on-disk, single node) that meant a restart over the same data dir
+    /// read back *nothing at all*: sessions never expired, and a delayed will armed before
+    /// the restart was lost even though its bytes were on disk. The in-memory and
+    /// clustered backends always enumerated; this one did not, and no test covered the
+    /// mode operators run on one node.
+    ///
+    /// Entry keys are `len(key) ++ key ++ offset_be`, so one logical key owns a contiguous
+    /// range and the scan **skips** from each key's first entry past its last rather than
+    /// walking every queued message: `O(distinct keys · log n)`, not `O(entries)`. That
+    /// matters because a session's offline queue can hold thousands of entries while
+    /// contributing exactly one key. The length prefix makes the range self-delimiting —
+    /// no logical key's prefix can extend another's — so `prefix ++ FF..FF ++ 00` is
+    /// strictly greater than every entry of that key and strictly less than any other
+    /// key's.
+    async fn keys(&self) -> Result<Vec<String>, ReplError> {
+        self.run(move |db| {
+            let txn = db.begin_read().map_err(backend)?;
+            let entries = txn.open_table(ENTRIES).map_err(backend)?;
+            let mut out = Vec::new();
+            let mut cursor: Vec<u8> = Vec::new();
+            loop {
+                let mut range = entries
+                    .range::<&[u8]>((
+                        std::ops::Bound::Included(cursor.as_slice()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .map_err(backend)?;
+                let Some(item) = range.next() else { break };
+                let (raw, _) = item.map_err(backend)?;
+                let Some(key) = decode_logical_key(raw.value()) else {
+                    // Not one of our entry keys (or not UTF-8): step one byte past it
+                    // rather than looping forever on it.
+                    cursor = raw.value().to_vec();
+                    cursor.push(0);
+                    continue;
+                };
+                cursor = entry_key(&key, Offset::MAX);
+                cursor.push(0);
+                out.push(key);
+            }
+            Ok(out)
         })
         .await
     }
@@ -393,5 +458,70 @@ mod tests {
         assert_eq!(&entries[0].record, b"b");
         // The offset counter persisted: the next append does not reuse offset 2.
         assert_eq!(log.append(&k, rec(b"c")).await.unwrap(), 3);
+    }
+
+    /// Issue #299: **this backend must be able to list its own keys, or every inherit
+    /// path over it is silently inert.**
+    ///
+    /// `ReplicatedSessionStore::all_sessions` / `expiring_sessions` enumerate through
+    /// `keys()`. This log took the trait's `Ok(Vec::new())` default, so on a single-node
+    /// on-disk broker (ADR 0018 phase 1 — `MQTTD_DATA_DIR`, no cluster) a restart read
+    /// back NOTHING: ADR 0009 §3's persisted session-expiry deadlines never fired, and a
+    /// delayed Will persisted at arm time was lost across the restart even though its
+    /// bytes were on disk. Only the in-memory and clustered backends enumerated, so no
+    /// test covered the mode operators run on one node.
+    ///
+    /// Also pinned here: only NON-EMPTY logs are reported (matching
+    /// `InMemoryReplicatedLog`), the queue-key scan does not depend on how many entries a
+    /// key holds, and the listing survives a reopen — which is the whole point.
+    #[tokio::test]
+    async fn keys_enumerates_every_logical_key_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.redb");
+        let (meta, queue, other) = (
+            "m/dev-1".to_string(),
+            "q/dev-1".to_string(),
+            "m/dev-2".to_string(),
+        );
+        {
+            let log = PersistentLog::open(&path).unwrap();
+            log.append(&meta, rec(b"snapshot")).await.unwrap();
+            log.append(&other, rec(b"snapshot")).await.unwrap();
+            // A key with MANY entries contributes exactly one key, and the scan must not
+            // walk them: a session's offline queue is routinely thousands of messages.
+            for i in 0..64u8 {
+                log.append(&queue, rec(&[i])).await.unwrap();
+            }
+            let mut keys = log.keys().await.unwrap();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![meta.clone(), other.clone(), queue.clone()],
+                "every logical key with entries is listed, exactly once each"
+            );
+        }
+
+        // The reopen is the case that was broken end to end: a restarted node reads the
+        // session metadata keys back out of the file it just opened.
+        let log = PersistentLog::open(&path).unwrap();
+        let mut keys = log.keys().await.unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![meta.clone(), other.clone(), queue.clone()],
+            "a restart over the same data dir must find the sessions on disk — without \
+             this, ADR 0009 §3's expiry deadlines and issue #299's pending wills are both \
+             read back as if the file were empty"
+        );
+
+        // A fully-drained queue is effectively absent (the in-memory backend's rule), and
+        // a removed key is gone.
+        log.truncate(&queue, 64).await.unwrap();
+        log.remove(&other).await.unwrap();
+        assert_eq!(
+            log.keys().await.unwrap(),
+            vec![meta],
+            "only keys with live entries are reported"
+        );
     }
 }

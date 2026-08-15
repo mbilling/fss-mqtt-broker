@@ -16,7 +16,7 @@
 | [0006](../adr/0006-consensus-and-replication.md) | Consensus & replication for durable sessions | Accepted | [13/13 done](0006-consensus-and-replication.md) | — |
 | [0007](../adr/0007-durable-store-integration.md) | Wiring the durable cluster session store into the broker | Accepted | [9/9 done](0007-durable-store-integration.md) | — |
 | [0008](../adr/0008-mqtt-5-codec.md) | MQTT 5.0 codec | Accepted | [10/10 done](0008-mqtt-5-codec.md) | — |
-| [0009](../adr/0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [3/3 done](0009-mqtt5-expiry.md) | — |
+| [0009](../adr/0009-mqtt5-expiry.md) | MQTT 5.0 session & message expiry | Accepted | [4/5 done](0009-mqtt5-expiry.md) | 1 deferred |
 | [0010](../adr/0010-shared-subscriptions.md) | Shared subscriptions | Accepted | [7/8 done](0010-shared-subscriptions.md) | 1 deferred |
 | [0011](../adr/0011-topic-aliases.md) | MQTT 5.0 topic aliases | Accepted | [7/7 done](0011-topic-aliases.md) | — |
 | [0012](../adr/0012-flow-control.md) | MQTT 5.0 flow control (Receive Maximum) | Accepted | [6/6 done](0012-flow-control.md) | — |
@@ -84,6 +84,10 @@
 
 - `0005-P2c` 💤 deferred: Delivery/lifecycle hardening of the splice (best-effort on half-close) — splice is best-effort on half-close; a delivery/lifecycle hardening pass is a documented follow-up
 - `0005-P3` 💤 deferred: MQTT 5 Server-Reference redirect replacing the relay for v5 clients — "Re-assessed 2026-07-02: the original blocker (no v5 codec) is gone (ADR 0008), so this is now buildable — but parked on the OTHER half of the original condition: mainstream v5 clients (paho, mosquitto) do not auto-follow Server Reference / 0x9C redirects, so the relay must remain the universal path regardless and a redirect would only serve clients that opt into handling it. Revisit if a redirect-capable client population materialises; the proxy serves 3.1.1 and v5 alike meanwhile."
+
+**0009 — MQTT 5.0 session & message expiry**
+
+- `0009-P5` 💤 deferred: Cross-node cancellation of a pending delayed Will (a resume on another node) — "Deferred, mechanism named (issue #299 R3). A resume that lands on a DIFFERENT node does not cancel a pending will held in the closing node's memory — and after a rehome close (ADR 0005) that is the routine case, because the reconnect is served by the owner. Two ways to close it: (a) fold an attach marker (client id + attach epoch) into the owner's existing attach-time SessionMeta write and compare it at fire time — one off-loop read, no peer-proto bump, and it reuses the record this feature already writes; or (b) add an additive PeerMessage::PendingWill hand-off, which needs a proto bump (ADR 0038) and a cluster oracle. (a) is preferred. Until then the residual is bounded, counted (mqttd_wills_published_total{reason=\"delay-elapsed\"} during a roll) and documented in OPERATIONS as 'size the device-offline suppression window to the roll PLUS your fleet's largest will delay'."
 
 **0010 — Shared subscriptions**
 

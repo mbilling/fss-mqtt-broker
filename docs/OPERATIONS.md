@@ -272,6 +272,39 @@ ordinary replace motion — wipe its data dir and give it seeds so it JOINS
 
 ## Rolling upgrades
 
+> ### ⚠️ One-time behaviour change on the first restart onto the issue-#299 build
+>
+> **If you run a single node with `MQTTD_DATA_DIR` and no cluster** (ADR 0018 phase 1),
+> **session expiry starts working across restarts on this build.** It did not before: the
+> restarted node enumerated its sessions through a store method that had no implementation
+> for this shape and silently returned "no sessions", so *persisted ADR 0009 §3 expiry
+> deadlines never fired after a restart* and offline sessions survived indefinitely,
+> whatever Session Expiry Interval their clients asked for.
+>
+> **The first restart onto this build therefore discards every offline session whose
+> persisted deadline has already passed — together with any offline queue it holds, acked
+> messages included.** Verified on the real binary: a session with
+> `SessionExpiryInterval=5` plus one PUBACKed `QoS` 1 message, node down 8 s → after the
+> restart `session_present=0` and the message is never replayed. This is the
+> spec-correct behaviour finally taking effect, and it is a one-way deletion, so it is
+> stated here rather than left to be discovered.
+>
+> **It says so, before it does it.** The boot session scan emits one `WARN` naming the
+> count and the worst offenders — grep for `DISCARDING offline sessions past their
+> persisted Session Expiry deadline`:
+>
+> ```text
+> WARN mqttd::hub: DISCARDING offline sessions past their persisted Session Expiry
+>   deadline (ADR 0009 §3), together with any queued messages they still hold. …
+>   sessions=37 oldest_overdue_s=91840 clients="dev-1(+91840s),dev-9(+7201s),…"
+>   truncated=17
+> ```
+>
+> To see what a restart *would* reap before committing to it, copy the data dir and start a
+> node over the copy with `RUST_LOG=warn`. Clustered durable deployments
+> (`MQTTD_DURABLE_SESSIONS=1`) are unaffected — expiry already worked there — and so is the
+> in-memory default, which keeps no sessions across a restart at all.
+
 `helm upgrade` with a new image tag rolls one pod at a time (OrderedReady +
 RollingUpdate + PDB `maxUnavailable: 1`); each pod drains via `preStop` before its
 restart and rejoins behind the caught-up watermark. Version-skew rules are
@@ -351,18 +384,59 @@ load; the client-facing cost scales with the rolled pod's share, not the fleet):
   was considered and rejected: the release is not witnessed by the new owner, so
   accelerating it widens a window in which a publish is *acked* with nothing stored —
   a bounded lie in place of an unbounded honest refusal.
-- **Each rehome close publishes the session's Last Will.** A server DISCONNECT is
-  not a client DISCONNECT, so the spec keeps the will armed ([MQTT-3.1.2-8],
-  §3.14.4) — consistent with session takeover and `evict`, and with the fix for
-  issue #265. **A roll therefore emits one LWT per rehomed session, and a
-  scale-out/scale-in emits roughly one per moved session** (paced: at most 32
-  closes per node per second, `mqttd_session_rehomes_total{reason="deferred"}`
-  counts each session that had to wait, once). Suppress device-offline alerting while
-  `mqttd_session_rehomes_total{reason="stale-owner"}` is climbing; treat that
-  counter as the suppressor signal. Honouring the MQTT 5 Will Delay Interval
-  cluster-wide is the follow-up that would remove the false event — it needs the
-  delay and its cancellation to survive the client reconnecting on a *different*
-  node, which no peer frame expresses today.
+- **Each rehome close still ends with the session's Last Will — but *when* depends on
+  whether the client asked for a Will Delay Interval.** A server DISCONNECT is not a
+  client DISCONNECT, so the spec keeps the will armed ([MQTT-3.1.2-8], §3.14.4) —
+  consistent with session takeover and `evict`, and with the fix for issue #265. **A
+  roll therefore emits one LWT per rehomed session, and a scale-out/scale-in emits
+  roughly one per moved session** (paced: at most 32 closes per node per second,
+  `mqttd_session_rehomes_total{reason="deferred"}` counts each session that had to
+  wait, once).
+
+  Since issue #299 mqttd honours the **MQTT 5 Will Delay Interval** (`0x18`), and that
+  splits the timing in two — **size your device-offline suppression window to the roll
+  PLUS your fleet's largest will delay**:
+
+  | Client | When its LWT lands after a rehome close |
+  | --- | --- |
+  | v3.1.1, or v5 without `0x18` (today's fleet) | at the close, as before — inside the window where `mqttd_session_rehomes_total{reason="stale-owner"}` is climbing |
+  | v5 with `0x18` and a non-zero Session Expiry Interval | `min(will delay, session expiry)` **after** the close — i.e. *after* that counter has stopped climbing |
+  | v5 with `0x18` but Session Expiry Interval 0 or absent | at the close: a session that does not outlive its connection publishes its will immediately, whatever delay it asked for (§3.1.2.11.2) |
+  | v5 with `0x18` that comes back with **Clean Start = 1** | never, from the *record*: a new Network Connection for the same client id inside the window **deletes** the will ([MQTT-3.1.2-8]), counted `mqttd_wills_cancelled_total{reason="clean-start"}`. The closing node's *memory* copy still fires one delay later, for residual R3's reason below |
+
+  The delayed one is not cancelled by the client coming back, because it reconnects on
+  the group's **owner** (ADR 0005 relocates it) and nothing there reaches the closing
+  node's memory — that is the named follow-up 0009-P5, and until it lands the delay
+  *moves* the false event rather than removing it. `mqttd_pending_wills` is the gauge
+  that shows the pending burst **before** it lands: it rises as delay-using sessions
+  rehome and drains as each delay elapses, so a roll is finished for alerting purposes
+  when that gauge is back at its baseline, not when the rehome counter stops.
+
+  **A node stopping does not fire its pending wills early** — deliberately, or every
+  rolling restart would emit an LWT storm ahead of every client's own deadline, and "never
+  earlier than the deadline" is the promise worth keeping. What happens to them instead
+  depends on the store: a node with a data dir (or a durable cluster) re-arms them from the
+  session record after the restart and publishes them at their original absolute deadlines,
+  late by up to the 30 s inherited-scan cadence; a node with **no** durable session store
+  loses them with the process, as it loses every session it holds. ADR 0009 §2's
+  as-delivered note has the per-shape table.
+
+  **What arming a delayed will costs the hub loop, measured.** The arm does a durable
+  read-modify-write of the session record (`load_meta` + append + truncate, fsync'd) and
+  **awaits it on the hub loop**, inside the same `detach` that already awaits
+  `persist_detach_deadline` — so a mass ungraceful disconnect of delay-using sessions
+  roughly *doubles* an already-multi-second stall rather than introducing a new class of
+  one. Measured against the real binary, single-node on-disk, with a probe client timing
+  hub round-trips: **500 sessions killed at once with a 6 s delay → worst client
+  round-trip 6.49 s, loop degraded until +11.0 s**, against a delay-0 control (today's
+  fleet, unchanged) of **4.98 s / +6.84 s**. At 200 sessions: 2.37 s / +4.21 s versus
+  1.13 s / +2.05 s. The fire dispatch is likewise **not** sub-millisecond where the store
+  persists: `mqttd_hub_dispatch_seconds_sum{command="will"}` came out at 8.9 ms mean over
+  486 fires (12.2 ms for a single fire on an idle node), because each dispatch includes the
+  fsync'd durable clear. Size a roll's per-tick close cap accordingly — OPERATIONS' own
+  1 700-session scenario extrapolates to tens of seconds of degraded dispatch for every
+  other client on the node. Moving the arm's write off the loop the way ADR 0017 moves the
+  rest of the attach path is the named follow-up (ADR 0009 residual R6).
 
 **Pacing.** The chart already enforces the safe motion — OrderedReady +
 RollingUpdate roll one pod at a time and the PDB (`maxUnavailable: 1`) stops a
@@ -413,8 +487,10 @@ the demo dashboard's "Operator signals" row):
 | **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | Node not catch-up-current; takeover from it would be degraded |
 | **Quorum thinning** | `mqttd_voters < 3` (with `lease_voters = 5`) | One more loss risks durable writes; restore nodes |
 | **Durable writes refused (under-replicated)** | `mqttd_replication_min_actual < mqttd_replication_write_floor` (page); `mqttd_replication_min_actual < mqttd_replication_desired` (warn) | **Page**: a group is below the min-replicas write floor, so durable writes are being REFUSED — QoS≥1 publishers get no ack, redeliver, and are disconnected; retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not. Corroborate with `mqttd_durable_append_failures_total{reason="unavailable"}` climbing. **Warn**: a group merely holds fewer copies than R. Either way: restore the missing members ([TROUBLESHOOTING](TROUBLESHOOTING.md)). Do **not** lower `durable.min_replicas` to silence it unless you are consciously accepting single-copy acks. Non-durable clusters (`durable.enabled = false`) report a floor of 1, so this rule cannot fire there |
-| **Sessions rehoming** | `rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | A node found itself hosting a live persistent session for a placement group it does not own and closed the connection so the client relocates to the owner (issue #284). Expected **in ones after a node roll** — each is one immediate client reconnect, and the alternative was an undeliverable session until the client's keepalive fired. A *sustained* rate means group ownership is churning, or client traffic is being opened before the lease topology has converged onto the voter set — check `mqttd_voters`, `mqttd_lease_epoch` and the *Replication lag* row. **Each close also publishes that client's Last Will**, so suppress device-offline alerting while this counter climbs |
+| **Sessions rehoming** | `rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | A node found itself hosting a live persistent session for a placement group it does not own and closed the connection so the client relocates to the owner (issue #284). Expected **in ones after a node roll** — each is one immediate client reconnect, and the alternative was an undeliverable session until the client's keepalive fired. A *sustained* rate means group ownership is churning, or client traffic is being opened before the lease topology has converged onto the voter set — check `mqttd_voters`, `mqttd_lease_epoch` and the *Replication lag* row. **Each close also ends with that client's Last Will**, so suppress device-offline alerting while this counter climbs — and for clients using the MQTT 5 Will Delay Interval, for `min(will delay, session expiry)` **longer** than that: the delayed burst lands after this counter stops (issue #299, see the rehome bullet above and `mqttd_pending_wills`) |
 | **Sessions stuck misplaced** | `mqttd_misplaced_sessions > 0` for 2m, or `rate(mqttd_session_rehomes_total{reason="unrelocatable"}[5m]) > 0` | A live persistent session is hosted on a node that does not own its group and **cannot be rehomed**, because the owner's peer-link address is unknown to that node — so ADR 0005's degrade-don't-refuse keeps serving it locally rather than closing it into a reconnect loop. Those sessions **are undeliverable**: every publish toward them is refused and the publisher's ack withheld (`not the owning node for this group` in the hosting node's logs). This is a peer-mesh/gossip problem, not a session problem — check `mqttd_peer_links` against `mqttd_cluster_members` and the peer-link TLS rows |
+| **Delayed Last Wills piling up** | `mqttd_pending_wills > 0` sustained, and especially a step change during a roll | Wills held for MQTT 5 clients that asked for a Will Delay Interval (`0x18`) and disconnected ungracefully — the device-offline burst **before it lands** (issue #299). Each one is published `min(will delay, session expiry)` after the disconnect unless the session resumes first, in which case it is never published at all (`mqttd_wills_cancelled_total{reason="resumed"}` / `{reason="takeover"}` / `{reason="clean-start"}` climbing is the feature working: one spurious device-offline event not sent each — `clean-start` is a same-client-id CONNECT that discards the session, which [MQTT-3.1.2-8] makes a will *deletion*, not a publish). Not an error condition on its own — treat it as the *timing* signal: during a roll, alert suppression for device-offline should last until this gauge is back to baseline, not until `mqttd_session_rehomes_total{reason="stale-owner"}` stops. A gauge that never drains means clients that ask for a delay are neither coming back nor reaching their deadline: check `mqttd_wills_published_total{reason="delay-elapsed"}` is moving at all |
+| **A delayed will could not be persisted or cleared** | `rate(mqttd_pending_will_unpersisted_total[15m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | The two arms fail in opposite directions (issue #299). `reason="not-owner"` or `"error"`: an **arm** did not reach the durable record, so that will lives only in one node's memory and a node death inside the delay window loses the announcement (residual R1). `not-owner` is STRUCTURAL after a rehome close — the closing node is by construction not the session's owner — so a low rate during a roll is expected; a sustained rate outside a roll means group ownership is churning (see *Sessions rehoming*). `reason="clear-not-owner"` or `"clear-error"`: a **clear** did not land after a resume or a fire, so a record still carries a will whose obligation has ended and its owner may announce that client dead at the original deadline — corroborate with `mqttd_wills_published_total{reason="inherited"}` arriving for clients that are demonstrably online |
 | **Rehome closes being deferred** | `rate(mqttd_session_rehomes_total{reason="deferred"}[5m]) > 0` for 5m | More sessions want rehoming than the per-tick close cap (32/node/s) allows, so the drain is paced (issue #284). The counter increments **once per session per deferral episode**, so its increase is the size of the backlog, not the number of ticks it took to drain. Expected for a few seconds after a scale-out or scale-in, where ~1/N of groups change owner at once — the cap is also the LWT-storm cap. Sustained means ownership is churning faster than the drain: check the *Sessions rehoming* row's causes |
 | **Prolonged rotation window** | `mqttd_swim_keys_accepted > 1` for > 1h | A rotation phase was never closed (see key rotation above) |
 | **Config divergence** | `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m | A config roll did not converge; check the stuck pod |

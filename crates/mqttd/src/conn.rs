@@ -6,10 +6,12 @@
 //! connection if nothing arrives from the client within 1.5x the interval; the
 //! deadline resets on *inbound* traffic only (outbound deliveries must not keep
 //! a dead client alive). An ungraceful end — EOF, error, keepalive expiry —
-//! publishes the client's will; a clean DISCONNECT discards it.
+//! publishes the client's will; a clean DISCONNECT discards it. A v5 CONNECT may
+//! carry a Will Delay Interval (`0x18`), which this layer reads into the
+//! [`WillSpec`] it hands the hub; the hub owns the waiting (issue #299).
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound};
+use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound, WillSpec};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthSession, AuthStep,
@@ -659,7 +661,7 @@ where
     }
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
-    let will = connect.last_will.map(into_will);
+    let will = connect.last_will.map(into_will_spec);
     // The writer half owns the outbound METER and calls it as it drains, so the hub
     // can see how far behind this client is — in packets and in bytes (issue #241) —
     // and shed `QoS 0` rather than queue it without limit (#123).
@@ -1323,20 +1325,33 @@ where
     }
 }
 
-/// Convert a CONNECT's Last Will into a deferred will [`Message`], carrying the will's
-/// application properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030).
-fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
+/// Convert a CONNECT's Last Will into a deferred [`WillSpec`], carrying the will's
+/// application properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030)
+/// **and its Will Delay Interval** (`0x18`, MQTT 5.0 §3.1.3.2.2 — issue #299).
+///
+/// The delay defaults to `0` when the property is absent, which is the spec's own default
+/// and therefore also every v3.1.1 client: those wills publish the instant the connection
+/// ends, exactly as before. The hub bounds the delay by the session expiry.
+///
+/// The will's ACL authorization is unchanged and still CONNECT-time (ADR 0004 step 3, see
+/// `will_rejected` above) — it is simply up to `delay` seconds staler than it was when the
+/// will published on the disconnect itself. Same policy, stated rather than implied.
+fn into_will_spec(w: mqtt_codec::packet::LastWill) -> WillSpec {
     let app = app_properties(&w.properties);
-    Message {
-        topic: w.topic,
-        payload: w.payload,
-        qos: w.qos,
-        retain: w.retain,
-        app,
-        // A will's Message Expiry Interval counts from PUBLICATION, which has not
-        // happened yet — the publish path stamps the deadline then (issue #227
-        // keeps will semantics unchanged).
-        expires_at: None,
+    let delay = w.properties.will_delay_interval().unwrap_or(0);
+    WillSpec {
+        message: Message {
+            topic: w.topic,
+            payload: w.payload,
+            qos: w.qos,
+            retain: w.retain,
+            app,
+            // A will's Message Expiry Interval counts from PUBLICATION, which has not
+            // happened yet — the publish path stamps the deadline then (issue #227
+            // keeps will semantics unchanged).
+            expires_at: None,
+        },
+        delay,
     }
 }
 

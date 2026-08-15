@@ -16,7 +16,12 @@
 //! a [`RetainedStore`] and replayed (with the retain flag set) on every new
 //! subscription. A will message attached at CONNECT is published on any
 //! ungraceful end of the connection — including session takeover — and
-//! discarded on clean DISCONNECT [MQTT-3.14.4-3].
+//! discarded on clean DISCONNECT [MQTT-3.14.4-3]. Since issue #299 a v5 client can
+//! also ask for that publication to WAIT: a Will Delay Interval (`0x18`) holds the
+//! will for `min(delay, session expiry)` (§3.1.3.2.2 + §3.1.2.11.2) and a session
+//! that resumes inside that window is never announced dead at all [MQTT-3.1.3-9].
+//! No delay (every v3.1.1 client, and every v5 client without the property) still
+//! publishes inline on the disconnect's own dispatch, unchanged.
 //!
 //! ## Persistent sessions
 //! A client connecting with `clean_session = false` (MQTT 3.1.1) gets a session
@@ -571,6 +576,123 @@ pub enum Refusal311 {
     CloseNoAck,
 }
 
+/// A client's Last Will **and its Will Delay Interval** (MQTT 5.0 §3.1.3.2.2, issue
+/// #299). One struct rather than two parallel fields, so `(no will, delay 5)` — a state
+/// with no meaning — is unrepresentable.
+#[derive(Debug, Clone)]
+pub struct WillSpec {
+    /// The will message itself, with its forwardable application properties (ADR 0030).
+    pub message: Message,
+    /// The Will Delay Interval (`0x18`) in seconds; `0` (absent, and every v3.1.1
+    /// client) means publish as soon as the network connection ends.
+    pub delay: u32,
+}
+
+/// Why a session's in-memory state is being dropped — the one input that decides what
+/// happens to a pending delayed Will (issue #299).
+///
+/// The distinction is not cosmetic. `discard_session_local` is the choke point for both
+/// "this session is over" and "I am no longer routing this session", and those are opposite
+/// answers to §3.1.3.2.2's "or the Session ends": one publishes the will, the other must
+/// not touch it, because the durable record and its deadline deliberately stay behind for
+/// the new owner (ADR 0043 P2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// The SESSION ended with NO new connection for the client id: the expiry sweep, an
+    /// `evict`, a zero-expiry disconnect. §3.1.3.2.2's "or the Session ends" fires any
+    /// pending will.
+    Ended,
+    /// The session was discarded because a NEW NETWORK CONNECTION for the same `ClientID` was
+    /// accepted with Clean Start = 1 ([MQTT-3.1.2-4] "MUST discard any existing Session").
+    ///
+    /// [MQTT-3.1.2-8] **deletes** the will in that case, so nothing is announced — see
+    /// [`Hub::resolve_replaced_will`], which applies the identical rule to the still-online
+    /// half. The two must agree, or the same CONNECT means different things depending on
+    /// whether the broker had already reaped the old socket.
+    ReplacedByNewConnection,
+    /// Only this node's ROUTING ended (ADR 0043 P2, issue #284): the session's group moved
+    /// to another owner, and its durable record — pending will and deadline included —
+    /// stays put for that owner by design. Nothing ended, so nothing is announced.
+    RoutingReleased,
+}
+
+/// How many client ids one overdue-discard warning names before it stops. Enough to act on
+/// without a mass reap turning one log line into a megabyte; the remainder is counted.
+const OVERDUE_DISCARD_NAMED: usize = 20;
+
+/// What a session scan is about to hand the expiry sweep for DISCARD: offline sessions whose
+/// persisted ADR 0009 §3 deadline has already passed, and whose queues go with them.
+#[derive(Debug, PartialEq, Eq)]
+struct OverdueDiscard {
+    /// How many sessions.
+    sessions: usize,
+    /// How far past its deadline the worst one is, in seconds.
+    oldest_overdue_s: u64,
+    /// `client(+Ns)` for the worst [`OVERDUE_DISCARD_NAMED`], comma-separated.
+    clients: String,
+    /// Sessions beyond that cap.
+    truncated: usize,
+}
+
+/// Summarize an about-to-be-discarded set for ONE loud line, worst first — `None` when there
+/// is nothing to say (issue #299 / ADR 0018 phase-1 upgrade note).
+///
+/// This is separated from the `warn!` that emits it so the counting can be asserted: the
+/// number of sessions and the identity of the worst ones are the whole value of the line, and
+/// an operator meeting an unexplained reap needs them to be right. Ordering is total
+/// (overdue descending, then client id) so the line is reproducible rather than
+/// hash-order-dependent.
+fn summarize_overdue_discard(mut overdue: Vec<(ClientId, u64)>) -> Option<OverdueDiscard> {
+    if overdue.is_empty() {
+        return None;
+    }
+    overdue.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0 .0.cmp(&b.0 .0)));
+    let named: Vec<String> = overdue
+        .iter()
+        .take(OVERDUE_DISCARD_NAMED)
+        .map(|(client, over)| format!("{}(+{over}s)", client.0))
+        .collect();
+    Some(OverdueDiscard {
+        sessions: overdue.len(),
+        oldest_overdue_s: overdue[0].1,
+        truncated: overdue.len().saturating_sub(named.len()),
+        clients: named.join(","),
+    })
+}
+
+/// A Last Will armed but NOT yet published: the connection ended ungracefully and
+/// `min(will delay, session expiry)` has not elapsed (issue #299). Authoritative while
+/// this node lives; a strictly-trailing block in the session's durable record is
+/// authoritative after it dies.
+#[derive(Debug)]
+struct PendingWill {
+    /// The will to publish when the deadline passes.
+    will: Message,
+    /// The MONOTONIC deadline that fires it locally. `tokio::time::Instant`, not an epoch
+    /// second, for two reasons: whole-second epoch arithmetic truncates, so a 4 s delay
+    /// would fire after 3.1 s of wall time — a false death announcement EARLY, which is
+    /// the very defect class this feature exists to remove — and an NTP step backwards or
+    /// forwards cannot move it at all.
+    due: Instant,
+    /// The ABSOLUTE wall-clock deadline (Unix epoch secs) that went into the durable
+    /// record, exactly as ADR 0009 §3 persists the session-expiry deadline "so a new
+    /// owner expires the session at the right time after a takeover".
+    ///
+    /// **Rounded UP to the next whole second** ([`Hub::will_deadline_epoch`]), and that
+    /// direction is the whole point: converting a whole-second deadline back into a delay
+    /// truncates a second time, and the two truncations do not cancel — a will re-armed
+    /// from the record elapsed `delay − frac(arm) + frac(re-arm)` and was measured firing
+    /// 7.312 s into an 8 s delay across a restart. Late is a slow announcement; early is a
+    /// false one.
+    deadline_epoch: u64,
+    /// Whether the durable record provably holds this will. `false` means memory-only —
+    /// a node death inside the window loses it (residual R1), counted at arm time.
+    persisted: bool,
+    /// Re-armed from the durable record by the inherited-session scan rather than by a
+    /// disconnect this node witnessed; only changes the `reason` label at fire time.
+    inherited: bool,
+}
+
 /// A currently-online client connection.
 #[derive(Debug)]
 struct Online {
@@ -578,8 +700,9 @@ struct Online {
     conn_id: u64,
     /// Channel to this connection's writer.
     tx: Outbound,
-    /// Will message published if this connection ends ungracefully.
-    will: Option<Message>,
+    /// Will published if this connection ends ungracefully, with its Will Delay
+    /// Interval (issue #299).
+    will: Option<WillSpec>,
     /// The revocable facts this connection was admitted under (ADR 0040 T1).
     admission: Admission,
     /// When this connection attached: a takeover-window re-delivery
@@ -1097,6 +1220,11 @@ pub enum SessionRecovery {
         present: bool,
         /// Persisted subscriptions to reconcile into routing.
         subscriptions: Vec<Subscription>,
+        /// Whether the recovered record carries a delayed Will (issue #299). Read here,
+        /// off-loop, because a resume must clear the DURABLE block even when this node
+        /// holds no in-memory twin for it — the record outlives the node that armed it,
+        /// which is the reason it exists.
+        pending_will: bool,
     },
     /// A clean-start attach finished discarding the prior durable state (ADR 0017);
     /// register a fresh session (`session_present = false`, no replay).
@@ -1128,8 +1256,8 @@ pub struct PendingAttach {
     session_expiry: u32,
     /// MQTT 5.0 Receive Maximum for this connection (ADR 0012).
     receive_maximum: u16,
-    /// Will message to publish if the connection ends ungracefully.
-    will: Option<Message>,
+    /// Will to publish if the connection ends ungracefully, with its delay (#299).
+    will: Option<WillSpec>,
     /// Channel the hub uses to deliver packets to this client.
     outbound: Outbound,
     /// Reply channel the connection awaits before its CONNACK.
@@ -1159,8 +1287,9 @@ pub enum HubCommand {
         /// MQTT 5.0 Receive Maximum: the most unacked `QoS` > 0 publishes the server
         /// may have outstanding to this client at once (ADR 0012).
         receive_maximum: u16,
-        /// Will message to publish if the connection ends ungracefully.
-        will: Option<Message>,
+        /// Will to publish if the connection ends ungracefully, with its MQTT 5.0 Will
+        /// Delay Interval (issue #299).
+        will: Option<WillSpec>,
         /// Channel the hub uses to deliver packets to this client.
         outbound: Outbound,
         /// Reply with the [`AttachOutcome`] so the connection can CONNACK (or reject).
@@ -1606,8 +1735,9 @@ pub enum HubCommand {
     /// the routing table so a publish arriving before the client's first re-attach
     /// enqueues instead of routing to nothing.
     InheritedSessions {
-        /// `(client, subscriptions, expiry deadline)` per stored session.
-        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+        /// Every stored session as the scan read it — subscriptions, absolute expiry
+        /// deadline, and any persisted delayed Will (issue #299).
+        sessions: Vec<mqtt_storage::ScannedSession>,
         /// Whether the scan saw everything (0043-P4 exhibit ②): `false` when a
         /// key was skipped for a transient reason — the view may be missing
         /// sessions, so it must not settle the interest-authoritative flag.
@@ -1752,6 +1882,32 @@ pub struct Hub {
     /// new owner inherit the right deadline after a takeover — the same value is persisted in
     /// the durable session metadata.
     expiring: HashMap<ClientId, u64>,
+    /// Last Wills armed but not yet published: the connection ended ungracefully and
+    /// `min(will delay, session expiry)` has not elapsed (issue #299, §3.1.3.2.2). At
+    /// most one per client id by construction — a new session's attach either cancelled
+    /// or fired the previous one.
+    pending_wills: HashMap<ClientId, PendingWill>,
+    /// Wills whose session ENDED inside the delay window (§3.1.3.2.2's "or the Session
+    /// ends"): queued by the sync `discard_session_local` choke point, published by the
+    /// loop's will branch microseconds later. A separate queue rather than a `due = now`
+    /// marker in `pending_wills` so nothing on the attach path can race it away — the
+    /// ordering between a session end and a connection registering is not guaranteed, and a
+    /// will that must be announced must not depend on it.
+    wills_due_now: Vec<(ClientId, Message)>,
+    /// Cached earliest `PendingWill::due`, driving the hub loop's will branch.
+    ///
+    /// **Invariant: this may be too EARLY, never too LATE.** Arming sets it to
+    /// `min(hint, new)`; the branch recomputes it from scratch when it runs. A cancel
+    /// deliberately leaves it stale-early, which costs one wakeup that finds nothing due
+    /// and re-derives the hint. A future edit that lets it run LATE would silently stop
+    /// wills firing, with no counter moving.
+    next_will_due: Option<Instant>,
+    /// Client ids whose pending will was RESOLVED (published, cancelled or handed off)
+    /// since the in-flight inherited-session scan started — the stale-snapshot fence
+    /// [`note_will_decided`](Self::note_will_decided) describes. Populated only while a
+    /// scan is in flight, consulted by `inherit_sessions`, cleared when the next scan
+    /// starts.
+    wills_decided_since_scan: HashSet<ClientId>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
     /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
@@ -2309,6 +2465,10 @@ impl Hub {
                 online: HashMap::new(),
                 session_expiry: HashMap::new(),
                 expiring: HashMap::new(),
+                pending_wills: HashMap::new(),
+                wills_due_now: Vec::new(),
+                next_will_due: None,
+                wills_decided_since_scan: HashSet::new(),
                 expiry_reconcile_tick: 0,
                 retained_antientropy_tick: 0,
                 subs_by_client: HashMap::new(),
@@ -2487,7 +2647,32 @@ impl Hub {
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
         self.spawn_inherited_session_scan();
         loop {
+            // The delayed-Will wakeup (issue #299). A COPY of the cached hint, taken
+            // before the `select!` so the branch's future borrows nothing of `self` —
+            // `self.rx.recv()` already holds the `&mut`. `None` disables the branch with
+            // a future that never completes, so an idle hub costs nothing; a spawned
+            // timer per disconnect was rejected (ADR 0061: it would have to be
+            // `spawn_owned`, could touch no hub state, would need a `conn_id` fence and a
+            // `JoinHandle` per client — the same map, plus 1 700 sleeping tasks on a
+            // resize). The 1 s sweep alone was rejected too: its granularity is
+            // observable, and a will that may land a second late makes the Eclipse
+            // conformance oracle's `2 < duration < 4` bound flaky. The sweep keeps the
+            // two jobs it is better at — the session-expiry coupling and re-arming
+            // inherited wills, both epoch-grained by nature.
+            let next_will_due = self.next_will_due;
             tokio::select! {
+                () = async move {
+                    match next_will_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let started = Instant::now();
+                    self.fire_due_wills().await;
+                    if let Some(m) = &self.metrics {
+                        m.observe_hub_dispatch("will", started.elapsed().as_secs_f64());
+                    }
+                }
                 cmd = self.rx.recv() => match cmd {
                     Some(cmd) => {
                         // Time-on-loop per dispatch (issue #242): the regression
@@ -3191,6 +3376,484 @@ impl Hub {
         .await;
     }
 
+    /// The effective delay before a will that WOULD fire actually fires, in seconds
+    /// (issue #299) — `min(Will Delay Interval, Session Expiry Interval)`, because
+    /// §3.1.3.2.2 delays the will by the interval while §3.1.2.11.2 also publishes it when
+    /// the session expires, **whichever comes first**.
+    ///
+    /// `0` means "publish now, on this dispatch, exactly as before this feature existed":
+    ///
+    /// * no delay property (absent → the spec's own default of 0) — every v3.1.1 client
+    ///   and every v5 client that does not ask, i.e. today's entire fleet;
+    /// * a delay of 0;
+    /// * a session that does not survive the disconnect at all (Session Expiry Interval 0,
+    ///   or v3.1.1 `clean_session = 1`): the session ends immediately, so the will fires
+    ///   immediately no matter how large the delay. Note a v5 CONNECT with NO Session
+    ///   Expiry Interval is normalized to 0 at the connection edge (ADR 0009 §1), which is
+    ///   spec-correct (§3.1.2.11.2: absent = 0) and the single most surprising edge here —
+    ///   a client asking for a delay must also ask for a session that outlives it.
+    ///
+    /// `self.session_expiry` holds only NON-zero intervals (`finish_attach` removes the key
+    /// for 0), so a missing key is the expiry-0 case; `Some(0)` is unreachable by
+    /// construction and kept explicit rather than folded into the `min`.
+    fn effective_will_delay(&self, client: &ClientId, delay: u32) -> u32 {
+        match self.session_expiry.get(client).copied() {
+            None | Some(0) => 0,
+            Some(SESSION_EXPIRY_NEVER) => delay,
+            Some(secs) => delay.min(secs),
+        }
+    }
+
+    /// Publish a will now, or ARM it for `min(delay, expiry)` from now (issue #299).
+    ///
+    /// The one seam this feature adds to the ungraceful-disconnect path. It is called only
+    /// where the pre-#299 code called [`publish_will`](Self::publish_will) unconditionally,
+    /// so #265/#238's graceful-vs-ungraceful rule is untouched: a will suppressed by a
+    /// client's own DISCONNECT never reaches here, and a will with no effective delay still
+    /// publishes inline on the same dispatch, with no new state and no new node-death
+    /// window.
+    async fn arm_or_publish_will(&mut self, client: &ClientId, w: WillSpec) {
+        let effective = self.effective_will_delay(client, w.delay);
+        if effective == 0 {
+            info!(client = %client.0, topic = %w.message.topic,
+                  "publishing will (ungraceful disconnect)");
+            self.publish_will(&w.message).await;
+            if let Some(m) = &self.metrics {
+                m.will_published("immediate");
+            }
+            return;
+        }
+        // An armed will implies a retained session, which implies a durable record to
+        // persist it into — there is no case where the delay matters and there is nothing
+        // to write to.
+        debug_assert!(
+            self.session_expiry
+                .get(client)
+                .is_some_and(|secs| *secs != 0),
+            "a will is only armed for a session that survives its disconnect"
+        );
+        debug_assert!(
+            !self.pending_wills.contains_key(client),
+            "at most one pending will per client id: an attach either cancelled or fired \
+             the previous one"
+        );
+        let deadline_epoch = self.will_deadline_epoch(effective);
+        let due = Instant::now()
+            .checked_add(Duration::from_secs(u64::from(effective)))
+            // A century-out deadline is exactly what a client asking for u32::MAX wants;
+            // it must not saturate to "now" and fire a false death announcement.
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(u64::from(u32::MAX)));
+        info!(client = %client.0, topic = %w.message.topic, delay_s = w.delay,
+              effective_s = effective, deadline_epoch,
+              "will DELAYED (MQTT 5.0 §3.1.3.2.2); a resume inside the window cancels it");
+        let persisted = self
+            .persist_pending_will(client, Some((&w.message, deadline_epoch)))
+            .await;
+        self.pending_wills.insert(
+            client.clone(),
+            PendingWill {
+                will: w.message,
+                due,
+                deadline_epoch,
+                persisted,
+                inherited: false,
+            },
+        );
+        self.note_will_due(due);
+    }
+
+    /// The Will of a connection that a new one just REPLACED (a takeover, issue #299).
+    ///
+    /// **A resume is a resume, whatever the resuming CONNECT asks for.** [MQTT-3.1.3-9]:
+    /// if the Session resumes before the Will Delay Interval elapses the will MUST NOT be
+    /// sent — the sentence says nothing about the new connection's Session Expiry Interval,
+    /// so this decision must not read it. Re-deriving `min(delay, expiry)` from the new
+    /// connection here was a real defect and the most ordinary reconnect shape there is: a
+    /// half-open old socket plus a client that reconnects WITHOUT the Session Expiry
+    /// property (paho's default, and every v5 client that does not set it) yields
+    /// `effective == 0` and announces the death of a device that is connected right now.
+    /// Session Expiry bounds a will only while the session has NO connection; a takeover
+    /// means it never lost one.
+    ///
+    /// **And a CLEAN START takeover deletes the will too — from the spec text, not from an
+    /// interpretation.** This reverses what the previous round shipped, so both clauses are
+    /// quoted here in full and the reasoning is laid out rather than asserted.
+    ///
+    /// §3.1.2.5 (Will Flag) is where the obligation to publish actually lives:
+    ///
+    /// > "The Will Message MUST be published after the Network Connection is subsequently
+    /// > closed and either the Will Delay Interval has elapsed or the Session ends, unless
+    /// > the Will Message has been deleted by the Server on receipt of a DISCONNECT packet
+    /// > with Reason Code 0x00 (Normal disconnection) or a new Network Connection for the
+    /// > ClientID is opened before the Will Delay Interval has elapsed \[MQTT-3.1.2-8\]."
+    ///
+    /// §3.1.3.2.2 (Will Delay Interval) is where the delay and the resume rule live:
+    ///
+    /// > "The Server delays publishing the Client's Will Message until the Will Delay
+    /// > Interval has passed or the Session ends, whichever happens first. If a new Network
+    /// > Connection to this Session is made before the Will Delay Interval has passed, the
+    /// > Server MUST NOT send the Will Message \[MQTT-3.1.3-9\]."
+    ///
+    /// Read together: [MQTT-3.1.2-8]'s `unless` is an exception to the WHOLE obligation —
+    /// "either the Will Delay Interval has elapsed **or the Session ends**" — so it
+    /// overrides both triggers, including the session-end one. And its second exception is
+    /// keyed on **the `ClientID`**, not on the Session: "a new Network Connection **for
+    /// the `ClientID`** is opened before the Will Delay Interval has elapsed". A Clean Start
+    /// CONNECT for the same client id inside the window is exactly that. [MQTT-3.1.3-9] is
+    /// the narrower, session-keyed rule and covers only the resume; §3.1.3.2.2's first
+    /// sentence describes when the *delay* ends, and cannot create an obligation that
+    /// [MQTT-3.1.2-8] explicitly excepts.
+    ///
+    /// So the previous reading — [MQTT-3.1.2-4] discards the Session, therefore "or the
+    /// Session ends" fires the will — reached its conclusion without weighing the one
+    /// normative sentence that governs the case, and it was wrong in the direction that
+    /// costs users the feature: `clean_start = 1` with a non-zero Session Expiry Interval is
+    /// an ordinary client shape (it is what this project's own paho oracle sends), and for
+    /// every such client a Will Delay Interval would have suppressed nothing at all.
+    ///
+    /// Therefore exactly two cases remain, and neither reads the new connection:
+    ///
+    /// * **No delay asked for** (`delay == 0`, i.e. every v3.1.1 client and every v5 client
+    ///   without property `0x18`) → published on this dispatch, byte-for-byte the pre-#299
+    ///   takeover path. [MQTT-3.1.2-8]'s exception cannot apply: the interval has already
+    ///   elapsed when the connection closes, so there is no window for a new connection to
+    ///   open inside.
+    /// * **A delay was asked for** → the will is DELETED, whatever `clean_start` says. This
+    ///   is the ONLINE half of what `discard_session_local` does for an offline session
+    ///   (`SessionEnd::ReplacedByNewConnection`); the two must agree, or the same CONNECT
+    ///   means different things depending on whether the broker had already reaped the old
+    ///   socket — timing the client cannot see.
+    async fn resolve_replaced_will(&mut self, client: &ClientId, w: WillSpec, clean_start: bool) {
+        if w.delay == 0 {
+            self.publish_will(&w.message).await;
+            if let Some(m) = &self.metrics {
+                m.will_published("immediate");
+            }
+            return;
+        }
+        let reason = if clean_start {
+            "clean-start"
+        } else {
+            "takeover"
+        };
+        info!(client = %client.0, topic = %w.message.topic, delay_s = w.delay, clean_start,
+              "a new connection for this client id inside the will delay window: will \
+               DELETED [MQTT-3.1.2-8] — and for a resume [MQTT-3.1.3-9] too, whatever this \
+               CONNECT's Session Expiry says");
+        self.note_will_decided(client);
+        if let Some(m) = &self.metrics {
+            m.will_cancelled(reason);
+        }
+    }
+
+    /// The ABSOLUTE deadline that goes in the durable record: a whole Unix epoch second,
+    /// **rounded UP** from the arm instant (issue #299).
+    ///
+    /// The record's field is whole seconds, mirroring ADR 0009 §3's persisted expiry
+    /// deadline, and it is read back by a *different* process at a different sub-second
+    /// offset. So the conversion truncates twice — once storing `floor(now) + effective`,
+    /// once computing `deadline − floor(now)` — and the two truncations do not cancel: the
+    /// elapsed delay came out as `effective − frac(arm) + frac(re-arm)`, uniform in
+    /// `(effective − 1 s, effective + 1 s)`. Measured on the real broker across a restart:
+    /// armed at 09:28:54.7408 with an 8 s delay, published at 09:29:02.0524 — **7.312 s,
+    /// 0.69 s early**, against an ADR that promises "never early" and a
+    /// TROUBLESHOOTING entry that calls an early will a defect rather than a tuning
+    /// question.
+    ///
+    /// Rounding up here (and reading the remaining time in MILLIS in
+    /// [`inherit_sessions`](Self::inherit_sessions)) makes every rounding error land LATE,
+    /// by strictly less than one second. A will is a death announcement: late is a slow
+    /// announcement, early is a false one, and only one of those can be un-published.
+    ///
+    /// `now_epoch_millis` defaults to `now_epoch_secs() * 1000`, so a whole-second test
+    /// clock yields exactly `now + effective` and the deterministic deadline tests keep
+    /// their exact arithmetic.
+    fn will_deadline_epoch(&self, effective: u32) -> u64 {
+        self.clock
+            .now_epoch_millis()
+            .saturating_add(u64::from(effective).saturating_mul(1_000))
+            .div_ceil(1_000)
+    }
+
+    /// Re-arm one delayed will read back from a durable session record (issue #299) — the
+    /// node-death answer, under [`inherit_sessions`](Self::inherit_sessions)'s existing
+    /// OWNED-and-not-online filter. This is what covers node death, a lease move, a crash
+    /// restart AND a graceful restart over the same data dir; without it a will armed on a
+    /// node that then dies is lost silently, which is precisely the unexpected death the
+    /// Will exists to announce.
+    ///
+    /// Two rules, each one a defect that reached review:
+    ///
+    /// * **The fence.** The block arrives in a SNAPSHOT read off the loop, so a will
+    ///   resolved on the loop since that read is invisible to it. Re-arming one anyway
+    ///   announced the same death twice in 5 of 6 restarts (the read raced
+    ///   `fire_due_wills`' durable clear) and re-published a will a resume had already
+    ///   cancelled, at once, because its deadline had passed. See
+    ///   [`note_will_decided`](Self::note_will_decided); re-ordering the sweep's own steps
+    ///   would close neither, because the read is off-loop.
+    /// * **Milliseconds, not whole seconds.** The remaining time comes from the ABSOLUTE
+    ///   epoch deadline, so a takeover does not restart the clock (ADR 0009 §3's argument,
+    ///   same machinery) — but that deadline is already rounded UP to a whole second by
+    ///   [`will_deadline_epoch`](Self::will_deadline_epoch), so landing exactly ON it is
+    ///   at-or-after what the client asked for. Subtracting a truncated `now` in SECONDS
+    ///   here was the second half of a measured 0.69 s-early fire.
+    ///
+    /// A deadline already in the past yields `due = now` and fires on the loop's next will
+    /// branch: late, but delivered. An arm this node made itself is authoritative and is
+    /// never pushed back by a scan.
+    fn inherit_pending_will(&mut self, client: &ClientId, will: Message, deadline_epoch: u64) {
+        if self.wills_decided_since_scan.contains(client) {
+            debug!(client = %client.0, deadline_epoch,
+                   "inherited-session scan: pending will SKIPPED — it was published, \
+                    cancelled or handed off after this scan's snapshot was read (issue #299)");
+            return;
+        }
+        if self.pending_wills.contains_key(client) {
+            return;
+        }
+        let remaining_ms = deadline_epoch
+            .saturating_mul(1_000)
+            .saturating_sub(self.clock.now_epoch_millis());
+        let due = Instant::now()
+            .checked_add(Duration::from_millis(remaining_ms))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(u64::from(u32::MAX)));
+        info!(client = %client.0, topic = %will.topic, deadline_epoch, remaining_ms,
+              "inherited a delayed will from the durable session record (issue #299)");
+        self.pending_wills.insert(
+            client.clone(),
+            PendingWill {
+                will,
+                due,
+                deadline_epoch,
+                persisted: true,
+                inherited: true,
+            },
+        );
+        self.note_will_due(due);
+    }
+
+    /// Fence a pending will's fate against an in-flight inherited-session scan (issue #299).
+    ///
+    /// **The one mechanism behind two duplicate/resurrection defects**, both of them the
+    /// same class the hub already fences elsewhere — a result computed off-loop from a
+    /// SNAPSHOT and applied later, exactly what `session_recovered` drops when a newer
+    /// `conn_id` won the id during the wait. `spawn_inherited_session_scan` reads
+    /// `all_sessions()` off the loop; whatever happens to a will *after* that read is
+    /// invisible to the result, so applying the result blindly re-armed wills that were
+    /// already resolved:
+    ///
+    /// * **A duplicate announcement, in 5 of 6 restart runs.** The sweep spawns the scan
+    ///   before `fire_due_wills`, so the scan's read of the record races the fire's durable
+    ///   clear. When the read won, `inherit_sessions` saw the block again, re-armed with
+    ///   zero remaining and published a second time ~20 ms later — both copies labelled
+    ///   `reason="inherited"`, so an operator could not tell one duplicate from two deaths.
+    /// * **A will a resume already cancelled, published at once** because its deadline had
+    ///   passed: the record read before the cancel, applied after it.
+    ///
+    /// **Ordering is not a fix and is deliberately not relied on**: the scan is off-loop,
+    /// so *any* ordering of the loop's own steps can still be raced by a slow read. The
+    /// fence is what closes it. Bounded by construction: entries are only recorded while a
+    /// scan is in flight, and cleared when the next one starts.
+    fn note_will_decided(&mut self, client: &ClientId) {
+        if self.inherited_scan_inflight {
+            self.wills_decided_since_scan.insert(client.clone());
+        }
+    }
+
+    /// Pull the cached wakeup hint no later than `due` — the only way the hint moves
+    /// earlier. It is never moved later here; see [`Hub::next_will_due`].
+    fn note_will_due(&mut self, due: Instant) {
+        self.next_will_due = Some(match self.next_will_due {
+            Some(current) => current.min(due),
+            None => due,
+        });
+    }
+
+    /// Re-derive the wakeup hint from the pending set (one O(pending) scan, only where the
+    /// loop's will branch already ran).
+    fn recompute_next_will_due(&mut self) {
+        self.next_will_due = if self.wills_due_now.is_empty() {
+            self.pending_wills.values().map(|p| p.due).min()
+        } else {
+            Some(Instant::now())
+        };
+    }
+
+    /// A resume CANCELS a pending will outright — [MQTT-3.1.3-9]: the will is *not* sent
+    /// at all if the session resumes inside the Will Delay Interval. That is the whole
+    /// point of the property, so each increment here is one spurious device-offline
+    /// announcement not sent.
+    ///
+    /// Called where the connection is actually REGISTERED (beside `online.insert`), never
+    /// at `attach` entry: a CONNECT refused for auth, quota, `Unavailable` or an owner
+    /// mismatch did not resume the session, so it must not cancel the will.
+    ///
+    /// **`record_holds` is why this cannot be a memory-only cancel.** The obligation a
+    /// resume ends can outlive the node that armed it: the durable record is authoritative
+    /// after the arming node dies (that is the whole point of persisting it), so a record
+    /// carrying a pending will this node never armed — armed on a peer, or armed by this
+    /// node before it restarted — must be cleared HERE. It was not, and the consequence was
+    /// the worst shape available: the inherited-session scan re-armed the stale block with
+    /// an already-past deadline and announced the client dead *after* it had resumed and
+    /// then disconnected cleanly, violating [MQTT-3.1.3-9] and [MQTT-3.14.4-3] at once,
+    /// with no connection event to correlate against. The flag comes from the attach's own
+    /// off-loop recovery read, so the common case (no pending will in the record) costs no
+    /// write at all.
+    async fn cancel_pending_will(&mut self, client: &ClientId, reason: &str, record_holds: bool) {
+        let held = self.pending_wills.remove(client);
+        // Fenced FIRST and unconditionally, before the "nothing to cancel" exit: the fact
+        // that matters to an in-flight scan is that this session was RESUMED, not whether
+        // this node could see a copy of the will to delete. A snapshot taken before the
+        // resume must not re-arm from it afterwards — see `note_will_decided`.
+        self.note_will_decided(client);
+        if held.is_none() && !record_holds {
+            return;
+        }
+        let topic = held
+            .as_ref()
+            .map_or("(from the durable record)", |p| p.will.topic.as_str());
+        info!(client = %client.0, topic, reason, record_holds,
+              "session resumed inside the will delay window: will CANCELLED \
+               [MQTT-3.1.3-9]");
+        if let Some(m) = &self.metrics {
+            m.will_cancelled(reason);
+        }
+        // The hint is deliberately left stale-EARLY: one harmless wakeup that finds
+        // nothing due and re-derives it.
+        if record_holds || held.is_some_and(|p| p.persisted) {
+            self.persist_pending_will(client, None).await;
+        }
+    }
+
+    /// Publish every will whose deadline has passed, and every will whose SESSION ended
+    /// inside its window. Runs on the hub loop's will branch (and once per sweep tick, for
+    /// the epoch-grained cases).
+    ///
+    /// Each fire goes through the unchanged [`publish_will`](Self::publish_will), so a
+    /// delayed will is still an UNGATED publish (issue #238): under brownout its durable
+    /// copy is refused and COUNTED as a drop while the live delivery still happens. A
+    /// dashboard must not keep a dead device "online" through exactly the incident
+    /// [MQTT-3.14.4-3] exists for, delayed or not.
+    async fn fire_due_wills(&mut self) {
+        // §3.1.3.2.2's "or the Session ends" first: these are already overdue.
+        for (client, will) in std::mem::take(&mut self.wills_due_now) {
+            info!(client = %client.0, topic = %will.topic,
+                  "publishing delayed will: the session ended inside its delay window");
+            self.note_will_decided(&client);
+            self.publish_will(&will).await;
+            if let Some(m) = &self.metrics {
+                m.will_published("session-ended");
+            }
+        }
+        let now = Instant::now();
+        let due: Vec<ClientId> = self
+            .pending_wills
+            .iter()
+            .filter(|(_, p)| p.due <= now)
+            .map(|(c, _)| c.clone())
+            .collect();
+        for client in due {
+            let Some(pending) = self.pending_wills.remove(&client) else {
+                continue;
+            };
+            let reason = if pending.inherited {
+                "inherited"
+            } else {
+                "delay-elapsed"
+            };
+            info!(client = %client.0, topic = %pending.will.topic, reason,
+                  deadline_epoch = pending.deadline_epoch,
+                  "publishing delayed will: the will delay elapsed with no resume");
+            // Fence an in-flight scan's snapshot against this fire, BEFORE the publish and
+            // before the durable clear: the scan may already have read the block. Without
+            // this the same will was announced twice, `reason="inherited"` both times, in
+            // 5 of 6 restart runs (`note_will_decided`).
+            self.note_will_decided(&client);
+            self.publish_will(&pending.will).await;
+            if let Some(m) = &self.metrics {
+                m.will_published(reason);
+            }
+            if pending.persisted {
+                self.persist_pending_will(&client, None).await;
+            }
+        }
+        self.recompute_next_will_due();
+    }
+
+    /// Persist (or clear) a session's pending will and its ABSOLUTE deadline, returning
+    /// whether the record provably holds it (issue #299).
+    ///
+    /// **Why persist at all.** Before this feature an ungraceful `detach` handed the will
+    /// to the delivery path synchronously, on the same dispatch, so no node-death window
+    /// existed on that path. A delay CREATES one — and accepting the loss inside it would
+    /// mean the broker silently drops the announcement of an unexpected death in the very
+    /// window where a death is suspected. That is not a residual; it is the feature
+    /// inverted. So the deadline rides the durable session record, exactly as ADR 0009 §3
+    /// persists the session-expiry deadline, and the inherited-session scan re-arms it
+    /// after a takeover, a restart or a node death.
+    ///
+    /// Skipped-not-attempted on a clustered durable node that does not own the session's
+    /// group, for `persist_detach_deadline`'s reasons: the group-routed write cannot land,
+    /// and after a rehome close (issue #284) that is true BY CONSTRUCTION. Counted either
+    /// way — an unpersisted arm is residual R1, a will that a node death would lose.
+    /// A failed CLEAR is counted apart from a failed ARM, because the two fail in opposite
+    /// directions: an unpersisted arm risks a will that is never announced (R1), while an
+    /// uncleared record risks one announced that should not have been.
+    async fn persist_pending_will(
+        &self,
+        client: &ClientId,
+        pending: Option<(&Message, u64)>,
+    ) -> bool {
+        let arming = pending.is_some();
+        if self.durable_plane.is_some() && self.clustered() && !self.owns_session(client) {
+            if arming {
+                warn!(
+                    client = %client.0,
+                    "delayed will NOT persisted: this node does not own the session's \
+                     group, so the group-routed write cannot land (issue #299 R1). A node \
+                     death inside the delay window loses this will"
+                );
+            } else {
+                warn!(
+                    client = %client.0,
+                    "a pending will could NOT be cleared from the durable record: this \
+                     node does not own the session's group (issue #299 R3). Its owner may \
+                     still announce this client dead once the deadline passes"
+                );
+            }
+            if let Some(m) = &self.metrics {
+                m.pending_will_unpersisted(if arming {
+                    "not-owner"
+                } else {
+                    "clear-not-owner"
+                });
+            }
+            return false;
+        }
+        if let Err(e) = self.store.set_pending_will(client, pending).await {
+            if arming {
+                warn!(
+                    client = %client.0,
+                    error = %e,
+                    "failed to persist the delayed will (issue #299 R1); a node death \
+                     inside the delay window loses it"
+                );
+            } else {
+                warn!(
+                    client = %client.0,
+                    error = %e,
+                    "failed to CLEAR a pending will from the durable record (issue #299); \
+                     an inherited-session scan may still announce this client dead"
+                );
+            }
+            if let Some(m) = &self.metrics {
+                m.pending_will_unpersisted(if arming { "error" } else { "clear-error" });
+            }
+            return false;
+        }
+        true
+    }
+
     /// Apply a message on this node: store/clear retained state and deliver to local
     /// ordinary subscribers. Does **not** forward or run shared selection — used both
     /// for local publishes (via
@@ -3327,7 +3990,12 @@ impl Hub {
             // group, which inline would freeze the hub and stall this CONNACK; the
             // CONNACK is still gated on the discard (via `SessionRecovered`) so the
             // clean-session wipe is observed before the client proceeds.
-            self.discard_session_local(&pending.client);
+            // Clean Start discards the existing session [MQTT-3.1.2-4] — but this is still
+            // "a new Network Connection for the ClientID … opened before the Will Delay
+            // Interval has elapsed", which [MQTT-3.1.2-8] makes the Server DELETE the will.
+            // So the pending will is dropped, not published: see `resolve_replaced_will`
+            // for the full reading and why the online half must answer the same way.
+            self.discard_session_local(&pending.client, SessionEnd::ReplacedByNewConnection);
             self.connecting
                 .insert(pending.client.clone(), pending.conn_id);
             // Appends for this session still in flight in its lane (issue #242): route
@@ -3407,12 +4075,16 @@ impl Hub {
             SessionRecovery::Ready {
                 present,
                 subscriptions,
+                pending_will,
             } => {
-                self.finish_attach(pending, false, present, subscriptions)
+                self.finish_attach(pending, false, present, subscriptions, pending_will)
                     .await;
             }
+            // A clean start REMOVED the durable record (and any pending will with it), so
+            // there is nothing left to clear. What that costs is named as R5 in ADR 0009.
             SessionRecovery::Cleaned => {
-                self.finish_attach(pending, true, false, Vec::new()).await;
+                self.finish_attach(pending, true, false, Vec::new(), false)
+                    .await;
             }
             SessionRecovery::Unavailable => {
                 warn!(
@@ -3449,6 +4121,7 @@ impl Hub {
         clean_start: bool,
         session_present: bool,
         subscriptions: Vec<Subscription>,
+        record_holds_pending_will: bool,
     ) {
         let PendingAttach {
             client,
@@ -3598,12 +4271,27 @@ impl Hub {
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
         // disconnect is not a client DISCONNECT, so the old will is published.
+        //
+        // …unless the client asked for a Will Delay Interval (issue #299) and this attach
+        // RESUMED the session — see [`resolve_replaced_will`](Self::resolve_replaced_will)
+        // for the rule and why it may not consult the NEW connection's Session Expiry.
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             if let Some(w) = old.will {
-                self.publish_will(&w).await;
+                self.resolve_replaced_will(&client, w, clean_start).await;
             }
         }
+        // A will armed by an earlier ungraceful disconnect: this attach RESUMED the
+        // session, so [MQTT-3.1.3-9] deletes the will — the in-memory arm AND the durable
+        // block, which may be all there is (a will armed on a peer, or before this node
+        // restarted). Here rather than at `attach` entry because only an ACCEPTED,
+        // registered connection is a resume — a CONNECT refused above for quota/brownout,
+        // `Unavailable` or an owner mismatch left the session untouched and must not cancel
+        // anything. A Clean Start CONNECT deletes a live pending will one step earlier, at
+        // `attach`'s `SessionEnd::ReplacedByNewConnection`, and reaches here with nothing
+        // left to clear — same outcome [MQTT-3.1.2-8], different choke point.
+        self.cancel_pending_will(&client, "resumed", record_holds_pending_will)
+            .await;
         self.online.insert(
             client.clone(),
             Online {
@@ -5936,10 +6624,17 @@ impl Hub {
         }
         // Any end other than a clean DISCONNECT publishes the will
         // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
+        //
+        // Since issue #299 the will may be HELD instead of published: `arm_or_publish_will`
+        // waits out `min(Will Delay Interval, Session Expiry Interval)` (§3.1.3.2.2 +
+        // §3.1.2.11.2) and a resume inside that window cancels it entirely. The gate above
+        // is unchanged and load-bearing — a will suppressed by a client's own DISCONNECT
+        // stays suppressed; the delay only ever applies to a will that WOULD have fired.
+        // Note this runs BEFORE the session-retention match below, which is what lets
+        // `effective_will_delay` still read the session's expiry interval.
         if !graceful {
             if let Some(w) = departed.and_then(|o| o.will) {
-                info!(client = %client.0, topic = %w.topic, "publishing will (ungraceful disconnect)");
-                self.publish_will(&w).await;
+                self.arm_or_publish_will(client, w).await;
             }
         }
         // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
@@ -6099,7 +6794,7 @@ impl Hub {
     /// simply spawned off-loop — it was previously awaited INLINE here, the same
     /// class of loop stall the #242 motion exists to remove.
     fn discard_session(&mut self, client: &ClientId) {
-        self.discard_session_local(client);
+        self.discard_session_local(client, SessionEnd::Ended);
         if self
             .append_lanes
             .get(client)
@@ -6136,12 +6831,90 @@ impl Hub {
     /// The in-memory half of discarding a session (routing, in-flight, expiry state).
     /// Fast and loop-safe; the durable `remove` is done separately (off-loop for a
     /// clean-start attach, ADR 0017).
-    fn discard_session_local(&mut self, client: &ClientId) {
+    ///
+    /// `end` says whether the SESSION ended or merely this node's routing of it — the one
+    /// thing that decides what happens to a pending delayed will. See [`SessionEnd`].
+    fn discard_session_local(&mut self, client: &ClientId, end: SessionEnd) {
         self.drop_subscriptions(client);
         self.inflight.remove(client);
         self.session_expiry.remove(client);
         self.expiring.remove(client);
         self.retained_windows.remove(client);
+        // §3.1.3.2.2, in full: the will is held "until the Will Delay Interval has passed
+        // OR THE SESSION ENDS, whichever happens first". This is the single choke point
+        // where a session ends — the expiry sweep, an evict, a zero-expiry disconnect — so
+        // a pending will is handed to the loop for publication rather than silently dropped
+        // with the session it belonged to.
+        //
+        // Sync, so no `await` enters this `fn` or any of its callers; the loop's will
+        // branch publishes microseconds later.
+        //
+        // …but ONLY where the session ended with NOBODY BACK. The other two shapes are
+        // both "not a session end for the will's purposes", for different reasons:
+        //
+        // * a **new connection for the ClientID** DELETES the will outright
+        //   ([MQTT-3.1.2-8]) even when it discards the session — `ReplacedByNewConnection`,
+        //   whose reasoning is in [`resolve_replaced_will`];
+        // * a local **routing release** is not an end at all: see [`SessionEnd`], and
+        //   `release_moved_sessions` for why treating it as one published a will up to a
+        //   whole delay early, mislabelled, and left the record's copy behind to announce
+        //   the same death a second time.
+        let Some(pending) = self.pending_wills.remove(client) else {
+            // Still fence the scan: the record may hold a block this node's memory does
+            // not, and this session just ended (issue #299).
+            if end != SessionEnd::RoutingReleased {
+                self.note_will_decided(client);
+            }
+            return;
+        };
+        self.note_will_decided(client);
+        match end {
+            SessionEnd::ReplacedByNewConnection => {
+                // [MQTT-3.1.2-8]: a new Network Connection for the ClientID opened before
+                // the Will Delay Interval has elapsed DELETES the Will Message. No publish,
+                // no hand-off — the obligation is gone. The durable block goes with the
+                // record, which every caller of this variant removes off-loop.
+                info!(client = %client.0, topic = %pending.will.topic,
+                      "clean-start CONNECT for this client id inside the will delay window: \
+                       will DELETED, not published [MQTT-3.1.2-8]");
+                if let Some(m) = &self.metrics {
+                    m.will_cancelled("clean-start");
+                }
+            }
+            SessionEnd::Ended => {
+                // No durable clear is needed here and none is done: every `Ended` caller
+                // removes the whole session record — `discard_session` covers the
+                // zero-expiry disconnect, the expiry sweep and `evict`, off-loop. A future
+                // `Ended` caller that does NOT remove the record must clear the block
+                // itself, or the scan will announce this death twice.
+                self.wills_due_now.push((client.clone(), pending.will));
+                self.next_will_due = Some(Instant::now());
+            }
+            SessionEnd::RoutingReleased if pending.persisted => {
+                // The record provably holds this will and its absolute deadline, and this
+                // node no longer owns the session's group — so the NEW owner fires it, at
+                // the right time, from the record (`reason="inherited"`). Neither a
+                // publish nor a cancel: a hand-off, counted as one.
+                info!(client = %client.0, topic = %pending.will.topic,
+                      deadline_epoch = pending.deadline_epoch,
+                      "pending will handed off with the session's group: the new owner's \
+                       record holds it and its deadline (ADR 0043 P2, issue #299)");
+                if let Some(m) = &self.metrics {
+                    m.will_handed_off();
+                }
+            }
+            SessionEnd::RoutingReleased => {
+                // Memory-only (residual R1: the arm could not be persisted, which after a
+                // rehome close is true by construction). Nothing else holds this will, so
+                // keep holding it: a duplicate is recoverable, a silence is not. It fires
+                // at its own deadline, never earlier.
+                warn!(client = %client.0, topic = %pending.will.topic,
+                      "routing released for a session whose pending will was never \
+                       persisted (issue #299 R1): keeping it armed here, since no other \
+                       node holds it");
+                self.pending_wills.insert(client.clone(), pending);
+            }
+        }
     }
 
     /// Discard every session whose MQTT 5.0 Session Expiry Interval has elapsed
@@ -6242,6 +7015,15 @@ impl Hub {
             self.broadcast_retained_digest().await;
         }
 
+        // Delayed wills (issue #299). The loop's own wakeup branch is what honours a delay
+        // to the millisecond; this call is the belt-and-braces pass for the epoch-grained
+        // cases — a will re-armed from a durable record with an already-past deadline, and
+        // any hint that a cancel left stale. Never fires anything EARLY: `fire_due_wills`
+        // compares monotonic deadlines, not the sweep's cadence.
+        if !self.pending_wills.is_empty() || !self.wills_due_now.is_empty() {
+            self.fire_due_wills().await;
+        }
+
         let now = self.clock.now_epoch_secs();
         let expired: Vec<ClientId> = self
             .expiring
@@ -6253,6 +7035,23 @@ impl Hub {
             return;
         }
         for client in &expired {
+            // §3.1.2.11.2: the will is ALSO published when the session expires. Because
+            // the arm took `min(delay, expiry)` this is normally already done, but the
+            // ordering is explicit — wills BEFORE `discard_session` — so that a wall-clock
+            // jump (epoch-based expiry vs the monotonic `due`) can never expire a session
+            // out from under its own will.
+            if let Some(pending) = self.pending_wills.remove(client) {
+                info!(client = %client.0, topic = %pending.will.topic,
+                      deadline_epoch = pending.deadline_epoch,
+                      "publishing delayed will: the session expiry was the binding bound \
+                       (§3.1.2.11.2)");
+                self.note_will_decided(client);
+                self.publish_will(&pending.will).await;
+                if let Some(m) = &self.metrics {
+                    m.will_published("session-expired");
+                }
+                self.recompute_next_will_due();
+            }
             self.discard_session(client);
             info!(client = %client.0, "session expired and discarded");
         }
@@ -6271,6 +7070,10 @@ impl Hub {
             return;
         }
         self.inherited_scan_inflight = true;
+        // Open this scan's fence window (issue #299): from here until the result lands,
+        // every will this loop resolves is recorded, and the result may not re-arm it.
+        // See [`note_will_decided`](Self::note_will_decided) for the two defects.
+        self.wills_decided_since_scan.clear();
         let store = self.store.clone();
         let tx = self.self_tx.clone();
         debug!("inherited-session scan started");
@@ -6308,7 +7111,7 @@ impl Hub {
     /// `finish_attach` overwrites the placeholder expiry interval.
     async fn inherit_sessions(
         &mut self,
-        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+        sessions: Vec<mqtt_storage::ScannedSession>,
         complete: bool,
     ) {
         self.inherited_scan_inflight = false;
@@ -6322,7 +7125,22 @@ impl Hub {
             debug!("interest gossip authoritative: first complete whole-mesh session scan landed");
         }
         let mut registered = false;
-        for (client, subs, deadline) in sessions {
+        let now_epoch = self.clock.now_epoch_secs();
+        // Sessions this scan is handing to the expiry sweep ALREADY PAST their persisted
+        // deadline — the ones about to be discarded, with their acked offline queues. Named
+        // and counted BEFORE it happens, because on the first restart onto a build where
+        // ADR 0009 §3 expiry actually works in this store shape (see
+        // `PersistentLog::keys()`), this is a one-way, data-visible reap that an operator
+        // would otherwise meet as "my sessions vanished". A loud line they can grep beats a
+        // surprise.
+        let mut overdue: Vec<(ClientId, u64)> = Vec::new();
+        for scanned in sessions {
+            let mqtt_storage::ScannedSession {
+                client,
+                subscriptions: subs,
+                expires_at: deadline,
+                pending_will,
+            } = scanned;
             // Skip ones already handled (online or attaching here) and ones this
             // node does not own (a replica held for another node — its owner
             // materializes it).
@@ -6334,7 +7152,17 @@ impl Hub {
                 continue;
             }
             if let Some(d) = deadline {
-                self.expiring.entry(client.clone()).or_insert(d);
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    self.expiring.entry(client.clone())
+                {
+                    slot.insert(d);
+                    if d <= now_epoch {
+                        overdue.push((client.clone(), now_epoch.saturating_sub(d)));
+                    }
+                }
+            }
+            if let Some((will, deadline_epoch)) = pending_will {
+                self.inherit_pending_will(&client, will, deadline_epoch);
             }
             debug!(
                 client = %client.0,
@@ -6365,6 +7193,29 @@ impl Hub {
                 .or_insert(u32::MAX);
             debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
             registered = true;
+        }
+        // The loud, counted line BEFORE the sweep reaps them (issue #299 / ADR 0018 phase 1
+        // upgrade note). Two facts an operator needs and could not previously get: HOW MANY
+        // offline sessions are past their persisted Session Expiry deadline, and WHICH — the
+        // sweep's own per-session "session expired and discarded" lines arrive after the
+        // fact and are indistinguishable from steady-state expiry. This fires on any scan
+        // that inherits an already-overdue deadline, but the shape that matters is the FIRST
+        // restart onto a build where `PersistentLog::keys()` exists: before it, single-node
+        // on-disk deployments (`MQTTD_DATA_DIR`, ADR 0018 phase 1) read back NO sessions, so
+        // ADR 0009 §3 expiry never applied across a restart and these sessions survived
+        // indefinitely. They no longer do — correctly, and irreversibly.
+        if let Some(summary) = summarize_overdue_discard(overdue) {
+            warn!(
+                sessions = summary.sessions,
+                oldest_overdue_s = summary.oldest_overdue_s,
+                clients = %summary.clients,
+                truncated = summary.truncated,
+                "DISCARDING offline sessions past their persisted Session Expiry deadline \
+                 (ADR 0009 §3), together with any queued messages they still hold. On a \
+                 single-node on-disk broker (MQTTD_DATA_DIR) this expiry became effective \
+                 with the fix to PersistentLog::keys(); the FIRST restart onto that build \
+                 reaps everything already past due"
+            );
         }
         if registered || self.interest_authoritative {
             // Peers must know this node now routes the inherited filters — this is
@@ -6436,7 +7287,10 @@ impl Hub {
             return;
         }
         for client in &moved {
-            self.discard_session_local(client);
+            // A ROUTING release, emphatically not a session end (issue #299): the durable
+            // record and its deadlines — session expiry and pending will alike — stay for
+            // the new owner, which is the entire point of this function.
+            self.discard_session_local(client, SessionEnd::RoutingReleased);
             debug!(
                 client = %client.0,
                 "session's group moved to another owner; local routing released (ADR 0043 P2)"
@@ -6724,13 +7578,17 @@ impl Hub {
             // suppression, was rejected as a spec violation). The spec agrees:
             // [MQTT-3.1.2-8] / §3.14.4 delete the will only on a CLIENT DISCONNECT with
             // reason 0x00, which a server `0x9C` is not. The spec's own answer to "this
-            // close is not a death" is the Will Delay Interval (0x18) — which this broker
-            // decodes but does not honour, and honouring it across a CLUSTER needs the
-            // delay and its cancellation to survive the client reconnecting on a
-            // DIFFERENT node, which no peer frame or durable record expresses today. That
-            // is the named follow-up; until then the cost (one LWT per rehomed session,
-            // paced by REHOME_CLOSES_PER_TICK) is documented in OPERATIONS and
-            // TROUBLESHOOTING and locked by a test.
+            // close is not a death" is the Will Delay Interval (0x18), and since issue #299
+            // this broker HONOURS it: a delay-using client's rehome close is now SILENT at
+            // the close — the will is armed for min(delay, expiry), and the routing release
+            // that follows deliberately leaves it alone (see `discard_session_local` and
+            // `SessionEnd`). What it does NOT do is cancel it, because the client's
+            // reconnect is served by the OWNER (ADR 0005 proxies the stream), so nothing
+            // reaches this node's memory to cancel it and the will fires one delay later.
+            // That is residual R3 / 0009-P5, with its mechanism named. For a client with no
+            // delay — every v3.1.1 client, and every v5 client without the property — the
+            // LWT still fires at the close, paced by REHOME_CLOSES_PER_TICK, and both
+            // timings are documented in OPERATIONS and TROUBLESHOOTING and locked by tests.
             self.detach(&client, conn_id, false).await;
             // ...and NOTHING else. The close ends the CONNECTION; the session's routing,
             // its gossiped interest and the settle machinery are left exactly as they
@@ -7046,6 +7904,9 @@ impl Hub {
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
         m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
+        // Delayed wills waiting out their interval (issue #299): the device-offline burst
+        // before it lands.
+        m.set_pending_wills(self.pending_wills.len());
         if let Ok(n) = self.retained.count().await {
             m.set_retained_messages(n);
         }
@@ -9283,9 +10144,17 @@ async fn recover_once(
     // skipped on a transient lease error — a resumed session must deliver its queued
     // messages on this connect, not only on a later reconnect (ADR 0017).
     let _ = store.pending(client, 0, 1).await?;
+    // Does the record carry a delayed will this resume has to cancel (issue #299)? Asked
+    // here, off-loop, and asked of the RECORD rather than of this node's memory: after the
+    // arming node died or restarted, the record is the only thing that still knows. One
+    // metadata read on a path that already does an authoritative claim plus two reads; the
+    // write it saves is the one this would otherwise have to do unconditionally on every
+    // persistent attach.
+    let pending_will = store.pending_will(client).await?.is_some();
     Ok(SessionRecovery::Ready {
         present,
         subscriptions,
+        pending_will,
     })
 }
 
@@ -9799,7 +10668,10 @@ mod tests {
             clean_start,
             session_expiry: if clean_start { 0 } else { u32::MAX },
             receive_maximum: u16::MAX,
-            will: Some(will),
+            will: Some(super::WillSpec {
+                message: will,
+                delay: 0,
+            }),
             outbound: out_tx,
             reply: reply_tx,
         })
@@ -10289,13 +11161,16 @@ mod tests {
             clean_start: true,
             session_expiry: 0,
             receive_maximum: u16::MAX,
-            will: Some(mqtt_core::Message {
-                topic: "wills/victim".into(),
-                payload: Bytes::from_static(b"gone"),
-                qos: QoS::AtMostOnce,
-                retain: false,
-                app: mqtt_core::AppProperties::default(),
-                expires_at: None,
+            will: Some(super::WillSpec {
+                delay: 0,
+                message: mqtt_core::Message {
+                    topic: "wills/victim".into(),
+                    payload: Bytes::from_static(b"gone"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
             }),
             outbound: out_tx,
             reply: reply_tx,
@@ -16248,6 +17123,26 @@ mod tests {
             self.inner.set_session_expiry(client, deadline).await
         }
 
+        async fn set_pending_will(
+            &self,
+            client: &ClientId,
+            pending: Option<(&Message, u64)>,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            // A group-routed WRITE, like the expiry deadline above: refused off the owner,
+            // which is exactly what makes issue #299's residual R1 observable here.
+            if !self.owns(client) {
+                return Err(mqtt_storage::StorageError::NotOwner);
+            }
+            self.inner.set_pending_will(client, pending).await
+        }
+
+        async fn pending_will(
+            &self,
+            client: &ClientId,
+        ) -> Result<Option<(Message, u64)>, mqtt_storage::StorageError> {
+            self.inner.pending_will(client).await
+        }
+
         async fn expiring_sessions(
             &self,
         ) -> Result<Vec<(ClientId, u64)>, mqtt_storage::StorageError> {
@@ -16288,6 +17183,23 @@ mod tests {
         Vec<NodeId>,
         Arc<mqtt_observability::metrics::Metrics>,
     ) {
+        let (tx, placement, remotes, metrics, _store) =
+            start_rehome_hub_with_store(remote_addrs).await;
+        (tx, placement, remotes, metrics)
+    }
+
+    /// [`start_rehome_hub_with`] keeping a handle on the group-gated store, so a test can
+    /// read what the DURABLE RECORD holds — the copy a lease move deliberately leaves
+    /// behind for the new owner (issue #299).
+    async fn start_rehome_hub_with_store(
+        remote_addrs: &[&str],
+    ) -> (
+        HubTx,
+        Arc<RwLock<Placement>>,
+        Vec<NodeId>,
+        Arc<mqtt_observability::metrics::Metrics>,
+        Arc<GroupGatedStore>,
+    ) {
         let local = NodeId("rehome-local".into());
         let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
         let remotes: Vec<NodeId> = (0..remote_addrs.len())
@@ -16306,14 +17218,12 @@ mod tests {
                 .observe(node, MemberState::Alive, addr, None);
         }
         let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
-        let (mut hub, tx) = Hub::with_config_and_placement(
-            local.clone(),
-            // The group-gated store, not a bare memory one: a publish toward a session
-            // whose group has moved away must FAIL its durable append here, exactly as
-            // the replicated store fails it on the real node (round-2 finding 1).
-            GroupGatedStore::new(placement.clone()),
-            Some(placement.clone()),
-        );
+        // The group-gated store, not a bare memory one: a publish toward a session
+        // whose group has moved away must FAIL its durable append here, exactly as
+        // the replicated store fails it on the real node (round-2 finding 1).
+        let store = GroupGatedStore::new(placement.clone());
+        let (mut hub, tx) =
+            Hub::with_config_and_placement(local.clone(), store.clone(), Some(placement.clone()));
         // Rehome (like the release path it feeds) is durable-cluster-only: attach a
         // real, idle plane.
         let (_store, _retained, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
@@ -16330,7 +17240,7 @@ mod tests {
         hub.attach_durable_plane(plane);
         hub.attach_metrics(metrics.clone());
         tokio::spawn(hub.run());
-        (tx, placement, remotes, metrics)
+        (tx, placement, remotes, metrics, store)
     }
 
     /// Point `client`'s group's COMMITTED lease at `holder` (what the durable driver
@@ -16438,7 +17348,7 @@ mod tests {
         client: &str,
         conn_id: u64,
         session_expiry: u32,
-        will: Option<Message>,
+        will: Option<super::WillSpec>,
     ) -> mpsc::UnboundedReceiver<Packet> {
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
@@ -17023,13 +17933,16 @@ mod tests {
             client,
             1,
             u32::MAX,
-            Some(Message {
-                topic: "wills/284".into(),
-                payload: Bytes::from_static(b"offline"),
-                qos: QoS::AtMostOnce,
-                retain: false,
-                app: mqtt_core::AppProperties::default(),
-                expires_at: None,
+            Some(super::WillSpec {
+                delay: 0,
+                message: Message {
+                    topic: "wills/284".into(),
+                    payload: Bytes::from_static(b"offline"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
             }),
         )
         .await;
@@ -17057,13 +17970,16 @@ mod tests {
             control,
             2,
             u32::MAX,
-            Some(Message {
-                topic: "wills/284".into(),
-                payload: Bytes::from_static(b"should-not-fire"),
-                qos: QoS::AtMostOnce,
-                retain: false,
-                app: mqtt_core::AppProperties::default(),
-                expires_at: None,
+            Some(super::WillSpec {
+                delay: 0,
+                message: Message {
+                    topic: "wills/284".into(),
+                    payload: Bytes::from_static(b"should-not-fire"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
             }),
         )
         .await;
@@ -17072,6 +17988,183 @@ mod tests {
             recv_packet(&mut watcher).await.is_none(),
             "a clean client DISCONNECT must still delete the will — 'always fire' is as \
              wrong as 'never fire'"
+        );
+    }
+
+    /// Issue #299's visible payoff for issue #284, and the assertion that pins it: **a
+    /// rehome close is SILENT for a client that asked for a Will Delay Interval.**
+    ///
+    /// The sibling test above (`a_rehome_close_publishes_the_clients_will`, `delay: 0`) locks
+    /// the other half: a client that asked for no delay is still announced at the close, so
+    /// this is not "the rehome stopped firing wills". What the delay buys is that the ONE
+    /// close the broker itself initiated because it expects the client back immediately no
+    /// longer announces a death on the spot.
+    ///
+    /// Two things had to hold for that, and both are asserted here. The close arms instead
+    /// of publishing — and then the ROUTING RELEASE that follows it (ADR 0043 P2), which is
+    /// how a rehomed session stops being routed here, must not treat itself as a session
+    /// end. It did: it dumped the pending will into the due-now queue and published it
+    /// within two sweep ticks, ~29 s early and labelled `session-ended` for a session that
+    /// was still very much alive. The false-offline burst arrived instantly, the delay
+    /// defeated, on exactly the path the delay exists for.
+    ///
+    /// The residual is asserted too, because it is the honest half: this node is NOT the
+    /// session's owner at the close, so the arm cannot be persisted (R1), and nothing
+    /// cancels the will when the client reconnects on the owner (R3) — it fires one delay
+    /// later, which is why OPERATIONS sizes the suppression window to the roll PLUS the
+    /// fleet's largest will delay.
+    #[tokio::test]
+    async fn a_rehome_close_is_silent_for_a_delay_using_client() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "willy-299";
+
+        let mut watcher = attach_persistent_v5(&tx, "watcher-299", 9).await;
+        subscribe(&tx, "watcher-299", "wills/299");
+
+        commit_lease(&placement, client, None);
+        let mut out = attach_persistent_v5_full(
+            &tx,
+            client,
+            1,
+            3600,
+            Some(super::WillSpec {
+                delay: 30,
+                message: Message {
+                    topic: "wills/299".into(),
+                    payload: Bytes::from_static(b"offline"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
+            }),
+        )
+        .await;
+        // A subscription of its own, so the session is one `release_moved_sessions` sees.
+        subscribe(&tx, client, "cmd/299");
+
+        // The lease moves; the rehome closes the connection and the routing release follows
+        // on the scan cadence that the membership/lease change arms eagerly.
+        commit_lease(&placement, client, Some(&remote));
+        await_rehome_disconnect(&mut out).await;
+
+        // Long enough for several sweep ticks AND the inherited-session scan that calls
+        // `release_moved_sessions` — the pre-fix publish landed inside two ticks.
+        for _ in 0..40 {
+            assert!(
+                recv_packet(&mut watcher).await.is_none(),
+                "a rehome close must NOT announce a death for a client that asked to be \
+                 given {}s to come back: not at the close, and not when this node releases \
+                 the session's routing (which is a lease move, not a session end)",
+                30
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "not one will published:\n{}",
+            metrics.render()
+        );
+        assert!(
+            counted(&metrics, "mqttd_pending_wills 1"),
+            "the gauge is the operator's view of the burst BEFORE it lands:\n{}",
+            metrics.render()
+        );
+        // The residual, stated as a test rather than only as prose: the closing node is by
+        // construction not the owner, so the arm is memory-only (R1).
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_pending_will_unpersisted_total{reason=\"not-owner\"} 1"
+            ),
+            "an arm on a non-owning node cannot persist, and says so (issue #299 R1):\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The other half of the same rule, from the other end: a session whose armed will WAS
+    /// persisted (this node owned the group when it armed) and whose group then moves. The
+    /// routing release hands the will over — the new owner's record holds it with its
+    /// ABSOLUTE deadline, so it fires there, at the right time, labelled `inherited`.
+    ///
+    /// Publishing here instead (the pre-fix behaviour) was wrong twice over: once
+    /// immediately, up to a whole delay early for a session that is still alive, and once
+    /// again later, because the record this node could no longer write kept its copy and the
+    /// new owner's scan announced the same death a second time.
+    #[tokio::test]
+    async fn a_lease_move_hands_a_persisted_pending_will_to_the_new_owner() {
+        let (tx, placement, remotes, metrics, store) =
+            start_rehome_hub_with_store(&["r:7000"]).await;
+        let remote = remotes[0].clone();
+        let client = "movey-299";
+
+        let mut watcher = attach_persistent_v5(&tx, "watcher-299b", 9).await;
+        subscribe(&tx, "watcher-299b", "wills/299b");
+
+        // Owned HERE, so the arm persists.
+        commit_lease(&placement, client, None);
+        let _out = attach_persistent_v5_full(
+            &tx,
+            client,
+            1,
+            3600,
+            Some(super::WillSpec {
+                delay: 30,
+                message: Message {
+                    topic: "wills/299b".into(),
+                    payload: Bytes::from_static(b"offline"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
+            }),
+        )
+        .await;
+        subscribe(&tx, client, "cmd/299b");
+        // An ungraceful end: the will is armed and persisted, and waits.
+        drop_connection(&tx, client, 1);
+        await_loop(&tx).await;
+        assert!(
+            !counted(&metrics, "mqttd_pending_will_unpersisted_total"),
+            "armed as the group's owner, so the record holds it:\n{}",
+            metrics.render()
+        );
+
+        // Now the group moves. The session is offline, so `release_moved_sessions` takes it.
+        commit_lease(&placement, client, Some(&remote));
+        let mut handed = false;
+        for _ in 0..60 {
+            if counted(&metrics, "mqttd_wills_handed_off_total 1") {
+                handed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            handed,
+            "a lease move must HAND the pending will over, not publish it:\n{}",
+            metrics.render()
+        );
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "nothing may be announced here — the will's deadline is 30 s out and the \
+             session is alive on its new owner"
+        );
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "…and no will was published on this node at all:\n{}",
+            metrics.render()
+        );
+        let (record_will, deadline) = store
+            .pending_will(&ClientId(client.into()))
+            .await
+            .unwrap()
+            .expect("the record keeps the will for the new owner (ADR 0043 P2)");
+        assert_eq!(record_will.topic, "wills/299b");
+        assert!(
+            deadline > 0,
+            "with its ABSOLUTE deadline, so the new owner does not restart the clock"
         );
     }
 
@@ -19023,6 +20116,1434 @@ mod tests {
             vec![b"m1".to_vec(), b"m2".to_vec(), b"m3-qos0".to_vec()],
             "admission order is wire order — the QoS 0 never overtakes a staged \
              QoS 2 (#242 finding A)"
+        );
+    }
+
+    // --- Issue #299: the MQTT 5.0 Will Delay Interval (§3.1.3.2.2) -------------------
+    //
+    // Found by the Eclipse `paho.mqtt.testing` suite, which is the fact that shapes this
+    // section: the property round-tripped in the codec with no reader anywhere, and every
+    // test this project wrote itself stayed green. `scripts/interop/paho_conformance.py`
+    // carries the foreign-oracle half; these are the unit-level bounds.
+
+    /// A hub with metrics (so the `reason` labels are assertable) and optionally a
+    /// controllable wall clock (so an absolute expiry deadline can be crossed with no real
+    /// time passing).
+    fn start_will_hub(
+        store: std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        clock: Option<TestClock>,
+    ) -> (HubTx, std::sync::Arc<mqtt_observability::metrics::Metrics>) {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store);
+        hub.attach_metrics(metrics.clone());
+        if let Some(clock) = clock {
+            hub.attach_clock(std::sync::Arc::new(clock));
+        }
+        tokio::spawn(hub.run());
+        (tx, metrics)
+    }
+
+    /// [`start_will_hub`] over an arbitrary injected wall clock — the sub-second one below.
+    fn start_will_hub_clocked(
+        store: std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        clock: std::sync::Arc<dyn crate::clock::Clock>,
+    ) -> (HubTx, std::sync::Arc<mqtt_observability::metrics::Metrics>) {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store);
+        hub.attach_metrics(metrics.clone());
+        hub.attach_clock(clock);
+        tokio::spawn(hub.run());
+        (tx, metrics)
+    }
+
+    /// A wall clock locked to tokio's PAUSED virtual time, at **millisecond** resolution.
+    ///
+    /// [`TestClock`] moves only in whole seconds, which is what the expiry tests want and
+    /// exactly what cannot express issue #299's early fire: the error came from the
+    /// SUB-SECOND part of the arm instant being truncated away and a second truncation not
+    /// cancelling it. This clock starts at `base_ms` and advances with `tokio::time::sleep`,
+    /// so a test can arm at 900 ms past a whole second, inherit at 50 ms past one, and
+    /// assert the DIRECTION of the resulting error to the millisecond — deterministically,
+    /// with no real time passing.
+    #[derive(Debug, Clone)]
+    struct VirtualWallClock {
+        base_ms: u64,
+        origin: tokio::time::Instant,
+    }
+
+    impl VirtualWallClock {
+        fn new(base_ms: u64) -> Self {
+            Self {
+                base_ms,
+                origin: tokio::time::Instant::now(),
+            }
+        }
+        fn now_ms(&self) -> u64 {
+            self.base_ms.saturating_add(
+                u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+        }
+    }
+
+    impl crate::clock::Clock for VirtualWallClock {
+        fn now_epoch_secs(&self) -> u64 {
+            self.now_ms() / 1_000
+        }
+        fn now_epoch_millis(&self) -> u64 {
+            self.now_ms()
+        }
+    }
+
+    /// A store whose `all_sessions()` takes its SNAPSHOT immediately and then parks before
+    /// returning it — the inherited-session scan's off-loop read→apply window, held open on
+    /// demand.
+    ///
+    /// This is the only way to test the *property* ("a will is published exactly once")
+    /// against a race that fires in 5 of 6 runs on a real broker and never in a unit test:
+    /// the window is real, but its width is a scheduling accident. Parking makes the
+    /// dangerous interleaving the one that always happens, and the release point is swept
+    /// across the whole window so no single lucky ordering is what passes.
+    #[derive(Debug)]
+    struct GatedScanStore {
+        inner: MemorySessionStore,
+        /// Set by [`gate_scans`](Self::gate_scans); a scan whose snapshot is taken while
+        /// this is present waits for it to go `true`.
+        gate: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+        /// Snapshots taken so far, so a test can wait for the READ before making the change
+        /// the result must not carry.
+        snapshots: std::sync::atomic::AtomicUsize,
+        /// Scans up to and including this ordinal are never parked.
+        gate_after: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedScanStore {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: MemorySessionStore::new(),
+                gate: std::sync::Mutex::new(None),
+                snapshots: std::sync::atomic::AtomicUsize::new(0),
+                gate_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            })
+        }
+
+        /// Park the RESULT of every scan after the first `n` (their snapshots are still
+        /// taken at once); the returned sender releases them with `send(true)`.
+        ///
+        /// `n = 1` leaves the BOOT scan free — it is the one that legitimately re-arms the
+        /// will — and parks the next one, whose snapshot therefore holds a block whose fate
+        /// the loop decides while the result is in the air. Counting rather than "gate from
+        /// now" removes the test's own race with the boot scan.
+        fn gate_scans_after(&self, n: usize) -> tokio::sync::watch::Sender<bool> {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            *self.gate.lock().unwrap() = Some(rx);
+            self.gate_after
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+            tx
+        }
+
+        fn snapshots(&self) -> usize {
+            self.snapshots.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Advance virtual time until a scan has read the store at least `n` times.
+        async fn await_snapshots(&self, n: usize) {
+            for _ in 0..2_000 {
+                if self.snapshots() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("no inherited-session scan read the store");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::SessionStore for GatedScanStore {
+        async fn all_sessions(
+            &self,
+        ) -> Result<mqtt_storage::SessionScan, mqtt_storage::StorageError> {
+            let scan = self.inner.all_sessions().await?;
+            let ordinal = self
+                .snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let gate = if ordinal > self.gate_after.load(std::sync::atomic::Ordering::SeqCst) {
+                self.gate.lock().unwrap().clone()
+            } else {
+                None
+            };
+            if let Some(mut rx) = gate {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break; // sender dropped: released
+                    }
+                }
+            }
+            Ok(scan)
+        }
+
+        async fn ensure_session(
+            &self,
+            client: &ClientId,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            self.inner.ensure_session(client).await
+        }
+        async fn claim_session(
+            &self,
+            client: &ClientId,
+            owner: &str,
+        ) -> Result<mqtt_storage::SessionClaim, mqtt_storage::StorageError> {
+            self.inner.claim_session(client, owner).await
+        }
+        async fn set_subscriptions(
+            &self,
+            client: &ClientId,
+            subscriptions: &[mqtt_core::Subscription],
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_subscriptions(client, subscriptions).await
+        }
+        async fn subscriptions(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_core::Subscription>, mqtt_storage::StorageError> {
+            self.inner.subscriptions(client).await
+        }
+        async fn enqueue_with_expiry(
+            &self,
+            client: &ClientId,
+            message: &Message,
+            expiry_at: Option<u64>,
+        ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+            self.inner
+                .enqueue_with_expiry(client, message, expiry_at)
+                .await
+        }
+        async fn pending(
+            &self,
+            client: &ClientId,
+            after: u64,
+            limit: usize,
+        ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+            self.inner.pending(client, after, limit).await
+        }
+        async fn ack(
+            &self,
+            client: &ClientId,
+            up_to: u64,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack(client, up_to).await
+        }
+        async fn record_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<mqtt_storage::InboundSighting, mqtt_storage::StorageError> {
+            self.inner.record_received(client, packet_id).await
+        }
+        async fn ack_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_received(client, packet_id).await
+        }
+        async fn clear_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_received(client, packet_id).await
+        }
+        async fn received(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<u16>, mqtt_storage::StorageError> {
+            self.inner.received(client).await
+        }
+        async fn record_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+            offset: u64,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.record_outbound(client, packet_id, offset).await
+        }
+        async fn advance_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.advance_outbound(client, packet_id).await
+        }
+        async fn clear_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_outbound(client, packet_id).await
+        }
+        async fn outbound(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            self.inner.outbound(client).await
+        }
+        async fn next_packet_id(
+            &self,
+            client: &ClientId,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.next_packet_id(client).await
+        }
+        async fn remove(&self, client: &ClientId) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.remove(client).await
+        }
+        async fn set_session_expiry(
+            &self,
+            client: &ClientId,
+            deadline: Option<u64>,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_session_expiry(client, deadline).await
+        }
+        async fn set_pending_will(
+            &self,
+            client: &ClientId,
+            pending: Option<(&Message, u64)>,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_pending_will(client, pending).await
+        }
+        async fn pending_will(
+            &self,
+            client: &ClientId,
+        ) -> Result<Option<(Message, u64)>, mqtt_storage::StorageError> {
+            self.inner.pending_will(client).await
+        }
+        async fn expiring_sessions(
+            &self,
+        ) -> Result<Vec<(ClientId, u64)>, mqtt_storage::StorageError> {
+            self.inner.expiring_sessions().await
+        }
+    }
+
+    fn delayed_will(topic: &str, payload: &'static [u8], delay: u32) -> super::WillSpec {
+        super::WillSpec {
+            message: Message {
+                topic: topic.into(),
+                payload: Bytes::from_static(payload),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+                expires_at: None,
+            },
+            delay,
+        }
+    }
+
+    /// Attach a v5 client whose Will carries a Will Delay Interval, under an explicit
+    /// Session Expiry Interval (the other half of `min(delay, expiry)`).
+    async fn attach_with_delayed_will(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+        session_expiry: u32,
+        will: super::WillSpec,
+    ) -> mpsc::UnboundedReceiver<Packet> {
+        let (out_tx, out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.into()),
+            admission: admission(client),
+            conn_id,
+            clean_start: false,
+            session_expiry,
+            receive_maximum: u16::MAX,
+            will: Some(will),
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        reply_rx.await.unwrap();
+        out_rx
+    }
+
+    /// The connection ends WITHOUT a client DISCONNECT — a network drop, the canonical
+    /// will-firing end [MQTT-3.14.4-3].
+    fn drop_connection(tx: &HubTx, client: &str, conn_id: u64) {
+        tx.send(HubCommand::Detach {
+            client: ClientId(client.into()),
+            conn_id,
+            graceful: false,
+        })
+        .unwrap();
+    }
+
+    /// Block until the hub loop has drained everything queued before this call — the
+    /// `Ping` reply is sent when the loop dequeues it (issue #242's liveness probe).
+    async fn await_loop(tx: &HubTx) {
+        let (ping_tx, ping_rx) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply: ping_tx }).unwrap();
+        ping_rx.await.unwrap();
+    }
+
+    fn counted(metrics: &mqtt_observability::metrics::Metrics, needle: &str) -> bool {
+        metrics.render().contains(needle)
+    }
+
+    /// §3.1.3.2.2, the issue's own reproduction: a Will with a delay is NOT published when
+    /// the connection ends — it is published when the delay has elapsed. Observed 0.1 s for
+    /// a 4 s delay before this fix.
+    #[tokio::test(start_paused = true)]
+    async fn a_will_delay_holds_the_will_until_the_delay_elapses() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let (tx, metrics) = start_will_hub(store.clone(), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/7/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev7",
+            2,
+            60,
+            delayed_will("dev/7/status", b"offline", 3),
+        )
+        .await;
+        drop_connection(&tx, "dev7", 2);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "a Will with a 3 s delay must not announce a death one second in — that \
+             spurious 'offline' on every brief blip is the whole defect (issue #299)"
+        );
+        // While it waits, the will lives in the DURABLE session record too, with an
+        // absolute deadline (issue #299's node-death answer): a node that dies inside the
+        // window must not take the announcement with it.
+        let armed = store.all_sessions().await.unwrap();
+        let (persisted_will, deadline) = armed
+            .sessions
+            .iter()
+            .find(|s| s.client.0 == "dev7")
+            .and_then(|s| s.pending_will.clone())
+            .expect("an armed will must be persisted, or a node death loses it");
+        assert_eq!(persisted_will.topic, "dev/7/status");
+        assert_eq!(&persisted_will.payload[..], b"offline");
+        assert!(
+            deadline > 0,
+            "the persisted deadline is ABSOLUTE, so a new owner does not restart the clock"
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("the will must arrive once its delay has elapsed")
+            ),
+            b"offline",
+            "the will is DELAYED, never dropped: a client that does not come back must \
+             still be announced"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_published_total{reason=\"delay-elapsed\"} 1"
+            ),
+            "the honoured-delay fire is labelled as such:\n{}",
+            metrics.render()
+        );
+        // And the record is cleared, so a later inherited-session scan cannot announce the
+        // same death a second time.
+        let after = store.all_sessions().await.unwrap();
+        assert!(
+            after.sessions.iter().all(|s| s.pending_will.is_none()),
+            "a published will must be cleared from the durable record"
+        );
+    }
+
+    /// [MQTT-3.1.3-9] and the entire point of the property: if the session resumes inside
+    /// the window the Will is **not sent at all**, ever.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_inside_the_delay_window_cancels_the_will_entirely() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/8/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev8",
+            2,
+            60,
+            delayed_will("dev/8/status", b"offline", 5),
+        )
+        .await;
+        drop_connection(&tx, "dev8", 2);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The blip ends: the same session resumes (clean_start = false).
+        let _again = attach_with_delayed_will(
+            &tx,
+            "dev8",
+            3,
+            60,
+            delayed_will("dev/8/status", b"offline", 5),
+        )
+        .await;
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"resumed\"} 1"
+            ),
+            "a resume inside the window deletes the will [MQTT-3.1.3-9]:\n{}",
+            metrics.render()
+        );
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "a cancelled will must never be published — not at the original deadline, \
+             not later"
+        );
+    }
+
+    /// §3.1.2.11.2: the will is also published when the session expires, whichever comes
+    /// FIRST — so a session whose expiry is shorter than the delay gets its will at the
+    /// expiry, not at the delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_expiry_shorter_than_the_delay_bounds_the_will_at_the_expiry() {
+        let (tx, _metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/9/status");
+
+        // delay 30, expiry 2 → min() = 2.
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev9",
+            2,
+            2,
+            delayed_will("dev/9/status", b"offline", 30),
+        )
+        .await;
+        drop_connection(&tx, "dev9", 2);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "min(delay, expiry) is still a delay — never publish early"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("the will must arrive at the session expiry, not 30 s later")
+            ),
+            b"offline",
+            "the effective deadline is min(will delay, session expiry) — the session \
+             cannot outlive itself waiting for its own will (§3.1.2.11.2)"
+        );
+    }
+
+    /// The ORDERING inside the sweep, which is what makes a wall-clock jump unable to lose
+    /// a will: the expiry pass publishes a pending will BEFORE `discard_session`, and
+    /// labels it for the bound that actually fired.
+    #[tokio::test(start_paused = true)]
+    async fn an_expiring_session_publishes_its_pending_will_before_it_is_discarded() {
+        let clock = TestClock::new(1_000_000);
+        let (tx, metrics) = start_will_hub(
+            std::sync::Arc::new(MemorySessionStore::new()),
+            Some(clock.clone()),
+        );
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/10/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev10",
+            2,
+            2,
+            delayed_will("dev/10/status", b"offline", 30),
+        )
+        .await;
+        drop_connection(&tx, "dev10", 2);
+
+        // The WALL clock jumps past the session's absolute expiry deadline while the
+        // will's own MONOTONIC deadline has not arrived. The expiry pass must fire the
+        // will rather than discarding the session out from under it. Ping first: the
+        // detach computes its absolute deadline from the clock, so advancing before the
+        // loop has processed it would move the deadline instead of crossing it.
+        await_loop(&tx).await;
+        clock.advance(5);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("an expiring session must publish its pending will")
+            ),
+            b"offline"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_published_total{reason=\"session-expired\"} 1"
+            ),
+            "the will is attributed to the bound that fired it (§3.1.2.11.2), which is \
+             also the proof it went out BEFORE the discard:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// A session that expires immediately (Session Expiry Interval 0, or v3.1.1
+    /// `clean_session = 1`) fires its will immediately, no matter how large the delay: the
+    /// session ends the moment the connection does.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_session_expiry_publishes_the_will_immediately_despite_a_delay() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/11/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev11",
+            2,
+            0,
+            delayed_will("dev/11/status", b"offline", 10),
+        )
+        .await;
+        drop_connection(&tx, "dev11", 2);
+
+        // On the detach's own dispatch — no sweep tick, no wakeup, nothing new to lose.
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("a session that does not survive its disconnect fires its will now")
+            ),
+            b"offline",
+            "there is no session left to resume, so nothing could ever cancel this will \
+             — holding it for 10 s would only delay the truth"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_published_total{reason=\"immediate\"} 1"
+            ),
+            "unchanged from the pre-#299 path, byte for byte:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// **[MQTT-3.1.2-8], the clause that governs this case** — the OFFLINE half. §3.1.2.5:
+    /// the Will Message MUST be published after the connection closes and either the delay
+    /// has elapsed or the Session ends, *"unless the Will Message has been deleted by the
+    /// Server on receipt of a DISCONNECT packet with Reason Code 0x00 … or a new Network
+    /// Connection **for the `ClientID`** is opened before the Will Delay Interval has
+    /// elapsed"*. The exception is keyed on the CLIENT ID, not on the Session, and it
+    /// excepts the whole obligation — including the "or the Session ends" trigger. So a
+    /// Clean Start CONNECT for the same client id inside the window DELETES the will.
+    ///
+    /// This reverses an earlier reading here, which cited [MQTT-3.1.2-4] plus §3.1.3.2.2's
+    /// "or the Session ends" and PUBLISHED. It was wrong in the direction that costs users
+    /// the whole feature: `clean_start = 1` with a non-zero Session Expiry is an ordinary
+    /// shape (it is what this project's paho oracle sends), and for every such client a
+    /// Will Delay Interval suppressed nothing at all — every blip still announced a death.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_start_connect_for_the_same_client_id_deletes_the_pending_will() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/12/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev12",
+            2,
+            300,
+            delayed_will("dev/12/status", b"offline", 30),
+        )
+        .await;
+        drop_connection(&tx, "dev12", 2);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let (_fresh, _) = attach_v5(&tx, "dev12", 3, true, 300).await;
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"clean-start\"} 1"
+            ),
+            "a new Network Connection for the ClientID inside the window deletes the will \
+             [MQTT-3.1.2-8]:\n{}",
+            metrics.render()
+        );
+        // Past the original deadline, and past every sweep tick in between.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "a deleted will must never be published — not at the original deadline, not \
+             when the discarded session's own record is swept"
+        );
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "nothing was published on this path at all:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// Anti-regression for the rule #265/#238 earned: a client's OWN DISCONNECT suppresses
+    /// the will entirely, and a Will Delay Interval does not turn a suppressed will into a
+    /// delayed one. The delay only ever applies to a will that WOULD have fired.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_disconnect_arms_no_delayed_will() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/13/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev13",
+            2,
+            60,
+            delayed_will("dev/13/status", b"offline", 5),
+        )
+        .await;
+        detach(&tx, "dev13", 2); // graceful = true: a clean client DISCONNECT
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "[MQTT-3.14.4-3]: a clean DISCONNECT DISCARDS the will. A delay must not \
+             smuggle it back in five seconds later"
+        );
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "nothing was armed and nothing was published:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The node-death answer, asserted: a pending will lives in the durable session record
+    /// with its ABSOLUTE deadline, so a node that did not see the disconnect — a new owner
+    /// after a takeover, or this node after a restart — re-arms it from the record and
+    /// fires it at the right wall-clock time. Without this, a node death inside the delay
+    /// window silently loses the announcement of exactly the unexpected death the Will
+    /// exists to announce.
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_will_is_fired_from_the_persisted_record_by_a_node_that_never_saw_the_disconnect(
+    ) {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let ghost = ClientId("ghost".into());
+        store.ensure_session(&ghost).await.unwrap();
+        let will = Message {
+            topic: "dev/ghost/status".into(),
+            payload: Bytes::from_static(b"offline"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            app: mqtt_core::AppProperties::default(),
+            expires_at: None,
+        };
+        // The deadline is ABSOLUTE, so the new owner does not restart the clock: two
+        // seconds of the original window remain (ADR 0009 §3's argument, same machinery).
+        store
+            .set_pending_will(&ghost, Some((&will, 1_000_002)))
+            .await
+            .unwrap();
+
+        let clock = TestClock::new(1_000_000);
+        let (tx, metrics) = start_will_hub(store.clone(), Some(clock));
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/ghost/status");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("an inherited pending will must be fired by its new holder")
+            ),
+            b"offline"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_published_total{reason=\"inherited\"} 1"
+            ),
+            "a will fired from the record is attributed to the record:\n{}",
+            metrics.render()
+        );
+
+        // And the record was CLEARED, so the repeating scan cannot announce the same
+        // death a second time.
+        let scan = store.all_sessions().await.unwrap();
+        assert!(
+            scan.sessions.iter().all(|s| s.pending_will.is_none()),
+            "a fired will must be cleared from the session record"
+        );
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "later inherited-session scans must not re-fire a will already published"
+        );
+    }
+
+    /// [MQTT-3.1.3-9] as the spec states it — **a resume is a resume**: "if the Session
+    /// resumes before the Will Delay Interval elapses the Server MUST NOT send the Will
+    /// Message". The sentence says nothing about what the resuming CONNECT asks for, so the
+    /// cancellation may not depend on the new connection's Session Expiry Interval.
+    ///
+    /// The shape here is the most ordinary reconnect there is, and it was a real defect: a
+    /// HALF-OPEN old socket (the broker has not reaped it yet, so this is a takeover) plus a
+    /// client whose CONNECT omits Session Expiry — the v5 default of 0, which is paho's
+    /// default and every v5 client that does not set the property. Re-deriving
+    /// `min(delay, expiry)` from that connection yields `effective == 0` and publishes the
+    /// replaced connection's delayed will: a death announced for a device that is connected
+    /// right now, on the exact reconnect the feature exists to keep quiet.
+    ///
+    /// The offline twin is asserted in the same test on purpose: the outcome must not flip
+    /// on whether the broker had already reaped the old socket, which is timing no client
+    /// can see.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_never_publishes_the_will_whatever_the_resuming_connect_asks_for() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/+/status");
+
+        // (a) TAKEOVER: conn 2 is still registered, and the resuming CONNECT carries NO
+        // Session Expiry Interval — normalized to 0 at the connection edge (ADR 0009 §1).
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "t1",
+            2,
+            300,
+            delayed_will("dev/t1/status", b"offline", 30),
+        )
+        .await;
+        let (_resumed, _) = attach_v5(&tx, "t1", 3, false, 0).await;
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"takeover\"} 1"
+            ),
+            "a takeover by a resuming CONNECT deletes the will [MQTT-3.1.3-9]:\n{}",
+            metrics.render()
+        );
+
+        // (b) The offline twin: the broker DID reap the socket first.
+        let _dev2 = attach_with_delayed_will(
+            &tx,
+            "t2",
+            4,
+            300,
+            delayed_will("dev/t2/status", b"offline", 30),
+        )
+        .await;
+        drop_connection(&tx, "t2", 4);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (_resumed2, _) = attach_v5(&tx, "t2", 5, false, 0).await;
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "neither resume may EVER announce a death: the session was resumed, by the \
+             very connection asking for a session that does not outlive itself"
+        );
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "not one will was published on either path:\n{}",
+            metrics.render()
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"resumed\"} 1"
+            ),
+            "the offline resume is counted too:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// A flapping client, which is what a Will Delay Interval is FOR: every blip re-arms
+    /// the will from that disconnect (never from the first one), and the resume that ends
+    /// the flapping cancels it. The death the client already took back is never announced.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_blip_never_announces_a_death_the_client_took_back() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/t3/status");
+
+        let will = || delayed_will("dev/t3/status", b"offline", 5);
+        let _dev = attach_with_delayed_will(&tx, "t3", 2, 300, will()).await;
+        drop_connection(&tx, "t3", 2); // t = 0; armed for t = 5
+
+        tokio::time::sleep(Duration::from_secs(1)).await; // t = 1
+        let _again = attach_with_delayed_will(&tx, "t3", 3, 300, will()).await;
+        tokio::time::sleep(Duration::from_secs(1)).await; // t = 2
+        drop_connection(&tx, "t3", 3); // re-armed for t = 7, NOT the original t = 5
+
+        tokio::time::sleep(Duration::from_secs(4)).await; // t = 6
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "the second disconnect starts its own window: the will must not fire at the \
+             FIRST disconnect's deadline, which has now passed"
+        );
+        let _third = attach_with_delayed_will(&tx, "t3", 4, 300, will()).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "and the resume that ends the flapping cancels it for good"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"resumed\"} 2"
+            ),
+            "each resume is one spurious device-offline announcement not sent:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The ONLINE half of [MQTT-3.1.2-8], and the assertion that keeps the rule consistent:
+    /// a clean-start CONNECT for the same client id deletes the replaced connection's will
+    /// — the identical answer the offline path gives
+    /// (`a_clean_start_connect_for_the_same_client_id_deletes_the_pending_will`).
+    ///
+    /// The two must agree whatever the broker's socket-reap timing was, because that timing
+    /// is invisible to the client. They have now disagreed in BOTH directions across two
+    /// rounds (online cancel + offline publish, then online publish + offline publish), so
+    /// the pairing is asserted, not assumed: a delay of 0 in the same shape still publishes,
+    /// which is `a_zero_delay_takeover_still_publishes_immediately` below.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_start_takeover_deletes_the_replaced_will_like_the_offline_half_does() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/t5/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "t5",
+            2,
+            300,
+            delayed_will("dev/t5/status", b"offline", 30),
+        )
+        .await;
+        // Still ONLINE (no detach): a clean-start CONNECT for the same id takes it over.
+        let (_fresh, _) = attach_v5(&tx, "t5", 3, true, 300).await;
+
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"clean-start\"} 1"
+            ),
+            "the online half must answer exactly as the offline half does:\n{}",
+            metrics.render()
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "a will deleted by [MQTT-3.1.2-8] is never published, online half or offline"
+        );
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "nothing published:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The other side of the same clause, and the constraint the whole feature is built
+    /// under: **[MQTT-3.1.2-8]'s exception needs a window to open inside, and a delay of 0
+    /// has none.** The interval has already elapsed when the connection closes, so a
+    /// takeover — clean start or not — publishes the replaced connection's will on the
+    /// dispatch, exactly as it did before this feature existed. Today's entire fleet
+    /// (every v3.1.1 client, every v5 client without property `0x18`) is in this row, so it
+    /// is asserted beside the delete rather than left to inference.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_delay_takeover_still_publishes_immediately() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/t7/status");
+
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "t7",
+            2,
+            300,
+            delayed_will("dev/t7/status", b"offline", 0),
+        )
+        .await;
+        let (_fresh, _) = attach_v5(&tx, "t7", 3, true, 300).await;
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("a will with no delay still fires on a takeover")
+            ),
+            b"offline",
+            "no delay means no window for a new connection to open inside, so \
+             [MQTT-3.1.2-8]'s exception cannot reach it"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_published_total{reason=\"immediate\"} 1"
+            ),
+            "byte-for-byte the pre-#299 takeover path:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The arm is durable, so the CANCEL must be durable too (issue #299).
+    ///
+    /// A session record can carry a pending will that this node never armed — armed on a
+    /// peer, or armed by this node before it restarted; the record outliving the arming node
+    /// is the whole reason it exists. A memory-only cancel cannot see that copy, so nothing
+    /// ever cleared it: the client resumed, disconnected CLEANLY, and the inherited-session
+    /// scan then re-armed the stale block and announced it dead — violating [MQTT-3.1.3-9]
+    /// and [MQTT-3.14.4-3] at once, with no connection event to correlate against.
+    ///
+    /// The state is reached with no seeding trick and no race: the record gains its block
+    /// while the client is **online here**, which is precisely when every inherited-session
+    /// scan skips the session (`online.contains_key`) — so this node's memory provably
+    /// never holds the twin. That is the cross-node and post-restart shape in miniature.
+    /// The deadline is already in the PAST, so if anything re-arms from that record after
+    /// the client leaves cleanly, it fires at once and the last assertion fails loudly.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_will_this_node_never_armed_is_cleared_by_a_resume() {
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        let ghost = ClientId("t6".into());
+        let (tx, metrics) = start_will_hub(store.clone(), Some(TestClock::new(1_000_000)));
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/t6/status");
+
+        // The client is connected HERE, with no will of its own on this connection.
+        let (_first, _) = attach_v5(&tx, "t6", 2, false, 300).await;
+        // …and its durable record gains a pending will this node did not arm: on a real
+        // cluster the arm happened on the node the client dropped off, or on this node
+        // before it restarted. Either way the record is the only copy this node can see.
+        let will = Message {
+            topic: "dev/t6/status".into(),
+            payload: Bytes::from_static(b"offline"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            app: mqtt_core::AppProperties::default(),
+            expires_at: None,
+        };
+        store
+            .set_pending_will(&ghost, Some((&will, 999_990)))
+            .await
+            .unwrap();
+
+        // The client reconnects (clean_start = false): a RESUME, which must end the will's
+        // obligation wherever it lives.
+        let _back = attach_with_delayed_will(
+            &tx,
+            "t6",
+            3,
+            300,
+            delayed_will("dev/t6/status", b"offline", 30),
+        )
+        .await;
+        let scan = store.all_sessions().await.unwrap();
+        assert!(
+            scan.sessions.iter().all(|s| s.pending_will.is_none()),
+            "a resume must clear the DURABLE block, not only this node's memory — the \
+             record is what a later scan re-arms from"
+        );
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"resumed\"} 1"
+            ),
+            "the cancellation is counted whichever copy held the obligation:\n{}",
+            metrics.render()
+        );
+
+        // …and then leaves cleanly: [MQTT-3.14.4-3] DISCARDS the will.
+        detach(&tx, "t6", 3);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "no scan may announce a death for a client that resumed and then disconnected \
+             cleanly — a will that outlives its own cancellation is worse than one that \
+             never fires"
+        );
+    }
+
+    /// Issue #238 extended to the DELAYED fire path: a delayed will is still an UNGATED
+    /// publish when it fires. Its refused durable copy is counted as the drop it is, and
+    /// the LIVE delivery still happens — a browned-out broker must not leave a dead device
+    /// "online" on every dashboard through exactly the incident [MQTT-3.14.4-3] exists for.
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop() {
+        let (tx, metrics) = start_will_hub(std::sync::Arc::new(MemorySessionStore::new()), None);
+        // ONLINE and PERSISTENT at QoS 1, so its copy of the will owes a durable record.
+        let (mut watcher, _) = attach(&tx, "watcher", 1, false).await;
+        subscribe_qos(&tx, "watcher", "dev/+/status", QoS::AtLeastOnce);
+
+        // QoS 1, so the watcher's copy OWES a durable record — that is the copy the
+        // watermark refuses.
+        let _dev = attach_with_delayed_will(
+            &tx,
+            "dev14",
+            2,
+            60,
+            super::WillSpec {
+                message: Message {
+                    topic: "dev/14/status".into(),
+                    payload: Bytes::from_static(b"offline"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
+                delay: 3,
+            },
+        )
+        .await;
+        drop_connection(&tx, "dev14", 2);
+        tx.send(HubCommand::SetBrownout {
+            axis: BrownoutAxis::Disk,
+            on: true,
+        })
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("a delayed will must still be delivered live under brownout")
+            ),
+            b"offline",
+            "there is no publisher to refuse and nothing that will retry, so suppressing \
+             a will's live delivery destroys the message rather than deferring it (#238)"
+        );
+        for _ in 0..200 {
+            if counted(
+                &metrics,
+                "mqttd_publish_dropped_total{reason=\"brownout\"} 1",
+            ) {
+                assert!(
+                    !counted(
+                        &metrics,
+                        "mqttd_quota_rejections_total{reason=\"brownout-publish\"}"
+                    ),
+                    "nobody was told, so this is a loss and not a retryable refusal:\n{}",
+                    metrics.render()
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "a delayed will's refused durable copy must be counted as a drop:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// The upgrade line an operator must not meet as a surprise (issue #299 / ADR 0018
+    /// phase 1). Implementing `PersistentLog::keys()` switched ADR 0009 §3 session expiry ON
+    /// for every single-node on-disk deployment — before it, `all_sessions` read back
+    /// NOTHING there, so persisted deadlines never fired and offline sessions survived
+    /// indefinitely. The FIRST restart onto this build therefore discards every offline
+    /// session already past its deadline, and its acked offline queue with it: correct, and
+    /// a silent one-way deletion unless something says so BEFORE it happens.
+    ///
+    /// The counting is asserted here rather than the `warn!` formatting, because the count
+    /// and the identity of the worst sessions are the whole value of the line: an operator
+    /// who greps it needs to know how many went and which.
+    #[test]
+    fn the_overdue_discard_summary_counts_every_session_and_names_the_worst_first() {
+        let overdue = vec![
+            (ClientId("b".into()), 5),
+            (ClientId("a".into()), 900),
+            (ClientId("c".into()), 5),
+        ];
+        let summary =
+            super::summarize_overdue_discard(overdue).expect("three sessions are about to go");
+        assert_eq!(
+            summary.sessions, 3,
+            "every session is counted, not just the named ones"
+        );
+        assert_eq!(summary.oldest_overdue_s, 900);
+        assert_eq!(
+            summary.clients, "a(+900s),b(+5s),c(+5s)",
+            "worst first, then by client id so the line is reproducible"
+        );
+        assert_eq!(summary.truncated, 0);
+
+        // A mass reap: bounded naming, with the remainder still counted — the count is the
+        // number an operator reconciles against, so it may never be the capped one.
+        let many: Vec<(ClientId, u64)> = (0..50u64)
+            .map(|i| (ClientId(format!("c{i:02}")), i))
+            .collect();
+        let summary = super::summarize_overdue_discard(many).expect("fifty sessions");
+        assert_eq!(summary.sessions, 50);
+        assert_eq!(summary.truncated, 30, "50 − the 20 named");
+        assert_eq!(
+            summary.clients.split(',').count(),
+            super::OVERDUE_DISCARD_NAMED,
+            "one line may not grow without bound"
+        );
+        assert!(
+            summary.clients.starts_with("c49(+49s),"),
+            "{}",
+            summary.clients
+        );
+    }
+
+    /// Nothing overdue must produce NO line: a warning that fires on every scan is a warning
+    /// an operator learns to ignore, which would waste the one above.
+    #[test]
+    fn a_scan_with_nothing_overdue_says_nothing() {
+        assert_eq!(super::summarize_overdue_discard(Vec::new()), None);
+        assert_eq!(
+            super::summarize_overdue_discard(vec![]).map(|s| s.sessions),
+            None,
+            "an empty inherit is the steady state, not an event"
+        );
+    }
+
+    /// **THE PROPERTY: a will inherited from the durable record fires at or after its
+    /// deadline, and NEVER before.** Asserted as a direction, with the measured margin
+    /// printed, because "never early" is what ADR 0009 promises operators and what
+    /// TROUBLESHOOTING calls a defect rather than a tuning question.
+    ///
+    /// It was false on exactly the path the persistence exists for. The arm stored
+    /// `floor(now) + effective` and the inherit computed `deadline − floor(now)`, so the
+    /// elapsed delay came out as `effective − frac(arm) + frac(re-arm)` — uniform in
+    /// `(effective − 1 s, effective + 1 s)`. Measured on the real broker: armed at
+    /// 09:28:54.7408 with an 8 s delay, published at 09:29:02.0524 — **7.312 s, 0.69 s
+    /// early**. The local (monotonic) path was always exact; only the record round-trip lied.
+    ///
+    /// The clock here is [`VirtualWallClock`], locked to tokio's paused time at millisecond
+    /// resolution, and the fractions are chosen to point the OLD error at its worst: the arm
+    /// lands 900 ms past a whole second (so the truncated deadline is 900 ms too early) and
+    /// the inherit lands ~100 ms past one (so almost none of it is given back). Under the
+    /// pre-fix arithmetic this fires ~800 ms early, every run, with no real time passing.
+    #[tokio::test(start_paused = true)]
+    async fn a_will_inherited_across_a_restart_never_fires_before_its_deadline() {
+        const DELAY_S: u64 = 8;
+        let store = std::sync::Arc::new(MemorySessionStore::new());
+        // …_900: the arm instant's sub-second part, which the record must not round away.
+        let clock = std::sync::Arc::new(VirtualWallClock::new(1_000_000_900));
+        let client = ClientId("restart-me".into());
+
+        // Node #1 sees the disconnect and arms the will.
+        let (tx1, _m1) = start_will_hub_clocked(store.clone(), clock.clone());
+        let _dev = attach_with_delayed_will(
+            &tx1,
+            "restart-me",
+            2,
+            300,
+            delayed_will(
+                "dev/restart-me/status",
+                b"offline",
+                u32::try_from(DELAY_S).unwrap(),
+            ),
+        )
+        .await;
+        // Read BEFORE the detach, so this is a lower bound on the arm instant: the true
+        // deadline is at or after `armed_at_ms + DELAY_S`, which makes the assertion below
+        // a necessary condition of "never early" and never a false alarm.
+        let armed_at_ms = clock.now_ms();
+        drop_connection(&tx1, "restart-me", 2);
+        await_loop(&tx1).await;
+        let deadline_ms = armed_at_ms + DELAY_S * 1_000;
+
+        // Half of the arithmetic, asserted at the seam it crosses: the RECORD's absolute
+        // deadline may not sit before the deadline the client asked for.
+        let (_, stored_epoch) = store
+            .pending_will(&client)
+            .await
+            .unwrap()
+            .expect("the arm must have persisted the will and its absolute deadline");
+        assert!(
+            stored_epoch * 1_000 >= deadline_ms,
+            "the persisted deadline ({}.{:03} s) is BEFORE the deadline the client asked \
+             for ({}.{:03} s): every rounding error must land late",
+            stored_epoch,
+            0,
+            deadline_ms / 1_000,
+            deadline_ms % 1_000
+        );
+
+        // Node #2 is the same node after a restart, or a new owner after a death: it never
+        // saw the disconnect and knows only the record.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (tx2, metrics2) = start_will_hub_clocked(store.clone(), clock.clone());
+        let (mut watcher, _) = attach(&tx2, "watcher", 1, true).await;
+        subscribe(&tx2, "watcher", "dev/restart-me/status");
+
+        let mut landed_ms = None;
+        for _ in 0..4_000 {
+            if watcher.try_recv().is_ok() {
+                landed_ms = Some(clock.now_ms());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let landed_ms = landed_ms.expect(
+            "a will inherited from the record must still be announced — late is acceptable, \
+             lost is not",
+        );
+        let margin_ms = i64::try_from(landed_ms).unwrap() - i64::try_from(deadline_ms).unwrap();
+        println!(
+            "inherited will landed {margin_ms} ms relative to its deadline \
+             (positive = late, which is the only permitted direction)"
+        );
+        assert!(
+            margin_ms >= 0,
+            "a will inherited across a restart fired {} ms EARLY. A will is a death \
+             announcement: late is a slow announcement, early is a false one, and only one \
+             of the two can be un-published",
+            -margin_ms
+        );
+        assert!(
+            counted(
+                &metrics2,
+                "mqttd_wills_published_total{reason=\"inherited\"} 1"
+            ),
+            "and exactly once, from the record:\n{}",
+            metrics2.render()
+        );
+    }
+
+    /// **THE PROPERTY: a will is published EXACTLY ONCE across a restart, whatever the
+    /// inherited-session scan's read/apply window overlaps.**
+    ///
+    /// This was false in **5 of 6 restart runs** on the real broker. `sweep_expired_sessions`
+    /// spawns the off-loop scan before `fire_due_wills`, so the scan's read of the record
+    /// races the fire's durable clear; when the read won, `inherit_sessions` saw the block
+    /// again, re-armed with zero remaining and published a second time ~20 ms later — both
+    /// copies labelled `reason="inherited"`, so an operator could not tell one duplicate
+    /// from two deaths, against a README that promises "never duplicated per node".
+    ///
+    /// A single green run proves nothing about a race, and repeating one identical schedule
+    /// proves little more. So the release point is SWEPT across the whole window — before
+    /// the fire, on it, just after it, and long after — and the property is asserted in
+    /// every case. Parking is what makes the dangerous interleaving happen at all: on the
+    /// real broker its width is a scheduling accident, here it is the test's choice.
+    #[tokio::test(start_paused = true)]
+    async fn an_inherited_will_is_published_exactly_once_across_a_scan_racing_the_fire() {
+        // The will's deadline is 3 s out; the scan that must not double it is parked from
+        // ~1 s (the first sweep tick) until each of these offsets.
+        for release_at_ms in [1_100u64, 2_900, 3_000, 3_050, 3_500, 8_000] {
+            let store = GatedScanStore::new();
+            let ghost = ClientId("dup-probe".into());
+            store.ensure_session(&ghost).await.unwrap();
+            let will = Message {
+                topic: "dev/dup-probe/status".into(),
+                payload: Bytes::from_static(b"offline"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+                expires_at: None,
+            };
+            store
+                .set_pending_will(&ghost, Some((&will, 1_000_003)))
+                .await
+                .unwrap();
+            // Scan #1 (the boot scan) runs free and legitimately re-arms; #2 is parked.
+            let release = store.gate_scans_after(1);
+            let clock = std::sync::Arc::new(VirtualWallClock::new(1_000_000_000));
+            let t0 = tokio::time::Instant::now();
+            let (tx, metrics) = start_will_hub_clocked(store.clone(), clock);
+            let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+            subscribe(&tx, "watcher", "dev/dup-probe/status");
+            // The snapshot that still holds the block is now taken, and in the air.
+            store.await_snapshots(2).await;
+
+            tokio::time::sleep_until(t0 + Duration::from_millis(release_at_ms)).await;
+            release.send(true).unwrap();
+
+            // Well past the deadline, the release and several more sweep ticks.
+            tokio::time::sleep_until(t0 + Duration::from_secs(12)).await;
+            let mut published = 0;
+            while watcher.try_recv().is_ok() {
+                published += 1;
+            }
+            assert_eq!(
+                published,
+                1,
+                "release at {release_at_ms} ms: a will inherited across a restart must be \
+                 announced exactly once — {published} copies arrived:\n{}",
+                metrics.render()
+            );
+            assert!(
+                counted(
+                    &metrics,
+                    "mqttd_wills_published_total{reason=\"inherited\"} 1"
+                ),
+                "release at {release_at_ms} ms: the counter an operator reads must agree \
+                 with the wire:\n{}",
+                metrics.render()
+            );
+        }
+    }
+
+    /// **THE PROPERTY, second half: a will a resume already cancelled is never published —
+    /// not by a scan whose snapshot predates the cancel.**
+    ///
+    /// Same missing fence as the duplicate above, and the same one closes it: the record was
+    /// read off-loop before the resume and applied after it, so the will was re-armed with
+    /// an already-past deadline and announced at once. Reproduced end-to-end over sockets in
+    /// review: a v5 client with a 30 s delay dropped, resumed with `clean_start = 0`, sent
+    /// DISCONNECT 0x00 — and the broker then published `wd/stale`. That is [MQTT-3.1.3-9]
+    /// and [MQTT-3.14.4-3] violated at once, with no connection event to correlate against.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_inherited_scan_never_republishes_a_will_a_resume_cancelled() {
+        let store = GatedScanStore::new();
+        let ghost = ClientId("stale-probe".into());
+        store.ensure_session(&ghost).await.unwrap();
+        let will = Message {
+            topic: "dev/stale-probe/status".into(),
+            payload: Bytes::from_static(b"offline"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            app: mqtt_core::AppProperties::default(),
+            expires_at: None,
+        };
+        store
+            .set_pending_will(&ghost, Some((&will, 1_000_003)))
+            .await
+            .unwrap();
+        let release = store.gate_scans_after(1);
+        let clock = std::sync::Arc::new(VirtualWallClock::new(1_000_000_000));
+        let t0 = tokio::time::Instant::now();
+        let (tx, metrics) = start_will_hub_clocked(store.clone(), clock);
+        let (mut watcher, _) = attach(&tx, "watcher", 1, true).await;
+        subscribe(&tx, "watcher", "dev/stale-probe/status");
+        store.await_snapshots(2).await;
+
+        // The client comes back — which deletes the will [MQTT-3.1.3-9] — and then leaves
+        // CLEANLY, which discards it a second time over [MQTT-3.14.4-3].
+        let (_back, _) = attach_v5(&tx, "stale-probe", 2, false, 300).await;
+        detach(&tx, "stale-probe", 2);
+        await_loop(&tx).await;
+        assert!(
+            counted(
+                &metrics,
+                "mqttd_wills_cancelled_total{reason=\"resumed\"} 1"
+            ),
+            "the resume must have cancelled it, record included:\n{}",
+            metrics.render()
+        );
+
+        // …and only NOW does the pre-resume snapshot land, carrying a deadline that has
+        // since passed — so anything that re-arms from it publishes immediately.
+        tokio::time::sleep_until(t0 + Duration::from_secs(4)).await;
+        release.send(true).unwrap();
+        tokio::time::sleep_until(t0 + Duration::from_secs(14)).await;
+        assert!(
+            watcher.try_recv().is_err(),
+            "no scan may announce a death for a client that resumed and then disconnected \
+             cleanly:\n{}",
+            metrics.render()
+        );
+        assert!(
+            !counted(&metrics, "mqttd_wills_published_total"),
+            "nothing was published at all:\n{}",
+            metrics.render()
         );
     }
 }

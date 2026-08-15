@@ -5,11 +5,16 @@ The Mosquitto CLI suite (run.sh) proves payloads round-trip. Paho, a second
 *independent* MQTT implementation, is driven programmatically so it can assert
 the things a CLI cannot surface: MQTT 5 **reason codes**, CONNACK/SUBACK
 **properties**, per-filter **granted QoS** (including a downgrade), **session
-present** on resume, **Will** delivery, and the broker's **capability
-advertisement** (Subscription Identifiers Available = 0) together with the
-DISCONNECT 0xA1 refusal that must accompany it. A passing run is independent
+present** on resume, **Will** delivery — including the MQTT 5 **Will Delay
+Interval** (0x18) and its cancellation by a resume, issue #299 — and the broker's
+**capability advertisement** (Subscription Identifiers Available = 0) together with
+the DISCONNECT 0xA1 refusal that must accompany it. A passing run is independent
 evidence the broker's control-plane semantics — not just its payloads — match
 what the ecosystem expects.
+
+The Will Delay case earns its ~9 s of lane time: the property round-tripped in the
+broker's own codec with NO reader anywhere outside it, and every test this project
+wrote itself stayed green. It took the Eclipse `paho.mqtt.testing` suite to notice.
 
 Paho is an external process dependency (pip), NOT a cargo dependency: nothing is
 added to the broker's supply chain. Driven against the plaintext listener the
@@ -314,6 +319,137 @@ def main():
         )
         expect("no PUBACK preceded the refusal", 0, pseen["pubacks"])
     pubc.loop_stop()
+
+    # --- 7. Will Delay Interval (0x18): honoured, and cancelled by a resume ----
+    #
+    # This is the case a foreign oracle FOUND (issue #299): the property round-tripped in
+    # the broker's codec with no reader anywhere, and every test the project wrote itself
+    # stayed green. Paho puts 0x18 on the wire for us, and the timing is asserted against
+    # the wall clock rather than against any broker-internal signal.
+    #
+    # Both halves need a session that OUTLIVES the disconnect: MQTT 5.0 §3.1.2.11.2 also
+    # publishes the will when the session expires, whichever comes first, so a client with
+    # SessionExpiryInterval 0 (paho's default) is *supposed* to get its will immediately no
+    # matter what delay it asked for.
+    watcher = v5_client("paho-will-watch")
+    connect(watcher)
+    wills = []
+    watcher.on_message = lambda cl, u, msg: wills.append((time.time(), msg))
+    watcher.subscribe("paho/will/delayed", qos=1)
+    watcher.subscribe("paho/will/cancelled", qos=1)
+    watcher.subscribe("paho/will/cleanstart", qos=1)
+    time.sleep(0.3)
+
+    def dying_client(cid, topic, delay):
+        """A v5 client with WillDelayInterval=delay and a 30 s session, killed at the socket."""
+        c = mqtt.Client(
+            CallbackAPIVersion.VERSION2,
+            client_id=cid,
+            protocol=mqtt.MQTTv5,
+            reconnect_on_failure=False,
+        )
+        c.enable_logger(None)
+        wp = Properties(PacketTypes.WILLMESSAGE)
+        wp.WillDelayInterval = delay
+        c.will_set(topic, b"gone", qos=1, retain=False, properties=wp)
+        cp = Properties(PacketTypes.CONNECT)
+        cp.SessionExpiryInterval = 30
+        c.connect(HOST, PORT, keepalive=30, clean_start=True, properties=cp)
+        c.loop_start()
+        time.sleep(0.3)
+        return c
+
+    # (a) HONOURED: kill the socket, expect nothing at +1 s and arrival in (2, 5) s.
+    dying = dying_client("paho-will-delayed", "paho/will/delayed", 3)
+    dying.loop_stop()  # joins the network thread first, which can take up to ~1 s
+    dying._sock.close()  # a dead socket, not a DISCONNECT: the will stays armed
+    killed_at = time.time()
+    time.sleep(1.0)
+    delayed = [t for (t, m) in wills if m.topic == "paho/will/delayed"]
+    expect("no will one second into a 3 s Will Delay Interval", [], delayed)
+    if not wait(
+        lambda: any(m.topic == "paho/will/delayed" for (_, m) in wills),
+        time.time() + 5.0,
+    ):
+        bad("a delayed will arrives once its Will Delay Interval elapses")
+    else:
+        landed = min(t for (t, m) in wills if m.topic == "paho/will/delayed")
+        waited = landed - killed_at
+        # Upper bound generous on purpose: the broker cannot start the clock before it
+        # notices the dead socket, and a loaded CI runner adds to that. The LOWER bound is
+        # the conformance assertion (0.1 s was the observed pre-fix value); the upper one
+        # only has to exclude "the delay was ignored" and "the will never came".
+        if 2.0 < waited < 6.0:
+            ok(f"the 3 s delayed will landed after {waited:.2f}s (never early)")
+        else:
+            bad("delayed will timing", f"landed after {waited:.2f}s, wanted 2-6s")
+
+    # (b) CANCELLED: the same story, but the client comes back inside the window. The will
+    # must NEVER be published [MQTT-3.1.3-9] — this is the whole point of the property.
+    dying2 = dying_client("paho-will-cancelled", "paho/will/cancelled", 3)
+    dying2.loop_stop()
+    dying2._sock.close()
+    time.sleep(1.0)
+    back = mqtt.Client(
+        CallbackAPIVersion.VERSION2, client_id="paho-will-cancelled", protocol=mqtt.MQTTv5
+    )
+    back.enable_logger(None)
+    # NO SessionExpiryInterval on the way back in — paho's default, and every v5 client
+    # that does not set the property (absent = 0, MQTT 5.0 §3.1.2.11.2). A resume is a
+    # resume: [MQTT-3.1.3-9] does not let the resuming CONNECT's own properties decide
+    # whether the PREVIOUS connection's will is sent. Re-deriving min(delay, expiry) from
+    # this connection made the broker announce the death of a client that had just come
+    # back — on the most ordinary reconnect there is.
+    back.connect(HOST, PORT, keepalive=30, clean_start=False)
+    back.loop_start()
+    time.sleep(4.0)  # well past the 3 s the will would have fired at
+    expect(
+        "a resume with NO Session Expiry is still a resume, never announced dead "
+        "[MQTT-3.1.3-9]",
+        [],
+        [t for (t, m) in wills if m.topic == "paho/will/cancelled"],
+    )
+    back.loop_stop()
+    back.disconnect()
+
+    # (c) DELETED BY A NEW CONNECTION FOR THE CLIENT ID — the shape a foreign oracle is worth
+    # having for, because the reading is contested and this client is the ORDINARY one:
+    # clean_start=True plus a non-zero Session Expiry Interval is exactly what `dying_client`
+    # above sends, i.e. what paho's own examples do.
+    #
+    # MQTT 5.0 §3.1.2.5: the Will Message MUST be published after the connection closes and
+    # either the delay has elapsed or the Session ends, "unless the Will Message has been
+    # deleted by the Server on receipt of a DISCONNECT packet with Reason Code 0x00 … or a new
+    # Network Connection FOR THE CLIENTID is opened before the Will Delay Interval has
+    # elapsed" [MQTT-3.1.2-8]. That exception is keyed on the client id, not on the Session,
+    # and it excepts the whole obligation — the "or the Session ends" trigger included. So a
+    # Clean Start CONNECT for the same id inside the window deletes the will. An earlier
+    # reading here published it (citing [MQTT-3.1.2-4] and "or the Session ends"), which took
+    # the feature away from every client that reconnects clean.
+    dying3 = dying_client("paho-will-cleanstart", "paho/will/cleanstart", 3)
+    dying3.loop_stop()
+    dying3._sock.close()
+    time.sleep(1.0)
+    fresh = mqtt.Client(
+        CallbackAPIVersion.VERSION2, client_id="paho-will-cleanstart", protocol=mqtt.MQTTv5
+    )
+    fresh.enable_logger(None)
+    fp = Properties(PacketTypes.CONNECT)
+    fp.SessionExpiryInterval = 30
+    fresh.connect(HOST, PORT, keepalive=30, clean_start=True, properties=fp)
+    fresh.loop_start()
+    time.sleep(4.0)  # well past the 3 s the will would have fired at
+    expect(
+        "a clean-start CONNECT for the same client id inside the window DELETES the will "
+        "[MQTT-3.1.2-8]",
+        [],
+        [t for (t, m) in wills if m.topic == "paho/will/cleanstart"],
+    )
+    fresh.loop_stop()
+    fresh.disconnect()
+
+    watcher.loop_stop()
+    watcher.disconnect()
 
     c.loop_stop()
     c.disconnect()

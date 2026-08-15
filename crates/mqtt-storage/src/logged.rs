@@ -405,6 +405,38 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         self.store_meta(client, &meta).await
     }
 
+    async fn set_pending_will(
+        &self,
+        client: &ClientId,
+        pending: Option<(&Message, u64)>,
+    ) -> Result<(), StorageError> {
+        // Read-modify-write the snapshot so subscriptions / dedup / packet-id / the expiry
+        // deadline survive — the same shape as `set_session_expiry` above (issue #299).
+        let existing = self.load_meta(client).await?;
+        // A CLEAR must never MATERIALIZE durable state. `unwrap_or_default()` on this path
+        // wrote a fresh `m/{client}` snapshot with `owner: None` for a record that had been
+        // removed — and `claim_session` treats any existing meta record as `present: true`
+        // and adopts the first claimant, so that phantom would report `session_present = 1`
+        // for a discarded session and, carrying no expiry deadline, would never be reaped.
+        // Reachable wherever the record is deleted between an arm and its clear (a peer's
+        // clean-start remove or expiry sweep while this node still holds the in-memory arm,
+        // then `fire_due_wills` clearing it). `MemorySessionStore`'s implementation of this
+        // seam was already guarded; this is the drift its comment claims cannot exist.
+        if pending.is_none() && existing.is_none() {
+            return Ok(());
+        }
+        let mut meta = existing.unwrap_or_default();
+        meta.pending_will = pending.map(|(w, deadline)| (w.clone(), deadline));
+        self.store_meta(client, &meta).await
+    }
+
+    async fn pending_will(
+        &self,
+        client: &ClientId,
+    ) -> Result<Option<(Message, u64)>, StorageError> {
+        Ok(self.load_meta(client).await?.and_then(|m| m.pending_will))
+    }
+
     async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
         // Enumerate the metadata keys this node holds (`m/{client}`) and return those with
         // a persisted deadline. Off the hot path — used at takeover to inherit expiries.
@@ -447,7 +479,12 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             // gossip an interest snapshot built from it). Reading an OWNED key
             // eagerly recovers its cold group — intended.
             match self.load_meta(&client).await {
-                Ok(Some(meta)) => out.push((client, meta.subscriptions, meta.session_expiry_at)),
+                Ok(Some(meta)) => out.push(crate::ScannedSession {
+                    client,
+                    subscriptions: meta.subscriptions,
+                    expires_at: meta.session_expiry_at,
+                    pending_will: meta.pending_will,
+                }),
                 Ok(None) | Err(StorageError::NotOwner) => {}
                 Err(_) => complete = false,
             }
@@ -518,8 +555,16 @@ struct SessionMeta {
     outbound_qos2: std::collections::BTreeMap<u16, (u64, bool)>,
     /// The SUBSET of `received_qos2` whose PUBREC was never released (issue #238).
     ///
-    /// Appended STRICTLY LAST and emitted only when NON-EMPTY, so a session with nothing
-    /// unacknowledged encodes byte-for-byte what the pre-#238 build encoded. Compatible
+    /// **No longer strictly last** (issue #299): `pending_will` follows it. Its count is
+    /// therefore emitted whenever a will block follows, EVEN WHEN EMPTY — otherwise the
+    /// decoder, which reads this block only `if !r.is_empty()`, consumes the will block's
+    /// presence flag and length prefix as an unacked count and desynchronises every field
+    /// after it. See the emit condition in [`encode_session_meta`]; the invariant is
+    /// "emitted when non-empty OR when anything follows", not "emitted when non-empty".
+    ///
+    /// Emitted only when NON-EMPTY *and nothing follows*, so a session with nothing
+    /// unacknowledged and no pending will encodes byte-for-byte what the pre-#238 build
+    /// encoded. Compatible
     /// in both directions by the same EOF-defaulting discipline as `session_expiry_at`
     /// (ADR 0009 §3), `owner` (ADR 0031) and `outbound_qos2` (ADR 0057): a new binary
     /// reading an old record finds no block and treats every held id as ACKED (today's
@@ -527,6 +572,22 @@ struct SessionMeta {
     /// entirely — degrading to the #238 `QoS` 2 bug for the duration of a downgrade, never
     /// to corruption. That is the rollback trade, and it is named in the ADR.
     unacked_received_qos2: BTreeSet<u16>,
+    /// A delayed Will held for this DISCONNECTED session, with its ABSOLUTE deadline
+    /// (Unix epoch seconds) — `min(will delay, session expiry)` frozen at the disconnect
+    /// that armed it (issue #299, MQTT 5.0 §3.1.3.2.2).
+    ///
+    /// Appended STRICTLY LAST as `[1][u64 deadline][u32 len][encode_queued(will, None)]`,
+    /// EOF-defaulted on decode, and absent when there is no pending will — the same
+    /// additive discipline as `session_expiry_at` (ADR 0009 §3), `owner` (ADR 0031),
+    /// `outbound_qos2` (ADR 0057) and `unacked_received_qos2` (#238), so no ADR 0058
+    /// schema stamp and no `cluster_upgrade.rs` `BASELINE_REF` bump. The length prefix is
+    /// what lets a FUTURE trailing field be appended after this one without re-reading the
+    /// will's own variable-length body.
+    ///
+    /// **Rollback trade, named:** an older binary ignores the trailing block, so a pending
+    /// will armed before a downgrade is forgotten — the session is otherwise intact, and
+    /// the loss is one missing "offline" announcement, never corruption.
+    pending_will: Option<(Message, u64)>,
 }
 
 fn qos_to_u8(q: QoS) -> u8 {
@@ -662,16 +723,33 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
         out.extend_from_slice(&offset.to_be_bytes());
         out.push(u8::from(*pubrec_seen));
     }
-    // Appended after the outbound window (issue #238), and ONLY when non-empty: a session
-    // with nothing unacknowledged therefore encodes exactly the bytes the pre-#238 build
-    // wrote, so nothing about the common record changes. An older record ends before this
-    // and decodes with every held id treated as ACKED — the pre-#238 behaviour.
-    if !m.unacked_received_qos2.is_empty() {
+    // Appended after the outbound window (issue #238), and only when non-empty OR when a
+    // trailing block FOLLOWS it: a session with nothing unacknowledged and no pending will
+    // therefore encodes exactly the bytes the pre-#238 build wrote, so nothing about the
+    // common record changes. An older record ends before this and decodes with every held
+    // id treated as ACKED — the pre-#238 behaviour.
+    //
+    // The `|| pending_will.is_some()` half is LOAD-BEARING (issue #299), not tidiness. The
+    // decoder reads this block only `if !r.is_empty()`, so an empty-and-omitted count in
+    // front of a will block would make it read the will's presence flag and deadline as an
+    // unacked COUNT and then as ids — silent session-metadata corruption of the kind
+    // ADR 0058 clause 3 forbids. Any field appended after `pending_will` inherits the same
+    // obligation: once something can follow a conditional block, that block stops being
+    // conditional.
+    if !m.unacked_received_qos2.is_empty() || m.pending_will.is_some() {
         let un = u32::try_from(m.unacked_received_qos2.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&un.to_be_bytes());
         for id in m.unacked_received_qos2.iter().take(un as usize) {
             out.extend_from_slice(&id.to_be_bytes());
         }
+    }
+    // Appended STRICTLY LAST (issue #299): the delayed Will and its absolute deadline. A
+    // record with no pending will ends before this and decodes as `None`; the will body is
+    // length-prefixed so a later trailing field need not re-parse it.
+    if let Some((will, deadline)) = &m.pending_will {
+        out.push(1);
+        out.extend_from_slice(&deadline.to_be_bytes());
+        put_bytes(&mut out, &encode_queued(will, None));
     }
     out
 }
@@ -841,6 +919,18 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
             unacked_received_qos2.insert(r.u16()?);
         }
     }
+    // Backward-compatible (issue #299): a record written before the delayed-Will block —
+    // or one with no pending will — ends here and decodes as `None`, which is the
+    // pre-#299 behaviour (the will fired at the disconnect, so there was none to hold).
+    let pending_will = if r.is_empty() {
+        None
+    } else if r.u8()? == 1 {
+        let deadline = r.u64()?;
+        let (message, _) = decode_queued(r.bytes()?)?;
+        Some((message, deadline))
+    } else {
+        None
+    };
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
@@ -849,6 +939,7 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
         owner,
         outbound_qos2,
         unacked_received_qos2,
+        pending_will,
     })
 }
 
@@ -1527,6 +1618,7 @@ mod tests {
             owner: Some("subject".into()),
             outbound_qos2: [(9u16, (100u64, true))].into_iter().collect(),
             unacked_received_qos2: BTreeSet::new(),
+            pending_will: None,
         };
         let without = encode_session_meta(&base);
 
@@ -1541,6 +1633,7 @@ mod tests {
                 owner: base.owner.clone(),
                 outbound_qos2: base.outbound_qos2.clone(),
                 unacked_received_qos2: BTreeSet::new(),
+                pending_will: None,
             }
         };
         let encoded_with = encode_session_meta(&with);
@@ -1589,5 +1682,191 @@ mod tests {
         // omitted when empty, so the common record's bytes do not change at all.
         with.unacked_received_qos2.clear();
         assert_eq!(encode_session_meta(&with), without);
+    }
+
+    /// Issue #299, the trap this record codec sets for the NEXT appender — and the reason
+    /// `unacked_received_qos2` stopped being "emitted only when non-empty".
+    ///
+    /// The decoder reads that block only `if !r.is_empty()`. Once a block FOLLOWS it, an
+    /// omitted-because-empty count in front of the will block makes the decoder read the
+    /// will's presence flag and deadline as an unacked count and then as packet ids —
+    /// silent session-metadata corruption of the kind ADR 0058 clause 3 forbids, and
+    /// invisible to any purely behavioural test. So: a record with NO unacked ids but WITH
+    /// a pending will must still round-trip every field.
+    #[test]
+    fn a_pending_will_after_an_empty_unacked_block_still_decodes() {
+        use super::{encode_session_meta, SessionMeta};
+        use std::collections::BTreeSet;
+
+        let mut will = Message::new(
+            "dev/7/status".to_string(),
+            bytes::Bytes::from_static(b"offline"),
+            QoS::AtLeastOnce,
+            true,
+        );
+        will.app
+            .user_properties
+            .push(("zone".into(), "attic".into()));
+        will.app.content_type = Some("text/plain".into());
+        will.app.response_topic = Some("dev/7/cmd".into());
+        will.app.correlation_data = Some(bytes::Bytes::from_static(b"\x01\x02"));
+        will.app.payload_format = Some(1);
+
+        let meta = SessionMeta {
+            subscriptions: vec![Subscription {
+                filter: "a/#".into(),
+                max_qos: QoS::AtLeastOnce,
+                no_local: true,
+            }],
+            received_qos2: [4u16, 7].into_iter().collect(),
+            last_packet_id: 42,
+            session_expiry_at: Some(1_755_000_000),
+            owner: Some("subject".into()),
+            outbound_qos2: [(9u16, (100u64, true))].into_iter().collect(),
+            // EMPTY — the whole point of this case.
+            unacked_received_qos2: BTreeSet::new(),
+            pending_will: Some((will.clone(), 1_755_000_004)),
+        };
+        let decoded = decode_session_meta(&encode_session_meta(&meta)).unwrap();
+
+        // Nothing before the will block moved.
+        assert_eq!(decoded.last_packet_id, 42);
+        assert_eq!(decoded.session_expiry_at, Some(1_755_000_000));
+        assert_eq!(decoded.owner.as_deref(), Some("subject"));
+        assert_eq!(decoded.received_qos2, [4u16, 7].into_iter().collect());
+        assert_eq!(
+            decoded.outbound_qos2,
+            [(9u16, (100u64, true))].into_iter().collect()
+        );
+        assert!(
+            decoded.unacked_received_qos2.is_empty(),
+            "an emitted-but-empty unacked count must decode as empty, not as the will's \
+             bytes"
+        );
+
+        // And the will itself survives whole: a will that arrives with the wrong QoS,
+        // retain flag or properties is a different announcement.
+        let (got, deadline) = decoded.pending_will.expect("the pending will must survive");
+        assert_eq!(
+            deadline, 1_755_000_004,
+            "the ABSOLUTE deadline is what a new owner fires on"
+        );
+        assert_eq!(got.topic, will.topic);
+        assert_eq!(got.payload, will.payload);
+        assert_eq!(got.qos, will.qos);
+        assert!(got.retain, "a retained will must stay retained");
+        assert_eq!(got.app.user_properties, will.app.user_properties);
+        assert_eq!(got.app.content_type, will.app.content_type);
+        assert_eq!(got.app.response_topic, will.app.response_topic);
+        assert_eq!(got.app.correlation_data, will.app.correlation_data);
+        assert_eq!(got.app.payload_format, will.app.payload_format);
+    }
+
+    /// The other direction of the same ADR 0058 guard: the will block is STRICTLY TRAILING
+    /// and additive, so a record written before issue #299 decodes with no pending will,
+    /// and a record with no pending will is byte-identical to what the previous build wrote.
+    #[test]
+    fn the_pending_will_block_is_strictly_trailing_and_absent_by_default() {
+        use super::{encode_session_meta, SessionMeta};
+        use std::collections::BTreeSet;
+
+        let base = SessionMeta {
+            subscriptions: Vec::new(),
+            received_qos2: BTreeSet::new(),
+            last_packet_id: 7,
+            session_expiry_at: Some(1_755_000_000),
+            owner: Some("subject".into()),
+            outbound_qos2: std::collections::BTreeMap::new(),
+            unacked_received_qos2: [3u16].into_iter().collect(),
+            pending_will: None,
+        };
+        let without = encode_session_meta(&base);
+        assert!(
+            decode_session_meta(&without)
+                .unwrap()
+                .pending_will
+                .is_none(),
+            "a pre-#299 record (and any record with no pending will) decodes as None — \
+             the pre-#299 behaviour, where the will fired at the disconnect"
+        );
+
+        let will = Message::new(
+            "d/s".to_string(),
+            bytes::Bytes::from_static(b"x"),
+            QoS::AtMostOnce,
+            false,
+        );
+        let with = encode_session_meta(&SessionMeta {
+            pending_will: Some((will, 1_755_000_009)),
+            ..base
+        });
+        assert_eq!(
+            &with[..without.len()],
+            &without[..],
+            "the no-will encoding must be a strict PREFIX of the with-will one: a block \
+             that is not strictly trailing corrupts an older decoder"
+        );
+    }
+
+    /// A CLEAR must never MATERIALIZE a session record (issue #299).
+    ///
+    /// `set_pending_will` read-modify-writes the metadata snapshot, and its
+    /// `unwrap_or_default()` made `set_pending_will(client, None)` against a REMOVED record
+    /// write a fresh `m/{client}` with `owner: None`. That phantom is not inert: `claim_session`
+    /// treats any existing meta record as `present: true` and adopts the first claimant, so the
+    /// next `clean_session = 0` CONNECT would be told `session_present = 1` for a session that
+    /// was discarded — and, carrying no expiry deadline, nothing would ever reap it. Reachable
+    /// wherever the record is deleted between an arm and its clear: a peer's clean-start remove
+    /// or expiry sweep while this node still holds the in-memory arm, and then `fire_due_wills`
+    /// clearing it.
+    ///
+    /// `MemorySessionStore`'s implementation of the same seam was already guarded, which is the
+    /// drift this asserts away: a comment claimed the two shapes "cannot drift", and they had.
+    #[tokio::test]
+    async fn clearing_a_pending_will_does_not_resurrect_a_removed_session_record() {
+        let s = store();
+        let c = cid("ghost");
+        let will = msg("dev/ghost/status", b"offline", QoS::AtMostOnce);
+
+        // Armed, then the whole session goes (a peer's clean start, or the expiry sweep).
+        s.ensure_session(&c).await.unwrap();
+        s.set_pending_will(&c, Some((&will, 1_755_000_004)))
+            .await
+            .unwrap();
+        s.remove(&c).await.unwrap();
+        assert!(!s.ensure_session(&c).await.unwrap(), "removed");
+        s.remove(&c).await.unwrap();
+
+        // The node that still held the in-memory arm fires it and clears the record.
+        s.set_pending_will(&c, None).await.unwrap();
+
+        assert!(
+            s.pending_will(&c).await.unwrap().is_none(),
+            "there is nothing to clear, and clearing nothing must write nothing"
+        );
+        assert!(
+            !s.ensure_session(&c).await.unwrap(),
+            "a clear-only operation must not bring a discarded session back into existence"
+        );
+        s.remove(&c).await.unwrap();
+        assert!(
+            matches!(
+                s.claim_session(&c, "someone").await.unwrap(),
+                SessionClaim::Granted { present: false }
+            ),
+            "and the next resuming client must not be told a discarded session is present"
+        );
+    }
+
+    /// The same seam in the OTHER store, asserted side by side so the two cannot drift again.
+    #[tokio::test]
+    async fn the_memory_store_agrees_that_a_clear_creates_nothing() {
+        let s = crate::MemorySessionStore::new();
+        let c = cid("ghost");
+        s.set_pending_will(&c, None).await.unwrap();
+        assert!(
+            !s.ensure_session(&c).await.unwrap(),
+            "clearing a pending will for an unknown client creates no session"
+        );
     }
 }

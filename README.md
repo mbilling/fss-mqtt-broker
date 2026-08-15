@@ -285,7 +285,8 @@ process and credentials — see [Bridging](#bridging-to-other-security-zones).
 - **Last Will & Testament**: published on any ungraceful end (abrupt drop,
   keepalive expiry, session takeover, protocol-violation close) and on a v5
   DISCONNECT with a non-zero reason (`0x04` Disconnect with Will Message);
-  discarded only on a clean DISCONNECT (reason `0x00`).
+  discarded only on a clean DISCONNECT (reason `0x00`). A v5 client can ask for the
+  publication to be *delayed* — see Will Delay Interval below.
 - **Keepalive enforcement** (1.5× grace), and persistent sessions
   (`clean_session=0`) with offline queueing and replay.
 - Zero-trust wire codec with a `cargo-fuzz` harness.
@@ -296,6 +297,16 @@ v5-framed packets with properties. The semantics are implemented, not just the c
 - **Session & message expiry** ([ADR 0009](docs/adr/0009-mqtt5-expiry.md)):
   Session Expiry Interval and per-message Message Expiry Interval, honoured on
   queueing and replay.
+- **Will Delay Interval** ([ADR 0009](docs/adr/0009-mqtt5-expiry.md)): a Will is held
+  for `min(will delay, session expiry)` after an ungraceful end instead of published on
+  the spot, and **any** new connection for that client id inside the window deletes it —
+  a resume ([MQTT-3.1.3-9]) and a Clean Start CONNECT alike, because [MQTT-3.1.2-8]'s
+  exception is keyed on the ClientID, not on the Session. So a brief blip no longer produces
+  a spurious "offline", whether or not the client reconnects clean. The pending will and its
+  absolute deadline ride the durable session record, so a takeover or a restart still
+  announces a client that does not come back — at or after its deadline, never before, and
+  exactly once. Cluster limitation: a resume that lands on a *different* node does not cancel
+  a will held elsewhere (see [Limitations](#limitations)).
 - **Topic aliases** ([ADR 0011](docs/adr/0011-topic-aliases.md)) and **flow
   control** (Receive Maximum, [ADR 0012](docs/adr/0012-flow-control.md)).
 - **Shared subscriptions** (`$share/<group>/<filter>`), including
@@ -621,6 +632,16 @@ be found. Each is tracked; none is a silent surprise.
   point: failing fast beats losing messages quietly. Delivery is tracked
   (ADR [0030](docs/adr/0030-user-property-forwarding.md) §1 "As delivered",
   [0010](docs/adr/0010-shared-subscriptions.md)-T7).
+
+- **A Will Delay Interval is not cancelled across nodes.** The delay itself is honoured
+  (see MQTT 5.0 above), and on one node a resume inside the window means the will is never
+  sent. In a **cluster**, a pending will lives in the memory of the node the client dropped
+  off, while the client's reconnect is served by the group's *owner* — so nothing cancels
+  it and the will fires one delay later. Bounded (never early, never duplicated per node),
+  counted (`mqttd_wills_published_total{reason="delay-elapsed"}`, `mqttd_pending_wills`)
+  and documented where operators read it: during a roll, size device-offline suppression to
+  the roll **plus** your fleet's largest will delay
+  ([OPERATIONS](docs/OPERATIONS.md)). Tracked as `0009-P5` with its mechanism named.
 
 - **Memory has a watermark, not a ceiling.** `MQTTD_MEMORY_MAX_BYTES` puts the
   broker into brownout above it — growth writes refused; subscriber acks, reads,

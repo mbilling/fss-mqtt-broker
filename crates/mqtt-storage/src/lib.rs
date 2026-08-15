@@ -210,16 +210,42 @@ pub enum SessionClaim {
 /// the whole truth).
 #[derive(Debug)]
 pub struct SessionScan {
-    /// Each readable session: `(client, subscriptions, expiry deadline)`.
-    pub sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    /// Each readable session.
+    pub sessions: Vec<ScannedSession>,
     /// Whether every stored key was either read or cleanly foreign.
     pub complete: bool,
+}
+
+/// One session as a scan sees it. A named struct rather than a tuple — and rather than a
+/// parallel side-list per field — so a reader can never marry the wrong pending will to
+/// the wrong client (issue #299).
+#[derive(Debug)]
+pub struct ScannedSession {
+    /// The session's client id.
+    pub client: ClientId,
+    /// Its persisted subscription set.
+    pub subscriptions: Vec<Subscription>,
+    /// Its persisted ABSOLUTE expiry deadline (Unix epoch secs), if any (ADR 0009 §3).
+    pub expires_at: Option<u64>,
+    /// Its persisted delayed Will and that will's ABSOLUTE deadline (Unix epoch secs) —
+    /// `min(will delay, session expiry)` frozen at the disconnect that armed it (issue
+    /// #299, MQTT 5.0 §3.1.3.2.2). A new owner re-arms from this after a takeover, and a
+    /// restarted node re-arms from it over its own data dir; without it a node death
+    /// inside the delay window would silently LOSE the announcement of exactly the
+    /// unexpected death the Will exists to announce.
+    ///
+    /// Reaching this at all depends on the backing log being able to ENUMERATE its keys
+    /// (`ReplicatedLog::keys`, whose default answers "none"): a store that cannot list
+    /// itself reports an empty scan, which is indistinguishable from having nothing to
+    /// inherit. ADR 0009 §2's as-delivered note states which deployment shapes survive
+    /// what, per shape, for exactly that reason.
+    pub pending_will: Option<(Message, u64)>,
 }
 
 impl SessionScan {
     /// A complete scan over `sessions`.
     #[must_use]
-    pub fn complete(sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>) -> Self {
+    pub fn complete(sessions: Vec<ScannedSession>) -> Self {
         Self {
             sessions,
             complete: true,
@@ -390,6 +416,47 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Persist a disconnected session's **delayed Will** together with that will's
+    /// ABSOLUTE deadline (Unix epoch seconds) — or clear it (`None`) once the will has
+    /// been published or the session resumed (issue #299, MQTT 5.0 §3.1.3.2.2).
+    ///
+    /// The deadline is absolute for the same reason
+    /// [`set_session_expiry`](SessionStore::set_session_expiry)'s is (ADR 0009 §3): a new
+    /// owner must fire the will at the right wall-clock time after a takeover rather than
+    /// restarting the clock. Persisting it at all is what stops a node death inside the
+    /// delay window from silently losing the will — the one case the Will exists for.
+    ///
+    /// Only ever written against a session that is retained past disconnect: a will is
+    /// only armed when `min(will delay, session expiry) > 0`, which implies a non-zero
+    /// session expiry, which is exactly when a durable record exists. Default: a no-op
+    /// (stores without durable metadata, e.g. test stubs).
+    async fn set_pending_will(
+        &self,
+        _client: &ClientId,
+        _pending: Option<(&Message, u64)>,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// This session's persisted delayed Will and its ABSOLUTE deadline, if the record
+    /// carries one (issue #299).
+    ///
+    /// Read on the off-loop recovery path of a persistent attach, because **the obligation
+    /// a resume cancels can outlive the node that armed it**: the record is authoritative
+    /// after the arming node dies, so a resume must clear the record even when this node
+    /// holds no in-memory pending will for the client (it armed nothing, or it restarted,
+    /// or the will was armed on a peer). Without it a session record keeps a will that no
+    /// resume and no graceful DISCONNECT ever clears, and the inherited-session scan
+    /// announces the client dead — after it came back and left cleanly.
+    ///
+    /// Default: `None` (stores without durable metadata, e.g. test stubs).
+    async fn pending_will(
+        &self,
+        _client: &ClientId,
+    ) -> Result<Option<(Message, u64)>, StorageError> {
+        Ok(None)
+    }
+
     /// Every session this store currently holds with a persisted expiry deadline, as
     /// `(client, deadline epoch secs)`. A new owner reads this after a takeover to
     /// schedule the expiry sweep for sessions it inherited (ADR 0009 §3). Default: empty.
@@ -491,6 +558,10 @@ struct SessionEntry {
     /// The authenticated identity that owns this session (ADR 0031). `None` only for a
     /// legacy entry created before owner binding; the next claim adopts it.
     owner: Option<String>,
+    /// A delayed Will and its ABSOLUTE deadline (Unix epoch secs), issue #299. Mirrors the
+    /// on-disk shape in `logged.rs` so the two implementations cannot drift — and so the
+    /// hub's own unit tests can drive the inherit-and-fire path with no replicated log.
+    pending_will: Option<(Message, u64)>,
 }
 
 /// A non-durable, single-process [`SessionStore`] backed by in-memory maps.
@@ -771,6 +842,27 @@ impl SessionStore for MemorySessionStore {
         Ok(())
     }
 
+    async fn set_pending_will(
+        &self,
+        client: &ClientId,
+        pending: Option<(&Message, u64)>,
+    ) -> Result<(), StorageError> {
+        // Only against an existing session; a will is only armed for a retained one, and a
+        // CLEAR must never materialize a record (the same rule `logged.rs` now follows on
+        // its clearing path — issue #299).
+        if let Some(entry) = self.lock().get_mut(client) {
+            entry.pending_will = pending.map(|(w, deadline)| (w.clone(), deadline));
+        }
+        Ok(())
+    }
+
+    async fn pending_will(
+        &self,
+        client: &ClientId,
+    ) -> Result<Option<(Message, u64)>, StorageError> {
+        Ok(self.lock().get(client).and_then(|e| e.pending_will.clone()))
+    }
+
     async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
         Ok(self
             .lock()
@@ -783,7 +875,12 @@ impl SessionStore for MemorySessionStore {
         Ok(SessionScan::complete(
             self.lock()
                 .iter()
-                .map(|(c, e)| (c.clone(), e.subscriptions.clone(), e.session_expiry_at))
+                .map(|(c, e)| ScannedSession {
+                    client: c.clone(),
+                    subscriptions: e.subscriptions.clone(),
+                    expires_at: e.session_expiry_at,
+                    pending_will: e.pending_will.clone(),
+                })
                 .collect(),
         ))
     }

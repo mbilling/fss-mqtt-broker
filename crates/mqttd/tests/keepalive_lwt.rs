@@ -301,3 +301,137 @@ async fn session_takeover_publishes_will() {
         other => panic!("expected will PUBLISH on takeover, got {other:?}"),
     }
 }
+
+// --- Issue #299: the MQTT 5.0 Will Delay Interval, over a real socket ------------------
+
+/// A v5 client, connected with an explicit Session Expiry Interval and (optionally) a Will
+/// carrying a Will Delay Interval. Separate from [`Client::connect_with`] because the
+/// framing is version-parameterised and every test above is v3.1.1.
+async fn connect_v5_delayed_will(
+    addr: std::net::SocketAddr,
+    client_id: &str,
+    session_expiry: Option<u32>,
+    will_delay: Option<u32>,
+    will_topic: &str,
+    clean_start: bool,
+) -> Client {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (rh, wh) = stream.into_split();
+    let mut client = Client {
+        reader: mqtt_net::FrameReader::new(rh, ProtocolVersion::V5),
+        writer: mqtt_net::FrameWriter::new(wh, ProtocolVersion::V5),
+    };
+    let last_will = will_delay.map(|delay| LastWill {
+        properties: mqtt_codec::Properties(vec![mqtt_codec::Property::WillDelayInterval(delay)]),
+        topic: will_topic.into(),
+        payload: bytes::Bytes::from_static(b"gone"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    client
+        .send(&Packet::Connect(Connect {
+            // `None` sends NO Session Expiry Interval — the v5 default of 0, which is
+            // paho's default and every client that does not set the property.
+            properties: mqtt_codec::Properties(
+                session_expiry
+                    .map(mqtt_codec::Property::SessionExpiryInterval)
+                    .into_iter()
+                    .collect(),
+            ),
+            protocol: ProtocolVersion::V5,
+            clean_session: clean_start,
+            keep_alive: 30,
+            client_id: client_id.to_string(),
+            last_will,
+            username: None,
+            password: None,
+        }))
+        .await;
+    match client.recv().await {
+        Packet::ConnAck(a) => assert_eq!(a.code, 0, "CONNACK should be success"),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    client
+}
+
+/// The only test that pins the `conn.rs` plumbing: a REAL v5 CONNECT carrying Will Delay
+/// Interval `0x18` and a Session Expiry Interval, over a real socket, with the will's
+/// arrival timed. Every hub-level test builds a `WillSpec` directly, so hard-coding
+/// `delay: 0` in `into_will_spec` leaves all of them green and only this one red — which is
+/// exactly why it exists (issue #299 was found by a foreign client for the same reason).
+#[tokio::test]
+async fn a_v5_will_delay_interval_is_honoured_end_to_end() {
+    let addr = start_broker().await;
+
+    let mut sub = Client::connect_with(addr, "lwt-sub-delay", 30, None).await;
+    sub.subscribe("will/delayed").await;
+
+    // Delay 2 s, session expiry 60 s → the effective deadline is the delay.
+    let victim =
+        connect_v5_delayed_will(addr, "lwt-delayed", Some(60), Some(2), "will/delayed", true).await;
+    let dropped_at = Instant::now();
+    drop(victim);
+
+    // Nothing at one second in: this is the spurious "offline on every blip" the property
+    // exists to prevent, and what the broker did for every client before this fix.
+    match timeout(Duration::from_secs(1), sub.reader.next_packet()).await {
+        Err(_) => {}
+        Ok(other) => panic!("a delayed will must not be published early, got {other:?}"),
+    }
+
+    match sub.recv_within(Duration::from_secs(4)).await {
+        Packet::Publish(p) => {
+            assert_eq!(p.topic, "will/delayed");
+            assert_eq!(&p.payload[..], b"gone");
+        }
+        other => panic!("expected the delayed will PUBLISH, got {other:?}"),
+    }
+    let waited = dropped_at.elapsed();
+    assert!(
+        waited >= Duration::from_secs(2),
+        "the will must never be published EARLY: waited only {waited:?} for a 2 s delay"
+    );
+}
+
+/// The same plumbing, the cancellation half [MQTT-3.1.3-9]: a reconnect inside the window
+/// means the will is never published at all.
+#[tokio::test]
+async fn a_v5_reconnect_inside_the_delay_window_cancels_the_will_end_to_end() {
+    let addr = start_broker().await;
+
+    let mut sub = Client::connect_with(addr, "lwt-sub-cancel", 30, None).await;
+    sub.subscribe("will/cancelled").await;
+
+    let victim = connect_v5_delayed_will(
+        addr,
+        "lwt-cancelled",
+        Some(60),
+        Some(2),
+        "will/cancelled",
+        true,
+    )
+    .await;
+    drop(victim);
+    sleep(Duration::from_millis(300)).await;
+    // The blip ends well inside the 2 s window. `clean_start = false`: this is a RESUME,
+    // which is what [MQTT-3.1.3-9] cancels the will for — a Clean Start CONNECT would end
+    // the old session and (deliberately) publish it instead.
+    // …and it reconnects WITHOUT a Session Expiry Interval — the v5 default of 0, which is
+    // what paho and most clients send. A resume is a resume: [MQTT-3.1.3-9] does not let the
+    // resuming CONNECT's own properties decide whether the previous will is sent, and
+    // re-deriving min(delay, expiry) from this connection published it.
+    let _back = connect_v5_delayed_will(
+        addr,
+        "lwt-cancelled",
+        None,
+        Some(2),
+        "will/cancelled",
+        false,
+    )
+    .await;
+
+    match timeout(Duration::from_secs(3), sub.reader.next_packet()).await {
+        Err(_) => {}
+        Ok(other) => panic!("a resumed session's will must NEVER be published, got {other:?}"),
+    }
+}

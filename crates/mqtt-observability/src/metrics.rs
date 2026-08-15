@@ -140,6 +140,11 @@ struct OtelInstruments {
     revocation_evictions: OtelCounter<u64>,
     session_rehomes: OtelCounter<u64>,
     session_expiry_unpersisted: OtelCounter<u64>,
+    wills_published: OtelCounter<u64>,
+    wills_cancelled: OtelCounter<u64>,
+    pending_will_unpersisted: OtelCounter<u64>,
+    wills_handed_off: OtelCounter<u64>,
+    pending_wills: OtelGauge<i64>,
     admission_rejected: OtelCounter<u64>,
     quota_rejections: OtelCounter<u64>,
     store_bytes: OtelGauge<i64>,
@@ -209,6 +214,11 @@ impl OtelInstruments {
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
             session_rehomes: meter.u64_counter("session_rehomes").build(),
             session_expiry_unpersisted: meter.u64_counter("session_expiry_unpersisted").build(),
+            wills_published: meter.u64_counter("wills_published").build(),
+            wills_cancelled: meter.u64_counter("wills_cancelled").build(),
+            pending_will_unpersisted: meter.u64_counter("pending_will_unpersisted").build(),
+            wills_handed_off: meter.u64_counter("wills_handed_off").build(),
+            pending_wills: meter.i64_gauge("pending_wills").build(),
             admission_rejected: meter.u64_counter("admission_rejected").build(),
             quota_rejections: meter.u64_counter("quota_rejections").build(),
             store_bytes: meter.i64_gauge("store_bytes").build(),
@@ -300,6 +310,11 @@ pub struct Metrics {
     revocation_evictions_total: Family<ReasonLabel, Counter>,
     session_rehomes_total: Family<ReasonLabel, Counter>,
     session_expiry_unpersisted_total: Family<ReasonLabel, Counter>,
+    wills_published_total: Family<ReasonLabel, Counter>,
+    wills_cancelled_total: Family<ReasonLabel, Counter>,
+    pending_will_unpersisted_total: Family<ReasonLabel, Counter>,
+    wills_handed_off_total: Counter,
+    pending_wills: Gauge,
     admission_rejected_total: Family<ReasonLabel, Counter>,
     quota_rejections_total: Family<ReasonLabel, Counter>,
     store_bytes: Family<StoreLabel, Gauge>,
@@ -532,6 +547,14 @@ impl Metrics {
              convergence (issue #229); sustained growth means an absent durable \
              member or chronic divergence",
         );
+        let pending_wills = register_gauge(
+            &mut registry,
+            "pending_wills",
+            "Delayed Last Wills currently held on this node, waiting out \
+             min(Will Delay Interval, Session Expiry Interval) after an ungraceful \
+             disconnect (issue #299). This is the device-offline burst BEFORE it lands: \
+             during a roll it rises as sessions rehome and drains as each delay elapses",
+        );
         let misplaced_sessions = register_gauge(
             &mut registry,
             "misplaced_sessions",
@@ -627,6 +650,55 @@ impl Metrics {
              (the write was attempted and failed). The new owner inherits a session \
              record with no deadline, so a client that never returns leaves a \
              persistent session behind",
+        );
+        let wills_published_total = register_family(
+            &mut registry,
+            "wills_published",
+            "Last Will messages published, by reason: immediate (no Will Delay \
+             Interval, or a session that ends at disconnect — the pre-#299 behaviour \
+             and still every v3.1.1 client), delay-elapsed (the client's Will Delay \
+             Interval ran out with no resume), session-ended (the session ended inside \
+             the delay window with no new connection for the client id — an evict, or \
+             the expiry sweep's ordering guard; MQTT 5.0 §3.1.3.2.2 'or the Session \
+             ends'), session-expired (the Session Expiry Interval was the binding \
+             bound, §3.1.2.11.2), inherited (re-armed from the durable session record \
+             after a takeover, restart or node death)",
+        );
+        let wills_cancelled_total = register_family(
+            &mut registry,
+            "wills_cancelled",
+            "Delayed Last Wills that were NEVER published because a new Network \
+             Connection for the client id opened inside the Will Delay Interval \
+             (MQTT 5.0 [MQTT-3.1.2-8], and for a resume [MQTT-3.1.3-9]), by reason: \
+             resumed (an accepted CONNECT re-registered an offline session), takeover \
+             (a second connection replaced a live one) or clean-start (a Clean Start \
+             CONNECT for the same client id — the session is discarded, and the will is \
+             DELETED with it rather than published). This counter climbing is the \
+             feature working — each increment is one spurious device-offline event not \
+             sent",
+        );
+        let pending_will_unpersisted_total = register_family(
+            &mut registry,
+            "pending_will_unpersisted",
+            "Delayed-Will records that could NOT be written, by reason. An ARM that did \
+             not persist — not-owner (this node does not hold the session group's lease, \
+             the structural case after a rehome close, issue #284) or error — lives only \
+             in this node's memory, so a node death inside the delay window LOSES it \
+             (issue #299 residual R1). A CLEAR that did not persist — clear-not-owner or \
+             clear-error — fails the other way: the record keeps a will whose obligation \
+             ended, so its owner may still announce that client dead once the deadline \
+             passes",
+        );
+        let wills_handed_off_total = register_counter(
+            &mut registry,
+            "wills_handed_off",
+            "Delayed Wills this node stopped holding because the session's group moved to \
+             another owner and the durable record provably holds the will and its \
+             absolute deadline (issue #299, ADR 0043 P2). Neither a publish nor a cancel: \
+             the new owner fires it from the record at the original deadline, where it is \
+             counted as a published will with reason=inherited (the selector is spelled \
+             out in OPERATIONS; naming it here would put another metric's sample name in \
+             this exposition, which a substring assertion cannot tell from a real sample)",
         );
         let admission_rejected_total = register_family(
             &mut registry,
@@ -821,6 +893,11 @@ impl Metrics {
             revocation_evictions_total,
             session_rehomes_total,
             session_expiry_unpersisted_total,
+            wills_published_total,
+            wills_cancelled_total,
+            pending_will_unpersisted_total,
+            wills_handed_off_total,
+            pending_wills,
             admission_rejected_total,
             quota_rejections_total,
             store_bytes,
@@ -1439,6 +1516,15 @@ impl Metrics {
     /// armed, exactly as for session takeover and `evict`. A roll or resize therefore
     /// emits one LWT per rehomed session — treat this counter as the suppressor signal
     /// for device-offline alerting while it climbs.
+    ///
+    /// **Since issue #299 the LWT of a delay-using client arrives LATER than this counter
+    /// moves,** by up to its `min(Will Delay Interval, Session Expiry Interval)`: the
+    /// rehome close arms the delay rather than publishing on the spot. The reconnect lands
+    /// on the *owner* (ADR 0005 relocates it), so nothing reaches the closing node's memory
+    /// to cancel the pending will and it still fires — the false event is delayed, not
+    /// removed. A suppression window sized to the roll alone therefore expires before the
+    /// burst lands: size it to the roll PLUS the fleet's largest will delay, and watch
+    /// [`set_pending_wills`](Self::set_pending_wills) to see the burst before it does.
     pub fn session_rehomed(&self, reason: &str) {
         self.session_rehomes_total
             .get_or_create(&ReasonLabel {
@@ -1473,6 +1559,93 @@ impl Metrics {
         self.otel
             .session_expiry_unpersisted
             .add(1, &[KeyValue::new("kind", reason.to_string())]);
+    }
+
+    /// A Last Will was published, by bounded `reason` (issue #299, MQTT 5.0 §3.1.3.2.2):
+    ///
+    /// * `immediate` — no Will Delay Interval to honour, or the session ends at
+    ///   disconnect (Session Expiry Interval 0 / v3.1.1 `clean_session = 1`), so the will
+    ///   went out on the disconnect's own dispatch exactly as before this feature.
+    /// * `delay-elapsed` — the delay ran out with no resume; the honoured case.
+    /// * `session-ended` — the session ended inside the window with NO new connection for
+    ///   the client id (an `evict`, or the expiry sweep's ordering guard), so
+    ///   §3.1.3.2.2's "or the Session ends" fires the will. A *new connection* for the id
+    ///   deletes it instead ([MQTT-3.1.2-8]) and is counted under `wills_cancelled`.
+    /// * `session-expired` — the Session Expiry Interval was the binding bound
+    ///   (§3.1.2.11.2, `min(delay, expiry)`).
+    /// * `inherited` — re-armed from the durable session record and fired by a node that
+    ///   did not see the disconnect: a takeover, a restart, or a node death.
+    pub fn will_published(&self, reason: &str) {
+        self.wills_published_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .wills_published
+            .add(1, &[KeyValue::new("kind", reason.to_string())]);
+    }
+
+    /// A delayed Last Will was **never published** because a new Network Connection for the
+    /// client id opened inside the Will Delay Interval — [MQTT-3.1.2-8] deletes the will in
+    /// that case, and for a resume [MQTT-3.1.3-9] says the same. Bounded `reason`:
+    ///
+    /// * `resumed` — an accepted CONNECT re-registered an offline session.
+    /// * `takeover` — a second connection replaced a live one.
+    /// * `clean-start` — a Clean Start CONNECT for the same client id: the session is
+    ///   discarded, and the will goes with it rather than being announced. [MQTT-3.1.2-8]'s
+    ///   exception is keyed on the `ClientID`, not on the Session, and it excepts the
+    ///   "or the Session ends" trigger too.
+    ///
+    /// Each increment is one spurious device-offline announcement not sent, which is the
+    /// entire point of the property.
+    pub fn will_cancelled(&self, reason: &str) {
+        self.wills_cancelled_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .wills_cancelled
+            .add(1, &[KeyValue::new("kind", reason.to_string())]);
+    }
+
+    /// A delayed-Will record that could not be written, by bounded `reason`. The two
+    /// directions fail differently, which is why they are separate labels:
+    ///
+    /// * `not-owner` / `error` — an **arm** did not persist (no group lease, or the write
+    ///   failed). That will lives only in this node's memory: a node death inside the delay
+    ///   window loses it (issue #299 R1).
+    /// * `clear-not-owner` / `clear-error` — a **clear** did not persist, after a resume,
+    ///   a fire or a cancellation. The record keeps a will whose obligation has ended, so
+    ///   its owner may still announce that client dead at the original deadline.
+    pub fn pending_will_unpersisted(&self, reason: &str) {
+        self.pending_will_unpersisted_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .pending_will_unpersisted
+            .add(1, &[KeyValue::new("kind", reason.to_string())]);
+    }
+
+    /// A pending delayed Will was **handed off** rather than published or cancelled (issue
+    /// #299): the session's group moved to another owner while the will waited, and the
+    /// durable record provably holds it with its absolute deadline, so the new owner fires
+    /// it at the right time (`mqttd_wills_published_total{reason="inherited"}`) and this
+    /// node stops holding it. A lease move is not a death — publishing here would announce
+    /// one up to a whole delay early, for a session that is still very much alive.
+    pub fn will_handed_off(&self) {
+        self.wills_handed_off_total.inc();
+        self.otel.wills_handed_off.add(1, &[]);
+    }
+
+    /// Set the number of delayed Wills this node is currently holding (issue #299) —
+    /// sampled on the session sweep. The pending device-offline burst, before it lands.
+    pub fn set_pending_wills(&self, n: usize) {
+        self.pending_wills.set(clamp_gauge(n));
+        self.otel.pending_wills.record(clamp_gauge(n), &[]);
     }
 
     /// A QUIC connection migrated to a new client path (ADR 0036 §3b): the peer's remote address

@@ -842,6 +842,131 @@ async fn qos2_inbound_dedup_survives_owner_takeover() {
     );
 }
 
+/// Issue #299, the **strongest row of the per-shape durability table**, on a real
+/// multi-node durable cluster instead of an in-process hub over a stub store: *a delayed
+/// Will armed on the node that saw the disconnect is still announced after that node
+/// DIES, by whichever survivor takes the group over.*
+///
+/// It is here because of what the previous round found. The clustered-durable row claimed
+/// "survives node death, lease move, takeover, restart", and every test behind it was an
+/// in-process hub unit test — while the row that was actually FALSE (single-node on-disk,
+/// where `PersistentLog` had no `keys()` and the restarted scan read back nothing) was the
+/// only one with a real-binary test. A durability claim can be true in one shape and false
+/// in another precisely because no test covered the shape operators run, so this row now
+/// carries its own evidence: three nodes over real sockets, the owner killed inside the
+/// window, the announcement observed on a survivor.
+///
+/// The will is RETAINED so the assertion is "the cluster announced it", not a race between
+/// the takeover and how fast a test client can subscribe: `retained_seen` asks a survivor
+/// afterwards. It is checked on the OWNER first — the node that would publish it early — so
+/// the delay itself is proven on the clustered path too, not only on one hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_delayed_will_survives_the_death_of_the_node_that_armed_it() {
+    use mqtt_codec::packet::{Connect, LastWill};
+    use mqtt_codec::{Properties, Property};
+
+    let a = start_durable_node("will-a", vec![]).await; // founder
+    let b = start_durable_node("will-b", vec![a.swim_addr.clone()]).await;
+    let c = start_durable_node("will-c", vec![a.swim_addr.clone()]).await;
+    let nodes = [&a, &b, &c];
+
+    wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 3)
+    })
+    .await;
+
+    // The client must connect to its own group's OWNER: that is the node whose store can
+    // persist the pending will (a non-owner's group-routed write is refused — residual R1).
+    let client_id = "will-death-1";
+    let owner = a.placement.read().unwrap().owner(client_id);
+    let owner_node = nodes.iter().find(|n| n.node_id == owner).unwrap();
+
+    // A v5 client asking for 6 s of grace and a session that outlives its connection.
+    let mut victim = common::Client::open(owner_node.client_addr, common::V5).await;
+    victim
+        .send(&mqtt_codec::Packet::Connect(Connect {
+            properties: Properties(vec![Property::SessionExpiryInterval(300)]),
+            protocol: common::V5,
+            clean_session: true,
+            keep_alive: 0,
+            client_id: client_id.to_string(),
+            last_will: Some(LastWill {
+                properties: Properties(vec![Property::WillDelayInterval(6)]),
+                topic: "wills/death".into(),
+                payload: bytes::Bytes::from_static(b"gone"),
+                qos: QoS::AtMostOnce,
+                retain: true,
+            }),
+            username: None,
+            password: None,
+        }))
+        .await;
+    match victim.recv().await {
+        mqtt_codec::Packet::ConnAck(ack) => assert_eq!(ack.code, 0, "v5 CONNACK success"),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    // The socket dies without a DISCONNECT: the will is armed on this node and written to
+    // the session's replicated record.
+    drop(victim);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        retained_seen(owner_node.client_addr, "will-early-check", "wills/death").await,
+        None,
+        "a 6 s Will Delay Interval must not be announced at the disconnect — not even on \
+         the node that armed it"
+    );
+
+    // …and now the arming node dies INSIDE the window, taking its memory with it. Only the
+    // replicated record is left.
+    owner_node.kill();
+    let survivors: Vec<&&DurableNode> = nodes.iter().filter(|n| n.node_id != owner).collect();
+    wait_until(Duration::from_secs(20), || {
+        survivors
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 2)
+    })
+    .await;
+    let new_owner = survivors[0].placement.read().unwrap().owner(client_id);
+    assert_ne!(new_owner, owner, "a survivor must take the group over");
+    let new_owner_node = survivors.iter().find(|n| n.node_id == new_owner).unwrap();
+
+    // The new owner's inherited-session scan reads the record back and fires the will at its
+    // ABSOLUTE deadline — which the takeover may already have carried past, so this is
+    // "late but delivered", the trade ADR 0009 states for absolute deadlines.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = None;
+    let mut probe = 0;
+    while Instant::now() < deadline {
+        probe += 1;
+        if let Some(payload) = retained_seen(
+            new_owner_node.client_addr,
+            &format!("will-death-watch-{probe}"),
+            "wills/death",
+        )
+        .await
+        {
+            seen = Some(payload);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some(&b"gone"[..]),
+        "the node that armed a delayed will DIED inside the window: the survivor that took \
+         the group over must announce it from the replicated record. This is the one case \
+         the Will exists for, and the row of the durability table that had no end-to-end \
+         evidence"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_replica_serves_the_session_after_the_owner_dies() {
     let a = start_durable_node("dur-a", vec![]).await; // founder

@@ -153,12 +153,41 @@ here would make the rehome the only broker-initiated close in mqttd that hides a
 broker-initiated closes were silently *not* publishing it — its "document the
 suppression" exit was rejected as a spec violation). The cost is real and is stated
 where operators read it: one LWT per rehomed session, so a roll — and every resize —
-emits a burst of false "device offline" events, paced by the per-tick close cap. The
-spec's own answer to "this close is not a death" is the **Will Delay Interval** (0x18),
-which mqttd decodes and does not honour; honouring it in a *cluster* needs the delay and
-its cancellation to survive the client reconnecting on a different node, which no peer
-frame or durable record expresses today. That is the named follow-up, not a local
-`graceful = true`.
+emits a burst of false "device offline" events for clients that ask for no delay, paced by
+the per-tick close cap. The spec's own answer to "this close is not a death" is the **Will
+Delay Interval** (0x18).
+
+**As delivered (2026-08-15, issue #299): mqttd now honours it, so the rehome close itself is
+SILENT for a delay-using client — and the false event is DELAYED rather than removed.** A
+rehome close of a client carrying a Will Delay Interval arms the will for
+`min(delay, session expiry)` instead of publishing on the spot, and the routing release that
+follows (0043-P2) deliberately leaves it alone: a lease move is not a session end, and the
+first cut of this feature published there instead, up to a whole delay early and labelled as
+a session that had ended. Both halves are pinned by
+`a_rehome_close_is_silent_for_a_delay_using_client`; the `delay: 0` twin
+(`a_rehome_close_publishes_the_clients_will`) locks the other side, so this is not "the
+rehome stopped firing wills" — every v3.1.1 client and every v5 client without the property
+is still announced at the close, exactly as before.
+
+What is *not* closed is cancellation. The pending will sits in the *closing* node's memory,
+and the client's reconnect is served by the **owner** — this ADR's own relocation is what
+makes that certain, since the proxy means even a reconnect to the same address never reaches
+the closing node's hub. So nothing cancels it, and it fires one delay later.
+
+Two consequences worth stating where operators read them. First, the false-offline burst now
+arrives **after** `mqttd_session_rehomes_total{reason="stale-owner"}` stops climbing, i.e.
+outside the suppression window [OPERATIONS](../OPERATIONS.md) used to describe: that window
+must now be sized to the roll **plus the fleet's largest will delay**, and the
+`mqttd_pending_wills` gauge shows the burst before it lands. Second, a local
+`graceful = true` is still the wrong fix, for the reason above — and keeping the rehome will
+*immediate* so the false event lands inside the old window was considered and rejected as a
+deliberate [MQTT-3.1.3-9] violation on the one path where the broker knows a reconnect is
+imminent.
+
+The remaining follow-up is **cross-node cancellation** (0009-P5), and its mechanism is now
+named rather than merely absent: either fold an attach marker into the owner's existing
+attach-time meta write and compare it at fire time (one off-loop read, no proto bump), or
+add an additive `PeerMessage::PendingWill` hand-off (proto bump, cluster oracle).
 
 ## Consequences
 

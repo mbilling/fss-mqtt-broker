@@ -94,6 +94,27 @@ every other relaxed mode.
 - **Retained:** loaded from disk on start; cross-node back-fill (ADR 0014) still reconciles
   divergence.
 
+> **⚠️ Phase-1 (single-node on-disk) recovery was INERT until issue #299's closing round,
+> and fixing it changes behaviour on the first restart.** The restart paths above enumerate
+> sessions through `ReplicatedSessionStore::all_sessions` → `ReplicatedLog::keys()`, and
+> `PersistentLog` — the phase-1 backend, `MQTTD_DATA_DIR` with no cluster — never implemented
+> `keys()`. It silently took the trait's `Ok(Vec::new())`, so a restarted node's
+> inherited-session scan saw **no sessions at all**: ADR 0009 §3's persisted session-expiry
+> deadlines never fired across a restart in this shape, and neither did issue #299's
+> persisted Will Delay deadlines. Sessions and their offline queues therefore survived
+> indefinitely regardless of the Session Expiry Interval their clients asked for.
+>
+> `PersistentLog::keys()` now range-scans the entry table, skipping key-to-key (so a session
+> with a thousand queued messages costs one step, not a thousand). The consequence operators
+> must not meet as a surprise: **the first restart onto that build discards every offline
+> session already past its persisted deadline, and its acked offline queue with it.** That is
+> the correct behaviour finally taking effect, and it is a one-way deletion — so the boot
+> scan emits one `WARN` naming the count and the worst offenders before the sweep reaps them
+> (`DISCARDING offline sessions past their persisted Session Expiry deadline`). See
+> [ADR 0009](0009-mqtt5-expiry.md) §2 and [OPERATIONS](../OPERATIONS.md#rolling-upgrades).
+> Clustered durable (phase 2, `MQTTD_DURABLE_SESSIONS=1`) enumerates through the replicated
+> log and was never affected.
+
 ### 4. Data location & layout
 
 A single configurable data directory (`MQTTD_DATA_DIR`, e.g. `/var/lib/mqttd`), one `redb`

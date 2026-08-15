@@ -152,7 +152,69 @@ DISCONNECT does not delete the will ([MQTT-3.1.2-8], §3.14.4), and mqttd is
 consistent about this across every broker-initiated close (takeover, `evict`,
 rehome — issue #265). One LWT per rehomed session, so a roll or a resize produces a
 burst of false "device offline" events. Suppress device-offline alerting while
-`mqttd_session_rehomes_total{reason="stale-owner"}` is climbing.
+`mqttd_session_rehomes_total{reason="stale-owner"}` is climbing — **and for
+`min(will delay, session expiry)` longer than that** if any of your clients set the
+MQTT 5 Will Delay Interval (`0x18`): since issue #299 those wills are *held* instead
+of published at the close, so their burst lands **after** the rehome counter stops.
+`mqttd_pending_wills` is the gauge that shows it coming; the suppression window that
+covers both is "the roll plus your fleet's largest will delay"
+([OPERATIONS](OPERATIONS.md) has the per-client-shape table). The delayed will is not
+*cancelled* by the client reconnecting, because it reconnects on the group's owner and
+nothing there reaches the closing node's memory — that is 0009-P5, named and deferred.
+
+*A delayed will arrived much later than the client's Will Delay Interval.* Expected in
+two shapes, both bounded (issue #299). If the node that armed it **died, restarted or
+lost the session's lease**, the will is re-armed from the durable session record by the
+new holder's inherited-session scan — that scan runs eagerly (~1 s) inside a takeover
+window and otherwise on the 30 s reconcile cadence, so a will whose absolute deadline
+has already passed can land up to ~30 s late, plus inter-node clock skew. The deadline
+itself is absolute wall-clock, so a takeover does **not** restart the delay.
+`mqttd_wills_published_total{reason="inherited"}` is that path; `reason="delay-elapsed"`
+is the local one, which is honoured to the millisecond. If the will is *early* instead,
+that is a defect, not a tuning question: nothing may publish before the deadline. On the
+inherited path that now holds by construction — the persisted deadline is a whole epoch
+second **rounded up** from the arm instant and the remaining time is read back in
+milliseconds, so the round trip through the record can only ever add up to a second, never
+subtract one. It did subtract, in review: a will armed at 09:28:54.7408 with an 8 s delay
+was published 7.312 s later, 0.69 s early, because both halves of the arithmetic truncated
+and the truncations did not cancel.
+
+*A delayed will never arrived at all.* Three causes, in the order worth checking.
+**(1)** A new connection for the same client id opened inside the window — then this is
+correct, not a fault: `mqttd_wills_cancelled_total{reason="resumed"}`, `{reason="takeover"}`
+or `{reason="clean-start"}` moved, and each increment is one spurious device-offline event
+deliberately not sent. `clean-start` is worth knowing about, because it looks like a loss and
+is not: a Clean Start CONNECT for the same client id **discards** the session, and
+[MQTT-3.1.2-8] deletes the will with it — "unless … a new Network Connection for the
+ClientID is opened before the Will Delay Interval has elapsed" excepts the whole obligation,
+"or the Session ends" included. mqttd published that will until issue #299's closing round,
+which took the feature away from every client that reconnects clean.
+**(2)** The client asked for a delay but for **no session** — Session Expiry Interval 0
+or absent, which §3.1.2.11.2 clamps the delay to, so the will was published *immediately*
+at the disconnect (`reason="immediate"`) and you are looking for it in the wrong second.
+A client that wants a delay must also ask for a session that outlives its connection.
+**(3)** The arm was never persisted and the node then died: check
+`mqttd_pending_will_unpersisted_total{reason="not-owner"}` (structural after a rehome
+close — the closing node does not own the session's group) or `{reason="error"}`. That is
+residual R1, and it is the one shape in which the announcement is genuinely lost rather
+than late. Note the *wider* pre-existing case R1 does not cover: a will lives only in the
+hub's memory while its client is **connected**, so a node that dies with live clients
+loses their wills — before and after #299.
+
+*Persistent sessions and their queued messages disappeared after an upgrade — on a single
+node with `MQTTD_DATA_DIR`.* Expected once, and only once: on this build ADR 0009 §3 session
+expiry **works across a restart in that store shape**, and it did not before. The restarted
+node used to read back *no sessions at all* (the store's key enumeration had no
+implementation for this shape and returned an empty list), so persisted expiry deadlines
+never fired and offline sessions survived indefinitely. The first restart onto this build
+therefore reaps every offline session already past its deadline, and its offline queue with
+it — acked messages included. Confirm rather than guess: the boot scan logs one `WARN` per
+restart naming the count and the worst offenders, `DISCARDING offline sessions past their
+persisted Session Expiry deadline`, with `sessions=`, `oldest_overdue_s=` and `clients=`.
+If those client ids are the ones you are missing, this is the behaviour, not a fault — and
+their Session Expiry Intervals are what asked for it. Clustered durable deployments and the
+in-memory default are unaffected. [OPERATIONS](OPERATIONS.md#rolling-upgrades) has the
+pre-flight (start a node over a *copy* of the data dir to see what a restart would reap).
 
 **The failure forms to look for instead.**
 
