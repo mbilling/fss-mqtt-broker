@@ -84,6 +84,13 @@ jobs:
       # shows up in a `cargo test` result. Both are build failures now.
       - name: Test hygiene (no naked sleeps, no silent self-skips)
         run: python3 scripts/check-test-hygiene.py
+      # The gate's own rules, against fixtures. Every defect this gate shipped with was a
+      # BOUNDARY — a rule that fired on prose, a check that read its own source as evidence —
+      # and a boundary is invisible from the rule's code and obvious from an input it gets
+      # wrong. Each fixture is a pair: an input the rule must flag and the nearest one it must
+      # not. Runs before the gate itself would be trusted on real source.
+      - name: The hygiene gate's rules still draw the lines they document
+        run: python3 scripts/check-test-hygiene.py --self-test
 
   interop:
     name: foreign-client interop (mosquitto + paho)

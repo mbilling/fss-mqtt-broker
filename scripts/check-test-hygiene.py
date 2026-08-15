@@ -1720,115 +1720,145 @@ def check_shell() -> list[str]:
         if p.suffix == ".py":
             errs += check_py_gate(rel, src)
             continue
-        if any(f"{h}()" in src or f"{h} " in src for h in SH_HELPERS):
-            if SH_HELPER_TEXT not in src:
-                errs.append(
-                    f"{rel}: uses the CI-fatal skip helpers but its inlined "
-                    f"copy is not byte-identical to the canonical text in "
-                    f"scripts/check-test-hygiene.py (SH_HELPER_TEXT). One drifted copy is one "
-                    f"script where a skip is silent again."
-                )
-        code = sh_code(src)
-        raw_lines = code.splitlines()
-        src_lines = src.splitlines()
-        fns = enclosing_fns(raw_lines)
-        helpers = probe_fns(raw_lines, fns)
-        # A call to a probing helper IS a probe, at the call site: `have kubeconform || exit 0`.
-        probe_call = (
-            re.compile(r"(?:^|[|&;({!]|\bthen\b|\bif\b|\bdo\b)\s*(?:!\s*)?(?:%s)\b" % "|".join(sorted(map(re.escape, helpers))))
-            if helpers
-            else None
+        errs += check_sh_script(rel, src)
+    return errs
+
+
+def check_sh_script(rel: Path, src: str) -> list[str]:
+    """Every shell rule, against one script's text.
+
+    Split out from `check_shell` so `--self-test` can drive the rules with fixtures. A rule
+    that can only be exercised by committing a real script to the repository is a rule whose
+    boundaries nobody can check, which is how this gate came to have three defects of its own
+    (issue #260): the boundary cases are exactly what goes wrong, and they are exactly what a
+    fixture can state and a real script cannot.
+    """
+    errs: list[str] = []
+    if any(f"{h}()" in src or f"{h} " in src for h in SH_HELPERS):
+        if SH_HELPER_TEXT not in src:
+            errs.append(
+                f"{rel}: uses the CI-fatal skip helpers but its inlined "
+                f"copy is not byte-identical to the canonical text in "
+                f"scripts/check-test-hygiene.py (SH_HELPER_TEXT). One drifted copy is one "
+                f"script where a skip is silent again."
+            )
+    code = sh_code(src)
+    raw_lines = code.splitlines()
+    src_lines = src.splitlines()
+    fns = enclosing_fns(raw_lines)
+    helpers = probe_fns(raw_lines, fns)
+    # A call to a probing helper IS a probe, at the call site: `have kubeconform || exit 0`.
+    probe_call = (
+        re.compile(r"(?:^|[|&;({!]|\bthen\b|\bif\b|\bdo\b)\s*(?:!\s*)?(?:%s)\b" % "|".join(sorted(map(re.escape, helpers))))
+        if helpers
+        else None
+    )
+
+    # The sanctioned-success-exit rule. `exit 0` inside a function is a function's own
+    # success (`wait_ready`), not the script leaving; only top-level exits are gate exits.
+    last_code_line = max(
+        (i + 1 for i, ln in enumerate(raw_lines) if ln.strip()), default=0
+    )
+    for line, text in logical_lines(code):
+        if not SH_EXIT_OK.search(sh_unquoted(text)) or (
+            line - 1 < len(fns) and fns[line - 1] is not None
+        ):
+            continue
+        if line >= last_code_line:
+            continue  # the script's own final `exit 0`
+        window = "\n".join(raw_lines[max(0, line - 4) : line])
+        if any(h in window for h in SH_HELPERS):
+            continue  # a declared skip, fatal or permitted, said so immediately above
+        mark = next(
+            (
+                mk.group(1).strip()
+                for probe in range(max(0, line - 5), min(line, len(src_lines)))
+                if (mk := SH_NOT_A_SKIP_MARK.search(src_lines[probe]))
+            ),
+            None,
+        )
+        if mark is not None and len(mark) >= SH_MARK_MIN_CHARS:
+            continue
+        errs.append(
+            f"{rel}:{line}: this script leaves with a SUCCESS status before its end, and "
+            f"nothing says the checks ran. Whatever led here — a `command -v`, a helper that "
+            f"probes, an unset variable, a `uname` — a gate that exits 0 early is "
+            f"indistinguishable from one that passed, which is the whole of issue #260 in "
+            f"shell. Route it through `skip_or_fail` (fatal under CI) or `skip_permitted`, "
+            f"or, if this success is real, annotate the line "
+            f"`# NOT-A-SKIP: <why, {SH_MARK_MIN_CHARS}+ chars>`"
+            + (f" (found only {len(mark)} chars)" if mark is not None else "")
+            + "."
         )
 
-        # The sanctioned-success-exit rule. `exit 0` inside a function is a function's own
-        # success (`wait_ready`), not the script leaving; only top-level exits are gate exits.
-        last_code_line = max(
-            (i + 1 for i, ln in enumerate(raw_lines) if ln.strip()), default=0
+    reported: set[int] = set()
+    for line, text in logical_lines(code):
+        fn_of = fns[line - 1] if line - 1 < len(fns) else None
+        if fn_of in SH_HELPERS or any(f"{h} " in text for h in SH_HELPERS):
+            continue
+        # Any mention of skipping, anywhere on the line — not only at the start of an
+        # `echo`. The three spellings that got through were `|| { echo "…skipping…"; }`
+        # (an echo after `|| {`), a `note "skipping…"` wrapper, and an anchor-defeating
+        # mid-line echo. The mechanism, not the spelling, is what has to be covered.
+        probes = SH_PROBE.search(text) or (probe_call and probe_call.search(text))
+        announces = SH_ANNOUNCES.search(text) or probes
+        # …but a mention of skipping is only an ANNOUNCEMENT if the script then actually
+        # stops. `echo "building mqttd (set MQTTD_BIN to skip)…"` is prose about a
+        # configuration option, immediately followed by the build it describes — flagging
+        # it would train authors to reword honest messages to appease the gate, which is
+        # how a gate stops being read. Require a real exit/return within a few lines.
+        follows_with_stop = bool(
+            re.search(
+                r"\b(exit|return)\b",
+                "\n".join(code.splitlines()[line - 1 : line + 4]),
+            )
         )
-        for line, text in logical_lines(code):
-            if not SH_EXIT_OK.search(sh_unquoted(text)) or (
-                line - 1 < len(fns) and fns[line - 1] is not None
-            ):
-                continue
-            if line >= last_code_line:
-                continue  # the script's own final `exit 0`
-            window = "\n".join(raw_lines[max(0, line - 4) : line])
-            if any(h in window for h in SH_HELPERS):
-                continue  # a declared skip, fatal or permitted, said so immediately above
-            mark = next(
-                (
-                    mk.group(1).strip()
-                    for probe in range(max(0, line - 5), min(line, len(src_lines)))
-                    if (mk := SH_NOT_A_SKIP_MARK.search(src_lines[probe]))
-                ),
-                None,
-            )
-            if mark is not None and len(mark) >= SH_MARK_MIN_CHARS:
-                continue
+        if (
+            announces
+            and SH_SKIP.search(text)
+            and follows_with_stop
+            and not SH_NOT_A_SKIP.search(text)
+        ):
+            reported.add(line)
             errs.append(
-                f"{rel}:{line}: this script leaves with a SUCCESS status before its end, and "
-                f"nothing says the checks ran. Whatever led here — a `command -v`, a helper that "
-                f"probes, an unset variable, a `uname` — a gate that exits 0 early is "
-                f"indistinguishable from one that passed, which is the whole of issue #260 in "
-                f"shell. Route it through `skip_or_fail` (fatal under CI) or `skip_permitted`, "
-                f"or, if this success is real, annotate the line "
-                f"`# NOT-A-SKIP: <why, {SH_MARK_MIN_CHARS}+ chars>`"
-                + (f" (found only {len(mark)} chars)" if mark is not None else "")
-                + "."
+                f"{rel}:{line}: announces a skip outside the sanctioned helpers. Use "
+                f"`skip_or_fail \"<reason>\"` (fatal when CI=true) or, for a lane that is "
+                f"legitimately unrunnable in CI by design, `skip_permitted \"<reason>\"` — "
+                f"so a skip is either impossible in CI or a deliberate, named exception."
             )
-
-        reported: set[int] = set()
-        for line, text in logical_lines(code):
-            fn_of = fns[line - 1] if line - 1 < len(fns) else None
-            if fn_of in SH_HELPERS or any(f"{h} " in text for h in SH_HELPERS):
-                continue
-            # Any mention of skipping, anywhere on the line — not only at the start of an
-            # `echo`. The three spellings that got through were `|| { echo "…skipping…"; }`
-            # (an echo after `|| {`), a `note "skipping…"` wrapper, and an anchor-defeating
-            # mid-line echo. The mechanism, not the spelling, is what has to be covered.
-            probes = SH_PROBE.search(text) or (probe_call and probe_call.search(text))
-            announces = SH_ANNOUNCES.search(text) or probes
-            if announces and SH_SKIP.search(text) and not SH_NOT_A_SKIP.search(text):
-                reported.add(line)
-                errs.append(
-                    f"{rel}:{line}: announces a skip outside the sanctioned helpers. Use "
-                    f"`skip_or_fail \"<reason>\"` (fatal when CI=true) or, for a lane that is "
-                    f"legitimately unrunnable in CI by design, `skip_permitted \"<reason>\"` — "
-                    f"so a skip is either impossible in CI or a deliberate, named exception."
-                )
-            elif probes and SH_SILENT_OK.search(text):
-                reported.add(line)
-                errs.append(
-                    f"{rel}:{line}: a capability probe leaves with a SUCCESS status and no "
-                    f"message at all (`|| exit 0`) — the one vacuous CI pass no message rule "
-                    f"can ever see, because there is no message. Route it through "
-                    f"`skip_or_fail`/`skip_permitted`, which say what did not run and which is "
-                    f"fatal under CI."
-                )
-        # A probe on one line and a silent success exit a few lines below, with nothing in
-        # between saying so: the multi-line spelling of the same thing.
-        multi = (
-            re.compile(f"{SH_PROBE.pattern}|{probe_call.pattern}") if probe_call else SH_PROBE
+        elif probes and SH_SILENT_OK.search(text):
+            reported.add(line)
+            errs.append(
+                f"{rel}:{line}: a capability probe leaves with a SUCCESS status and no "
+                f"message at all (`|| exit 0`) — the one vacuous CI pass no message rule "
+                f"can ever see, because there is no message. Route it through "
+                f"`skip_or_fail`/`skip_permitted`, which say what did not run and which is "
+                f"fatal under CI."
+            )
+    # A probe on one line and a silent success exit a few lines below, with nothing in
+    # between saying so: the multi-line spelling of the same thing.
+    multi = (
+        re.compile(f"{SH_PROBE.pattern}|{probe_call.pattern}") if probe_call else SH_PROBE
+    )
+    for m in multi.finditer(code):
+        start = code[: m.start()].count("\n")
+        if start + 1 in reported:
+            continue
+        window = raw_lines[start : start + 6]
+        if not any(SH_SILENT_OK.search(w) for w in window):
+            continue
+        upto = "\n".join(window[: 1 + next(i for i, w in enumerate(window) if SH_SILENT_OK.search(w))])
+        if any(h in upto for h in SH_HELPERS) or (
+            start < len(fns) and fns[start] in SH_HELPERS
+        ):
+            continue
+        if SH_SKIP.search(upto):
+            continue  # already reported above by the message rule
+        errs.append(
+            f"{rel}:{start + 1}: a capability probe here reaches `exit 0`/`return 0` "
+            f"within {len(window)} lines without announcing anything — a silent green "
+            f"pass for a check that did not run. Use `skip_or_fail`/`skip_permitted`."
         )
-        for m in multi.finditer(code):
-            start = code[: m.start()].count("\n")
-            if start + 1 in reported:
-                continue
-            window = raw_lines[start : start + 6]
-            if not any(SH_SILENT_OK.search(w) for w in window):
-                continue
-            upto = "\n".join(window[: 1 + next(i for i, w in enumerate(window) if SH_SILENT_OK.search(w))])
-            if any(h in upto for h in SH_HELPERS) or (
-                start < len(fns) and fns[start] in SH_HELPERS
-            ):
-                continue
-            if SH_SKIP.search(upto):
-                continue  # already reported above by the message rule
-            errs.append(
-                f"{rel}:{start + 1}: a capability probe here reaches `exit 0`/`return 0` "
-                f"within {len(window)} lines without announcing anything — a silent green "
-                f"pass for a check that did not run. Use `skip_or_fail`/`skip_permitted`."
-            )
     return errs
 
 
@@ -2607,9 +2637,114 @@ def check_results(only: str | None, log_path: str | None) -> list[str]:
 # --------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------------
+# The gate's own tests.
+#
+# This gate shipped with three defects of its own (issue #260), and every one was a BOUNDARY:
+# a rule that fired on prose it should have ignored, a check whose evidence was its own source
+# line, a wiring assertion that `cargo fmt` silently broke. None of them were visible from the
+# rule's code — they were visible only from an input the rule got wrong. So each rule here is
+# pinned by a pair: an input it MUST flag, and the nearest input it must NOT. The pair is the
+# test. A rule with only positive fixtures passes by firing on everything.
+FIXTURES: list[tuple[str, str, str, bool, str]] = [
+    # (rule, name, source, should_flag, why this input is the boundary)
+    (
+        "sh-announce",
+        "an announced skip that stops",
+        'if ! command -v cosign >/dev/null; then\n  echo "skipping: no cosign"\n  exit 0\nfi\n',
+        True,
+        "announces and then stops: the coverage is gone and the script reports success",
+    ),
+    (
+        "sh-announce",
+        "prose about a build option",
+        'echo "building mqttd (set MQTTD_BIN to skip)…"\ncargo build --quiet -p mqttd\n'
+        'MQTTD_BIN="target/debug/mqttd"\n',
+        False,
+        "the word `skip` names an env var, and the next line does the work it describes — "
+        "flagging this teaches authors to reword honest messages, which is how a gate stops "
+        "being read",
+    ),
+    (
+        "sh-announce",
+        "a skip mentioned in a comment about the rule itself",
+        '# this lane cannot be skipped: it gates merges\nrun_the_lane\n',
+        False,
+        "prose that mentions skipping in order to deny it",
+    ),
+]
+
+RUST_FIXTURES: list[tuple[str, str, bool, str]] = [
+    (
+        "a bare early return with no loop",
+        "#[test]\nfn t() {\n    if !have_it() { return; }\n    assert!(check());\n}\n",
+        True,
+        "returns success having asserted nothing — the exact silent-coverage-loss shape",
+    ),
+    (
+        "a poll whose exhaustion panics",
+        "#[test]\nfn t() {\n    for _ in 0..50 {\n        if ready() { return; }\n    }\n"
+        '    panic!("never became ready");\n}\n',
+        False,
+        "the `return` is a success exit only because falling out of the loop diverges "
+        "unconditionally; this is the sanctioned poll",
+    ),
+    (
+        "a poll whose exhaustion merely asserts a truth",
+        "#[test]\nfn t() {\n    for _ in 0..50 {\n        if ready() { return; }\n    }\n"
+        "    assert!(1 == 1);\n}\n",
+        True,
+        "adjacency is not loudness: a trailing assertion that cannot fail lets the loop finish "
+        "and the test pass having done nothing — the fig leaf B1 was tightened to reject",
+    ),
+]
+
+
+def self_test() -> list[str]:
+    """Run every fixture. Returns the failures, each naming the boundary it lost."""
+    import tempfile
+
+    bad: list[str] = []
+    for rule, name, src, should, why in FIXTURES:
+        got = check_sh_script(Path(f"fixture/{rule}.sh"), "#!/usr/bin/env bash\n" + src)
+        flagged = bool(got)
+        if flagged != should:
+            bad.append(
+                f"{rule}: {name!r} was {'not flagged' if should else 'flagged'} but must be "
+                f"{'flagged' if should else 'left alone'} — {why}"
+                + (f"\n      the gate said: {got[0]}" if got else "")
+            )
+
+    # Under ROOT, because `parse` derives a file's repo-relative name and a fixture outside the
+    # tree has none. `target/` is not scanned, so a fixture cannot be mistaken for real source.
+    scratch = ROOT / "target"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch, prefix="hygiene-fixtures-") as td:
+        for name, src, should, why in RUST_FIXTURES:
+            f = Path(td) / "fixture.rs"
+            f.write_text(src, encoding="utf-8")
+            rf = parse(f)
+            # `/tests/` in the path is what makes B1 look at all: `is_test_code` scopes the
+            # rule to test code so production timers stay out of it. A fixture that forgets this
+            # is silently never examined, and every negative fixture would "pass".
+            rf.rel = "crates/fixture/tests/fixture.rs"
+            got = check_b([rf])
+            flagged = bool(got)
+            if flagged != should:
+                bad.append(
+                    f"B1: {name!r} was {'not flagged' if should else 'flagged'} but must be "
+                    f"{'flagged' if should else 'left alone'} — {why}"
+                    + (f"\n      the gate said: {got[0]}" if got else "")
+                )
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--audit", action="store_true", help="print every wait site and class")
+    ap.add_argument(
+        "--self-test", action="store_true", help="check this gate's own rules against fixtures"
+    )
     ap.add_argument("--write", action="store_true", help="regenerate the (b) census")
     ap.add_argument(
         "--write-inventory", action="store_true", help="regenerate docs/test-inventory.md"
@@ -2631,6 +2766,21 @@ def main() -> int:
         "--only", choices=sorted(WORKSPACES), help="restrict --*-inventory to one workspace"
     )
     args = ap.parse_args()
+
+    if args.self_test:
+        bad = self_test()
+        for b in bad:
+            print(f"  FAIL {b}", file=sys.stderr)
+        n = len(FIXTURES) + len(RUST_FIXTURES)
+        if bad:
+            print(
+                f"\ncheck-test-hygiene --self-test: {len(bad)} of {n} fixture(s) failed — a rule "
+                f"of this gate no longer draws the line where it is documented to.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"check-test-hygiene --self-test: OK — {n} fixtures, each a should-flag/must-not pair.")
+        return 0
 
     if args.check_results is not None:
         recorded = (

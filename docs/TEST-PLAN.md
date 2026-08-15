@@ -468,6 +468,19 @@ below before trusting a row further down.** Every one of these was found by an a
 the source and told to get a vacuous test past the gate, and each is recorded with what
 actually changed:
 
+- **The gate's rules had no tests, and one of them fired on prose.** The shell
+  skip-announcement rule flagged `echo "building mqttd (set MQTTD_BIN to skip)…"` in
+  `scripts/interop/paho-testing.sh` — a message about an environment variable, on a line
+  immediately followed by the build it describes. A gate that flags honest text teaches authors
+  to reword messages until it stops complaining, which is worse than not having the rule: the
+  script gets quieter and the gate gets ignored. The rule now requires the announcement to be
+  followed by an actual stop (`exit`/`return` within five lines), and — the larger change —
+  `--self-test` pins every rule with FIXTURE PAIRS: an input it must flag and the nearest input
+  it must not. Every defect this gate has shipped was a boundary, and a boundary is invisible
+  from the rule's code and obvious from an input it gets wrong. **What that still cannot see:** a
+  script that announces a skip and then stops by a mechanism other than `exit`/`return` — falling
+  off the end of a `set -e` script after a failed command, say — is not flagged, and the fixtures
+  cover the rules that exist rather than the rules that are missing.
 - **`--check-results` could not have passed in CI at all.** It anchors on `^\s+Running`, and
   `.github/workflows/ci.yml` sets `CARGO_TERM_COLOR: always` at file scope, so the tee'd log
   carries SGR escapes and every anchored pattern matched nothing — the flagship mechanism would
