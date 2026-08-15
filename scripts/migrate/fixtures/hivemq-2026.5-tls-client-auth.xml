@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<!--
+  FIXTURE PROVENANCE — VERBATIM VENDOR CONFIGURATION. Do not edit the body.
+
+  This file is one file from HiveMQ Community Edition, byte for byte, fetched 2026-08-14
+  from https://github.com/hivemq/hivemq-community-edition at tag 2026.5:
+    src/distribution/conf/examples/configuration/tls/config-sample-mqtt-tls-client-auth.xml
+  Nothing was added, removed, reworded, reformatted or revalued — the vendor's own
+  Apache-2.0 licence header and its inline comments are intact, because that is what an
+  operator's real file looks like. The only edit is the position of THIS comment: an XML
+  declaration must be the first thing in a document, so the vendor's `<?xml ...?>` line
+  stays on line 1 and this block sits immediately after it.
+
+  Re-checkable byte for byte, with no trust in this sentence. The vendor file is 1382
+  bytes, sha256:72f561d63b06553329c3ce53b6a5a98dda4dc77e9c87df35e67001cc895afac7, and
+  this file reproduces it exactly once the provenance comment is removed: line 1, plus
+  everything from the line that opens the vendor's own licence comment.
+    F=hivemq-2026.5-tls-client-auth.xml
+    { head -1 $F; sed -n '/^-[-]>$/,$p' $F | tail -n +2; } | shasum -a 256
+    curl -sS https://raw.githubusercontent.com/hivemq/hivemq-community-edition/2026.5/src/distribution/conf/examples/configuration/tls/config-sample-mqtt-tls-client-auth.xml | shasum -a 256
+  Both printed 72f561d63b065533… on 2026-08-14, re-run that day by a docs pass that also
+  re-fetched the file and diffed it. (The bracket in that sed pattern is only there
+  because an XML comment may not contain two consecutive hyphens.) Note the path: these
+  samples live under src/distribution/conf/examples/, not conf/examples/ — an earlier
+  draft of the docs cited the shorter form, which 404s.
+
+  It also validates against the vendor's own schema at the same tag,
+  src/main/resources/config.xsd, checked with xmllint's noout and schema flags: it
+  reports "validates".
+
+  WHY IT EXISTS: it is the vendor's own mTLS example, and it is the one shipped file
+  that takes the POSITIVE branch of the client-authentication-mode mapping —
+  <client-authentication-mode>REQUIRED</client-authentication-mode> with a truststore.
+  Without it, every test of that mapping would run on input this repository composed,
+  which proves the code works on our own example and nothing about the vendor's.
+
+  NO LIVE HiveMQ BROKER WAS RUN to produce this file. It is vendor SOURCE, fetched from
+  the vendor's repository — not a config dumped out of a running broker.
+-->
+<!--
+  ~ Copyright 2019-present HiveMQ GmbH
+  ~
+  ~ Licensed under the Apache License, Version 2.0 (the "License");
+  ~ you may not use this file except in compliance with the License.
+  ~ You may obtain a copy of the License at
+  ~
+  ~     http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+
+<hivemq>
+    <listeners>
+        <tls-tcp-listener>
+            <port>8883</port>
+            <bind-address>0.0.0.0</bind-address>
+            <tls>
+                <keystore>
+                    <path>/path/to/the/key/store.jks</path>
+                    <password>password-keystore</password>
+                    <private-key-password>password-key</private-key-password>
+                </keystore>
+                <truststore>
+                    <path>/path/to/the/trust/store.jks</path>
+                    <password>password-truststore</password>
+                </truststore>
+                <client-authentication-mode>REQUIRED</client-authentication-mode>
+            </tls>
+        </tls-tcp-listener>
+    </listeners>
+</hivemq>

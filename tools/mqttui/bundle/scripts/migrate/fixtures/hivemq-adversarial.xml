@@ -1,0 +1,125 @@
+<?xml version="1.0"?>
+<!--
+  FIXTURE PROVENANCE — an ADVERSARIAL fixture, written for this repository.
+
+  Unlike hivemq-2026.5-config.xml this is NOT vendor-shipped configuration. It was
+  written on 2026-08-14 to prove the properties the converter's contract rests on.
+  Element names that DO exist are spelled as HiveMQ CE 2026.5's config.xsd spells
+  them (https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/resources/config.xsd);
+  the Enterprise-only names are spelled from the vendor's published documentation,
+  and the rest are deliberately invented, which is the point.
+
+  What each block proves:
+   1. UNKNOWN ELEMENTS — <invented-element>, <mqtt><no-such-thing> : each must become
+      a TODO(migrate) naming its full element PATH, never a silent drop, never a crash.
+   2. ENTERPRISE / EXTENSION CONSTRUCTS with no mqttd equivalent — <cluster>,
+      <control-center>, <license>, <extensions>, <ese>, <bridge>: HiveMQ Enterprise's
+      schema is not open source, so these are recognised by NAME and reported. This is
+      the honest handling and it must produce a TODO for every one.
+   3. SECURITY-POSTURE TRAPS — client-authentication-mode OPTIONAL (mqttd has no
+      cert-optional mode, so client_ca must be emitted COMMENTED OUT), a second
+      tcp-listener (one bind per protocol), a <protocols> list admitting TLSv1.2, and
+      persistence in-memory.
+
+  NO LIVE HiveMQ BROKER WAS RUN to produce this file. See also
+  hivemq-empty.xml (an empty document) and the malformed-XML case, which the fixture
+  test builds inline.
+-->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+        <tcp-listener>
+            <port>11883</port>
+            <bind-address>127.0.0.1</bind-address>
+        </tcp-listener>
+        <tls-tcp-listener>
+            <port>8883</port>
+            <bind-address>0.0.0.0</bind-address>
+            <tls>
+                <keystore>
+                    <path>/opt/hivemq/conf/keystore.jks</path>
+                    <password>secret</password>
+                    <private-key-password>secret</private-key-password>
+                </keystore>
+                <truststore>
+                    <path>/opt/hivemq/conf/truststore.jks</path>
+                    <password>secret</password>
+                </truststore>
+                <!-- The trap: a client MAY present a certificate. mqttd's client_ca
+                     MANDATES one, so this must NOT be mapped. -->
+                <client-authentication-mode>OPTIONAL</client-authentication-mode>
+                <protocols>
+                    <protocol>TLSv1.3</protocol>
+                    <protocol>TLSv1.2</protocol>
+                </protocols>
+                <cipher-suites>
+                    <cipher-suite>TLS_AES_256_GCM_SHA384</cipher-suite>
+                </cipher-suites>
+                <prefer-server-cipher-suites>true</prefer-server-cipher-suites>
+                <handshake-timeout>10000</handshake-timeout>
+            </tls>
+        </tls-tcp-listener>
+        <!-- A transport mqttd does not have. -->
+        <mqtt-sn-listener>
+            <port>1884</port>
+        </mqtt-sn-listener>
+    </listeners>
+    <mqtt>
+        <packets>
+            <max-packet-size>1048576</max-packet-size>
+        </packets>
+        <!-- Unknown element: must be reported by path. -->
+        <no-such-thing>
+            <deeper>42</deeper>
+        </no-such-thing>
+        <queued-messages>
+            <max-queue-size>500</max-queue-size>
+            <strategy>discard-oldest</strategy>
+        </queued-messages>
+    </mqtt>
+    <persistence>
+        <mode>in-memory</mode>
+    </persistence>
+    <!-- HiveMQ ENTERPRISE / extension constructs. None of these can be translated. -->
+    <cluster>
+        <enabled>true</enabled>
+        <transport>
+            <tcp>
+                <bind-address>10.0.0.1</bind-address>
+                <bind-port>8000</bind-port>
+            </tcp>
+        </transport>
+        <discovery>
+            <static>
+                <node><host>10.0.0.2</host><port>8000</port></node>
+            </static>
+        </discovery>
+        <replication><replica-count>2</replica-count></replication>
+    </cluster>
+    <control-center>
+        <listeners><http><port>8080</port></http></listeners>
+    </control-center>
+    <license>
+        <path>/opt/hivemq/license/hivemq.lic</path>
+    </license>
+    <extensions>
+        <extension><id>hivemq-allow-all-extension</id><enabled>true</enabled></extension>
+    </extensions>
+    <ese>
+        <realms><ldap-realm><name>corp</name></ldap-realm></realms>
+    </ese>
+    <bridge>
+        <name>to-cloud</name>
+        <remote-broker><host>cloud.example</host><port>8883</port></remote-broker>
+    </bridge>
+    <overload-protection>
+        <enabled>true</enabled>
+    </overload-protection>
+    <!-- An element that exists in no HiveMQ version. -->
+    <invented-element>
+        <some-key>some value</some-key>
+    </invented-element>
+</hivemq>

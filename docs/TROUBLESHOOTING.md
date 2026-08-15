@@ -56,8 +56,8 @@ nothing and there is no obvious failure.
   made (README): a v3.1.1 **retained** publish under brownout or over the retained quota
   is acked and delivered live but its retained *value* is not stored, and the offline
   queue's overflow policy (default `drop-oldest`) truncates already-acked entries at the
-  cap — check `publish_dropped{reason="queue-overflow"}` and
-  `quota_rejections_total{reason="retained"}`.
+  cap — check `mqttd_publish_dropped_total{reason="queue-overflow"}` and
+  `mqttd_quota_rejections_total{reason="retained"}`.
 
 ## Publishes are refused (`0x97`) or the connection closes without a PUBACK
 
@@ -85,13 +85,20 @@ not).
 - **Remedy:** expand the disk / raise the watermark / prune retained topics / let
   subscribers drain their queues. Brownout refuses only *growth*, so consumption, deletes
   and expiry shrink the store until the edge lifts on its own.
+  **If a migration bridge is running, prune retained state with the bridge UP and then check
+  both sides.** The bridge re-syncs retained values in **both** directions on every
+  reconnect, so a value pruned while it is down is resurrected from the other broker with no
+  log line attributing it — you delete the stale config, see it gone, and it comes back.
+  [OPERATIONS](OPERATIONS.md) ("That retained sync has a hazard") states the position; the same
+  caveat is on every other "prune retained" instruction in the tree, and this page is the one
+  you land on from a brownout alert, i.e. exactly mid-cutover.
 - **Also possible: the retained quota.** `MQTTD_MAX_RETAINED_MESSAGES` answers a v5
   retained publish creating a *new* topic with the same `0x97`. For **v3.1.1 retained**
   publishes, note that both the quota *and* brownout keep the plain PUBACK when no durable
   enqueue is owed (delivered live, not retained) — so a plain PUBACK does **not** rule
   brownout out. A *close* with no PUBACK points at brownout's durable-enqueue refusal; to
   discriminate, read `mqttd_brownout{axis}` and the counters —
-  `quota_rejections_total{reason="retained"}` (retained growth, quota or brownout) vs
+  `mqttd_quota_rejections_total{reason="retained"}` (retained growth, quota or brownout) vs
   `{reason="brownout-publish"}` (a refused durable enqueue).
 
 ## The broker disconnects a client a few seconds after a node roll

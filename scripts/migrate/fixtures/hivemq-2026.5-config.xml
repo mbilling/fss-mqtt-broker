@@ -1,0 +1,158 @@
+<?xml version="1.0"?>
+<!--
+  FIXTURE PROVENANCE — COMPOSED (a merge of vendor parts, not any single shipped file).
+  Read this before changing a line.
+
+  For a fixture that IS a single vendor file, byte for byte, see
+  hivemq-2026.5-default-config.xml and hivemq-2026.5-tls-client-auth.xml. This one is a
+  MERGE, because a HiveMQ config.xml holds one <listeners>, one <mqtt> and one
+  <restrictions> while the vendor ships those in separate sample files — so exercising
+  the whole mapping surface in one document requires composition, and composition is a
+  claim that has to be spelled out rather than called "verbatim".
+
+  Re-fetched and diffed 2026-08-14 against HiveMQ Community Edition at tag 2026.5,
+  https://github.com/hivemq/hivemq-community-edition:
+
+  VERBATIM PARTS — element for element and value for value as the vendor ships them.
+  Nothing but comments was dropped: each part's Apache-2.0 licence header, and the
+  vendor's inline explanatory comments inside <mqtt> and <restrictions> ("256 MB",
+  "-1 = unlimited", and so on), both for length. Re-verified 2026-08-14 by parsing this
+  file and each cited vendor file and comparing every leaf path and value: equal.
+    <listeners><tcp-listener> + <websocket-listener>
+        src/distribution/conf/examples/configuration/config-sample-tcp-and-websockets.xml
+    <listeners><tls-tcp-listener>
+        src/distribution/conf/examples/configuration/tls/config-sample-mqtt-tls-client-auth.xml
+    <mqtt> (all twelve of its child blocks, in the vendor's order)
+        src/distribution/conf/examples/configuration/config-sample-mqtt.xml
+    <restrictions>
+        src/distribution/conf/examples/configuration/other/config-restrictions.xml
+    <anonymous-usage-statistics>
+        src/main/resources/config.xml   (the default config.xml a CE install ships)
+
+  COMPOSED PARTS — written here, from the shipped src/main/resources/config.xsd's
+  element set and its documented defaults at the same tag. The vendor ships no example
+  file containing either block, so no value here can be attributed to one:
+    <security>      four toggles, each at the XSD's documented default
+                    (payload-format-validation false, utf8-validation true,
+                    allow-empty-client-id true, allow-request-problem-information true)
+    <persistence>   <mode>file</mode>, the XSD's declared default
+
+  Corrected 2026-08-14: the <security> children were previously written flat
+  (<utf8-validation>true</utf8-validation>). The XSD declares each of them as a complex
+  type whose only child is <enabled>, so the flat form is not schema-valid and no real
+  HiveMQ config could contain it. They now carry <enabled>, which is also the shape a
+  live config.xml has. (The converter reports either form identically — it reports the
+  parent element path — so this is a fixture-fidelity fix, not a converter fix.)
+
+  Versioning note carried into the docs: HiveMQ CE is CALENDAR-versioned (2023.x …
+  2026.5); "HiveMQ 4.x" now names the Enterprise line and the extension SDK.
+
+  Schema-checked, which is the point of composing it from the XSD rather than from
+  imagination: this file validates against src/main/resources/config.xsd at tag 2026.5
+  (xmllint, noout and schema flags → "validates"), as do the two verbatim vendor
+  fixtures beside it and hivemq-multi-tls.xml.
+
+  NO LIVE HiveMQ BROKER WAS RUN to produce this file, and no ground-truth config from
+  one was used. HiveMQ Enterprise's config schema is not open source — nothing here
+  came from it.
+-->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+        <websocket-listener>
+            <port>8000</port>
+            <bind-address>0.0.0.0</bind-address>
+            <path>/mqtt</path>
+            <subprotocols>
+                <subprotocol>mqttv3.1</subprotocol>
+                <subprotocol>mqtt</subprotocol>
+            </subprotocols>
+            <allow-extensions>true</allow-extensions>
+        </websocket-listener>
+        <tls-tcp-listener>
+            <port>8883</port>
+            <bind-address>0.0.0.0</bind-address>
+            <tls>
+                <keystore>
+                    <path>/path/to/the/key/store.jks</path>
+                    <password>password-keystore</password>
+                    <private-key-password>password-key</private-key-password>
+                </keystore>
+                <truststore>
+                    <path>/path/to/the/trust/store.jks</path>
+                    <password>password-truststore</password>
+                </truststore>
+                <client-authentication-mode>REQUIRED</client-authentication-mode>
+            </tls>
+        </tls-tcp-listener>
+    </listeners>
+    <mqtt>
+        <queued-messages>
+            <max-queue-size>1000</max-queue-size>
+            <strategy>discard</strategy>
+        </queued-messages>
+        <topic-alias>
+            <enabled>true</enabled>
+            <max-per-client>5</max-per-client>
+        </topic-alias>
+        <message-expiry>
+            <max-interval>4294967296</max-interval>
+        </message-expiry>
+        <session-expiry>
+            <max-interval>4294967295</max-interval>
+        </session-expiry>
+        <keep-alive>
+            <allow-unlimited>true</allow-unlimited>
+            <max-keep-alive>65535</max-keep-alive>
+        </keep-alive>
+        <packets>
+            <max-packet-size>268435460</max-packet-size>
+        </packets>
+        <receive-maximum>
+            <server-receive-maximum>10</server-receive-maximum>
+        </receive-maximum>
+        <quality-of-service>
+            <max-qos>2</max-qos>
+        </quality-of-service>
+        <wildcard-subscriptions>
+            <enabled>true</enabled>
+        </wildcard-subscriptions>
+        <shared-subscriptions>
+            <enabled>true</enabled>
+        </shared-subscriptions>
+        <subscription-identifier>
+            <enabled>true</enabled>
+        </subscription-identifier>
+        <retained-messages>
+            <enabled>true</enabled>
+        </retained-messages>
+    </mqtt>
+    <restrictions>
+        <max-connections>-1</max-connections>
+        <max-client-id-length>65535</max-client-id-length>
+        <incoming-bandwidth-throttling>0</incoming-bandwidth-throttling>
+    </restrictions>
+    <security>
+        <allow-empty-client-id>
+            <enabled>true</enabled>
+        </allow-empty-client-id>
+        <payload-format-validation>
+            <enabled>false</enabled>
+        </payload-format-validation>
+        <utf8-validation>
+            <enabled>true</enabled>
+        </utf8-validation>
+        <allow-request-problem-information>
+            <enabled>true</enabled>
+        </allow-request-problem-information>
+    </security>
+    <persistence>
+        <mode>file</mode>
+    </persistence>
+    <anonymous-usage-statistics>
+        <enabled>true</enabled>
+    </anonymous-usage-statistics>
+</hivemq>
