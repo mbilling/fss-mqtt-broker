@@ -28,7 +28,7 @@ test functions.
 | Cluster (routing, SWIM, placement, relocation) | `cluster`, `swim_routing`, `swim_cluster` |
 | Cluster fault injection | `cluster_chaos`, `cluster_stress`, `cluster_proc`, `cluster_soak` |
 | Transports | `ws`, `quic`, `tls` |
-| Bridge | `mqtt-bridge/tests/{client,engine}` |
+| Bridge, incl. **loop prevention across real topologies** | `mqtt-bridge/tests/{client,engine}` |
 
 ### The fact that shapes this plan
 
@@ -234,6 +234,28 @@ The third is the instructive one: filter *validity* is invisible at the matching
 layer, because `topic_matches` returns false for a malformed filter exactly as it
 does for a valid filter with no traffic. Only a test that asserts the **refusal**
 can see it.
+
+## Bridge loop prevention — which layer catches which shape
+
+Three defences run at once, and they are **not** interchangeable. Testing one does not
+test the others, which is why `mqtt-bridge/tests/engine.rs` now covers each shape
+separately:
+
+| Defence | Catches | Blind to | Pinned by |
+|---|---|---|---|
+| **No Local** (every bridge subscription sets it) | The single-broker echo, including a remap ping-pong written as two individually-legal one-way rules — config validation cannot see that one | Any cycle through more than one broker: each hop is a *different* client, so the broker has nothing to suppress on | `a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local` |
+| **Hop count** (`fss-bridge-hop-count`) | The multi-broker cycle — the shape No Local cannot see. It is the *only* defence there | A publisher that stamps the property itself (client-settable; ADR 0025 risk E, issue #191) | `a_three_broker_ring_is_terminated_by_the_hop_counter`, `hop_count_increments_along_a_chain` |
+| **Direction** (`plan_forwards`) | Upstream→upstream: hub-and-spoke is structural, never routed | — | existing one-way leak tests |
+
+The ring test is the one that matters most: before it, the hop counter's only real job —
+terminating a cycle No Local is blind to — had never been exercised end to end. The
+pre-existing test pre-stamps a message *already at* the limit and checks the counter moved,
+which does not prove a cycle terminates.
+
+Termination is asserted by **quiescence**: an uncut ring would keep feeding the drain, so
+reaching silence at all is the proof, and the delivery count says how far it got first.
+Raising `hop_count_limit` from 3 to 200 makes the ring amplify to ~266 deliveries and the
+test fail — so it is load-bearing, not decorative.
 
 ## Policy register
 
