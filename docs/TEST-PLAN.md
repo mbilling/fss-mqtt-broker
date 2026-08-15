@@ -273,6 +273,27 @@ statements; this register covers the choices, not the requirements.)
 | `$SYS` topic tree | **Not implemented.** `$SYS` appears only as something the bridge refuses to bridge (`mqtt-bridge/src/config.rs`) | — |
 | Denied publish | Still ACKed, then dropped (no information leak about ACL shape) | `acl`, `audit` |
 | Offline-queue overflow | Drop-oldest, bounded | `resource_limits` |
+| Subscription Identifiers | **Not implemented**, and said so: every v5 CONNACK carries `SubscriptionIdentifierAvailable = 0`, which §3.2.2.3.12 requires of a server that lacks them, and a SUBSCRIBE that uses one is refused `0xA1` rather than silently degraded (issue #245) | `conn::v5_connack_advertises_subscription_identifiers_unavailable`, `interop-paho` |
+| Server Keep Alive | **No cap.** The client's requested keep alive is used verbatim and the property is never sent. §3.2.2.3.14 makes it optional — a server sends it only to override — so declining is conformant | `interop-paho-testing` (declared) |
+
+## The independent oracle — `paho.mqtt.testing`
+
+Everything above is checked by tests that share this implementation's reading of the
+spec. `scripts/interop/paho-testing.sh` runs Eclipse's own MQTT 5 conformance suite at a
+pinned commit against the real binary — written against a reference broker by people who
+never saw this code, so its verdict is evidence in a way our own green suite is not.
+
+**27 tests; 22 pass.** The five that do not are declared in the script with reasons, and
+the script fails *both* ways — on an undeclared failure, and on a declared failure that
+starts passing — so the list cannot decay into an ignore list.
+
+| Test | Verdict |
+|---|---|
+| `test_session_expiry` | **Real deviation** ([#298](https://github.com/mbilling/fss-mqtt-broker/issues/298)): a DISCONNECT's Session Expiry Interval must override the CONNECT's [MQTT-3.14.2.2.2]; `conn.rs`'s DISCONNECT arm reads only the reason and drops the properties |
+| `test_will_delay` | **Real gap** ([#299](https://github.com/mbilling/fss-mqtt-broker/issues/299)): Will Delay Interval is decoded but never honoured — the Will fired at 0.1 s where the suite expects 4 s [MQTT-3.1.3.2.2] |
+| `test_subscribe_identifiers` | Legal difference — see the register row above; the suite assumes support without reading the advertisement |
+| `test_server_keep_alive` | Legal difference — the suite asserts its reference broker's 60 s cap, not a spec requirement |
+| `test_subscribe_failure` | Suite configuration we decline. Answering it needs an ACL denying `test/nosubscribe`, but our deny rules match by filter **overlap**, so that also denies the suite's own `cleanRetained()` subscription to `#` — retained state then leaks between tests and five unrelated ones fail (measured: 9 failures with the ACL, 4 without). Both behaviours are correct and simply incompatible; the SUBACK-failure path is covered directly in `crates/mqttd/tests` |
 
 ## Conventions
 
