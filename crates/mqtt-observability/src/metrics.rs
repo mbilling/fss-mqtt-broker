@@ -124,6 +124,7 @@ struct OtelInstruments {
     replication_min_actual: OtelGauge<i64>,
     replication_write_floor: OtelGauge<i64>,
     retained_tombstones: OtelGauge<i64>,
+    misplaced_sessions: OtelGauge<i64>,
     members: OtelGauge<i64>,
     lease_leader: OtelGauge<i64>,
     lease_epoch: OtelGauge<i64>,
@@ -135,6 +136,8 @@ struct OtelInstruments {
     gossip_rejected: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
     revocation_evictions: OtelCounter<u64>,
+    session_rehomes: OtelCounter<u64>,
+    session_expiry_unpersisted: OtelCounter<u64>,
     admission_rejected: OtelCounter<u64>,
     quota_rejections: OtelCounter<u64>,
     store_bytes: OtelGauge<i64>,
@@ -186,6 +189,7 @@ impl OtelInstruments {
             replication_min_actual: meter.i64_gauge("replication_min_actual").build(),
             replication_write_floor: meter.i64_gauge("replication_write_floor").build(),
             retained_tombstones: meter.i64_gauge("retained_tombstones").build(),
+            misplaced_sessions: meter.i64_gauge("misplaced_sessions").build(),
             members: meter.i64_gauge("members").build(),
             lease_leader: meter.i64_gauge("lease_leader").build(),
             lease_epoch: meter.i64_gauge("lease_epoch").build(),
@@ -199,6 +203,8 @@ impl OtelInstruments {
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
+            session_rehomes: meter.u64_counter("session_rehomes").build(),
+            session_expiry_unpersisted: meter.u64_counter("session_expiry_unpersisted").build(),
             admission_rejected: meter.u64_counter("admission_rejected").build(),
             quota_rejections: meter.u64_counter("quota_rejections").build(),
             store_bytes: meter.i64_gauge("store_bytes").build(),
@@ -262,6 +268,7 @@ pub struct Metrics {
     replication_min_actual: Gauge,
     replication_write_floor: Gauge,
     retained_tombstones: Gauge,
+    misplaced_sessions: Gauge,
     peer_links: Gauge,
     members_by_state: Family<StateLabel, Gauge>,
     lease_leader: Gauge,
@@ -285,6 +292,8 @@ pub struct Metrics {
     gossip_rejected_total: Family<ReasonLabel, Counter>,
     security_reloads_total: Family<OutcomeLabel, Counter>,
     revocation_evictions_total: Family<ReasonLabel, Counter>,
+    session_rehomes_total: Family<ReasonLabel, Counter>,
+    session_expiry_unpersisted_total: Family<ReasonLabel, Counter>,
     admission_rejected_total: Family<ReasonLabel, Counter>,
     quota_rejections_total: Family<ReasonLabel, Counter>,
     store_bytes: Family<StoreLabel, Gauge>,
@@ -504,6 +513,15 @@ impl Metrics {
              convergence (issue #229); sustained growth means an absent durable \
              member or chronic divergence",
         );
+        let misplaced_sessions = register_gauge(
+            &mut registry,
+            "misplaced_sessions",
+            "Live persistent sessions hosted on a node that does NOT own their \
+             placement group (issue #284). Non-zero for longer than a convergence \
+             window means sessions that cannot be rehomed (the owner's peer address \
+             is unknown) — those sessions are undeliverable and their publishers \
+             are withheld",
+        );
 
         let members_by_state = register_gauge_family(
             &mut registry,
@@ -568,6 +586,28 @@ impl Metrics {
             "revocation_evictions",
             "Live state revoked by a policy-reload sweep (ADR 0040), by kind \
              (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked)",
+        );
+        let session_rehomes_total = register_family(
+            &mut registry,
+            "session_rehomes",
+            "Rehome-on-settle decisions for a live session hosted on a non-owning \
+             node (issue #284), by reason: stale-owner (closed, so the client \
+             relocates to the owner), unrelocatable (kept and served locally because \
+             the owner's address is unknown — ADR 0005 degrade-don't-refuse), \
+             cooldown (a repeat close suppressed), deferred (over the per-tick close \
+             cap, retried on a later tick — counted once per session per deferral \
+             episode, not once per tick). Each stale-owner close also publishes the \
+             client's Last Will",
+        );
+        let session_expiry_unpersisted_total = register_family(
+            &mut registry,
+            "session_expiry_unpersisted",
+            "Detaches whose ADR 0009 §3 absolute session-expiry deadline could NOT be \
+             persisted, by reason: not-owner (this node does not hold the session \
+             group's lease — the structural case after a rehome, issue #284) or error \
+             (the write was attempted and failed). The new owner inherits a session \
+             record with no deadline, so a client that never returns leaves a \
+             persistent session behind",
         );
         let admission_rejected_total = register_family(
             &mut registry,
@@ -745,6 +785,7 @@ impl Metrics {
             replication_min_actual,
             replication_write_floor,
             retained_tombstones,
+            misplaced_sessions,
             members_by_state,
             lease_leader,
             lease_epoch,
@@ -757,6 +798,8 @@ impl Metrics {
             gossip_rejected_total,
             security_reloads_total,
             revocation_evictions_total,
+            session_rehomes_total,
+            session_expiry_unpersisted_total,
             admission_rejected_total,
             quota_rejections_total,
             store_bytes,
@@ -991,6 +1034,18 @@ impl Metrics {
     pub fn set_retained_tombstones(&self, n: usize) {
         self.retained_tombstones.set(clamp_gauge(n));
         self.otel.retained_tombstones.record(clamp_gauge(n), &[]);
+    }
+
+    /// Set the count of live persistent sessions currently hosted on a node that does
+    /// not own their placement group (issue #284). Transiently non-zero around an
+    /// ownership move — the sessions are closed so they relocate. **Sustained**
+    /// non-zero is the one wedge shape rehome-on-settle cannot heal: the owner's peer
+    /// address is unknown, so ADR 0005 §5 keeps serving locally rather than kicking
+    /// the client into a reconnect loop, and those sessions are undeliverable (their
+    /// publishers' acks are withheld with `not the owning node for this group`).
+    pub fn set_misplaced_sessions(&self, n: usize) {
+        self.misplaced_sessions.set(clamp_gauge(n));
+        self.otel.misplaced_sessions.record(clamp_gauge(n), &[]);
     }
 
     /// Set the member count for one bounded SWIM `state` (`"alive"`/`"suspect"`/`"dead"`).
@@ -1308,6 +1363,67 @@ impl Metrics {
         self.otel
             .revocation_evictions
             .add(1, &[KeyValue::new("kind", kind.to_string())]);
+    }
+
+    /// A rehome-on-settle decision for a live session found hosted on a node that does
+    /// not own its placement group (issue #284). Bounded reasons only — never a
+    /// per-client value:
+    ///
+    /// * `stale-owner` — the session was closed, so the client's next CONNECT relocates
+    ///   it to the committed owner. Expected in ones after a node roll.
+    /// * `unrelocatable` — the condition holds but the owner's peer address is unknown,
+    ///   so ADR 0005 §5 keeps serving locally instead of kicking into a reconnect loop.
+    ///   These sessions stay undeliverable; see [`set_misplaced_sessions`](Self::set_misplaced_sessions).
+    /// * `cooldown` — a repeat close suppressed within the per-session cooldown, so a
+    ///   flapping placement cannot turn into a close loop.
+    /// * `deferred` — the session was over this tick's close cap and is retried on a
+    ///   later tick, so a mass ownership move drains at a paced rate instead of closing
+    ///   (and will-publishing for) every session in one dispatch. Counted **once per
+    ///   session per deferral episode**, not once per tick: the pass re-derives its
+    ///   candidates every tick, so per-tick counting would report ~n²/(2·cap) for an
+    ///   n-session move — ~45 000 samples for the 1700-session resize this cap exists
+    ///   for — and an operator sizing a drain from it would overestimate the backlog by
+    ///   more than an order of magnitude.
+    ///
+    /// Every `stale-owner` close also publishes the client's **Last Will**: a server
+    /// DISCONNECT is not a client DISCONNECT, so [MQTT-3.1.2-8] / §3.14.4 keep the will
+    /// armed, exactly as for session takeover and `evict`. A roll or resize therefore
+    /// emits one LWT per rehomed session — treat this counter as the suppressor signal
+    /// for device-offline alerting while it climbs.
+    pub fn session_rehomed(&self, reason: &str) {
+        self.session_rehomes_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .session_rehomes
+            .add(1, &[KeyValue::new("kind", reason.to_string())]);
+    }
+
+    /// A detach whose ADR 0009 §3 absolute expiry deadline could not be persisted, by
+    /// bounded `reason`:
+    ///
+    /// * `not-owner` — this node does not hold the session group's lease, so the
+    ///   group-routed write is refused by construction. The structural case after a
+    ///   rehome close (issue #284): the deadline is deliberately NOT attempted rather
+    ///   than attempted-and-swallowed.
+    /// * `error` — the write was attempted and failed for another reason (no quorum, a
+    ///   backend error).
+    ///
+    /// Either way the durable session record is left without a deadline, so a client that
+    /// never returns leaves a persistent session (and its queue) behind. The deadline is
+    /// re-established by the client's next CONNECT wherever it lands; this counter is the
+    /// visibility for the case where it never does.
+    pub fn session_expiry_unpersisted(&self, reason: &str) {
+        self.session_expiry_unpersisted_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .session_expiry_unpersisted
+            .add(1, &[KeyValue::new("kind", reason.to_string())]);
     }
 
     /// A QUIC connection migrated to a new client path (ADR 0036 §3b): the peer's remote address

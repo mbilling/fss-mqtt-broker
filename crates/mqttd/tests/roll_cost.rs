@@ -17,11 +17,14 @@
 //!   refuted structurally: the blast radius is ~hosted-sessions/N-th of the
 //!   fleet, not the fleet.
 //! * The dropped clients resume with `session_present=1` on a survivor and
-//!   their subscriptions still deliver. One measured wart on top (filed as
-//!   issue #284, see the post-roll section): a client that resumes in the
-//!   seconds around the rolled node's readmission can be routed onto a stale
-//!   placement and sit undeliverable until it reconnects once more — the
-//!   keepalive-driven second reconnect is modelled and counted here.
+//!   their subscriptions still deliver. A client that resumes in the seconds
+//!   around the rolled node's readmission can be routed onto the group's
+//!   INTERIM owner (the ring hands the readmitted node its groups back a
+//!   couple of seconds after it turns ready, and relocation is decided once,
+//!   at CONNECT) — that node then closes the connection itself, promptly, so
+//!   the client relocates on the reconnect it already knows how to do
+//!   (rehome on settle, 0043-P6 / issue #284). Counted and bounded here; the
+//!   number of clients that had to notice dead air themselves is asserted 0.
 //! * `QoS` 1 publishes into a group mid-ownership-move are REFUSED (ack
 //!   withheld, never silently dropped) for a measured seconds-scale window.
 //! * The drain-to-exit and restart-to-readmission times are bounded and
@@ -128,6 +131,13 @@ async fn receives(client: &mut common::Client, payload: &[u8], within: Duration)
         }
     }
 }
+
+/// How long after the rolled node's readmission a session placed on the group's
+/// interim owner must be closed by the broker (issue #284 / 0043-P6). The rehome
+/// fires within a couple of hub sweep ticks of the ownership move; this window is
+/// generous enough to absorb the move's own convergence and still be far inside any
+/// client's keepalive, which is what the fix exists to beat.
+const REHOME_BOUND: Duration = Duration::from_secs(20);
 
 /// The measured k8s-style roll: 9 durable clients spread 3-per-node, node `b`
 /// is rolled with the chart's exact motion, and only the sessions it hosted
@@ -329,71 +339,135 @@ async fn a_rolled_node_disconnects_only_its_own_clients() {
         clients[i].via = via;
     }
 
-    // Post-roll: every client (resumed and undisturbed alike) still delivers.
+    // A client that resumed in the seconds around the rolled node's readmission
+    // can land on the INTERIM owner its group had while the node was away: the
+    // ring hands b's groups back a couple of seconds after b turns ready, and
+    // relocation is decided once, at CONNECT. The node that finds itself hosting
+    // a session for a group it no longer owns CLOSES that connection (rehome on
+    // settle, 0043-P6 / issue #284) so the client relocates on its next CONNECT,
+    // instead of sitting silently undeliverable until its keepalive fires.
     //
-    // With one measured wart: a client that RESUMED in the seconds around the
-    // rolled node's readmission can be routed to a stale/interim owner — its
-    // session then sits on a node the placement no longer maps to the group, so
-    // every QoS 1 publish to it is refused (`not the owning node for this
-    // group`, ack withheld) and it receives nothing, indefinitely. A real
-    // client's keepalive fires on that dead air and it RECONNECTS, which
-    // re-relocates the session and heals it — modelled here (and counted, so
-    // the docs can state the double-reconnect cost). Filed as issue #284;
-    // this loop is the measurement, not an endorsement.
-    let mut second_reconnects = 0usize;
-    for i in 0..clients.len() {
-        let after = format!("after-{seed}-{i}").into_bytes();
-        let overall = Instant::now() + Duration::from_secs(180);
-        loop {
-            let via = (clients[i].via + 1) % nodes.len();
-            let delivered = match try_publish_acked(
-                &nodes,
-                via,
-                &clients[i].topic,
-                &after,
-                Duration::from_secs(20),
+    // Watch every socket for that server-initiated close over a bounded window
+    // (acking any live traffic that arrives meanwhile), then reconnect whoever
+    // was rehomed — once. This is the roll's true client-visible cost.
+    let watch_until = Instant::now() + REHOME_BOUND;
+    let mut rehomed: Vec<usize> = Vec::new();
+    while Instant::now() < watch_until {
+        for i in 0..clients.len() {
+            if rehomed.contains(&i) {
+                continue;
+            }
+            match clients[i]
+                .conn
+                .recv_bounded(Duration::from_millis(50))
+                .await
+            {
+                common::Recv::Closed => rehomed.push(i),
+                common::Recv::Packet(Packet::Publish(p)) => {
+                    if let Some(pkid) = p.pkid {
+                        clients[i].conn.puback(pkid).await;
+                    }
+                }
+                common::Recv::Packet(_) | common::Recv::Quiet => {}
+            }
+        }
+    }
+    for &i in &rehomed {
+        let rvia = (clients[i].via + 2) % nodes.len();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let conn = loop {
+            if let Some((conn, present)) = common::Client::connect_v311_within(
+                nodes[rvia].client_addr,
+                &clients[i].id,
+                false,
+                Duration::from_secs(10),
             )
             .await
             {
-                Some(stall) => {
-                    post_roll_stall = post_roll_stall.max(stall);
-                    receives(&mut clients[i].conn, &after, Duration::from_secs(20)).await
-                }
-                None => false,
-            };
-            if delivered {
-                break;
-            }
-            assert!(
-                Instant::now() < overall,
-                "{}: still wedged after reconnect retries",
-                clients[i].id
-            );
-            // The real client's move on dead air: drop and reconnect.
-            second_reconnects += 1;
-            let rvia = (clients[i].via + 2) % nodes.len();
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let conn = loop {
-                if let Some((conn, present)) = common::Client::connect_v311_within(
-                    nodes[rvia].client_addr,
-                    &clients[i].id,
-                    false,
-                    Duration::from_secs(10),
-                )
-                .await
-                {
-                    assert!(present, "{}: session lost during rehome", clients[i].id);
-                    break conn;
-                }
                 assert!(
-                    Instant::now() < deadline,
-                    "{} could not reconnect during rehome",
+                    present,
+                    "{}: a rehomed session must survive the close it was given",
                     clients[i].id
                 );
-            };
-            clients[i].conn = conn;
-            clients[i].via = rvia;
+                break conn;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} could not reconnect after being rehomed",
+                clients[i].id
+            );
+        };
+        clients[i].conn = conn;
+        clients[i].via = rvia;
+    }
+
+    // Post-roll: every client (undisturbed, resumed, and rehomed alike)
+    // delivers — with NO client needing to discover the problem itself. A blind
+    // reconnect on dead air is the pre-#284 heal; it must not happen any more,
+    // so it is counted and asserted zero.
+    let mut blind_retries = 0usize;
+    for i in 0..clients.len() {
+        let after = format!("after-{seed}-{i}").into_bytes();
+        let via = (clients[i].via + 1) % nodes.len();
+        let delivered = match try_publish_acked(
+            &nodes,
+            via,
+            &clients[i].topic,
+            &after,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            Some(stall) => {
+                post_roll_stall = post_roll_stall.max(stall);
+                receives(&mut clients[i].conn, &after, Duration::from_secs(20)).await
+            }
+            None => false,
+        };
+        if delivered {
+            continue;
         }
+        // Dead air. What a real client eventually does — and the measurement of
+        // the defect: nothing told it, it had to wait out a keepalive.
+        blind_retries += 1;
+        let rvia = (clients[i].via + 2) % nodes.len();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let conn = loop {
+            if let Some((conn, present)) = common::Client::connect_v311_within(
+                nodes[rvia].client_addr,
+                &clients[i].id,
+                false,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                assert!(present, "{}: session lost during rehome", clients[i].id);
+                break conn;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} could not reconnect during rehome",
+                clients[i].id
+            );
+        };
+        clients[i].conn = conn;
+        clients[i].via = rvia;
+        let retry = format!("retry-{seed}-{i}").into_bytes();
+        let via = (clients[i].via + 1) % nodes.len();
+        let stall = publish_acked(
+            &nodes,
+            via,
+            &clients[i].topic,
+            &retry,
+            Duration::from_secs(30),
+        )
+        .await;
+        post_roll_stall = post_roll_stall.max(stall);
+        assert!(
+            receives(&mut clients[i].conn, &retry, Duration::from_secs(20)).await,
+            "{}: wedged even after a blind reconnect",
+            clients[i].id
+        );
     }
 
     eprintln!(
@@ -402,7 +476,9 @@ async fn a_rolled_node_disconnects_only_its_own_clients() {
          every other connection stayed open and receiving), \
          drain-to-exit={:.1}s, restart-to-full-readmission={:.1}s, \
          worst QoS1 ack stall: mid-roll={:.1}s post-roll={:.1}s, \
-         clients needing a second (keepalive-style) reconnect: {second_reconnects}",
+         sessions rehomed by the broker after readmission: {} \
+         (each one immediate server-initiated reconnect, within {:.0}s), \
+         clients that had to notice dead air themselves: {blind_retries}",
         closed.len(),
         clients.len(),
         closed.len() - direct,
@@ -410,6 +486,35 @@ async fn a_rolled_node_disconnects_only_its_own_clients() {
         readmit.as_secs_f64(),
         mid_roll_stall.as_secs_f64(),
         post_roll_stall.as_secs_f64(),
+        rehomed.len(),
+        REHOME_BOUND.as_secs_f64(),
+    );
+
+    // The acceptance criterion of issue #284: no session heals by waiting out a
+    // keepalive on a stale placement. Either it was never misplaced, or the
+    // broker closed it promptly and it relocated on the reconnect it already
+    // knows how to do.
+    assert_eq!(
+        blind_retries, 0,
+        "{blind_retries} client(s) were left to discover a stale placement by \
+         dead air; rehome-on-settle must close them instead (issue #284)"
+    );
+
+    // …and the criterion needs its other half, or it is vacuous. `blind_retries == 0`
+    // is ALSO what a roll where nothing was ever misplaced looks like, so on its own
+    // this test would pass whether the mechanism fired or the scenario simply did not
+    // arise — a placement, seed or timing shift would silently turn the only
+    // end-to-end guard for issue #284 into a no-op that still reads green. At seed
+    // 4848 exactly one of the nine clients CAN be placed across the readmission
+    // window (the ownership of its group differs with and without the rolled node —
+    // computed from the broker's own placement hash, see the header), so a roll that
+    // rehomes nobody means the harness stopped reproducing the scenario and must be
+    // re-derived, not shrugged at.
+    assert!(
+        !rehomed.is_empty(),
+        "no session was rehomed, so this run exercised nothing: at this seed one \
+         client's group ownership moves across the readmission window, and the \
+         rehome close is what this test exists to observe (issue #284)"
     );
 
     for node in &mut nodes {

@@ -521,12 +521,28 @@ group whose ownership is moving are **refused (acks withheld), never silently dr
 for a measured ≈ 5 s takeover window.
 
 The measurement also surfaced one genuine defect the fear had been standing in front of:
-a client that *resumes* in the seconds around the rolled pod's readmission can be routed
+a client that *resumes* in the seconds around the rolled pod's readmission could be routed
 onto a stale owner and sit undeliverable — publishes toward it refused `NotOwner` — until
-its keepalive fires and it reconnects a second time. Filed as **issue #284** with the
-mechanism (a session placed across the ring/lease convergence split is never rehomed);
-the roll-cost test models the keepalive-driven second reconnect and counts it (1 of 9),
-and OPERATIONS.md states the client-backoff mitigation until it lands.
+its keepalive fired and it reconnected a second time. Filed as **issue #284**; the
+roll-cost test modelled that keepalive-driven second reconnect and counted it (1 of 9).
+
+**Corrected and closed (2026-08-15, issue #284, delivered as 0043-P6).** This record
+originally named the mechanism as "a session placed across the ring/lease convergence
+split". That was wrong, and the correction matters because it points at a different fix:
+there is no split. `Placement::owner_route` (what relocation reads) and the enqueue-side
+`owns_group` both resolve through the *same* `Placement::group_owner`, and both were
+self-consistent at every point in the reproduction. What actually happens is that
+relocation is a one-shot CONNECT-time snapshot of an ownership that legitimately moves
+again moments later: a readmitted pod rejoins gossip membership — and turns `/readyz`
+green — a couple of seconds *before* it re-enters the lease voter set, so its groups'
+leases are still parked on the interim holder at that instant and are pulled back to it
+2–4 s later. Nothing re-evaluated a **live** session's placement. As delivered, the
+hosting node closes such a session itself within a second or two (v5: DISCONNECT `0x9C`),
+so the client relocates on the reconnect it already knows how to do. The roll-cost test
+now asserts that no client heals by waiting out dead air; the client-backoff mitigation
+OPERATIONS.md carried is withdrawn. Still open, and now the load-bearing half: readiness
+turns green before the lease topology has converged onto the voter set, which is what
+opens client traffic inside the window in the first place.
 
 Unchanged, deliberately: the `preStop` hook still cannot distinguish a roll from a
 shrink, so every roll pays the (cheap-when-caught-up) drain — that distinction remains

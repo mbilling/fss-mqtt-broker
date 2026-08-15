@@ -303,13 +303,66 @@ load; the client-facing cost scales with the rolled pod's share, not the fleet):
   ready lease group on every node).
 - **`QoS` 1 publishes into a moving group are refused, never silently dropped:**
   acks are withheld for a seconds-scale ownership-takeover window (measured
-  worst ≈ 5 s mid-roll) and publishers retry; everything acked is delivered.
-- **The straggler wart (issue #284):** a client that *resumes* in the seconds
-  around the rolled pod's readmission can be routed onto a stale owner and
-  receive nothing — acks toward it refused — until its keepalive fires and it
-  reconnects once more (measured: 1 of 9). Until #284 lands, keep client
-  reconnect backoff + jitter at least as long as the readmission time above, so
-  stragglers resume after placement settles.
+  worst ≈ 5 s mid-roll) and publishers retry. The mechanism is the *withheld* ack,
+  not a promise about acks already given: while a node cannot durably append for a
+  group, it answers with silence and the publisher resends (see the rehome bullet
+  below for the live-session case).
+  **One window is NOT covered, and it is pre-existing:** a node releases a moved
+  session's routing when it observes that *it* is no longer the owner — never on
+  evidence that the new owner has materialised the session. Between those two facts
+  (an inherited-session scan on the old node, then the new owner claiming the
+  session) a publish can match nobody anywhere and be acked with nothing stored.
+  That is the same hole for a session that was already offline as for one this
+  release closes, it long predates issue #284, and closing it needs a
+  witnessed-release protocol that is deliberately NOT part of this change (issue
+  filed; the reasoning is in ADR 0043's as-delivered note). Do not read this bullet
+  as "an `Accepted` always means stored" during an ownership move.
+- **A straggler that resumes into the readmission window is rehomed, promptly**
+  (issue #284, delivered): a client that resumes in the seconds around the rolled
+  pod's readmission can be placed on the group's *interim* owner — the ring hands
+  the readmitted pod its groups back a couple of seconds after it turns Ready, and
+  relocation is decided once, at CONNECT. That pod now **closes the connection
+  itself** within a second or two of the ownership move (v5 clients get DISCONNECT
+  `0x9C` Use another server), so the client relocates on its next CONNECT rather
+  than waiting out a keepalive on dead air. Measured on the three-node roll harness
+  (`roll_cost`, three runs, 2026-08-15): 1 of 9 clients rehomed per roll, 0 clients
+  left to discover the problem themselves, worst post-roll `QoS` 1 ack stall **0.2 s**
+  (0.1-0.2 s across four runs; it was 26 s before the fix, with no self-heal at all if the client never
+  reconnected). Watch `mqttd_session_rehomes_total{reason="stale-owner"}`; a handful
+  per roll is normal.
+- **The close touches the connection and NOTHING else, so no publish is acked into
+  the void.** The closing node keeps routing — and keeps advertising — the session's
+  subscriptions afterwards, exactly as it did before the close, until its own
+  inherited-session scan releases them on the pre-existing cadence. While it holds
+  them, a `QoS` ≥ 1 publish toward that session is answered exactly as before the
+  fix: the durable append is refused (`not the owning node for this group`) and the
+  **publisher's ack is withheld**, so it retries. That holds at every entry point,
+  including a publisher on a third node, where the fan-out reaches both nodes and the
+  old node's failure withholds the ack even if the new owner's copy was stored first.
+  **The cost, stated:** for as long as the old node holds the routing, *both* nodes
+  advertise the session's filters, so publishers to those filters keep retrying even
+  once the session is healthy on its owner. Inside a roll that is **about two seconds** —
+  measured 1.8-2.4 s on the three-node roll harness (reconnect the closed client
+  immediately, then publish toward its topic from a third node until the ack stops
+  being withheld); the readmission's membership change arms eager scans on every
+  node, which is what keeps it seconds rather than the 30 s cadence below. For a lease move
+  with **no** membership change (an assigner rebalance, a lease-leader change, or a
+  paced elastic-resize drain) it is up to the 30 s reconcile cadence. Releasing sooner
+  was considered and rejected: the release is not witnessed by the new owner, so
+  accelerating it widens a window in which a publish is *acked* with nothing stored —
+  a bounded lie in place of an unbounded honest refusal.
+- **Each rehome close publishes the session's Last Will.** A server DISCONNECT is
+  not a client DISCONNECT, so the spec keeps the will armed ([MQTT-3.1.2-8],
+  §3.14.4) — consistent with session takeover and `evict`, and with the fix for
+  issue #265. **A roll therefore emits one LWT per rehomed session, and a
+  scale-out/scale-in emits roughly one per moved session** (paced: at most 32
+  closes per node per second, `mqttd_session_rehomes_total{reason="deferred"}`
+  counts each session that had to wait, once). Suppress device-offline alerting while
+  `mqttd_session_rehomes_total{reason="stale-owner"}` is climbing; treat that
+  counter as the suppressor signal. Honouring the MQTT 5 Will Delay Interval
+  cluster-wide is the follow-up that would remove the false event — it needs the
+  delay and its cancellation to survive the client reconnecting on a *different*
+  node, which no peer frame expresses today.
 
 **Pacing.** The chart already enforces the safe motion — OrderedReady +
 RollingUpdate roll one pod at a time and the PDB (`maxUnavailable: 1`) stops a
@@ -360,6 +413,9 @@ the demo dashboard's "Operator signals" row):
 | **Replication lag** | `mqttd_replica_groups_tracked - mqttd_replica_groups_current > 0` sustained | Node not catch-up-current; takeover from it would be degraded |
 | **Quorum thinning** | `mqttd_voters < 3` (with `lease_voters = 5`) | One more loss risks durable writes; restore nodes |
 | **Durable writes refused (under-replicated)** | `mqttd_replication_min_actual < mqttd_replication_write_floor` (page); `mqttd_replication_min_actual < mqttd_replication_desired` (warn) | **Page**: a group is below the min-replicas write floor, so durable writes are being REFUSED — QoS≥1 publishers get no ack, redeliver, and are disconnected; retained mutations queue; reads, QoS 0, acked-driven truncation and removal keep serving, but QoS 2 in-flight bookkeeping does not. Corroborate with `mqttd_durable_append_failures_total{reason="unavailable"}` climbing. **Warn**: a group merely holds fewer copies than R. Either way: restore the missing members ([TROUBLESHOOTING](TROUBLESHOOTING.md)). Do **not** lower `durable.min_replicas` to silence it unless you are consciously accepting single-copy acks. Non-durable clusters (`durable.enabled = false`) report a floor of 1, so this rule cannot fire there |
+| **Sessions rehoming** | `rate(mqttd_session_rehomes_total{reason="stale-owner"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | A node found itself hosting a live persistent session for a placement group it does not own and closed the connection so the client relocates to the owner (issue #284). Expected **in ones after a node roll** — each is one immediate client reconnect, and the alternative was an undeliverable session until the client's keepalive fired. A *sustained* rate means group ownership is churning, or client traffic is being opened before the lease topology has converged onto the voter set — check `mqttd_voters`, `mqttd_lease_epoch` and the *Replication lag* row. **Each close also publishes that client's Last Will**, so suppress device-offline alerting while this counter climbs |
+| **Sessions stuck misplaced** | `mqttd_misplaced_sessions > 0` for 2m, or `rate(mqttd_session_rehomes_total{reason="unrelocatable"}[5m]) > 0` | A live persistent session is hosted on a node that does not own its group and **cannot be rehomed**, because the owner's peer-link address is unknown to that node — so ADR 0005's degrade-don't-refuse keeps serving it locally rather than closing it into a reconnect loop. Those sessions **are undeliverable**: every publish toward them is refused and the publisher's ack withheld (`not the owning node for this group` in the hosting node's logs). This is a peer-mesh/gossip problem, not a session problem — check `mqttd_peer_links` against `mqttd_cluster_members` and the peer-link TLS rows |
+| **Rehome closes being deferred** | `rate(mqttd_session_rehomes_total{reason="deferred"}[5m]) > 0` for 5m | More sessions want rehoming than the per-tick close cap (32/node/s) allows, so the drain is paced (issue #284). The counter increments **once per session per deferral episode**, so its increase is the size of the backlog, not the number of ticks it took to drain. Expected for a few seconds after a scale-out or scale-in, where ~1/N of groups change owner at once — the cap is also the LWT-storm cap. Sustained means ownership is churning faster than the drain: check the *Sessions rehoming* row's causes |
 | **Prolonged rotation window** | `mqttd_swim_keys_accepted > 1` for > 1h | A rotation phase was never closed (see key rotation above) |
 | **Config divergence** | `count(count by (checksum) (mqttd_config_info == 1)) > 1` for > 15m | A config roll did not converge; check the stuck pod |
 | **Degraded durable plane** | `mqttd_lease_quorum_ack_ms` growing (ADR 0049) | fsync-bound consensus; check disks before sessions are refused |

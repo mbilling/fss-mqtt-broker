@@ -80,6 +80,68 @@ sessions, retained state, interest — without waiting for a client or publish t
 them. The takeover window machinery (settle/re-route, mesh-whole ack rule) already holds
 acks honest while this runs; resize inherits it unchanged.
 
+**As delivered (2026-08-14, issue #284):** P2 released the moved sessions that were
+*offline*. The LIVE mirror was missing, and it is the one a rolling upgrade hits: a node
+readmitted after a roll rejoins gossip membership — and turns `/readyz` green — a couple
+of seconds before it re-enters the lease voter set, so its groups' leases are still parked
+on the interim holder from its absence. A session that resumes in that window is relocated
+onto the interim holder correctly (ADR 0005 decides at CONNECT) and stranded there when
+the lease legitimately returns; every publish toward it is then refused `NotOwner` (ack
+withheld) with no self-heal until the client's keepalive fires. As delivered, an ONLINE
+persistent session whose group's **committed lease** names another node is closed on the
+hub's sweep tick after a two-tick grace, so the client relocates on its next CONNECT.
+Bounded four ways: the grace; the requirement of a committed lease (never the HRW
+fallback, so the transient ring/lease split is not a trigger); a per-session cooldown; and
+the requirement that the owner be relocatable at all (else ADR 0005 §5's
+degrade-don't-refuse keeps serving locally, counted rather than looped). No durable state
+moves — the session's queue is in its group's replicated log, which the real owner holds.
+
+**Amended (2026-08-15, issue #284 rounds 2–3).** Three corrections to the paragraphs
+above.
+
+1. **The takeover window does NOT hold acks honest for this path.** P2's claim ("the
+   takeover window machinery … already holds acks honest while this runs") is true of
+   *membership* events, which arm the settle window on every node at once. A lease/voter
+   move arms nothing anywhere: the cluster driver pushes it into the shared placement ring
+   and no hub is told. So the honesty here comes from the close **changing nothing but the
+   connection**: the closing node keeps routing and advertising the moved session's
+   subscriptions — the cluster's only evidence that a message is owed to it — and lets
+   `release_moved_sessions` take them on its own pre-existing scan cadence, where the
+   release is already paired with the settle pass that clears held acks. Every publish
+   toward the session is withheld throughout, exactly as before the fix, at every entry
+   point: locally the append fails `NotOwner`; a peer's forward is answered *failed*; and
+   at a third node the fan-out reaches both nodes and the first terminal verdict wins, so
+   the old node's failure withholds the ack even when the owner's `stored` arrives first.
+   The price is a double-advertise window (both nodes advertise the filters, so publishers
+   to them retry) lasting about a tick inside a roll and up to the 30 s reconcile cadence
+   for a lease move with no membership change. Shortening it by arming the eager window at
+   the close was **rejected**: it accelerates a release that no successor claim witnesses,
+   trading an unbounded honest refusal for a bounded lie. That unwitnessed release is a
+   pre-existing property of `release_moved_sessions`, reachable with no rehome in the story
+   at all, and is recorded as a follow-up in 0043-P6.
+2. **Closes are capped per tick** (32/node/s), remainder deferred and counted
+   (`mqttd_session_rehomes_total{reason="deferred"}`, once per session per deferral
+   episode — the pass re-derives its candidates every tick, so counting the per-tick
+   deferral events would report ~n²/(2·cap) for an n-session move). Uncapped, resize's
+   ~1/N-of-groups move closed every affected session in one dispatch — measured 400 closes
+   in one to two ticks, 25–44 ms of on-loop sweep time — and sent them all to reconnect on
+   the same instant onto the coldest node.
+3. **The LWT volume is one will per rehomed session, not "a handful".** Every rehome close
+   publishes the client's Last Will (spec-required, and consistent with takeover/`evict`
+   — see ADR 0005's note), so a resize emits on the order of *sessions/N* false
+   device-offline events, paced only by the per-tick cap. The cap is therefore also the
+   will-storm cap.
+
+The candidate scan is additionally **gated on a placement ownership version**, so a
+steady-state tick does no scanning at all: unconditional, it took the `sweep` dispatch
+from ~4.0 ms to ~6.6 ms per tick at 5000 online sessions (release build, this fixture),
+forever, for a condition that only arises when a lease moves. The gate is edge-triggered on
+*ownership*, so it needs a second trigger for the other way a session becomes misplaced —
+by **arriving**. A persistent session that attaches to a non-owning node after the lease
+already moved is seeded into the observation set at the attach (one committed-owner read per
+persistent attach, nothing per tick); without it the pass would never look at that session
+again and the wedge would return silently, with the gauge reading zero.
+
 ### 3. Shrink is a decommission, not a disappearance
 
 Removing a node on purpose becomes an explicit **decommission**: the node (a) stops
