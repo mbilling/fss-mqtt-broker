@@ -571,6 +571,19 @@ pub enum Refusal311 {
     CloseNoAck,
 }
 
+/// A connection's Will, with the delay the client asked for.
+///
+/// The delay rides here rather than inside [`Message`] because `Message` is the
+/// generic publish type and this timing is specific to a Will — the same reason
+/// its `expires_at` is left `None` until the Will is actually published.
+#[derive(Debug, Clone)]
+pub struct Will {
+    /// What to publish.
+    pub message: Message,
+    /// Will Delay Interval in seconds (§3.1.3.2.2); `0` publishes immediately.
+    pub delay_secs: u32,
+}
+
 /// A currently-online client connection.
 #[derive(Debug)]
 struct Online {
@@ -579,7 +592,7 @@ struct Online {
     /// Channel to this connection's writer.
     tx: Outbound,
     /// Will message published if this connection ends ungracefully.
-    will: Option<Message>,
+    will: Option<Will>,
     /// The revocable facts this connection was admitted under (ADR 0040 T1).
     admission: Admission,
     /// When this connection attached: a takeover-window re-delivery
@@ -1129,7 +1142,7 @@ pub struct PendingAttach {
     /// MQTT 5.0 Receive Maximum for this connection (ADR 0012).
     receive_maximum: u16,
     /// Will message to publish if the connection ends ungracefully.
-    will: Option<Message>,
+    will: Option<Will>,
     /// Channel the hub uses to deliver packets to this client.
     outbound: Outbound,
     /// Reply channel the connection awaits before its CONNACK.
@@ -1171,8 +1184,9 @@ pub enum HubCommand {
         /// MQTT 5.0 Receive Maximum: the most unacked `QoS` > 0 publishes the server
         /// may have outstanding to this client at once (ADR 0012).
         receive_maximum: u16,
-        /// Will message to publish if the connection ends ungracefully.
-        will: Option<Message>,
+        /// Will message to publish if the connection ends ungracefully, with the
+        /// delay the client asked for (§3.1.3.2.2).
+        will: Option<Will>,
         /// Channel the hub uses to deliver packets to this client.
         outbound: Outbound,
         /// Reply with the [`AttachOutcome`] so the connection can CONNACK (or reject).
@@ -1819,6 +1833,17 @@ pub struct Hub {
     /// new owner inherit the right deadline after a takeover — the same value is persisted in
     /// the durable session metadata.
     expiring: HashMap<ClientId, u64>,
+    /// Wills held back by a Will Delay Interval (§3.1.3.2.2, issue #299), keyed by
+    /// client, each with the absolute epoch second it becomes due. The same sweep
+    /// that expires sessions publishes them — one clock, not two.
+    ///
+    /// **Node-local and in-memory, deliberately.** If this node dies inside the
+    /// window the delayed Will is lost, and a session that relocates mid-window
+    /// does not take it along. That is the same class as the in-memory outbound
+    /// queue, and the honest first cut: firing a delayed Will from a node that no
+    /// longer owns the session would be worse than not delaying at all. Recorded
+    /// in `docs/TEST-PLAN.md`'s policy register rather than left to be discovered.
+    pending_wills: HashMap<ClientId, (Will, u64)>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
     /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
@@ -2385,6 +2410,7 @@ impl Hub {
                 remote_append_pending: HashMap::new(),
                 node_id,
                 online: HashMap::new(),
+                pending_wills: HashMap::new(),
                 session_expiry: HashMap::new(),
                 expiring: HashMap::new(),
                 expiry_reconcile_tick: 0,
@@ -3694,13 +3720,25 @@ impl Hub {
                 .unwrap_or(u16::MAX),
         );
 
+        // The client is back: cancel any Will this session was holding for its delay
+        // (§3.1.3.2.2, issue #299). This is the whole point of the delay — without
+        // the cancel it is only a slower announcement of a death that did not
+        // happen. Done before the takeover branch below, so a client that returns by
+        // taking over its own session also cancels.
+        if self.pending_wills.remove(&client).is_some() {
+            info!(client = %client.0, "client returned inside its will delay; will cancelled");
+        }
+
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
-        // disconnect is not a client DISCONNECT, so the old will is published.
+        // disconnect is not a client DISCONNECT, so the old will is published —
+        // IMMEDIATELY, delay or not: a takeover ends the old session, and
+        // §3.1.3.2.2 publishes on whichever of "delay elapsed" or "session ended"
+        // comes first.
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             if let Some(w) = old.will {
-                self.publish_will(&w).await;
+                self.publish_will(&w.message).await;
             }
         }
         self.online.insert(
@@ -6039,25 +6077,46 @@ impl Hub {
             inf.pending
                 .retain(|_, p| p.state != OutState::AwaitingIdRecord);
         }
-        // Any end other than a clean DISCONNECT publishes the will
-        // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
-        if !graceful {
-            if let Some(w) = departed.and_then(|o| o.will) {
-                info!(client = %client.0, topic = %w.topic, "publishing will (ungraceful disconnect)");
-                self.publish_will(&w).await;
-            }
-        }
         // §3.14.2.2.2 (issue #298): a Session Expiry Interval on the DISCONNECT
         // replaces the one agreed at CONNECT, for this detach AND for the stored
         // session — a client that reconnects without naming an interval should get
         // the terms it last asked for, not the ones it has since revised. `conn.rs`
         // has already refused the zero-to-non-zero case, so anything arriving here
         // is legal to apply.
+        //
+        // Applied BEFORE the Will decision below, which bounds its delay by the
+        // session's lifetime: the revised terms are the ones in force.
         if let Some(secs) = session_expiry_override {
             if secs == 0 {
                 self.session_expiry.remove(client);
             } else {
                 self.session_expiry.insert(client.clone(), secs);
+            }
+        }
+        // Any end other than a clean DISCONNECT publishes the will
+        // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
+        if !graceful {
+            if let Some(w) = departed.and_then(|o| o.will) {
+                // §3.1.3.2.2 (issue #299): publish when the delay elapses OR the
+                // session ends, whichever comes FIRST — so the hold is bounded by
+                // the session's own lifetime, and a session that expires at once
+                // (interval 0) publishes at once no matter what delay was asked
+                // for. Will Delay exists so a brief reconnect does not announce a
+                // death that did not happen; without the bound it could outlive
+                // the very session it describes.
+                let expiry = self.session_expiry.get(client).copied().unwrap_or(0);
+                let hold = w.delay_secs.min(expiry);
+                if hold == 0 {
+                    info!(client = %client.0, topic = %w.message.topic, "publishing will (ungraceful disconnect)");
+                    self.publish_will(&w.message).await;
+                } else {
+                    let due = self.clock.now_epoch_secs() + u64::from(hold);
+                    info!(
+                        client = %client.0, topic = %w.message.topic, delay_s = hold,
+                        "holding will (will delay interval)"
+                    );
+                    self.pending_wills.insert(client.clone(), (w, due));
+                }
             }
         }
         // Session retention (ADR 0009): expiry 0 discards now; u32::MAX keeps the
@@ -6268,6 +6327,27 @@ impl Hub {
     // allow when the floor rises.
     #[allow(clippy::manual_is_multiple_of)]
     async fn sweep_expired_sessions(&mut self) {
+        // Wills held for their delay (§3.1.3.2.2, issue #299) ride this same tick
+        // rather than each arming a timer: one clock for "time passed and something
+        // is due" is easier to reason about than N, and the 1s cadence is already
+        // the granularity session expiry is judged at. A client that reconnects in
+        // the meantime removed its entry at attach.
+        let now = self.clock.now_epoch_secs();
+        let due: Vec<(ClientId, Will)> = self
+            .pending_wills
+            .iter()
+            .filter(|(_, (_, at))| *at <= now)
+            .map(|(c, (w, _))| (c.clone(), w.clone()))
+            .collect();
+        for (client, will) in due {
+            self.pending_wills.remove(&client);
+            info!(
+                client = %client.0, topic = %will.message.topic,
+                "publishing will (delay elapsed)"
+            );
+            self.publish_will(&will.message).await;
+        }
+
         // Ring-change watch (ADR 0043 P2): any placement member-set change moves
         // group ownership (growth moves ~1/N of the groups onto the joiner), so it
         // re-arms the takeover window — every node then scans eagerly (the NEW
@@ -9569,7 +9649,7 @@ mod tests {
 
     use super::{
         Admission, AttachOutcome, AuthMethod, BrownoutAxis, Hub, HubCommand, Inflight, Outbound,
-        PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup,
+        PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup, Will,
         EXPIRY_RECONCILE_EVERY, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
     };
     use crate::backpressure::{
@@ -10045,6 +10125,11 @@ mod tests {
         clean_start: bool,
         will: Message,
     ) -> (mpsc::UnboundedReceiver<Packet>, bool) {
+        // Delay 0: these predate Will Delay and assert the publish-at-once path.
+        let will = Will {
+            message: will,
+            delay_secs: 0,
+        };
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
             (Outbound::new(t).0, r)
@@ -10553,13 +10638,16 @@ mod tests {
             clean_start: true,
             session_expiry: 0,
             receive_maximum: u16::MAX,
-            will: Some(mqtt_core::Message {
-                topic: "wills/victim".into(),
-                payload: Bytes::from_static(b"gone"),
-                qos: QoS::AtMostOnce,
-                retain: false,
-                app: mqtt_core::AppProperties::default(),
-                expires_at: None,
+            will: Some(Will {
+                delay_secs: 0,
+                message: mqtt_core::Message {
+                    topic: "wills/victim".into(),
+                    payload: Bytes::from_static(b"gone"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
             }),
             outbound: out_tx,
             reply: reply_tx,
@@ -16858,7 +16946,7 @@ mod tests {
         client: &str,
         conn_id: u64,
         session_expiry: u32,
-        will: Option<Message>,
+        will: Option<Will>,
     ) -> mpsc::UnboundedReceiver<Packet> {
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
@@ -17459,13 +17547,16 @@ mod tests {
             client,
             1,
             u32::MAX,
-            Some(Message {
-                topic: "wills/284".into(),
-                payload: Bytes::from_static(b"offline"),
-                qos: QoS::AtMostOnce,
-                retain: false,
-                app: mqtt_core::AppProperties::default(),
-                expires_at: None,
+            Some(Will {
+                delay_secs: 0,
+                message: Message {
+                    topic: "wills/284".into(),
+                    payload: Bytes::from_static(b"offline"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
             }),
         )
         .await;
@@ -17493,13 +17584,16 @@ mod tests {
             control,
             2,
             u32::MAX,
-            Some(Message {
-                topic: "wills/284".into(),
-                payload: Bytes::from_static(b"should-not-fire"),
-                qos: QoS::AtMostOnce,
-                retain: false,
-                app: mqtt_core::AppProperties::default(),
-                expires_at: None,
+            Some(Will {
+                delay_secs: 0,
+                message: Message {
+                    topic: "wills/284".into(),
+                    payload: Bytes::from_static(b"should-not-fire"),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    app: mqtt_core::AppProperties::default(),
+                    expires_at: None,
+                },
             }),
         )
         .await;

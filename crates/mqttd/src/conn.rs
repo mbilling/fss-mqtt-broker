@@ -9,7 +9,7 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound};
+use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound, Will};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthSession, AuthStep,
@@ -1329,20 +1329,35 @@ where
     }
 }
 
-/// Convert a CONNECT's Last Will into a deferred will [`Message`], carrying the will's
-/// application properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030).
-fn into_will(w: mqtt_codec::packet::LastWill) -> Message {
+/// Convert a CONNECT's Last Will into a deferred [`Will`], carrying the will's
+/// application properties so a published will forwards them too (MQTT-3.3.2-17, ADR 0030)
+/// and the Will Delay Interval the hub holds it for (§3.1.3.2.2, issue #299).
+fn into_will(w: mqtt_codec::packet::LastWill) -> Will {
     let app = app_properties(&w.properties);
-    Message {
-        topic: w.topic,
-        payload: w.payload,
-        qos: w.qos,
-        retain: w.retain,
-        app,
-        // A will's Message Expiry Interval counts from PUBLICATION, which has not
-        // happened yet — the publish path stamps the deadline then (issue #227
-        // keeps will semantics unchanged).
-        expires_at: None,
+    // The Will Delay Interval lives in the WILL's property block, not the CONNECT's
+    // — a distinct set, decoded from the payload alongside the topic and payload.
+    let delay_secs = w
+        .properties
+        .0
+        .iter()
+        .find_map(|p| match p {
+            mqtt_codec::Property::WillDelayInterval(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Will {
+        delay_secs,
+        message: Message {
+            topic: w.topic,
+            payload: w.payload,
+            qos: w.qos,
+            retain: w.retain,
+            app,
+            // A will's Message Expiry Interval counts from PUBLICATION, which has not
+            // happened yet — the publish path stamps the deadline then (issue #227
+            // keeps will semantics unchanged).
+            expires_at: None,
+        },
     }
 }
 

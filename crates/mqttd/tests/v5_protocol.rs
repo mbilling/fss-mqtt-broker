@@ -200,6 +200,123 @@ async fn v5_will_user_properties_are_forwarded() {
     );
 }
 
+// --- will delay (§3.1.3.2.2, issue #299) ------------------------------------
+
+/// Open a v5 connection whose Will carries a Will Delay Interval, and whose
+/// session lives long enough for the delay to matter.
+async fn connect_with_delayed_will(
+    addr: std::net::SocketAddr,
+    client_id: &str,
+    topic: &str,
+    delay_secs: u32,
+    session_expiry: u32,
+) -> Client {
+    let mut c = Client::open(addr, ProtocolVersion::V5).await;
+    c.send(&Packet::Connect(Connect {
+        properties: Properties(vec![Property::SessionExpiryInterval(session_expiry)]),
+        protocol: ProtocolVersion::V5,
+        clean_session: false,
+        keep_alive: 30,
+        client_id: client_id.to_string(),
+        last_will: Some(LastWill {
+            topic: topic.to_string(),
+            payload: bytes::Bytes::from_static(b"gone"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            properties: Properties(vec![Property::WillDelayInterval(delay_secs)]),
+        }),
+        username: None,
+        password: None,
+    }))
+    .await;
+    match c.recv().await {
+        Packet::ConnAck(a) => assert_eq!(a.code, 0),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    c
+}
+
+/// §3.1.3.2.2: the Will is held for its Will Delay Interval, not published the
+/// instant the connection drops.
+///
+/// This is what the property is FOR: a brief network blip must not announce a
+/// death that did not happen. Found by the Eclipse `paho.mqtt.testing` oracle
+/// (`test_will_delay`, issue #299), which measured the Will arriving at 0.1 s
+/// where 4 s had been asked for.
+#[tokio::test]
+async fn v5_a_will_is_held_for_its_delay_then_published() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "delay-watch").await;
+    watcher.subscribe(1, "wills/delayed", QoS::AtMostOnce).await;
+
+    let dying = connect_with_delayed_will(addr, "delay-dies", "wills/delayed", 2, 300).await;
+    drop(dying); // abrupt close — ungraceful, so the Will is owed
+
+    // Not immediately: the whole point of the delay.
+    assert!(
+        matches!(
+            watcher.recv_bounded(Duration::from_millis(700)).await,
+            common::Recv::Quiet
+        ),
+        "the will must be HELD for its delay, not published on the drop"
+    );
+
+    // ...and then it arrives, once the delay has elapsed (2s delay + the 1s sweep
+    // cadence, with margin for a loaded runner).
+    let p = watcher.expect_publish().await;
+    assert_eq!(p.topic, "wills/delayed");
+    assert_eq!(&p.payload[..], b"gone");
+}
+
+/// The half that makes the delay worth having: a client that comes back inside
+/// the window cancels its own Will. Without this the feature is only a slower
+/// announcement of a death that did not happen.
+#[tokio::test]
+async fn v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "cancel-watch").await;
+    watcher
+        .subscribe(1, "wills/cancelled", QoS::AtMostOnce)
+        .await;
+
+    let dying = connect_with_delayed_will(addr, "cancel-dies", "wills/cancelled", 3, 300).await;
+    drop(dying);
+
+    // Back well inside the 3s window.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _back = connect_with_delayed_will(addr, "cancel-dies", "wills/cancelled", 3, 300).await;
+
+    // Past when the will would have fired had the reconnect not cancelled it.
+    assert!(
+        matches!(
+            watcher.recv_bounded(Duration::from_secs(5)).await,
+            common::Recv::Quiet
+        ),
+        "a client that returned inside its will delay must not have its will published"
+    );
+}
+
+/// §3.1.3.2.2 publishes on "delay elapsed" OR "session ended", whichever is
+/// FIRST — so a delay longer than the session's own lifetime is bounded by it.
+/// A Will must never outlive the session it describes.
+#[tokio::test]
+async fn v5_a_will_delay_is_bounded_by_the_session_expiry() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "bound-watch").await;
+    watcher.subscribe(1, "wills/bounded", QoS::AtMostOnce).await;
+
+    // Expiry 0: the session ends the moment the connection does, so the will is
+    // due at once however long a delay was requested.
+    let dying = connect_with_delayed_will(addr, "bound-dies", "wills/bounded", 3600, 0).await;
+    drop(dying);
+
+    let p = watcher.expect_publish().await;
+    assert_eq!(
+        p.topic, "wills/bounded",
+        "a session that ends at once publishes its will at once, delay or not"
+    );
+}
+
 // --- session expiry (ADR 0009 phase 1) --------------------------------------
 
 #[tokio::test]
