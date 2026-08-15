@@ -33,6 +33,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Re-exported so the binary wires the hub's own bounds type (issue #241).
+pub use crate::backpressure::SubscriberLimits;
+use crate::backpressure::{message_bytes, packet_bytes, BacklogBound, BacklogEntry, BacklogQueue};
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
@@ -65,11 +68,6 @@ const REPLAY_LIMIT: usize = 10_000;
 /// Default outbound Receive Maximum when the client advertised none — effectively
 /// unlimited (ADR 0012). v3.1.1 sessions always use this.
 const RECEIVE_MAXIMUM_DEFAULT: u16 = u16::MAX;
-
-/// Maximum `QoS` > 0 messages held in a session's flow-control backlog before
-/// drop-oldest evicts (ADR 0012). Bounds broker memory under a stalled consumer,
-/// mirroring the offline-queue cap (ADR 0001 §6).
-const MAX_BACKLOG: usize = 10_000;
 
 /// How often the hub sweeps for sessions whose MQTT 5.0 Session Expiry Interval has
 /// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
@@ -203,33 +201,81 @@ pub struct RemoteSharedGroup {
 /// The channel is unbounded *by design* — a bounded one would make the hub block
 /// or drop control packets, and the hub must never stall on one slow client. But
 /// unbounded with no visibility was a memory leak with a nice name: `QoS 1/2` is
-/// bounded by [`MAX_BACKLOG`] via the flow-control path, while **`QoS 0` went
-/// straight into this channel with no cap, no counter and no shed policy** (#123).
-/// `QoS 0` is also exempt from Receive Maximum, so nothing else applied
-/// backpressure — a subscriber that stopped reading a busy topic grew this
+/// bounded by the flow-control backlog ([`BacklogQueue`]) via the flow-control path,
+/// while **`QoS 0` went straight into this channel with no cap, no counter and no
+/// shed policy** (#123). `QoS 0` is also exempt from Receive Maximum, so nothing else
+/// applied backpressure — a subscriber that stopped reading a busy topic grew this
 /// without limit.
 ///
 /// So the depth is tracked here: cheap on the hot path (one relaxed add, one
 /// relaxed sub), and it lets the hub shed `QoS 0` — which MQTT defines as
 /// at-most-once, so dropping it is legal — while every other packet still flows.
+///
+/// Since issue #241 the queued **bytes** are tracked alongside the count, because a
+/// packet count is not a memory budget under mixed-size traffic: at the 1 MiB default
+/// packet ceiling the 10 000-packet cap alone allowed ~10 GiB to sit here.
+/// `MQTTD_MAX_OUTBOUND_BYTES` bounds the bytes; the count cap still applies.
+///
+/// **Exactness class, stated honestly:** this counter is cross-task — the hub adds, the
+/// connection's writer subtracts — so it equals the sum over packets the writer has not yet
+/// DEQUEUED. `OutboundMeter::drained` subtracts on `recv()`, before the topic-alias rewrite
+/// and before the write, so a packet currently being written has ALREADY been subtracted and
+/// is excluded. The counter therefore under-counts resident bytes by at most one packet.
+/// That direction is the safe one for a gate — it never over-states pressure and so never
+/// sheds early — but it is the opposite of what this doc claimed until review caught it.
+/// Same semantics [`depth`](Self::depth) has always had, and deliberately *weaker* than the
+/// single-owner exactness of [`BacklogQueue::bytes`].
 #[derive(Clone, Debug)]
 pub struct Outbound {
     tx: mpsc::UnboundedSender<Packet>,
     depth: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+}
+
+/// The reader half of the outbound accounting: what a connection's writer calls for each
+/// packet it dequeues, so the hub's view of that client's queue shrinks.
+///
+/// One type with one method rather than two loose atomics, so the depth and the byte
+/// total structurally cannot be decremented in different places — or one of them
+/// forgotten.
+#[derive(Clone, Debug)]
+pub struct OutboundMeter {
+    depth: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl OutboundMeter {
+    /// One packet left the channel for the socket. Call it with the packet **as
+    /// received**, before any outbound rewrite: add and subtract are then the same pure
+    /// function of the same immutable packet, which is what makes the counter return to
+    /// zero rather than drift.
+    pub fn drained(&self, packet: &Packet) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+        let n = packet_bytes(packet);
+        // Saturating rather than wrapping: a counter that went momentarily negative
+        // would read as ~18 EiB and pin the `QoS` 0 gate shut forever.
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                Some(b.saturating_sub(n))
+            });
+    }
 }
 
 impl Outbound {
-    /// Wrap a channel, returning the sender and the counter its reader must
-    /// decrement as it drains.
+    /// Wrap a channel, returning the sender and the meter its reader must call as it
+    /// drains.
     #[must_use]
-    pub fn new(tx: mpsc::UnboundedSender<Packet>) -> (Self, Arc<AtomicUsize>) {
+    pub fn new(tx: mpsc::UnboundedSender<Packet>) -> (Self, OutboundMeter) {
         let depth = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
         (
             Self {
                 tx,
                 depth: depth.clone(),
+                bytes: bytes.clone(),
             },
-            depth,
+            OutboundMeter { depth, bytes },
         )
     }
 
@@ -239,10 +285,13 @@ impl Outbound {
     /// the same way — the packet is dropped and a Detach is already in flight — so
     /// this is a plain bool rather than a `Result` carrying a whole `Packet` back.
     pub fn send(&self, packet: Packet) -> bool {
+        let n = packet_bytes(&packet);
         self.depth.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(n, Ordering::Relaxed);
         if self.tx.send(packet).is_err() {
-            // Never queued, so never drained: keep the count honest.
+            // Never queued, so never drained: keep both counts honest.
             self.depth.fetch_sub(1, Ordering::Relaxed);
+            self.bytes.fetch_sub(n, Ordering::Relaxed);
             return false;
         }
         true
@@ -253,14 +302,62 @@ impl Outbound {
     pub fn depth(&self) -> usize {
         self.depth.load(Ordering::Relaxed)
     }
+
+    /// Accounted bytes queued for this client but not yet written to its socket
+    /// (issue #241). See the type docs for what "accounted" means and why this is a
+    /// weaker exactness class than the backlog's.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// How many packets may sit unwritten for one client before `QoS 0` is shed.
 ///
 /// Sized so it is unreachable by well-behaved clients and by the `QoS 1/2` paths
-/// (which [`MAX_BACKLOG`] already bounds), and only bites a consumer that has
-/// genuinely stopped reading.
+/// (which the flow-control backlog already bounds), and only bites a consumer that has
+/// genuinely stopped reading. The **byte** dimension is the operator's
+/// (`MQTTD_MAX_OUTBOUND_BYTES`, issue #241); this count stays fixed because bytes were
+/// the missing dimension, not the count.
 pub const MAX_OUTBOUND_QUEUE: usize = 10_000;
+
+/// One WARN for a backlog eviction, naming **which bound fired** and how much it shed
+/// (issue #241).
+///
+/// The bound goes in the log line, not into the metric's label set: the counter stays
+/// `publish_dropped{reason="backlog-overflow"}` with exactly its existing labels, so
+/// cardinality discipline holds and existing dashboards keep working. One line per push
+/// rather than per entry — a byte bound can shed several at once, and `dropped` says how
+/// many.
+///
+/// `bound` is derived from *every* entry that went, not from the first: one arrival can
+/// trip the count bound and then still be over the byte bound, and a line that named only
+/// the count would send the operator to the wrong knob.
+fn warn_backlog_eviction(
+    client: &ClientId,
+    evicted: &[(BacklogEntry, BacklogBound)],
+    bytes_now: usize,
+    limits: &SubscriberLimits,
+) {
+    let by_bytes = evicted
+        .iter()
+        .filter(|(_, b)| *b == BacklogBound::Bytes)
+        .count();
+    let bound = match (by_bytes, evicted.len() - by_bytes) {
+        (0, _) => BacklogBound::Messages.as_str(),
+        (_, 0) => BacklogBound::Bytes.as_str(),
+        _ => "messages+bytes",
+    };
+    warn!(
+        client = %client.0,
+        dropped = evicted.len(),
+        bound,
+        bytes = bytes_now,
+        cap_messages = limits.max_backlog_messages,
+        cap_bytes = ?limits.max_backlog_bytes,
+        "flow-control backlog full: evicted the oldest already-acked message(s)"
+    );
+}
 
 /// Sender for messages destined to a peer node's link.
 pub type PeerOutbound = mpsc::UnboundedSender<PeerMessage>;
@@ -524,17 +621,6 @@ struct PendingOut {
     /// cap rejected under `reject-newest` — none of which owe a redelivery. (Brownout no
     /// longer appears here: it refuses the publish rather than sending an unrecorded
     /// copy — 0041-T11, issue #238.)
-    offset: Option<Offset>,
-}
-
-/// A `QoS` > 0 message held back because the session's Receive Maximum quota is full
-/// (ADR 0012). It has no packet id yet — one is assigned when it is finally sent.
-#[derive(Debug)]
-struct Backlog {
-    message: Message,
-    retain: bool,
-    message_expiry: Option<u32>,
-    /// Its durable log offset, as for [`PendingOut::offset`] (#124).
     offset: Option<Offset>,
 }
 
@@ -869,7 +955,12 @@ struct Inflight {
     /// have unacked to it at once (ADR 0012).
     receive_maximum: u16,
     /// `QoS` > 0 messages waiting for quota; drained FIFO as PUBACK/PUBCOMP frees slots.
-    backlog: VecDeque<Backlog>,
+    ///
+    /// Bounded in **both** messages and bytes by the operator's [`SubscriberLimits`]
+    /// (issue #241), drop-oldest at either bound (ADR 0012, policy unchanged). The
+    /// running byte total lives inside [`BacklogQueue`] with private fields precisely so
+    /// this 18 000-line module cannot mutate the queue without adjusting it.
+    backlog: BacklogQueue,
     /// Durable log offsets appended for this session and not yet acknowledged by the
     /// subscriber (#124). The log is truncated only through the **contiguous** acked
     /// prefix, so an out-of-order PUBACK cannot discard a message still in flight
@@ -905,7 +996,7 @@ impl Default for Inflight {
             block_remaining: 0,
             pending: BTreeMap::new(),
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
-            backlog: VecDeque::new(),
+            backlog: BacklogQueue::default(),
             outstanding: BTreeSet::new(),
             high_water: 0,
             acked_through: 0,
@@ -956,16 +1047,19 @@ impl Inflight {
         })
     }
 
-    /// Append to the flow-control backlog, evicting the oldest entry when the cap is
-    /// reached (drop-oldest, ADR 0012). Returns the evicted entry, if any — the caller
-    /// must [`release`](Self::release) its durable offset, since nothing will deliver
-    /// it and an offset owed forever would stop the log ever being truncated.
-    fn push_backlog(&mut self, entry: Backlog) -> Option<Backlog> {
-        let evicted = (self.backlog.len() >= MAX_BACKLOG)
-            .then(|| self.backlog.pop_front())
-            .flatten();
-        self.backlog.push_back(entry);
-        evicted
+    /// Append to the flow-control backlog, evicting the oldest entries until BOTH the
+    /// message and the byte bound hold (drop-oldest, ADR 0012, issue #241). Returns the
+    /// evicted entries oldest-first with the bound that evicted each — the caller must
+    /// [`release`](Self::release) every offset, since nothing will deliver those
+    /// messages and an offset owed forever would stop the log ever being truncated.
+    ///
+    /// The byte bound may evict several entries where the count bound evicts one.
+    fn push_backlog(
+        &mut self,
+        entry: BacklogEntry,
+        limits: &SubscriberLimits,
+    ) -> Vec<(BacklogEntry, BacklogBound)> {
+        self.backlog.push_back_capped(entry, limits)
     }
 }
 
@@ -1903,6 +1997,11 @@ pub struct Hub {
     /// Wall-clock source for absolute message-expiry deadlines (ADR 0009 §3).
     /// Injectable so expiry can be tested without real time passing.
     clock: Arc<dyn crate::clock::Clock>,
+    /// The operator's per-subscriber in-memory bounds (issue #241, ADR 0041 T10). Set
+    /// once before [`run`](Self::run); a reload reports `limits` as requires-restart
+    /// (ADR 0041 §6), so this is never swapped mid-flight. `Default` is exactly the
+    /// former hard-coded behaviour.
+    subscriber_limits: SubscriberLimits,
 }
 
 /// The bounded `{reason}` label for a durable-append failure (ADR 0020-T6).
@@ -2267,6 +2366,7 @@ impl Hub {
                 placement,
                 metrics: None,
                 clock: crate::clock::system_clock(),
+                subscriber_limits: SubscriberLimits::default(),
             },
             tx,
         )
@@ -2311,6 +2411,15 @@ impl Hub {
     /// Attach the shared brownout status the `/statusz` body reads (ADR 0054).
     pub fn attach_brownout_status(&mut self, status: Arc<crate::health::BrownoutStatus>) {
         self.brownout_status = Some(status);
+    }
+
+    /// Set the per-subscriber in-memory bounds before [`run`](Self::run) (issue #241).
+    ///
+    /// Startup-only, like the other `attach_*` setters: a reload reports the `limits`
+    /// section as requires-restart (ADR 0041 §6) rather than half-applying a bound to
+    /// queues that are already at it.
+    pub fn set_subscriber_limits(&mut self, limits: SubscriberLimits) {
+        self.subscriber_limits = limits;
     }
 
     /// Record that `axis` is (or is no longer) over its watermark, and recompute the
@@ -3468,10 +3577,23 @@ impl Hub {
 
         // Adopt this connection's outbound Receive Maximum quota (ADR 0012). A
         // reconnect may carry a different value than the prior one.
+        //
+        // `MQTTD_MAX_INFLIGHT_MESSAGES` caps it (issue #241). A client's Receive Maximum
+        // is a ceiling on what the broker MAY send it, never a floor, so lowering it is
+        // protocol-legal — and it is the LOSS-FREE lever: the in-flight table is the
+        // second-largest per-subscriber structure (65 535 entries by default, since every
+        // v3.1.1 client and any v5 client with no property gets `u16::MAX`), and an entry
+        // there is on the wire under a packet id, so it could never be shed without
+        // breaking DUP redelivery or the QoS 2 handshake. Capping the window diverts the
+        // surplus into the (byte-bounded) backlog instead of dropping anything.
         self.inflight
             .entry(client.clone())
             .or_default()
-            .receive_maximum = receive_maximum;
+            .receive_maximum = receive_maximum.min(
+            self.subscriber_limits
+                .max_inflight_messages
+                .unwrap_or(u16::MAX),
+        );
 
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
@@ -4632,22 +4754,23 @@ impl Hub {
         if !gated {
             return false;
         }
+        let limits = self.subscriber_limits;
         let inf = self.inflight.entry(job.client.clone()).or_default();
-        let evicted = inf.push_backlog(Backlog {
-            message: job.message.clone(),
-            retain: job.retain,
-            message_expiry: job.message_expiry,
-            offset: None,
-        });
-        if let Some(evicted) = evicted {
-            if let Some(offset) = evicted.offset {
-                inf.release(offset);
+        let evicted = inf.push_backlog(
+            BacklogEntry::new(job.message.clone(), job.retain, job.message_expiry, None),
+            &limits,
+        );
+        if !evicted.is_empty() {
+            let bytes = inf.backlog.bytes();
+            for (e, _) in &evicted {
+                if let Some(offset) = e.offset {
+                    inf.release(offset);
+                }
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("backlog-overflow");
+                }
             }
-            warn!(client = %job.client.0, cap = MAX_BACKLOG,
-                  "flow-control backlog full: evicted oldest message");
-            if let Some(m) = &self.metrics {
-                m.publish_dropped("backlog-overflow");
-            }
+            warn_backlog_eviction(&job.client, &evicted, bytes, &limits);
             self.truncate_acked(&job.client).await;
         }
         true
@@ -4731,12 +4854,12 @@ impl Hub {
                         .entry(job.client.clone())
                         .or_default()
                         .backlog
-                        .push_front(Backlog {
-                            message: job.message,
-                            retain: job.retain,
-                            message_expiry: job.message_expiry,
-                            offset: Some(offset),
-                        });
+                        .push_front_admitted(BacklogEntry::new(
+                            job.message,
+                            job.retain,
+                            job.message_expiry,
+                            Some(offset),
+                        ));
                 }
                 // Fence failed: the entry is simply dropped — the offset stays
                 // owed and the reattach replay owns delivery, the same rule the
@@ -4789,9 +4912,9 @@ impl Hub {
     /// spawned single-flight task owning only `(client, store, self_tx)` — the
     /// off-loop contract. [`PkidBlockReserved`](HubCommand::PkidBlockReserved)
     /// banks the result and drains.
-    fn defer_for_pkid_block(&mut self, client: &ClientId, entry: Backlog) {
+    fn defer_for_pkid_block(&mut self, client: &ClientId, entry: BacklogEntry) {
         let inf = self.inflight.entry(client.clone()).or_default();
-        inf.backlog.push_front(entry);
+        inf.backlog.push_front_admitted(entry);
         if inf.reserve_outstanding {
             return;
         }
@@ -5152,6 +5275,7 @@ impl Hub {
         message_expiry: Option<u32>,
         offset: Option<Offset>,
     ) {
+        let limits = self.subscriber_limits;
         // `QoS` 0 owes no acknowledgement, so a replayed one is settled the moment it is
         // handed to the channel — only `QoS` > 0 becomes owed.
         if let Some(offset) = offset.filter(|_| message.qos != QoS::AtMostOnce) {
@@ -5162,20 +5286,34 @@ impl Hub {
         }
         if message.qos == QoS::AtMostOnce {
             // QoS 0 is the only path with no other bound: the QoS 1/2 backlog is
-            // capped by MAX_BACKLOG below, and Receive Maximum does not apply to
-            // QoS 0 — so without this a subscriber that stopped reading a busy
+            // capped in messages and bytes below, and Receive Maximum does not apply
+            // to QoS 0 — so without this a subscriber that stopped reading a busy
             // topic grew its outbound channel without limit (#123).
             //
             // At-most-once is exactly the delivery contract that permits dropping,
             // so shedding here is legal where dropping a QoS 1/2 message or an ack
             // would not be. Counted and logged: a silent drop would be the same
             // defect in a different place.
-            if tx.depth() >= MAX_OUTBOUND_QUEUE {
+            //
+            // Two dimensions since issue #241: the fixed packet count, and the
+            // operator's byte bound — because 10 000 packets at the 1 MiB default
+            // packet ceiling is ~10 GiB, i.e. a count is not a memory budget. The
+            // gate covers ONLY this shed-legal class; control packets and QoS 1/2
+            // still flow past a full channel, exactly as before.
+            let over_bytes = limits
+                .max_outbound_bytes
+                .is_some_and(|c| tx.bytes() + message_bytes(message) > c);
+            if tx.depth() >= MAX_OUTBOUND_QUEUE || over_bytes {
                 if let Some(m) = &self.metrics {
                     m.publish_dropped("outbound-full");
                 }
                 warn!(
-                    client = %client.0, cap = MAX_OUTBOUND_QUEUE, topic = %message.topic,
+                    client = %client.0,
+                    bound = if over_bytes { "bytes" } else { "packets" },
+                    cap_packets = MAX_OUTBOUND_QUEUE,
+                    cap_bytes = ?limits.max_outbound_bytes,
+                    queued_bytes = tx.bytes(),
+                    topic = %message.topic,
                     "outbound queue full: shedding QoS 0 for a subscriber that is not reading"
                 );
                 return;
@@ -5211,25 +5349,26 @@ impl Hub {
         let inf = self.inflight.entry(client.clone()).or_default();
         let must_queue = inf.quota_full() || !inf.backlog.is_empty() || inf.records_pending > 0;
         if must_queue {
-            // The backlog is bounded (ADR 0012); drop-oldest on overflow so a stalled
-            // consumer cannot force unbounded memory.
-            let evicted = inf.push_backlog(Backlog {
-                message: message.clone(),
-                retain,
-                message_expiry,
-                offset,
-            });
-            if let Some(evicted) = evicted {
-                if let Some(offset) = evicted.offset {
-                    inf.release(offset);
+            // The backlog is bounded in messages AND bytes (ADR 0012, issue #241);
+            // drop-oldest at either bound so a stalled consumer cannot force unbounded
+            // memory. The byte bound may evict several entries for one arrival.
+            let evicted = inf.push_backlog(
+                BacklogEntry::new(message.clone(), retain, message_expiry, offset),
+                &limits,
+            );
+            if !evicted.is_empty() {
+                let bytes = inf.backlog.bytes();
+                for (e, _) in &evicted {
+                    if let Some(offset) = e.offset {
+                        inf.release(offset);
+                    }
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("backlog-overflow");
+                    }
                 }
-                warn!(client = %client.0, cap = MAX_BACKLOG,
-                      "flow-control backlog full: evicted oldest message");
-                if let Some(m) = &self.metrics {
-                    m.publish_dropped("backlog-overflow");
-                }
-                // Nothing will deliver the evicted message, so its offset no longer
-                // holds the truncation point back.
+                warn_backlog_eviction(client, &evicted, bytes, &limits);
+                // Nothing will deliver the evicted messages, so their offsets no longer
+                // hold the truncation point back.
                 self.truncate_acked(client).await;
             }
             // Quota free but the backlog holds a deferred delivery: retry the drain now,
@@ -5323,12 +5462,7 @@ impl Hub {
             // used to wait in the inline await.
             self.defer_for_pkid_block(
                 client,
-                Backlog {
-                    message: message.clone(),
-                    retain,
-                    message_expiry,
-                    offset,
-                },
+                BacklogEntry::new(message.clone(), retain, message_expiry, offset),
             );
             return QosSend::Deferred;
         };
@@ -5425,12 +5559,12 @@ impl Hub {
                 let inf = self.inflight.entry(client.clone()).or_default();
                 inf.pending.remove(&pkid);
                 inf.records_pending = inf.records_pending.saturating_sub(1);
-                inf.backlog.push_front(Backlog {
-                    message: message.clone(),
+                inf.backlog.push_front_admitted(BacklogEntry::new(
+                    message.clone(),
                     retain,
                     message_expiry,
-                    offset: Some(off),
-                });
+                    Some(off),
+                ));
                 QosSend::Deferred
             }
         }
@@ -5907,7 +6041,8 @@ impl Hub {
             Some(inf) if !inf.backlog.is_empty() => {
                 let now = self.clock.now_epoch_secs();
                 inf.backlog
-                    .drain(..)
+                    .drain_all()
+                    .into_iter()
                     // At-most-once owes no redelivery: a `QoS` 0 parked here for
                     // wire order (issue #242 finding A) dies with the connection,
                     // exactly like one sitting in the closed conn channel.
@@ -6895,6 +7030,19 @@ impl Hub {
         m.set_sessions(self.online.len() + offline_persistent);
         m.set_subscriptions(self.subs_by_client.values().map(HashMap::len).sum());
         m.set_inflight_messages(self.inflight.values().map(|i| i.pending.len()).sum());
+        // Flow-control backlog bytes across sessions (issue #241): so an operator can SEE
+        // the number before choosing a byte cap, and watch it after.
+        // Both, from one pass: the SUM answers "how much RAM is in backlogs on this node",
+        // while the MAX is what a PER-SUBSCRIBER cap must be sized against (issue #241 review
+        // — the docs pointed operators at the sum for a per-subscriber decision).
+        m.set_backlog_bytes(self.inflight.values().map(|i| i.backlog.bytes()).sum());
+        m.set_backlog_bytes_max(
+            self.inflight
+                .values()
+                .map(|i| i.backlog.bytes())
+                .max()
+                .unwrap_or(0),
+        );
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
         m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
@@ -8844,8 +8992,11 @@ pub(crate) fn app_from_wire(w: mqtt_cluster::peer::WireAppProps) -> AppPropertie
     }
 }
 
+// `pub(crate)` so `backpressure`'s byte-accounting identity test can assert against the packet
+// the broker ACTUALLY sends, rather than a hand-assembled lookalike — the previous version of
+// that test built its own packet and was therefore blind to a per-property disagreement.
 #[allow(clippy::too_many_arguments)] // a thin PUBLISH constructor; all fields are the wire packet's
-fn publish_packet(
+pub(crate) fn publish_packet(
     topic: &str,
     payload: Bytes,
     qos: QoS,
@@ -9159,9 +9310,12 @@ mod tests {
     }
 
     use super::{
-        Admission, AttachOutcome, AuthMethod, Backlog, BrownoutAxis, Hub, HubCommand, Inflight,
-        Outbound, PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup,
-        EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+        Admission, AttachOutcome, AuthMethod, BrownoutAxis, Hub, HubCommand, Inflight, Outbound,
+        PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup,
+        EXPIRY_RECONCILE_EVERY, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+    };
+    use crate::backpressure::{
+        BacklogBound, BacklogEntry, SubscriberLimits, DEFAULT_MAX_BACKLOG_MESSAGES,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
@@ -12540,42 +12694,329 @@ mod tests {
 
     /// The flow-control backlog is bounded: past the cap it drops the oldest held
     /// message rather than growing without limit (ADR 0012).
+    ///
+    /// Kept verbatim modulo the issue #241 API rename — it is the **regression witness**
+    /// for the no-silent-change criterion: with the DEFAULT limits, the boundary is still
+    /// exactly 10 000 pushes with no eviction and one eviction on the 10 001st.
     #[test]
     fn flow_control_backlog_is_bounded_drop_oldest() {
+        let limits = SubscriberLimits::default();
         let mut inf = Inflight::default();
-        let entry = |topic: String| Backlog {
-            message: mqtt_core::Message {
-                topic,
-                payload: Bytes::from_static(b"x"),
-                qos: QoS::AtLeastOnce,
-                retain: false,
-                app: AppProperties::default(),
-                expires_at: None,
-            },
-            retain: false,
-            message_expiry: None,
-            offset: None,
+        let entry = |topic: String| {
+            BacklogEntry::new(
+                mqtt_core::Message {
+                    topic,
+                    payload: Bytes::from_static(b"x"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    app: AppProperties::default(),
+                    expires_at: None,
+                },
+                false,
+                None,
+                None,
+            )
         };
-        for i in 0..MAX_BACKLOG {
+        for i in 0..DEFAULT_MAX_BACKLOG_MESSAGES {
             assert!(
-                inf.push_backlog(entry(format!("t{i}"))).is_none(),
+                inf.push_backlog(entry(format!("t{i}")), &limits).is_empty(),
                 "no eviction under the cap"
             );
         }
         // At the cap, the next push evicts the oldest (t0) and stays bounded.
+        let evicted = inf.push_backlog(entry("overflow".into()), &limits);
         assert_eq!(
-            inf.push_backlog(entry("overflow".into()))
-                .map(|e| e.message.topic),
-            Some("t0".to_string()),
+            evicted.len(),
+            1,
+            "exactly one entry goes at the count bound"
+        );
+        assert_eq!(
+            evicted[0].0.message.topic, "t0",
             "the oldest is the one evicted at the cap"
         );
-        assert_eq!(inf.backlog.len(), MAX_BACKLOG, "backlog stays bounded");
+        assert_eq!(evicted[0].1, BacklogBound::Messages);
+        assert_eq!(
+            inf.backlog.len(),
+            DEFAULT_MAX_BACKLOG_MESSAGES,
+            "backlog stays bounded"
+        );
         assert_eq!(
             inf.backlog.front().unwrap().message.topic,
             "t1",
             "oldest was dropped"
         );
         assert_eq!(inf.backlog.back().unwrap().message.topic, "overflow");
+    }
+
+    /// A hub with metrics and explicit per-subscriber bounds (issue #241).
+    fn start_hub_with_limits(
+        limits: SubscriberLimits,
+    ) -> (HubTx, std::sync::Arc<mqtt_observability::metrics::Metrics>) {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        hub.set_subscriber_limits(limits);
+        tokio::spawn(hub.run());
+        (tx, metrics)
+    }
+
+    /// A publish whose message accounts for exactly `bytes` (issue #241's size
+    /// definition: envelope + topic + payload + properties).
+    fn publish_sized(tx: &HubTx, topic: &str, qos: QoS, bytes: usize, marker: u8) {
+        let fixed = crate::backpressure::ENTRY_OVERHEAD + topic.len();
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from(vec![marker; bytes - fixed]),
+            qos,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+        })
+        .unwrap();
+    }
+
+    /// The delivered `QoS` of a PUBLISH, so a test can tell a shed-legal class from one
+    /// that must never be shed.
+    fn qos_of(packet: &Packet) -> QoS {
+        match packet {
+            Packet::Publish(p) => p.qos,
+            other => panic!("expected a publish, got {other:?}"),
+        }
+    }
+
+    /// How many times `reason` was counted, read out of the rendered exposition.
+    fn dropped_for(metrics: &mqtt_observability::metrics::Metrics, reason: &str) -> u64 {
+        let needle = format!("mqttd_publish_dropped_total{{reason=\"{reason}\"}} ");
+        metrics
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(&needle))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Issue #241, end-to-end on the real hub: with a BYTE bound set, a subscriber that
+    /// stops acknowledging sheds already-acked entries at that bound — long before the
+    /// 10 000-message count bound — counted as `publish_dropped{reason="backlog-overflow"}`
+    /// and with the NEWEST messages surviving in FIFO order.
+    ///
+    /// It also pins what did NOT change: `queue-overflow` belongs to the DURABLE offline
+    /// queue, which this change does not touch, and `outbound-full` to the `QoS` 0
+    /// channel. Neither moves.
+    #[tokio::test]
+    async fn the_backlog_byte_bound_sheds_acked_entries_and_counts_them() {
+        // 1 KiB per message; a 4 KiB cap therefore holds 4.
+        let (tx, metrics) = start_hub_with_limits(SubscriberLimits {
+            max_backlog_bytes: Some(4096),
+            ..SubscriberLimits::default()
+        });
+        // Receive Maximum 1 and never a PUBACK: everything after the first message piles
+        // into the flow-control backlog.
+        let (mut rx, _) = attach_full(&tx, "slow", 1, true, 0, 1).await;
+        subscribe_qos(&tx, "slow", "t/1", QoS::AtLeastOnce);
+        // One warm-up delivery first: a session's FIRST QoS>0 send finds its packet-id
+        // block spent and parks in the backlog while the reservation runs off-loop
+        // (issue #242 finding A). Draining that deferral before the run under test keeps
+        // this about the byte bound rather than about the id reservation.
+        publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'W');
+        let warm = recv_packet(&mut rx).await.expect("the warm-up delivery");
+        assert_eq!(payload_of(&warm)[0], b'W');
+        pub_ack(&tx, "slow", pkid_of(&warm));
+
+        for i in 0..8u8 {
+            publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'a' + i);
+        }
+
+        // The first is on the wire under the quota of one.
+        let first = recv_packet(&mut rx).await.expect("the first delivery");
+        assert_eq!(payload_of(&first)[0], b'a');
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the quota holds the rest"
+        );
+
+        // Seven pushes into a queue that holds four: three evictions at the BYTE bound.
+        assert_eq!(
+            dropped_for(&metrics, "backlog-overflow"),
+            3,
+            "eviction at the byte bound, not the count bound: {}",
+            metrics.render()
+        );
+        assert_eq!(
+            dropped_for(&metrics, "queue-overflow"),
+            0,
+            "the DURABLE queue's counter is untouched by a RAM bound"
+        );
+        assert_eq!(dropped_for(&metrics, "outbound-full"), 0);
+
+        // Drop-oldest: what survived is the NEWEST four, delivered in FIFO order as acks
+        // free the quota.
+        let mut delivered = vec![payload_of(&first)[0]];
+        let mut pkid = pkid_of(&first);
+        for _ in 0..4 {
+            pub_ack(&tx, "slow", pkid);
+            let Some(pkt) = recv_packet(&mut rx).await else {
+                break;
+            };
+            delivered.push(payload_of(&pkt)[0]);
+            pkid = pkid_of(&pkt);
+        }
+        assert_eq!(
+            delivered,
+            vec![b'a', b'e', b'f', b'g', b'h'],
+            "the three oldest held messages (b, c, d) were the ones shed"
+        );
+    }
+
+    /// Issue #241: the outbound channel's byte bound sheds `QoS` 0 well before the fixed
+    /// 10 000-PACKET cap — and it gates ONLY that shed-legal class, so a `QoS` 1 delivery
+    /// in the same state still reaches the wire.
+    #[tokio::test]
+    async fn the_outbound_byte_cap_sheds_qos0_before_the_packet_count_cap() {
+        let (tx, metrics) = start_hub_with_limits(SubscriberLimits {
+            max_outbound_bytes: Some(4096),
+            ..SubscriberLimits::default()
+        });
+        // Nothing ever calls the meter for this receiver, so the channel never drains —
+        // exactly a subscriber that stopped reading.
+        let (mut rx, _) = attach_full(&tx, "deaf", 1, true, 0, u16::MAX).await;
+        subscribe_qos(&tx, "deaf", "t/1", QoS::AtLeastOnce);
+
+        for i in 0..8u8 {
+            publish_sized(&tx, "t/1", QoS::AtMostOnce, 1024, b'a' + i);
+        }
+        // A QoS 1 arriving while the channel is over its byte bound is NOT shed.
+        publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'Z');
+
+        let mut got = Vec::new();
+        while let Some(pkt) = recv_packet(&mut rx).await {
+            got.push((payload_of(&pkt)[0], qos_of(&pkt)));
+        }
+        assert_eq!(
+            dropped_for(&metrics, "outbound-full"),
+            4,
+            "shed at the byte bound with the packet count nowhere near 10 000: {}",
+            metrics.render()
+        );
+        assert_eq!(
+            got,
+            vec![
+                (b'a', QoS::AtMostOnce),
+                (b'b', QoS::AtMostOnce),
+                (b'c', QoS::AtMostOnce),
+                (b'd', QoS::AtMostOnce),
+                (b'Z', QoS::AtLeastOnce),
+            ],
+            "four QoS 0 fit the 4 KiB budget; the QoS 1 flows past it"
+        );
+        assert_eq!(dropped_for(&metrics, "backlog-overflow"), 0);
+    }
+
+    /// Issue #241: the outbound byte counter is exactly the accounted sum of what the
+    /// writer has not yet dequeued, and it returns to ZERO once it drains. A counter that
+    /// drifted upward would pin the `QoS` 0 gate shut for the rest of the connection.
+    #[test]
+    fn the_outbound_byte_counter_returns_to_zero_when_the_writer_drains() {
+        use crate::backpressure::packet_bytes;
+        let (t, mut r) = mpsc::unbounded_channel();
+        let (out, meter) = Outbound::new(t);
+
+        let publish = |marker: u8, payload: usize| {
+            Packet::Publish(mqtt_codec::packet::Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "t/1".into(),
+                pkid: Some(u16::from(marker)),
+                properties: mqtt_codec::Properties::new(),
+                payload: Bytes::from(vec![marker; payload]),
+            })
+        };
+        let packets = vec![
+            publish(1, 100),
+            publish(2, 5000),
+            Packet::PubAck(mqtt_codec::packet::Ack::new(3)),
+        ];
+        let expected: usize = packets.iter().map(packet_bytes).sum();
+        for p in &packets {
+            assert!(out.send(p.clone()));
+        }
+        assert_eq!(out.bytes(), expected, "the accounted sum of what is queued");
+        assert_eq!(out.depth(), 3);
+
+        // Drained one at a time: each subtraction is that packet's own size.
+        let mut remaining = expected;
+        while let Ok(pkt) = r.try_recv() {
+            meter.drained(&pkt);
+            remaining -= packet_bytes(&pkt);
+            assert_eq!(out.bytes(), remaining);
+        }
+        assert_eq!(out.bytes(), 0, "a fully drained channel holds zero bytes");
+        assert_eq!(out.depth(), 0);
+
+        // A send that never queued (the client left) leaves both counters alone.
+        drop(r);
+        assert!(!out.send(publish(9, 42)));
+        assert_eq!(out.bytes(), 0);
+        assert_eq!(out.depth(), 0);
+    }
+
+    /// Issue #241: `MQTTD_MAX_INFLIGHT_MESSAGES` caps the client's OWN Receive Maximum —
+    /// legal, because a client's Receive Maximum is a ceiling on what the broker may send,
+    /// never a floor. It is the LOSS-FREE lever: the surplus waits in the backlog and
+    /// nothing is dropped.
+    #[tokio::test]
+    async fn an_inflight_ceiling_caps_the_clients_own_receive_maximum() {
+        let (tx, metrics) = start_hub_with_limits(SubscriberLimits {
+            max_inflight_messages: Some(2),
+            ..SubscriberLimits::default()
+        });
+        let (mut rx, _) = attach_full(&tx, "fast", 1, true, 0, 100).await;
+        subscribe_qos(&tx, "fast", "t/1", QoS::AtLeastOnce);
+        for i in 0..5u8 {
+            publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'a' + i);
+        }
+
+        let a = recv_packet(&mut rx).await.expect("the first");
+        let b = recv_packet(&mut rx).await.expect("the second");
+        assert_eq!((payload_of(&a)[0], payload_of(&b)[0]), (b'a', b'b'));
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the ceiling holds the third off the wire even though the client allowed 100"
+        );
+
+        // Acking one releases exactly one more — a gate, not a drop.
+        pub_ack(&tx, "fast", pkid_of(&a));
+        let c = recv_packet(&mut rx)
+            .await
+            .expect("the third, after one ack");
+        assert_eq!(payload_of(&c)[0], b'c');
+        assert!(recv_packet(&mut rx).await.is_none());
+        assert_eq!(
+            dropped_for(&metrics, "backlog-overflow"),
+            0,
+            "the in-flight ceiling drops nothing"
+        );
+        assert_eq!(dropped_for(&metrics, "outbound-full"), 0);
+        assert_eq!(dropped_for(&metrics, "queue-overflow"), 0);
+
+        // Unset, the client's own 100 stays in force: all five go straight out.
+        let (tx, _m) = start_hub_with_limits(SubscriberLimits::default());
+        let (mut rx, _) = attach_full(&tx, "fast", 1, true, 0, 100).await;
+        subscribe_qos(&tx, "fast", "t/1", QoS::AtLeastOnce);
+        for i in 0..5u8 {
+            publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'a' + i);
+        }
+        for want in b"abcde" {
+            let pkt = recv_packet(&mut rx).await.expect("an unthrottled delivery");
+            assert_eq!(payload_of(&pkt)[0], *want);
+        }
     }
 
     /// Receive Maximum bounds in-flight `QoS` > 0 deliveries: with a quota of 1, the

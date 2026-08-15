@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod aliases;
+pub mod backpressure;
 pub mod clock;
 pub mod cluster;
 pub mod config_watch;

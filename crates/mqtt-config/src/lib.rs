@@ -507,8 +507,44 @@ pub struct Limits {
     pub max_packet_size: Option<u64>,
     /// Per-client publish-rate cap, msg/s (`MQTTD_MAX_PUBLISH_RATE`).
     pub max_publish_rate: Option<u64>,
-    /// Per-client offline-queue depth (`MQTTD_MAX_QUEUED_MESSAGES`).
+    /// Per-client offline-queue depth (`MQTTD_MAX_QUEUED_MESSAGES`). Bounds **disk**
+    /// (the durable per-session queue), not the in-memory flow-control backlog.
     pub max_queued_messages: Option<u64>,
+    /// Messages one online subscriber's **in-memory flow-control backlog** may hold
+    /// before drop-oldest evicts (`MQTTD_MAX_BACKLOG_MESSAGES`, issue #241). Default
+    /// 10 000 — the former hard-coded `MAX_BACKLOG`. Range `1..=10_000_000`; **0 is
+    /// refused**, because ADR 0012 requires this structure be bounded and there is
+    /// deliberately no "unbounded" setting. Bounds RAM, per subscriber, per node — never
+    /// disk.
+    pub max_backlog_messages: Option<u64>,
+    /// Accounted bytes one online subscriber's in-memory flow-control backlog may hold
+    /// before drop-oldest evicts (`MQTTD_MAX_BACKLOG_BYTES`, issue #241). Unset = **off**,
+    /// which is exactly the pre-#241 behaviour; if set, at least 4096. Bounds RAM, per
+    /// subscriber, per node — never disk.
+    ///
+    /// The eviction sheds messages that were already stored and already acked, so a value
+    /// below `max_packet_size` makes that shed routine rather than exceptional (startup
+    /// warns). `max_inflight_messages` is the loss-free lever.
+    pub max_backlog_bytes: Option<u64>,
+    /// Accounted bytes that may sit unwritten in one client's **outbound socket channel**
+    /// before `QoS` 0 is shed (`MQTTD_MAX_OUTBOUND_BYTES`, issue #241). Unset = off; if
+    /// set, at least 4096. The fixed 10 000-packet cap applies either way. Only the
+    /// at-most-once class is shed — control packets and `QoS` 1/2 always flow. Bounds RAM.
+    pub max_outbound_bytes: Option<u64>,
+    /// A ceiling on the **effective outbound Receive Maximum**
+    /// (`MQTTD_MAX_INFLIGHT_MESSAGES`, issue #241): the broker keeps at most
+    /// `min(client Receive Maximum, this)` unacked `QoS` > 0 publishes per subscriber.
+    /// Unset = the client's own value verbatim, i.e. 65 535 for every v3.1.1 client and
+    /// any v5 client that sends no property. Range `1..=65_535`.
+    ///
+    /// A pure GATE: the surplus waits in the flow-control backlog, nothing is dropped —
+    /// so this is the loss-free way to bound per-subscriber RAM. It costs throughput for
+    /// a fast subscriber that legitimately keeps thousands in flight, and the deferred
+    /// traffic lands in the backlog, so set it deliberately.
+    ///
+    /// Distinct from `receive_maximum`, which is the **inbound** grant the broker
+    /// advertises to publishers.
+    pub max_inflight_messages: Option<u16>,
     /// Global retained-message cap (`MQTTD_MAX_RETAINED_MESSAGES`).
     pub max_retained_messages: Option<u64>,
     /// Global session cap (`MQTTD_MAX_SESSIONS`).
@@ -564,6 +600,10 @@ impl Default for Limits {
             max_packet_size: None,
             max_publish_rate: None,
             max_queued_messages: None,
+            max_backlog_messages: None,
+            max_backlog_bytes: None,
+            max_outbound_bytes: None,
+            max_inflight_messages: None,
             max_retained_messages: None,
             max_sessions: None,
             max_subscriptions_per_client: None,
@@ -1045,6 +1085,18 @@ impl Config {
         on!("MQTTD_MAX_QUEUED_MESSAGES", v, {
             self.limits.max_queued_messages = Some(num("MQTTD_MAX_QUEUED_MESSAGES", &v)?);
         });
+        on!("MQTTD_MAX_BACKLOG_MESSAGES", v, {
+            self.limits.max_backlog_messages = Some(num("MQTTD_MAX_BACKLOG_MESSAGES", &v)?);
+        });
+        on!("MQTTD_MAX_BACKLOG_BYTES", v, {
+            self.limits.max_backlog_bytes = Some(num("MQTTD_MAX_BACKLOG_BYTES", &v)?);
+        });
+        on!("MQTTD_MAX_OUTBOUND_BYTES", v, {
+            self.limits.max_outbound_bytes = Some(num("MQTTD_MAX_OUTBOUND_BYTES", &v)?);
+        });
+        on!("MQTTD_MAX_INFLIGHT_MESSAGES", v, {
+            self.limits.max_inflight_messages = Some(num("MQTTD_MAX_INFLIGHT_MESSAGES", &v)?);
+        });
         on!("MQTTD_MAX_RETAINED_MESSAGES", v, {
             self.limits.max_retained_messages = Some(num("MQTTD_MAX_RETAINED_MESSAGES", &v)?);
         });
@@ -1203,6 +1255,11 @@ impl Config {
                 )));
             }
         }
+        // The per-subscriber in-memory bounds (issue #241). Refused in `validate()` —
+        // which startup, `--check-config` and the reload precheck all run — so all three
+        // gates are covered by construction, with no separate startup-only check.
+        self.refuse_out_of_range_subscriber_bounds()
+            .map_err(ConfigError::Invalid)?;
         if let Some(p) = &self.limits.queue_overflow {
             if p != "drop-oldest" && p != "reject-newest" {
                 return Err(ConfigError::Invalid(format!(
@@ -1224,6 +1281,46 @@ impl Config {
         // reported for that reason first.
         self.refuse_unopted_ephemeral_durability()
             .map_err(ConfigError::Invalid)?;
+        Ok(())
+    }
+}
+
+impl Config {
+    /// The per-subscriber in-memory bounds' ranges (issue #241, ADR 0041 T10).
+    ///
+    /// Its own function so [`Config::validate`] stays readable, and so every gate reaches
+    /// the same refusal through the same helper — the messages cannot drift.
+    fn refuse_out_of_range_subscriber_bounds(&self) -> Result<(), String> {
+        if let Some(n) = self.limits.max_backlog_messages {
+            if n == 0 || n > 10_000_000 {
+                return Err(format!(
+                    "limits.max_backlog_messages must be in 1..=10000000, got {n} \
+                     (ADR 0012 requires the flow-control backlog be bounded: there is no \
+                     unbounded setting, and 0 would evict every message it received)"
+                ));
+            }
+        }
+        for (field, v) in [
+            ("max_backlog_bytes", self.limits.max_backlog_bytes),
+            ("max_outbound_bytes", self.limits.max_outbound_bytes),
+        ] {
+            if let Some(n) = v {
+                if n < 4096 {
+                    return Err(format!(
+                        "limits.{field} must be at least 4096 bytes, got {n} (a cap below one \
+                         message evicts the whole queue on every arrival)"
+                    ));
+                }
+            }
+        }
+        // The upper end is the type: `u16` cannot hold more than the protocol maximum.
+        if self.limits.max_inflight_messages == Some(0) {
+            return Err(
+                "limits.max_inflight_messages must be in 1..=65535, got 0 (a zero \
+                        in-flight window could never put a QoS>0 message on the wire)"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -1302,6 +1399,10 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_MAX_PACKET_SIZE",
     "MQTTD_MAX_PUBLISH_RATE",
     "MQTTD_MAX_QUEUED_MESSAGES",
+    "MQTTD_MAX_BACKLOG_MESSAGES",
+    "MQTTD_MAX_BACKLOG_BYTES",
+    "MQTTD_MAX_OUTBOUND_BYTES",
+    "MQTTD_MAX_INFLIGHT_MESSAGES",
     "MQTTD_MAX_RETAINED_MESSAGES",
     "MQTTD_MAX_SESSIONS",
     "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT",
@@ -1375,12 +1476,20 @@ mod tests {
             [limits]
             max_connections = 10000
             queue_overflow = "drop-oldest"
+            max_backlog_messages = 20000
+            max_backlog_bytes = 67108864
+            max_outbound_bytes = 33554432
+            max_inflight_messages = 64
         "#;
         let c = Config::from_toml(toml).expect("valid config");
         assert_eq!(c.node.id, "n1");
         assert_eq!(c.listeners.tls_bind.as_deref(), Some("0.0.0.0:8883"));
         assert_eq!(c.durable.lease_voters, 3);
         assert_eq!(c.limits.max_connections, Some(10000));
+        assert_eq!(c.limits.max_backlog_messages, Some(20000));
+        assert_eq!(c.limits.max_backlog_bytes, Some(67_108_864));
+        assert_eq!(c.limits.max_outbound_bytes, Some(33_554_432));
+        assert_eq!(c.limits.max_inflight_messages, Some(64));
     }
 
     #[test]
@@ -1464,6 +1573,61 @@ mod tests {
             "[runtime]\nshutdown_grace_secs = 0\n[durable]\nallow_ephemeral = true\n"
         )
         .is_ok());
+    }
+
+    /// Issue #241 — the four per-subscriber in-memory bounds are refused out of range in
+    /// `validate()`, which is what makes startup, `--check-config` and the reload
+    /// precheck all covered by construction (they each run `validate()`; there is
+    /// deliberately no separate startup-only check).
+    #[test]
+    fn the_new_per_subscriber_bounds_are_refused_out_of_range() {
+        let cfg = |body: &str| {
+            let mut c =
+                Config::from_toml("[durable]\nallow_ephemeral = true\n").expect("base parses");
+            let extra: super::Limits =
+                toml::from_str(body).expect("the limits fragment must parse");
+            c.limits = super::Limits {
+                max_backlog_messages: extra.max_backlog_messages,
+                max_backlog_bytes: extra.max_backlog_bytes,
+                max_outbound_bytes: extra.max_outbound_bytes,
+                max_inflight_messages: extra.max_inflight_messages,
+                ..c.limits
+            };
+            c
+        };
+
+        // A zero count is refused, and the message says WHY there is no unbounded
+        // setting — an operator reaching for 0 wants "off", and off does not exist here.
+        let err = cfg("max_backlog_messages = 0")
+            .validate()
+            .expect_err("0 must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("max_backlog_messages"), "{msg}");
+        assert!(msg.contains("ADR 0012"), "{msg}");
+        assert!(cfg("max_backlog_messages = 10000001").validate().is_err());
+        // Both boundaries accept.
+        assert!(cfg("max_backlog_messages = 1").validate().is_ok());
+        assert!(cfg("max_backlog_messages = 10000000").validate().is_ok());
+
+        // A byte cap below one message is a mistake, not a tight budget.
+        for field in ["max_backlog_bytes", "max_outbound_bytes"] {
+            let err = cfg(&format!("{field} = 1024"))
+                .validate()
+                .expect_err("a sub-4096 byte cap must be refused");
+            assert!(err.to_string().contains(field), "{err}");
+            assert!(cfg(&format!("{field} = 4096")).validate().is_ok());
+        }
+
+        // The in-flight ceiling: 0 could never put a QoS>0 message on the wire, and
+        // 65 535 (the protocol maximum) is the top of the range.
+        assert!(cfg("max_inflight_messages = 0").validate().is_err());
+        assert!(cfg("max_inflight_messages = 1").validate().is_ok());
+        assert!(cfg("max_inflight_messages = 65535").validate().is_ok());
+        // Above u16 the TOML does not even deserialise — the type is the check.
+        assert!(toml::from_str::<super::Limits>("max_inflight_messages = 65536").is_err());
+
+        // And the unset shape — every deployment that changes nothing — validates.
+        assert!(cfg("").validate().is_ok());
     }
 
     /// Issue #239 — the min-replicas write floor is ON by default, as the *derived*
@@ -1716,6 +1880,9 @@ mod tests {
             // The default is the derived `majority` posture (#239), so only an
             // explicit integer *changes* it.
             "MQTTD_MIN_REPLICAS" => "2",
+            // Byte caps are refused below 4096 (a value under one message is a
+            // configuration mistake, not a tight budget), so "7" would not validate.
+            "MQTTD_MAX_BACKLOG_BYTES" | "MQTTD_MAX_OUTBOUND_BYTES" => "8192",
             // The node=domain map needs a well-formed entry.
             "MQTTD_FAILURE_DOMAINS" => "n1=rack-a",
             // Numerics (all widths parse "7").
@@ -1729,6 +1896,8 @@ mod tests {
             | "MQTTD_MAX_PACKET_SIZE"
             | "MQTTD_MAX_PUBLISH_RATE"
             | "MQTTD_MAX_QUEUED_MESSAGES"
+            | "MQTTD_MAX_INFLIGHT_MESSAGES"
+            | "MQTTD_MAX_BACKLOG_MESSAGES"
             | "MQTTD_MAX_RETAINED_MESSAGES"
             | "MQTTD_MAX_SESSIONS"
             | "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT"
@@ -1832,7 +2001,7 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            75,
+            79,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

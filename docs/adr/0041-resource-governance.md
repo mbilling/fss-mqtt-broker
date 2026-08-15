@@ -20,7 +20,8 @@
 ## Context
 
 The broker bounds what a **single frame, packet, or session object** can cost: the read
-buffer (1 MiB), the peer frame (16 MiB), the flow-control backlog (10 000, drop-oldest),
+buffer (1 MiB), the peer frame (16 MiB), the flow-control backlog (10 000, drop-oldest —
+two operator-set dimensions since the issue-#241 amendment below),
 the offline queue (100 000, drop-oldest), the topic-alias table (16), the durable retained
 mutation queue (1024), pre-CONNECT and auth-round timeouts. Each has a defined at-bound
 behavior, and each is tested.
@@ -353,6 +354,152 @@ it decays into an excuse.
    refusal for `sessions`/`retained` only, and blocked on giving `BrownoutAxis` a store
    dimension in the hub; `replicas`/`lease` map to the global axis by decision, stated so
    the semantics cannot become "some stores are enforceable and we never said which".
+
+## Amendment (2026-08-15): the per-subscriber write path, byte-bounded (0041-T10 as delivered, issue #241)
+
+Three reviewers from three broker backgrounds independently flagged the same thing: the
+flow-control backlog's `MAX_BACKLOG = 10_000` was hard-coded, count-based, and drop-oldest of
+already-acked messages, so at the 1 MiB default packet ceiling it allowed ~10 GiB per stalled
+connection that **no setting could lower**. Mosquitto has `max_queued_bytes`; we had neither a
+byte cap nor a knob.
+
+**The finding that changed the scope.** The "~10 GiB" counted one of **three** per-subscriber
+in-memory structures. A single stalled subscriber can hold:
+
+1. the flow-control backlog (`MAX_BACKLOG`, 10 000, drop-oldest) — the structure the issue named;
+2. the **in-flight window** (`Inflight::pending`), bounded only by the client's own Receive
+   Maximum, which is `u16::MAX` for every v3.1.1 client and any v5 client that sends no
+   property — **65 535 messages with no operator knob at all**, a bigger hole than the backlog
+   and one neither README nor SIZING's bounds table mentioned;
+3. the outbound socket channel (10 000 packets, `QoS` 0 shed only).
+
+True worst case at the default packet ceiling: `(65 535 + 10 000 + 10 000) x 1 MiB ≈ 84 GiB`
+per stalled subscriber. Byte-capping only (1) would have left a same-magnitude hole and made
+the headline claim still false, so **all three got an operator-lowerable bound** — but only
+where the mechanism can be honest:
+
+| structure | new bound | mechanism | why this one |
+|---|---|---|---|
+| flow-control backlog (RAM) | `MQTTD_MAX_BACKLOG_MESSAGES` + `MQTTD_MAX_BACKLOG_BYTES`, exact accounting | drop-oldest, policy unchanged | the issue's target; mixed-size traffic is exactly where a count is not a budget |
+| in-flight window (RAM) | `MQTTD_MAX_INFLIGHT_MESSAGES` — a ceiling on the *effective* outbound Receive Maximum | pure gate; the surplus diverts into the (byte-capped) backlog | an entry here is on the wire under a packet id, so shedding it would break DUP redelivery (`QoS` 1) and the PUBREC handshake (`QoS` 2). A byte cap could only *gate*, and a gate over a count-bounded set is fully expressed as `count x max_packet_size` — a knob with **no counter** beats a counter that can drift |
+| outbound channel (RAM) | `MQTTD_MAX_OUTBOUND_BYTES` (the 10 000-packet count stays fixed) | shed `QoS` 0 only, at the existing gate site (#123) | shed-legal (at-most-once), already counted `outbound-full`; bytes were the missing dimension, not the count |
+| durable offline queue (DISK) | **none — declined, T6 stays open** | — | below |
+| refuse the publisher instead of shedding | **declined, filed as 0041-T15** | — | below |
+
+**What a message's bytes are.** `256 + topic + payload + forwarded MQTT 5
+application-property bytes` (payload-format flag, content type, response topic, correlation
+data, and every user-property key and value). Not payload-only: those property bytes are
+publisher-controlled and forwarded verbatim (ADR 0030), so a 20-byte payload with 8 KiB of
+user properties is 8 KiB resident, and a payload-only counter could be evaded by a factor of
+hundreds. Not the encoded packet length either: the encoding is version-dependent, and one
+queued entry is delivered to subscribers on different protocol versions with different Maximum
+Packet Sizes — "the encoded size" is a property of a `(subscriber, entry)` pair, not of the
+entry, and a total that must be recomputed per observer cannot be the single running number an
+operator's arithmetic needs. The `256` is the per-entry envelope, guarded by a compile-time
+`size_of` assert so it cannot silently become an under-count. The counter is exactly the sum
+of that function over the resident entries — **not a heap measurement**, so `SIZING.md` keeps
+its RSS allowance rather than treating the cap as an RSS ceiling.
+
+**Why it cannot drift.** Not a counter beside a `VecDeque` in an 18 000-line module: Rust
+privacy is per-module, so such a field would be writable by all of `hub.rs` and exactness
+would rest on discipline. The queue and its total live in a new module,
+`crates/mqttd/src/backpressure.rs`, with **private fields** and a closed mutator set
+(`push_back_capped`, `push_front_admitted`, `pop_front`, `drain_all`). Each mutator adjusts the
+total in the same expression as its queue mutation; `hub.rs` cannot reach past them, and a
+seventh mutation site cannot exist without a method. Two deliberate properties of the eviction
+loop: the just-pushed entry is **never** evicted (`len > 1`), so a message larger than the
+whole byte cap is delivered rather than dropped forever; and `push_front_admitted` never
+evicts, because all three of its callers are re-parking an already-admitted delivery and
+evicting there would lose an already-acked message or invert wire order. Both overshoots are in
+the documented arithmetic. **No await was added to the `fn`-only send chain** (ADR 0061 §6):
+the size function is pure arithmetic, and the two byte-capped push sites are the two `async`
+sites that already existed.
+
+**Defaults: an unset configuration is bit-for-bit today's behaviour.** `max_backlog_messages`
+defaults to the same literal `10_000`, moved rather than copied so the number keeps one
+definition; the other three default to **off**. This is the load-bearing refusal to pick a
+number: the byte cap's only enforcement mechanism is evicting already-acked, already-durable
+messages, so *any* finite default would mean an operator upgrades, changes nothing, and the
+broker starts silently discarding messages it previously delivered — the one direction that
+also breaks a durability claim. A finite `max_inflight_messages` default would additionally
+push the surplus into the backlog, i.e. make the drop arm *more* likely; a default that
+increases data loss is disqualified. `Limits` gains four `Option`-shaped fields under
+`#[serde(default)]`, so a config file that does not mention them deserialises to today's
+values, and the fields are **not** in `requires_restart`'s live-swap mask, so a reload that
+changes them is reported as requires-restart (§6) rather than half-applying a bound
+mid-flight. Ranges are refused in `Config::validate()`, which covers startup,
+`--check-config` and the reload precheck by construction; a count of `0` is refused outright,
+because ADR 0012 requires this structure be bounded and there is no "unbounded" setting.
+
+**Honesty: this is the existing ack-and-drop arm reached earlier, not a new one.** An entry
+evicted by the byte bound is one that was already durably stored and whose publisher was
+already acked (or whose obligation was already met at `AppendDone`); its offset is released and
+truncated. Nothing is acked that was not stored, so ADR 0057/#124 and the #238 rule are
+untouched, and the arriving message is admitted and acked normally. The counter is the existing
+`publish_dropped{reason="backlog-overflow"}`, unchanged in name and label set — the bound that
+fired (`bound="messages"`, `"bytes"`, or `"messages+bytes"`) and the number shed are **log fields**, not new label
+values, so cardinality discipline holds. (The issue text asked that
+`publish_dropped{reason="queue-overflow"}` stay unchanged: that reason belongs to the *durable*
+queue, which this change does not touch at all; the backlog's reason has always been
+`backlog-overflow`. Both are unchanged.) README and COMPARISON keep their ack-and-drop
+statements and gain one clause: the arm is now reachable at an operator-set byte bound too, and
+a low bound makes it routine. **No refusal surface was added or removed**, so §5 and
+`store_watch.rs`'s "growth is refused" enumeration are deliberately untouched — the eviction is
+a *delete* plus a shed of in-memory state, both already permitted under brownout, and no
+publisher's answer changes. Recorded here so the next reader need not re-derive it.
+
+**Declined: a byte cap for the durable offline queue (T6 stays open).**
+`ReplicatedSessionStore::enqueue_with_expiry` enforces the count cap from the log's
+`live_range()` — O(1), never materializing the queue. There is no byte total, and an exact one
+costs a **persisted per-session counter** that must stay exact across append, `truncate`, crash
+recovery, quorum replication, and on nodes that merely *follow* a group. A persisted counter
+that drifts fires the cap at the wrong time and makes the operator's disk arithmetic wrong,
+which is the bar this amendment sets for "exact". `MemorySessionStore` could do it trivially,
+and that is precisely the trap: a byte knob exact on the ephemeral backend and absent on the
+durable default is worse than no knob, because the number would silently mean nothing on the
+deployment that matters. So `MQTTD_MAX_QUEUED_BYTES` is left unclaimed for T6 — the 2026-08-04
+amendment above already assigns that name to the offline queue — and the new knobs are named
+for the structures they actually bound. One line the docs must keep saying:
+**`MQTTD_MAX_BACKLOG_BYTES` bounds RAM, per online subscriber, per node; it bounds no disk.
+Disk stays bounded by `MQTTD_MAX_QUEUED_MESSAGES` (count) and the aggregate
+`MQTTD_STORE_MAX_BYTES` watermark.** (Side effect worth a clause: a byte eviction releases the
+entry's offset and truncates, so the RAM cap shrinks the durable log *earlier* — it does not
+bound it.)
+
+**Declined, and better: refusing the publisher instead of shedding — accepted as strictly more
+honest, tracked as 0041-T15.** The decision point exists: the #238 freeze point (plan/submit,
+on-loop, before any effect) can see the target session's backlog bytes and answer
+`DurableOutcome::Refused` before the append, so the refusal would be effect-free and the retry
+idempotent. Four reasons it is not in this change. (1) It is a new refusal surface **new in
+kind**: every refusal today is a node-wide condition (watermark, quota), whereas this would let
+one slow *subscriber* refuse every *publisher* of a topic — MQTT acks per-PUBLISH, so one full
+backlog would refuse the whole publish while healthy subscribers still receive it, an
+availability trade no operator has asked for and none of the compared brokers make. (2) It
+needs a new `PublishRefusal` variant with a peer-bus wire code (T12), and mid-rolling-upgrade
+an older peer degrades an unknown code to `Failed` ⇒ withheld ack + close: safe, but a
+version-skew behaviour change that deserves its own reviewed change. (3) It moves §5 and the
+`store_watch.rs` enumeration, the two documents this change is otherwise provably orthogonal
+to. (4) The right long-term answer is better than either: an online drain that re-reads the
+durable log — the backlog becoming a *window* over the log rather than the only copy — makes
+the drop unnecessary instead of merely announced; it needs an off-loop lane read (ADR 0061) and
+is a design, not an amendment.
+
+What ships is the honest half an operator can act on today: the exposure is bounded and
+lowerable, the arm is counted and logged with the bound that fired, `mqttd_backlog_bytes_max`
+shows the largest single subscriber's backlog *before* a per-subscriber cap is chosen (the
+sum in `mqttd_backlog_bytes` is the node total and would size that cap far too high — a
+review finding: four documents had pointed at the sum for a per-subscriber decision), and the docs lead with
+`MQTTD_MAX_INFLIGHT_MESSAGES` — the lever that sheds nothing ITSELF (the surplus waits in the drop-oldest backlog, so it is not loss-free end to end) — so nobody reaches for the shedding knob
+first.
+
+**One residual made worse, on purpose and in writing.** The eviction's on-loop
+`truncate_acked` was ADR 0061's narrowest residual ("reachable only past a 10 000-entry
+backlog"). With a byte bound near `max_packet_size` it can fire on ordinary traffic, i.e. a
+publish-class `mqttd_hub_dispatch_seconds` tail an operator can configure into existence.
+Mitigation shipped: ADR 0061 and OPERATIONS are amended, the env table says so, and startup
+WARNs when `max_backlog_bytes < max_packet_size`. The real fix — routing that truncate through
+the session's append lane as a control job — is deliberately left in ADR 0061's residual list
+rather than mixed in here.
 
 ## Amendment (2026-08-14): a v5 DISCONNECT with a non-zero reason fires the Will (issue #265)
 

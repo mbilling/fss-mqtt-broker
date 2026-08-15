@@ -75,6 +75,32 @@ pub struct AppProperties {
 }
 
 impl AppProperties {
+    /// The bytes this property block contributes to a byte-based queue bound
+    /// (issue #241): the sum of the payload-carrying halves, with no per-property
+    /// wire framing.
+    ///
+    /// These bytes are **publisher-controlled and forwarded verbatim** (ADR 0030), so a
+    /// byte cap that counted only the PUBLISH payload could be evaded by a factor of
+    /// hundreds — a 20-byte payload with 8 KiB of user properties is 8 KiB of resident
+    /// memory. Deliberately **not** the encoded property-block length: the encoding is
+    /// version-dependent, and one queued message is delivered to subscribers on
+    /// different protocol versions, so "the encoded size" is not a property of the
+    /// queued entry at all. The single definition every byte bound shares — one
+    /// definition is how a RAM cap and a future disk cap stay able to agree about the
+    /// same message.
+    #[must_use]
+    pub fn accounted_bytes(&self) -> usize {
+        usize::from(self.payload_format.is_some())
+            + self.content_type.as_ref().map_or(0, String::len)
+            + self.response_topic.as_ref().map_or(0, String::len)
+            + self.correlation_data.as_ref().map_or(0, bytes::Bytes::len)
+            + self
+                .user_properties
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+    }
+
     /// Whether no forwardable application property is present (the common case).
     #[must_use]
     pub fn is_empty(&self) -> bool {

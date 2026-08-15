@@ -86,10 +86,27 @@ released only at PUBCOMP, matching the spec's "until PUBCOMP" rule.
   reconnect via the existing offline queue; reuses the in-flight table and ack paths
   with no new wire state.
 - **Cost / limits:** the backlog is held in memory while the client is online, so it
-  is **bounded** by `MAX_BACKLOG` with a drop-oldest overflow policy (mirroring the
-  offline queue, ADR 0001 §6) — a stalled `QoS` > 0 consumer cannot force unbounded
-  memory; the trade is that a consumer lagging past the cap loses its oldest held
-  messages (logged). A held backlog entry forwards its Message Expiry Interval as
+  is **bounded** with a drop-oldest overflow policy (mirroring the offline queue,
+  ADR 0001 §6) — a stalled `QoS` > 0 consumer cannot force unbounded memory; the trade
+  is that a consumer lagging past the cap loses its oldest held messages (logged).
+
+  **As delivered (issue #241):** the bound is now **two operator-set dimensions**
+  rather than the hard-coded `MAX_BACKLOG` constant —
+  `MQTTD_MAX_BACKLOG_MESSAGES` (default `10_000`, exactly the former constant) and
+  `MQTTD_MAX_BACKLOG_BYTES` (unset = off, so an unset configuration behaves exactly as
+  before). The overflow policy is unchanged: drop-oldest at *either* bound, evicting
+  from the front until both hold, except that the just-arrived entry is never evicted —
+  a message larger than the whole byte cap is delivered rather than dropped forever.
+  There is deliberately **no unbounded setting**: a count of `0` is refused in
+  `Config::validate()`, because this ADR's whole point is that the structure be bounded.
+  The byte accounting is exact for the queued set (a message counts as
+  `256 + topic + payload + forwarded application-property bytes`), and it is enforced by
+  encapsulation rather than by discipline: the queue and its running total live in
+  `mqttd::backpressure` with private fields, so `hub.rs` cannot mutate one without the
+  other. A third knob, `MQTTD_MAX_INFLIGHT_MESSAGES`, caps the *effective* outbound
+  Receive Maximum this ADR introduced — legal, because a client's Receive Maximum is a
+  ceiling on what the broker MAY send it, never a floor — and is the loss-free lever:
+  the surplus waits in this backlog and nothing is dropped. A held backlog entry forwards its Message Expiry Interval as
   captured at enqueue, so a long hold slightly over-states the remaining lifetime
   (ADR 0009); the inbound direction is advertised but not strictly enforced (§3),
   pending the reason-code work.

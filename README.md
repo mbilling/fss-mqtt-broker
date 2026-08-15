@@ -631,13 +631,30 @@ be found. Each is tracked; none is a silent surprise.
   OOM. Keep the watermark at 75-85% of the container limit — that gap IS the overshoot
   allowance — and the container limit remains the hard bound. It needs
   `/proc` (Linux); elsewhere the broker logs that it is **not** enforcing rather than
-  pretending. Underneath, the per-subscriber queues are still bounded by message
-  count and not by bytes: QoS 1/2 by `MAX_BACKLOG` (10 000, drop-oldest) and QoS 0 by
-  the outbound-queue cap (10 000 packets, shed and counted as
-  `mqttd_publish_dropped_total{reason="outbound-full"}`), both hard-coded. At the 1 MiB default
-  packet size that is ~10 GiB of worst-case headroom per connection, so cap
-  `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full arithmetic and a bounded
-  preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T10).
+  pretending. Underneath, one stalled subscriber holds **three**
+  per-subscriber in-memory structures, and since issue
+  [#241](https://github.com/mbilling/fss-mqtt-broker/issues/241) all three are
+  operator-lowerable: the `QoS` 1/2 **flow-control backlog** (`MQTTD_MAX_BACKLOG_MESSAGES`,
+  default 10 000, **plus** `MQTTD_MAX_BACKLOG_BYTES`, exact byte accounting, drop-oldest,
+  counted `mqttd_publish_dropped_total{reason="backlog-overflow"}`); the **in-flight
+  window** (`MQTTD_MAX_INFLIGHT_MESSAGES` — a ceiling on the effective outbound Receive
+  Maximum, which otherwise defaults to **65 535** for every v3.1.1 client and any v5
+  client that sends no property); and the **outbound socket channel**
+  (`MQTTD_MAX_OUTBOUND_BYTES` alongside the fixed 10 000-packet cap, `QoS` 0 shed and
+  counted as `mqttd_publish_dropped_total{reason="outbound-full"}`). With all three unset
+  the exposure at the 1 MiB default packet size is `(65 535 + 10 000 + 10 000) x
+  max_packet_size` ≈ **84 GiB** per stalled subscriber — the earlier "~10 GiB" counted the
+  backlog alone. Two of the three bounds shed messages; the in-flight ceiling is a pure
+  gate on the wire window: it drops nothing itself, though the surplus it holds back waits in
+  the drop-oldest backlog, so it bounds RAM without being loss-free. The backlog byte bound makes the
+  ack-and-drop arm below reachable *earlier*: at that bound already-acked entries are
+  truncated and the publisher is not told. `mqttd_backlog_bytes_max` — the LARGEST single
+  subscriber's backlog — is the number to size a per-subscriber cap against;
+  `mqttd_backlog_bytes` sums every session and answers a different question (this node's
+  total RAM in backlogs). Byte-capping the **durable** offline queue (disk) is still open — that is
+  mosquitto's `max_queued_bytes`, our 0041-T6; disk stays bounded by
+  `MQTTD_MAX_QUEUED_MESSAGES` (count) and the `MQTTD_STORE_MAX_BYTES` watermark. Full
+  arithmetic and a bounded preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T10).
 - **Disk is bounded in aggregate, not per store.** One store can consume the whole
   `MQTTD_STORE_MAX_BYTES` watermark and brown out the others. The broker now WARNs once,
   naming the store, above 70% of the mark (and `store_bytes{store}` is always exported),
@@ -1104,7 +1121,11 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | Variable | Purpose |
 |---|---|
 | `MQTTD_NODE_ID` | This node's id (default `node-local`) |
-| `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`) |
+| `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`). Bounds **disk** — the durable queue — not the in-memory backlog below |
+| `MQTTD_MAX_BACKLOG_MESSAGES` | Messages one online subscriber's in-memory **flow-control backlog** holds before drop-oldest evicts (ADR 0012, 0041-T10; default `10000` = the former hard-coded `MAX_BACKLOG`; range `1..=10000000`, **`0` is refused** — the backlog must be bounded, so there is no "unbounded" setting). Bounds **RAM**, per online subscriber, per node — never disk. Worst case unset: `10 000 x (MQTTD_MAX_PACKET_SIZE + 256)` ≈ **10 GiB** at the 1 MiB default. Read at startup only (a reload reports `limits` as requires-restart) |
+| `MQTTD_MAX_BACKLOG_BYTES` | The same backlog's **byte** bound, with exact accounting (issue #241; unset = **off**, i.e. exactly the pre-#241 behaviour; if set, at least `4096`). A message counts as `256 + topic + payload + forwarded MQTT 5 application-property bytes` — not payload-only (topics and user properties are publisher-controlled) and not the encoded packet (that is version- and subscriber-dependent). Worst case when set: `MQTTD_MAX_BACKLOG_BYTES + 2 x (MQTTD_MAX_PACKET_SIZE + 256)` — one entry may exceed the whole cap and is kept so delivery still progresses, plus one already-admitted re-parked entry. Drop-oldest at the bound **sheds already-acked messages without telling the publisher** (`mqttd_publish_dropped_total{reason="backlog-overflow"}`; the WARN names the bound); a value below `MQTTD_MAX_PACKET_SIZE` makes that routine and is warned at startup. Bounds **RAM**, never disk. Startup only |
+| `MQTTD_MAX_OUTBOUND_BYTES` | Accounted bytes that may sit unwritten in one client's **outbound socket channel** before `QoS` 0 is shed (issue #241; unset = off, minimum `4096`). The fixed 10 000-**packet** cap applies either way, and only the at-most-once class is shed — control packets and `QoS` 1/2 always flow (`mqttd_publish_dropped_total{reason="outbound-full"}`). Worst case unset: `10 000 x MQTTD_MAX_PACKET_SIZE`. Bounds **RAM**. Startup only |
+| `MQTTD_MAX_INFLIGHT_MESSAGES` | Ceiling on the **effective outbound** Receive Maximum (issue #241): the broker keeps at most `min(client Receive Maximum, this)` unacked `QoS` > 0 publishes per subscriber. Unset = the client's own value verbatim, i.e. **65 535** for every v3.1.1 client and any v5 client that sends no property — worst case `65 535 x MQTTD_MAX_PACKET_SIZE`. Range `1..=65535`. A pure **gate** on the wire window: it drops nothing itself, and the surplus waits in the backlog instead. **But that is not the same as loss-free** — the backlog is drop-oldest, so holding messages back into it can make `backlog-overflow` shedding of already-acked messages *more* likely, not less. Lower this to bound RAM and to slow a subscriber that legitimately keeps thousands in flight; pair it with a backlog bound sized for the lag you expect, and watch `publish_dropped{reason="backlog-overflow"}` rather than assuming zero. Distinct from `MQTTD_RECEIVE_MAXIMUM`, which is the **inbound** grant advertised to publishers. Bounds **RAM**. Startup only |
 | `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
 | `MQTTD_TOPIC_ALIAS_MAX` | Topic Alias Maximum advertised to v5 clients (ADR 0011; default `16`, `0` disables) |
 | `MQTTD_RECEIVE_MAXIMUM` | Receive Maximum advertised to v5 clients (ADR 0012; default `256`). Exceeding it → DISCONNECT `0x93` |
