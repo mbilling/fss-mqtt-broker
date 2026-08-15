@@ -301,10 +301,115 @@ accepting that an acknowledged message may exist on one copy only, and one furth
 lose it — the broker logs a warning saying so on every start while
 `ready_min_members >= 2`.
 
+## The backup-age alert is firing (`mqttd_backup_last_success_timestamp_seconds` is stale)
+
+A run that fails writes **nothing** and does not advance that series, on purpose — a file
+missing sessions is worse than no file — so a stale timestamp is the design working, not the
+alert misfiring. Find which:
+
+- `mqttd_backup_runs_total{outcome="error"}` is increasing → runs are happening and failing.
+  `/statusz`'s `backup.last_error` and the node's log carry the reason. The common one is
+  **an INCOMPLETE session scan**: a placement group could not be read at export time (no
+  quorum mid-recovery, a lease in flux), so the whole export was refused. Check
+  `/statusz`'s `replication` and `replica_groups` blocks and retry once the durable plane is
+  ready.
+- The series reads exactly `0` and `backup.scheduled` is `false` on `/statusz` → no backup
+  is configured on this node. That is what the `> 0` guard clause in the alert rule is for;
+  without it, the rule fires on every default installation.
+- The directory is unwritable, missing or full → the log names the path and the OS error
+  (`backup: cannot create /var/backups/mqttd: Permission denied (os error 13)`), and it is
+  also in `/statusz`'s `backup.last_error`. **`--check-config` does not catch this**: it
+  validates the setting, not the volume. On the Helm chart and the systemd unit a backup
+  directory is an opt-in mount you must add — see
+  [the backup directory on the surfaces this repo ships](OPERATIONS.md#backup-and-disaster-recovery).
+  `--check-config` *does* refuse a `backup.dir` inside `node.data_dir`, so a node that browns
+  out from backup files is a node whose config was hand-edited past that gate.
+
+## A restore is refused
+
+Every refusal imports **nothing** and exits non-zero, and each names what is wrong:
+
+- **`format_version N is NEWER than this build reads`** — the file was written by the mqttd
+  build the message names. Restore it with that build (or newer); there is no downgrade
+  path, and none is faked.
+- **`no migration path exists pre-1.0`** — the file is older than this build's format.
+- **`sha256 mismatch`** or **`no trailer`** — the export is truncated or altered. A run that
+  died mid-write leaves a `.ndjson.partial` file, which is deliberately invisible to a
+  restore; take a fresh backup.
+- **`two exports of node "N" carry the SAME created_unix_ms`** — two files of one node from
+  the same millisecond. Recency is undecidable and the restore will not guess: keep the one
+  you mean and move the other out of the directory. (Several *distinct* generations per node
+  are fine — the newest of each is selected and the rest are logged as `superseded`.)
+- **`the supplied exports come from N DIFFERENT clusters`** — staging's exports are sitting
+  beside prod's, or a stale bundle was left behind. Both `cluster_id`s and an example file
+  for each are named. Move one set out of the way. Note the converse is *not* detected: a
+  directory holding only the wrong cluster's complete set restores that cluster, so check a
+  header before you point at it (`head -1 <file>`).
+- **`the supplied exports name cluster members with no export of their own: [...]`** — a
+  per-node export is not a cluster snapshot. Add the named node's file. If that node's data
+  **and** its export are permanently gone, the refusal names the deliberate escape hatch:
+  `MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS=1`, which imports the survivors and forfeits
+  everything the missing nodes held (see OPERATIONS for what that costs).
+- **`session(s) were skipped as owned-elsewhere ... and appear in none of them: [...]`** —
+  the named client ids were owned by a node whose export you did not supply, or the session
+  changed owner between two exports. Supply the missing node's file, take a fresh set of
+  exports closer together, or forfeit them knowingly with the same flag.
+- **`already holds [...] and no restored-from stamp, so this node is neither fresh nor a
+  node this backup was already restored into`** — the data dir has store files that nothing
+  explains. A restore never merges into existing state and an interrupted restore is never
+  resumed: empty the volume deliberately, or point `node.data_dir` at a new one, and start
+  again.
+- **`was already restored from "X" ... and "Y" is a DIFFERENT source`** — this node holds a
+  completed restore of another backup set. Restoring a second set into it would be a merge.
+  Use a fresh volume for `Y`, or set `backup.restore_from` back to `X` (or remove it) to
+  start the node on the data it already holds.
+- **`the durable plane did not become ready within Ns`** — the message reports
+  `lease_group_ready` and the member count it saw. The usual cause is that not every node of
+  the target cluster is up, or `runtime.ready_min_members` is higher than the number of
+  nodes you started.
+
+While an import runs, `/readyz` is NotReady with reason `restore-in-progress` and no client
+port is bound — that is intended, so an orchestrator does not route traffic at a closed
+listener. `mqttd_restore_state` is `1` then, `2` on success, `3` on failure.
+
+## A restored node is restarting (and `MQTTD_RESTORE_FROM` is still set)
+
+That is the supported shape, not a mistake — the setting lives in a pod spec or a unit file
+and does not disappear after the restore. On the next start the node reads its own
+`restored-from` stamp, logs
+
+```
+this data dir already holds a COMPLETED restore of this set (ADR 0062):
+backup.restore_from is INERT this boot and the node starts normally
+```
+
+and serves the data it already holds. `mqttd_restore_state` stays `2` and `/statusz`'s
+`restore.detail` reads `completed <time> from <path> (N files, set <sha>); this boot
+imported nothing`. **Do not** delete the volume's contents to "make it fresh again": that
+destroys the data the restore just rebuilt. The only refusal here is a *different*
+`backup.restore_from` value (see the entry above).
+
+`cat <data_dir>/restored-from` is the provenance record an incident responder wants: the
+source path, the instant, the file names, the set digest, and — if the restore was partial
+— `"partial": true` with every forfeited node and client id.
+
 ## An unrecognised flag or `mqttd --version`
 
 - `mqttd --version` prints the version and exits; `mqttd --help` lists every flag. An
   unrecognised flag is an **error** (exit 2), not a silent broker start.
+- `mqttd --backup` exits `2` when the effective config does not load, has no `[backup] dir`
+  (the broker has nowhere to write, so there is nothing to wait for), or names a pid it
+  cannot signal; `1` when the export did not appear before `--timeout` (default 3600 s);
+  `0` once a new file appears, printing its path. It signals `--pid` (default `1`, the
+  container's entrypoint). Run it with the broker's **own configuration** — inside the
+  container, or via `kubectl exec` — and pass `--config` if any of that configuration lives
+  in a file: with the Helm chart, `node.data_dir` is rendered into `/config/mqttd.toml`, so
+  a bare `mqttd --backup` cannot load an effective config and exits 2 with
+  `backup.dir requires node.data_dir`. Use
+  `kubectl exec mqttd-0 -- mqttd --backup --config /config/mqttd.toml`.
+- `SIGUSR2` on a node with **no** `[backup] dir` is a no-op, not a death: the handler is
+  installed unconditionally, so the broker logs `SIGUSR2 received … but no [backup] dir is
+  configured` and keeps serving.
 
 ---
 

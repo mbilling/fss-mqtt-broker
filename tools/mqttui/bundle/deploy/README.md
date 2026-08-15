@@ -87,5 +87,16 @@ they are looking at.
 - **Load balancing.** MQTT is long-lived and stateful; any TCP load balancer works, but
   point its health check at `/readyz` (majority-aware) rather than at the MQTT port.
 - **Backups.** Durable state is quorum-replicated, so the primary recovery story is the
-  cluster itself. For disaster recovery see
-  [Backup](../docs/OPERATIONS.md#backup) — snapshot a **stopped** node's data directory.
+  cluster itself — but quorum is not a backup: it replicates operator error faithfully. Take
+  an **online** export with `mqttd --backup` on **every** node (a per-node export is not a
+  cluster snapshot) and restore into a fresh cluster with `MQTTD_RESTORE_FROM`; see
+  [Backup and disaster recovery](../docs/OPERATIONS.md#backup-and-disaster-recovery) for the
+  window it guarantees, the RPO/RTO, and the gaps it leaves open.
+  **Neither packaging here mounts a backup destination by default** — the chart ships no
+  backup volume or `MQTTD_BACKUP_*` plumbing, and the systemd unit's `ProtectSystem=strict`
+  grants `ReadWritePaths=/var/lib/mqttd` only, while `backup.dir` must live *outside* the
+  data dir. OPERATIONS carries the minimum opt-in for each (chart `extraVolumes` /
+  `extraVolumeMounts` / `extraEnv` against a separate PVC; a `systemctl edit` drop-in adding
+  `ReadWritePaths`), and until you add one, `kubectl exec mqttd-0 -- mqttd --backup` exits 2.
+  In the pod, pass `--config /config/mqttd.toml` — the chart renders `node.data_dir` into
+  that file, and `--backup` must load an effective config to know where to watch.

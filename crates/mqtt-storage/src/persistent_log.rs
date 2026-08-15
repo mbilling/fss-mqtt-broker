@@ -34,7 +34,7 @@ use std::sync::Arc;
 /// The session store's on-disk layout version (ADR 0038 T2).
 /// v2: retained records (`r/` keys) carry application properties (ADR 0038 T3) —
 /// the row bytes' meaning changed, so a v1 file fails closed at the gate.
-const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// In-place migrations for `sessions.redb` (ADR 0058). **Empty by design at 1.0**: the
 /// first post-1.0 schema bump must land its `MigrationStep` here in the same PR, or
@@ -110,6 +110,14 @@ fn entry_bounds(key: &str, after: Offset) -> (Vec<u8>, Vec<u8>) {
         entry_key(key, after.saturating_add(1)),
         entry_key(key, Offset::MAX),
     )
+}
+
+/// Decode the logical key from an entry key (`len ++ key ++ offset_be`), or `None` if the
+/// bytes are not a well-formed entry key.
+fn decode_entry_key(entry_key: &[u8]) -> Option<String> {
+    let len = usize::try_from(u32::from_be_bytes(entry_key.get(..4)?.try_into().ok()?)).ok()?;
+    let bytes = entry_key.get(4..4 + len)?;
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
 /// Decode the offset suffix (last 8 bytes) of an entry key.
@@ -229,6 +237,29 @@ impl ReplicatedLog for PersistentLog {
             }
             txn.commit().map_err(backend)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn keys(&self) -> Result<Vec<String>, ReplError> {
+        // Every logical key with at least one LIVE entry, decoded from the entry-key
+        // prefix. Without this the trait default (`empty`) applied to the single-node
+        // persistent store, and everything built on key enumeration read as "this node
+        // holds no sessions": the ADR 0009 expiry sweep, the ADR 0042 T9 takeover
+        // materialisation — and, once ADR 0062 landed, an ONLINE BACKUP that would have
+        // reported success over an empty file. A backup that silently omits every session
+        // is worse than no backup, which is why this is implemented rather than refused.
+        self.run(move |db| {
+            let txn = db.begin_read().map_err(backend)?;
+            let entries = txn.open_table(ENTRIES).map_err(backend)?;
+            let mut out = std::collections::BTreeSet::new();
+            for item in entries.range::<&[u8]>(..).map_err(backend)? {
+                let (k, _) = item.map_err(backend)?;
+                if let Some(key) = decode_entry_key(k.value()) {
+                    out.insert(key);
+                }
+            }
+            Ok(out.into_iter().collect())
         })
         .await
     }
@@ -370,6 +401,29 @@ mod tests {
 
     /// The durability claim: committed state survives the database being closed and
     /// reopened, and the per-key offset counter is preserved across the reopen.
+    /// Key enumeration on the single-node persistent store — absent until ADR 0062 needed
+    /// it, and the trait default (`empty`) is a silent wrong answer: every feature built on
+    /// enumeration (the ADR 0009 expiry sweep, ADR 0042 T9 takeover materialisation, and an
+    /// online BACKUP) read "this node holds no sessions".
+    #[tokio::test]
+    async fn keys_enumerates_every_live_key_and_forgets_removed_ones() {
+        let (_dir, log) = temp_log();
+        for key in ["m/a", "q/a", "m/b"] {
+            log.append(&key.to_string(), rec(b"x")).await.unwrap();
+        }
+        let mut keys = log.keys().await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["m/a", "m/b", "q/a"]);
+
+        // A removed key is gone; a TRUNCATED one with no live entries is gone too (the
+        // contract is "holds a non-empty log"), and the survivors are unaffected.
+        log.remove(&"m/b".to_string()).await.unwrap();
+        log.truncate(&"q/a".to_string(), 1).await.unwrap();
+        let mut keys = log.keys().await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["m/a"]);
+    }
+
     #[tokio::test]
     async fn state_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();

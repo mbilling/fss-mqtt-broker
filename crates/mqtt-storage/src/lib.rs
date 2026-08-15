@@ -227,6 +227,68 @@ impl SessionScan {
     }
 }
 
+/// One session's WHOLE durable state, read for an online backup
+/// ([ADR 0062](../../../docs/adr/0062-online-backup-and-restore.md)).
+///
+/// Everything a restore needs to reconstruct the session through the ordinary store API:
+/// the owner binding (ADR 0031), subscriptions, the absolute expiry deadline (ADR 0009 §3),
+/// the packet-id high-water (ADR 0007 T9), the inbound QoS-2 dedup window **with its
+/// acknowledged bit** (issue #238), the outbound QoS-2 in-flight window with `pubrec_seen`
+/// (ADR 0057), and the offline queue.
+///
+/// `epoch` / `high_offset` are the `(epoch, offset)` token pair the repo already uses to
+/// order retained convergence (ADR 0037), stamped here as the **audit position** of this
+/// record: the lease epoch a write to the session's queue would commit under at read time,
+/// and the highest live queue offset the read saw. They are what makes one session's cut
+/// citable, and what lets an import resolve the same client id appearing in two nodes'
+/// exports (highest token wins).
+#[derive(Debug, Clone)]
+pub struct SessionExport {
+    /// The session's client id.
+    pub client: ClientId,
+    /// The identity bound to the session (ADR 0031), or `None` for a legacy record.
+    pub owner: Option<String>,
+    /// The persisted subscription set.
+    pub subscriptions: Vec<Subscription>,
+    /// The absolute expiry deadline (Unix epoch seconds), or `None`.
+    pub session_expiry_at: Option<u64>,
+    /// The outbound packet-id high-water (0 = none allocated yet).
+    pub last_packet_id: u16,
+    /// The inbound QoS-2 dedup window: `(packet id, PUBREC released)` — the three-state
+    /// distinction of [`InboundSighting`], flattened to the one bit that is durable.
+    pub received_qos2: Vec<(u16, bool)>,
+    /// The outbound QoS-2 deliveries in flight, with the queue offset each refers to.
+    pub outbound_qos2: Vec<OutboundInflight>,
+    /// The offline queue, in offset order.
+    pub queue: Vec<QueuedMessage>,
+    /// The lease epoch this record's queue would commit under (0 on backends with no
+    /// lease plane).
+    pub epoch: u64,
+    /// The highest live queue offset seen (0 for an empty queue).
+    pub high_offset: Offset,
+}
+
+/// The result of [`SessionStore::export_sessions`]: the sessions this node could read,
+/// the ones it cleanly could not, and whether anything was missed for a *transient*
+/// reason.
+///
+/// The three fields are the honesty of the whole backup. `not_owned` names the client ids
+/// this node enumerated but whose values live on another node — the input to the import's
+/// cross-file coverage check, which is what turns "run the export on every node" from an
+/// instruction into a verified precondition. `complete = false` means at least one key
+/// could not be read *yet* (no quorum mid-recovery): the caller must FAIL the backup, not
+/// publish a file that silently omits sessions.
+#[derive(Debug, Default)]
+pub struct SessionExportScan {
+    /// Every session read in full.
+    pub sessions: Vec<SessionExport>,
+    /// Client ids enumerated but owned elsewhere (a clean skip — another node's export
+    /// holds them).
+    pub not_owned: Vec<ClientId>,
+    /// Whether every enumerated key was either read or cleanly foreign.
+    pub complete: bool,
+}
+
 #[async_trait]
 pub trait SessionStore: Send + Sync + std::fmt::Debug {
     /// Ensure a persistent session record exists for `client`.
@@ -441,6 +503,50 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         Ok(SessionClaim::Granted {
             present: self.ensure_session(client).await?,
         })
+    }
+
+    /// Read one session's whole durable state for an online backup (ADR 0062), or `None`
+    /// if no session record exists.
+    ///
+    /// **The ordered-read contract, which is part of this trait's promise and not an
+    /// implementation detail.** A session's durable state lives in two independent places
+    /// (the queue and the metadata snapshot), so two reads are two instants and skew
+    /// between them is unavoidable. An implementation MUST read the **queue first and the
+    /// metadata second**, so the metadata is never OLDER than the queue. Every possible
+    /// interleaving then resolves to a spec-legal outcome: a message acked and truncated
+    /// between the two reads is redelivered (legal at `QoS` 1, suppressed at `QoS` 2 by
+    /// the newer dedup window), and `last_packet_id` is always ≥ any id the queued
+    /// messages could have used, so a restore can never reuse an id that is still live.
+    /// The opposite order produces exactly those two corruptions.
+    ///
+    /// # Errors
+    /// [`StorageError::NotOwner`] when the session's group is owned elsewhere (a clean
+    /// skip — that node's export holds it); the transient/terminal errors of the backend
+    /// otherwise. The default refuses: see [`Self::export_sessions`].
+    async fn export_session(
+        &self,
+        _client: &ClientId,
+    ) -> Result<Option<SessionExport>, StorageError> {
+        Err(StorageError::Backend(
+            "this session store does not support export".to_string(),
+        ))
+    }
+
+    /// Every session this node can read, for an online backup (ADR 0062).
+    ///
+    /// Deliberately **no lossy default**: a store that cannot surface a session's owner
+    /// and packet-id high-water must REFUSE rather than produce a file that looks like a
+    /// backup and is not. A non-durable store has nothing to back up, and answering with
+    /// an empty scan would let an operator schedule backups of nothing and never learn.
+    ///
+    /// # Errors
+    /// [`StorageError::Backend`] on a store with no durable metadata (the default);
+    /// otherwise the backend's own errors. A per-key transient failure does not error —
+    /// it clears [`SessionExportScan::complete`], and the caller must fail the run.
+    async fn export_sessions(&self) -> Result<SessionExportScan, StorageError> {
+        Err(StorageError::Backend(
+            "this session store does not support export".to_string(),
+        ))
     }
 }
 

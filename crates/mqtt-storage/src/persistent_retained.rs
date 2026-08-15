@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 /// at the gate — wipe-and-rejoin). Bumped to 2 for the absolute expiry deadline in
 /// the value (issue #227, MQTT 5 Message Expiry on retained copies) — pre-1.0, so
 /// the bump is another fail-closed reshape, no migration (ADR 0039/0058).
-const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// In-place migrations for `retained.redb` (ADR 0058). Empty by design at 1.0 — the first
 /// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage

@@ -45,7 +45,7 @@ type NodeId = u64;
 /// postcard-encoded values. A pre-ADR-0052 dev store carries bincode bytes under
 /// the same stamp and fails at value decode (not at the gate) — wipe dev data
 /// dirs; nothing is released, so no upgrade path is owed.
-const LEASE_SCHEMA_VERSION: u32 = 1;
+pub const LEASE_SCHEMA_VERSION: u32 = 1;
 
 /// In-place migrations for `lease.redb` (ADR 0058). Empty by design at 1.0 — the first
 /// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
