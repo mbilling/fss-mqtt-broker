@@ -140,6 +140,54 @@ pub struct Placement {
     /// because a liveness-following witness would disarm the floor during the very
     /// outage it exists to refuse.
     peak_members: usize,
+    /// Bumped whenever something that can change a group's COMMITTED owner — or this
+    /// node's ability to route a relocation to it — actually changes: the committed lease
+    /// map, or the eligible/addr membership. A monotone version, so a poller can skip an
+    /// `O(sessions)` ownership pass entirely while ownership has not moved (issue #284
+    /// round-2 finding 3: that pass cost 8-11x the sweep dispatch's time, every second,
+    /// forever). Deliberately NOT bumped for `set_voters`: voters steer the lease
+    /// ASSIGNER's target (`hrw_owner`), never the committed map this version tracks — and
+    /// where a lease IS committed, `group_owner` is that lease regardless of voters.
+    ownership_epoch: u64,
+}
+
+/// A cheap, lock-free snapshot of COMMITTED group ownership and the owners this node can
+/// route a relocation to (ADR 0005) — the input to the hub's rehome pass (issue #284).
+///
+/// Bounded by [`NUM_GROUPS`] (256) plus the member count, so cloning it is O(cluster),
+/// never O(sessions). It exists so the pass over live sessions runs with **no placement
+/// lock held**: the lock is shared with the cluster driver's per-tick lease/voter pushes,
+/// and holding it across the whole pass stalled that writer once a second (round-2
+/// finding 3).
+#[derive(Debug, Clone)]
+pub struct CommittedOwnership {
+    epoch: u64,
+    local: NodeId,
+    committed: BTreeMap<GroupId, NodeId>,
+    routable: BTreeSet<NodeId>,
+}
+
+impl CommittedOwnership {
+    /// The [`Placement::ownership_epoch`] this snapshot was taken at.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The cluster-agreed owner of `client`'s session, or `None` when its group has no
+    /// committed lease (or the holder is no longer eligible) — see
+    /// [`Placement::committed_group_owner`].
+    #[must_use]
+    pub fn session_owner(&self, client: &str) -> Option<&NodeId> {
+        self.committed.get(&group_of(client))
+    }
+
+    /// Whether a session owned by `node` could be relocated there by this node: `node` is
+    /// not us and its peer-link address is known (else ADR 0005 §5 serves locally).
+    #[must_use]
+    pub fn is_relocatable(&self, node: &NodeId) -> bool {
+        *node != self.local && self.routable.contains(node)
+    }
 }
 
 /// The min-replicas write-floor policy (issues #167, #239) — what
@@ -185,6 +233,7 @@ impl Placement {
             floor: WriteFloor::Fixed(1),
             peak_members: 1,
             durable_roster: None,
+            ownership_epoch: 0,
         }
     }
 
@@ -320,14 +369,22 @@ impl Placement {
         }
         match state {
             MemberState::Dead => {
-                self.eligible.remove(id);
-                self.addrs.remove(id);
+                // Eligibility gates the committed-lease liveness filter, and the addr is
+                // what makes an owner relocatable — so a real change moves the ownership
+                // version (a repeat observation of the same state does not).
+                if self.eligible.remove(id) | self.addrs.remove(id).is_some() {
+                    self.ownership_epoch += 1;
+                }
                 self.domains.remove(id);
             }
             MemberState::Alive | MemberState::Suspect => {
-                self.eligible.insert(id.clone());
-                if !addr.is_empty() {
-                    self.addrs.insert(id.clone(), addr.to_string());
+                if self.eligible.insert(id.clone()) {
+                    self.ownership_epoch += 1;
+                }
+                if !addr.is_empty()
+                    && self.addrs.insert(id.clone(), addr.to_string()).as_deref() != Some(addr)
+                {
+                    self.ownership_epoch += 1;
                 }
                 // Learn the peer's failure-domain label; a membership event that never
                 // carried one must not erase a label we already learned (ADR 0016 T5).
@@ -395,7 +452,40 @@ impl Placement {
     /// from the map falls back to the desired HRW owner. Passing an empty map (e.g. a
     /// non-durable node) restores pure-HRW routing.
     pub fn set_lease_owners(&mut self, owners: BTreeMap<GroupId, NodeId>) {
+        // Pushed every reconcile tick, and in the steady state IDENTICAL every time: only
+        // a real move bumps the ownership version, so a poller gated on it does no work
+        // while nothing has moved (issue #284 round-2 finding 3).
+        if self.lease_owners != owners {
+            self.ownership_epoch += 1;
+        }
         self.lease_owners = owners;
+    }
+
+    /// A monotone version of COMMITTED group ownership: it changes only when a committed
+    /// lease moves, or when membership changes in a way that can change a committed
+    /// owner or its reachability. Cheap to read under a short lock, so an `O(sessions)`
+    /// ownership pass can be skipped entirely while it is unchanged (issue #284 round-2
+    /// finding 3).
+    #[must_use]
+    pub fn ownership_epoch(&self) -> u64 {
+        self.ownership_epoch
+    }
+
+    /// Snapshot COMMITTED ownership and relocatability for a lock-free pass — see
+    /// [`CommittedOwnership`]. Bounded by [`NUM_GROUPS`] plus the member count.
+    #[must_use]
+    pub fn committed_ownership(&self) -> CommittedOwnership {
+        CommittedOwnership {
+            epoch: self.ownership_epoch,
+            local: self.local.clone(),
+            committed: self
+                .lease_owners
+                .iter()
+                .filter(|(_, holder)| self.eligible.contains(*holder))
+                .map(|(g, holder)| (*g, holder.clone()))
+                .collect(),
+            routable: self.addrs.keys().cloned().collect(),
+        }
     }
 
     /// The committed durable owner of `group`, if a lease has been reported for it —
@@ -495,6 +585,26 @@ impl Placement {
             .unwrap_or_else(|| self.hrw_owner(group))
     }
 
+    /// The **cluster-agreed** owner of a placement `group`: the holder of its committed
+    /// lease, liveness-filtered exactly as [`group_owner`](Self::group_owner) filters it —
+    /// and `None` when no lease has been reported for the group.
+    ///
+    /// Deliberately WITHOUT `group_owner`'s HRW fallback. This is the accessor for a
+    /// caller that may only act on ownership the cluster has actually committed and
+    /// replicated: a bare HRW answer (no lease assigned yet), or a lease whose holder the
+    /// ring has — possibly falsely — evicted, is the transient ring/lease split the
+    /// 2026-07-20 post-mortem describes (see `cluster_store::log_for_key` and the
+    /// liveness-rule note on `group_owner`). The data path is right to fail closed on it;
+    /// a caller that DISRUPTS a live session on it would be kicking clients during
+    /// ordinary convergence. Used by the hub's rehome-on-settle (issue #284).
+    #[must_use]
+    pub fn committed_group_owner(&self, group: GroupId) -> Option<NodeId> {
+        self.lease_owners
+            .get(&group)
+            .filter(|holder| self.eligible.contains(*holder))
+            .cloned()
+    }
+
     /// The ordered replica set of a placement `group` — the **committed** owner leads
     /// (so the lease holder always holds the group's data), followed by the HRW replica
     /// set, capped at `R` and at the current member count.
@@ -569,6 +679,14 @@ impl Placement {
     #[must_use]
     pub fn owner(&self, client: &str) -> NodeId {
         self.group_owner(group_of(client))
+    }
+
+    /// The cluster-agreed owner of `client`'s session — see
+    /// [`committed_group_owner`](Self::committed_group_owner) for why this is not
+    /// [`owner`](Self::owner).
+    #[must_use]
+    pub fn committed_session_owner(&self, client: &str) -> Option<NodeId> {
+        self.committed_group_owner(group_of(client))
     }
 
     /// The ordered replica set for `client` (owner first) — its group's replica set.
@@ -694,6 +812,145 @@ mod tests {
             .unwrap();
         assert_eq!(p.group_owner(g_unassigned), p.hrw_owner(g_unassigned));
         assert_eq!(p.committed_owner(g_unassigned), None);
+    }
+
+    /// Issue #284: `committed_group_owner` answers only for CLUSTER-AGREED ownership —
+    /// the same liveness filter as `group_owner`, but `None` instead of `group_owner`'s
+    /// HRW fallback. That is what lets a caller DISRUPT a live session on the answer:
+    /// an unsettled group (no lease pushed yet) and a corpse's lease are both the
+    /// transient ring/lease split, and both must read as "no committed owner" rather
+    /// than as an ownership move.
+    #[test]
+    fn the_committed_group_owner_never_falls_back_to_the_hrw_ring() {
+        use super::NUM_GROUPS;
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b", "c"]);
+        // A group the HRW ring hands to b, with NO lease pushed for it.
+        let g = (0..NUM_GROUPS)
+            .find(|g| p.hrw_owner(*g) == node("b"))
+            .unwrap();
+        assert_eq!(
+            p.group_owner(g),
+            node("b"),
+            "the data path falls back to HRW"
+        );
+        assert_eq!(
+            p.committed_group_owner(g),
+            None,
+            "an unsettled group has no committed owner, however loudly HRW answers"
+        );
+
+        // Once the lease is committed, it answers — and agrees with the data path.
+        let mut leases = BTreeMap::new();
+        leases.insert(g, node("c"));
+        p.set_lease_owners(leases);
+        assert_eq!(p.committed_group_owner(g), Some(node("c")));
+        assert_eq!(p.group_owner(g), node("c"));
+
+        // A corpse's lease is not cluster-agreed ownership either: `group_owner`
+        // degrades to HRW, and this accessor goes quiet rather than naming a mover.
+        p.observe(&node("c"), MemberState::Dead, "", None);
+        assert_eq!(p.committed_group_owner(g), None);
+        assert_eq!(p.group_owner(g), p.hrw_owner(g));
+
+        // The client-keyed form is the same answer over `group_of`.
+        let mut p = ring("a", &["b", "c"]);
+        let mut leases = BTreeMap::new();
+        leases.insert(super::group_of("some-client"), node("b"));
+        p.set_lease_owners(leases);
+        assert_eq!(
+            p.committed_session_owner("some-client"),
+            Some(node("b")),
+            "client-keyed accessor resolves through group_of"
+        );
+        assert_eq!(p.committed_session_owner("another-client-entirely"), None);
+    }
+
+    /// Issue #284 round-2 finding 3: the ownership VERSION moves only on a change that can
+    /// actually move a committed owner (or its reachability). The durable driver re-pushes
+    /// the same lease map every reconcile tick and SWIM re-observes the same members
+    /// constantly, so a version that moved on every push would gate nothing and the hub's
+    /// `O(online sessions)` rehome pass would still run every second, forever.
+    #[test]
+    fn the_ownership_version_moves_only_on_a_real_committed_change() {
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b"]);
+        let base = p.ownership_epoch();
+
+        // Re-observing a member with the SAME state and address changes nothing.
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        assert_eq!(
+            p.ownership_epoch(),
+            base,
+            "a repeat observation is not a change"
+        );
+
+        // Pushing the same (empty) lease map changes nothing either.
+        p.set_lease_owners(BTreeMap::new());
+        assert_eq!(
+            p.ownership_epoch(),
+            base,
+            "an unchanged lease push is not a change"
+        );
+
+        // A real committed move does.
+        let mut leases = BTreeMap::new();
+        leases.insert(super::group_of("cl"), node("b"));
+        p.set_lease_owners(leases.clone());
+        let moved = p.ownership_epoch();
+        assert!(moved > base, "a committed lease move must move the version");
+        p.set_lease_owners(leases);
+        assert_eq!(p.ownership_epoch(), moved, "...and then settle again");
+
+        // So does a new member, a learned address, and a death — each of which can change
+        // who a committed owner is, or whether it can be relocated to.
+        p.observe(&node("c"), MemberState::Alive, "", None);
+        let with_c = p.ownership_epoch();
+        assert!(with_c > moved);
+        p.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        let with_addr = p.ownership_epoch();
+        assert!(with_addr > with_c, "learning an address is a change");
+        p.observe(&node("c"), MemberState::Dead, "", None);
+        assert!(p.ownership_epoch() > with_addr);
+    }
+
+    /// Issue #284 round-2 finding 3: the snapshot the hub scans is lock-free and answers
+    /// exactly the two questions the rehome pass asks — who cluster-agreed-owns this
+    /// session (with `committed_group_owner`'s liveness filter applied), and can this node
+    /// route a relocation there at all.
+    #[test]
+    fn the_committed_ownership_snapshot_filters_a_corpse_and_reports_routability() {
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b"]);
+        // c is eligible but its peer address was never learned.
+        p.observe(&node("c"), MemberState::Alive, "", None);
+        let mut leases = BTreeMap::new();
+        leases.insert(super::group_of("to-b"), node("b"));
+        leases.insert(super::group_of("to-c"), node("c"));
+        p.set_lease_owners(leases);
+
+        let own = p.committed_ownership();
+        assert_eq!(own.epoch(), p.ownership_epoch());
+        assert_eq!(own.session_owner("to-b"), Some(&node("b")));
+        assert!(
+            own.is_relocatable(&node("b")),
+            "b's peer address is known, so a rehome can send the client there"
+        );
+        assert_eq!(own.session_owner("to-c"), Some(&node("c")));
+        assert!(
+            !own.is_relocatable(&node("c")),
+            "an owner with no known address is NOT relocatable (ADR 0005 §5)"
+        );
+        assert!(
+            !own.is_relocatable(&node("a")),
+            "this node is never a relocation target"
+        );
+        assert_eq!(own.session_owner("no-lease-for-this-one"), None);
+
+        // A corpse's lease is filtered out of the snapshot exactly as
+        // `committed_group_owner` filters it, so it can never trigger a rehome.
+        p.observe(&node("b"), MemberState::Dead, "", None);
+        assert_eq!(p.committed_ownership().session_owner("to-b"), None);
     }
 
     /// The liveness rule: a committed lease held by a node SWIM has declared **Dead** is

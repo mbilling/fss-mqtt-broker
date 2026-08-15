@@ -76,6 +76,28 @@ replica takes over, the session data survives (it is in the replicated
 log) but the deadline is lost — the clock effectively restarts. Persisting the
 disconnect time in the session's durable meta snapshot closes this and is a follow-up.
 
+**As delivered — §3's persisted deadline, and the one case it cannot reach
+(2026-08-14, issue #284).** The follow-up above was delivered: `detach` persists the
+**absolute** deadline through the (group-routed) session store, so a new owner expires an
+inherited session at the right wall-clock time. It cannot land, however, when the
+detaching node does **not** hold the session group's lease: the write is refused
+`NotOwner` by construction. That is now the routine case, because a rehome close (ADR
+0005's as-delivered note) happens precisely on a non-owning node. As delivered the write
+is therefore **skipped deliberately**, warned, and counted
+(`mqttd_session_expiry_unpersisted_total{reason="not-owner"}`) rather than attempted with
+its error discarded.
+
+*The residual, stated:* the new owner then holds a session record with no deadline, so a
+client that never comes back leaves a persistent session and its queue behind instead of
+expiring at its stated interval. It self-heals the moment the client reconnects anywhere
+(its CONNECT carries the interval; that owner's next detach persists the deadline) —
+~0.1 s in the measured rehome. It cannot be closed inside this seam: only the absolute
+deadline is persisted, never the *interval*, so no owner can re-derive it, and no peer
+frame carries a session's deadline. The same hole is pre-existing for every takeover of an
+**online** session (the deadline is cleared while the client is connected, so a dead
+owner's successor inherits none). The follow-up that closes both at once is to persist the
+interval alongside the deadline in the durable session record.
+
 ### 3. Message expiry rides in the stored queue entry; the deadline is absolute
 
 A queued message carries an **absolute expiry deadline** (not the original interval),
