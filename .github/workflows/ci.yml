@@ -60,6 +60,11 @@ jobs:
       # in both directions, before this ran.
       - name: README states derivable facts correctly
         run: python3 scripts/check-readme-facts.py
+      # A reason code the broker can emit but no test provokes is a reason code
+      # nobody has ever seen it send. Twelve of thirteen were unaudited before
+      # this ran; the script explains any exemption it is carrying.
+      - name: Every emittable reason code has a test that provokes it
+        run: python3 scripts/check-reason-codes.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)
@@ -88,11 +93,45 @@ jobs:
             MQTTD_HEALTH_BIND=127.0.0.1:$HPORT RUST_LOG=off target/debug/mqttd &
           for _ in $(seq 1 100); do curl -fsS http://127.0.0.1:$HPORT/readyz >/dev/null 2>&1 && break; sleep 0.1; done
           MQTT_PORT=$PORT python3 scripts/interop/paho_conformance.py
+      # The INDEPENDENT oracle: Eclipse's own MQTT 5 conformance suite, pinned, driving
+      # the real binary. Our tests share this implementation's reading of the spec; this
+      # one does not. Its five non-passing tests are declared in the script with reasons,
+      # and it fails BOTH ways — on a new failure and on a declared one that starts
+      # passing — so the list cannot become an ignore list.
+      - name: Interop conformance (eclipse/paho.mqtt.testing — independent MQTT 5 oracle)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/interop/paho-testing.sh
       # ADR 0051 T6: the migration converter's output must be accepted by the real
       # broker, not merely well-formed. A migration tool that emits plausible TOML
       # the broker then rejects burns the evaluation it exists to enable.
       - name: Mosquitto migration converter (output boots the broker)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-mosquitto.sh
+
+      # ADR 0051 T7/T17: the same bar for the EMQX and HiveMQ converters, plus the two
+      # assertions the Mosquitto harness never made — `mqttd --check-config` on the
+      # converted config (ADR 0051 §3's third rule) and expected-TODO-marker greps, so a
+      # mapping that quietly stopped emitting cannot pass. The EMQX lane also needs
+      # mqtt-bridge, because its bridge output is validated by the real bridge binary.
+      - name: Build mqtt-bridge (the EMQX converter's bridge output is validated by it)
+        run: cargo build --quiet -p mqtt-bridge
+      - name: EMQX migration converter (output validates, boots the broker, bridges)
+        run: |
+          MQTTD_BIN=target/debug/mqttd MQTT_BRIDGE_BIN=target/debug/mqtt-bridge \
+            ./scripts/migrate/test-from-emqx.sh
+      - name: HiveMQ migration converter (output validates and boots the broker)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-hivemq.sh
+
+      # ADR 0051 T18: docs/MIGRATION.md's dual-run cutover playbook is only worth having if
+      # its bridge config actually works, so the document's own shape is run against mqttd +
+      # mqtt-bridge + a REAL third-party broker. Needs the mosquitto BROKER, not just the
+      # clients this job already installs; the script exits 2 (not 1) if it is missing.
+      - name: Install the mosquitto broker (incumbent stand-in for the cutover smoke)
+        run: |
+          sudo apt-get install -y mosquitto
+          sudo systemctl stop mosquitto || true
+      - name: Dual-run cutover smoke (mqttd <-> Mosquitto through mqtt-bridge)
+        run: |
+          MQTTD_BIN=target/debug/mqttd MQTT_BRIDGE_BIN=target/debug/mqtt-bridge \
+            ./scripts/migrate/dual-run-smoke.sh
 
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh

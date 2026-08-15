@@ -34,10 +34,10 @@ use common::{
 };
 use std::time::Duration;
 
-/// Reason codes asserted here, named rather than magic (see `mqtt_codec::reason`).
-const MALFORMED_PACKET: u8 = 0x81;
-const PROTOCOL_ERROR: u8 = 0x82;
-const TOPIC_FILTER_INVALID: u8 = 0x8F;
+use mqtt_codec::reason::{
+    CLIENT_IDENTIFIER_NOT_VALID, MALFORMED_PACKET, PACKET_TOO_LARGE, PROTOCOL_ERROR,
+    TOPIC_FILTER_INVALID,
+};
 
 /// Assert the answer is a SUBACK whose (single) per-filter reason code is `reason`.
 /// A per-filter refusal is deliberately NOT a connection close: the other filters in
@@ -727,4 +727,76 @@ async fn malformed_and_protocol_errors_are_told_apart() {
     body.push(0x00);
     c.send_bytes(&frame(0x82, &body)).await;
     c.expect_disconnect_bytes(PROTOCOL_ERROR).await;
+}
+
+// ---------------------------------------------------------------------------
+// Reason-code provocations (Phase 3d) — codes the broker can emit that no test
+// had ever actually observed on the wire.
+// ---------------------------------------------------------------------------
+
+/// FLOW-021 / `0x95`: a packet that grows past the inbound ceiling while still
+/// incomplete is refused with Packet too large.
+///
+/// **Read the shape of this test carefully — it is narrower than its name suggests,
+/// and the narrowness is the finding.** `next_packet` (every TCP/TLS client's path)
+/// tries `Packet::decode` FIRST and only checks the ceiling when decode says
+/// "incomplete". So the ceiling catches a packet that stalls oversized, which is
+/// what this test provokes — but a *complete* oversized packet decodes successfully
+/// and is **accepted**, ceiling and advertised Maximum Packet Size notwithstanding.
+///
+/// The declared-length check that would refuse from the header alone exists in
+/// `take_raw_frame`, used only by the QUIC mux — and `frame.rs`'s own
+/// `oversized_packet_is_rejected_not_buffered` exercises that function, so the
+/// property is tested on the path clients do not use. Filed separately; the memory
+/// is still bounded, so this is "refuses later and less often than it should", not
+/// an unbounded-allocation hole.
+#[tokio::test]
+async fn a_packet_over_the_inbound_ceiling_is_refused() {
+    let addr = start_broker().await;
+    let mut c = connected(addr, "wire-too-large").await;
+
+    // Declare 4 MiB and send 2 MiB of it: the buffer passes the ceiling while the
+    // packet is still incomplete, which is the condition the check actually tests.
+    let mut header = vec![0x30]; // PUBLISH
+    header.extend_from_slice(&vbi(4 * 1024 * 1024));
+    header.extend_from_slice(&mqtt_str("wire/big"));
+    c.send_bytes(&header).await;
+    c.send_bytes(&vec![b'x'; 2 * 1024 * 1024]).await;
+
+    c.expect_disconnect_bytes(PACKET_TOO_LARGE).await;
+}
+
+/// CONN-012 / `0x85`: a zero-length Client Identifier is only meaningful with Clean
+/// Start = 1, because the server assigns an id that exists for one connection. With
+/// Clean Start = 0 the client is asking to resume a session it cannot name, so the
+/// CONNECT is refused [MQTT-3.1.3-8].
+///
+/// The v3.1.1 form of this refusal (return code `0x02`) was already covered; the v5
+/// form was not, and they are different code spaces.
+#[tokio::test]
+async fn an_empty_client_id_without_clean_start_is_refused() {
+    let addr = start_broker().await;
+    let mut c = RawClient::open(addr).await;
+
+    let mut body = mqtt_str("MQTT");
+    body.push(5); // v5
+    body.push(0x00); // connect flags: clean start CLEARED
+    body.extend_from_slice(&0u16.to_be_bytes()); // keep alive
+    body.push(0x00); // no properties
+    body.extend_from_slice(&mqtt_str("")); // zero-length client id
+    c.send_bytes(&frame(0x10, &body)).await;
+
+    c.expect_connack_bytes(CLIENT_IDENTIFIER_NOT_VALID).await;
+}
+
+/// The same CONNECT with Clean Start SET is accepted, and the server assigns an
+/// identifier. Without this the test above could pass against a broker that simply
+/// rejects every empty client id — the refusal must be specific to the combination.
+#[tokio::test]
+async fn an_empty_client_id_with_clean_start_is_assigned_one() {
+    let addr = start_broker().await;
+    let mut c = RawClient::open(addr).await;
+
+    c.send_bytes(&connect_v5_bytes("")).await; // clean start is set by the builder
+    c.expect_connack_bytes(0x00).await;
 }

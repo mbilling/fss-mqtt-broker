@@ -228,10 +228,21 @@ class is its watchdog, and the class is what the operator alert should point at.
   clear on a persistent attach.
 - **Session-expiry persistence at detach** (`control` class): the finite-expiry
   detach's `set_session_expiry(Some(deadline))` write (ADR 0009 §3).
-- **Backlog-overflow eviction truncate** (`publish` class, narrow): evicting the
-  oldest entry from a flow-control backlog at `MAX_BACKLOG` (10 000) awaits
-  `truncate_acked` inline — the one remaining publish-class store await, reachable
-  only when a single session's in-memory backlog overflows.
+- **Backlog-overflow eviction truncate** (`publish` class): evicting the oldest
+  entries from a flow-control backlog at either of its bounds awaits `truncate_acked`
+  inline — the one remaining publish-class store await.
+
+  **As delivered (issue #241): no longer narrow.** This residual used to be described
+  as "reachable only past a 10 000-entry backlog". Since the backlog gained an
+  operator-set BYTE bound (`MQTTD_MAX_BACKLOG_BYTES`, ADR 0041 T10), an operator can
+  configure it to fire on ordinary traffic: a cap near `MQTTD_MAX_PACKET_SIZE` means
+  roughly one on-loop store ack per publish to that subscriber, i.e. a publish-class
+  `mqttd_hub_dispatch_seconds` tail an operator can configure into existence. Startup
+  warns when the byte cap is below `max_packet_size`, and `docs/SIZING.md` says so at
+  the point where the number is chosen. The fix is to route the eviction truncate
+  through the session's own append lane as a control job — deliberately NOT bundled
+  into #241, because it is this ADR's residual rather than a backpressure knob, and
+  mixing them would blur two changes.
 - **The local (non-durable) `retained.set`** stays on-loop: local fsync, no 5 s RPC.
   The durable-retained authority commit was already off-loop (ADR 0037).
 - **Bounded-replay corner:** a session with more backlog than one replay window that

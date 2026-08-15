@@ -128,8 +128,8 @@ record of exactly what is built (61 ADRs, per-task status).
 ## The runnable map: mqttui
 
 **`mqttui`** is the map of everything runnable in this repository — the demo
-cluster, the Mosquitto migration converter, the secured quickstarts, the Kubernetes
-examples. It tells you what each task needs *before* it starts, instead of failing five
+cluster, the Mosquitto / EMQX / HiveMQ migration converters, the secured quickstarts, the
+Kubernetes examples. It tells you what each task needs *before* it starts, instead of failing five
 minutes in ([ADR 0056](docs/adr/0056-mqttui.md)):
 
 ```sh
@@ -148,13 +148,24 @@ mqttui            # the terminal UI — `mqttui --list` is the same thing, headl
 **Migrating from a production broker, or evaluating one?**
 
 ```sh
-mqttui migrate mosquitto /etc/mosquitto/mosquitto.conf
+mqttui migrate mosquitto /etc/mosquitto/mosquitto.conf      # Mosquitto
+scripts/migrate/from-emqx.py /etc/emqx/emqx.conf --acl-file /etc/emqx/acl.conf
+scripts/migrate/from-hivemq.py /opt/hivemq/conf/config.xml
 ```
 
-converts your config *and* your ACL file. Anything without an exact equivalent becomes a
-`# TODO(migrate):` comment at the point it belongs — never a silent drop, because a
-setting that quietly vanishes is how a migration ships the wrong policy. Then see it hold
-up: `mqttui --run deploy-smoke` boots the three-node reference deployment (password auth,
+Each converts your config *and* your ACL/RBAC policy, and **what it produces is a reviewed
+DRAFT, not a translated configuration — read it before you deploy it.** Every construct a
+converter *reads* is either translated or becomes a `# TODO(migrate):` comment at the point it
+belongs, never a silent drop, because a setting that quietly vanishes is how a migration ships
+the wrong policy; anything it could not derive from your input comes out **commented out** beside
+that TODO, so the worst case is a config **you** finish rather than a live setting nobody derived.
+What is *not* claimed: total coverage of any vendor's schema, and correctness of what was read —
+[`docs/MIGRATION.md`](docs/MIGRATION.md#known-gaps-after-round-4) lists every construct known to
+be misread or unhandled, with what to check by hand. And because
+mqttd cannot import another broker's *session* state, the converter is only half the job:
+[`docs/MIGRATION.md`](docs/MIGRATION.md) carries the per-broker mapping tables **and** a
+dual-run cutover playbook (bridge both brokers, move clients in cohorts, verify, cut) whose
+bridge step is exercised against a real third-party broker. Then see it hold up: `mqttui --run deploy-smoke` boots the three-node reference deployment (password auth,
 deny-by-default ACL) and proves an **acknowledged QoS 1 message survives `SIGKILL`** of
 the node that accepted it, in about a minute. `mqttui --run quickstart` is the two-node
 version, including the TLS 1.3 + mTLS + ACL variant. What this broker does and does not
@@ -620,13 +631,30 @@ be found. Each is tracked; none is a silent surprise.
   OOM. Keep the watermark at 75-85% of the container limit — that gap IS the overshoot
   allowance — and the container limit remains the hard bound. It needs
   `/proc` (Linux); elsewhere the broker logs that it is **not** enforcing rather than
-  pretending. Underneath, the per-subscriber queues are still bounded by message
-  count and not by bytes: QoS 1/2 by `MAX_BACKLOG` (10 000, drop-oldest) and QoS 0 by
-  the outbound-queue cap (10 000 packets, shed and counted as
-  `publish_dropped{reason="outbound-full"}`), both hard-coded. At the 1 MiB default
-  packet size that is ~10 GiB of worst-case headroom per connection, so cap
-  `MQTTD_MAX_PACKET_SIZE` to bound it in practice. Full arithmetic and a bounded
-  preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T10).
+  pretending. Underneath, one stalled subscriber holds **three**
+  per-subscriber in-memory structures, and since issue
+  [#241](https://github.com/mbilling/fss-mqtt-broker/issues/241) all three are
+  operator-lowerable: the `QoS` 1/2 **flow-control backlog** (`MQTTD_MAX_BACKLOG_MESSAGES`,
+  default 10 000, **plus** `MQTTD_MAX_BACKLOG_BYTES`, exact byte accounting, drop-oldest,
+  counted `mqttd_publish_dropped_total{reason="backlog-overflow"}`); the **in-flight
+  window** (`MQTTD_MAX_INFLIGHT_MESSAGES` — a ceiling on the effective outbound Receive
+  Maximum, which otherwise defaults to **65 535** for every v3.1.1 client and any v5
+  client that sends no property); and the **outbound socket channel**
+  (`MQTTD_MAX_OUTBOUND_BYTES` alongside the fixed 10 000-packet cap, `QoS` 0 shed and
+  counted as `mqttd_publish_dropped_total{reason="outbound-full"}`). With all three unset
+  the exposure at the 1 MiB default packet size is `(65 535 + 10 000 + 10 000) x
+  max_packet_size` ≈ **84 GiB** per stalled subscriber — the earlier "~10 GiB" counted the
+  backlog alone. Two of the three bounds shed messages; the in-flight ceiling is a pure
+  gate on the wire window: it drops nothing itself, though the surplus it holds back waits in
+  the drop-oldest backlog, so it bounds RAM without being loss-free. The backlog byte bound makes the
+  ack-and-drop arm below reachable *earlier*: at that bound already-acked entries are
+  truncated and the publisher is not told. `mqttd_backlog_bytes_max` — the LARGEST single
+  subscriber's backlog — is the number to size a per-subscriber cap against;
+  `mqttd_backlog_bytes` sums every session and answers a different question (this node's
+  total RAM in backlogs). Byte-capping the **durable** offline queue (disk) is still open — that is
+  mosquitto's `max_queued_bytes`, our 0041-T6; disk stays bounded by
+  `MQTTD_MAX_QUEUED_MESSAGES` (count) and the `MQTTD_STORE_MAX_BYTES` watermark. Full
+  arithmetic and a bounded preset: [SIZING.md](docs/SIZING.md) (ADR 0041 T6, T10).
 - **Disk is bounded in aggregate, not per store.** One store can consume the whole
   `MQTTD_STORE_MAX_BYTES` watermark and brown out the others. The broker now WARNs once,
   naming the store, above 70% of the mark (and `store_bytes{store}` is always exported),
@@ -686,11 +714,43 @@ be found. Each is tracked; none is a silent surprise.
   is gone is still acked and dropped by the pre-existing no-known-subscriber path, with
   no refusal logged. All three are stated in
   [ADR 0006](docs/adr/0006-consensus-and-replication.md) §4 rather than papered over.
-- **Migration tooling covers Mosquitto only.**
-  `scripts/migrate/from-mosquitto.py` translates `mosquitto.conf` and its
-  `acl_file`, marking anything without an equivalent as `TODO(migrate)` in the
-  output rather than dropping it silently. EMQX and HiveMQ converters do not
-  exist yet.
+- **Migration tooling covers Mosquitto, EMQX and HiveMQ — and what it produces is a
+  reviewed DRAFT, not a translated configuration.**
+  `scripts/migrate/from-{mosquitto,emqx,hivemq}.py` translate the config and the ACL/RBAC
+  policy, marking anything without an equivalent as `TODO(migrate)` in the output rather than
+  dropping it silently, and each converter's output is put through `mqttd --check-config` and
+  booted by a real broker in CI. **Every security-relevant value they write — every bind,
+  every `[tls]` path, `client_ca`, `acl_file`, `password_file`, `allow_anonymous`, the ACL
+  `default`, every bridge upstream — carries the input key it was derived from
+  (`# from: listener 8883 0.0.0.0`), because the one gate that emits those lines refuses to
+  write a live one without it.** Anything a converter could not derive comes out **commented
+  out** beside a TODO naming the decision, so the worst case is a config **you** have to
+  finish rather than a live setting nobody derived — that is what makes the output reviewable,
+  and it is enforced by a provenance invariant over 136 generated inputs plus a fuzz pass over
+  mutated ones ([the draft contract](docs/MIGRATION.md#what-a-converter-produces-a-draft-where-anything-undecidable-is-inert-and-named)).
+  **Read the output before deploying it: none of the above makes it correct, only honest.** What
+  the gate does NOT close is **misreading** — a value genuinely derived from a real input key
+  whose MEANING the converter got wrong (a Mosquitto TLS-PSK listener converted to a plaintext
+  bind, an anonymous-scoped ACL block emitted as a grant to everyone). Five such were found and
+  fixed on 2026-08-15 and the class is open, so every construct known to be misread or unhandled
+  is enumerated in [KNOWN GAPS](docs/MIGRATION.md#known-gaps-after-round-4) with what to check by
+  hand. Three further limits:
+  **(a)** the EMQX and HiveMQ converters were built from each vendor's own shipped example
+  configuration at a pinned tag — **no live EMQX or HiveMQ broker was ever run** (and no live
+  Mosquitto either: its mappings come from `mosquitto.conf(5)` @ `v2.0.22`), and **no claim of
+  total coverage over any vendor's schema is made** — a construct a converter has never seen
+  is one it cannot report, though it also cannot turn into a live setting; **(b)** only the
+  Mosquitto converter has a Rust twin in `mqttui`, so the other two need `python3`;
+  **(c)** **no session state migrates** — a moved
+  client's offline queue, subscriptions and in-flight QoS 2 exchanges are lost and it must
+  resubscribe. Retained state *does* cross, through the bridge — but that sync runs in
+  **both** directions on every reconnect, so a retained value deleted while the bridge is
+  down is **resurrected** from the other side (prune with the bridge running, then check
+  both sides). The [migration guide](docs/MIGRATION.md) proves both halves and spells out
+  the dual-run cutover that the missing session state forces. NanoMQ, VerneMQ, AWS IoT Core, Azure IoT Hub and
+  everything else have **no** converter, and no partial one:
+  [what ships and what the manual path costs](docs/MIGRATION.md#what-ships) prices that
+  case honestly — the config is an hour, the ACL is the part that scales with your fleet.
 - **TLS 1.3 by default.** Older device firmware that cannot negotiate 1.3 will
   fail to connect out of the box — and the failure looks like a network problem
   rather than a policy one, so check your fleet before planning a migration.
@@ -1066,7 +1126,11 @@ The tables below are the authoritative reference for every `MQTTD_*` variable (a
 | Variable | Purpose |
 |---|---|
 | `MQTTD_NODE_ID` | This node's id (default `node-local`) |
-| `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`) |
+| `MQTTD_MAX_QUEUED_MESSAGES` | Per-session offline-queue cap (default `100000`). Bounds **disk** — the durable queue — not the in-memory backlog below |
+| `MQTTD_MAX_BACKLOG_MESSAGES` | Messages one online subscriber's in-memory **flow-control backlog** holds before drop-oldest evicts (ADR 0012, 0041-T10; default `10000` = the former hard-coded `MAX_BACKLOG`; range `1..=10000000`, **`0` is refused** — the backlog must be bounded, so there is no "unbounded" setting). Bounds **RAM**, per online subscriber, per node — never disk. Worst case unset: `10 000 x (MQTTD_MAX_PACKET_SIZE + 256)` ≈ **10 GiB** at the 1 MiB default. Read at startup only (a reload reports `limits` as requires-restart) |
+| `MQTTD_MAX_BACKLOG_BYTES` | The same backlog's **byte** bound, with exact accounting (issue #241; unset = **off**, i.e. exactly the pre-#241 behaviour; if set, at least `4096`). A message counts as `256 + topic + payload + forwarded MQTT 5 application-property bytes` — not payload-only (topics and user properties are publisher-controlled) and not the encoded packet (that is version- and subscriber-dependent). Worst case when set: `MQTTD_MAX_BACKLOG_BYTES + 2 x (MQTTD_MAX_PACKET_SIZE + 256)` — one entry may exceed the whole cap and is kept so delivery still progresses, plus one already-admitted re-parked entry. Drop-oldest at the bound **sheds already-acked messages without telling the publisher** (`mqttd_publish_dropped_total{reason="backlog-overflow"}`; the WARN names the bound); a value below `MQTTD_MAX_PACKET_SIZE` makes that routine and is warned at startup. Bounds **RAM**, never disk. Startup only |
+| `MQTTD_MAX_OUTBOUND_BYTES` | Accounted bytes that may sit unwritten in one client's **outbound socket channel** before `QoS` 0 is shed (issue #241; unset = off, minimum `4096`). The fixed 10 000-**packet** cap applies either way, and only the at-most-once class is shed — control packets and `QoS` 1/2 always flow (`mqttd_publish_dropped_total{reason="outbound-full"}`). Worst case unset: `10 000 x MQTTD_MAX_PACKET_SIZE`. Bounds **RAM**. Startup only |
+| `MQTTD_MAX_INFLIGHT_MESSAGES` | Ceiling on the **effective outbound** Receive Maximum (issue #241): the broker keeps at most `min(client Receive Maximum, this)` unacked `QoS` > 0 publishes per subscriber. Unset = the client's own value verbatim, i.e. **65 535** for every v3.1.1 client and any v5 client that sends no property — worst case `65 535 x MQTTD_MAX_PACKET_SIZE`. Range `1..=65535`. A pure **gate** on the wire window: it drops nothing itself, and the surplus waits in the backlog instead. **But that is not the same as loss-free** — the backlog is drop-oldest, so holding messages back into it can make `backlog-overflow` shedding of already-acked messages *more* likely, not less. Lower this to bound RAM and to slow a subscriber that legitimately keeps thousands in flight; pair it with a backlog bound sized for the lag you expect, and watch `publish_dropped{reason="backlog-overflow"}` rather than assuming zero. Distinct from `MQTTD_RECEIVE_MAXIMUM`, which is the **inbound** grant advertised to publishers. Bounds **RAM**. Startup only |
 | `MQTTD_QUEUE_OVERFLOW` | `drop-oldest` (default) or `reject-newest` |
 | `MQTTD_TOPIC_ALIAS_MAX` | Topic Alias Maximum advertised to v5 clients (ADR 0011; default `16`, `0` disables) |
 | `MQTTD_RECEIVE_MAXIMUM` | Receive Maximum advertised to v5 clients (ADR 0012; default `256`). Exceeding it → DISCONNECT `0x93` |
@@ -1307,8 +1371,9 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 
 ### Running the demo, migrations and test scripts
 
-There are 28 runnable scripts here — the demo stack, the Mosquitto converter, the smoke and
-conformance suites, the Kubernetes end-to-end runs, the benchmark harness. `mqttui` is the
+There are 36 runnable scripts here — the demo stack, the Mosquitto/EMQX/HiveMQ converters
+and the dual-run cutover smoke, the smoke and conformance suites, the Kubernetes end-to-end
+runs, the benchmark harness. `mqttui` is the
 one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and
 [The runnable map: mqttui](#the-runnable-map-mqttui) for installing it):
 

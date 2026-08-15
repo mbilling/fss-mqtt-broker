@@ -660,11 +660,11 @@ where
 
     let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
     let will = connect.last_will.map(into_will);
-    // The writer half owns `out_depth` and decrements it as it drains, so the hub
-    // can see how far behind this client is and shed `QoS 0` rather than queue it
-    // without limit (#123).
+    // The writer half owns the outbound METER and calls it as it drains, so the hub
+    // can see how far behind this client is — in packets and in bytes (issue #241) —
+    // and shed `QoS 0` rather than queue it without limit (#123).
     let (raw_out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let (out_tx, out_depth) = Outbound::new(raw_out_tx);
+    let (out_tx, out_meter) = Outbound::new(raw_out_tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     // The client's Receive Maximum bounds how many unacked QoS>0 PUBLISHes the hub
     // may have outstanding to it (ADR 0012); 0/absent means unlimited.
@@ -772,7 +772,7 @@ where
         auth_method,
         policy,
         &mut out_rx,
-        &out_depth,
+        &out_meter,
         connect.keep_alive,
         connect.protocol == ProtocolVersion::V5,
         // The client's advertised MQTT 5 Maximum Packet Size (ADR 0041 T4): the
@@ -1536,9 +1536,10 @@ async fn serve<R, W>(
     auth_method: Option<String>,
     policy: &ConnPolicy,
     out_rx: &mut mpsc::UnboundedReceiver<Packet>,
-    // Decremented as packets are drained, so the hub can see this client's
-    // backlog and shed `QoS 0` rather than queue it without limit (#123).
-    out_depth: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    // Called as packets are drained (packets AND accounted bytes, issue #241), so the
+    // hub can see this client's backlog and shed `QoS 0` rather than queue it without
+    // limit (#123).
+    out_meter: &crate::hub::OutboundMeter,
     keep_alive: u16,
     is_v5: bool,
     client_max_packet: Option<u32>,
@@ -1637,8 +1638,12 @@ where
                 }
             }
             maybe_out = out_rx.recv() => {
-                if maybe_out.is_some() {
-                    out_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                // Metered on the packet AS RECEIVED — before the topic-alias rewrite
+                // below, which only shrinks it: add and subtract are then the same pure
+                // function of the same packet, which is what makes the byte counter
+                // return to zero instead of drifting (issue #241).
+                if let Some(pkt) = &maybe_out {
+                    out_meter.drained(pkt);
                 }
                 match maybe_out {
                     // Rewrite outbound PUBLISHes to use topic aliases where the

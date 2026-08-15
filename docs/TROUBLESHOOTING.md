@@ -56,8 +56,8 @@ nothing and there is no obvious failure.
   made (README): a v3.1.1 **retained** publish under brownout or over the retained quota
   is acked and delivered live but its retained *value* is not stored, and the offline
   queue's overflow policy (default `drop-oldest`) truncates already-acked entries at the
-  cap — check `publish_dropped{reason="queue-overflow"}` and
-  `quota_rejections_total{reason="retained"}`.
+  cap — check `mqttd_publish_dropped_total{reason="queue-overflow"}` and
+  `mqttd_quota_rejections_total{reason="retained"}`.
 
 ## Publishes are refused (`0x97`) or the connection closes without a PUBACK
 
@@ -85,14 +85,84 @@ not).
 - **Remedy:** expand the disk / raise the watermark / prune retained topics / let
   subscribers drain their queues. Brownout refuses only *growth*, so consumption, deletes
   and expiry shrink the store until the edge lifts on its own.
+  **If a migration bridge is running, prune retained state with the bridge UP and then check
+  both sides.** The bridge re-syncs retained values in **both** directions on every
+  reconnect, so a value pruned while it is down is resurrected from the other broker with no
+  log line attributing it — you delete the stale config, see it gone, and it comes back.
+  [OPERATIONS](OPERATIONS.md) ("That retained sync has a hazard") states the position; the same
+  caveat is on every other "prune retained" instruction in the tree, and this page is the one
+  you land on from a brownout alert, i.e. exactly mid-cutover.
 - **Also possible: the retained quota.** `MQTTD_MAX_RETAINED_MESSAGES` answers a v5
   retained publish creating a *new* topic with the same `0x97`. For **v3.1.1 retained**
   publishes, note that both the quota *and* brownout keep the plain PUBACK when no durable
   enqueue is owed (delivered live, not retained) — so a plain PUBACK does **not** rule
   brownout out. A *close* with no PUBACK points at brownout's durable-enqueue refusal; to
   discriminate, read `mqttd_brownout{axis}` and the counters —
-  `quota_rejections_total{reason="retained"}` (retained growth, quota or brownout) vs
+  `mqttd_quota_rejections_total{reason="retained"}` (retained growth, quota or brownout) vs
   `{reason="brownout-publish"}` (a refused durable enqueue).
+
+## The broker disconnects a client a few seconds after a node roll
+
+**Symptom:** a client that reconnected during or just after a rolling restart is
+disconnected again by the broker seconds later — a v5 client with reason `0x9C`
+(*Use another server*), a v3.1.1 client with a bare close. It reconnects and
+everything works.
+
+**This is expected, and it is a fix, not a fault** (issue #284). A persistent
+session is served on its placement group's owner ([ADR 0005](adr/0005-session-affinity.md)),
+and that decision is made once, at CONNECT. A pod readmitted after a roll rejoins
+gossip membership — and turns Ready — a couple of seconds before it re-enters the
+lease voter set, so for that moment its groups are still owned by the interim
+holder they were handed during its absence. A client resuming inside that window
+is placed on the interim holder correctly, and would be stranded there when the
+lease legitimately returns: every publish toward it refused, its publishers'
+acks honestly withheld, with no self-heal until the client's keepalive noticed
+the dead air. Instead, the hosting node closes the connection so the next CONNECT
+relocates properly.
+
+Confirm it: on the closing node,
+
+```
+WARN mqttd::hub: session hosted on a node that does not own its group; closing it
+so the client relocates to the owner (issue #284, ADR 0005) client=… owner=…
+```
+
+paired with `mqttd_session_rehomes_total{reason="stale-owner"}`. A handful per roll
+is normal; a *sustained* rate means group ownership is churning — see the
+*Sessions rehoming* row in [OPERATIONS](OPERATIONS.md).
+
+**Two more symptoms come with the same fix, both expected.**
+
+*Publishers to that session's topics retry.* The close ends the connection and
+touches nothing else: the closing node keeps ROUTING the session — and keeps
+advertising its subscriptions — until its own inherited-session scan releases them
+on the ordinary reconcile cadence. So for that window a `QoS` ≥ 1 publish toward the
+session has its ack **withheld** (`not the owning node for this group` on the closing
+node) and the publisher resends, and it keeps doing so briefly even after the session
+is healthy on its new owner, because both nodes advertise its filters until the old
+one lets go. That is deliberate: the alternative is releasing the routing sooner, and
+that release is not witnessed by the new owner — after it, the same publish can match
+nobody anywhere and be **acked** for a message no node stored. Inside a roll the
+window is about a second (the readmission's membership change makes every node scan
+eagerly); for a lease move with no membership change it is up to the 30 s reconcile
+cadence.
+
+*A bystander sees the client's Last Will on every rehome close.* A server
+DISCONNECT does not delete the will ([MQTT-3.1.2-8], §3.14.4), and mqttd is
+consistent about this across every broker-initiated close (takeover, `evict`,
+rehome — issue #265). One LWT per rehomed session, so a roll or a resize produces a
+burst of false "device offline" events. Suppress device-offline alerting while
+`mqttd_session_rehomes_total{reason="stale-owner"}` is climbing.
+
+**The failure forms to look for instead.**
+
+*`not the owning node for this group` persisting for a client for more than a few
+seconds, with no close.* Check `mqttd_misplaced_sessions` and
+`mqttd_session_rehomes_total{reason="unrelocatable"}` — the node knows the session is
+misplaced but cannot rehome it, because it does not know the owner's peer-link
+address, and closing the client would only send it back here. Those sessions really
+are undeliverable. It is a peer-mesh problem: compare `mqttd_peer_links` with
+`mqttd_cluster_members` and check the peer-link TLS/gossip health.
 
 ## `/readyz` returns not-ready but the broker is running
 

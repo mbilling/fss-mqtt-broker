@@ -858,3 +858,421 @@ async fn a_local_message_fans_out_to_multiple_upstreams() {
 
     bridge.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Loop prevention across REAL topologies (BR-030..038).
+//
+// Three defences are active at once and they catch different shapes, which is
+// why the tests below are written as a set rather than one "loops are prevented"
+// case:
+//
+//   1. No Local — every bridge subscription sets it (`bridge_subscription_options`).
+//      Unforgeable, but the broker only suppresses when the publisher is the SAME
+//      client, so it catches the single-broker echo and nothing else.
+//   2. Hop count (`fss-bridge-hop-count`) — the ONLY defence against a cycle
+//      through several brokers, where each hop is a different client.
+//   3. Direction — `plan_forwards` never routes upstream→upstream.
+//
+// The pre-existing hop-limit test pre-stamps a message at the limit and checks
+// the counter moved; it never spins a cycle. So layer 2's actual job had never
+// been exercised end to end.
+// ---------------------------------------------------------------------------
+
+/// Start a bridge whose local side is `local` and whose single upstream is `up`,
+/// with one `both` rule on `filter` and an explicit id on BOTH endpoints.
+///
+/// The ids are not decoration. `default_client_id` derives from the hostname, so
+/// several bridge instances in one test process would all pick the same id, take
+/// each other over, and leave the ring silently broken rather than failing.
+fn ring_bridge(tag: &str, local: SocketAddr, up: SocketAddr, filter: &str, limit: u32) -> Bridge {
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        hop_count_limit = {limit}
+        [local]
+        url = "{local}"
+        client_id = "{tag}-local"
+        [[upstreams]]
+        name = "next"
+        url = "{up}"
+        client_id = "{tag}-up"
+        [[upstreams.rules]]
+        direction = "both"
+        filter = "{filter}"
+        "#,
+    ))
+    .unwrap();
+    Bridge::start(cfg)
+}
+
+/// Drain everything a subscriber sees until it goes quiet for `quiet`, returning
+/// the payloads in arrival order.
+///
+/// Quiescence is the termination proof: a cycle that had NOT been cut would keep
+/// feeding this loop, so "the socket went quiet" is the observable that says the
+/// ring stopped, and the count says how far it got before it did.
+async fn drain_until_quiet(c: &mut MqttClient, quiet: Duration) -> Vec<Vec<u8>> {
+    let mut seen = Vec::new();
+    while let Ok(Ok(Event::Publish(p))) = tokio::time::timeout(quiet, c.next_event()).await {
+        seen.push(p.payload.to_vec());
+    }
+    seen
+}
+
+/// BR-031: a **cycle** A→B→C→A is terminated by the hop counter.
+///
+/// This is the topology No Local cannot see: three bridges are three different
+/// clients, so every hop looks like a fresh publisher to the broker it lands on.
+/// Nothing but the hop count stops the message going round forever.
+#[tokio::test]
+async fn a_three_broker_ring_is_terminated_by_the_hop_counter() {
+    let (a, b, c) = (
+        start_broker().await,
+        start_broker().await,
+        start_broker().await,
+    );
+
+    // A→B, B→C, C→A: a closed ring on the same topic space, no remap, so every
+    // hop re-matches the rule that would forward it onward.
+    let ab = ring_bridge("ab", a, b, "ring/#", 3);
+    let bc = ring_bridge("bc", b, c, "ring/#", 3);
+    let ca = ring_bridge("ca", c, a, "ring/#", 3);
+
+    let mut watch = client(a, "ring-watch").await;
+    subscribe(&mut watch, "ring/#").await;
+
+    // Inject ONE message, retrying until the ring is actually wired (each bridge
+    // must have its local subscription live) — then stop injecting.
+    let mut pubc = client(a, "ring-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        pubc.publish(
+            "ring/x",
+            Bytes::from_static(b"go"),
+            QoS::AtMostOnce,
+            false,
+            None,
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+        if ab.metrics().forwarded_out_count() > 0
+            && bc.metrics().forwarded_out_count() > 0
+            && ca.metrics().forwarded_out_count() > 0
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ring never came up: ab={} bc={} ca={}",
+            ab.metrics().forwarded_out_count(),
+            bc.metrics().forwarded_out_count(),
+            ca.metrics().forwarded_out_count()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // THE ASSERTION: the ring goes quiet. An uncut cycle would feed this drain
+    // forever; reaching quiescence at all is the termination proof.
+    let seen = drain_until_quiet(&mut watch, Duration::from_secs(2)).await;
+
+    let dropped = ab.metrics().dropped_hop_limit_count()
+        + bc.metrics().dropped_hop_limit_count()
+        + ca.metrics().dropped_hop_limit_count();
+    assert!(
+        dropped > 0,
+        "the ring stopped, but not because of the hop limit — no bridge counted a \
+         hop-limit drop, so something else (or nothing) cut it: {} deliveries seen",
+        seen.len()
+    );
+
+    // Bounded, not merely finite: with a limit of 3 and one injected message per
+    // warm-up round, a runaway would be orders of magnitude larger than this.
+    assert!(
+        seen.len() < 200,
+        "the ring amplified before it was cut: {} deliveries",
+        seen.len()
+    );
+
+    ab.shutdown();
+    bc.shutdown();
+    ca.shutdown();
+}
+
+/// BR-032: hop count **increments** along a chain A→B→C→D.
+///
+/// The stamp was only ever asserted at hop 1 (one bridge) and as a pure unit test
+/// of `set_hop_count`. If the counter were re-stamped rather than incremented at
+/// each crossing, every single-bridge test would still pass and the ring test
+/// above would never terminate — so the increment is the property that makes the
+/// backstop work, and this pins it end to end.
+#[tokio::test]
+async fn hop_count_increments_along_a_chain() {
+    // Four brokers named for their position in the chain, not a-b-c-d soup.
+    let (first, second, third, last) = (
+        start_broker().await,
+        start_broker().await,
+        start_broker().await,
+        start_broker().await,
+    );
+
+    let one_way = |tag: &str, local: SocketAddr, up: SocketAddr| {
+        Bridge::start(
+            BridgeConfig::parse_toml(&format!(
+                r#"
+                [local]
+                url = "{local}"
+                client_id = "{tag}-local"
+                [[upstreams]]
+                name = "next"
+                url = "{up}"
+                client_id = "{tag}-up"
+                [[upstreams.rules]]
+                direction = "out"
+                filter = "chain/#"
+                "#,
+            ))
+            .unwrap(),
+        )
+    };
+    let ab = one_way("ab", first, second);
+    let bc = one_way("bc", second, third);
+    let cd = one_way("cd", third, last);
+
+    let mut end = client(last, "chain-sub").await;
+    subscribe(&mut end, "chain/#").await;
+
+    // Republish until the whole chain is wired; the far end tells us when.
+    let mut pubc = client(first, "chain-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let arrived = loop {
+        pubc.publish(
+            "chain/x",
+            Bytes::from_static(b"walk"),
+            QoS::AtMostOnce,
+            false,
+            None,
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+        match tokio::time::timeout(Duration::from_millis(300), end.next_event()).await {
+            Ok(Ok(Event::Publish(p))) => break p,
+            _ => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the message never traversed all three hops"
+            ),
+        }
+    };
+
+    assert_eq!(
+        hop_count(&arrived).as_deref(),
+        Some("3"),
+        "three crossings must stamp 3, not a re-stamped 1"
+    );
+
+    ab.shutdown();
+    bc.shutdown();
+    cd.shutdown();
+}
+
+/// BR-030: a bidirectional pair delivers **exactly one** copy per side.
+///
+/// The `both` rule is the shape most likely to double-deliver: the same filter is
+/// subscribed on both sides, so a naive implementation echoes the message back to
+/// the broker it came from and the origin-side subscriber sees it twice.
+#[tokio::test]
+async fn a_bidirectional_pair_delivers_exactly_one_copy_per_side() {
+    let (a, b) = (start_broker().await, start_broker().await);
+    let bridge = ring_bridge("pair", a, b, "pair/#", 4);
+
+    let mut a_sub = client(a, "pair-a-sub").await;
+    subscribe(&mut a_sub, "pair/#").await;
+    let mut b_sub = client(b, "pair-b-sub").await;
+    subscribe(&mut b_sub, "pair/#").await;
+
+    // Warm up on a topic the assertions ignore, so the retried warm-up publishes
+    // cannot be mistaken for duplicates of the message under test.
+    let mut a_pub = client(a, "pair-a-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        a_pub
+            .publish(
+                "pair/warmup",
+                Bytes::from_static(b"w"),
+                QoS::AtMostOnce,
+                false,
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        if bridge.metrics().forwarded_out_count() > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the bridge never forwarded the warm-up"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = drain_until_quiet(&mut a_sub, Duration::from_millis(400)).await;
+    let _ = drain_until_quiet(&mut b_sub, Duration::from_millis(400)).await;
+
+    a_pub
+        .publish(
+            "pair/once",
+            Bytes::from_static(b"ONCE"),
+            QoS::AtMostOnce,
+            false,
+            None,
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+
+    let a_seen = drain_until_quiet(&mut a_sub, Duration::from_millis(600)).await;
+    let b_seen = drain_until_quiet(&mut b_sub, Duration::from_millis(600)).await;
+    let count = |v: &[Vec<u8>]| v.iter().filter(|p| p.as_slice() == b"ONCE").count();
+
+    assert_eq!(
+        count(&a_seen),
+        1,
+        "the origin-side subscriber must see the message once (its own broker's \
+         delivery), not a second time echoed back across the bridge"
+    );
+    assert_eq!(count(&b_seen), 1, "the far side must see exactly one copy");
+
+    bridge.shutdown();
+}
+
+/// BR-037: a **retained** value in a `both` rule does not ping-pong.
+///
+/// Retained deserves its own case: bridge subscriptions use `retain_handling: 0`,
+/// so the bridge receives a retained replay on **every reconnect**, and a replay
+/// carries `retain = 1`. A retained value crossing a bidirectional rule can
+/// therefore be re-injected on each reconnect rather than only once, with the hop
+/// counter as the only bound.
+#[tokio::test]
+async fn a_retained_value_does_not_ping_pong_across_a_both_rule() {
+    let (a, b) = (start_broker().await, start_broker().await);
+    let bridge = ring_bridge("ret", a, b, "ret/#", 3);
+
+    let mut a_pub = client(a, "ret-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        a_pub
+            .publish(
+                "ret/v",
+                Bytes::from_static(b"RETAINED"),
+                QoS::AtMostOnce,
+                true, // retain
+                None,
+                Properties::new(),
+            )
+            .await
+            .unwrap();
+        if bridge.metrics().forwarded_out_count() > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the retained value never crossed the bridge"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A late subscriber on the far side gets the retained value — it crossed and
+    // landed retained, which is the behaviour a loop test must not accidentally
+    // "prove" by the value never having arrived at all.
+    let mut b_late = client(b, "ret-late").await;
+    subscribe(&mut b_late, "ret/#").await;
+    let got = tokio::time::timeout(Duration::from_secs(5), b_late.next_event()).await;
+    assert!(
+        matches!(got, Ok(Ok(Event::Publish(ref p))) if &p.payload[..] == b"RETAINED"),
+        "the retained value must be served on the far side, got {got:?}"
+    );
+
+    // And it settles: no endless re-injection.
+    let tail = drain_until_quiet(&mut b_late, Duration::from_secs(2)).await;
+    assert!(
+        tail.len() < 50,
+        "the retained value re-amplified across the bridge: {} extra deliveries",
+        tail.len()
+    );
+
+    bridge.shutdown();
+}
+
+/// BR-036: a remap ping-pong that PASSES config validation is stopped by No Local.
+///
+/// Validation rejects `both` + remap (#192), but the same cycle can be written as
+/// two separate, individually legal one-way rules — `out ping/# → pong/` paired
+/// with `in pong/# → ping/`. Config cannot see it. This asserts the runtime
+/// defence that does: the bridge publishes to its local broker on the same client
+/// that subscribes there, so the broker's No Local suppression breaks the cycle at
+/// the source.
+///
+/// It is the complement to the ring test above: together they show which layer
+/// catches which shape — No Local the single-broker echo, the hop counter the
+/// multi-broker cycle it cannot see.
+#[tokio::test]
+async fn a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local() {
+    let (local, up) = (start_broker().await, start_broker().await);
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        hop_count_limit = 4
+        [local]
+        url = "{local}"
+        client_id = "pp-local"
+        [[upstreams]]
+        name = "partner"
+        url = "{up}"
+        client_id = "pp-up"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "ping/#"
+        remap = {{ strip_prefix = "ping/", prefix = "pong/" }}
+        [[upstreams.rules]]
+        direction = "in"
+        filter = "pong/#"
+        remap = {{ strip_prefix = "pong/", prefix = "ping/" }}
+        "#,
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+
+    let mut watch = client(local, "pp-watch").await;
+    subscribe(&mut watch, "ping/#").await;
+
+    let mut pubc = client(local, "pp-pub").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        pubc.publish(
+            "ping/x",
+            Bytes::from_static(b"PP"),
+            QoS::AtMostOnce,
+            false,
+            None,
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+        if bridge.metrics().forwarded_out_count() > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the out leg never forwarded"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let seen = drain_until_quiet(&mut watch, Duration::from_secs(2)).await;
+    assert!(
+        seen.len() < 100,
+        "a two-rule remap ping-pong amplified: {} deliveries",
+        seen.len()
+    );
+
+    bridge.shutdown();
+}

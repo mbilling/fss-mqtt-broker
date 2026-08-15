@@ -33,6 +33,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Re-exported so the binary wires the hub's own bounds type (issue #241).
+pub use crate::backpressure::SubscriberLimits;
+use crate::backpressure::{message_bytes, packet_bytes, BacklogBound, BacklogEntry, BacklogQueue};
 use bytes::Bytes;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
@@ -66,14 +69,42 @@ const REPLAY_LIMIT: usize = 10_000;
 /// unlimited (ADR 0012). v3.1.1 sessions always use this.
 const RECEIVE_MAXIMUM_DEFAULT: u16 = u16::MAX;
 
-/// Maximum `QoS` > 0 messages held in a session's flow-control backlog before
-/// drop-oldest evicts (ADR 0012). Bounds broker memory under a stalled consumer,
-/// mirroring the offline-queue cap (ADR 0001 §6).
-const MAX_BACKLOG: usize = 10_000;
-
 /// How often the hub sweeps for sessions whose MQTT 5.0 Session Expiry Interval has
 /// elapsed (ADR 0009). Second-grained expiry does not need a finer cadence.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How many consecutive sweep ticks a live session must be observed hosted on a node
+/// that does NOT own its placement group before that node closes it (issue #284).
+///
+/// The grace is what separates a session PLACED ACROSS an ownership move from ordinary
+/// convergence noise: a lease that lands elsewhere for a tick and comes straight back
+/// (assigner rebalance, leader change) must not cost a live client its connection.
+/// Two ticks ≈ 1s, which is well under any client's keepalive — the thing this fix
+/// exists to beat — and well over the sub-second churn the lease assigner produces.
+const MISPLACED_GRACE_TICKS: u8 = 2;
+
+/// The minimum interval between two rehome closes of the SAME session (issue #284).
+///
+/// The close is only useful if the client's next CONNECT lands somewhere better. A
+/// placement that flaps — or a load balancer that keeps returning the client to a
+/// non-owning node — would otherwise turn rehome-on-settle into a close loop (and a
+/// will-publish loop). Suppressed repeats are counted (`session_rehomes{reason="cooldown"}`)
+/// and warned, so a standing flap is loud rather than silent.
+const REHOME_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How many sessions ONE sweep tick may close for rehoming (issue #284 round-2 finding
+/// 4). The remainder is deferred to later ticks — the pass re-derives its candidates
+/// every tick, so a deferral costs nothing but time.
+///
+/// The rehome is the LIVE mirror of elastic resize (ADR 0043 P2), where ~1/N of groups
+/// change owner in one step: at the documented 5000-session sizing that is ~1700 live
+/// sessions whose leases move together. Uncapped, one dispatch closed 400 of them in
+/// 25-44 ms of on-loop sweep time, published 400 Last Wills in one breath, and sent 400
+/// clients to reconnect on the same instant onto the newly-joined (coldest) node. The cap
+/// converts that synchronized storm into a paced drain — and, because the will fires on
+/// every rehome close ([MQTT-3.1.2-8]), it is the will-storm cap too. Deferrals are
+/// counted (`session_rehomes{reason="deferred"}`) so a mass move is visible, not silent.
+const REHOME_CLOSES_PER_TICK: usize = 32;
 
 /// How many sweep ticks between offering every peer our retained digest — the
 /// retained set's ANTI-ENTROPY cadence (issue #87).
@@ -170,33 +201,81 @@ pub struct RemoteSharedGroup {
 /// The channel is unbounded *by design* — a bounded one would make the hub block
 /// or drop control packets, and the hub must never stall on one slow client. But
 /// unbounded with no visibility was a memory leak with a nice name: `QoS 1/2` is
-/// bounded by [`MAX_BACKLOG`] via the flow-control path, while **`QoS 0` went
-/// straight into this channel with no cap, no counter and no shed policy** (#123).
-/// `QoS 0` is also exempt from Receive Maximum, so nothing else applied
-/// backpressure — a subscriber that stopped reading a busy topic grew this
+/// bounded by the flow-control backlog ([`BacklogQueue`]) via the flow-control path,
+/// while **`QoS 0` went straight into this channel with no cap, no counter and no
+/// shed policy** (#123). `QoS 0` is also exempt from Receive Maximum, so nothing else
+/// applied backpressure — a subscriber that stopped reading a busy topic grew this
 /// without limit.
 ///
 /// So the depth is tracked here: cheap on the hot path (one relaxed add, one
 /// relaxed sub), and it lets the hub shed `QoS 0` — which MQTT defines as
 /// at-most-once, so dropping it is legal — while every other packet still flows.
+///
+/// Since issue #241 the queued **bytes** are tracked alongside the count, because a
+/// packet count is not a memory budget under mixed-size traffic: at the 1 MiB default
+/// packet ceiling the 10 000-packet cap alone allowed ~10 GiB to sit here.
+/// `MQTTD_MAX_OUTBOUND_BYTES` bounds the bytes; the count cap still applies.
+///
+/// **Exactness class, stated honestly:** this counter is cross-task — the hub adds, the
+/// connection's writer subtracts — so it equals the sum over packets the writer has not yet
+/// DEQUEUED. `OutboundMeter::drained` subtracts on `recv()`, before the topic-alias rewrite
+/// and before the write, so a packet currently being written has ALREADY been subtracted and
+/// is excluded. The counter therefore under-counts resident bytes by at most one packet.
+/// That direction is the safe one for a gate — it never over-states pressure and so never
+/// sheds early — but it is the opposite of what this doc claimed until review caught it.
+/// Same semantics [`depth`](Self::depth) has always had, and deliberately *weaker* than the
+/// single-owner exactness of [`BacklogQueue::bytes`].
 #[derive(Clone, Debug)]
 pub struct Outbound {
     tx: mpsc::UnboundedSender<Packet>,
     depth: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+}
+
+/// The reader half of the outbound accounting: what a connection's writer calls for each
+/// packet it dequeues, so the hub's view of that client's queue shrinks.
+///
+/// One type with one method rather than two loose atomics, so the depth and the byte
+/// total structurally cannot be decremented in different places — or one of them
+/// forgotten.
+#[derive(Clone, Debug)]
+pub struct OutboundMeter {
+    depth: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl OutboundMeter {
+    /// One packet left the channel for the socket. Call it with the packet **as
+    /// received**, before any outbound rewrite: add and subtract are then the same pure
+    /// function of the same immutable packet, which is what makes the counter return to
+    /// zero rather than drift.
+    pub fn drained(&self, packet: &Packet) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+        let n = packet_bytes(packet);
+        // Saturating rather than wrapping: a counter that went momentarily negative
+        // would read as ~18 EiB and pin the `QoS` 0 gate shut forever.
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                Some(b.saturating_sub(n))
+            });
+    }
 }
 
 impl Outbound {
-    /// Wrap a channel, returning the sender and the counter its reader must
-    /// decrement as it drains.
+    /// Wrap a channel, returning the sender and the meter its reader must call as it
+    /// drains.
     #[must_use]
-    pub fn new(tx: mpsc::UnboundedSender<Packet>) -> (Self, Arc<AtomicUsize>) {
+    pub fn new(tx: mpsc::UnboundedSender<Packet>) -> (Self, OutboundMeter) {
         let depth = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
         (
             Self {
                 tx,
                 depth: depth.clone(),
+                bytes: bytes.clone(),
             },
-            depth,
+            OutboundMeter { depth, bytes },
         )
     }
 
@@ -206,10 +285,13 @@ impl Outbound {
     /// the same way — the packet is dropped and a Detach is already in flight — so
     /// this is a plain bool rather than a `Result` carrying a whole `Packet` back.
     pub fn send(&self, packet: Packet) -> bool {
+        let n = packet_bytes(&packet);
         self.depth.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(n, Ordering::Relaxed);
         if self.tx.send(packet).is_err() {
-            // Never queued, so never drained: keep the count honest.
+            // Never queued, so never drained: keep both counts honest.
             self.depth.fetch_sub(1, Ordering::Relaxed);
+            self.bytes.fetch_sub(n, Ordering::Relaxed);
             return false;
         }
         true
@@ -220,14 +302,62 @@ impl Outbound {
     pub fn depth(&self) -> usize {
         self.depth.load(Ordering::Relaxed)
     }
+
+    /// Accounted bytes queued for this client but not yet written to its socket
+    /// (issue #241). See the type docs for what "accounted" means and why this is a
+    /// weaker exactness class than the backlog's.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// How many packets may sit unwritten for one client before `QoS 0` is shed.
 ///
 /// Sized so it is unreachable by well-behaved clients and by the `QoS 1/2` paths
-/// (which [`MAX_BACKLOG`] already bounds), and only bites a consumer that has
-/// genuinely stopped reading.
+/// (which the flow-control backlog already bounds), and only bites a consumer that has
+/// genuinely stopped reading. The **byte** dimension is the operator's
+/// (`MQTTD_MAX_OUTBOUND_BYTES`, issue #241); this count stays fixed because bytes were
+/// the missing dimension, not the count.
 pub const MAX_OUTBOUND_QUEUE: usize = 10_000;
+
+/// One WARN for a backlog eviction, naming **which bound fired** and how much it shed
+/// (issue #241).
+///
+/// The bound goes in the log line, not into the metric's label set: the counter stays
+/// `publish_dropped{reason="backlog-overflow"}` with exactly its existing labels, so
+/// cardinality discipline holds and existing dashboards keep working. One line per push
+/// rather than per entry — a byte bound can shed several at once, and `dropped` says how
+/// many.
+///
+/// `bound` is derived from *every* entry that went, not from the first: one arrival can
+/// trip the count bound and then still be over the byte bound, and a line that named only
+/// the count would send the operator to the wrong knob.
+fn warn_backlog_eviction(
+    client: &ClientId,
+    evicted: &[(BacklogEntry, BacklogBound)],
+    bytes_now: usize,
+    limits: &SubscriberLimits,
+) {
+    let by_bytes = evicted
+        .iter()
+        .filter(|(_, b)| *b == BacklogBound::Bytes)
+        .count();
+    let bound = match (by_bytes, evicted.len() - by_bytes) {
+        (0, _) => BacklogBound::Messages.as_str(),
+        (_, 0) => BacklogBound::Bytes.as_str(),
+        _ => "messages+bytes",
+    };
+    warn!(
+        client = %client.0,
+        dropped = evicted.len(),
+        bound,
+        bytes = bytes_now,
+        cap_messages = limits.max_backlog_messages,
+        cap_bytes = ?limits.max_backlog_bytes,
+        "flow-control backlog full: evicted the oldest already-acked message(s)"
+    );
+}
 
 /// Sender for messages destined to a peer node's link.
 pub type PeerOutbound = mpsc::UnboundedSender<PeerMessage>;
@@ -491,17 +621,6 @@ struct PendingOut {
     /// cap rejected under `reject-newest` — none of which owe a redelivery. (Brownout no
     /// longer appears here: it refuses the publish rather than sending an unrecorded
     /// copy — 0041-T11, issue #238.)
-    offset: Option<Offset>,
-}
-
-/// A `QoS` > 0 message held back because the session's Receive Maximum quota is full
-/// (ADR 0012). It has no packet id yet — one is assigned when it is finally sent.
-#[derive(Debug)]
-struct Backlog {
-    message: Message,
-    retain: bool,
-    message_expiry: Option<u32>,
-    /// Its durable log offset, as for [`PendingOut::offset`] (#124).
     offset: Option<Offset>,
 }
 
@@ -836,7 +955,12 @@ struct Inflight {
     /// have unacked to it at once (ADR 0012).
     receive_maximum: u16,
     /// `QoS` > 0 messages waiting for quota; drained FIFO as PUBACK/PUBCOMP frees slots.
-    backlog: VecDeque<Backlog>,
+    ///
+    /// Bounded in **both** messages and bytes by the operator's [`SubscriberLimits`]
+    /// (issue #241), drop-oldest at either bound (ADR 0012, policy unchanged). The
+    /// running byte total lives inside [`BacklogQueue`] with private fields precisely so
+    /// this 18 000-line module cannot mutate the queue without adjusting it.
+    backlog: BacklogQueue,
     /// Durable log offsets appended for this session and not yet acknowledged by the
     /// subscriber (#124). The log is truncated only through the **contiguous** acked
     /// prefix, so an out-of-order PUBACK cannot discard a message still in flight
@@ -872,7 +996,7 @@ impl Default for Inflight {
             block_remaining: 0,
             pending: BTreeMap::new(),
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
-            backlog: VecDeque::new(),
+            backlog: BacklogQueue::default(),
             outstanding: BTreeSet::new(),
             high_water: 0,
             acked_through: 0,
@@ -923,16 +1047,19 @@ impl Inflight {
         })
     }
 
-    /// Append to the flow-control backlog, evicting the oldest entry when the cap is
-    /// reached (drop-oldest, ADR 0012). Returns the evicted entry, if any — the caller
-    /// must [`release`](Self::release) its durable offset, since nothing will deliver
-    /// it and an offset owed forever would stop the log ever being truncated.
-    fn push_backlog(&mut self, entry: Backlog) -> Option<Backlog> {
-        let evicted = (self.backlog.len() >= MAX_BACKLOG)
-            .then(|| self.backlog.pop_front())
-            .flatten();
-        self.backlog.push_back(entry);
-        evicted
+    /// Append to the flow-control backlog, evicting the oldest entries until BOTH the
+    /// message and the byte bound hold (drop-oldest, ADR 0012, issue #241). Returns the
+    /// evicted entries oldest-first with the bound that evicted each — the caller must
+    /// [`release`](Self::release) every offset, since nothing will deliver those
+    /// messages and an offset owed forever would stop the log ever being truncated.
+    ///
+    /// The byte bound may evict several entries where the count bound evicts one.
+    fn push_backlog(
+        &mut self,
+        entry: BacklogEntry,
+        limits: &SubscriberLimits,
+    ) -> Vec<(BacklogEntry, BacklogBound)> {
+        self.backlog.push_back_capped(entry, limits)
     }
 }
 
@@ -1520,6 +1647,32 @@ impl HubCommand {
     }
 }
 
+/// A live session seen hosted on a node that does not own its placement group
+/// (issue #284) — the grace counter and last-close time behind rehome-on-settle.
+#[derive(Debug, Default)]
+struct Misplaced {
+    /// Consecutive sweep ticks the condition has held, capped at
+    /// [`MISPLACED_GRACE_TICKS`]. Reset to 0 when the condition clears, and after a
+    /// close — the next episode earns its own grace.
+    ticks: u8,
+    /// When this session was last closed to make it relocate — the
+    /// [`REHOME_COOLDOWN`] anchor. `None` until the first close. Outlives the
+    /// condition clearing, or a re-attach to the same non-owning node would be closed
+    /// again at once and the cooldown would bound nothing.
+    last_kick: Option<Instant>,
+    /// Whether the CURRENT non-actionable episode (unrelocatable, or cooling down) has
+    /// already been warned and counted. A standing condition this node cannot resolve
+    /// must not warn — or count — once a second.
+    noted: bool,
+    /// Whether this session has already been counted as deferred over
+    /// [`REHOME_CLOSES_PER_TICK`] in the CURRENT deferral episode. The pass re-derives
+    /// its candidates every tick, so without this the counter would report deferral
+    /// EVENTS: an n-session move increments it ~n²/(2·cap) times, and the operator sizing
+    /// a drain from it overestimates the backlog by more than an order of magnitude.
+    /// Cleared with `ticks`/`noted` — on the close, and when candidacy ends.
+    deferred: bool,
+}
+
 /// A connected peer node's link.
 #[derive(Debug)]
 struct Peer {
@@ -1773,6 +1926,23 @@ pub struct Hub {
     /// materialize eagerly on their NEW owners and un-materialize on their old
     /// ones, instead of waiting for first touch.
     known_members: BTreeSet<NodeId>,
+    /// Live sessions observed hosted here for a group this node does not own (issue
+    /// #284), with how many consecutive sweep ticks the condition has held and when
+    /// this session was last closed for it. Entries are dropped the moment the
+    /// condition clears, so the map is bounded by the session count and empty in the
+    /// steady state.
+    ///
+    /// Non-empty is also the candidate pass's ESCAPE HATCH from its ownership-version
+    /// skip, which is why `finish_attach` seeds an entry here for a persistent session
+    /// that arrives on a non-owning node: a session that becomes misplaced by ARRIVING
+    /// moves no lease, so nothing else would ever make the pass look at it.
+    misplaced: HashMap<ClientId, Misplaced>,
+    /// The [`Placement::ownership_epoch`] the last rehome candidate scan ran at (issue
+    /// #284 round-2 finding 3). While it is unchanged no committed lease has moved and no
+    /// membership relevant to ownership has changed, so the `O(online sessions)` pass is
+    /// skipped entirely — the steady-state cost of rehome-on-settle is one `u64` read
+    /// under a short lock per tick, not a scan.
+    ownership_epoch_seen: Option<u64>,
     /// Connected peer nodes.
     peers: HashMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest (filters).
@@ -1827,6 +1997,11 @@ pub struct Hub {
     /// Wall-clock source for absolute message-expiry deadlines (ADR 0009 §3).
     /// Injectable so expiry can be tested without real time passing.
     clock: Arc<dyn crate::clock::Clock>,
+    /// The operator's per-subscriber in-memory bounds (issue #241, ADR 0041 T10). Set
+    /// once before [`run`](Self::run); a reload reports `limits` as requires-restart
+    /// (ADR 0041 §6), so this is never swapped mid-flight. `Default` is exactly the
+    /// former hard-coded behaviour.
+    subscriber_limits: SubscriberLimits,
 }
 
 /// The bounded `{reason}` label for a durable-append failure (ADR 0020-T6).
@@ -2184,11 +2359,14 @@ impl Hub {
                 // member set as a "change", which (re)arms the boot window —
                 // harmless overlap with the 8 ticks above.
                 known_members: BTreeSet::new(),
+                misplaced: HashMap::new(),
+                ownership_epoch_seen: None,
                 peers: HashMap::new(),
                 remote_interest: HashMap::new(),
                 placement,
                 metrics: None,
                 clock: crate::clock::system_clock(),
+                subscriber_limits: SubscriberLimits::default(),
             },
             tx,
         )
@@ -2233,6 +2411,15 @@ impl Hub {
     /// Attach the shared brownout status the `/statusz` body reads (ADR 0054).
     pub fn attach_brownout_status(&mut self, status: Arc<crate::health::BrownoutStatus>) {
         self.brownout_status = Some(status);
+    }
+
+    /// Set the per-subscriber in-memory bounds before [`run`](Self::run) (issue #241).
+    ///
+    /// Startup-only, like the other `attach_*` setters: a reload reports the `limits`
+    /// section as requires-restart (ADR 0041 §6) rather than half-applying a bound to
+    /// queues that are already at it.
+    pub fn set_subscriber_limits(&mut self, limits: SubscriberLimits) {
+        self.subscriber_limits = limits;
     }
 
     /// Record that `axis` is (or is no longer) over its watermark, and recompute the
@@ -3093,10 +3280,23 @@ impl Hub {
         (durable, matched)
     }
 
-    /// Log when a persistent session is served on a node that is not its
-    /// placement owner (ADR 0005). Until the session-proxy lands, such a session
-    /// is served locally — sharded by landing node, but not yet relocated to its
-    /// owner, and lost if *this* node dies (the ephemeral-sessions mode).
+    /// Log when a persistent session attaches on a node that is not its placement
+    /// owner (ADR 0005). Expected transiently: relocation is decided against the view
+    /// at CONNECT, and ownership can move moments later (a readmitted node reclaiming
+    /// its groups). It is USUALLY brief — a session left standing in this state is closed
+    /// by [`rehome_misplaced_sessions`](Self::rehome_misplaced_sessions) (issue #284) so
+    /// the client relocates, including when the ownership moved BEFORE the session arrived
+    /// (`finish_attach` seeds the observation, which the pass would otherwise skip).
+    ///
+    /// **But this warning is not self-healing in every case it fires**, which is worth
+    /// knowing when grepping for a stranded session: it is computed from the HRW-fallback
+    /// view (`owns`/`owner` below), while the rehome pass is deliberately
+    /// COMMITTED-lease-only. For a group with no committed lease — the transient ring/lease
+    /// split during convergence — this warns and nothing closes the session. That is
+    /// deliberate, and `a_group_with_no_committed_lease_is_never_rehomed` pins it: a
+    /// lease-less group is not evidence that another node owns it, and closing on the ring
+    /// alone would kick clients around a converging cluster. Diagnostic only; the sweep
+    /// tick, not this warning, decides.
     fn note_session_ownership(&self, client: &ClientId) {
         let Some(placement) = &self.placement else {
             return;
@@ -3377,10 +3577,23 @@ impl Hub {
 
         // Adopt this connection's outbound Receive Maximum quota (ADR 0012). A
         // reconnect may carry a different value than the prior one.
+        //
+        // `MQTTD_MAX_INFLIGHT_MESSAGES` caps it (issue #241). A client's Receive Maximum
+        // is a ceiling on what the broker MAY send it, never a floor, so lowering it is
+        // protocol-legal — and it is the LOSS-FREE lever: the in-flight table is the
+        // second-largest per-subscriber structure (65 535 entries by default, since every
+        // v3.1.1 client and any v5 client with no property gets `u16::MAX`), and an entry
+        // there is on the wire under a packet id, so it could never be shed without
+        // breaking DUP redelivery or the QoS 2 handshake. Capping the window diverts the
+        // surplus into the (byte-bounded) backlog instead of dropping anything.
         self.inflight
             .entry(client.clone())
             .or_default()
-            .receive_maximum = receive_maximum;
+            .receive_maximum = receive_maximum.min(
+            self.subscriber_limits
+                .max_inflight_messages
+                .unwrap_or(u16::MAX),
+        );
 
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
@@ -3402,6 +3615,28 @@ impl Hub {
             },
         );
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
+
+        // Issue #284 round 3: a session becomes misplaced by ARRIVING, not only by an
+        // ownership move. `rehome_misplaced_sessions` skips its whole candidate pass while
+        // the placement's ownership version is unchanged and nothing is under observation,
+        // so a persistent session that attaches to a non-owning node AFTER the lease moved
+        // would never be looked at again — the wedge, silently, with no counter moving.
+        // Seed the observation here rather than by deleting that skip: one committed-owner
+        // read per persistent attach, nothing per tick. `misplaced` being non-empty is
+        // itself the pass's escape hatch, so it then runs until the episode ends, and if
+        // the reading was stale the pass's own `retain` drops the entry on its next tick.
+        if session_expiry != 0 {
+            if let Some(placement) = &self.placement {
+                let elsewhere = placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .committed_session_owner(&client.0)
+                    .is_some_and(|owner| owner != self.node_id);
+                if elsewhere {
+                    self.misplaced.entry(client.clone()).or_default();
+                }
+            }
+        }
 
         // Tell the connection the result so it can CONNACK before any replay.
         let _ = reply.send(AttachOutcome::Present(session_present));
@@ -4519,22 +4754,23 @@ impl Hub {
         if !gated {
             return false;
         }
+        let limits = self.subscriber_limits;
         let inf = self.inflight.entry(job.client.clone()).or_default();
-        let evicted = inf.push_backlog(Backlog {
-            message: job.message.clone(),
-            retain: job.retain,
-            message_expiry: job.message_expiry,
-            offset: None,
-        });
-        if let Some(evicted) = evicted {
-            if let Some(offset) = evicted.offset {
-                inf.release(offset);
+        let evicted = inf.push_backlog(
+            BacklogEntry::new(job.message.clone(), job.retain, job.message_expiry, None),
+            &limits,
+        );
+        if !evicted.is_empty() {
+            let bytes = inf.backlog.bytes();
+            for (e, _) in &evicted {
+                if let Some(offset) = e.offset {
+                    inf.release(offset);
+                }
+                if let Some(m) = &self.metrics {
+                    m.publish_dropped("backlog-overflow");
+                }
             }
-            warn!(client = %job.client.0, cap = MAX_BACKLOG,
-                  "flow-control backlog full: evicted oldest message");
-            if let Some(m) = &self.metrics {
-                m.publish_dropped("backlog-overflow");
-            }
+            warn_backlog_eviction(&job.client, &evicted, bytes, &limits);
             self.truncate_acked(&job.client).await;
         }
         true
@@ -4618,12 +4854,12 @@ impl Hub {
                         .entry(job.client.clone())
                         .or_default()
                         .backlog
-                        .push_front(Backlog {
-                            message: job.message,
-                            retain: job.retain,
-                            message_expiry: job.message_expiry,
-                            offset: Some(offset),
-                        });
+                        .push_front_admitted(BacklogEntry::new(
+                            job.message,
+                            job.retain,
+                            job.message_expiry,
+                            Some(offset),
+                        ));
                 }
                 // Fence failed: the entry is simply dropped — the offset stays
                 // owed and the reattach replay owns delivery, the same rule the
@@ -4676,9 +4912,9 @@ impl Hub {
     /// spawned single-flight task owning only `(client, store, self_tx)` — the
     /// off-loop contract. [`PkidBlockReserved`](HubCommand::PkidBlockReserved)
     /// banks the result and drains.
-    fn defer_for_pkid_block(&mut self, client: &ClientId, entry: Backlog) {
+    fn defer_for_pkid_block(&mut self, client: &ClientId, entry: BacklogEntry) {
         let inf = self.inflight.entry(client.clone()).or_default();
-        inf.backlog.push_front(entry);
+        inf.backlog.push_front_admitted(entry);
         if inf.reserve_outstanding {
             return;
         }
@@ -5039,6 +5275,7 @@ impl Hub {
         message_expiry: Option<u32>,
         offset: Option<Offset>,
     ) {
+        let limits = self.subscriber_limits;
         // `QoS` 0 owes no acknowledgement, so a replayed one is settled the moment it is
         // handed to the channel — only `QoS` > 0 becomes owed.
         if let Some(offset) = offset.filter(|_| message.qos != QoS::AtMostOnce) {
@@ -5049,20 +5286,34 @@ impl Hub {
         }
         if message.qos == QoS::AtMostOnce {
             // QoS 0 is the only path with no other bound: the QoS 1/2 backlog is
-            // capped by MAX_BACKLOG below, and Receive Maximum does not apply to
-            // QoS 0 — so without this a subscriber that stopped reading a busy
+            // capped in messages and bytes below, and Receive Maximum does not apply
+            // to QoS 0 — so without this a subscriber that stopped reading a busy
             // topic grew its outbound channel without limit (#123).
             //
             // At-most-once is exactly the delivery contract that permits dropping,
             // so shedding here is legal where dropping a QoS 1/2 message or an ack
             // would not be. Counted and logged: a silent drop would be the same
             // defect in a different place.
-            if tx.depth() >= MAX_OUTBOUND_QUEUE {
+            //
+            // Two dimensions since issue #241: the fixed packet count, and the
+            // operator's byte bound — because 10 000 packets at the 1 MiB default
+            // packet ceiling is ~10 GiB, i.e. a count is not a memory budget. The
+            // gate covers ONLY this shed-legal class; control packets and QoS 1/2
+            // still flow past a full channel, exactly as before.
+            let over_bytes = limits
+                .max_outbound_bytes
+                .is_some_and(|c| tx.bytes() + message_bytes(message) > c);
+            if tx.depth() >= MAX_OUTBOUND_QUEUE || over_bytes {
                 if let Some(m) = &self.metrics {
                     m.publish_dropped("outbound-full");
                 }
                 warn!(
-                    client = %client.0, cap = MAX_OUTBOUND_QUEUE, topic = %message.topic,
+                    client = %client.0,
+                    bound = if over_bytes { "bytes" } else { "packets" },
+                    cap_packets = MAX_OUTBOUND_QUEUE,
+                    cap_bytes = ?limits.max_outbound_bytes,
+                    queued_bytes = tx.bytes(),
+                    topic = %message.topic,
                     "outbound queue full: shedding QoS 0 for a subscriber that is not reading"
                 );
                 return;
@@ -5098,25 +5349,26 @@ impl Hub {
         let inf = self.inflight.entry(client.clone()).or_default();
         let must_queue = inf.quota_full() || !inf.backlog.is_empty() || inf.records_pending > 0;
         if must_queue {
-            // The backlog is bounded (ADR 0012); drop-oldest on overflow so a stalled
-            // consumer cannot force unbounded memory.
-            let evicted = inf.push_backlog(Backlog {
-                message: message.clone(),
-                retain,
-                message_expiry,
-                offset,
-            });
-            if let Some(evicted) = evicted {
-                if let Some(offset) = evicted.offset {
-                    inf.release(offset);
+            // The backlog is bounded in messages AND bytes (ADR 0012, issue #241);
+            // drop-oldest at either bound so a stalled consumer cannot force unbounded
+            // memory. The byte bound may evict several entries for one arrival.
+            let evicted = inf.push_backlog(
+                BacklogEntry::new(message.clone(), retain, message_expiry, offset),
+                &limits,
+            );
+            if !evicted.is_empty() {
+                let bytes = inf.backlog.bytes();
+                for (e, _) in &evicted {
+                    if let Some(offset) = e.offset {
+                        inf.release(offset);
+                    }
+                    if let Some(m) = &self.metrics {
+                        m.publish_dropped("backlog-overflow");
+                    }
                 }
-                warn!(client = %client.0, cap = MAX_BACKLOG,
-                      "flow-control backlog full: evicted oldest message");
-                if let Some(m) = &self.metrics {
-                    m.publish_dropped("backlog-overflow");
-                }
-                // Nothing will deliver the evicted message, so its offset no longer
-                // holds the truncation point back.
+                warn_backlog_eviction(client, &evicted, bytes, &limits);
+                // Nothing will deliver the evicted messages, so their offsets no longer
+                // hold the truncation point back.
                 self.truncate_acked(client).await;
             }
             // Quota free but the backlog holds a deferred delivery: retry the drain now,
@@ -5210,12 +5462,7 @@ impl Hub {
             // used to wait in the inline await.
             self.defer_for_pkid_block(
                 client,
-                Backlog {
-                    message: message.clone(),
-                    retain,
-                    message_expiry,
-                    offset,
-                },
+                BacklogEntry::new(message.clone(), retain, message_expiry, offset),
             );
             return QosSend::Deferred;
         };
@@ -5312,12 +5559,12 @@ impl Hub {
                 let inf = self.inflight.entry(client.clone()).or_default();
                 inf.pending.remove(&pkid);
                 inf.records_pending = inf.records_pending.saturating_sub(1);
-                inf.backlog.push_front(Backlog {
-                    message: message.clone(),
+                inf.backlog.push_front_admitted(BacklogEntry::new(
+                    message.clone(),
                     retain,
                     message_expiry,
-                    offset: Some(off),
-                });
+                    Some(off),
+                ));
                 QosSend::Deferred
             }
         }
@@ -5714,9 +5961,59 @@ impl Hub {
                 // session at the right time after a takeover instead of restarting the clock
                 // (ADR 0009 §3).
                 let deadline = self.clock.now_epoch_secs() + u64::from(secs);
-                let _ = self.store.set_session_expiry(client, Some(deadline)).await;
+                self.persist_detach_deadline(client, deadline).await;
                 self.expiring.insert(client.clone(), deadline);
                 info!(client = %client.0, expires_in_s = secs, "client detached (session expiring)");
+            }
+        }
+    }
+
+    /// Persist a detaching session's ABSOLUTE expiry deadline (ADR 0009 §3), or say — out
+    /// loud, and on a counter — that it could not be (issue #284 round-2 finding 5).
+    ///
+    /// The deadline is persisted so a NEW owner expires the session at the right time
+    /// after a takeover instead of never expiring it. On a clustered durable node the
+    /// write is group-routed, so it is refused with `NotOwner` whenever this node does not
+    /// hold the session group's lease — which, after a rehome close, is true BY
+    /// CONSTRUCTION. That case is now skipped deliberately rather than attempted and its
+    /// error discarded: the outcome is identical, the log line and the counter are not.
+    ///
+    /// **The residual, named** (ADR 0009 §3's as-delivered note, 0043-P6): the new owner
+    /// then holds a session record with NO deadline, so a client that never comes back
+    /// leaves a persistent session and its queue behind. It is re-established the moment
+    /// the client reconnects anywhere (its CONNECT carries the Session Expiry Interval, and
+    /// that owner's next detach persists the deadline) — in the measured rehome that is
+    /// ~100 ms later. It cannot be fixed here without a channel that does not exist: only
+    /// the absolute deadline is persisted, never the INTERVAL, so an owner cannot re-derive
+    /// it, and no peer frame carries a session's deadline. The same hole is pre-existing for
+    /// every takeover of an ONLINE session (the deadline is cleared while connected, so a
+    /// dead owner's successor inherits none); the named follow-up — persist the interval
+    /// alongside the deadline — closes both at once.
+    async fn persist_detach_deadline(&self, client: &ClientId, deadline: u64) {
+        if self.durable_plane.is_some() && self.clustered() && !self.owns_session(client) {
+            warn!(
+                client = %client.0,
+                deadline,
+                "session expiry deadline NOT persisted: this node does not own the \
+                 session's group, so the group-routed write cannot land (ADR 0009 §3). \
+                 The new owner inherits no deadline until the client reconnects \
+                 (issue #284)"
+            );
+            if let Some(m) = &self.metrics {
+                m.session_expiry_unpersisted("not-owner");
+            }
+            return;
+        }
+        if let Err(e) = self.store.set_session_expiry(client, Some(deadline)).await {
+            warn!(
+                client = %client.0,
+                deadline,
+                error = %e,
+                "failed to persist the session expiry deadline (ADR 0009 §3); the session \
+                 may outlive its stated interval if its owner changes"
+            );
+            if let Some(m) = &self.metrics {
+                m.session_expiry_unpersisted("error");
             }
         }
     }
@@ -5744,7 +6041,8 @@ impl Hub {
             Some(inf) if !inf.backlog.is_empty() => {
                 let now = self.clock.now_epoch_secs();
                 inf.backlog
-                    .drain(..)
+                    .drain_all()
+                    .into_iter()
                     // At-most-once owes no redelivery: a `QoS` 0 parked here for
                     // wire order (issue #242 finding A) dies with the connection,
                     // exactly like one sitting in the closed conn channel.
@@ -5878,6 +6176,13 @@ impl Hub {
                 self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(8);
             }
         }
+
+        // The LIVE half of the same rule (issue #284): a session already CONNECTED
+        // here whose group's committed lease has moved away is closed, so the client
+        // relocates instead of waiting out a keepalive on a stale placement. Runs
+        // right after the membership watch above, so a membership-driven lease move
+        // is evaluated on the very tick that arms the window.
+        self.rehome_misplaced_sessions().await;
 
         // Liveness backstop for the interest-authoritative gate (0043-P4 exhibit
         // ②): a node whose scans NEVER complete (quorum lost for good) must not
@@ -6082,6 +6387,37 @@ impl Hub {
     /// advertises the session, and the client re-attaches there (ADR 0005).
     /// Durable-cluster mode only: with local-only session storage the data cannot
     /// follow the ownership move, so dropping routing would drop delivery.
+    ///
+    /// Its ONLINE-excluding filter is the other half of one rule: the live case is
+    /// converted into this offline one first, by
+    /// [`rehome_misplaced_sessions`](Self::rehome_misplaced_sessions) (issue #284).
+    /// Widening this filter instead would drop the routing out from under a connected
+    /// client and leave it attached to a node that can no longer enqueue for it —
+    /// silently undeliverable, which is the defect, not the fix.
+    ///
+    /// **A rehome (issue #284) adds a TRIGGER to this path, not a new one.** The rehome
+    /// close turns a misplaced live session into exactly the offline, moved session this
+    /// filter already matches, and then does nothing else: the routing stays until this
+    /// function's own scan releases it, on its own pre-existing cadence. That is
+    /// deliberate. While the routing is here, this node still advertises the session's
+    /// filters, so every publish toward it is answered by a node that KNOWS the message
+    /// is owed — the append fails `NotOwner` and the publisher's ack is WITHHELD, locally
+    /// and as a peer forward alike. Releasing sooner (arming the eager window at the
+    /// close, say) would shorten that honest window by widening the dishonest one below.
+    ///
+    /// **The release itself is unwitnessed, and that is a pre-existing hole.** It is
+    /// justified by evidence that this node is not the owner, never by evidence that the
+    /// new owner routes the session — so between this release and the owner materialising
+    /// the session on its own scan, NO node advertises its filters and a publish toward it
+    /// can be acked with nothing stored. Reachable with no rehome in the story at all (a
+    /// client disconnects, then its group's lease moves), which is why it is recorded as a
+    /// follow-up rather than patched at the rehome seam: fixing it honestly needs
+    /// per-session hand-off evidence on the peer bus (`PeerMessage::Interest` carries
+    /// FILTERS, not client ids) or a lease-move-aware cluster-wide settle window. See
+    /// 0043-P6. Note the pairing this function already gets right, which any fix must
+    /// preserve: its one call site calls
+    /// [`settle_pending_publishes`](Self::settle_pending_publishes) on the very next line
+    /// — the only thing that clears a held ack.
     fn release_moved_sessions(&mut self) {
         if self.durable_plane.is_none() || !self.clustered() {
             return;
@@ -6109,6 +6445,370 @@ impl Hub {
         // Peers must see the shrunken interest, so forwards stop targeting this
         // node for filters it no longer serves.
         self.gossip_interest();
+    }
+
+    /// The live persistent sessions hosted here whose group's COMMITTED lease names
+    /// another node, as `(client, committed owner, whether this node can route the
+    /// client's next CONNECT to that owner)` — the input to
+    /// [`rehome_misplaced_sessions`](Self::rehome_misplaced_sessions).
+    ///
+    /// Runs against an ownership SNAPSHOT and takes **no lock at all** (issue #284 round-2
+    /// finding 3). The placement lock is shared with the cluster driver's per-tick
+    /// lease/voter pushes; the original form held its read guard across the whole pass, so
+    /// that writer stalled behind an `O(online sessions)` scan once a second. The snapshot
+    /// is `O(NUM_GROUPS + members)` to take and answers exactly the two questions this
+    /// pass asks (`CommittedOwnership`).
+    ///
+    /// Note that `relocatable` no longer needs a second `owner_route` comparison:
+    /// `committed_group_owner` is the eligible-filtered lease map, and `group_owner` is
+    /// the same map with an HRW fallback used only where it is EMPTY — so wherever a
+    /// committed owner exists, it *is* the routed owner. All that remains to check is
+    /// whether its peer-link address is known.
+    fn misplaced_candidates(
+        &self,
+        own: &mqtt_cluster::placement::CommittedOwnership,
+    ) -> Vec<(ClientId, NodeId, bool)> {
+        self.online
+            .keys()
+            // Persistent sessions only. A clean session is never relocated (ADR 0005
+            // §1) and never durably enqueued to (`deliver_to_client` skips it — it has
+            // nothing to resume into), so it cannot wedge this way, and closing it
+            // would DESTROY it rather than move it.
+            .filter(|c| {
+                !matches!(self.session_expiry.get(*c).copied(), None | Some(0))
+                    && !self.connecting.contains_key(*c)
+            })
+            .filter_map(|c| {
+                let owner = own.session_owner(&c.0)?;
+                if *owner == self.node_id {
+                    return None;
+                }
+                // Can this node actually send the client somewhere better? If the
+                // owner's peer address is unknown, the next CONNECT here is served
+                // locally (ADR 0005 §5) and a close would only loop.
+                Some((c.clone(), owner.clone(), own.is_relocatable(owner)))
+            })
+            .collect()
+    }
+
+    /// The committed-ownership snapshot for this tick, or `None` when the pass can be
+    /// SKIPPED because nothing that could change a session's placement has changed since
+    /// the last one (issue #284 round-2 finding 3).
+    ///
+    /// The skip is what removes the steady-state cost: measured at 5000 online sessions,
+    /// the unconditional pass took the `sweep` dispatch from ~4.0 ms to ~6.6 ms/tick,
+    /// forever, for a condition that only arises when a lease moves. The version
+    /// ([`Placement::ownership_epoch`]) moves on exactly the events that can make a
+    /// session misplaced, so a skipped tick cannot miss one.
+    ///
+    /// Sessions already under observation (`misplaced`, i.e. mid-grace, cooling down, or
+    /// standing unrelocatable) keep the pass running: their grace has to be counted, and
+    /// the epoch does not move again while they wait.
+    ///
+    /// The skip is edge-triggered on OWNERSHIP, which is only one of the two ways a session
+    /// becomes misplaced; the other is the session ARRIVING on a non-owning node after the
+    /// epoch settled, which moves no lease. That second edge is covered by `finish_attach`
+    /// seeding the `misplaced` entry above, so this skip cannot lose it. Without that seed
+    /// the pass never ran again and the issue #284 wedge returned silently, with
+    /// `mqttd_misplaced_sessions` reading 0 — pinned by
+    /// `a_session_that_becomes_misplaced_by_attaching_is_rehomed`.
+    fn ownership_for_rehome(&mut self) -> Option<mqtt_cluster::placement::CommittedOwnership> {
+        let placement = self.placement.as_ref()?;
+        let p = placement
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.ownership_epoch_seen == Some(p.ownership_epoch()) && self.misplaced.is_empty() {
+            return None;
+        }
+        let own = p.committed_ownership();
+        drop(p);
+        self.ownership_epoch_seen = Some(own.epoch());
+        Some(own)
+    }
+
+    /// The LIVE mirror of [`release_moved_sessions`] (issue #284, 0043-P6): close a
+    /// connected persistent session whose placement group this node does not own, so
+    /// the client relocates to the real owner on the reconnect it already knows how to
+    /// do — promptly, instead of sitting silently undeliverable until its keepalive
+    /// fires on the dead air.
+    ///
+    /// **Why it is needed at all.** Relocation (ADR 0005) is decided ONCE, at CONNECT.
+    /// A node readmitted after a roll rejoins SWIM membership — and turns `/readyz`
+    /// green — before it is back in the lease voter set, so for a couple of seconds its
+    /// groups' leases are still parked on the interim holder they were handed during
+    /// its absence. A session that resumes inside that window is relocated onto the
+    /// interim holder *correctly*, and is stranded there seconds later when the lease
+    /// legitimately returns. From then on the interim holder refuses every publish
+    /// toward that session (`NotOwner`, ack withheld — honest, but unavailable) and
+    /// nothing re-evaluates a LIVE session's placement. Measured: unbounded, still
+    /// wedged after two minutes, on a cluster reporting fully converged and ready.
+    ///
+    /// **Why the decision lives on the sweep tick** rather than on the refusal: the
+    /// refusal is traffic-driven, so it cannot see an idle misplaced session (which is
+    /// just as undeliverable, only nobody is watching), and the placement is pushed
+    /// into the ring by the cluster driver with no channel to the hub. Re-deriving the
+    /// condition each tick is self-correcting after a missed edge, and it does not have
+    /// to be right the first time.
+    ///
+    /// **Why a close and not a transparent re-relocation:** ADR 0005's proxy is
+    /// structurally one hop (`run_framed` refuses to re-proxy — a chain would loop),
+    /// the CONNECT and its CONNACK (with a `session_present` computed against THIS
+    /// node's state) are already on the wire with no vocabulary for replaying them
+    /// elsewhere, and a hand-off would make exactly-one-owner a timing argument. The
+    /// close is single-writer by construction: this node drops the session before the
+    /// client can learn to reconnect, and the reconnect is an ordinary CONNECT through
+    /// the existing takeover fence.
+    ///
+    /// **The close ends the CONNECTION and NOTHING ELSE** — no routing change, no
+    /// interest change, no settle-window arming (issue #284 round 3). Releasing the
+    /// routing here, as the first cut did by calling
+    /// [`release_moved_sessions`](Self::release_moved_sessions) at the close, is an
+    /// acked-but-dropped publish: a lease move arms no settle window on ANY node, so once
+    /// this node stops advertising the filters and the owner has not started, a publisher
+    /// (typically on a third node, which decides its fan-out purely from gossiped
+    /// interest) matches nobody, concludes nothing is owed, and acks a message no node
+    /// stored. So the close leaves the routing where it is and lets the PRE-EXISTING
+    /// [`release_moved_sessions`](Self::release_moved_sessions) — which is paired with the
+    /// only thing that clears a held ack — take the session on its own cadence. Until it
+    /// does, this node still advertises the session's filters and every publish toward it
+    /// is answered by a node that knows the message is owed: `NotOwner` → ack WITHHELD
+    /// locally, `Failed` for a peer's forward, and at a third node the owner's `Stored`
+    /// composed with our `Failed` still withholds (`forward_answered` is
+    /// first-terminal-verdict-wins). The cost is stated rather than hidden: for as long as
+    /// the old node holds the routing, BOTH nodes advertise the session's filters, so
+    /// publishers to them are withheld and retry even once the session is healthy on the
+    /// owner — bounded by that scan cadence (≈1 tick inside a roll, whose membership
+    /// change arms eager scans on every node; up to `EXPIRY_RECONCILE_EVERY` for a lease
+    /// move with no membership change).
+    ///
+    /// Arming the pre-existing `takeover_reconcile_ticks` here was CONSIDERED AND
+    /// REJECTED (recorded so it is not re-litigated): it is a one-line reuse of a
+    /// reviewed, scan-paired armer and it would shorten the double-advertise window above
+    /// to ~2 ticks — but it does so by making this node RELEASE sooner, which widens
+    /// `release_moved_sessions`' pre-existing unwitnessed-release window (the new owner
+    /// may not have materialised the session yet). That buys availability with ack
+    /// honesty, and an unbounded honest refusal beats a bounded lie.
+    ///
+    /// Nothing durable is repaired or moved: the session's queue is in its group's
+    /// replicated log, which the real owner holds — the client's reconnect there replays
+    /// it with `session_present = 1`. One durable ITEM does not survive the move: a finite
+    /// Session Expiry Interval's persisted deadline (ADR 0009 §3) cannot be written from a
+    /// non-owner, so it is deliberately skipped and counted rather than attempted and
+    /// swallowed — see [`persist_detach_deadline`](Self::persist_detach_deadline).
+    ///
+    /// Four bounds keep a flapping placement from becoming a close loop:
+    /// [`MISPLACED_GRACE_TICKS`] of continuous observation; a COMMITTED lease naming
+    /// another node (never the HRW fallback — see
+    /// [`Placement::committed_session_owner`]); the owner being relocatable at all (else
+    /// ADR 0005 §5's degrade-don't-refuse would serve the next CONNECT locally again,
+    /// forever); and a per-session [`REHOME_COOLDOWN`].
+    ///
+    /// A fifth bound is on the AGGREGATE: [`REHOME_CLOSES_PER_TICK`] closes per tick, the
+    /// rest deferred to later ticks (and counted), so a resize that moves ~1/N of groups
+    /// at once drains at a paced rate instead of closing — and will-publishing for —
+    /// every affected session in one dispatch.
+    ///
+    /// Durable-cluster mode only, for [`release_moved_sessions`]' reason: with
+    /// local-only session storage the data cannot follow the ownership move, so closing
+    /// the client would strand it rather than heal it.
+    async fn rehome_misplaced_sessions(&mut self) {
+        if self.durable_plane.is_none() || !self.clustered() {
+            self.misplaced.clear();
+            return;
+        }
+        // Skip the O(online sessions) pass entirely while no committed lease has moved
+        // (round-2 finding 3). Nothing is forgotten: the version moves on exactly the
+        // events that can make a session misplaced, and a session already under
+        // observation keeps the pass alive until its episode ends.
+        let Some(own) = self.ownership_for_rehome() else {
+            return;
+        };
+        let candidates = self.misplaced_candidates(&own);
+
+        // Forget sessions whose condition cleared — but KEEP a cooldown that is still
+        // running, or a re-attach to this same non-owning node would be closed again
+        // immediately and the bound would be no bound at all.
+        let now = Instant::now();
+        self.misplaced.retain(|client, m| {
+            let still = candidates.iter().any(|(c, _, _)| c == client);
+            if !still {
+                m.ticks = 0;
+                m.noted = false;
+                m.deferred = false;
+            }
+            still
+                || m.last_kick
+                    .is_some_and(|t| now.duration_since(t) < REHOME_COOLDOWN)
+        });
+        if let Some(m) = &self.metrics {
+            m.set_misplaced_sessions(candidates.len());
+        }
+
+        let mut closed = 0usize;
+        let mut deferred = 0usize;
+        let mut newly_deferred = 0usize;
+        for (client, owner, relocatable) in candidates {
+            let entry = self.misplaced.entry(client.clone()).or_default();
+            entry.ticks = entry.ticks.saturating_add(1).min(MISPLACED_GRACE_TICKS);
+            if entry.ticks < MISPLACED_GRACE_TICKS {
+                continue;
+            }
+            let cooling = entry
+                .last_kick
+                .is_some_and(|t| now.duration_since(t) < REHOME_COOLDOWN);
+            if !relocatable || cooling {
+                let first = !std::mem::replace(&mut entry.noted, true);
+                if first {
+                    self.note_unactionable_misplacement(&client, &owner, relocatable, cooling);
+                }
+                continue;
+            }
+            // The per-tick close cap (round-2 finding 4). The pass re-derives its
+            // candidates every tick, so the remainder simply goes next tick; the cost of
+            // deferring is one more second of a wedge that was measured unbounded, and
+            // the benefit is that a mass ownership move does not close (and will-publish
+            // for) every affected session in one dispatch. Counted, so it is visible.
+            if closed >= REHOME_CLOSES_PER_TICK {
+                deferred += 1;
+                // Counted ONCE per session per deferral episode, not once per tick.
+                if !std::mem::replace(&mut entry.deferred, true) {
+                    newly_deferred += 1;
+                }
+                continue;
+            }
+            // Re-read the connection: an EARLIER candidate's `detach` was awaited on
+            // this loop, so this one may have ended meanwhile. Nothing to close — and
+            // no cooldown to charge a session that was never closed.
+            let Some(online) = self.online.get(&client) else {
+                continue;
+            };
+            let conn_id = online.conn_id;
+            // MQTT 5 can be told why; 3.1.1 has no client-redirect mechanism and just
+            // sees the close (ADR 0005 acknowledges this). No Server Reference
+            // property: the placement holds PEER-BUS addresses, and handing a client
+            // one would point it at the cluster's internal listener. `0x9C` is the
+            // honest code — "temporarily use another server" — where `0x8E`
+            // (session taken over) would be a lie: nothing took this session over.
+            if online.admission.protocol == ProtocolVersion::V5 {
+                let _ = online.tx.send(Packet::Disconnect(Disconnect {
+                    reason: mqtt_codec::reason::USE_ANOTHER_SERVER,
+                    properties: mqtt_codec::Properties::new(),
+                }));
+            }
+            warn!(
+                client = %client.0,
+                owner = %owner.0,
+                "session hosted on a node that does not own its group; closing it so \
+                 the client relocates to the owner (issue #284, ADR 0005)"
+            );
+            if let Some(m) = &self.metrics {
+                m.session_rehomed("stale-owner");
+            }
+            if let Some(m) = self.misplaced.get_mut(&client) {
+                m.last_kick = Some(now);
+                // The next episode earns its own grace (and its own warning), and its own
+                // deferral count.
+                m.ticks = 0;
+                m.noted = false;
+                m.deferred = false;
+            }
+            // The queued DISCONNECT drains to the wire before the dropped outbound
+            // closes the writer — exactly `evict`'s shape.
+            //
+            // `graceful = false`, decided deliberately (round-2 finding 2). `graceful`
+            // controls exactly one thing — will publication — and suppressing it here
+            // would make the rehome the ONLY broker-initiated close that hides a will:
+            // session takeover and `evict` both fire it, and issue #265 existed precisely
+            // because broker-initiated closes were silently NOT firing it (its exit 1:
+            // "every broker-initiated close fires the Will"; its exit 2, documenting
+            // suppression, was rejected as a spec violation). The spec agrees:
+            // [MQTT-3.1.2-8] / §3.14.4 delete the will only on a CLIENT DISCONNECT with
+            // reason 0x00, which a server `0x9C` is not. The spec's own answer to "this
+            // close is not a death" is the Will Delay Interval (0x18) — which this broker
+            // decodes but does not honour, and honouring it across a CLUSTER needs the
+            // delay and its cancellation to survive the client reconnecting on a
+            // DIFFERENT node, which no peer frame or durable record expresses today. That
+            // is the named follow-up; until then the cost (one LWT per rehomed session,
+            // paced by REHOME_CLOSES_PER_TICK) is documented in OPERATIONS and
+            // TROUBLESHOOTING and locked by a test.
+            self.detach(&client, conn_id, false).await;
+            // ...and NOTHING else. The close ends the CONNECTION; the session's routing,
+            // its gossiped interest and the settle machinery are left exactly as they
+            // were, so the session becomes an ordinary offline persistent session on a
+            // node that no longer owns its group — precisely what
+            // [`release_moved_sessions`](Self::release_moved_sessions) already handles, on
+            // its own pre-existing cadence, from the inherited-session scan that also
+            // clears held acks. Every publish toward it meanwhile is answered by a node
+            // that still knows the message is owed: `NotOwner` locally, `Failed` as a peer
+            // forward, and a withhold at a third node where the owner's `Stored` composes
+            // with our `Failed`. See the module tests
+            // `no_publish_toward_a_rehomed_session_is_ever_acked_while_this_node_routes_it`
+            // and `a_third_node_composes_a_refusal_and_a_store_into_a_withhold`.
+            closed += 1;
+        }
+        if deferred > 0 {
+            info!(
+                deferred,
+                newly_deferred,
+                cap = REHOME_CLOSES_PER_TICK,
+                "rehome close cap reached this tick; the remaining misplaced sessions are \
+                 deferred to later ticks (issue #284)"
+            );
+            if let Some(m) = &self.metrics {
+                // Only the sessions deferred for the FIRST time in their current episode:
+                // `deferred` is this tick's backlog, which the same sessions re-enter on
+                // every tick until they are closed.
+                for _ in 0..newly_deferred {
+                    m.session_rehomed("deferred");
+                }
+            }
+        }
+    }
+
+    /// Say — once per episode, not once a second — that a misplaced live session cannot be
+    /// acted on: either its owner has no known address (ADR 0005 §5 keeps serving it
+    /// locally rather than closing it into a reconnect loop) or it is inside its rehome
+    /// cooldown. Either way the session stays undeliverable, so it is warned and counted.
+    ///
+    /// BOTH facts are passed, and the precedence is stated rather than inferred:
+    /// **unrelocatable wins**, because an owner with no known address is a mesh problem an
+    /// operator can act on, while a cooldown resolves itself. An earlier version took only
+    /// `cooling` and was handed `relocatable` at its one call site — correct solely because
+    /// the guard there (`!relocatable || cooling`) makes `relocatable == true` imply
+    /// `cooling == true`. Two operator-facing alert rows key off the label this picks, so
+    /// the coincidence is not worth keeping: widening that guard would have silently
+    /// relabelled them.
+    fn note_unactionable_misplacement(
+        &self,
+        client: &ClientId,
+        owner: &NodeId,
+        relocatable: bool,
+        cooling: bool,
+    ) {
+        if relocatable && cooling {
+            warn!(
+                client = %client.0,
+                owner = %owner.0,
+                "session is misplaced again within the rehome cooldown; not closing it \
+                 (placement flapping, or the client keeps landing on a non-owning node) \
+                 — issue #284"
+            );
+        } else {
+            warn!(
+                client = %client.0,
+                owner = %owner.0,
+                "session hosted here but its group is owned by a node whose address is \
+                 unknown; serving locally (ADR 0005 §5) — publishes toward it are REFUSED \
+                 until the peer mesh heals (issue #284)"
+            );
+        }
+        if let Some(m) = &self.metrics {
+            m.session_rehomed(if relocatable && cooling {
+                "cooldown"
+            } else {
+                "unrelocatable"
+            });
+        }
     }
 
     /// A takeover-window re-delivery of pending publish `id` (ADR 0042 T9):
@@ -6330,6 +7030,19 @@ impl Hub {
         m.set_sessions(self.online.len() + offline_persistent);
         m.set_subscriptions(self.subs_by_client.values().map(HashMap::len).sum());
         m.set_inflight_messages(self.inflight.values().map(|i| i.pending.len()).sum());
+        // Flow-control backlog bytes across sessions (issue #241): so an operator can SEE
+        // the number before choosing a byte cap, and watch it after.
+        // Both, from one pass: the SUM answers "how much RAM is in backlogs on this node",
+        // while the MAX is what a PER-SUBSCRIBER cap must be sized against (issue #241 review
+        // — the docs pointed operators at the sum for a per-subscriber decision).
+        m.set_backlog_bytes(self.inflight.values().map(|i| i.backlog.bytes()).sum());
+        m.set_backlog_bytes_max(
+            self.inflight
+                .values()
+                .map(|i| i.backlog.bytes())
+                .max()
+                .unwrap_or(0),
+        );
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
         m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
@@ -8279,8 +8992,11 @@ pub(crate) fn app_from_wire(w: mqtt_cluster::peer::WireAppProps) -> AppPropertie
     }
 }
 
+// `pub(crate)` so `backpressure`'s byte-accounting identity test can assert against the packet
+// the broker ACTUALLY sends, rather than a hand-assembled lookalike — the previous version of
+// that test built its own packet and was therefore blind to a per-property disagreement.
 #[allow(clippy::too_many_arguments)] // a thin PUBLISH constructor; all fields are the wire packet's
-fn publish_packet(
+pub(crate) fn publish_packet(
     topic: &str,
     payload: Bytes,
     qos: QoS,
@@ -8594,9 +9310,12 @@ mod tests {
     }
 
     use super::{
-        Admission, AttachOutcome, AuthMethod, Backlog, BrownoutAxis, Hub, HubCommand, Inflight,
-        Outbound, PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup,
-        EXPIRY_RECONCILE_EVERY, MAX_BACKLOG, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+        Admission, AttachOutcome, AuthMethod, BrownoutAxis, Hub, HubCommand, Inflight, Outbound,
+        PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup,
+        EXPIRY_RECONCILE_EVERY, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+    };
+    use crate::backpressure::{
+        BacklogBound, BacklogEntry, SubscriberLimits, DEFAULT_MAX_BACKLOG_MESSAGES,
     };
     use bytes::Bytes;
     use mqtt_cluster::peer::{ForwardVerdict, PeerMessage, RetainedWireEntry};
@@ -11975,42 +12694,329 @@ mod tests {
 
     /// The flow-control backlog is bounded: past the cap it drops the oldest held
     /// message rather than growing without limit (ADR 0012).
+    ///
+    /// Kept verbatim modulo the issue #241 API rename — it is the **regression witness**
+    /// for the no-silent-change criterion: with the DEFAULT limits, the boundary is still
+    /// exactly 10 000 pushes with no eviction and one eviction on the 10 001st.
     #[test]
     fn flow_control_backlog_is_bounded_drop_oldest() {
+        let limits = SubscriberLimits::default();
         let mut inf = Inflight::default();
-        let entry = |topic: String| Backlog {
-            message: mqtt_core::Message {
-                topic,
-                payload: Bytes::from_static(b"x"),
-                qos: QoS::AtLeastOnce,
-                retain: false,
-                app: AppProperties::default(),
-                expires_at: None,
-            },
-            retain: false,
-            message_expiry: None,
-            offset: None,
+        let entry = |topic: String| {
+            BacklogEntry::new(
+                mqtt_core::Message {
+                    topic,
+                    payload: Bytes::from_static(b"x"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    app: AppProperties::default(),
+                    expires_at: None,
+                },
+                false,
+                None,
+                None,
+            )
         };
-        for i in 0..MAX_BACKLOG {
+        for i in 0..DEFAULT_MAX_BACKLOG_MESSAGES {
             assert!(
-                inf.push_backlog(entry(format!("t{i}"))).is_none(),
+                inf.push_backlog(entry(format!("t{i}")), &limits).is_empty(),
                 "no eviction under the cap"
             );
         }
         // At the cap, the next push evicts the oldest (t0) and stays bounded.
+        let evicted = inf.push_backlog(entry("overflow".into()), &limits);
         assert_eq!(
-            inf.push_backlog(entry("overflow".into()))
-                .map(|e| e.message.topic),
-            Some("t0".to_string()),
+            evicted.len(),
+            1,
+            "exactly one entry goes at the count bound"
+        );
+        assert_eq!(
+            evicted[0].0.message.topic, "t0",
             "the oldest is the one evicted at the cap"
         );
-        assert_eq!(inf.backlog.len(), MAX_BACKLOG, "backlog stays bounded");
+        assert_eq!(evicted[0].1, BacklogBound::Messages);
+        assert_eq!(
+            inf.backlog.len(),
+            DEFAULT_MAX_BACKLOG_MESSAGES,
+            "backlog stays bounded"
+        );
         assert_eq!(
             inf.backlog.front().unwrap().message.topic,
             "t1",
             "oldest was dropped"
         );
         assert_eq!(inf.backlog.back().unwrap().message.topic, "overflow");
+    }
+
+    /// A hub with metrics and explicit per-subscriber bounds (issue #241).
+    fn start_hub_with_limits(
+        limits: SubscriberLimits,
+    ) -> (HubTx, std::sync::Arc<mqtt_observability::metrics::Metrics>) {
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config(
+            NodeId("hub-test".into()),
+            std::sync::Arc::new(MemorySessionStore::new()),
+        );
+        hub.attach_metrics(metrics.clone());
+        hub.set_subscriber_limits(limits);
+        tokio::spawn(hub.run());
+        (tx, metrics)
+    }
+
+    /// A publish whose message accounts for exactly `bytes` (issue #241's size
+    /// definition: envelope + topic + payload + properties).
+    fn publish_sized(tx: &HubTx, topic: &str, qos: QoS, bytes: usize, marker: u8) {
+        let fixed = crate::backpressure::ENTRY_OVERHEAD + topic.len();
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from(vec![marker; bytes - fixed]),
+            qos,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+        })
+        .unwrap();
+    }
+
+    /// The delivered `QoS` of a PUBLISH, so a test can tell a shed-legal class from one
+    /// that must never be shed.
+    fn qos_of(packet: &Packet) -> QoS {
+        match packet {
+            Packet::Publish(p) => p.qos,
+            other => panic!("expected a publish, got {other:?}"),
+        }
+    }
+
+    /// How many times `reason` was counted, read out of the rendered exposition.
+    fn dropped_for(metrics: &mqtt_observability::metrics::Metrics, reason: &str) -> u64 {
+        let needle = format!("mqttd_publish_dropped_total{{reason=\"{reason}\"}} ");
+        metrics
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(&needle))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Issue #241, end-to-end on the real hub: with a BYTE bound set, a subscriber that
+    /// stops acknowledging sheds already-acked entries at that bound — long before the
+    /// 10 000-message count bound — counted as `publish_dropped{reason="backlog-overflow"}`
+    /// and with the NEWEST messages surviving in FIFO order.
+    ///
+    /// It also pins what did NOT change: `queue-overflow` belongs to the DURABLE offline
+    /// queue, which this change does not touch, and `outbound-full` to the `QoS` 0
+    /// channel. Neither moves.
+    #[tokio::test]
+    async fn the_backlog_byte_bound_sheds_acked_entries_and_counts_them() {
+        // 1 KiB per message; a 4 KiB cap therefore holds 4.
+        let (tx, metrics) = start_hub_with_limits(SubscriberLimits {
+            max_backlog_bytes: Some(4096),
+            ..SubscriberLimits::default()
+        });
+        // Receive Maximum 1 and never a PUBACK: everything after the first message piles
+        // into the flow-control backlog.
+        let (mut rx, _) = attach_full(&tx, "slow", 1, true, 0, 1).await;
+        subscribe_qos(&tx, "slow", "t/1", QoS::AtLeastOnce);
+        // One warm-up delivery first: a session's FIRST QoS>0 send finds its packet-id
+        // block spent and parks in the backlog while the reservation runs off-loop
+        // (issue #242 finding A). Draining that deferral before the run under test keeps
+        // this about the byte bound rather than about the id reservation.
+        publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'W');
+        let warm = recv_packet(&mut rx).await.expect("the warm-up delivery");
+        assert_eq!(payload_of(&warm)[0], b'W');
+        pub_ack(&tx, "slow", pkid_of(&warm));
+
+        for i in 0..8u8 {
+            publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'a' + i);
+        }
+
+        // The first is on the wire under the quota of one.
+        let first = recv_packet(&mut rx).await.expect("the first delivery");
+        assert_eq!(payload_of(&first)[0], b'a');
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the quota holds the rest"
+        );
+
+        // Seven pushes into a queue that holds four: three evictions at the BYTE bound.
+        assert_eq!(
+            dropped_for(&metrics, "backlog-overflow"),
+            3,
+            "eviction at the byte bound, not the count bound: {}",
+            metrics.render()
+        );
+        assert_eq!(
+            dropped_for(&metrics, "queue-overflow"),
+            0,
+            "the DURABLE queue's counter is untouched by a RAM bound"
+        );
+        assert_eq!(dropped_for(&metrics, "outbound-full"), 0);
+
+        // Drop-oldest: what survived is the NEWEST four, delivered in FIFO order as acks
+        // free the quota.
+        let mut delivered = vec![payload_of(&first)[0]];
+        let mut pkid = pkid_of(&first);
+        for _ in 0..4 {
+            pub_ack(&tx, "slow", pkid);
+            let Some(pkt) = recv_packet(&mut rx).await else {
+                break;
+            };
+            delivered.push(payload_of(&pkt)[0]);
+            pkid = pkid_of(&pkt);
+        }
+        assert_eq!(
+            delivered,
+            vec![b'a', b'e', b'f', b'g', b'h'],
+            "the three oldest held messages (b, c, d) were the ones shed"
+        );
+    }
+
+    /// Issue #241: the outbound channel's byte bound sheds `QoS` 0 well before the fixed
+    /// 10 000-PACKET cap — and it gates ONLY that shed-legal class, so a `QoS` 1 delivery
+    /// in the same state still reaches the wire.
+    #[tokio::test]
+    async fn the_outbound_byte_cap_sheds_qos0_before_the_packet_count_cap() {
+        let (tx, metrics) = start_hub_with_limits(SubscriberLimits {
+            max_outbound_bytes: Some(4096),
+            ..SubscriberLimits::default()
+        });
+        // Nothing ever calls the meter for this receiver, so the channel never drains —
+        // exactly a subscriber that stopped reading.
+        let (mut rx, _) = attach_full(&tx, "deaf", 1, true, 0, u16::MAX).await;
+        subscribe_qos(&tx, "deaf", "t/1", QoS::AtLeastOnce);
+
+        for i in 0..8u8 {
+            publish_sized(&tx, "t/1", QoS::AtMostOnce, 1024, b'a' + i);
+        }
+        // A QoS 1 arriving while the channel is over its byte bound is NOT shed.
+        publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'Z');
+
+        let mut got = Vec::new();
+        while let Some(pkt) = recv_packet(&mut rx).await {
+            got.push((payload_of(&pkt)[0], qos_of(&pkt)));
+        }
+        assert_eq!(
+            dropped_for(&metrics, "outbound-full"),
+            4,
+            "shed at the byte bound with the packet count nowhere near 10 000: {}",
+            metrics.render()
+        );
+        assert_eq!(
+            got,
+            vec![
+                (b'a', QoS::AtMostOnce),
+                (b'b', QoS::AtMostOnce),
+                (b'c', QoS::AtMostOnce),
+                (b'd', QoS::AtMostOnce),
+                (b'Z', QoS::AtLeastOnce),
+            ],
+            "four QoS 0 fit the 4 KiB budget; the QoS 1 flows past it"
+        );
+        assert_eq!(dropped_for(&metrics, "backlog-overflow"), 0);
+    }
+
+    /// Issue #241: the outbound byte counter is exactly the accounted sum of what the
+    /// writer has not yet dequeued, and it returns to ZERO once it drains. A counter that
+    /// drifted upward would pin the `QoS` 0 gate shut for the rest of the connection.
+    #[test]
+    fn the_outbound_byte_counter_returns_to_zero_when_the_writer_drains() {
+        use crate::backpressure::packet_bytes;
+        let (t, mut r) = mpsc::unbounded_channel();
+        let (out, meter) = Outbound::new(t);
+
+        let publish = |marker: u8, payload: usize| {
+            Packet::Publish(mqtt_codec::packet::Publish {
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "t/1".into(),
+                pkid: Some(u16::from(marker)),
+                properties: mqtt_codec::Properties::new(),
+                payload: Bytes::from(vec![marker; payload]),
+            })
+        };
+        let packets = vec![
+            publish(1, 100),
+            publish(2, 5000),
+            Packet::PubAck(mqtt_codec::packet::Ack::new(3)),
+        ];
+        let expected: usize = packets.iter().map(packet_bytes).sum();
+        for p in &packets {
+            assert!(out.send(p.clone()));
+        }
+        assert_eq!(out.bytes(), expected, "the accounted sum of what is queued");
+        assert_eq!(out.depth(), 3);
+
+        // Drained one at a time: each subtraction is that packet's own size.
+        let mut remaining = expected;
+        while let Ok(pkt) = r.try_recv() {
+            meter.drained(&pkt);
+            remaining -= packet_bytes(&pkt);
+            assert_eq!(out.bytes(), remaining);
+        }
+        assert_eq!(out.bytes(), 0, "a fully drained channel holds zero bytes");
+        assert_eq!(out.depth(), 0);
+
+        // A send that never queued (the client left) leaves both counters alone.
+        drop(r);
+        assert!(!out.send(publish(9, 42)));
+        assert_eq!(out.bytes(), 0);
+        assert_eq!(out.depth(), 0);
+    }
+
+    /// Issue #241: `MQTTD_MAX_INFLIGHT_MESSAGES` caps the client's OWN Receive Maximum —
+    /// legal, because a client's Receive Maximum is a ceiling on what the broker may send,
+    /// never a floor. It is the LOSS-FREE lever: the surplus waits in the backlog and
+    /// nothing is dropped.
+    #[tokio::test]
+    async fn an_inflight_ceiling_caps_the_clients_own_receive_maximum() {
+        let (tx, metrics) = start_hub_with_limits(SubscriberLimits {
+            max_inflight_messages: Some(2),
+            ..SubscriberLimits::default()
+        });
+        let (mut rx, _) = attach_full(&tx, "fast", 1, true, 0, 100).await;
+        subscribe_qos(&tx, "fast", "t/1", QoS::AtLeastOnce);
+        for i in 0..5u8 {
+            publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'a' + i);
+        }
+
+        let a = recv_packet(&mut rx).await.expect("the first");
+        let b = recv_packet(&mut rx).await.expect("the second");
+        assert_eq!((payload_of(&a)[0], payload_of(&b)[0]), (b'a', b'b'));
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the ceiling holds the third off the wire even though the client allowed 100"
+        );
+
+        // Acking one releases exactly one more — a gate, not a drop.
+        pub_ack(&tx, "fast", pkid_of(&a));
+        let c = recv_packet(&mut rx)
+            .await
+            .expect("the third, after one ack");
+        assert_eq!(payload_of(&c)[0], b'c');
+        assert!(recv_packet(&mut rx).await.is_none());
+        assert_eq!(
+            dropped_for(&metrics, "backlog-overflow"),
+            0,
+            "the in-flight ceiling drops nothing"
+        );
+        assert_eq!(dropped_for(&metrics, "outbound-full"), 0);
+        assert_eq!(dropped_for(&metrics, "queue-overflow"), 0);
+
+        // Unset, the client's own 100 stays in force: all five go straight out.
+        let (tx, _m) = start_hub_with_limits(SubscriberLimits::default());
+        let (mut rx, _) = attach_full(&tx, "fast", 1, true, 0, 100).await;
+        subscribe_qos(&tx, "fast", "t/1", QoS::AtLeastOnce);
+        for i in 0..5u8 {
+            publish_sized(&tx, "t/1", QoS::AtLeastOnce, 1024, b'a' + i);
+        }
+        for want in b"abcde" {
+            let pkt = recv_packet(&mut rx).await.expect("an unthrottled delivery");
+            assert_eq!(payload_of(&pkt)[0], *want);
+        }
     }
 
     /// Receive Maximum bounds in-flight `QoS` > 0 deliveries: with a quota of 1, the
@@ -15049,6 +16055,1269 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // --- issue #284 / 0043-P6: rehome on settle -------------------------------
+
+    /// A `SessionStore` that models the CLUSTERED durable store's group gate: every
+    /// session **write** is refused with `StorageError::NotOwner` unless this node owns
+    /// the client's placement group, exactly as `cluster_store::log_for_key` refuses it
+    /// (`crates/mqtt-cluster/src/cluster_store.rs`, the `!placement.owns_group(group)`
+    /// early return).
+    ///
+    /// Without this gate a unit fixture over a bare `MemorySessionStore` happily stores
+    /// for a session whose group has moved away — which would hide the only thing that
+    /// makes issue #284's hand-off observable (round-2 finding 1): a publish toward a
+    /// rehomed session must fail its durable append and have its publisher's ack
+    /// WITHHELD, not be acked for a message no node holds. Reads and the attach path are
+    /// deliberately left ungated: on the real node those go through the same gate, but a
+    /// unit fixture that refused them could not attach a session at all before moving
+    /// its lease.
+    #[derive(Debug)]
+    struct GroupGatedStore {
+        inner: MemorySessionStore,
+        placement: Arc<RwLock<Placement>>,
+    }
+
+    impl GroupGatedStore {
+        fn new(placement: Arc<RwLock<Placement>>) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemorySessionStore::new(),
+                placement,
+            })
+        }
+
+        /// The gate itself: `Placement::owns` is `group_owner(group_of(client)) == local`,
+        /// i.e. the very predicate the replicated store fences writes on.
+        fn owns(&self, client: &ClientId) -> bool {
+            self.placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owns(&client.0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mqtt_storage::SessionStore for GroupGatedStore {
+        async fn ensure_session(
+            &self,
+            client: &ClientId,
+        ) -> Result<bool, mqtt_storage::StorageError> {
+            self.inner.ensure_session(client).await
+        }
+
+        async fn set_subscriptions(
+            &self,
+            client: &ClientId,
+            subscriptions: &[mqtt_core::Subscription],
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.set_subscriptions(client, subscriptions).await
+        }
+
+        async fn subscriptions(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_core::Subscription>, mqtt_storage::StorageError> {
+            self.inner.subscriptions(client).await
+        }
+
+        async fn enqueue_with_expiry(
+            &self,
+            client: &ClientId,
+            message: &Message,
+            expiry_at: Option<u64>,
+        ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
+            if !self.owns(client) {
+                return Err(mqtt_storage::StorageError::NotOwner);
+            }
+            self.inner
+                .enqueue_with_expiry(client, message, expiry_at)
+                .await
+        }
+
+        async fn pending(
+            &self,
+            client: &ClientId,
+            after: u64,
+            limit: usize,
+        ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
+            self.inner.pending(client, after, limit).await
+        }
+
+        async fn ack(
+            &self,
+            client: &ClientId,
+            up_to: u64,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack(client, up_to).await
+        }
+
+        async fn record_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<mqtt_storage::InboundSighting, mqtt_storage::StorageError> {
+            self.inner.record_received(client, packet_id).await
+        }
+
+        async fn ack_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.ack_received(client, packet_id).await
+        }
+
+        async fn clear_received(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_received(client, packet_id).await
+        }
+
+        async fn received(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<u16>, mqtt_storage::StorageError> {
+            self.inner.received(client).await
+        }
+
+        async fn record_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+            offset: u64,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.record_outbound(client, packet_id, offset).await
+        }
+
+        async fn advance_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.advance_outbound(client, packet_id).await
+        }
+
+        async fn clear_outbound(
+            &self,
+            client: &ClientId,
+            packet_id: u16,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            self.inner.clear_outbound(client, packet_id).await
+        }
+
+        async fn outbound(
+            &self,
+            client: &ClientId,
+        ) -> Result<Vec<mqtt_storage::OutboundInflight>, mqtt_storage::StorageError> {
+            self.inner.outbound(client).await
+        }
+
+        async fn next_packet_id(
+            &self,
+            client: &ClientId,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.next_packet_id(client).await
+        }
+
+        async fn reserve_packet_ids(
+            &self,
+            client: &ClientId,
+            count: u16,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            self.inner.reserve_packet_ids(client, count).await
+        }
+
+        async fn remove(&self, client: &ClientId) -> Result<(), mqtt_storage::StorageError> {
+            if !self.owns(client) {
+                return Err(mqtt_storage::StorageError::NotOwner);
+            }
+            self.inner.remove(client).await
+        }
+
+        async fn set_session_expiry(
+            &self,
+            client: &ClientId,
+            deadline: Option<u64>,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            if !self.owns(client) {
+                return Err(mqtt_storage::StorageError::NotOwner);
+            }
+            self.inner.set_session_expiry(client, deadline).await
+        }
+
+        async fn expiring_sessions(
+            &self,
+        ) -> Result<Vec<(ClientId, u64)>, mqtt_storage::StorageError> {
+            self.inner.expiring_sessions().await
+        }
+
+        async fn all_sessions(
+            &self,
+        ) -> Result<mqtt_storage::SessionScan, mqtt_storage::StorageError> {
+            self.inner.all_sessions().await
+        }
+    }
+
+    /// A durable + clustered hub whose placement holds one remote peer and whose
+    /// COMMITTED lease map the test controls — the rehome-on-settle fixture
+    /// (issue #284). `remote_addr` empty makes the peer eligible with NO known
+    /// peer-link address, which is the unrelocatable case.
+    async fn start_rehome_hub(
+        remote_addr: &str,
+    ) -> (
+        HubTx,
+        Arc<RwLock<Placement>>,
+        NodeId,
+        Arc<mqtt_observability::metrics::Metrics>,
+    ) {
+        let (tx, placement, mut remotes, metrics) = start_rehome_hub_with(&[remote_addr]).await;
+        (tx, placement, remotes.remove(0), metrics)
+    }
+
+    /// [`start_rehome_hub`] with one peer per address — two of them make this hub an
+    /// ORIGIN that fans a publish out to a moved session's old node and its new owner at
+    /// once, which is the third-node entry point neither of the earlier rounds tested.
+    async fn start_rehome_hub_with(
+        remote_addrs: &[&str],
+    ) -> (
+        HubTx,
+        Arc<RwLock<Placement>>,
+        Vec<NodeId>,
+        Arc<mqtt_observability::metrics::Metrics>,
+    ) {
+        let local = NodeId("rehome-local".into());
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        let remotes: Vec<NodeId> = (0..remote_addrs.len())
+            .map(|i| {
+                NodeId(if i == 0 {
+                    "rehome-remote".to_string()
+                } else {
+                    format!("rehome-remote{}", i + 1)
+                })
+            })
+            .collect();
+        for (node, addr) in remotes.iter().zip(remote_addrs) {
+            placement
+                .write()
+                .unwrap()
+                .observe(node, MemberState::Alive, addr, None);
+        }
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let (mut hub, tx) = Hub::with_config_and_placement(
+            local.clone(),
+            // The group-gated store, not a bare memory one: a publish toward a session
+            // whose group has moved away must FAIL its durable append here, exactly as
+            // the replicated store fails it on the real node (round-2 finding 1).
+            GroupGatedStore::new(placement.clone()),
+            Some(placement.clone()),
+        );
+        // Rehome (like the release path it feeds) is durable-cluster-only: attach a
+        // real, idle plane.
+        let (_store, _retained, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
+            local.clone(),
+            placement.clone(),
+            false,
+            5,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .await;
+        driver.abort();
+        hub.attach_durable_plane(plane);
+        hub.attach_metrics(metrics.clone());
+        tokio::spawn(hub.run());
+        (tx, placement, remotes, metrics)
+    }
+
+    /// Point `client`'s group's COMMITTED lease at `holder` (what the durable driver
+    /// pushes each reconcile tick). An empty map restores pure-HRW routing.
+    fn commit_lease(placement: &Arc<RwLock<Placement>>, client: &str, holder: Option<&NodeId>) {
+        let mut owners = std::collections::BTreeMap::new();
+        if let Some(h) = holder {
+            owners.insert(mqtt_cluster::placement::group_of(client), h.clone());
+        }
+        placement.write().unwrap().set_lease_owners(owners);
+    }
+
+    /// Make the fixture's peer link count as SETTLED, the way a real peer does: gossip
+    /// it an interest snapshot. A peer that has never spoken leaves `mesh_settled()`
+    /// false, which holds EVERY gated ack — so without this an ack-honesty assertion
+    /// could not tell issue #284's hand-off withhold from the mesh gate's.
+    fn peer_gossips_interest(tx: &HubTx, node: &NodeId, filters: &[&str]) {
+        tx.send(HubCommand::RemoteInterest {
+            node: node.clone(),
+            filters: filters.iter().map(|f| (*f).to_string()).collect(),
+        })
+        .unwrap();
+    }
+
+    /// Wait until `filter` is (or is not) in a gossiped `Interest` snapshot.
+    async fn await_wire_interest(
+        peer: &mut mpsc::UnboundedReceiver<PeerMessage>,
+        filter: &str,
+        present: bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match recv_peer(peer).await {
+                Some(PeerMessage::Interest { filters })
+                    if filters.contains(&filter.to_string()) == present =>
+                {
+                    return;
+                }
+                _ => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "gossiped interest never reported {filter} present={present}"
+                ),
+            }
+        }
+    }
+
+    /// Block until this hub's ROUTING VIEW reports settled, probed exactly the way the
+    /// production ack gate reads it: a gated `QoS` 1 publish nobody subscribes to is
+    /// released only once `routing_unsettled()` is false (`awaiting_settle`). A fresh hub
+    /// arms an 8-tick boot window and re-arms it on the first membership observation, so
+    /// this takes several seconds — and every ack-honesty assertion is meaningless before
+    /// it, because the ack would be held by the pre-existing gate rather than by the
+    /// behaviour under test.
+    async fn await_routing_settled(tx: &HubTx) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            let probe = publish_gated(tx, "settle/probe/284", b"p", QoS::AtLeastOnce, true);
+            if let Ok(Ok(PublishOutcome::Accepted)) =
+                timeout(super::SESSION_SWEEP_INTERVAL, probe).await
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the hub's routing view never settled"
+            );
+        }
+    }
+
+    /// Wait for the rehome close (`0x9C` Use another server) on a v5 client's socket.
+    async fn await_rehome_disconnect(out: &mut mpsc::UnboundedReceiver<Packet>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match recv_packet(out).await {
+                Some(Packet::Disconnect(d)) => {
+                    assert_eq!(
+                        d.reason,
+                        mqtt_codec::reason::USE_ANOTHER_SERVER,
+                        "a rehomed v5 client is told to use another server"
+                    );
+                    return;
+                }
+                other => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no rehome DISCONNECT; got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Attach a persistent **v5** session (so it can be told WHY it is closed).
+    async fn attach_persistent_v5(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+    ) -> mpsc::UnboundedReceiver<Packet> {
+        attach_persistent_v5_full(tx, client, conn_id, u32::MAX, None).await
+    }
+
+    /// [`attach_persistent_v5`] with an explicit Session Expiry Interval and Will — the
+    /// two session properties the rehome close has to answer for (ADR 0009 §3's persisted
+    /// deadline, and [MQTT-3.1.2-8]'s will).
+    async fn attach_persistent_v5_full(
+        tx: &HubTx,
+        client: &str,
+        conn_id: u64,
+        session_expiry: u32,
+        will: Option<Message>,
+    ) -> mpsc::UnboundedReceiver<Packet> {
+        let (out_tx, out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.into()),
+            admission: Admission {
+                identity: mqtt_auth::Identity {
+                    subject: client.to_string(),
+                    groups: vec![],
+                },
+                method: AuthMethod::Password,
+                cert_serial: None,
+                protocol: ProtocolVersion::V5,
+            },
+            conn_id,
+            clean_start: false,
+            session_expiry,
+            receive_maximum: u16::MAX,
+            will,
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        reply_rx.await.unwrap();
+        out_rx
+    }
+
+    /// Issue #284: an ONLINE persistent session whose group's committed lease has
+    /// moved to another node is CLOSED, so the client relocates to the real owner on
+    /// its next CONNECT — the wedge otherwise persists until the client's keepalive
+    /// notices dead air (measured unbounded; still wedged after two minutes).
+    ///
+    /// A v5 client is told why (`0x9C` Use another server) and the session leaves
+    /// `online`. The close does NOTHING ELSE: the session's filter is still advertised
+    /// afterwards and a publish toward it is still WITHHELD, which is this fix's whole
+    /// honesty story in one assertion. Releasing the routing at the close instead — the
+    /// first cut — acked that publish with nothing stored anywhere; the pre-existing
+    /// [`Hub::release_moved_sessions`] takes the session on its own scan cadence, paired
+    /// with the only thing that clears a held ack.
+    #[tokio::test]
+    async fn an_online_session_whose_group_moved_is_closed_so_it_relocates() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "mover-284";
+
+        // The session is here and owned here: the committed lease names this node.
+        commit_lease(&placement, client, None);
+        let mut out = attach_persistent_v5(&tx, client, 1).await;
+        subscribe_qos(&tx, client, "mv/284", QoS::AtLeastOnce);
+        let mut peer = connect_peer(&tx, "rehome-remote", 1);
+        // The owner-to-be is linked and has spoken, but claims nothing yet.
+        peer_gossips_interest(&tx, &remote, &[]);
+
+        // Its filter is gossiped, so the release below is observable as its removal.
+        await_wire_interest(&mut peer, "mv/284", true).await;
+        await_routing_settled(&tx).await;
+
+        // Ownership settles elsewhere while the client stays connected — the roll
+        // aftermath: the readmitted node takes its groups' leases back.
+        commit_lease(&placement, client, Some(&remote));
+
+        // The client is told to use another server, and the connection closes.
+        await_rehome_disconnect(&mut out).await;
+        assert!(
+            recv_packet(&mut out).await.is_none(),
+            "the rehomed connection must be closed"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("mqttd_session_rehomes_total{reason=\"stale-owner\"} 1"),
+            "{rendered}"
+        );
+
+        // ...and NOTHING else changed. The filter is still advertised (so the cluster can
+        // still see that the message is owed), and the publisher's ack is WITHHELD rather
+        // than given for a message this node cannot append and no other node claims yet.
+        // A negative-in-time assertion on the gossip would prove nothing, so the routing
+        // is probed the way it matters: by the answer a publisher gets.
+        let held = publish_gated(&tx, "mv/284", b"held", QoS::AtLeastOnce, true);
+        let got = timeout(super::SESSION_SWEEP_INTERVAL * 3, held).await;
+        assert!(
+            matches!(got, Err(_) | Ok(Err(_))),
+            "after a rehome close this node still routes the session, so the publisher's \
+             ack must be WITHHELD, got {got:?}"
+        );
+        // The same fact from the gossip side: no shrunken snapshot followed the close.
+        while let Ok(frame) = peer.try_recv() {
+            if let PeerMessage::Interest { filters } = frame {
+                assert!(
+                    filters.contains(&"mv/284".to_string()),
+                    "the rehome close must not re-gossip a shrunken interest: {filters:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #284: the grace. A committed lease that lands elsewhere for a single
+    /// sweep tick and comes straight back (assigner rebalance, leader change) must
+    /// NOT cost a live client its connection — that churn is ordinary convergence,
+    /// not a session placed across an ownership move.
+    #[tokio::test]
+    async fn a_transient_ownership_blip_does_not_close_a_live_session() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "blip-284";
+
+        commit_lease(&placement, client, None);
+        let mut out = attach_persistent_v5(&tx, client, 1).await;
+        // Settle: the session is online and owned here for a couple of ticks.
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 2).await;
+
+        // Elsewhere and back inside one sweep interval: at most a single tick can
+        // observe it, which is strictly less than the grace.
+        commit_lease(&placement, client, Some(&remote));
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL / 3).await;
+        commit_lease(&placement, client, None);
+
+        // Well past the grace: nothing happened to the connection.
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 4).await;
+        assert!(
+            recv_packet(&mut out).await.is_none(),
+            "a sub-tick ownership blip must not disturb a live session"
+        );
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains("mqttd_session_rehomes_total{"),
+            "no rehome of any reason: {rendered}"
+        );
+        assert!(
+            rendered.contains("mqttd_misplaced_sessions 0"),
+            "the grace entry must be dropped, not merely reset: {rendered}"
+        );
+    }
+
+    /// Issue #284: a group with NO committed lease is never rehomed. With the lease
+    /// map empty the ring falls back to the desired (HRW) owner, which can name
+    /// another node while the cluster has committed nothing — the transient
+    /// ring/lease split the 2026-07-20 post-mortem describes. The data path is right
+    /// to fail closed on it; DISRUPTING a live client on it would close healthy
+    /// sessions during ordinary convergence.
+    #[tokio::test]
+    async fn a_group_with_no_committed_lease_is_never_rehomed() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        // A client the HRW ring hands to the remote node, with no lease anywhere.
+        let client = {
+            let p = placement.read().unwrap();
+            (0..100_000)
+                .map(|i| format!("hrw-284-{i}"))
+                .find(|c| p.owner(c) == remote)
+                .expect("some client's desired owner is the remote node")
+        };
+        commit_lease(&placement, &client, None);
+        assert!(
+            placement
+                .read()
+                .unwrap()
+                .committed_session_owner(&client)
+                .is_none(),
+            "the fixture must have no committed lease for the group"
+        );
+
+        let mut out = attach_persistent_v5(&tx, &client, 1).await;
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 5).await;
+
+        assert!(
+            recv_packet(&mut out).await.is_none(),
+            "an unsettled (lease-less) group must not close a live session"
+        );
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains("mqttd_session_rehomes_total{"),
+            "no rehome of any reason: {rendered}"
+        );
+    }
+
+    /// Issue #284: an owner this node cannot route to is COUNTED, not closed. With
+    /// the owner's peer-link address unknown, the client's next CONNECT would be
+    /// served locally again (ADR 0005 §5 degrade-don't-refuse) — closing it would be
+    /// an unbounded close/reconnect loop. The session stays (still undeliverable),
+    /// and says so through `session_rehomes{reason="unrelocatable"}` and the
+    /// misplaced-sessions gauge.
+    #[tokio::test]
+    async fn an_unrelocatable_owner_is_counted_not_closed() {
+        // Eligible remote member, no address learned.
+        let (tx, placement, remote, metrics) = start_rehome_hub("").await;
+        let client = "stranded-284";
+
+        commit_lease(&placement, client, None);
+        let mut out = attach_persistent_v5(&tx, client, 1).await;
+        commit_lease(&placement, client, Some(&remote));
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 5).await;
+
+        assert!(
+            recv_packet(&mut out).await.is_none(),
+            "a session whose owner has no known address must be kept, not closed"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("mqttd_session_rehomes_total{reason=\"unrelocatable\"} 1"),
+            "counted exactly once per episode: {rendered}"
+        );
+        assert!(
+            !rendered.contains("reason=\"stale-owner\""),
+            "nothing was closed: {rendered}"
+        );
+        assert!(
+            rendered.contains("mqttd_misplaced_sessions 1"),
+            "the standing wedge must be visible on the gauge: {rendered}"
+        );
+    }
+
+    /// Issue #284: the cooldown. A client that comes straight back to the SAME
+    /// non-owning node (a flapping placement, or a load balancer that keeps
+    /// returning it there) is not closed again immediately — otherwise the fix is a
+    /// close loop, and a will-publish loop with it. The suppressed repeat is
+    /// counted so a standing flap is loud rather than silent.
+    #[tokio::test]
+    async fn a_rehomed_session_is_not_closed_again_within_the_cooldown() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "flapper-284";
+
+        commit_lease(&placement, client, None);
+        let mut first = attach_persistent_v5(&tx, client, 1).await;
+        commit_lease(&placement, client, Some(&remote));
+
+        // First close: the ordinary rehome.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match recv_packet(&mut first).await {
+                Some(Packet::Disconnect(_)) => break,
+                other => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no first rehome DISCONNECT; got {other:?}"
+                ),
+            }
+        }
+
+        // The client lands right back here, still not the owner.
+        let mut second = attach_persistent_v5(&tx, client, 2).await;
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 5).await;
+        assert!(
+            recv_packet(&mut second).await.is_none(),
+            "a second close inside the cooldown would be a close loop"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("mqttd_session_rehomes_total{reason=\"stale-owner\"} 1"),
+            "exactly one close so far: {rendered}"
+        );
+        assert!(
+            rendered.contains("mqttd_session_rehomes_total{reason=\"cooldown\"} 1"),
+            "the suppressed repeat must be counted: {rendered}"
+        );
+    }
+
+    /// Where a publish toward a rehomed session ENTERS this node — the enumeration axis
+    /// that killed both earlier rounds of issue #284 (each sampled one entry point and
+    /// missed a case).
+    #[derive(Debug, Clone, Copy)]
+    enum RehomeEntry {
+        /// A client publishing here: the local gate, whose answer is the publisher's
+        /// `PublishOutcome` (or its absence — a withhold).
+        Local,
+        /// A peer forwarding here off its interest snapshot: the answer is a
+        /// `PublishVerdict` on the peer link.
+        PeerForward,
+    }
+
+    /// What the committed OWNER is advertising while the probe runs. Filter-level interest
+    /// is all a peer publishes (`PeerMessage::Interest` carries filters, not client ids),
+    /// so "present" is also what a co-subscriber of the same filter already living on the
+    /// owner looks like — and "present then withdrawn" is that co-subscriber going away,
+    /// the shape that survived round 2's evidence check and produced an acked-but-dropped
+    /// publish.
+    #[derive(Debug, Clone, Copy)]
+    enum OwnerInterest {
+        Absent,
+        Present,
+        PresentThenWithdrawn,
+    }
+
+    /// Issue #284 round 3 — **the ack-honesty invariant, enumerated rather than sampled.**
+    ///
+    /// The rehome close ends the connection and touches nothing else, so from the close
+    /// until the pre-existing `release_moved_sessions` scan takes it, this node still
+    /// routes the moved session and still advertises its filters. That is what keeps every
+    /// publish toward it honest: locally the durable append fails `NotOwner` and the
+    /// publisher's ack is WITHHELD; as a peer's forward it is answered `Failed`, which is a
+    /// withhold at the origin too. No cell may answer `Accepted` or `Stored`.
+    ///
+    /// Rounds 1 and 2 each closed the named hole and opened one in an adjacent mechanism,
+    /// and each time the missed case was an entry point or a moment the test did not visit.
+    /// So this test is a table: {local, peer-forward} x {owner interest absent, present,
+    /// present-then-withdrawn} x {before the close, after the close}. The third-node entry
+    /// point — where the owner's `Stored` must compose with this node's `Failed` into a
+    /// withhold — cannot be posed on the rehoming node itself and is the separate
+    /// [`a_third_node_composes_a_refusal_and_a_store_into_a_withhold`] test.
+    #[tokio::test]
+    async fn no_publish_toward_a_rehomed_session_is_ever_acked_while_this_node_routes_it() {
+        let (tx, placement, remote, _metrics) = start_rehome_hub("r:7000").await;
+        let mut peer = connect_peer(&tx, "rehome-remote", 1);
+        peer_gossips_interest(&tx, &remote, &[]);
+        await_routing_settled(&tx).await;
+        let mut seq = 1_000u64;
+        // THE CONTROL, without which every cell below could be passing for the wrong
+        // reason. A forward that matches nothing here is answered `Stored` only while
+        // `routing_unsettled()` is false, so this proves the routing view is settled — and
+        // therefore that every `Failed` below comes from the session's append being refused
+        // `NotOwner`, not from a pre-existing honesty gate.
+        assert_eq!(
+            forward_verdict_for(&tx, &mut peer, &remote, "nobody/284", &mut seq).await,
+            ForwardVerdict::Stored,
+            "the fixture's routing view must be settled before any cell runs, or a \
+             withheld ack proves nothing about the rehome"
+        );
+
+        for (i, interest) in [
+            OwnerInterest::Absent,
+            OwnerInterest::Present,
+            OwnerInterest::PresentThenWithdrawn,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let client = format!("enum-284-{i}");
+            let filter = format!("enum/{i}/284");
+            commit_lease(&placement, &client, None);
+            let mut out = attach_persistent_v5(&tx, &client, 700 + i as u64).await;
+            subscribe_qos(&tx, &client, &filter, QoS::AtLeastOnce);
+            await_wire_interest(&mut peer, &filter, true).await;
+
+            // Put the owner's advertised interest where this cell wants it. `Present` and
+            // `PresentThenWithdrawn` differ only in the second frame, which is the whole
+            // point: a claim that is observed and then retracted must not have discharged
+            // anything.
+            match interest {
+                OwnerInterest::Absent => peer_gossips_interest(&tx, &remote, &[]),
+                OwnerInterest::Present | OwnerInterest::PresentThenWithdrawn => {
+                    peer_gossips_interest(&tx, &remote, &[&filter]);
+                }
+            }
+
+            // Ownership moves away. The close needs MISPLACED_GRACE_TICKS of observation,
+            // so the BEFORE-the-close cells run in the window that opens right here: the
+            // session is still online and routed, and its append already fails `NotOwner`.
+            commit_lease(&placement, &client, Some(&remote));
+            // Pins the phase: the earliest possible close is a sweep tick away
+            // (MISPLACED_GRACE_TICKS of continuous observation), so these two cells really
+            // do run with the session still ONLINE. Their answers are immediate — the
+            // group-gated append refuses synchronously — so they land well inside the grace.
+            assert!(
+                out.try_recv().is_err(),
+                "the before-the-close cells must run before the close"
+            );
+            for entry in [RehomeEntry::Local, RehomeEntry::PeerForward] {
+                assert_publish_is_withheld(
+                    &tx,
+                    &mut peer,
+                    &remote,
+                    &filter,
+                    entry,
+                    &mut seq,
+                    &format!("{interest:?}/{entry:?}/before-the-close"),
+                )
+                .await;
+            }
+
+            // The close itself, and then the same probes on the other side of it.
+            await_rehome_disconnect(&mut out).await;
+            if matches!(interest, OwnerInterest::PresentThenWithdrawn) {
+                // The owner's advertised interest disappears while the moved session is
+                // still unmaterialised there — round 2's proven acked-but-dropped shape.
+                peer_gossips_interest(&tx, &remote, &[]);
+            }
+            for entry in [RehomeEntry::Local, RehomeEntry::PeerForward] {
+                assert_publish_is_withheld(
+                    &tx,
+                    &mut peer,
+                    &remote,
+                    &filter,
+                    entry,
+                    &mut seq,
+                    &format!("{interest:?}/{entry:?}/after-the-close"),
+                )
+                .await;
+            }
+        }
+
+        // The control again: the close arms no window, so a zero-match forward is still
+        // answered `Stored`. Every withhold above was the session's own obligation.
+        assert_eq!(
+            forward_verdict_for(&tx, &mut peer, &remote, "nobody/284", &mut seq).await,
+            ForwardVerdict::Stored,
+            "a rehome close must not arm a node-wide settle window (round-2 blocking #1 \
+             stalled every gated ack on the node for up to 30 s that way)"
+        );
+    }
+
+    /// Feed one peer forward for `topic` and read this node's verdict for it.
+    async fn forward_verdict_for(
+        tx: &HubTx,
+        peer: &mut mpsc::UnboundedReceiver<PeerMessage>,
+        remote: &NodeId,
+        topic: &str,
+        seq: &mut u64,
+    ) -> ForwardVerdict {
+        *seq += 1;
+        let this = *seq;
+        tx.send(HubCommand::RemotePublishAcked {
+            node: remote.clone(),
+            seq: this,
+            topic: topic.into(),
+            payload: Bytes::from_static(b"probe"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+        })
+        .unwrap();
+        next_verdict(peer, this).await
+    }
+
+    /// One cell of [`no_publish_toward_a_rehomed_session_is_ever_acked_while_this_node_routes_it`]:
+    /// publish toward `filter` through `entry` and require the ack to be WITHHELD.
+    async fn assert_publish_is_withheld(
+        tx: &HubTx,
+        peer: &mut mpsc::UnboundedReceiver<PeerMessage>,
+        remote: &NodeId,
+        filter: &str,
+        entry: RehomeEntry,
+        seq: &mut u64,
+        cell: &str,
+    ) {
+        match entry {
+            RehomeEntry::Local => {
+                let out = publish_gated(tx, filter, b"owed", QoS::AtLeastOnce, true);
+                let got = timeout(Duration::from_millis(600), out).await;
+                assert!(
+                    matches!(got, Err(_) | Ok(Err(_))),
+                    "[{cell}] a publish toward a session this node still routes must have \
+                     its ack WITHHELD, never Accepted; got {got:?}"
+                );
+            }
+            RehomeEntry::PeerForward => {
+                assert_eq!(
+                    forward_verdict_for(tx, peer, remote, filter, seq).await,
+                    ForwardVerdict::Failed,
+                    "[{cell}] a peer's forward toward a session this node still routes must \
+                     be answered Failed (which withholds at the origin), never Stored"
+                );
+            }
+        }
+    }
+
+    /// The verdict this node sent for one forward `seq`, skipping the frames it sends as
+    /// an ORIGIN (its own forwards and interest gossip) which share the channel.
+    async fn next_verdict(
+        rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
+        seq: u64,
+    ) -> ForwardVerdict {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Some(PeerMessage::PublishVerdict { seq: s, verdict })) if s == seq => {
+                    return verdict;
+                }
+                Ok(Some(PeerMessage::PublishAck { seq: s, ok })) if s == seq => {
+                    return if ok {
+                        ForwardVerdict::Stored
+                    } else {
+                        ForwardVerdict::Failed
+                    };
+                }
+                _ => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no answer for forward seq {seq}"
+                ),
+            }
+        }
+    }
+
+    /// Issue #284 round 3 — **the composition rule the whole honesty story rests on**, and
+    /// the entry point neither earlier round tested: a THIRD node.
+    ///
+    /// While a rehomed session's old node still routes it, both that node and the session's
+    /// new owner advertise its filters, so a publisher entering at some third node fans out
+    /// to both. The owner may answer `Stored` (it materialised the session) while the old
+    /// node answers `Failed` (its append is refused `NotOwner`). The publisher must be left
+    /// UNACKED either way round: `forward_answered` is first-terminal-verdict-wins, and
+    /// `try_complete_pending` additionally requires every obligation to have resolved, so an
+    /// early `Stored` cannot release the ack while the old node's obligation is outstanding.
+    ///
+    /// Round 2 asserted this composition in prose ("ours fails `NotOwner` and withholds,
+    /// the publisher retries") and nothing tested it. Nothing else in this suite pins it.
+    #[tokio::test]
+    async fn a_third_node_composes_a_refusal_and_a_store_into_a_withhold() {
+        let (tx, _placement, remotes, _metrics) =
+            start_rehome_hub_with(&["owner:7000", "old:7000"]).await;
+        let (owner, old) = (remotes[0].clone(), remotes[1].clone());
+        let mut owner_link = connect_peer(&tx, &owner.0, 1);
+        let mut old_link = connect_peer(&tx, &old.0, 2);
+        // BOTH advertise the moved session's filter — the double-advertise window a rehome
+        // close leaves open until the old node's own scan releases its routing.
+        peer_gossips_interest(&tx, &owner, &["t/284"]);
+        peer_gossips_interest(&tx, &old, &["t/284"]);
+        await_routing_settled(&tx).await;
+
+        // Both orders, because the composition must not depend on which answer lands first.
+        for (first_stored, label) in [(true, "stored-then-failed"), (false, "failed-then-stored")] {
+            let publisher = publish_gated(&tx, "t/284", b"owed", QoS::AtLeastOnce, true);
+            let owner_seq = next_forward_seq(&mut owner_link, "t/284").await;
+            let old_seq = next_forward_seq(&mut old_link, "t/284").await;
+
+            let answers = if first_stored {
+                [
+                    (owner.clone(), owner_seq, ForwardVerdict::Stored),
+                    (old.clone(), old_seq, ForwardVerdict::Failed),
+                ]
+            } else {
+                [
+                    (old.clone(), old_seq, ForwardVerdict::Failed),
+                    (owner.clone(), owner_seq, ForwardVerdict::Stored),
+                ]
+            };
+            for (node, seq, verdict) in answers {
+                tx.send(HubCommand::RemotePublishVerdict { node, seq, verdict })
+                    .unwrap();
+            }
+
+            let got = timeout(Duration::from_secs(5), publisher).await;
+            assert!(
+                matches!(got, Ok(Err(_))),
+                "[{label}] one node storing does not discharge the other node's \
+                 outstanding obligation: the publisher's outcome sender must be DROPPED \
+                 (the withhold), never resolved to Accepted, got {got:?}"
+            );
+        }
+    }
+
+    /// The `seq` this node used for the forward of `topic` to one peer.
+    async fn next_forward_seq(rx: &mut mpsc::UnboundedReceiver<PeerMessage>, topic: &str) -> u64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Some(PeerMessage::PublishAcked { seq, topic: t, .. })) if t == topic => {
+                    return seq;
+                }
+                _ => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no acked forward of {topic} reached this peer"
+                ),
+            }
+        }
+    }
+
+    /// Issue #284, round-2 finding 2 — **the Will fires on a rehome close, deliberately**,
+    /// and the decision is locked here so a future suppression has to break a test rather
+    /// than slip through.
+    ///
+    /// A server DISCONNECT is not a client DISCONNECT: [MQTT-3.1.2-8] / §3.14.4 delete the
+    /// will only on a client DISCONNECT with reason `0x00`. Suppressing it would also make
+    /// the rehome the ONLY broker-initiated close that hides a will — session takeover and
+    /// `evict` both publish it, and issue #265 existed because broker-initiated closes were
+    /// silently NOT publishing it.
+    ///
+    /// The control in the same test is the anti-overcorrection partner: a client's own
+    /// clean DISCONNECT must still suppress its will. "Always fire" is as wrong as "never
+    /// fire".
+    #[tokio::test]
+    async fn a_rehome_close_publishes_the_clients_will() {
+        let (tx, placement, remote, _metrics) = start_rehome_hub("r:7000").await;
+        let client = "willy-284";
+
+        // A bystander watching the will topic — the fleet's device-offline dashboard.
+        let mut watcher = attach_persistent_v5(&tx, "watcher-284", 9).await;
+        subscribe(&tx, "watcher-284", "wills/284");
+
+        commit_lease(&placement, client, None);
+        let mut out = attach_persistent_v5_full(
+            &tx,
+            client,
+            1,
+            u32::MAX,
+            Some(Message {
+                topic: "wills/284".into(),
+                payload: Bytes::from_static(b"offline"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+                expires_at: None,
+            }),
+        )
+        .await;
+
+        // The lease moves; the rehome closes the connection.
+        commit_lease(&placement, client, Some(&remote));
+        await_rehome_disconnect(&mut out).await;
+
+        assert_eq!(
+            payload_of(
+                &recv_packet(&mut watcher)
+                    .await
+                    .expect("a rehome close must publish the client's Last Will")
+            ),
+            b"offline",
+            "a server DISCONNECT (0x9C) does not delete the will [MQTT-3.1.2-8]; the \
+             rehome is consistent with takeover and evict (issue #265)"
+        );
+
+        // The control: a client's OWN clean DISCONNECT still suppresses its will.
+        let control = "control-284";
+        commit_lease(&placement, control, None);
+        let _ctl = attach_persistent_v5_full(
+            &tx,
+            control,
+            2,
+            u32::MAX,
+            Some(Message {
+                topic: "wills/284".into(),
+                payload: Bytes::from_static(b"should-not-fire"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                app: mqtt_core::AppProperties::default(),
+                expires_at: None,
+            }),
+        )
+        .await;
+        detach(&tx, control, 2);
+        assert!(
+            recv_packet(&mut watcher).await.is_none(),
+            "a clean client DISCONNECT must still delete the will — 'always fire' is as \
+             wrong as 'never fire'"
+        );
+    }
+
+    /// Issue #284, round-2 finding 4 — a mass ownership move is PACED. The rehome is the
+    /// live mirror of elastic resize, where ~1/N of groups change owner in one step; with
+    /// no aggregate bound one sweep tick closed every affected session at once, published
+    /// one Last Will per close in the same breath, and sent them all to reconnect on the
+    /// same instant. Over the cap the remainder is deferred to later ticks and counted.
+    #[tokio::test]
+    async fn one_tick_closes_at_most_the_per_tick_cap_and_defers_the_rest() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let n = super::REHOME_CLOSES_PER_TICK + 8;
+
+        // Every session's group lease points at the remote node at once.
+        let mut owners = std::collections::BTreeMap::new();
+        let clients: Vec<String> = (0..n).map(|i| format!("mass-284-{i}")).collect();
+        let mut outs = Vec::new();
+        for (i, client) in clients.iter().enumerate() {
+            outs.push(attach_persistent_v5(&tx, client, 100 + i as u64).await);
+        }
+        for client in &clients {
+            owners.insert(mqtt_cluster::placement::group_of(client), remote.clone());
+        }
+        placement.write().unwrap().set_lease_owners(owners);
+
+        // Wait for the first tick that closes anything, then read the cap off the metrics
+        // before the next tick can add to it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let rendered = metrics.render();
+            if let Some(deferred) = counter_value(&rendered, "reason=\"deferred\"") {
+                let closed = counter_value(&rendered, "reason=\"stale-owner\"").unwrap_or(0);
+                assert!(
+                    closed <= super::REHOME_CLOSES_PER_TICK as u64,
+                    "one tick must not close more than the cap; closed {closed}, \
+                     cap {}: {rendered}",
+                    super::REHOME_CLOSES_PER_TICK
+                );
+                assert!(deferred > 0, "the remainder must be counted as deferred");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the close cap never engaged: {}",
+                metrics.render()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // ...and the deferral is a delay, not a drop: every session is closed eventually.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            let rendered = metrics.render();
+            if counter_value(&rendered, "reason=\"stale-owner\"") == Some(n as u64) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deferred sessions were never closed: {rendered}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(outs);
+    }
+
+    /// Issue #284 round 3 — `reason="deferred"` counts each SESSION once, not each
+    /// deferral EVENT.
+    ///
+    /// The pass re-derives its candidates every tick, so a session over the cap is
+    /// re-deferred on every tick until it is closed. Counting the events makes an
+    /// n-session move report ~n²/(2·cap) samples — for the 1700-session resize this cap
+    /// exists for, ~45 000 — and an operator sizing a drain from
+    /// `increase(session_rehomes_total{reason="deferred"}[5m])` overestimates the backlog
+    /// by more than an order of magnitude, with the error silently depending on the cap.
+    /// With `n = 3·cap + 8` the two readings are far apart: 3 deferral ticks give
+    /// `3·cap+8 - cap = 2·cap+8` distinct sessions but `(2·cap+8) + (cap+8) + 8` events.
+    #[tokio::test]
+    async fn a_mass_move_counts_each_deferred_session_once() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let cap = super::REHOME_CLOSES_PER_TICK;
+        let n = cap * 3 + 8;
+
+        let clients: Vec<String> = (0..n).map(|i| format!("once-284-{i}")).collect();
+        let mut outs = Vec::new();
+        for (i, client) in clients.iter().enumerate() {
+            outs.push(attach_persistent_v5(&tx, client, 500 + i as u64).await);
+        }
+        // Every session's group lease moves in the same push — resize's ~1/N-of-groups
+        // step, which is what this cap and this counter exist for.
+        let mut owners = std::collections::BTreeMap::new();
+        for client in &clients {
+            owners.insert(mqtt_cluster::placement::group_of(client), remote.clone());
+        }
+        placement.write().unwrap().set_lease_owners(owners);
+
+        // Let the whole drain finish, so the counter is read at its final value.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let rendered = metrics.render();
+            if counter_value(&rendered, "reason=\"stale-owner\"") == Some(n as u64) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the paced drain never finished: {rendered}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let rendered = metrics.render();
+        let deferred = counter_value(&rendered, "reason=\"deferred\"")
+            .expect("a mass move over the cap must count deferrals");
+        assert!(
+            deferred > 0,
+            "the remainder over the cap must be visible: {rendered}"
+        );
+        assert!(
+            deferred <= (n - cap) as u64,
+            "reason=\"deferred\" must count each SESSION once per deferral episode, not \
+             each per-tick deferral event: at most {} sessions could be deferred, the \
+             counter says {deferred}: {rendered}",
+            n - cap
+        );
+        drop(outs);
+    }
+
+    /// Read one `mqttd_session_rehomes_total{...}` sample out of a rendered registry.
+    fn counter_value(rendered: &str, label: &str) -> Option<u64> {
+        rendered
+            .lines()
+            .find(|l| l.starts_with("mqttd_session_rehomes_total{") && l.contains(label))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+    }
+
+    /// Issue #284, round-2 finding 5 — a rehomed session's ADR 0009 §3 expiry deadline
+    /// cannot be persisted from a non-owner (the write is group-routed and this node is by
+    /// construction not the owner), so the attempt is SKIPPED deliberately and counted
+    /// instead of being attempted with its error discarded. The residual — the new owner
+    /// inherits a session record with no deadline until the client reconnects — is named in
+    /// ADR 0009's as-delivered note; what this test pins is that it is never silent.
+    #[tokio::test]
+    async fn a_rehomed_finite_expiry_session_reports_its_unpersisted_deadline() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "expiring-284";
+
+        commit_lease(&placement, client, None);
+        // A FINITE Session Expiry Interval: this is the only case with a deadline to lose.
+        let mut out = attach_persistent_v5_full(&tx, client, 1, 3600, None).await;
+        commit_lease(&placement, client, Some(&remote));
+        await_rehome_disconnect(&mut out).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let rendered = metrics.render();
+            if rendered.contains("mqttd_session_expiry_unpersisted_total{reason=\"not-owner\"} 1") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the undeliverable expiry write must be COUNTED, not discarded: {rendered}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Issue #284, round-2 finding 3 — the candidate pass is EVENT-GATED. It used to run
+    /// unconditionally over every online session on every 1 s tick, which took the `sweep`
+    /// dispatch from ~4.0 ms to ~6.6 ms at 5000 sessions, forever, for a condition that
+    /// only arises when a lease moves. Gated on the placement's ownership version, a
+    /// steady-state tick does no scanning at all — and (the half that could silently break)
+    /// a lease that DOES move is still noticed on the very next tick.
+    #[tokio::test]
+    async fn the_rehome_scan_is_skipped_while_ownership_has_not_moved() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "epoch-284";
+
+        commit_lease(&placement, client, None);
+        let mut out = attach_persistent_v5(&tx, client, 1).await;
+        // Several ticks of steady state: the version has not moved since the attach, so
+        // the pass is skipped and the gauge stays where it was.
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 3).await;
+        let epoch_before = placement.read().unwrap().ownership_epoch();
+        // Re-pushing the SAME lease map (what the durable driver does every reconcile
+        // tick) must not move the version — else the gate would never save anything.
+        commit_lease(&placement, client, None);
+        assert_eq!(
+            placement.read().unwrap().ownership_epoch(),
+            epoch_before,
+            "an unchanged lease push must not move the ownership version"
+        );
+        assert!(
+            metrics.render().contains("mqttd_misplaced_sessions 0"),
+            "nothing is misplaced in the steady state"
+        );
+
+        // And the gate does not blind it: a real move is still acted on.
+        commit_lease(&placement, client, Some(&remote));
+        assert!(
+            placement.read().unwrap().ownership_epoch() > epoch_before,
+            "a real lease move must move the ownership version"
+        );
+        await_rehome_disconnect(&mut out).await;
+    }
+
+    /// Issue #284 round 3 — a session becomes misplaced by **ARRIVING**, not only by an
+    /// ownership move, and the pass must fire for it too.
+    ///
+    /// The candidate pass is skipped while [`Placement::ownership_epoch`] is unchanged and
+    /// no session is already under observation — a real saving, but it makes detection
+    /// edge-triggered on OWNERSHIP. A session that attaches to a non-owning node AFTER the
+    /// lease already moved therefore never enters `misplaced`, so the escape hatch cannot
+    /// fire and the pass never runs again: the #284 wedge returns, silently, with
+    /// `mqttd_misplaced_sessions` reading 0 and no counter moving. Production-reachable in
+    /// exactly the window this task exists to survive — a node whose placement view is a
+    /// few hundred ms stale relays a persistent client here, and `serve_proxied` runs with
+    /// `allow_proxy = false`, so it is attached LOCALLY on a node whose epoch moved before
+    /// the client arrived.
+    ///
+    /// The trigger is seeded at the attach instead of by deleting the skip: one committed
+    /// -owner read per persistent attach, nothing per tick.
+    #[tokio::test]
+    async fn a_session_that_becomes_misplaced_by_attaching_is_rehomed() {
+        let (tx, placement, remote, metrics) = start_rehome_hub("r:7000").await;
+        let client = "latecomer-284";
+
+        // Ownership moves FIRST, with nothing here to notice it, and several sweep ticks
+        // consume the epoch bump while the candidate set is empty.
+        commit_lease(&placement, client, Some(&remote));
+        tokio::time::sleep(super::SESSION_SWEEP_INTERVAL * 4).await;
+        assert!(
+            metrics.render().contains("mqttd_misplaced_sessions 0"),
+            "nothing is misplaced yet — the session has not arrived"
+        );
+
+        // Only NOW does the client land here, on a node that is already not the owner.
+        let mut out = attach_persistent_v5(&tx, client, 1).await;
+        subscribe_qos(&tx, client, "late/284", QoS::AtLeastOnce);
+
+        // It must be rehomed — the arrival is the observation.
+        await_rehome_disconnect(&mut out).await;
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("mqttd_session_rehomes_total{reason=\"stale-owner\"} 1"),
+            "a session misplaced by ATTACHING must be rehomed like any other: {rendered}"
+        );
     }
 
     /// ADR 0007 T9: a new owner allocates outbound packet ids **past** the durable

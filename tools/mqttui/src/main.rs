@@ -262,7 +262,41 @@ fn usage() {
            mqttui migrate mosquitto <conf> [--out-config P] [--out-acl P]\n  \
            mqttui update                fetch the latest examples as a SIGNED bundle\n  \
            mqttui update --clear        back to the examples this binary shipped with\n  \
-           mqttui update --channel main raw main branch — UNVERIFIED, maintainers only\n"
+           mqttui update --channel main raw main branch — UNVERIFIED, maintainers only\n\n\
+         MIGRATE PROVENANCE\n  \
+           `migrate mosquitto` is a byte-for-byte port of \
+         scripts/migrate/from-mosquitto.py.\n  \
+           Its mappings are written against mosquitto.conf(5) from \
+         eclipse-mosquitto/mosquitto\n  \
+           @ v2.0.22; NO vendor config file is pinned as a fixture for it and no live\n  \
+           Mosquitto broker has ever been converted by it. The version RANGE in\n  \
+           docs/MIGRATION.md's What-ships table is a PARSER claim and nothing more.\n\n  \
+           WHAT IT PRODUCES: a reviewed DRAFT, not `your config, translated`. Anything it\n  \
+           could not DERIVE from your input is emitted INERT — commented out, beside a\n  \
+           TODO naming the decision you have to make — so an unread construct can leave\n  \
+           the output INCOMPLETE but can never leave a live security setting nobody\n  \
+           derived. Every live security-relevant line (`*_bind`, `[tls]` paths,\n  \
+           client_ca, crl, acl_file, allow_anonymous, the ACL `default`) carries\n  \
+           `# from: <the input key it came from>`; --provenance-json writes the same\n  \
+           ledger as JSON. Mosquitto scopes password_file, acl_file, psk_file,\n  \
+           allow_anonymous, allow_zero_length_clientid, auto_id_prefix, plugin and\n  \
+           plugin_opt_* PER LISTENER when per_listener_settings is true (mosquitto.conf(5)\n  \
+           @ v2.0.22 names those eight) and mqttd has no per-listener security at all —\n  \
+           that collapse is reported, not taken silently. An include_dir is NOT followed\n  \
+           and a plugin's own config file is NOT opened: their contents are never read.\n\n  \
+           VERIFIED, for THIS converter: the provenance, no-live-without-source, drop,\n  \
+           contradiction and validity invariants of scripts/migrate/property_sweep.py\n  \
+           over generated and mechanically mutated inputs; `mqttd --check-config` on\n  \
+           every generated config plus the ACL loaded by the real broker; and this port\n  \
+           compared BYTE FOR BYTE with the Python original. NOT diffed against vendor\n  \
+           bytes: there is NO pinned Mosquitto fixture at all (the EMQX and HiveMQ\n  \
+           converters do have vendor fixtures with re-derivable SHA-256s; this one does\n  \
+           not), so every mapping rests on mosquitto.conf(5) alone. NOT VERIFIED: no\n  \
+           live Mosquitto was ever run, and NO claim of total coverage over\n  \
+           mosquitto.conf(5) is made — a construct it has never seen is one it cannot\n  \
+           report, and a construct whose MEANING it misreads is one it can still\n  \
+           translate wrongly (docs/MIGRATION.md's KNOWN GAPS lists the misreadings\n  \
+           found so far).\n"
     );
 }
 

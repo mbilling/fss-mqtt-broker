@@ -105,6 +105,61 @@ default = "/etc/mosquitto/mosquitto.conf"
 help = "The mosquitto.conf to read (passed as the first argument)"
 
 [[task]]
+id = "migrate-emqx"
+group = "Migration"
+name = "Convert an EMQX configuration to mqttd"
+script = "scripts/migrate/from-emqx.py"
+about = """
+Reads YOUR emqx.conf (HOCON) — or the dashboard-managed data/configs/cluster.hocon — plus
+its acl.conf, and emits an mqttd TOML config, an ACL policy, and an mqtt-bridge config for
+the MQTT bridges it can express. Anything without an exact equivalent is emitted as a
+`# TODO(migrate):` comment at the point it belongs, including whole EMQX subsystems mqttd
+deliberately does not have (rule engine, data integration, gateways, exhook, plugins, zones,
+the dashboard) — a converter that silently dropped a setting would be worse than no
+converter, because you would deploy believing the policy came across.
+
+Mappings and fixtures come from emqx/emqx @ 6.2.2's own shipped examples; NO live EMQX was
+run. Review the output, then validate it: `mqttd --check-config --config <out>`.
+See docs/MIGRATION.md.
+"""
+requires = ["python3"]
+duration = "~1s"
+args = ["${INPUT}"]
+[[task.env]]
+name = "INPUT"
+default = "/etc/emqx/emqx.conf"
+help = "The emqx.conf (or cluster.hocon) to read (passed as the first argument)"
+
+[[task]]
+id = "migrate-hivemq"
+group = "Migration"
+name = "Convert a HiveMQ configuration to mqttd"
+script = "scripts/migrate/from-hivemq.py"
+about = """
+Reads YOUR HiveMQ config.xml (and, with --credentials, the File RBAC extension's
+credentials.xml) and emits an mqttd TOML config plus an ACL policy. Anything without an
+exact equivalent is emitted as a `# TODO(migrate):` comment at the point it belongs —
+including every unknown XML element, reported by its element path, which is how HiveMQ
+ENTERPRISE-only sections (cluster, control-center, the Security and Bridge extensions, the
+extension SDK) are handled honestly without this tool ever having seen their schema.
+
+Two things cannot be converted and say so loudly: JKS keystores (a keytool+openssl
+extraction recipe is emitted instead) and file-RBAC roles (flattened onto per-user
+identities, because mqttd groups come only from OIDC or the HTTP auth hook).
+
+Mappings and fixtures come from HiveMQ CE @ 2026.5 and the file-RBAC extension @ 4.6.16;
+NO live HiveMQ was run. Review the output, then validate it:
+`mqttd --check-config --config <out>`. See docs/MIGRATION.md.
+"""
+requires = ["python3"]
+duration = "~1s"
+args = ["${INPUT}"]
+[[task.env]]
+name = "INPUT"
+default = "/opt/hivemq/conf/config.xml"
+help = "The HiveMQ config.xml to read (passed as the first argument)"
+
+[[task]]
 id = "migrate-test"
 group = "Migration"
 name = "Prove the converter's output boots the real broker"
@@ -123,6 +178,134 @@ duration = "~10s"
 name = "MQTTD_BIN"
 default = ""
 help = "Prebuilt broker to test against; this script does NOT build one, it exits 2"
+
+[[task]]
+id = "migrate-test-emqx"
+group = "Migration"
+name = "Prove the EMQX converter's output is accepted by the real binaries"
+script = "scripts/migrate/test-from-emqx.sh"
+# Boots the REAL broker and the REAL bridge from target/debug and does not build them —
+# standalone there is no toolchain and no source to build from.
+needs_checkout = true
+about = """
+Converts vendor-derived EMQX fixtures and then asks the real binaries to accept the
+results: `mqttd --check-config` on the config (ADR 0051 §3's third rule), a broker BOOT on
+the translated ACL, and mqtt-bridge's own parse+validate on the bridge config. It also
+asserts the other half of the contract on an adversarial fixture — unknown keys, whole
+subsystems with no equivalent, malformed input, an empty file, and the vendor's own default
+acl.conf whose four rules each land on a different gap — proving each becomes a
+TODO(migrate) line rather than a drop or a crash (ADR 0051 T7).
+"""
+requires = ["python3", "curl"]
+duration = "~15s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker to test against; this script does NOT build one, it exits 2"
+[[task.env]]
+name = "MQTT_BRIDGE_BIN"
+default = ""
+help = "Prebuilt mqtt-bridge; this script does NOT build one, it exits 2"
+
+[[task]]
+id = "migrate-test-hivemq"
+group = "Migration"
+name = "Prove the HiveMQ converter's output is accepted by the real broker"
+script = "scripts/migrate/test-from-hivemq.sh"
+# Boots the REAL broker from target/debug/mqttd and does not build it.
+needs_checkout = true
+about = """
+Converts vendor-derived HiveMQ fixtures and then asks the real broker to accept the
+results: `mqttd --check-config` on the config and a BOOT on the translated ACL. It also
+proves the contract's other half — unknown XML elements reported by path, every HiveMQ
+Enterprise construct reported rather than dropped, an empty document and malformed XML
+handled without a crash, keystore passwords and PBKDF2 hashes never copied into the
+output, and cert-OPTIONAL client auth never turned into an mTLS mandate (ADR 0051 T17).
+"""
+requires = ["python3", "curl"]
+duration = "~10s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker to test against; this script does NOT build one, it exits 2"
+
+[[task]]
+id = "migrate-property-sweep"
+group = "Migration"
+name = "Sweep a converter's defect CLASSES over permuted inputs"
+script = "scripts/migrate/property_sweep.py"
+# Run by all three test-from-*.sh steps; declared so the manifest knows about it. Hidden
+# because the useful entry points are those three, not this one.
+hidden = true
+needs_checkout = true
+about = """
+The three fixture tests are example-based: one input, a list of greps — so they catch a
+regression exactly where a reviewer already looked and are blind everywhere else. That is
+how the same first-listener-only TLS defect was found three times in three converters,
+each harness having only ever fed its converter ONE ordering of ONE listener set.
+
+This generates many inputs from a cross product (listener ORDER, enable flags, mTLS
+postures, `no_match` postures, truststore presence, the Mosquitto default-listener form,
+`protocol websockets`, a listener-scoped EMQX authn chain, `acl_claim_name`, a TLS bridge)
+and asserts SEVEN invariants per defect CLASS on every one: (A) nothing silently dropped —
+every security-relevant input value appears in the output, translated or named in a
+TODO/NOTE; (B) nothing disabled activated; (C) no deny/allow claim contradicting the
+`default` the same document writes; (D) no dangling `step N` cross-reference; (E) `mqttd
+--check-config` on every generated config; (F) PROVENANCE — every LIVE security-relevant
+value is one the INPUT held (for a `*_bind`, the PORT always), which is the invariant (A)
+could not express: (A) asks only whether a value appears somewhere, so it passed while a
+bind was FABRICATED; and (G) NO LIVE SETTING WITHOUT A SOURCE — every uncommented
+security-relevant line carries `# from: <input key>`, which is what proves the converters'
+emission gate was not bypassed at a site nobody has looked at yet.
+
+`--fuzz N` runs a different pass: each fixture mutated mechanically (lines deleted, the
+file truncated mid-structure, blocks permuted, enable flags flipped, transports swapped),
+asserting only that the converter always exits 0 or 1 WITH A MESSAGE, never hangs, writes
+valid TOML, and never invents a live security-relevant setting. That is how from-emqx.py's
+HOCON reader was caught spinning forever at 100% CPU on a two-line input.
+
+Usage: `python3 scripts/migrate/property_sweep.py mosquitto|emqx|hivemq --mqttd <bin>`,
+or `... mosquitto --fuzz 200 [--seed N]`.
+"""
+requires = ["python3"]
+duration = "~15s per converter; --fuzz 200 is ~10s more"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Passed through by the test-from-*.sh callers as --mqttd; optional standalone"
+
+[[task]]
+id = "dual-run-smoke"
+group = "Migration"
+name = "Run the dual-run cutover playbook's bridge step for real"
+script = "scripts/migrate/dual-run-smoke.sh"
+# Boots the REAL broker, the REAL bridge and a REAL third-party broker; builds none of them.
+needs_checkout = true
+about = """
+docs/MIGRATION.md tells you to bridge your incumbent broker to mqttd, move clients in
+cohorts, verify, then cut. This runs that document's own bridge config against real
+binaries — mqttd, mqtt-bridge, and Mosquitto standing in for the incumbent — and asserts
+its SIX claims: the inbound leg crosses at QoS 1, the outbound leg crosses (a moved client
+can still reach an unmoved one), RETAINED state crosses by itself, one inbound publish yields
+exactly one delivery (with mqttd's own No Local shown to have made the cut, by its counters),
+one OUTBOUND publish yields exactly one delivery on the incumbent (which is the assertion that
+puts the FOREIGN broker's No Local on the hook), and a retained value pruned with the bridge UP
+stays gone on BOTH sides — the mitigation for the resurrection hazard the bidirectional
+connect-time re-sync creates.
+
+Needs the mosquitto BROKER, not just its clients; exits 2 (not 1) if anything is missing,
+so "environment not ready" is never mistaken for "assertion failed" (ADR 0051 T18).
+"""
+requires = ["mosquitto", "mosquitto_pub", "mosquitto_sub", "python3", "curl"]
+duration = "~20s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; this script does NOT build one, it exits 2"
+[[task.env]]
+name = "MQTT_BRIDGE_BIN"
+default = ""
+help = "Prebuilt mqtt-bridge; this script does NOT build one, it exits 2"
 
 # ── Try it ───────────────────────────────────────────────────────────────────────────
 [[task]]
@@ -291,6 +474,34 @@ duration = "~15s"
 name = "MQTT_PORT"
 default = ""
 help = "Port of an already-running broker; empty starts one"
+
+[[task]]
+id = "interop-paho-testing"
+group = "Conformance"
+name = "Run Eclipse's own MQTT 5 conformance suite against the broker"
+script = "scripts/interop/paho-testing.sh"
+about = """
+The independent oracle. `scripts/interop/run.sh` and `paho_conformance.py` use foreign
+CLIENTS, but the assertions are still ours — they encode our reading of the spec. This
+runs Eclipse's own `paho.mqtt.testing` suite, written against a reference broker by people
+who never saw this code, at a pinned commit.
+
+Five of its 27 tests do not pass, and each is declared in the script with its reason: two
+are real deviations (issues #298 and #299), two are legal implementation-defined
+differences the broker advertises honestly, and one is a suite-configuration choice we
+decline. The script fails BOTH ways — on an undeclared failure AND on a declared failure
+that starts passing — so the list cannot rot into an ignore list.
+"""
+requires = ["python3", "git"]
+duration = "~3m"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+[[task.env]]
+name = "PAHO_CACHE"
+default = ""
+help = "Reuse an existing clone of the suite; empty clones into a temp dir"
 
 # ── Kubernetes ───────────────────────────────────────────────────────────────────────
 [[task]]
@@ -478,6 +689,18 @@ needs_checkout = true
 about = "Regenerates docs/delivery/STATUS.md and each doc's progress table from frontmatter."
 requires = ["python3"]
 duration = "~1s"
+hidden = true
+
+[[task]]
+id = "check-reason-codes"
+group = "Internal"
+name = "Check every emittable reason code has a test"
+script = "scripts/check-reason-codes.py"
+# Audits the repo's own tests against the repo's own code.
+needs_checkout = true
+about = "Fails when the broker can emit an MQTT reason code no integration test provokes."
+requires = ["python3"]
+duration = "~2s"
 hidden = true
 
 [[task]]

@@ -287,7 +287,7 @@ message, so the far broker stores it retained (issue #189). Per-rule `outgoing_r
 strips the flag for a far broker that cannot handle retained messages (the Mosquitto
 `bridge_outgoing_retain` escape).
 
-Two things to know:
+Three things to know:
 
 - **The far broker must honour RAP for the live case.** Against mqttd it does (#198). Against a
   broker that ignores RAP, only *existing* retained state crosses — a value published while the
@@ -296,6 +296,14 @@ Two things to know:
   retained messages ([MQTT-3.8.4]), so the replay never reaches the bridge. The default
   `partitioned` HA uses plain subscriptions and does not have this problem — one more reason it
   is the default (ADR 0059).
+- **Under a `both` rule, a deletion can be undone by the far side.** The connect-time replay
+  runs in **both** directions, so a retained value cleared on one broker while the bridge is
+  **down** is republished from the other on the next reconnect — the surviving copy wins, and a
+  tombstone is not idempotent. Measured, and any reconnect triggers it: a restart, a blip, a
+  rolling deploy. **Prune retained state with the bridge running**, so the zero-length retained
+  publish crosses as a tombstone and both sides agree; then check both sides. Asserted by
+  `scripts/migrate/dual-run-smoke.sh`, and written up with the measurement in the
+  [migration guide](MIGRATION.md#the-dual-run-cutover).
 
 ---
 
@@ -376,3 +384,15 @@ from ever seeing plaintext.
 Start standalone. Move to HA when a forwarding gap during a restart is a problem
 — and set `share_group` and per-replica `client_id` together, since either one
 without the other is broken in a different way.
+
+### A migration cutover is a third shape
+
+Bridging your *previous* broker to mqttd while you move clients across is a different
+configuration from either column above: **one** instance, sharing off, a `both` rule with
+**no** remap over the shared namespace (a remap on `both` is refused), `qos = 1` set
+explicitly, and a durable spool. It is also temporary by design — you narrow the rule to
+one-way, then delete it. That shape, its refusals, and the fact that **retained state
+crosses on its own while session state does not** — with the resurrection hazard that comes
+with a bidirectional replay — are in the
+[migration guide](MIGRATION.md#the-dual-run-cutover), whose bridge step is exercised
+against a real third-party broker by `scripts/migrate/dual-run-smoke.sh`.

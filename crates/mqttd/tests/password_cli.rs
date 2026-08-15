@@ -28,8 +28,13 @@ use proc_common::free_tcp_port;
 const V4: ProtocolVersion = ProtocolVersion::V311;
 
 /// MQTT 3.1.1 CONNACK return codes (table 3.1).
-const ACCEPTED: u8 = 0x00;
-const BAD_CREDENTIALS: u8 = 0x04;
+// MQTT 3.1.1 CONNACK **return codes** — a DIFFERENT code space from the MQTT 5
+// reason codes in `mqtt_codec::reason`, and the collision is not hypothetical:
+// here `V3_NOT_AUTHORIZED` is 0x05, while `reason::NOT_AUTHORIZED` is 0x87. The
+// `V3_` prefix keeps the space visible at the use site rather than in a header
+// comment nobody re-reads.
+const V3_ACCEPTED: u8 = 0x00;
+const V3_BAD_CREDENTIALS: u8 = 0x04;
 
 fn mqttd() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_mqttd"));
@@ -148,18 +153,18 @@ async fn a_cli_generated_line_authenticates_against_the_running_broker() {
 
     assert_eq!(
         connack_code(addr, "alice", password).await,
-        ACCEPTED,
+        V3_ACCEPTED,
         "the password that was hashed must be accepted by the broker"
     );
     // Without this the test above would pass against a broker that accepted anything.
     assert_eq!(
         connack_code(addr, "alice", "wrong password").await,
-        BAD_CREDENTIALS,
+        V3_BAD_CREDENTIALS,
         "a wrong password must still be refused"
     );
     assert_eq!(
         connack_code(addr, "mallory", password).await,
-        BAD_CREDENTIALS,
+        V3_BAD_CREDENTIALS,
         "an unknown username must be refused"
     );
 }
@@ -183,12 +188,12 @@ async fn spaces_and_punctuation_survive_the_round_trip() {
     let (_broker, addr) = start_broker(&pw_file).await;
     assert_eq!(
         connack_code(addr, "bob", password).await,
-        ACCEPTED,
+        V3_ACCEPTED,
         "leading/trailing spaces inside the password must be preserved by the CLI"
     );
     assert_eq!(
         connack_code(addr, "bob", password.trim()).await,
-        BAD_CREDENTIALS,
+        V3_BAD_CREDENTIALS,
         "the trimmed password is a DIFFERENT password and must not authenticate"
     );
 }

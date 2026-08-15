@@ -1492,8 +1492,7 @@ async fn start_hub(
         if let Some(dir) = &data_dir {
             hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
         }
-        hub.attach_metrics(metrics.clone());
-        hub.attach_brownout_status(brownout_status.clone());
+        wire_hub(&mut hub, config, metrics, brownout_status)?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(plane_for_health), Some(driver)))
     } else if let Some(dir) = config.node.data_dir.clone() {
@@ -1520,8 +1519,7 @@ async fn start_hub(
             hub.set_cluster_configured();
         }
         hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
-        hub.attach_metrics(metrics.clone());
-        hub.attach_brownout_status(brownout_status.clone());
+        wire_hub(&mut hub, config, metrics, brownout_status)?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     } else {
@@ -1536,8 +1534,7 @@ async fn start_hub(
         if cluster_configured {
             hub.set_cluster_configured();
         }
-        hub.attach_metrics(metrics.clone());
-        hub.attach_brownout_status(brownout_status.clone());
+        wire_hub(&mut hub, config, metrics, brownout_status)?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None))
     }
@@ -1659,6 +1656,107 @@ fn queue_limits_from_config(config: &Config) -> Result<QueueLimits, Box<dyn std:
         "offline session queues bounded"
     );
     Ok(limits)
+}
+
+/// The per-subscriber **in-memory** bounds (issue #241, ADR 0041 T10): the flow-control
+/// backlog's two dimensions, the outbound channel's byte bound, and the in-flight-window
+/// ceiling.
+///
+/// Ranges are refused in `Config::validate()` — which startup, `--check-config` and the
+/// reload precheck all run — so what remains here is the width conversion, which can only
+/// fail on a 32-bit target, and the operator-facing log line.
+///
+/// Nothing here bounds disk: the durable per-session queue is
+/// [`queue_limits_from_config`]'s business (`MQTTD_MAX_QUEUED_MESSAGES` /
+/// `MQTTD_QUEUE_OVERFLOW`), and the aggregate disk bound is the `MQTTD_STORE_MAX_BYTES`
+/// watermark.
+fn subscriber_limits_from_config(
+    config: &Config,
+) -> Result<hub::SubscriberLimits, Box<dyn std::error::Error>> {
+    let mut limits = hub::SubscriberLimits::default();
+    if let Some(n) = config.limits.max_backlog_messages {
+        limits.max_backlog_messages = usize::try_from(n)
+            .map_err(|_| format!("limits.max_backlog_messages is too large: {n}"))?;
+    }
+    for (field, raw, slot) in [
+        (
+            "limits.max_backlog_bytes",
+            config.limits.max_backlog_bytes,
+            &mut limits.max_backlog_bytes,
+        ),
+        (
+            "limits.max_outbound_bytes",
+            config.limits.max_outbound_bytes,
+            &mut limits.max_outbound_bytes,
+        ),
+    ] {
+        if let Some(n) = raw {
+            *slot = Some(usize::try_from(n).map_err(|_| format!("{field} is too large: {n}"))?);
+        }
+    }
+    // Guarded like its three siblings: an unset config must keep the struct default, not
+    // overwrite it with None. No behaviour difference today (both are None), but the change's
+    // load-bearing defaults argument is "unset == today's behaviour", and an unconditional
+    // assignment quietly makes that depend on the two defaults staying equal forever.
+    if let Some(n) = config.limits.max_inflight_messages {
+        limits.max_inflight_messages = Some(n);
+    }
+    info!(
+        max_backlog_messages = limits.max_backlog_messages,
+        max_backlog_bytes = ?limits.max_backlog_bytes,
+        max_outbound_bytes = ?limits.max_outbound_bytes,
+        max_inflight_messages = ?limits.max_inflight_messages,
+        "per-subscriber in-memory bounds (RAM per online subscriber; disk is bounded \
+         separately by max_queued_messages and store_max_bytes)"
+    );
+    // A byte cap under one maximum-size message means ONE such message evicts the whole
+    // backlog — already-acked messages, shed without telling the publisher. Legal, and
+    // occasionally intended, but it must not be an accident: warn rather than refuse,
+    // because the operator who wants a very small budget is entitled to it.
+    //
+    // The comparison MUST use the EFFECTIVE ceiling, not `config.limits.max_packet_size`:
+    // that field is `None` unless the operator sets it, while the ceiling actually enforced
+    // is `WireLimits::default().max_packet_size` (1 MiB). Gating on the raw Option meant this
+    // warning could not fire in the DEFAULT configuration — i.e. in every deployment that had
+    // not already thought about packet size — which is precisely the operator this warning
+    // exists for, and six documents promised it as the mitigation for this change's sharpest
+    // edge.
+    let effective_packet_size = u64::from(conn::WireLimits::default().max_packet_size);
+    let effective_packet_size = config
+        .limits
+        .max_packet_size
+        .unwrap_or(effective_packet_size);
+    if let Some(cap) = limits.max_backlog_bytes {
+        if u64::try_from(cap).is_ok_and(|c| c < effective_packet_size) {
+            warn!(
+                max_backlog_bytes = cap,
+                max_packet_size = effective_packet_size,
+                max_packet_size_is_default = config.limits.max_packet_size.is_none(),
+                "the backlog byte cap is smaller than one maximum-size packet: a single large \
+                 message will evict the whole backlog, so already-acked messages will be shed \
+                 routinely (MQTTD_MAX_INFLIGHT_MESSAGES bounds memory without dropping anything)"
+            );
+        }
+    }
+    Ok(limits)
+}
+
+/// Everything every hub-construction arm must do before [`hub::Hub::run`] (issue #241).
+///
+/// It exists because there are three arms (durable / persistent single-node / in-memory)
+/// and "wired into two of the three" is exactly the class of bug a documented knob cannot
+/// survive: the knob would be inert on one deployment shape and nothing would say so.
+/// One call site per arm, one body.
+fn wire_hub(
+    hub: &mut hub::Hub,
+    config: &Config,
+    metrics: &Arc<mqtt_observability::metrics::Metrics>,
+    brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    hub.attach_metrics(metrics.clone());
+    hub.attach_brownout_status(brownout_status.clone());
+    hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
+    Ok(())
 }
 
 /// The reload half of the peer-bus TLS context (ADR 0040 T4): the `watch` senders
@@ -2598,6 +2696,7 @@ fn runtime_precheck(config: &Config) -> Result<(), String> {
     }
     ok(wire_limits_from_config(config))?;
     ok(queue_limits_from_config(config))?;
+    ok(subscriber_limits_from_config(config))?;
     ok(quotas_from_config(config))?;
     ok(positive_cap(
         "limits.max_connections",
@@ -3412,9 +3511,9 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
-        resolve_write_floor, runtime_precheck, unknown_flags, watched_policy_paths,
-        wire_limits_from_config, WriteFloor,
+        hub, identity_source_from_config, positive_cap, queue_limits_from_config, requires_restart,
+        resolve_write_floor, runtime_precheck, subscriber_limits_from_config, unknown_flags,
+        watched_policy_paths, wire_limits_from_config, WriteFloor,
     };
     use mqtt_config::{Config, MinReplicas};
     use mqtt_storage::OverflowPolicy;
@@ -3533,6 +3632,62 @@ mod tests {
         let q = queue_limits_from_config(&cfg).unwrap();
         assert_eq!(q.max_messages, 42);
         assert_eq!(q.overflow, OverflowPolicy::RejectNewest);
+    }
+
+    /// Issue #241: every one of the four knobs must reach the hub. A knob that is
+    /// documented and inert is worse than an absent one — the operator's arithmetic would
+    /// be wrong and nothing would say so.
+    #[test]
+    fn subscriber_limits_from_config_maps_every_knob() {
+        // Unset config = today's behaviour, exactly.
+        let cfg = Config::default();
+        assert_eq!(
+            subscriber_limits_from_config(&cfg).unwrap(),
+            hub::SubscriberLimits::default(),
+            "an unset config must produce the pre-#241 bounds"
+        );
+
+        let mut cfg = Config::default();
+        cfg.limits.max_backlog_messages = Some(4242);
+        cfg.limits.max_backlog_bytes = Some(64 * 1024 * 1024);
+        cfg.limits.max_outbound_bytes = Some(32 * 1024 * 1024);
+        cfg.limits.max_inflight_messages = Some(77);
+        let l = subscriber_limits_from_config(&cfg).unwrap();
+        assert_eq!(l.max_backlog_messages, 4242);
+        assert_eq!(l.max_backlog_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(l.max_outbound_bytes, Some(32 * 1024 * 1024));
+        assert_eq!(l.max_inflight_messages, Some(77));
+
+        // A value past usize is a startup error, not a silent truncation (32-bit path).
+        let mut cfg = Config::default();
+        cfg.limits.max_backlog_bytes = Some(u64::MAX);
+        assert_eq!(
+            subscriber_limits_from_config(&cfg).is_err(),
+            usize::try_from(u64::MAX).is_err()
+        );
+
+        // The reload gate runs the same conversion, so a config that could not start is
+        // not swapped in live.
+        let mut cfg = Config::default();
+        cfg.node.data_dir = Some("/tmp/mqttd-precheck".into());
+        assert!(runtime_precheck(&cfg).is_ok());
+
+        // And a changed bound reports `limits` as requires-restart: the fields are
+        // deliberately NOT in the live-swap mask (ADR 0041 §6).
+        let base = Config::default();
+        for mutate in [
+            (|c: &mut Config| c.limits.max_backlog_messages = Some(5)) as fn(&mut Config),
+            |c: &mut Config| c.limits.max_backlog_bytes = Some(8192),
+            |c: &mut Config| c.limits.max_outbound_bytes = Some(8192),
+            |c: &mut Config| c.limits.max_inflight_messages = Some(8),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(
+                requires_restart(&base, &changed).contains(&"limits"),
+                "a per-subscriber bound edit must be reported as requires-restart"
+            );
+        }
     }
 
     #[test]

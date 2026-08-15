@@ -347,14 +347,29 @@ mod tests {
     /// ADR 0041 T2: crossing the failure threshold penalizes the address — its
     /// connections are refused at accept — while a different address is
     /// unaffected, and the penalty decays back to admission.
+    ///
+    /// Split across two gates on purpose. Decay is *continuous*
+    /// (`level - elapsed / decay`), so a single short-decay gate makes the
+    /// "still penalized" assertion a race against the scheduler: any pause
+    /// longer than `decay` between the strikes and the check decays the penalty
+    /// away and the test fails for reasons that have nothing to do with the
+    /// penalty box. That is exactly what happened once CI grew enough parallel
+    /// work to stall a thread for 50 ms.
+    ///
+    /// Each half is now robust in the direction load pushes it: the penalize
+    /// assertions use a decay far longer than any plausible stall (slowness
+    /// cannot un-penalize), and the decay assertion uses a short one (slowness
+    /// only makes it *more* decayed, never less).
     #[test]
-    fn the_penalty_box_refuses_after_the_threshold_and_decays() {
+    fn the_penalty_box_refuses_after_the_threshold() {
         let gate = AdmissionGate::with_penalty(
             None,
             None,
             Some(PenaltyConfig {
                 threshold: 2,
-                decay: Duration::from_millis(50),
+                // Long enough that no scheduling stall can decay a strike away
+                // mid-test; this half is not about decay at all.
+                decay: Duration::from_secs(600),
             }),
             None,
             None,
@@ -373,8 +388,26 @@ mod tests {
             gate.try_admit(Some(ip(2))).is_some(),
             "the penalty must key on the failing address only"
         );
-        // The strikes decay: after ~2 decay periods the level drops below the
-        // threshold and the address is admitted again.
+    }
+
+    /// ADR 0041 T2, the other half: the penalty is temporary.
+    #[test]
+    fn the_penalty_decays_back_to_admission() {
+        let gate = AdmissionGate::with_penalty(
+            None,
+            None,
+            Some(PenaltyConfig {
+                threshold: 2,
+                decay: Duration::from_millis(50),
+            }),
+            None,
+            None,
+        );
+        gate.record_auth_failure(Some(ip(1)));
+        gate.record_auth_failure(Some(ip(1)));
+        // After ~2 decay periods the level is below the threshold again. A slow
+        // machine sleeps LONGER, which only decays further — so this assertion
+        // cannot be broken by load, unlike the one above.
         std::thread::sleep(Duration::from_millis(120));
         assert!(
             gate.try_admit(Some(ip(1))).is_some(),

@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  FIXTURE PROVENANCE — VERBATIM VENDOR CONFIGURATION. Do not edit the body.
+
+  This file is one file from HiveMQ Community Edition, byte for byte, fetched 2026-08-14
+  from https://github.com/hivemq/hivemq-community-edition at tag 2026.5:
+    src/main/resources/config.xml
+  Nothing was added, removed, reworded, reformatted or revalued — the vendor's own
+  Apache-2.0 licence header and its inline comments are intact, because that is what an
+  operator's real file looks like. The only edit is the position of THIS comment: an XML
+  declaration must be the first thing in a document, so the vendor's `<?xml ...?>` line
+  stays on line 1 and this block sits immediately after it.
+
+  Re-checkable byte for byte, with no trust in this sentence. The vendor file is 1018
+  bytes, sha256:9a8a93f3a1dfee2170d31b6cb4a57e47d7e12c2f188003bc893b160db85e4a6b, and
+  this file reproduces it exactly once the provenance comment is removed: line 1, plus
+  everything from the line that opens the vendor's own licence comment.
+    F=hivemq-2026.5-default-config.xml
+    { head -1 $F; sed -n '/^-[-]>$/,$p' $F | tail -n +2; } | shasum -a 256
+    curl -sS https://raw.githubusercontent.com/hivemq/hivemq-community-edition/2026.5/src/main/resources/config.xml | shasum -a 256
+  Both printed 9a8a93f3a1dfee21… on 2026-08-14, re-run that day by a docs pass that also
+  re-fetched the file and diffed it. (The bracket in that sed pattern is only there
+  because an XML comment may not contain two consecutive hyphens; it matches the line
+  that closes this comment.)
+
+  It also validates against the vendor's own schema at the same tag,
+  src/main/resources/config.xsd, checked with xmllint's noout and schema flags: it
+  reports "validates".
+
+  WHY IT EXISTS: this is the config.xml a stock HiveMQ CE install actually has — one
+  plaintext tcp-listener, telemetry on, and nothing else. It is the most common real
+  input this converter will ever see, and it is the honest baseline: CE has no built-in
+  authentication and no authorization, so this file describes an ANONYMOUS broker, and
+  the conversion must say so rather than emit a config that quietly looks finished.
+
+  NO LIVE HiveMQ BROKER WAS RUN to produce this file. It is vendor SOURCE, fetched from
+  the vendor's repository — not a config dumped out of a running broker.
+-->
+<!--
+
+    Copyright 2019-present HiveMQ GmbH
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<hivemq xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="config.xsd">
+
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+    </listeners>
+
+    <anonymous-usage-statistics>
+        <enabled>true</enabled>
+    </anonymous-usage-statistics>
+
+</hivemq>

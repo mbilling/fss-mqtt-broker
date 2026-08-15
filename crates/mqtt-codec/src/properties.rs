@@ -242,6 +242,55 @@ impl Properties {
         self.0.len()
     }
 
+    /// The bytes this block contributes to a byte-based queue bound (issue #241): the
+    /// variable-length halves only, with no per-property wire framing.
+    ///
+    /// The match is **exhaustive on purpose** — no `_ =>` arm — so a new property that
+    /// carries a string or a binary blob fails to compile here rather than silently
+    /// under-counting and letting a byte cap be evaded. Fixed-width properties
+    /// (integers, flags) are covered by the per-entry envelope the caller adds, so they
+    /// count 0 here.
+    #[must_use]
+    pub fn accounted_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|p| match p {
+                Property::ContentType(s)
+                | Property::ResponseTopic(s)
+                | Property::AssignedClientIdentifier(s)
+                | Property::AuthenticationMethod(s)
+                | Property::ResponseInformation(s)
+                | Property::ServerReference(s)
+                | Property::ReasonString(s) => s.len(),
+                Property::CorrelationData(b) | Property::AuthenticationData(b) => b.len(),
+                Property::UserProperty(k, v) => k.len() + v.len(),
+                // ONE byte, matching `AppProperties::accounted_bytes`'s
+                // `usize::from(self.payload_format.is_some())`. The two functions are
+                // documented as one shared definition and a test pins the identity, but that
+                // test built its packet with `Properties::new()` — so it could not observe
+                // this property, and the two disagreed by exactly 1 for any message carrying
+                // a payload-format indicator (which hub.rs sets on forwarded publishes).
+                Property::PayloadFormatIndicator(_) => 1,
+                Property::MessageExpiryInterval(_)
+                | Property::SubscriptionIdentifier(_)
+                | Property::SessionExpiryInterval(_)
+                | Property::ServerKeepAlive(_)
+                | Property::RequestProblemInformation(_)
+                | Property::WillDelayInterval(_)
+                | Property::RequestResponseInformation(_)
+                | Property::ReceiveMaximum(_)
+                | Property::TopicAliasMaximum(_)
+                | Property::TopicAlias(_)
+                | Property::MaximumQoS(_)
+                | Property::RetainAvailable(_)
+                | Property::MaximumPacketSize(_)
+                | Property::WildcardSubscriptionAvailable(_)
+                | Property::SubscriptionIdentifierAvailable(_)
+                | Property::SharedSubscriptionAvailable(_) => 0,
+            })
+            .sum()
+    }
+
     /// The Session Expiry Interval (`0x11`) in seconds, if present (MQTT 5.0).
     #[must_use]
     pub fn session_expiry_interval(&self) -> Option<u32> {

@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<!--
+  FIXTURE PROVENANCE — an ADVERSARIAL fixture, written for this repository.
+
+  This is NOT vendor-shipped configuration. It was written on 2026-08-14 to pin the
+  BLOCKING defect the review of that date found, and it is the ordinary HiveMQ shape:
+  wss for browsers, tls-tcp for devices. Element names are spelled as HiveMQ CE
+  2026.5's config.xsd spells them
+  (https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/resources/config.xsd).
+
+  WHAT IT PROVES. The converter used to read TLS settings from the FIRST TLS listener in
+  document order only. Here the first is a <tls-websocket-listener> with
+  client-authentication-mode NONE, and the second is a <tls-tcp-listener> that REQUIRES a
+  client certificate, has a <truststore>, and admits TLSv1.2. Every one of those three
+  facts vanished from the output: no client_ca, no commented candidate, no TODO, no
+  truststore in the extraction recipe, no TLS-1.2 warning. A `mqttd` config check passes
+  on such a file, so nothing downstream caught it — the operator migrated a broker that
+  REQUIRED client certificates and deployed one that accepts those clients with none.
+
+  BOTH LISTENERS DELIBERATELY SHARE ONE KEYSTORE PATH. That is what made the drop
+  invisible: the "TLS listeners with DIFFERENT keystores" TODO did not fire either, so the
+  generated config mentioned the second listener nowhere at all.
+
+  NO LIVE HiveMQ BROKER WAS RUN to produce this file.
+-->
+<hivemq>
+    <listeners>
+        <!-- FIRST in document order, and the LAX one. -->
+        <tls-websocket-listener>
+            <port>8000</port>
+            <bind-address>0.0.0.0</bind-address>
+            <path>/mqtt</path>
+            <tls>
+                <keystore>
+                    <path>/opt/hivemq/conf/keystore.jks</path>
+                    <password>secret-ks</password>
+                    <private-key-password>secret-key</private-key-password>
+                </keystore>
+                <client-authentication-mode>NONE</client-authentication-mode>
+            </tls>
+        </tls-websocket-listener>
+        <!-- SECOND in document order, and the one that MANDATES mTLS. -->
+        <tls-tcp-listener>
+            <port>8883</port>
+            <bind-address>0.0.0.0</bind-address>
+            <tls>
+                <keystore>
+                    <path>/opt/hivemq/conf/keystore.jks</path>
+                    <password>secret-ks</password>
+                    <private-key-password>secret-key</private-key-password>
+                </keystore>
+                <truststore>
+                    <path>/opt/hivemq/conf/device-truststore.jks</path>
+                    <password>secret-ts</password>
+                </truststore>
+                <client-authentication-mode>REQUIRED</client-authentication-mode>
+                <protocols>
+                    <protocol>TLSv1.3</protocol>
+                    <protocol>TLSv1.2</protocol>
+                </protocols>
+            </tls>
+        </tls-tcp-listener>
+    </listeners>
+    <persistence>
+        <mode>file</mode>
+    </persistence>
+</hivemq>
