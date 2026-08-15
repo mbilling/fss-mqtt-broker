@@ -20,6 +20,9 @@
 //!    node serves the same one.
 //! 4. **Per-publisher order** — deliveries to one subscriber from one publisher
 //!    stream never reorder that publisher's acknowledged sequence.
+//! 5. **Redelivery is marked** — a `QoS` > 0 payload delivered to the same
+//!    subscriber more than once carries `DUP = 1` on every delivery after the
+//!    first ([MQTT-4.4.0-1]), so a client can tell a repeat from a new message.
 //!
 //! A violation names the events that prove it; the harness prints the offending
 //! slice, keeping the #214 discipline: a failure must be diagnosable without a
@@ -66,11 +69,29 @@ pub enum Event {
         acked: bool,
     },
     /// A payload was delivered to (and acknowledged by) a subscriber.
+    ///
+    /// **Every** delivery is recorded, including repeats of a payload the same
+    /// subscriber already saw. That is deliberate and load-bearing: the recorder
+    /// used to drop duplicates, and no counting promise (redelivery marking,
+    /// exactly-once) can be checked against a history that has already thrown
+    /// away the counts. `check_acked_durability` and `check_publisher_order` both
+    /// tolerate repeats, so the richer history costs them nothing.
     Deliver {
         at_ms: u64,
         client: String,
         topic: String,
         payload: String,
+        /// The wire DUP flag as the subscriber saw it ([MQTT-4.4.0-1]).
+        ///
+        /// `#[serde(default)]` because the nightly archives histories for 14 days
+        /// and re-checks them with the standalone binary: `parse` deliberately
+        /// refuses what it cannot decode, so a required field would make every
+        /// history recorded before this change unreadable.
+        #[serde(default)]
+        dup: bool,
+        /// The delivered `QoS`. Redelivery is a `QoS` > 0 concept only.
+        #[serde(default)]
+        qos: u8,
     },
     /// A fresh clean-session probe read a node's retained value for `topic`
     /// (`payload = None` = nothing served). The LAST probe per (node, topic)
@@ -134,7 +155,7 @@ pub fn parse(jsonl: &str) -> Result<Vec<Event>, String> {
 }
 
 /// Run every check; the returned list is empty exactly when the history keeps
-/// all four promises.
+/// all five promises.
 #[must_use]
 pub fn check(events: &[Event]) -> Vec<Violation> {
     let mut v = Vec::new();
@@ -142,6 +163,7 @@ pub fn check(events: &[Event]) -> Vec<Violation> {
     v.extend(check_session_present(events));
     v.extend(check_retained_convergence(events));
     v.extend(check_publisher_order(events));
+    v.extend(check_redelivery_marked(events));
     v
 }
 
@@ -285,6 +307,89 @@ fn check_retained_convergence(events: &[Event]) -> Vec<Violation> {
     v
 }
 
+/// Check 5: a repeat delivery of the same payload to the same subscriber is
+/// marked `DUP = 1`.
+///
+/// [MQTT-4.4.0-1]: when a client reconnects with an existing session, the server
+/// resends unacknowledged messages with the DUP flag set. The hub's own doc
+/// comment claims this, so the check verifies a stated behaviour rather than
+/// inventing one. It matters because an unmarked repeat is precisely how a
+/// client silently double-processes a message it has already handled: DUP is the
+/// only signal it gets that "you may have seen this before".
+///
+/// Two restrictions keep it from firing on legal histories, and both are the
+/// difference between a check and a nuisance:
+///
+/// * **`QoS` 0 is skipped.** There is no redelivery concept below `QoS` 1, so a
+///   repeat there is a different phenomenon and carries no DUP promise.
+/// * **Only payloads the history shows published EXACTLY ONCE are considered.**
+///   Two genuinely distinct publishes can carry identical bytes, and the second
+///   one's delivery is then a FIRST delivery wearing the same clothes as a
+///   repeat. This is not hypothetical: the harness's interest warm-up
+///   republishes one payload in a loop until the subscriber observes it, and a
+///   recorded history really does contain two same-ms deliveries of those bytes
+///   with `DUP = 0` — correctly, because they are two publishes. Without this
+///   guard the check reports a violation for correct behaviour, which is worse
+///   than not checking at all.
+///
+///   The rule also skips payloads with NO recorded `Publish` (warm-up traffic
+///   is not recorded), which is the same conservatism: if the history cannot say
+///   how many times those bytes were sent, it cannot say a delivery is a repeat.
+///   Where it DOES apply the check is exact, because the recorded publish stream
+///   carries a per-publisher `seq` in every payload and so never repeats bytes.
+///
+/// **Honest status: this check is LATENT on today's `cluster_proc` workload.** An
+/// 8-seed sweep recorded 120 deliveries and *zero* judgeable repeats, so it is
+/// proven only against fixtures ([`tests::each_check_bites`]) — it has never yet
+/// judged a real one. It is reachable rather than dead: the shape it wants is a
+/// `QoS` 1 delivery whose PUBACK is lost to a node death, which the seeded kill
+/// can produce but did not in those seeds. Two things follow, and neither is
+/// "assume it works": the nightly sweep runs far more seeds than 8 and re-checks
+/// 14 days of archived histories, so the odds compound; and a schedule step that
+/// manufactures the shape deliberately is the named follow-up. It is recorded
+/// here rather than in a commit message because a check nobody knows is latent
+/// reads as coverage it has not earned.
+fn check_redelivery_marked(events: &[Event]) -> Vec<Violation> {
+    // How many times each payload was published at all (acked or not: an unacked
+    // publish may still have reached the broker and been delivered).
+    let mut published: BTreeMap<&str, usize> = BTreeMap::new();
+    for ev in events {
+        if let Event::Publish { payload, .. } = ev {
+            *published.entry(payload).or_default() += 1;
+        }
+    }
+
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut v = Vec::new();
+    for ev in events {
+        let Event::Deliver {
+            at_ms,
+            client,
+            payload,
+            dup,
+            qos,
+            ..
+        } = ev
+        else {
+            continue;
+        };
+        if *qos == 0 || published.get(payload.as_str()).copied() != Some(1) {
+            continue;
+        }
+        if !seen.insert((client, payload)) && !dup {
+            v.push(Violation {
+                check: "redelivery-marked",
+                detail: format!(
+                    "{client} received payload {payload:?} again at t+{at_ms}ms with \
+                     DUP = 0 — a repeat delivery must be marked [MQTT-4.4.0-1], or the \
+                     subscriber cannot tell it apart from a new message"
+                ),
+            });
+        }
+    }
+    v
+}
+
 /// Check 4: deliveries to one subscriber never reorder one publisher's acked
 /// sequence.
 fn check_publisher_order(events: &[Event]) -> Vec<Violation> {
@@ -370,6 +475,8 @@ mod tests {
                 client: "s1".into(),
                 topic: "t".into(),
                 payload: "m1".into(),
+                dup: false,
+                qos: 1,
             },
             Event::Nemesis {
                 at_ms: 12,
@@ -491,23 +598,126 @@ mod tests {
             client: "s1".into(),
             topic: "t".into(),
             payload: "m3".into(),
+            dup: false,
+            qos: 1,
         });
         h.push(Event::Deliver {
             at_ms: 91,
             client: "s1".into(),
             topic: "t".into(),
             payload: "m2".into(), // first delivery of seq 2 AFTER seq 3
+            dup: false,
+            qos: 1,
         });
         assert!(check(&h).iter().any(|v| v.check == "publisher-order"));
 
-        // A duplicate re-delivery of an older seq is at-least-once legal.
+        // 5. A repeat delivery that does not say it is one.
         let mut h = ok_history();
         h.push(Event::Deliver {
             at_ms: 95,
             client: "s1".into(),
             topic: "t".into(),
-            payload: "m1".into(), // dup of seq 1: fine
+            payload: "m1".into(), // second delivery of m1, unmarked
+            dup: false,
+            qos: 1,
         });
-        assert!(check(&h).is_empty());
+        let v = check(&h);
+        assert!(
+            v.iter().any(|v| v.check == "redelivery-marked"),
+            "an unmarked repeat must be caught: {v:?}"
+        );
+    }
+
+    /// The redelivery check must stay silent on the three legal shapes that look
+    /// like violations. Each is a false positive that would fire on ordinary
+    /// runs, so these controls are what make the check usable rather than a
+    /// source of noise someone eventually silences.
+    #[test]
+    fn the_redelivery_check_accepts_the_legal_shapes() {
+        // Negative control A: the same repeat, correctly marked, is legal — this
+        // is the ordinary resume-after-kill path, and a check that flagged it
+        // would fail every honest run.
+        let mut h = ok_history();
+        h.push(Event::Deliver {
+            at_ms: 95,
+            client: "s1".into(),
+            topic: "t".into(),
+            payload: "m1".into(),
+            dup: true,
+            qos: 1,
+        });
+        assert!(
+            check(&h).is_empty(),
+            "a MARKED repeat is at-least-once legal"
+        );
+
+        // Negative control B: two distinct publishes carrying identical bytes.
+        // The second delivery is a FIRST delivery that merely looks like a
+        // repeat, so DUP = 0 is correct and the check must stay silent. This is
+        // the false positive the "published exactly once" guard exists for — the
+        // warm-up path really does reuse payloads.
+        let mut h = ok_history();
+        h.push(Event::Publish {
+            at_ms: 96,
+            publisher: "p1".into(),
+            topic: "t".into(),
+            payload: "m1".into(), // same bytes as the publish in ok_history
+            acked: true,
+            seq: 2,
+        });
+        h.push(Event::Deliver {
+            at_ms: 97,
+            client: "s1".into(),
+            topic: "t".into(),
+            payload: "m1".into(),
+            dup: false,
+            qos: 1,
+        });
+        assert!(
+            check(&h).is_empty(),
+            "identical bytes from two publishes are not a redelivery"
+        );
+
+        // Negative control C: QoS 0 has no redelivery concept, so a repeat there
+        // carries no DUP promise.
+        let mut h = ok_history();
+        h.push(Event::Deliver {
+            at_ms: 98,
+            client: "s1".into(),
+            topic: "t".into(),
+            payload: "m1".into(),
+            dup: false,
+            qos: 0,
+        });
+        assert!(check(&h).is_empty(), "QoS 0 repeats carry no DUP promise");
+    }
+
+    /// A history recorded before `dup`/`qos` existed must still parse and check.
+    ///
+    /// The nightly archives histories for 14 days and re-checks them with the
+    /// standalone binary. `parse` refuses anything it cannot decode — by design,
+    /// since a checker that skips what it does not understand can be silently
+    /// blinded — so without `#[serde(default)]` this change would make every
+    /// archived artifact unreadable. This test is that guarantee, stated as a
+    /// literal pre-change line rather than as a round-trip of today's struct.
+    #[test]
+    fn a_history_recorded_before_dup_and_qos_still_parses() {
+        let old = r#"{"ev":"deliver","at_ms":11,"client":"s1","topic":"t","payload":"m1"}"#;
+        let events = parse(old).expect("a pre-change history must still parse");
+        assert_eq!(
+            events[0],
+            Event::Deliver {
+                at_ms: 11,
+                client: "s1".into(),
+                topic: "t".into(),
+                payload: "m1".into(),
+                dup: false,
+                qos: 0,
+            }
+        );
+        // qos defaults to 0, so the redelivery check skips archived deliveries
+        // rather than reading a missing field as "QoS 1, not marked DUP" and
+        // inventing violations in histories recorded before the flag existed.
+        assert!(check(&events).is_empty());
     }
 }

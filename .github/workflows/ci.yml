@@ -60,6 +60,11 @@ jobs:
       # in both directions, before this ran.
       - name: README states derivable facts correctly
         run: python3 scripts/check-readme-facts.py
+      # A reason code the broker can emit but no test provokes is a reason code
+      # nobody has ever seen it send. Twelve of thirteen were unaudited before
+      # this ran; the script explains any exemption it is carrying.
+      - name: Every emittable reason code has a test that provokes it
+        run: python3 scripts/check-reason-codes.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)
@@ -88,6 +93,13 @@ jobs:
             MQTTD_HEALTH_BIND=127.0.0.1:$HPORT RUST_LOG=off target/debug/mqttd &
           for _ in $(seq 1 100); do curl -fsS http://127.0.0.1:$HPORT/readyz >/dev/null 2>&1 && break; sleep 0.1; done
           MQTT_PORT=$PORT python3 scripts/interop/paho_conformance.py
+      # The INDEPENDENT oracle: Eclipse's own MQTT 5 conformance suite, pinned, driving
+      # the real binary. Our tests share this implementation's reading of the spec; this
+      # one does not. Its five non-passing tests are declared in the script with reasons,
+      # and it fails BOTH ways — on a new failure and on a declared one that starts
+      # passing — so the list cannot become an ignore list.
+      - name: Interop conformance (eclipse/paho.mqtt.testing — independent MQTT 5 oracle)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/interop/paho-testing.sh
       # ADR 0051 T6: the migration converter's output must be accepted by the real
       # broker, not merely well-formed. A migration tool that emits plausible TOML
       # the broker then rejects burns the evaluation it exists to enable.

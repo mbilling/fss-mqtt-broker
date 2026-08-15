@@ -475,6 +475,34 @@ name = "MQTT_PORT"
 default = ""
 help = "Port of an already-running broker; empty starts one"
 
+[[task]]
+id = "interop-paho-testing"
+group = "Conformance"
+name = "Run Eclipse's own MQTT 5 conformance suite against the broker"
+script = "scripts/interop/paho-testing.sh"
+about = """
+The independent oracle. `scripts/interop/run.sh` and `paho_conformance.py` use foreign
+CLIENTS, but the assertions are still ours — they encode our reading of the spec. This
+runs Eclipse's own `paho.mqtt.testing` suite, written against a reference broker by people
+who never saw this code, at a pinned commit.
+
+Five of its 27 tests do not pass, and each is declared in the script with its reason: two
+are real deviations (issues #298 and #299), two are legal implementation-defined
+differences the broker advertises honestly, and one is a suite-configuration choice we
+decline. The script fails BOTH ways — on an undeclared failure AND on a declared failure
+that starts passing — so the list cannot rot into an ignore list.
+"""
+requires = ["python3", "git"]
+duration = "~3m"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+[[task.env]]
+name = "PAHO_CACHE"
+default = ""
+help = "Reuse an existing clone of the suite; empty clones into a temp dir"
+
 # ── Kubernetes ───────────────────────────────────────────────────────────────────────
 [[task]]
 id = "k8s-kind-smoke"
@@ -661,6 +689,18 @@ needs_checkout = true
 about = "Regenerates docs/delivery/STATUS.md and each doc's progress table from frontmatter."
 requires = ["python3"]
 duration = "~1s"
+hidden = true
+
+[[task]]
+id = "check-reason-codes"
+group = "Internal"
+name = "Check every emittable reason code has a test"
+script = "scripts/check-reason-codes.py"
+# Audits the repo's own tests against the repo's own code.
+needs_checkout = true
+about = "Fails when the broker can emit an MQTT reason code no integration test provokes."
+requires = ["python3"]
+duration = "~2s"
 hidden = true
 
 [[task]]

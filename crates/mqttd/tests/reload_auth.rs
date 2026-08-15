@@ -139,7 +139,12 @@ async fn connect_code(addr: SocketAddr, username: &str, password: &str) -> u8 {
 }
 
 /// MQTT 3.1.1 CONNACK return code 4: bad user name or password.
-const BAD_CREDENTIALS: u8 = 0x04;
+// MQTT 3.1.1 CONNACK **return codes** — a DIFFERENT code space from the MQTT 5
+// reason codes in `mqtt_codec::reason`, and the collision is not hypothetical:
+// here `V3_NOT_AUTHORIZED` is 0x05, while `reason::NOT_AUTHORIZED` is 0x87. The
+// `V3_` prefix keeps the space visible at the use site rather than in a header
+// comment nobody re-reads.
+const V3_BAD_CREDENTIALS: u8 = 0x04;
 
 /// Rotating the password file and reloading takes effect on the next CONNECT: the new
 /// password authenticates, the old one is rejected — no restart.
@@ -152,7 +157,7 @@ async fn rotated_password_file_reload_authenticates_the_new_credential() {
     assert_eq!(connect_code(addr, "alice", "secret-one").await, 0x00);
     assert_eq!(
         connect_code(addr, "alice", "secret-two").await,
-        BAD_CREDENTIALS
+        V3_BAD_CREDENTIALS
     );
 
     // Rotate the password and reload.
@@ -166,7 +171,7 @@ async fn rotated_password_file_reload_authenticates_the_new_credential() {
     assert_eq!(connect_code(addr, "alice", "secret-two").await, 0x00);
     assert_eq!(
         connect_code(addr, "alice", "secret-one").await,
-        BAD_CREDENTIALS,
+        V3_BAD_CREDENTIALS,
         "the rotated-out password must no longer authenticate"
     );
 }
@@ -297,7 +302,7 @@ async fn a_removed_user_cannot_resume_their_durable_session() {
     // the durable session is unreachable (and reaped by expiry, never resumed).
     assert_eq!(
         connect_code(addr, "bob", "bob-pw").await,
-        BAD_CREDENTIALS,
+        V3_BAD_CREDENTIALS,
         "a removed user must not authenticate, so their durable session cannot resume"
     );
     // The surviving user still connects fine.

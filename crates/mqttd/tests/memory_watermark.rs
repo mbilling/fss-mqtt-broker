@@ -36,7 +36,7 @@ const RSS_GAUGE: &str = "mqttd_process_resident_bytes";
 const MAX_GAUGE: &str = "mqttd_memory_max_bytes";
 const MEM_BROWNOUT_ON: &str = "mqttd_brownout{axis=\"memory\"} 1";
 /// MQTT 5.0 reason code 0x97 — the honest answer to "your session would exceed a quota".
-const QUOTA_EXCEEDED: u8 = 0x97;
+use mqtt_codec::reason::QUOTA_EXCEEDED;
 
 struct Broker(Child);
 
