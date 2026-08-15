@@ -69,7 +69,7 @@
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
 | [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/8 done](0060-bridge-durability-and-ack-contract.md) | 1 open |
 | [0061](../adr/0061-off-loop-durable-appends.md) | Off-loop durable appends: per-session lanes for the publish path | Accepted | [6/6 done](0061-off-loop-durable-appends.md) | — |
-| [0062](../adr/0062-online-backup-and-restore.md) | Online backup and restore: a per-node export with a stated window | Accepted | [10/10 done](0062-online-backup-and-restore.md) | — |
+| [0062](../adr/0062-online-backup-and-restore.md) | Online backup and restore: a per-node export with a stated window | Accepted | [11/11 done](0062-online-backup-and-restore.md) | — |
 
 ## Open and deferred work
 

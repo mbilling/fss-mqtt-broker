@@ -489,6 +489,24 @@ read by a restore and never counted by retention. The name is sortable, but a **
 orders by the header's `created_unix_ms`, never by the file name** — renaming a file changes
 nothing.
 
+**An export never overwrites another export.** If the name it would take is already on disk,
+it waits for the clock to leave that millisecond — so the file name *and* the recorded
+`created_unix_ms` are both distinct, which matters because a restore **refuses** a directory
+holding two exports of one node with the same `created_unix_ms` ("which one is newer is not
+decidable"). Two consequences you can meet:
+
+- `backup: no free export name for node … after 1000 ms` — exports are being produced faster
+  than a millisecond-stamped name can distinguish them. Nothing was written. Slow the
+  schedule; a sub-second backup cadence is not a supported shape.
+- `backup: REFUSED to overwrite <file>` — the name was free when the run started and had been
+  claimed by the time it finished writing. Nothing was published, and the run's own data is in
+  the neighbouring `.ndjson.partial`, which the next run cleans up. Seeing this repeatedly
+  means two things are exporting into one directory for the same node id (two processes
+  sharing a `backup.dir`, most likely) — give each node its own, or its own directory.
+
+Both are counted as `mqttd_backup_runs_total{outcome="error"}` and surface in `/statusz`'s
+`backup.last_error`, so the RPO alert fires rather than a generation being lost quietly.
+
 #### The backup directory on the surfaces this repo ships
 
 Neither shipped deployment surface mounts one by default — **it is an opt-in you add**, and

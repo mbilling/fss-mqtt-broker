@@ -463,10 +463,10 @@ pub async fn export(
     sessions: &Arc<dyn SessionStore>,
     retained: &Arc<dyn RetainedSource>,
 ) -> Result<ExportReport, String> {
-    let started_ms = unix_millis();
     std::fs::create_dir_all(&ctx.dir)
         .map_err(|e| format!("backup: cannot create {}: {e}", ctx.dir.display()))?;
     clean_stale_partials(&ctx.dir, &ctx.node_id);
+    let started_ms = free_export_start(&ctx.dir, &ctx.node_id)?;
 
     // Read the two sources through the LIVE handles (never a second redb open, ADR 0061).
     // Sessions first: it is the long half, and reading retained second keeps the retained
@@ -488,16 +488,7 @@ pub async fn export(
     }
     let retained_all = retained.snapshot().await?;
 
-    // The stamp carries MILLISECONDS: two exports inside one second (an operator hitting
-    // `--backup` twice, a schedule racing a signal) must be two files, not one silently
-    // overwriting the other. Still lexicographically sortable, which is what retention and
-    // "the newest export" both rely on.
-    let stem = format!(
-        "{FORMAT}-{}-{}-{:03}",
-        sanitize(&ctx.node_id),
-        utc_stamp(started_ms / 1000),
-        started_ms % 1000
-    );
+    let stem = export_stem(&ctx.node_id, started_ms);
     let partial = ctx.dir.join(format!("{stem}{PARTIAL_SUFFIX}"));
     let final_path = ctx.dir.join(format!("{stem}{SUFFIX}"));
 
@@ -540,6 +531,20 @@ pub async fn export(
     push_line(&mut body, &trailer)?;
 
     write_private_fsynced(&partial, &body)?;
+    // The name was free when this run picked it, and `rename` REPLACES silently — so if
+    // something claimed it during the scan, renaming would destroy a generation. Refuse
+    // instead. The `.partial` stays as the evidence this run made, which the next run's
+    // `clean_stale_partials` collects; that is the same trade the torn-file design already
+    // makes, and it is the only ordering where no existing export can be lost.
+    if final_path.exists() {
+        return Err(format!(
+            "backup: REFUSED to overwrite {} — that export already exists and this run would \
+             have replaced it silently. Its own data is in {}; move or remove one of them. \
+             Nothing was published",
+            final_path.display(),
+            partial.display()
+        ));
+    }
     std::fs::rename(&partial, &final_path).map_err(|e| {
         format!(
             "backup: cannot rename {} to {}: {e}",
@@ -722,6 +727,72 @@ fn clean_stale_partials(dir: &Path, node_id: &str) {
 }
 
 /// A node id reduced to a file-name-safe token (ids are operator-supplied).
+/// How long an export will wait for the clock to leave an occupied millisecond before it
+/// refuses. A millisecond is the resolution of the name, so one wait is normally enough; a
+/// second of them means something is generating exports faster than they can be named, and
+/// that deserves an error rather than an unbounded spin.
+const NAME_WAIT_MAX_MS: u32 = 1_000;
+
+/// The export's file name, without a suffix.
+///
+/// The stamp carries MILLISECONDS: two exports inside one second (an operator hitting
+/// `--backup` twice, a schedule racing a signal) must be two files. Still lexicographically
+/// sortable, which is what retention and "the newest export" both rely on.
+fn export_stem(node_id: &str, started_ms: u64) -> String {
+    format!(
+        "{FORMAT}-{}-{}-{:03}",
+        sanitize(node_id),
+        utc_stamp(started_ms / 1000),
+        started_ms % 1000
+    )
+}
+
+/// True if either half of this stem's name is already on disk.
+///
+/// The `.partial` half counts: a run still writing one owns that name, and renaming onto its
+/// final name is what the caller is about to do.
+fn export_name_taken(dir: &Path, stem: &str) -> bool {
+    dir.join(format!("{stem}{SUFFIX}")).exists()
+        || dir.join(format!("{stem}{PARTIAL_SUFFIX}")).exists()
+}
+
+/// A start timestamp whose name no export in `dir` already owns.
+///
+/// **A name collision was silent data loss.** `std::fs::rename` replaces an existing file
+/// without complaint, so two exports of one node that started in the same millisecond left
+/// ONE file behind: the older generation destroyed by the newer, with no error, no log line
+/// and no metric. Milliseconds made that rare rather than impossible, and CI found it — two
+/// `run_once` calls over an in-memory store finished inside one millisecond, and the test that
+/// asked for "two runs, two files" got one.
+///
+/// **Why the clock is waited on rather than the name nudged.** Bumping only the *name*'s
+/// millisecond field would leave both headers carrying the same `created_unix_ms`, and
+/// [`select_generations`] REFUSES a directory holding two exports of one node with equal
+/// timestamps — "which one is newer is not decidable". That trades a silent loss for a
+/// directory nothing can be restored from, which is worse. Leaving the occupied millisecond
+/// instead makes the name AND the recorded moment genuinely distinct, and the export really
+/// did start when it says it did.
+fn free_export_start(dir: &Path, node_id: &str) -> Result<u64, String> {
+    let mut started_ms = unix_millis();
+    for _ in 0..NAME_WAIT_MAX_MS {
+        if !export_name_taken(dir, &export_stem(node_id, started_ms)) {
+            return Ok(started_ms);
+        }
+        // Blocking, deliberately: this function is called from the same synchronous stretch
+        // that fsyncs the body a few lines later, so a millisecond here is nothing beside it —
+        // and a real sleep would resolve against tokio's paused clock in tests where the
+        // system clock is what names the file.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        started_ms = unix_millis();
+    }
+    Err(format!(
+        "backup: no free export name for node {node_id:?} in {} after {NAME_WAIT_MAX_MS} ms — \
+         every millisecond-stamped name is already taken, so exports are being produced faster \
+         than they can be distinguished. Nothing was written; slow the schedule down",
+        dir.display()
+    ))
+}
+
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -3662,5 +3733,158 @@ mod tests {
             "the export taken AFTER adoption must carry the id — a snapshot taken at \
              construction would leave both files empty"
         );
+    }
+
+    /// The naming rule, deterministically: a stamp whose name is taken is never handed out.
+    ///
+    /// The end-to-end version of this cannot be made to collide on demand — it depends on two
+    /// exports landing in one millisecond, which is exactly why the defect reached main and
+    /// showed up as a flake. So the mechanism is tested where its input can be fixed.
+    #[test]
+    fn an_export_never_takes_a_name_another_export_already_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = export_stem("node-a", 1_700_000_000_116);
+        std::fs::write(
+            dir.path().join(format!("{taken}{SUFFIX}")),
+            b"an earlier generation",
+        )
+        .unwrap();
+        assert!(export_name_taken(dir.path(), &taken));
+
+        let chosen = free_export_start(dir.path(), "node-a").unwrap();
+        assert_ne!(
+            export_stem("node-a", chosen),
+            taken,
+            "handed back the name of an export already on disk; `rename` would have destroyed it"
+        );
+
+        // And the `.partial` half of a name counts as owned: a run still writing one is about
+        // to rename onto its final name.
+        let busy = export_stem("node-b", 1_700_000_000_117);
+        std::fs::write(
+            dir.path().join(format!("{busy}{PARTIAL_SUFFIX}")),
+            b"mid-write",
+        )
+        .unwrap();
+        assert!(
+            export_name_taken(dir.path(), &busy),
+            "a name whose .partial exists is owned by the run writing it"
+        );
+    }
+
+    /// The call site: an export whose millisecond is already spoken for must not destroy the
+    /// file that owns it.
+    ///
+    /// **Why a band of names and not simply two exports in a row.** Two real exports collide
+    /// only if they finish inside one millisecond. On this machine they never do — a "run it
+    /// twice and count the files" test passes with the fix REMOVED, which is precisely how the
+    /// defect reached main and surfaced only as a CI flake. Occupying a contiguous band of
+    /// names starting at the current millisecond makes the collision certain on any machine:
+    /// whatever millisecond the export starts in is already taken, so it must walk out of the
+    /// band, and every file in the band must still hold its own bytes afterwards.
+    #[tokio::test]
+    async fn an_export_whose_name_is_taken_leaves_the_existing_file_intact() {
+        // Wide enough that the export cannot start outside it, small enough that walking out
+        // costs a fraction of `NAME_WAIT_MAX_MS`.
+        const BAND: u64 = 200;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ctx(dir.path());
+        // Retention would delete the band and read exactly like the overwrite being detected.
+        c.keep = 10_000;
+        let sessions: Arc<dyn SessionStore> =
+            Arc::new(mqtt_storage::logged::ReplicatedSessionStore::new(
+                mqtt_storage::repl::InMemoryReplicatedLog::new(),
+            ));
+        let retained = memory_retained_source();
+
+        let base = unix_millis();
+        let band: Vec<PathBuf> = (0..BAND)
+            .map(|d| {
+                dir.path()
+                    .join(format!("{}{SUFFIX}", export_stem(&c.node_id, base + d)))
+            })
+            .collect();
+        for f in &band {
+            std::fs::write(f, b"an earlier generation").unwrap();
+        }
+
+        let report = export(&c, &sessions, &retained)
+            .await
+            .expect("the export must find a free name, not fail");
+
+        for f in &band {
+            assert_eq!(
+                std::fs::read(f).unwrap(),
+                b"an earlier generation",
+                "{} was REPLACED by an export that should have taken a name of its own; \
+                 `rename` destroys silently, so this is a backup generation lost with no error",
+                f.display()
+            );
+        }
+        assert!(
+            !band.contains(&report.path),
+            "the export claims to have written {}, which is a file that already existed",
+            report.path.display()
+        );
+    }
+
+    /// The residual race, and the only ordering in which no existing export can be lost.
+    ///
+    /// The name is chosen before the scan, and the scan takes time — so a name that was free
+    /// can be claimed before the rename. Refusing is the only safe answer, and the `.partial`
+    /// is left as this run's evidence for the next run's `clean_stale_partials` to collect.
+    /// Driven deterministically by a retained source that occupies the band WHILE it is read,
+    /// which is the one point between the two events a test can reach.
+    #[tokio::test]
+    async fn an_export_refuses_rather_than_replace_a_name_claimed_during_its_scan() {
+        struct ClaimsNamesWhenRead {
+            dir: PathBuf,
+            node_id: String,
+        }
+        #[async_trait::async_trait]
+        impl RetainedSource for ClaimsNamesWhenRead {
+            async fn snapshot(&self) -> Result<Vec<RetainedSnapshotEntry>, String> {
+                let base = unix_millis();
+                // Backwards as well as forwards: the export picked its millisecond before this
+                // ran, so the name to occupy is at or just before "now".
+                for d in 0..400u64 {
+                    let stem = export_stem(&self.node_id, base.saturating_sub(200) + d);
+                    let _ = std::fs::write(
+                        self.dir.join(format!("{stem}{SUFFIX}")),
+                        b"claimed mid-scan",
+                    );
+                }
+                Ok(Vec::new())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ctx(dir.path());
+        c.keep = 10_000;
+        let sessions: Arc<dyn SessionStore> =
+            Arc::new(mqtt_storage::logged::ReplicatedSessionStore::new(
+                mqtt_storage::repl::InMemoryReplicatedLog::new(),
+            ));
+        let retained: Arc<dyn RetainedSource> = Arc::new(ClaimsNamesWhenRead {
+            dir: dir.path().to_path_buf(),
+            node_id: c.node_id.clone(),
+        });
+
+        let err = export(&c, &sessions, &retained)
+            .await
+            .expect_err("the name it chose was taken during the scan, so it must refuse");
+        assert!(
+            err.contains("REFUSED to overwrite"),
+            "the refusal must say what it would have destroyed, got: {err}"
+        );
+        for f in exports_of(dir.path(), &c.node_id) {
+            assert_eq!(
+                std::fs::read(&f).unwrap(),
+                b"claimed mid-scan",
+                "{} was replaced by the run that found it in the way",
+                f.display()
+            );
+        }
     }
 }

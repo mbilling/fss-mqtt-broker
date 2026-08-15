@@ -836,7 +836,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 326 test(s)
+## `crates/mqttd/src/lib.rs` — 329 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -867,7 +867,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `backup::tests::a_restore_reads_the_newest_generation_of_each_node_and_never_merges_two`
 - `backup::tests::a_restored_node_restarts_inertly_and_a_different_set_is_still_refused`
 - `backup::tests::a_retained_snapshot_that_fails_fails_the_run_and_writes_nothing`
+- `backup::tests::an_export_never_takes_a_name_another_export_already_owns`
 - `backup::tests::an_export_of_a_live_store_round_trips_through_the_importer`
+- `backup::tests::an_export_refuses_rather_than_replace_a_name_claimed_during_its_scan`
+- `backup::tests::an_export_whose_name_is_taken_leaves_the_existing_file_intact`
 - `backup::tests::an_export_without_a_valid_trailer_or_still_partial_is_never_imported`
 - `backup::tests::an_incomplete_session_scan_fails_the_run_and_advances_no_timestamp`
 - `backup::tests::base64_round_trips_every_byte_and_length`
