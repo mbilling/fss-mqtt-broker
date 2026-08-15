@@ -43,7 +43,7 @@
 use crate::repl::{ReplError, ReplicatedLog};
 use crate::{
     Enqueued, InboundSighting, OutboundInflight, QueueLimits, QueuedMessage, SessionClaim,
-    SessionScan, SessionStore, StorageError,
+    SessionExport, SessionExportScan, SessionScan, SessionStore, StorageError,
 };
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
@@ -469,6 +469,108 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         meta.last_packet_id = base.wrapping_add(count);
         self.store_meta(client, &meta).await?;
         Ok(base)
+    }
+
+    async fn export_session(
+        &self,
+        client: &ClientId,
+    ) -> Result<Option<SessionExport>, StorageError> {
+        // THE READ ORDER IS THE GUARANTEE (ADR 0062), not an implementation detail:
+        // the QUEUE is read FIRST and the METADATA SECOND, so the metadata can only ever
+        // be NEWER than the queue it describes. Under concurrent traffic that makes every
+        // interleaving spec-legal:
+        //
+        // - an entry acked and truncated between the two reads is exported and
+        //   redelivered on restore — legal for QoS 1, and suppressed for QoS 2 by the
+        //   *newer* dedup window read second;
+        // - `last_packet_id` is read after the queue, so it is ≥ any id those messages
+        //   could have been delivered under: a restored session's next allocation can
+        //   never collide with an id that was still in flight at export time.
+        //
+        // Reversing the order buys nothing and costs exactly those two corruptions, which
+        // is why `the_queue_is_read_before_the_metadata_that_covers_it` pins it.
+        let qkey = Self::queue_key(client);
+        let mut queue = Vec::new();
+        let mut high_offset = 0u64;
+        for entry in self.log.read(&qkey, 0, usize::MAX).await? {
+            let (message, expiry_at) = decode_queued(&entry.record)?;
+            high_offset = high_offset.max(entry.offset);
+            queue.push(QueuedMessage {
+                offset: entry.offset,
+                message,
+                expiry_at,
+            });
+        }
+        // The epoch half of the ADR 0037 audit token: a POSITION query, not session
+        // state, so it cannot widen the queue↔metadata window above.
+        let epoch = self.log.epoch_for(&qkey).await?;
+        let meta = self.load_meta(client).await?;
+        // No metadata AND no queue: not a session. Metadata missing with a queue present
+        // is the `ensure_session` presence rule's edge (a torn removal); export it under a
+        // default snapshot rather than dropping messages that were ACKED to a publisher.
+        if meta.is_none() && queue.is_empty() {
+            return Ok(None);
+        }
+        let meta = meta.unwrap_or_default();
+        let received_qos2 = meta
+            .received_qos2
+            .iter()
+            .map(|id| (*id, !meta.unacked_received_qos2.contains(id)))
+            .collect();
+        let outbound_qos2 = meta
+            .outbound_qos2
+            .iter()
+            .map(|(packet_id, (offset, pubrec_seen))| OutboundInflight {
+                packet_id: *packet_id,
+                offset: *offset,
+                pubrec_seen: *pubrec_seen,
+            })
+            .collect();
+        Ok(Some(SessionExport {
+            client: client.clone(),
+            owner: meta.owner,
+            subscriptions: meta.subscriptions,
+            session_expiry_at: meta.session_expiry_at,
+            last_packet_id: meta.last_packet_id,
+            received_qos2,
+            outbound_qos2,
+            queue,
+            epoch,
+            high_offset,
+        }))
+    }
+
+    async fn export_sessions(&self) -> Result<SessionExportScan, StorageError> {
+        // Enumerate BOTH key spaces (ADR 0062): a `q/` key whose `m/` snapshot is missing
+        // still holds messages a publisher was ACKED for, and losing those is the one
+        // thing a backup exists to prevent.
+        let mut clients = BTreeSet::new();
+        for key in self.log.keys().await? {
+            if let Some(id) = key.strip_prefix("m/").or_else(|| key.strip_prefix("q/")) {
+                clients.insert(id.to_string());
+            }
+        }
+        let mut scan = SessionExportScan {
+            complete: true,
+            ..SessionExportScan::default()
+        };
+        for id in clients {
+            let client = ClientId(id);
+            // The skip KINDS are the same distinction `all_sessions` draws (0043-P4
+            // exhibit ②) and carry the same weight here: `NotOwner` is CLEAN — the value
+            // lives on another node, whose own export holds it, and whose absence from a
+            // restore the import then refuses over. Anything else means a session this
+            // scan SHOULD have seen could not be read yet, so the whole export is
+            // incomplete and the caller must fail the run rather than publish a file
+            // missing sessions.
+            match self.export_session(&client).await {
+                Ok(Some(export)) => scan.sessions.push(export),
+                Ok(None) => {}
+                Err(StorageError::NotOwner) => scan.not_owned.push(client),
+                Err(_) => scan.complete = false,
+            }
+        }
+        Ok(scan)
     }
 }
 
@@ -1589,5 +1691,118 @@ mod tests {
         // omitted when empty, so the common record's bytes do not change at all.
         with.unacked_received_qos2.clear();
         assert_eq!(encode_session_meta(&with), without);
+    }
+}
+
+/// The ordered-read contract of [`SessionStore::export_session`] (ADR 0062), pinned
+/// against a log that records every key it is asked for.
+///
+/// This is the one property of the export that no type can enforce and no comment can
+/// defend: the queue MUST be read before the metadata that describes it. It lives in its
+/// own module because it needs a `ReplicatedLog` double that records reads, which the rest
+/// of the tests have no use for.
+#[cfg(test)]
+mod export_order_tests {
+    use super::ReplicatedSessionStore;
+    use crate::repl::{InMemoryReplicatedLog, LogEntry, ReplError, ReplicatedLog};
+    use crate::{Offset, SessionStore};
+    use async_trait::async_trait;
+    use mqtt_core::{ClientId, Message, QoS};
+    use std::sync::{Arc, Mutex};
+
+    /// An [`InMemoryReplicatedLog`] that records the key of every `read`, in order.
+    #[derive(Debug)]
+    struct RecordingLog {
+        inner: InMemoryReplicatedLog,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl RecordingLog {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryReplicatedLog::new(),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+        fn reads(&self) -> Vec<String> {
+            self.reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ReplicatedLog for RecordingLog {
+        type Key = String;
+
+        async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
+            self.inner.append(key, record).await
+        }
+
+        async fn read(
+            &self,
+            key: &String,
+            after: Offset,
+            limit: usize,
+        ) -> Result<Vec<LogEntry>, ReplError> {
+            self.reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key.clone());
+            self.inner.read(key, after, limit).await
+        }
+
+        async fn truncate(&self, key: &String, up_to: Offset) -> Result<(), ReplError> {
+            self.inner.truncate(key, up_to).await
+        }
+
+        async fn remove(&self, key: &String) -> Result<(), ReplError> {
+            self.inner.remove(key).await
+        }
+
+        async fn keys(&self) -> Result<Vec<String>, ReplError> {
+            self.inner.keys().await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_queue_is_read_before_the_metadata_that_covers_it() {
+        let log = Arc::new(RecordingLog::new());
+        let store = ReplicatedSessionStore::new(log.clone());
+        let client = ClientId("c1".to_string());
+        store.ensure_session(&client).await.unwrap();
+        store
+            .enqueue(
+                &client,
+                &Message::new(
+                    "t".to_string(),
+                    bytes::Bytes::from_static(b"p"),
+                    QoS::AtLeastOnce,
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+
+        log.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let export = store.export_session(&client).await.unwrap().unwrap();
+        assert_eq!(export.queue.len(), 1, "the queue was exported");
+
+        let reads = log.reads();
+        let q = reads.iter().position(|k| k == "q/c1");
+        let m = reads.iter().position(|k| k == "m/c1");
+        let (Some(q), Some(m)) = (q, m) else {
+            panic!("the export must read both key spaces; it read {reads:?}");
+        };
+        assert!(
+            q < m,
+            "ADR 0062: the queue must be read BEFORE the metadata that covers it, so the \
+             dedup window and packet-id high-water are never older than the queue — a \
+             reversed order makes a restore reuse a live packet id. Read order: {reads:?}"
+        );
     }
 }

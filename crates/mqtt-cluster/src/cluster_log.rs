@@ -84,7 +84,7 @@ pub enum ReplOp {
 /// with postcard-encoded property blobs", and the incremental bump history starts
 /// at 1.0.0. A file stamped with a retired pre-release version fails closed at
 /// the gate (wipe-and-rejoin).
-const R_SCHEMA_VERSION: u32 = 1;
+pub const R_SCHEMA_VERSION: u32 = 1;
 
 /// In-place migrations for `replicas.redb` (ADR 0058). Empty by design at 1.0 — the first
 /// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage

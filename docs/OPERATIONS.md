@@ -386,13 +386,309 @@ release, and `runtime.config_unknown_keys = "warn"` does not rescue type mismatc
 release you might roll back to, spell the floor as an integer or omit the key entirely —
 omitting it takes the same derived default.
 
-## Backup
+## Backup and disaster recovery
 
-Durable state is quorum-replicated: the primary recovery story is *the cluster itself*
-(a lost node's state rebuilds from survivors — wipe-and-rejoin). For disaster recovery
-beyond quorum loss, snapshot the PVs of a **stopped** node (redb files are only
-crash-consistent under snapshot while running) or use storage-class volume snapshots;
-restore = recreate the StatefulSet over restored PVs with the same pod names.
+Quorum replication is the primary recovery story, and it is a good one: a lost node's
+state rebuilds from survivors (wipe-and-rejoin). It is a **durability** story, not a
+**backup** story — it does not protect you from operator error, a bad migration, or
+correlated corruption, because every replica faithfully replicates the mistake. That is
+what backups are for ([ADR 0062](adr/0062-online-backup-and-restore.md), issue #249).
+
+### What the online export guarantees — and what it does not
+
+An export is taken from the **live** node. Nothing is stopped, no client is disconnected,
+and no second store handle is opened. It is **not** an instant, and the difference matters
+when you plan a recovery. The guarantee, in one sentence:
+
+> Every fact durably committed before the export's `started_unix_ms` is present; facts
+> committed inside `[started_unix_ms, finished_unix_ms]` may or may not be; facts
+> committed after `finished_unix_ms` are not.
+
+Both instants are written into every file's trailer, so the window is a number you can
+read, not a promise you have to trust. It is **one-directional**: the uncertainty is only
+ever "a fact from inside the window may be missing", never "a fact that was never committed
+is present". Within the window two stronger properties hold: retained messages are one
+atomic whole-store snapshot, and each session is a self-consistent record whose queue and
+metadata cannot skew in the dangerous direction (worst case is a redelivery that MQTT
+already permits, never a reused packet id). There is **no cross-store atomic cut and no
+cluster-wide instant** — the ADR says why, from the code.
+
+**Three sentences that bound the whole feature:**
+
+- **A per-node export is one node's readable state** — the sessions this node owns, plus
+  its view of retained state. In a cluster a foreign session answers `NotOwner`, so no node
+  can export the whole cluster, and the file name carries the node id.
+- **A cluster backup is the SET of every node's export**, taken close together. Each node
+  writes into its trailer the client ids it skipped as owned-elsewhere, and into its header
+  the members it could see, so the set's completeness is *checked* at restore time rather
+  than left to your bookkeeping.
+- **A restore rebuilds DATA, not identity and not consensus.** Sessions (with their
+  subscriptions, owner binding, offline queues, packet-id high-water and both QoS-2
+  windows) and retained values come back. Cluster id, node ids, the lease/Raft log and
+  `replicas.redb` do not: the target cluster keeps its own identity and elects its own
+  leaders, and each node imports the slice the *new* ring gives it.
+
+### Configuration
+
+```toml
+[backup]
+dir = "/var/backups/mqttd"   # MQTTD_BACKUP_DIR — a volume SEPARATE from node.data_dir
+every_secs = 3600            # MQTTD_BACKUP_EVERY — 0 (default) = on demand only
+keep = 7                     # MQTTD_BACKUP_KEEP — kept per node id
+```
+
+`--check-config` refuses three shapes: a `backup.dir` inside `node.data_dir` (exports there
+would grow the volume the disk watermark protects, counted by nothing), `every_secs > 0`
+with no `dir`, and `keep = 0`. It validates the *setting*, **not the volume** — a
+nonexistent or unwritable `backup.dir` passes `--check-config` and fails at the first run,
+with the path and the OS error in the log, `/statusz`'s `backup.last_error`, and
+`mqttd_backup_runs_total{outcome="error"}`. Take one backup by hand after a config change
+rather than discovering it at 03:00.
+
+Files are written `0600`, fsynced, then renamed into place as
+`mqttd-backup-<node-id>-<YYYY-MM-DD_HHMMSS>-<mmm>.ndjson` (UTC, milliseconds included so two
+exports in one second are two files); a `.ndjson.partial` file is an interrupted run, never
+read by a restore and never counted by retention. The name is sortable, but a **restore
+orders by the header's `created_unix_ms`, never by the file name** — renaming a file changes
+nothing.
+
+#### The backup directory on the surfaces this repo ships
+
+Neither shipped deployment surface mounts one by default — **it is an opt-in you add**, and
+both need a writable path *outside* `node.data_dir`:
+
+**Helm.** The chart ships no backup volume and no `MQTTD_BACKUP_*` plumbing, so on a default
+install there is nowhere to write and `mqttd --backup` exits `2`. Add it through the
+chart's existing extension points (verified with `helm template`); a separate PVC, because
+an `emptyDir` would put the backup on the pod it is protecting:
+
+```yaml
+# values.yaml — pair this with a ReadWriteMany PVC named mqttd-backups
+extraEnv:
+  - name: MQTTD_BACKUP_DIR
+    value: /var/backups/mqttd
+  - name: MQTTD_BACKUP_EVERY
+    value: "3600"
+extraVolumes:
+  - name: backups
+    persistentVolumeClaim:
+      claimName: mqttd-backups
+extraVolumeMounts:
+  - name: backups
+    mountPath: /var/backups/mqttd
+```
+
+`readOnlyRootFilesystem: true` does not block this: it makes the *root* filesystem
+read-only, and a mounted volume stays writable (the data PVC works the same way). Note the
+`check-config` init container is not given `extraEnv`, so these settings are validated by
+the broker at startup rather than by the init container.
+
+**systemd.** `deploy/systemd/mqttd.service` is `ProtectSystem=strict` with
+`ReadWritePaths=/var/lib/mqttd` only, so the example `dir = "/var/backups/mqttd"` is
+unwritable there by construction. Grant it with a drop-in rather than editing the shipped
+unit:
+
+```sh
+install -d -o mqttd -g mqttd -m 0700 /var/backups/mqttd
+systemctl edit mqttd            # writes /etc/systemd/system/mqttd.service.d/override.conf
+# [Service]
+# ReadWritePaths=/var/backups/mqttd
+systemctl daemon-reload && systemctl restart mqttd
+```
+
+Then add `MQTTD_BACKUP_DIR=/var/backups/mqttd` to `/etc/mqttd/mqttd.env`. Keep the path off
+the data volume — that is what `--check-config` enforces — and remember the export is
+plaintext data-plane content (see the gap list below).
+
+### Taking a backup
+
+Run it **on every node**, ideally close together:
+
+```sh
+# In the container (distroless: no shell needed, this IS the entrypoint binary).
+# --config is REQUIRED wherever the broker's own settings live in a file rather than in the
+# environment — the Helm chart renders node.data_dir into /config/mqttd.toml, and without
+# it `--backup` cannot load an effective config and exits 2.
+kubectl exec mqttd-0 -- mqttd --backup --config /config/mqttd.toml
+```
+
+`--backup` signals the broker (`SIGUSR2`, `--pid` default `1`) and waits for a new file to
+appear under `[backup] dir` (`--timeout` default `3600` seconds). It prints the path it
+wrote and exits `0`; `1` on timeout; `2` on a usage error, a config that will not load, no
+`[backup] dir`, or a pid it cannot signal. A schedule (`every_secs`) does the same thing on
+a timer. Copy the directory off the node's volume — an export sitting on the disk you are
+protecting against is not a backup.
+
+**`SIGUSR2` is safe on a node with no `[backup] dir`.** The handler is installed
+unconditionally at startup, so a monitoring or cron rollout that lands before the config
+does logs `SIGUSR2 received … but no [backup] dir is configured` and keeps serving, instead
+of terminating the broker (which is `SIGUSR2`'s default disposition).
+
+### RPO and RTO
+
+Both are formulas whose terms this repository measures:
+[docs/benchmarks/BACKUP-RESTORE.md](benchmarks/BACKUP-RESTORE.md) (development-grade, one
+host — read its preamble).
+
+- **RPO ≤ `every_secs` + W**, where `W` is the export's own window width. Measured:
+  **W = 51 ms for a 21,000-record node** (1,000 sessions × 10 queued + 10,000 retained, 256 B
+  payloads, release build, one developer machine), so at any sane schedule the RPO *is* the
+  schedule. Every run records its own `W`: `finished_unix_ms − started_unix_ms` in the file's
+  trailer, and `backup.window_ms` on `/statusz`. `mqttd_backup_duration_ms` is the **whole
+  run's** wall clock — the reads *plus* the write, fsync and rename — so it is an upper
+  bound on `W`, not `W` itself; alert on it if you want a single series, and read the
+  trailer when you want the exact number.
+- **RTO ≈ fresh-cluster start + records / durable-write rate.** The second term dominates:
+  every restored record is one fsync (plus a quorum round-trip in cluster mode), and there
+  is deliberately no batch path. Measured on that host: **162–173 records/s single-node**
+  over two consecutive runs, i.e. ~2 min for 21,000 records and ~10 min for 100,000. Treat
+  the *shape* as the guidance and the constant as yours: an earlier session on the same host
+  measured 74 records/s at the same fixture, and a different developer machine measured 3×
+  again. Re-run the harness on your own volume. The record count is the trailer's
+  `sessions + queued + retained`, summed over the set.
+
+**Alert on the age of the last successful export, or the RPO is fiction:**
+
+```promql
+time() - mqttd_backup_last_success_timestamp_seconds > 2 * 3600
+  and mqttd_backup_last_success_timestamp_seconds > 0
+```
+
+The `> 0` guard is not optional: a node with no backup configured exports a literal `0`,
+so a bare comparison fires on every default installation and tells you nothing. A run that
+fails deliberately does **not** advance that series (it increments
+`mqttd_backup_runs_total{outcome="error"}` instead), so a partially-readable node shows up
+as a stale backup rather than as a fresh lie.
+
+### Restoring
+
+A restore rebuilds **data** into a **fresh** cluster. It never merges into a serving one.
+
+1. Stand up a new cluster with **empty** data dirs (no `sessions.redb`, `retained.redb`,
+   `replicas.redb`, `lease.redb` — the node refuses otherwise).
+2. Put **every** node's export in one directory, reachable by every node. **One cluster's
+   exports only**: a set naming two `cluster_id`s is refused, but a directory holding only
+   the *wrong* cluster's set restores that cluster — check a header's `cluster_id` before
+   you point at it (`head -1 <file>`).
+3. Set, on every node:
+   ```
+   MQTTD_RESTORE_FROM=/restore          # a file or a directory
+   MQTTD_READY_MIN_MEMBERS=3            # = your node count, so the import waits for the
+                                        #   assembled ring before placing sessions
+   ```
+4. Start the nodes. Each verifies the whole set first (format stamp, sha-256, one
+   generation per node, a single cluster id, coverage), then waits for the durable plane,
+   then imports the sessions **it** owns; the others are imported by their owners from the
+   same files. `/readyz` reports `NotReady` with reason `restore-in-progress` and no client
+   port is bound until the import finishes; `/statusz` carries a `restore` block, and
+   `mqttd_restore_state` is `1` while it runs, `2` on success, `3` on failure. Any failure
+   exits the process non-zero: a broker never starts on a half-imported store.
+5. Check `mqttd_restore_state == 2` on every node, then let clients reconnect.
+
+**Leave `MQTTD_RESTORE_FROM` in place afterwards.** A completed restore writes a
+`restored-from` stamp (a JSON record of the source, the instant, the files, the set digest
+and anything forfeited) into the data dir, and the node's next ordinary start — a
+reschedule, an OOM kill, a rolling upgrade — reads it, reports
+`backup.restore_from is INERT this boot`, and starts normally on the data it already holds.
+Pointing an already-restored node at a *different* source is refused: that would be a merge.
+
+**Several generations in one directory are fine.** `keep` defaults to 7, so the directory
+you copied off the volume normally holds several exports per node. The restore selects the
+**newest export of each node** by its header's `created_unix_ms`, logs the older ones as
+`superseded`, and never merges two generations record by record. Two exports of one node
+sharing a `created_unix_ms` are refused, naming both.
+
+#### If a node's data AND its export are both gone
+
+The coverage check refuses an incomplete set by default, which is right almost always — and
+wrong in exactly one case: the disaster took a node's volume *and* the copy of its export,
+so an all-or-nothing check would hold the surviving nodes' backups hostage to the one file
+that no longer exists. The escape hatch says what it costs:
+
+```
+MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS=1      # backup.restore_partial_accept_data_loss
+```
+
+Only `1`, `true`, `on` or `yes` enables it — a flag that forfeits data is not turned on by a
+stray value. With it set the restore **imports the surviving nodes' data and FORFEITS
+everything the missing nodes held**: their sessions, those sessions' queued messages, and
+any retained topic no surviving node had cached. It warns at startup, warns again naming
+every forfeited node and client id, records
+`PARTIAL (data forfeited): …` in `/statusz`'s `restore.detail`, and writes `"partial": true`
+with the forfeited names into the `restored-from` stamp permanently. Unset it once the
+restore is done, so the next incident starts from the safe default.
+
+#### What a restore refuses
+
+Every refusal imports **nothing** and exits non-zero. The **data dir** is judged first,
+before a file is opened: store files with no `restored-from` stamp to explain them, or a
+stamp naming a different source. Then the **set**: a `format_version` newer than this build
+(naming the build that wrote the file) or older ("no migration path exists pre-1.0"); two
+exports of one node with the same `created_unix_ms`; a missing or malformed trailer, a
+sha-256 that does not match the bytes, a trailer saying the export was incomplete, or an
+unknown record kind; exports from two different clusters, naming both ids; and finally a
+set missing a member's export or a session named as owned-elsewhere and present nowhere
+(unless the partial opt-in above is set). An interrupted restore is **not** resumable —
+start again on an empty data dir.
+
+### Not covered by 1.0 (read this before you rely on it)
+
+These are deliberate gaps, not oversights. Each has a reason in
+[ADR 0062](adr/0062-online-backup-and-restore.md):
+
+1. **Lease/Raft state (`lease.redb`) is never exported or restored.** It holds the
+   persisted vote and log; re-injecting them is a consensus-safety violation, not a
+   recovery. Lease-group recovery = rejoin from survivors, or found a fresh cluster and
+   import.
+2. **Cluster id and node id are provenance only** — recorded in the export so you can
+   prove where it came from, never written back. Restoring them would manufacture a second
+   cluster carrying a live cluster's identity. The consequence is that the *target* cluster
+   is never verified against the backup's `cluster_id`: mixing two clusters in one
+   directory is refused, but restoring the wrong cluster's complete set is not detectable.
+3. **Replica copies (`replicas.redb`) are not exported.** A session another node owns is
+   unreadable here; it is a coverage entry, not data.
+4. **No cluster-wide consistent instant.** Per-node windows make the skew visible instead
+   of asserting it away. Run the exports close together.
+5. **A session that changed owner between two nodes' exports may be in neither** — the
+   coverage check catches it and refuses the restore rather than losing it silently.
+6. **No restore into a live or non-fresh node**, no selective per-session restore, no
+   point-in-time recovery, no incremental/differential backup (every export is full).
+7. **A partial restore is lossy by definition and is not a supported steady state.** It
+   exists for the one disaster above; what it forfeits is named in the log and in the
+   stamp, and nothing later reconciles it.
+8. **The bridge spool is out of scope.** `mqttd-bridge` holds acked-but-unforwarded
+   messages in its own redb spool; that is a different process's durable state.
+9. **Non-durable state is not exported**: QoS 0 queues, live connection state, topic
+   aliases, pending wills.
+10. **Config, ACLs, PKI, passwords are not exported.** That is GitOps' job and
+    `--check-config`'s gate.
+11. **A node with no durable store refuses to export.** A file that looks like a backup of
+    nothing is worse than an error.
+12. **The export file is plaintext data-plane content** — every retained payload, every
+    queued message, every client id and owner subject. It is created `0600`, and it is as
+    sensitive as the broker's data volume: encrypt it at rest, restrict the directory, and
+    treat a shared backup volume as a lateral-movement path.
+
+### Rolling back across the `[backup]` section
+
+`[backup]` is a **new config section**, so a config file carrying it is a config with an
+unknown key for the previous release — and the default `runtime.config_unknown_keys =
+"refuse"` fails that load. Unlike a type mismatch this one *is* rescuable: set
+`config_unknown_keys = "warn"` (or `MQTTD_CONFIG_UNKNOWN_KEYS=warn`) on the release you
+might roll back to, or configure backups through `MQTTD_BACKUP_*` env vars, which an older
+binary simply ignores. Nothing on disk changes: no store schema version moves and the
+export lives outside the data dir, so a rollback needs no data migration
+([ADR 0062](adr/0062-online-backup-and-restore.md), [ADR 0058](adr/0058-one-dot-zero-stability-contract.md) §E).
+
+### The byte-level path, still supported, as the complement
+
+For what the online export deliberately does not cover — lease/Raft state, or an exact
+image of one node — snapshot the volumes of a **stopped** node (redb files are only
+crash-consistent, not application-consistent, while running) or use storage-class volume
+snapshots; restore by recreating the StatefulSet over the restored PVs with the same pod
+names. The cost is the reason it is no longer the only path: stopping a node means a full
+decommission drain, whose measured per-pod cost is issue #248's, and during it the cluster
+runs one replica short. Use it deliberately, not as routine DR.
 
 ## Monitoring for the operator (and humans)
 
@@ -407,6 +703,8 @@ the demo dashboard's "Operator signals" row):
 | **Foreign gossip arriving** | `rate(mqttd_gossip_rejected_total{reason="cluster-mismatch"}[5m]) > 0` | Contained, but find and fix the re-founded node |
 | **Node self-quarantined** | `mqttd_refound_quarantine == 1` | This node re-founded beside a live cluster and took itself out of rotation; it never recovers on its own — wipe and rejoin it (see the founder rule) |
 | **Brownout** | `mqttd_brownout == 1` (page); `sum(mqttd_store_bytes) / mqttd_store_max_bytes > 0.8 and mqttd_store_max_bytes > 0` (warn); `max by (store) (mqttd_store_bytes) / scalar(mqttd_store_max_bytes) > 0.6 and on() mqttd_store_max_bytes > 0` (warn) | Expand the PVC / raise the watermark / prune retained. The per-store rule finds which store is eating the budget — the mark is **aggregate on purpose** (`replicas`/`lease` grow from peers' committed appends and from consensus, with no client write to refuse), and the broker itself warns once, naming the store, above 70% of the mark. **Every watermark ratio here needs its guard clause:** an unset mark is exported as a literal `0`, so a bare divide is `+Inf` and fires on the default configuration, and a per-store numerator carries a `store` label the mark does not, so it needs `scalar()` or it matches nothing and never fires. Timing: a transition is seen within `MQTTD_WATERMARK_POLL` seconds (default 10) and within `max(1s, poll/10)` once inside 10% of the mark — which is also how long a *cleared* brownout takes to lift, i.e. how long the publish refusals outlive the pressure |
+| **Backup stale (RPO breached)** | `time() - mqttd_backup_last_success_timestamp_seconds > 2 * <every_secs> and mqttd_backup_last_success_timestamp_seconds > 0` (page) | No successful export in two schedule periods. The `> 0` guard is mandatory — an unconfigured backup exports a literal `0`. Check `mqttd_backup_runs_total{outcome="error"}` and the node's log: an INCOMPLETE session scan fails the run on purpose (a file missing sessions is worse than none), so the usual cause is a group that could not be read (no quorum) at export time |
+| **Restore stuck or failed** | `mqttd_restore_state == 1` for longer than the expected RTO, or `== 3` (page) | `1` = importing (the node is `NotReady` and its client port is closed, by design); `3` = the restore was refused or failed and the process exited non-zero. `/statusz`'s `restore.detail` and the log carry the reason — a format stamp from another build, a digest mismatch, an uncovered session set, two clusters or two generations in one directory, or a data dir that is not fresh. `2` means completed, and reads `2` on **every later boot too**, because the `restored-from` stamp makes the setting inert; `restore.detail` then says `this boot imported nothing`. A detail beginning `PARTIAL (data forfeited)` means the set was incomplete and imported anyway under `MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS` — the forfeited nodes and sessions are named there and in the stamp |
 | **Memory pressure short of brownout** | `mqttd_process_resident_bytes / mqttd_memory_max_bytes > 0.9 and mqttd_memory_max_bytes > 0` for 5m (warn) | The last warning before the memory axis browns out. The **container/cgroup limit is the ceiling**, not this watermark: check one is actually set (the Helm chart ships `resources: {}`) and that the watermark is 75-85% of it — the gap is the overshoot allowance (`poll x allocation rate`), see [SIZING](SIZING.md) |
 | **Publishers being refused** | `rate(mqttd_quota_rejections_total{reason="brownout-publish"}[5m]) > 0` (the Prometheus label is `reason`; the OTel attribute is `kind`) | `QoS` ≥ 1 publish availability is degraded, not silently lost: above the watermark a publish needing a durable append is refused (v5 `0x97`, v3.1.1 no ack + close — cross-node too, as a peer-bus verdict; an older link mid-rolling-upgrade degrades to a withheld ack + close). Re-delivery is the publishing application's decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle, and only a `CleanSession=0` v3.1.1 publisher resends on reconnect. Expand the PVC / raise the watermark / prune retained / let subscribers drain. `mqttd_brownout{axis}` plus `store_bytes` vs `store_max_bytes` and `process_resident_bytes` vs `memory_max_bytes` say which axis; `/statusz` gives the onset timestamp |
 | **Stuck drain** | `mqttd_decommission_state == 1` and `mqttd_decommission_pending` not decreasing for 10m | Inspect the drain logs; the grace deadline will fall back to crash semantics |

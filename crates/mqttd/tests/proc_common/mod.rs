@@ -174,6 +174,10 @@ pub struct ProcNode {
     /// kernel — the process dies exactly ON a write syscall, the harshest
     /// honest form of "the disk ran out mid-operation" (0018-T7).
     pub file_size_limit_blocks: Option<u64>,
+    /// Extra environment for every (re)spawn — the documented `MQTTD_*` surface, so a
+    /// test configures a spawned node exactly as an operator would (`MQTTD_BACKUP_DIR`,
+    /// `MQTTD_RESTORE_FROM`, ADR 0062).
+    pub extra_env: Vec<(String, String)>,
     /// The broker binary this node runs — HEAD (`CARGO_BIN_EXE_mqttd`) by
     /// default; the P3 rolling-upgrade test points it at a BASELINE build and
     /// back, one node at a time (ADR 0044 P3 / ADR 0039).
@@ -279,11 +283,17 @@ impl ProcNode {
             .env("MQTTD_HEALTH_BIND", self.health_addr.to_string())
             .env("MQTTD_SHUTDOWN_GRACE", "0")
             .env("RUST_LOG", "info")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(std::process::Stdio::from(log))
             .spawn()
             .expect("spawn mqttd binary");
         self.child = Some(child);
+    }
+
+    /// This node's process id, while it is running.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
     /// `Some(status)` if the process is no longer running, without blocking.
@@ -564,6 +574,7 @@ pub async fn build_topology(seed: u64, root: &std::path::Path) -> Vec<ProcNode> 
             relay,
             _relay_abort: relay_abort,
             file_size_limit_blocks: None,
+            extra_env: Vec::new(),
             binary: PathBuf::from(env!("CARGO_BIN_EXE_mqttd")),
         });
     }

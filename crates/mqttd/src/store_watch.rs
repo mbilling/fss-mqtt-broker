@@ -74,7 +74,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// The redb store files a node may hold (ADR 0018): gauge label per store.
-const STORE_FILES: [(&str, &str); 4] = [
+pub const STORE_FILES: [(&str, &str); 4] = [
     ("sessions", "sessions.redb"),
     ("retained", "retained.redb"),
     ("replicas", "replicas.redb"),

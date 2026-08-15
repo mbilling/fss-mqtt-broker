@@ -165,12 +165,22 @@
 //! `decommission{pending,rounds,complete}`), and only then runs the graceful
 //! leave — so a planned removal loses nothing, unlike pulling the plug. A
 //! `SIGTERM` during the drain escalates to a plain shutdown (crash semantics).
+//! **`SIGUSR2` takes an ONLINE BACKUP** (ADR 0062): an export of this node's readable
+//! durable state into `[backup] dir`, from the live process — nothing is stopped, no
+//! second store handle is opened. `mqttd --backup` is the front end for it. Its handler is
+//! installed UNCONDITIONALLY at startup, whether or not a `[backup] dir` is configured: the
+//! default disposition of `SIGUSR2` is *terminate*, so a node without the handler would be
+//! killed — with crash semantics, no drain — by the signal the docs advertise. With no
+//! destination configured the signal logs that fact and the broker keeps serving.
 //!
 //! Subcommands (each validates + exits, binding nothing): `--check-config [--config <path>]`
 //! (ADR 0046 T3) validates the effective config; **`--decommission [--pid <n>] [--timeout <secs>]`**
 //! (ADR 0047 T4) sends `SIGUSR1` to the running broker (`--pid`, default 1 — the container
 //! entrypoint) to begin the decommission drain and **blocks until it exits**, so a Kubernetes
 //! `preStop` holds the pod open for the whole drain even though the distroless image has no shell.
+//! **`--backup [--pid <n>] [--timeout <secs>]`** (ADR 0062) sends `SIGUSR2` to the running broker
+//! and waits for a new export file to appear under the configured `[backup] dir`, so a cron job or
+//! a `kubectl exec` can take a backup on an image with no shell.
 
 use mqtt_auth::basic::BasicAuthenticator;
 use mqtt_auth::{Authenticator, Authorizer};
@@ -263,6 +273,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_decommission();
     }
 
+    // ADR 0062: `--backup` sends SIGUSR2 to the running broker and waits for a new export
+    // file to appear. A NEW process signalling the old one — never a second reader of the
+    // stores, which redb's exclusive flock makes impossible anyway.
+    if std::env::args().skip(1).any(|a| a == "--backup") {
+        run_backup();
+    }
+
     // ADR 0046 T2: assemble the effective configuration in precedence order —
     // defaults < TOML file < `MQTTD_*` env. The file path comes from `--config <path>` or
     // `MQTTD_CONFIG` (the flag wins); with neither, the config is defaults + the env overlay,
@@ -300,6 +317,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_write_floor(write_floor),
     ));
 
+    // The backup task stamps the membership it can see into every export header, so the
+    // import's coverage check can refuse a union that is missing a node (ADR 0062).
+    let placement_for_backup = placement.clone();
+
     // Graceful-shutdown plumbing (ADR 0019): a cancellation token that stops the accept
     // loops and drains live connections, and a tracker that lets us wait for them.
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -332,6 +353,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // watcher fills sizes, /statusz reads both.
     let brownout_status = Arc::new(mqttd::health::BrownoutStatus::default());
     let store_snapshot = Arc::new(mqttd::store_watch::StoreSnapshot::default());
+    // Online backup + restore state (ADR 0062), shared with /statusz and /readyz.
+    let backup_status = Arc::new(mqttd::backup::BackupStatus::default());
+    // SIGUSR2 — the online-backup trigger — is installed HERE, unconditionally and before
+    // anything can send one, because installing the stream is what overrides the signal's
+    // default disposition, and that default is TERMINATE. Installed inside the backup task
+    // (which only exists when `[backup] dir` is set) it left every default-configured node
+    // one `kill -USR2` away from a crash-semantics death. See `backup::install_on_demand_signal`.
+    let backup_demand = mqttd::backup::install_on_demand_signal();
+    // A restore is only ever into a FRESH node — or into the node it already restored, which
+    // must boot normally rather than refuse. Decided HERE, before any store is opened, so
+    // the check is local and race-free (a peer's already-imported keys would make a "the
+    // store is empty" query fail on the next node of a cluster restore).
+    let mut restore_from = config.backup.restore_from.clone();
+    if let Some(from) = &config.backup.restore_from {
+        let Some(dir) = &config.node.data_dir else {
+            return Err(
+                "backup.restore_from requires node.data_dir: there is nothing durable \
+                        to restore into without one"
+                    .into(),
+            );
+        };
+        match mqttd::backup::restore_disposition(std::path::Path::new(dir), from)? {
+            mqttd::backup::RestoreDisposition::Proceed => {}
+            mqttd::backup::RestoreDisposition::AlreadyRestored(stamp) => {
+                // The ordinary restart of an already-restored node. The setting is part of
+                // the pod spec / unit file and does not go away after the restore, so this
+                // path is every reschedule, OOM kill and rolling upgrade of a recovered
+                // cluster — it must be a normal start, not a refusal.
+                info!(
+                    restored_from = %stamp.restored_from,
+                    restored_at = %stamp.restored_at,
+                    files = stamp.files.len(),
+                    set_sha256 = %stamp.set_sha256,
+                    partial = stamp.partial,
+                    forfeited_nodes = ?stamp.forfeited_nodes,
+                    "this data dir already holds a COMPLETED restore of this set (ADR 0062): \
+                     backup.restore_from is INERT this boot and the node starts normally. \
+                     Restoring a different set into this node would be a merge and is refused \
+                     — use a fresh volume for that"
+                );
+                backup_status.set_restore(
+                    2,
+                    Some(format!(
+                        "completed {} from {} ({} files, set {}); this boot imported nothing",
+                        stamp.restored_at,
+                        stamp.restored_from,
+                        stamp.files.len(),
+                        stamp.set_sha256
+                    )),
+                );
+                metrics.set_restore_state(2);
+                restore_from = None;
+            }
+            mqttd::backup::RestoreDisposition::AlreadyRestoredUnreadable(why) => {
+                warn!(
+                    detail = %why,
+                    "this data dir holds a {} stamp that cannot be read; treating it as a \
+                     COMPLETED restore (a stamp only exists once an import finished) and \
+                     starting normally without importing anything",
+                    mqttd::backup::RESTORED_STAMP
+                );
+                backup_status.set_restore(
+                    2,
+                    Some(
+                        "completed earlier (unreadable stamp); this boot imported nothing"
+                            .to_string(),
+                    ),
+                );
+                metrics.set_restore_state(2);
+                restore_from = None;
+            }
+        }
+    }
     // Cluster identity (ADR 0054 T2): the founder (seedless) mints it, joiners adopt
     // it over gossip, and gossip from a separately-founded cluster is dropped —
     // split-brain becomes detectable (compare /statusz across nodes) AND contained.
@@ -401,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    let (hub_tx, store, durable_plane, lease_driver) =
+    let (hub_tx, store, retained_store, durable_plane, lease_driver) =
         start_hub(&config, &node_id, &placement, &metrics, &brownout_status).await?;
 
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
@@ -420,6 +514,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &store_snapshot,
         &config_stamp,
         &swim_key_fps,
+        &backup_status,
         // Arm the guard only for a cluster node that has not opted out.
         (cluster_configured && config.cluster.refound_guard).then(|| foreign_cluster_seen.clone()),
     )
@@ -445,7 +540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &live_config,
         &node_id,
         Some(proxy),
-        store,
+        store.clone(),
         shutdown.clone(),
         metrics.clone(),
     )?;
@@ -646,6 +741,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = hub_tx.send(mqttd::hub::HubCommand::AttachAuthorizer(
         mqttd::hub::AuthzWatch(policy.authz.clone()),
     ));
+
+    // Restore from backup (ADR 0062), BEFORE any client listener binds: a node serving
+    // half an import is the one state this design refuses. /readyz reports NotReady with
+    // reason `restore-in-progress` for the whole window (the gate is armed by the status
+    // handle the health server already holds), and a failure exits non-zero rather than
+    // starting a broker with a partial store.
+    if let Some(from) = restore_from.clone() {
+        run_restore(
+            &from,
+            &config,
+            &store,
+            &hub_tx,
+            &backup_status,
+            &metrics,
+            &durable_plane,
+            &placement_for_backup,
+        )
+        .await?;
+    }
+
+    // The online-backup task (ADR 0062): a schedule and/or SIGUSR2, holding the LIVE store
+    // handles and never opening a redb handle of its own. Spawned on the connections
+    // tracker with the shutdown token, so an export in flight at SIGTERM is cancelled and
+    // awaited with everything else instead of outliving the process's hold on the data dir
+    // (#242: a task that outlives the node keeps the dir locked and the next start fails
+    // with "Database already open").
+    match config.backup.dir.clone() {
+        Some(dir) if retained_store.is_some() => {
+            let task = mqttd::backup::BackupTask {
+                ctx: mqttd::backup::ExportContext {
+                    dir: std::path::PathBuf::from(dir),
+                    keep: config.backup.keep,
+                    node_id: node_id.0.clone(),
+                    // Filled per run by the closures below.
+                    cluster_id: None,
+                    durable: config.durable.enabled,
+                    members: Vec::new(),
+                },
+                every_secs: config.backup.every_secs,
+                sessions: store.clone(),
+                // Retained values AND their convergence tokens, read together through the
+                // hub — the only place the pair is atomic (ADR 0062).
+                retained: Arc::new(HubRetainedSource {
+                    hub: hub_tx.clone(),
+                }),
+                status: backup_status.clone(),
+                metrics: Some(metrics.clone()),
+                // Read fresh per export: the import's coverage check is only as strong
+                // as the membership the header names.
+                members: {
+                    let placement = placement_for_backup.clone();
+                    Arc::new(move || {
+                        placement
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .members()
+                            .into_iter()
+                            .map(|n| n.0)
+                            .collect()
+                    })
+                },
+                // Also fresh per export: a joiner adopts the cluster identity over gossip
+                // AFTER this point in startup, so a value read once here would leave every
+                // never-restarted node's exports stamped `cluster_id: null` — the field the
+                // cross-cluster refusal and the provenance promise both rest on.
+                cluster_id: {
+                    let identity = cluster_identity.clone();
+                    Arc::new(move || identity.get())
+                },
+            };
+            connections.spawn(task.run(shutdown.clone(), backup_demand));
+        }
+        Some(_) => {
+            // Unreachable: `Config::validate` refuses `backup.dir` without a data dir, so
+            // this is defence in depth rather than a second policy. Kept because the
+            // alternative — silently not backing up — is the failure mode this feature
+            // exists to prevent.
+            return Err("backup.dir is set but this node has no durable store \
+                        (node.data_dir unset): there is nothing to export"
+                .into());
+        }
+        None => {
+            // No destination: the SIGUSR2 handle still has to be held by something, or the
+            // signal falls back to its default disposition and kills the broker. This task
+            // answers it with the missing setting instead.
+            connections.spawn(mqttd::backup::log_no_backup_dir(
+                backup_demand,
+                shutdown.clone(),
+            ));
+        }
+    }
 
     start_client_listeners(
         &config,
@@ -1333,6 +1519,10 @@ fn jwt_config(config: &Config) -> mqtt_auth::token::TokenConfig {
 type HubHandle = (
     mpsc::UnboundedSender<hub::HubCommand>,
     Arc<dyn SessionStore>,
+    // The retained store the hub reads and writes, shared (not cloned) with the online
+    // backup task so an export reads the live handle instead of opening a second one over
+    // a locked data dir (ADR 0062 / ADR 0061).
+    Option<Arc<dyn RetainedStore>>,
     Option<mqtt_cluster::durable_plane::DurablePlane>,
     // The lease-group driver task (durable mode only), so graceful shutdown can stop it
     // rather than leave it spinning against a shut-down raft (ADR 0019).
@@ -1418,6 +1608,9 @@ fn log_durability_mode(config: &Config, founder: bool, voter_cap: usize, failure
     }
 }
 
+// One branch per durability mode, each a flat wiring block; long by mode count, not
+// complexity (the same shape `start_client_listeners` carries).
+#[allow(clippy::too_many_lines)]
 async fn start_hub(
     config: &Config,
     node_id: &NodeId,
@@ -1489,12 +1682,21 @@ async fn start_hub(
         // Durable retained (ADR 0037): retained mutations also commit through the
         // topic's group lease-owner, so retained state converges instead of diverging.
         hub.attach_durable_retained(durable_retained);
+        let mut retained_handle = None;
         if let Some(dir) = &data_dir {
-            hub.attach_retained_store(persistent_retained(dir)?); // ADR 0018 phase 4
+            let retained = persistent_retained(dir)?; // ADR 0018 phase 4
+            hub.attach_retained_store(retained.clone());
+            retained_handle = Some(retained);
         }
         wire_hub(&mut hub, config, metrics, brownout_status)?;
         tokio::spawn(hub.run());
-        Ok((hub_tx, store, Some(plane_for_health), Some(driver)))
+        Ok((
+            hub_tx,
+            store,
+            retained_handle,
+            Some(plane_for_health),
+            Some(driver),
+        ))
     } else if let Some(dir) = config.node.data_dir.clone() {
         // Single-node **persistent** sessions (ADR 0018 phase 1): the session log is
         // backed by an on-disk redb database, so sessions, subscriptions, the QoS-2
@@ -1518,10 +1720,14 @@ async fn start_hub(
         if cluster_configured {
             hub.set_cluster_configured();
         }
-        hub.attach_retained_store(persistent_retained(&dir)?); // ADR 0018 phase 4
+        // #241's `wire_hub` does the metrics/brownout wiring for all three arms (it exists
+        // precisely so a knob cannot be wired into two of the three); the local binding stays
+        // because this arm returns the retained handle for the backup exporter (#249).
+        let retained = persistent_retained(&dir)?; // ADR 0018 phase 4
+        hub.attach_retained_store(retained.clone());
         wire_hub(&mut hub, config, metrics, brownout_status)?;
         tokio::spawn(hub.run());
-        Ok((hub_tx, store, None, None))
+        Ok((hub_tx, store, Some(retained), None, None))
     } else {
         let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::with_limits(
             queue_limits_from_config(config)?,
@@ -1536,15 +1742,256 @@ async fn start_hub(
         }
         wire_hub(&mut hub, config, metrics, brownout_status)?;
         tokio::spawn(hub.run());
-        Ok((hub_tx, store, None, None))
+        Ok((hub_tx, store, None, None, None))
+    }
+}
+
+/// Apply a restore-from-backup before any client listener binds (ADR 0062).
+///
+/// The order is the safety property. The plan is parsed, digest-verified and
+/// coverage-checked FIRST (so a bad set of files costs nothing), then the node waits for
+/// the durable plane to converge — a cluster restore must place sessions by the CONVERGED
+/// ring, not by the single-member view a node has in its first seconds — and only then
+/// writes, through the ordinary store API. Any failure returns an error, which exits the
+/// process non-zero: a broker serving a partial import is the state this refuses.
+// A wiring seam with one call site and named handles, like `start_health`. Linear by design:
+// verify, wait, import, stamp, report — the ORDER is the safety property, so it reads as one
+// sequence rather than as helpers a reader has to reassemble.
+#[allow(clippy::too_many_arguments, clippy::ref_option, clippy::too_many_lines)]
+async fn run_restore(
+    from: &str,
+    config: &Config,
+    store: &Arc<dyn SessionStore>,
+    hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
+    status: &Arc<mqttd::backup::BackupStatus>,
+    metrics: &Arc<mqtt_observability::metrics::Metrics>,
+    plane: &Option<mqtt_cluster::durable_plane::DurablePlane>,
+    placement: &Arc<RwLock<Placement>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    status.set_restore(1, Some(format!("importing from {from}")));
+    metrics.set_restore_state(1);
+    let fail =
+        |status: &Arc<mqttd::backup::BackupStatus>, e: String| -> Box<dyn std::error::Error> {
+            status.set_restore(3, Some(e.clone()));
+            metrics.set_restore_state(3);
+            e.into()
+        };
+
+    let coverage = if config.backup.restore_partial_accept_data_loss {
+        warn!(
+            "restore: backup.restore_partial_accept_data_loss is SET — a set missing a \
+             cluster member's export will be imported anyway, FORFEITING that node's \
+             sessions. Unset it unless a node's data and its export are both permanently gone"
+        );
+        mqttd::backup::Coverage::PartialAcceptDataLoss
+    } else {
+        mqttd::backup::Coverage::Complete
+    };
+    let plan = match mqttd::backup::load_with(std::path::Path::new(from), coverage) {
+        Ok(plan) => plan,
+        Err(e) => return Err(fail(status, e)),
+    };
+    info!(
+        files = plan.files.len(),
+        superseded = plan.superseded.len(),
+        sessions = plan.sessions.len(),
+        retained = plan.retained.len(),
+        cleared = plan.cleared_topics.len(),
+        partial = plan.is_partial(),
+        set_sha256 = %plan.set_sha256,
+        "restore: verified backup set (format, digest, one generation per node, single \
+         cluster, coverage); waiting for the durable plane before importing (ADR 0062)"
+    );
+
+    // Wait for readiness: a durable restore that ran against an unconverged ring would
+    // place sessions on this node that the settled ring owns elsewhere.
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(config.backup.restore_timeout_secs);
+    if let Some(plane) = plane {
+        loop {
+            let members = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .member_count();
+            if plane.lease_group_ready() && members >= config.runtime.ready_min_members {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(fail(
+                    status,
+                    format!(
+                        "restore: the durable plane did not become ready within {}s \
+                         (backup.restore_timeout_secs) — lease_group_ready={}, members={} of \
+                         the {} runtime.ready_min_members asks for; nothing was imported. A \
+                         cluster restore needs every node up so sessions are placed by the \
+                         settled ring",
+                        config.backup.restore_timeout_secs,
+                        plane.lease_group_ready(),
+                        placement
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .member_count(),
+                        config.runtime.ready_min_members,
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    let sink = HubRetainedSink {
+        hub: hub_tx.clone(),
+    };
+    let report = match mqttd::backup::apply(&plan, store, &sink).await {
+        Ok(report) => report,
+        Err(e) => return Err(fail(status, e)),
+    };
+    if let Some(dir) = &config.node.data_dir {
+        // The stamp is also this node's licence to reboot: its next start reads it, sees the
+        // import already happened, and starts normally instead of refusing (ADR 0062).
+        if let Err(e) =
+            mqttd::backup::write_restored_stamp(std::path::Path::new(dir), from, &plan, &report)
+        {
+            warn!(
+                error = %e,
+                "restore succeeded but the provenance stamp could not be written — WITHOUT it \
+                 this node's next start will refuse (the data dir holds stores with nothing to \
+                 explain them). Fix the volume's permissions before restarting"
+            );
+        }
+    }
+    info!(
+        sessions = report.sessions,
+        queued = report.queued,
+        retained = report.retained,
+        retained_cleared = plan.cleared_topics.len(),
+        retained_expired = report.retained_expired,
+        already_present = report.already_present,
+        skipped_not_owner = report.skipped_not_owner,
+        imported = ?report.imported_clients,
+        skipped = ?report.skipped_clients,
+        partial = plan.is_partial(),
+        forfeited_nodes = ?plan.forfeited_nodes,
+        forfeited_clients = ?plan.forfeited_clients,
+        "restore complete (ADR 0062): sessions this node owns were imported; keys owned by \
+         other nodes are imported by THEIR restore of the same files"
+    );
+    status.set_restore(
+        2,
+        Some(if plan.is_partial() {
+            format!(
+                "PARTIAL (data forfeited): {} sessions, {} queued, {} retained; missing nodes \
+                 {:?}; forfeited sessions {}",
+                report.sessions,
+                report.queued,
+                report.retained,
+                plan.forfeited_nodes,
+                plan.forfeited_clients.len()
+            )
+        } else {
+            format!(
+                "{} sessions, {} queued, {} retained",
+                report.sessions, report.queued, report.retained
+            )
+        }),
+    );
+    metrics.set_restore_state(2);
+    Ok(())
+}
+
+/// Write a restored retained value through the HUB as RETAINED STATE — never as a publish.
+///
+/// A retained mutation must commit through its topic's group lease-owner (ADR 0037) or it
+/// would not converge across the cluster; that path lives in the hub, so the import uses it.
+/// It goes through [`hub::HubCommand::RestoreRetained`] rather than `Publish { retain: true }`
+/// because a publish also FANS OUT: it appends to every durable offline session whose
+/// restored subscription matches the topic — no client listener need be bound for that — so
+/// the restore would inject messages that were in no export, once per node, at whatever
+/// `QoS` the subscription granted. Retained state is written as retained state; the only
+/// outward traffic is the token-carrying fan-out to peer caches.
+struct HubRetainedSink {
+    hub: mpsc::UnboundedSender<hub::HubCommand>,
+}
+
+#[async_trait::async_trait]
+impl mqttd::backup::RetainedSink for HubRetainedSink {
+    async fn publish(
+        &self,
+        record: &mqttd::backup::RetainedRecord,
+        message_expiry: Option<u32>,
+    ) -> Result<(), String> {
+        let message = mqttd::backup::retained_message(record)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.hub
+            .send(hub::HubCommand::RestoreRetained {
+                topic: message.topic.clone(),
+                payload: message.payload.clone(),
+                qos: message.qos,
+                message_expiry,
+                app: message.app.clone(),
+                done: tx,
+            })
+            .map_err(|_| "restore: the hub is gone".to_string())?;
+        match rx.await {
+            Ok(mqttd::hub::PublishOutcome::Accepted) => Ok(()),
+            Ok(mqttd::hub::PublishOutcome::Refused(r)) => Err(format!(
+                "restore: retained topic {:?} was REFUSED ({r:?}) — nothing further was \
+                 imported. A quota or watermark that refuses a restore must be raised \
+                 before retrying, not worked around",
+                message.topic
+            )),
+            Err(_) => Err(format!(
+                "restore: retained topic {:?} was never answered by the hub — the retained \
+                 write failed or its authority commit was dropped; nothing further was imported",
+                message.topic
+            )),
+        }
+    }
+}
+
+/// Read the retained set for an export through the HUB, so each value comes paired with the
+/// `(epoch, offset)` convergence token that decides which of two nodes' exports of a topic
+/// is the later one — and with live tombstones, which exist in no cache (ADR 0062).
+///
+/// The hub is a single-threaded actor, so the pair is an atomic cut. The timeout is the
+/// honesty: a hub too busy to answer produces a failed run (the RPO alert fires) rather than
+/// an export that quietly waits forever or ships values with no ordering evidence.
+struct HubRetainedSource {
+    hub: mpsc::UnboundedSender<hub::HubCommand>,
+}
+
+/// How long the exporter waits for the hub's retained snapshot before failing the run.
+const RETAINED_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[async_trait::async_trait]
+impl mqttd::backup::RetainedSource for HubRetainedSource {
+    async fn snapshot(&self) -> Result<Vec<mqttd::backup::RetainedSnapshotEntry>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.hub
+            .send(hub::HubCommand::RetainedExportSnapshot { done: tx })
+            .map_err(|_| "backup: the hub is gone; no retained snapshot".to_string())?;
+        let entries = tokio::time::timeout(RETAINED_SNAPSHOT_TIMEOUT, rx)
+            .await
+            .map_err(|_| {
+                format!(
+                    "backup: the hub did not answer the retained snapshot within {}s; nothing \
+                     was written",
+                    RETAINED_SNAPSHOT_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|_| "backup: the hub dropped the retained snapshot request".to_string())??;
+        Ok(entries
+            .into_iter()
+            .map(|(message, token)| mqttd::backup::RetainedSnapshotEntry { message, token })
+            .collect())
     }
 }
 
 /// Build the on-disk retained-message store at `<dir>/retained.redb` (ADR 0018 phase 4),
 /// so retained messages survive a restart.
-fn persistent_retained(dir: &str) -> Result<Box<dyn RetainedStore>, Box<dyn std::error::Error>> {
+fn persistent_retained(dir: &str) -> Result<Arc<dyn RetainedStore>, Box<dyn std::error::Error>> {
     let path = Path::new(dir).join("retained.redb");
-    Ok(Box::new(PersistentRetainedStore::open(path)?))
+    Ok(Arc::new(PersistentRetainedStore::open(path)?))
 }
 
 /// Start the health endpoint server from `MQTTD_HEALTH_BIND` (no-op when unset).
@@ -1564,6 +2011,7 @@ async fn start_health(
     store_snapshot: &Arc<mqttd::store_watch::StoreSnapshot>,
     config_stamp: &Arc<mqttd::reload::ConfigStamp>,
     swim_key_fps: &Arc<std::sync::OnceLock<Vec<String>>>,
+    backup_status: &Arc<mqttd::backup::BackupStatus>,
     refound_evidence: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<
     (
@@ -1608,6 +2056,9 @@ async fn start_health(
     );
     // Re-found self-quarantine (issue #92 follow-up): a node that minted an identity
     // this boot AND then hears gossip from another cluster refuses to serve.
+    // Online backup + restore (ADR 0062): the export's age on /statusz, and a NotReady
+    // /readyz for as long as a restore is importing (its client listeners are not bound).
+    let state = state.with_backup_status(backup_status.clone());
     let state = match refound_evidence {
         Some(evidence) => state.with_refound_guard(evidence),
         None => state,
@@ -2771,6 +3222,11 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     if o.runtime != n.runtime {
         changed.push("runtime");
     }
+    // The backup task is wired at startup (its destination, schedule and store handles), so
+    // a changed [backup] section is staged, not live (ADR 0062).
+    if o.backup != n.backup {
+        changed.push("backup");
+    }
     changed
 }
 
@@ -2842,6 +3298,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--probe",
     "--url",
     "--decommission",
+    "--backup",
     "--pid",
     "--timeout",
     "--version",
@@ -2881,6 +3338,7 @@ fn print_usage() {
            mqttd --hash-password [u] print an Argon2id password-file line and exit\n  \
            mqttd --probe [/readyz]   query the running broker's health endpoint and exit\n  \
            mqttd --decommission      drain and gracefully stop the running broker\n  \
+           mqttd --backup            take an online backup on the running broker and wait\n  \
            mqttd --version           print the version and exit\n  \
            mqttd --help              print this help and exit\n\n\
          Configuration is via MQTTD_* environment variables and/or a --config TOML file;\n\
@@ -3130,6 +3588,116 @@ fn run_decommission() -> ! {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// `mqttd --backup [--pid <n>] [--timeout <secs>]` (ADR 0062): ask the RUNNING broker to
+/// take an online backup, and wait for the file.
+///
+/// Two facts decide this shape. First, an export must be taken by the process that already
+/// holds the stores: `redb` takes an exclusive `flock` per database, so a second process
+/// (this one) cannot read them — the work has to happen over there, and a signal is how a
+/// distroless image is reached. Second, a signal carries no payload, so the destination is
+/// broker-side config; this side reads the same config only to know where to WATCH.
+///
+/// Exit `0` once a new export appears, `1` on timeout (default **300 s**, not
+/// `--decommission`'s hour — a failed export writes no `.ndjson`, so the wait would otherwise
+/// outlast the failure by 55 minutes), `2` on a usage/config/signal error.
+#[cfg(unix)]
+fn run_backup() -> ! {
+    use rustix::process::{kill_process, Pid, Signal};
+
+    // A DEFAULT SUITED TO THIS COMMAND, not inherited from --decommission. The completion
+    // signal is a new `.ndjson` appearing, and a FAILED export produces none — only an
+    // invisible `.partial`, or nothing — so with the one-hour drain default this CLI blocked
+    // for 3600 s on a failure the broker had already recorded in milliseconds. Five minutes is
+    // far longer than any export measured here and short enough that a failure is reported
+    // while an operator is still watching; `--timeout` still overrides it.
+    let (raw_pid, timeout) = match decommission_args() {
+        Ok((pid, t)) => (
+            pid,
+            if std::env::args().any(|a| a == "--timeout") {
+                t
+            } else {
+                Duration::from_secs(300)
+            },
+        ),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let config = match config_path().and_then(|p| Ok(Config::load(p.as_deref())?)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("backup: cannot load the config to find [backup] dir: {e}");
+            std::process::exit(2);
+        }
+    };
+    let Some(dir) = config.backup.dir.clone() else {
+        eprintln!(
+            "backup: no [backup] dir configured (MQTTD_BACKUP_DIR) — the broker has nowhere to \
+             write an export, so there is nothing to wait for"
+        );
+        std::process::exit(2);
+    };
+    let dir = std::path::PathBuf::from(dir);
+    // What is already there, so a pre-existing file is never mistaken for this run's.
+    let before = backup_files(&dir);
+    let Some(pid) = Pid::from_raw(raw_pid) else {
+        eprintln!("error: --pid must be a positive pid, got {raw_pid}");
+        std::process::exit(2);
+    };
+    if let Err(e) = kill_process(pid, Signal::USR2) {
+        eprintln!("backup: cannot signal pid {raw_pid}: {e}");
+        std::process::exit(2);
+    }
+    println!(
+        "backup: sent SIGUSR2 to pid {raw_pid}; waiting for a new export under {}",
+        dir.display()
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(new) = backup_files(&dir).into_iter().find(|f| !before.contains(f)) {
+            println!("backup: wrote {}", new.display());
+            println!(
+                "backup: this is ONE NODE's readable state, not a cluster snapshot — back up \
+                 every node (see docs/OPERATIONS.md)"
+            );
+            std::process::exit(0);
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "backup: timed out after {}s waiting for an export under {}; check the broker's \
+                 log and mqttd_backup_runs_total{{outcome=\"error\"}}",
+                timeout.as_secs(),
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// The completed export files in `dir` (`.partial` files are deliberately invisible).
+#[cfg(unix)]
+fn backup_files(dir: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(mqttd::backup::FORMAT) && n.ends_with(".ndjson"))
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn run_backup() -> ! {
+    eprintln!("error: --backup is only supported on Unix");
+    std::process::exit(2);
 }
 
 /// Has the broker process exited (drain complete)? On Linux we read `/proc/<pid>/stat` and treat

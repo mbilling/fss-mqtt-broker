@@ -111,6 +111,9 @@ pub struct HealthState {
     /// Accepted SWIM key fingerprints (rotation posture, ADR 0054 T3); filled
     /// once the gossip plane starts. Fingerprints only — never material.
     keys: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
+    /// Backup + restore state (ADR 0062): the `/statusz` blocks, and the `/readyz` gate
+    /// that keeps a RESTORING node out of rotation until its import finishes.
+    backup: Option<Arc<crate::backup::BackupStatus>>,
     /// Re-found self-quarantine (issue #92 follow-up): `(guard enabled and cluster
     /// networking configured, foreign-cluster gossip seen)`. `None` when the guard is
     /// off or this is not a cluster node. See [`Self::refound_quarantined`].
@@ -143,6 +146,10 @@ struct Report {
     /// behind the 2026-07-14 incident).
     voters: Option<usize>,
     quorum_ack_age_ms: Option<u64>,
+    /// Whether a restore-from-backup is importing (ADR 0062). Reported in the body
+    /// because a node that is `NotReady` for a bounded, progressing reason must not look
+    /// like one that is merely slow to start.
+    restoring: bool,
 }
 
 impl Report {
@@ -171,6 +178,9 @@ impl Report {
         if let Some(ms) = self.quorum_ack_age_ms {
             let _ = write!(s, ",\"quorum_ack_age_ms\":{ms}");
         }
+        if self.restoring {
+            s.push_str(",\"restore\":{\"in_progress\":true,\"reason\":\"restore-in-progress\"}");
+        }
         s.push('}');
         s
     }
@@ -198,6 +208,7 @@ impl HealthState {
             metrics: None,
             identity: None,
             refound: None,
+            backup: None,
             brownout: None,
             stores: None,
             config: None,
@@ -223,6 +234,14 @@ impl HealthState {
         self.config = Some(config);
         self.keys = Some(keys);
         self.stores = stores;
+        self
+    }
+
+    /// Report the online-backup and restore state (ADR 0062) on `/statusz`, and fail
+    /// `/readyz` while a restore is importing.
+    #[must_use]
+    pub fn with_backup_status(mut self, status: Arc<crate::backup::BackupStatus>) -> Self {
+        self.backup = Some(status);
         self
     }
 
@@ -327,7 +346,15 @@ impl HealthState {
         if let Some(m) = &self.metrics {
             m.set_refound_quarantine(refound_quarantined);
         }
-        let ready = !refound_quarantined
+        // A RESTORING node is not ready, and must say so: the import runs before the client
+        // listeners bind, so reporting Ready would send an orchestrator's traffic to a port
+        // that is not open yet (ADR 0062).
+        let restoring = self
+            .backup
+            .as_ref()
+            .is_some_and(|b| b.restore_in_progress());
+        let ready = !restoring
+            && !refound_quarantined
             && !draining
             && live
             && members.is_none_or(|n| n >= self.min_members)
@@ -355,6 +382,7 @@ impl HealthState {
             decommission,
             voters,
             quorum_ack_age_ms,
+            restoring,
         }
     }
 }
@@ -541,6 +569,11 @@ impl HealthState {
                     ",\"config\":{{\"checksum\":\"{sum}\",\"generation\":{generation}}}"
                 );
             }
+        }
+        // Online backup + restore (ADR 0062): the last export's age is the RPO an operator
+        // alerts on, and a restore in progress is why this node is NotReady.
+        if let Some(fragment) = self.backup.as_ref().and_then(|b| b.statusz_fragment()) {
+            s.push_str(&fragment);
         }
         // Peer-bus protocol range: a mixed-version fleet is visible per node.
         let _ = write!(

@@ -41,6 +41,8 @@ pub struct Config {
     pub observability: Observability,
     /// Runtime behaviour (shutdown, readiness, reload).
     pub runtime: Runtime,
+    /// Online backup + restore (ADR 0062).
+    pub backup: Backup,
     /// The unknown key paths the last parse IGNORED under
     /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
     /// log them loudly without a signature change. Never serialized; empty under
@@ -391,6 +393,61 @@ pub struct Durable {
     /// explicitly off (`enabled = false`) never needs it: the lightweight in-memory
     /// store is an explicit choice already.
     pub allow_ephemeral: bool,
+}
+
+/// Online backup + restore of the durable state ([ADR 0062](../../../docs/adr/0062-online-backup-and-restore.md)).
+///
+/// The export is taken from the LIVE node — nothing is stopped — and is **per node**: a
+/// cluster backup is the set of every node's export. Off by default (`every_secs = 0`),
+/// because a scheduled backup with no destination would be a promise the broker cannot
+/// keep; `mqttd --backup` triggers one on demand whenever `dir` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Backup {
+    /// Directory the export files are written to (`MQTTD_BACKUP_DIR`). Must NOT be inside
+    /// `node.data_dir`: exports there grow the volume the disk watermark protects while
+    /// being counted by nothing (the watcher stats only the four store files).
+    pub dir: Option<String>,
+    /// Seconds between scheduled exports (`MQTTD_BACKUP_EVERY`); `0` (the default) = no
+    /// schedule. With a schedule, this is the RPO's cadence term.
+    pub every_secs: u64,
+    /// Export files kept per node id before the oldest is deleted (`MQTTD_BACKUP_KEEP`,
+    /// default 7). Retention is per node so a directory shared by several nodes cannot
+    /// have one node's rotation delete another's backups.
+    pub keep: u32,
+    /// A backup FILE or a DIRECTORY of them to import at startup (`MQTTD_RESTORE_FROM`).
+    /// Only into a node whose data dir holds no store files yet — a restore never merges
+    /// into a serving cluster.
+    pub restore_from: Option<String>,
+    /// Seconds the restore waits for the durable plane to become ready before giving up
+    /// (`MQTTD_RESTORE_TIMEOUT`, default 300). A cluster restore must place sessions by
+    /// the CONVERGED ring, so it waits for the mesh rather than importing into a
+    /// single-member view.
+    pub restore_timeout_secs: u64,
+    /// Import a set that is MISSING a cluster member's export, forfeiting that node's
+    /// sessions (`MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS`, default `false` = refuse).
+    ///
+    /// The default refuses, because a restore that silently drops a third of a cluster's
+    /// sessions is the failure the coverage check exists to prevent. But the disaster this
+    /// feature is for can take a node's data *and* its export together, and an
+    /// all-or-nothing check then makes the SURVIVING nodes' backups unrestorable too — so
+    /// there has to be a way to say "I know, restore the rest". The name states the
+    /// consequence: data is lost. Every forfeited node and session id is named in the log,
+    /// in `/statusz`, and in the on-disk `restored-from` stamp, permanently.
+    pub restore_partial_accept_data_loss: bool,
+}
+
+impl Default for Backup {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            every_secs: 0,
+            keep: 7,
+            restore_from: None,
+            restore_timeout_secs: 300,
+            restore_partial_accept_data_loss: false,
+        }
+    }
 }
 
 impl Default for Durable {
@@ -1162,6 +1219,30 @@ impl Config {
             self.runtime.config_watch_secs = num("MQTTD_CONFIG_WATCH", &v)?;
         });
 
+        // -- backup (ADR 0062) --
+        on!("MQTTD_BACKUP_DIR", v, {
+            self.backup.dir = Some(v);
+        });
+        on!("MQTTD_BACKUP_EVERY", v, {
+            self.backup.every_secs = num("MQTTD_BACKUP_EVERY", &v)?;
+        });
+        on!("MQTTD_BACKUP_KEEP", v, {
+            self.backup.keep = num("MQTTD_BACKUP_KEEP", &v)?;
+        });
+        on!("MQTTD_RESTORE_FROM", v, {
+            self.backup.restore_from = Some(v);
+        });
+        on!("MQTTD_RESTORE_TIMEOUT", v, {
+            self.backup.restore_timeout_secs = num("MQTTD_RESTORE_TIMEOUT", &v)?;
+        });
+        // A flag that FORFEITS data is turned on deliberately or not at all: unlike the
+        // presence-flips-on flags, only an explicit truthy value counts, so an empty or
+        // stray value cannot silently license a lossy restore.
+        on!("MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS", v, {
+            self.backup.restore_partial_accept_data_loss =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+        });
+
         Ok(())
     }
 
@@ -1170,6 +1251,9 @@ impl Config {
     ///
     /// # Errors
     /// [`ConfigError::Invalid`] describing the first problem found.
+    // One linear list of refusals — long by the number of settings it checks, not by
+    // branching complexity (the same shape `overlay_from` carries above).
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Plaintext / WS listeners are insecure; allowed, but never without a bind that
         // makes the intent explicit (the presence of the bind IS the opt-in, loudly logged
@@ -1211,6 +1295,48 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "observability.otlp_interval_secs must be >= 1".to_string(),
             ));
+        }
+        // Backup (ADR 0062). Each of these is a rollout-time refusal rather than a 03:00
+        // surprise, which is the whole reason `--check-config` exists.
+        if self.backup.every_secs > 0 && self.backup.dir.is_none() {
+            return Err(ConfigError::Invalid(
+                "backup.every_secs > 0 requires backup.dir (MQTTD_BACKUP_DIR): a scheduled \
+                 backup with no destination would report success and write nothing"
+                    .to_string(),
+            ));
+        }
+        // Nothing durable to export: a scheduled or on-demand backup of a node with no data
+        // dir would either write an empty file or refuse at run time. Refuse at the gate
+        // instead, so `--check-config` says it before a rollout.
+        if self.backup.dir.is_some() && self.node.data_dir.is_none() {
+            return Err(ConfigError::Invalid(
+                "backup.dir requires node.data_dir (MQTTD_DATA_DIR): a node with no durable \
+                 store has nothing to export, and a file that looks like a backup of nothing \
+                 is worse than an error"
+                    .to_string(),
+            ));
+        }
+        if self.backup.dir.is_some() && self.backup.keep == 0 {
+            return Err(ConfigError::Invalid(
+                "backup.keep must be >= 1 (MQTTD_BACKUP_KEEP): retention that keeps nothing \
+                 deletes the export it just wrote"
+                    .to_string(),
+            ));
+        }
+        // A backup directory inside the data dir would grow the very volume the disk
+        // watermark protects — and invisibly, since the watcher stats only the four store
+        // files, so the node browns out (or fills the PV) from BACKUPS rather than data.
+        if let (Some(backup_dir), Some(data_dir)) = (&self.backup.dir, &self.node.data_dir) {
+            let backup = std::path::Path::new(backup_dir);
+            let data = std::path::Path::new(data_dir);
+            if backup == data || backup.starts_with(data) {
+                return Err(ConfigError::Invalid(format!(
+                    "backup.dir ({backup_dir}) is inside node.data_dir ({data_dir}): exports \
+                     there grow the volume the disk watermark protects and are counted by \
+                     nothing (store_watch stats only the four store files). Put backup.dir on \
+                     a separate volume"
+                )));
+            }
         }
         // mTLS CRL needs a client CA to check against.
         if self.tls.crl.is_some() && self.tls.client_ca.is_none() {
@@ -1423,6 +1549,13 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_SHUTDOWN_GRACE",
     "MQTTD_READY_MIN_MEMBERS",
     "MQTTD_CONFIG_WATCH",
+    // backup (ADR 0062)
+    "MQTTD_BACKUP_DIR",
+    "MQTTD_BACKUP_EVERY",
+    "MQTTD_BACKUP_KEEP",
+    "MQTTD_RESTORE_FROM",
+    "MQTTD_RESTORE_TIMEOUT",
+    "MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS",
 ];
 
 #[cfg(test)]
@@ -1872,6 +2005,7 @@ mod tests {
             // Presence flips these on (default off).
             "MQTTD_ALLOW_ANONYMOUS"
             | "MQTTD_OIDC_ALLOW_HTTP"
+            | "MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS"
             | "MQTTD_ALLOW_EPHEMERAL_DURABILITY" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
@@ -1913,7 +2047,11 @@ mod tests {
             | "MQTTD_READY_MIN_MEMBERS"
             | "MQTTD_CONFIG_WATCH"
             | "MQTTD_OIDC_JWKS_REFRESH"
-            | "MQTTD_OIDC_MAX_STALE" => "7",
+            | "MQTTD_OIDC_MAX_STALE"
+            | "MQTTD_BACKUP_EVERY" => "7",
+            // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
+            // change nothing and the totality sweep would read as a missing mapping.
+            "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" => "3",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
@@ -2001,7 +2139,9 @@ mod tests {
         // Guards the count so adding/removing a field forces a deliberate list update.
         assert_eq!(
             seen.len(),
-            79,
+            // 79 before #249 (which itself included #241's four backlog/in-flight knobs)
+            // plus this change's six MQTTD_BACKUP_* / MQTTD_RESTORE_* variables.
+            85,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
@@ -2136,5 +2276,71 @@ mod tests {
             !c.durability_is_ephemeral(),
             "durable OFF is not ephemeral — it is in-memory by design"
         );
+    }
+
+    /// ADR 0062: the three backup misconfigurations `--check-config` must catch before a
+    /// rollout, each naming the keys involved. The containment check is the load-bearing
+    /// one: exports written inside the data dir grow the volume the disk watermark
+    /// protects while being counted by nothing, so the node browns out from BACKUPS.
+    #[test]
+    fn a_backup_dir_inside_the_data_dir_is_a_config_error() {
+        let base = || {
+            let mut c = Config::default();
+            c.node.data_dir = Some("/var/lib/mqttd".into());
+            c
+        };
+
+        // Equal to the data dir.
+        let mut c = base();
+        c.backup.dir = Some("/var/lib/mqttd".into());
+        let msg = c
+            .validate()
+            .expect_err("equal paths must refuse")
+            .to_string();
+        assert!(msg.contains("backup.dir"), "{msg}");
+        assert!(msg.contains("node.data_dir"), "{msg}");
+
+        // Nested under it.
+        let mut c = base();
+        c.backup.dir = Some("/var/lib/mqttd/backups".into());
+        let msg = c
+            .validate()
+            .expect_err("a nested path must refuse")
+            .to_string();
+        assert!(msg.contains("/var/lib/mqttd/backups"), "{msg}");
+
+        // Beside it: fine.
+        let mut c = base();
+        c.backup.dir = Some("/var/backups/mqttd".into());
+        c.validate()
+            .expect("a separate volume is the supported shape");
+
+        // A destination on a node with no durable store.
+        let mut c = Config::default();
+        c.node.data_dir = None;
+        c.durable.enabled = false;
+        c.backup.dir = Some("/var/backups/mqttd".into());
+        let msg = c
+            .validate()
+            .expect_err("a backup of a node with no durable store must refuse")
+            .to_string();
+        assert!(msg.contains("backup.dir requires node.data_dir"), "{msg}");
+
+        // A schedule with no destination.
+        let mut c = base();
+        c.backup.every_secs = 900;
+        let msg = c
+            .validate()
+            .expect_err("a schedule with no destination must refuse")
+            .to_string();
+        assert!(msg.contains("backup.every_secs"), "{msg}");
+        assert!(msg.contains("MQTTD_BACKUP_DIR"), "{msg}");
+
+        // Retention that keeps nothing.
+        let mut c = base();
+        c.backup.dir = Some("/var/backups/mqttd".into());
+        c.backup.keep = 0;
+        let msg = c.validate().expect_err("keep = 0 must refuse").to_string();
+        assert!(msg.contains("backup.keep"), "{msg}");
     }
 }
