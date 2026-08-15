@@ -1834,8 +1834,17 @@ pub struct Hub {
     /// the durable session metadata.
     expiring: HashMap<ClientId, u64>,
     /// Wills held back by a Will Delay Interval (§3.1.3.2.2, issue #299), keyed by
-    /// client, each with the absolute epoch second it becomes due. The same sweep
-    /// that expires sessions publishes them — one clock, not two.
+    /// client, each with the instant it becomes due. The same sweep that expires
+    /// sessions publishes them — one tick, not two.
+    ///
+    /// A monotonic [`Instant`], NOT the `Clock`'s epoch seconds, and the difference
+    /// is observable: `now_epoch_secs` truncates, so a disconnect at `t.9` would
+    /// arm `floor(t) + delay` and fire nearly a second EARLY — CI caught exactly
+    /// that (4 s asked, 2.8 s measured). Session expiry uses epoch seconds because
+    /// its deadline is persisted and must survive a takeover; this one is
+    /// node-local and never written down, so it has no such constraint and can
+    /// simply be accurate. The 1 s sweep cadence is then the only error, and it is
+    /// in the safe direction — never early.
     ///
     /// **Node-local and in-memory, deliberately.** If this node dies inside the
     /// window the delayed Will is lost, and a session that relocates mid-window
@@ -1843,7 +1852,7 @@ pub struct Hub {
     /// queue, and the honest first cut: firing a delayed Will from a node that no
     /// longer owns the session would be worse than not delaying at all. Recorded
     /// in `docs/TEST-PLAN.md`'s policy register rather than left to be discovered.
-    pending_wills: HashMap<ClientId, (Will, u64)>,
+    pending_wills: HashMap<ClientId, (Will, Instant)>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
     /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
@@ -6110,7 +6119,7 @@ impl Hub {
                     info!(client = %client.0, topic = %w.message.topic, "publishing will (ungraceful disconnect)");
                     self.publish_will(&w.message).await;
                 } else {
-                    let due = self.clock.now_epoch_secs() + u64::from(hold);
+                    let due = Instant::now() + Duration::from_secs(u64::from(hold));
                     info!(
                         client = %client.0, topic = %w.message.topic, delay_s = hold,
                         "holding will (will delay interval)"
@@ -6332,7 +6341,7 @@ impl Hub {
         // is due" is easier to reason about than N, and the 1s cadence is already
         // the granularity session expiry is judged at. A client that reconnects in
         // the meantime removed its entry at attach.
-        let now = self.clock.now_epoch_secs();
+        let now = Instant::now();
         let due: Vec<(ClientId, Will)> = self
             .pending_wills
             .iter()

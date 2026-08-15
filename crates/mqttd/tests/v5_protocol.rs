@@ -249,23 +249,28 @@ async fn v5_a_will_is_held_for_its_delay_then_published() {
     let mut watcher = Client::connect_v5_ok(addr, "delay-watch").await;
     watcher.subscribe(1, "wills/delayed", QoS::AtMostOnce).await;
 
-    let dying = connect_with_delayed_will(addr, "delay-dies", "wills/delayed", 2, 300).await;
+    let dying = connect_with_delayed_will(addr, "delay-dies", "wills/delayed", 3, 300).await;
+    let dropped_at = std::time::Instant::now();
     drop(dying); // abrupt close — ungraceful, so the Will is owed
 
-    // Not immediately: the whole point of the delay.
-    assert!(
-        matches!(
-            watcher.recv_bounded(Duration::from_millis(700)).await,
-            common::Recv::Quiet
-        ),
-        "the will must be HELD for its delay, not published on the drop"
-    );
-
-    // ...and then it arrives, once the delay has elapsed (2s delay + the 1s sweep
-    // cadence, with margin for a loaded runner).
     let p = watcher.expect_publish().await;
     assert_eq!(p.topic, "wills/delayed");
     assert_eq!(&p.payload[..], b"gone");
+
+    // MEASURED, not merely "it eventually arrives". Asserting only arrival would
+    // pass against a broker that ignores the delay entirely — the very bug this
+    // test exists for. The lower bound is the one that bites: a deadline armed on
+    // TRUNCATED whole seconds fires up to a second early, and only a measured
+    // assertion catches that (CI did, at 2.8s for a 4s delay).
+    let waited = dropped_at.elapsed();
+    assert!(
+        waited >= Duration::from_secs(3),
+        "the will fired after {waited:?}, EARLIER than the 3s delay asked for"
+    );
+    assert!(
+        waited < Duration::from_secs(6),
+        "the will fired after {waited:?}, far later than the 3s delay plus the 1s sweep"
+    );
 }
 
 /// The half that makes the delay worth having: a client that comes back inside
