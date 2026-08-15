@@ -9,7 +9,8 @@
 # Three properties, checked on every PR (no docker, no network — pure git):
 #
 #   1. THE PIN IS A PIN. The compose default and bootstrap.sh's fallback must be the
-#      SAME `ghcr.io/...:vX.Y.Z` reference — an exact release tag, never `latest` or any
+#      SAME `ghcr.io/...:X.Y.Z` reference — an exact release image tag (registry form,
+#      no 'v'; the git tag is v<X.Y.Z>), never `latest` or any
 #      other floating name. A floating tag is exactly how the skew arrived unnoticed.
 #   2. THE FLAG LIST IS CLOSED. Every `--flag` these artifacts hand to an mqttd
 #      invocation must be in REQUIRED_FLAGS below, so a new flag added to the artifacts
@@ -46,9 +47,17 @@ bootstrap_ref="$(grep -oE 'MQTTD_IMAGE:-[^}]+' "$BOOTSTRAP" | head -1 | cut -d- 
 [[ "$compose_ref" == "$bootstrap_ref" ]] \
   || fail "the defaults disagree: $COMPOSE says '$compose_ref', $BOOTSTRAP says '$bootstrap_ref'"
 TAG="${compose_ref##*:}"
-[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-  || fail "the default image tag '$TAG' is not an exact release tag (vX.Y.Z) — a floating tag is how issue #263 happened"
-ok "one pinned default: $compose_ref"
+# IMAGE tags carry no `v` — the release pipeline publishes `ghcr.io/...:X.Y.Z`
+# (VERSION="${GITHUB_REF_NAME#v}"; verified against GHCR: `0.9.0` exists, `v0.9.0`
+# is a 404). The pin originally shipped in the GIT-tag form (`:v0.9.1`), which the
+# pipeline would never have pushed: the default would have 404'd on release day and
+# the nightly default-image lane's manifest-inspect skip would have skipped FOREVER.
+# Corrected in the 0055-T8 PR; this gate now enforces the image-tag form and maps
+# it to the git tag (v$TAG) for the released-branch check below.
+[[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || fail "the default image tag '$TAG' is not an exact release image tag (X.Y.Z, no 'v' — the registry form) — a floating or git-form tag is how issue #263 happened"
+GIT_TAG="v$TAG"
+ok "one pinned default: $compose_ref (release tag $GIT_TAG)"
 
 # ── 2. the flag list is closed ───────────────────────────────────────────────────────
 # Flags handed to an mqttd invocation in the artifacts: the healthcheck's exec-form
@@ -69,26 +78,37 @@ done
 ok "every artifact flag is on the checked list ($(echo "$used_flags" | tr '\n' ' '))"
 
 # ── 3. the tag's binary parses every flag ────────────────────────────────────────────
-if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+if git rev-parse -q --verify "refs/tags/$GIT_TAG" >/dev/null; then
   for f in "${REQUIRED_FLAGS[@]}"; do
-    git show "$TAG:$MAIN_RS" | grep -q -- "\"$f\"" \
-      || fail "the pinned tag $TAG does not parse '$f' ($MAIN_RS at that tag) — the artifacts would break against their own default image"
+    git show "$GIT_TAG:$MAIN_RS" | grep -q -- "\"$f\"" \
+      || fail "the pinned tag $GIT_TAG does not parse '$f' ($MAIN_RS at that tag) — the artifacts would break against their own default image"
   done
-  ok "released: $TAG parses every checked flag"
+  ok "released: $GIT_TAG parses every checked flag"
 else
   newest="$(git tag --list 'v[0-9]*' | sort -V | tail -1)"
   if [[ -n "$newest" ]]; then
-    top="$(printf '%s\n%s\n' "$newest" "$TAG" | sort -V | tail -1)"
-    [[ "$top" == "$TAG" && "$TAG" != "$newest" ]] \
-      || fail "the pinned tag $TAG is not newer than the newest release ($newest) yet does not exist — a stale or bogus pin"
+    top="$(printf '%s\n%s\n' "$newest" "$GIT_TAG" | sort -V | tail -1)"
+    [[ "$top" == "$GIT_TAG" && "$GIT_TAG" != "$newest" ]] \
+      || fail "the pinned tag $GIT_TAG is not newer than the newest release ($newest) yet does not exist — a stale or bogus pin"
   fi
   for f in "${REQUIRED_FLAGS[@]}"; do
     grep -q -- "\"$f\"" "$MAIN_RS" \
       || fail "'$f' is not parsed by the working tree's $MAIN_RS — releasing HEAD cannot satisfy the pin"
   done
-  echo "NOTICE — the pinned tag $TAG is not released yet: the pin is forward-looking and"
-  echo "         HEAD parses every checked flag, so pushing the $TAG release tag makes it"
+  echo "NOTICE — the pinned tag $GIT_TAG is not released yet: the pin is forward-looking and"
+  echo "         HEAD parses every checked flag, so pushing the $GIT_TAG release tag makes it"
   echo "         real. Until then the nightly default-image compose lane skips loudly."
 fi
+
+# ── 4. the operator chart rides the same version train (0055-T8, issue #252) ─────────
+# The operator image first exists at the same release that makes the compose pin real,
+# and both are cut by one pipeline — so the operator chart's appVersion must equal the
+# compose pin's version. One forward tag for the whole repo, or none.
+OPERATOR_CHART=deploy/helm/mqttd-operator/Chart.yaml
+op_app="$(grep -E '^appVersion:' "$OPERATOR_CHART" | head -1 | sed -E 's/appVersion: *"?([^"]*)"?/\1/')"
+[[ -n "$op_app" ]] || fail "no appVersion found in $OPERATOR_CHART"
+[[ "$op_app" == "$TAG" ]] \
+  || fail "the operator chart pins appVersion $op_app but the compose default pins $TAG — the two artifacts must ride one release tag (v$TAG publishes both images)"
+ok "operator chart appVersion matches the compose pin ($op_app)"
 
 echo "deploy image pin: OK"

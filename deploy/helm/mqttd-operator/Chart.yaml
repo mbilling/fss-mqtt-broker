@@ -1,0 +1,32 @@
+apiVersion: v2
+name: mqttd-operator
+description: >-
+  The mqttd Kubernetes operator (ADR 0055): a MqttdCluster CRD and its kube-rs
+  reconciler — renders the same objects as the mqttd chart (render-parity gated),
+  reports status/conditions from /statusz, and runs the opt-in remediations
+  (split-brain fencing, brownout PVC expansion). Alert-only by default; no
+  remediation ever deletes data.
+type: application
+# Chart version — bumped on chart changes. appVersion tracks the operator image
+# tag, which is cut by the SAME release pipeline as the broker (one version train).
+#
+# FORWARD PIN (issue #252, same discipline as the compose default image, #263):
+# v0.9.1 does not exist yet — no operator image was ever published before it, so
+# there is no older tag this chart COULD pin. scripts/check-deploy-image-pin.sh
+# gates that this appVersion equals the compose pin (one forward tag for the whole
+# repo) and that the pin stays an exact vX.Y.Z; pushing the v0.9.1 release tag
+# publishes ghcr.io/mbilling/fss-mqtt-broker-operator:0.9.1 (signed, SBOM'd,
+# reproducible) and makes this chart installable as-is.
+version: 0.1.0
+appVersion: "0.9.1"
+home: https://github.com/mbilling/fss-mqtt-broker
+sources:
+  - https://github.com/mbilling/fss-mqtt-broker
+maintainers:
+  - name: project maintainers
+kubeVersion: ">=1.24.0-0"
+keywords:
+  - mqtt
+  - operator
+  - broker
+  - iot

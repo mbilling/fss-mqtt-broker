@@ -14,7 +14,7 @@ later `up`s reuse the same PKI. Each node's key lands in its **own** volume, and
 private key in one that no broker mounts.
 
 > **Which image this runs**: the default is **pinned** to
-> `ghcr.io/mbilling/fss-mqtt-broker:v0.9.1` — the oldest release whose binary has every
+> `ghcr.io/mbilling/fss-mqtt-broker:0.9.1` (the v0.9.1 release) — the oldest release whose binary has every
 > flag these artifacts use — never a floating `:latest` (issue #263 was that float
 > drifting behind the artifacts: v0.9.0 predates `mqttd --hash-password` and `--probe`,
 > so the healthcheck could not pass and `./bootstrap.sh` wrote log lines into

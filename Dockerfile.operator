@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+#
+# Hardened runtime image for the mqttd Kubernetes operator (ADR 0055 T8, ADR 0045 T4).
+#
+# A SEPARATE image from the broker's: the operator is a control-plane process — a
+# kube-rs reconciler for the `MqttdCluster` CRD — with its own (namespaced, minimal)
+# RBAC identity and failure domain, deployed once per namespace rather than once per
+# broker pod. Folding it into the broker image would put a Kubernetes API client
+# inside every broker deployment, most of which never run the operator.
+#
+# Same base and same posture as the broker and bridge images: distroless/static, no
+# libc, no shell, no package manager, uid 65532. The operator talks to the API
+# server over TLS, so the base's CA bundle is load-bearing here.
+#
+# The binary is built reproducibly OUTSIDE the image and copied in — the image
+# contains the *exact* signed, checksummed binary from the release, not a second one
+# compiled here that could drift from it. The release pipeline stages the per-arch
+# binary at `dist/mqttd-operator` before building.
+#
+# Build (from repo root, after staging the binary):
+#   cp target/<musl-triple>/release/mqttd-operator dist/mqttd-operator
+#   docker build -t mqttd-operator:dev -f Dockerfile.operator .
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ARG VCS_REF=unknown
+ARG VERSION=0.0.0-dev
+LABEL org.opencontainers.image.title="mqttd-operator" \
+      org.opencontainers.image.description="Kubernetes operator for mqttd — MqttdCluster CRD reconciler: rendering, split-brain fencing, brownout remediation (ADR 0055)" \
+      org.opencontainers.image.source="https://github.com/mbilling/fss-mqtt-broker" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${VERSION}"
+
+# The pre-built reproducible binary for this image's architecture, staged by the
+# release pipeline (or by hand for a local build) at dist/mqttd-operator.
+COPY --chmod=0755 dist/mqttd-operator /usr/local/bin/mqttd-operator
+
+# Configuration is entirely environmental (the ADR 0055 posture — the operator has
+# no config file): POD_NAME / POD_NAMESPACE via the downward API (leader election +
+# the namespaced watch), RUST_LOG for verbosity. The install path is the Helm chart
+# at deploy/helm/mqttd-operator, whose Deployment sets all of it.
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/mqttd-operator"]

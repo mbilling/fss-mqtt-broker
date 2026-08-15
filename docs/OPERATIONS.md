@@ -386,6 +386,43 @@ release, and `runtime.config_unknown_keys = "warn"` does not rescue type mismatc
 release you might roll back to, spell the floor as an integer or omit the key entirely —
 omitting it takes the same derived default.
 
+## Running the operator (optional)
+
+Everything on this page works with the plain chart — the operator
+([ADR 0055](adr/0055-kubernetes-operator.md)) is the *optional* reconciler for the parts
+that are multi-step reactions to observed state: split-brain **fencing**, brownout
+**PVC expansion** (with the watermark following the volume), and continuous
+status/conditions (`kubectl get mqc`) from the same `/statusz` you would read by hand.
+Every destructive remediation is **opt-in per cluster and alert-only by default**, and
+no remediation can delete data — the operator's RBAC has no PVC `delete` verb, and the
+nightly e2e asserts that with `kubectl auth can-i`.
+
+**Install** (one release per namespace that runs brokers — the RBAC and the watch are
+namespaced by design):
+
+```sh
+helm install mqttd-operator deploy/helm/mqttd-operator -n <ns>
+kubectl -n <ns> apply -f deploy/helm/mqttd-operator/example-mqttdcluster.yaml
+```
+
+The operator image is cut by the same release pipeline as the broker — signed
+(cosign, keyless), SBOM-attested, reproducible ([RELEASING](RELEASING.md)) — and the
+chart forward-pins the first release that publishes it (`v0.9.1`, the same
+gate-proven pin as the compose default; until that tag is pushed the image is not on
+GHCR). Render parity between the operator and the chart is a per-PR CI gate: both
+produce the same objects for equivalent inputs, so switching paths is not a migration.
+
+**Upgrading:** `helm upgrade` updates the operator, but Helm never upgrades CRDs it
+installed from `crds/` — after upgrading, apply the CRD for the new version yourself:
+`kubectl apply -f deploy/crds/mqttd.io_mqttdclusters.json` (from the release's tag).
+
+**CRD stability posture:** `mqttd.io/v1alpha1`. The schema is pinned in CI — a golden
+test regenerates it from the operator's own Rust types and fails on any drift, and the
+chart's packaged copy must be byte-identical — so within a release the installed schema
+is exactly the tested one. Pre-1.0 the schema may still change **between** releases
+(`v1alpha1` means exactly that); changes are called out in release notes, and the
+chart-only path remains the stability-conservative choice until the CRD graduates.
+
 ## Backup and disaster recovery
 
 Quorum replication is the primary recovery story, and it is a good one: a lost node's

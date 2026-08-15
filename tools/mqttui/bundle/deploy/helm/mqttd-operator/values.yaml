@@ -1,0 +1,35 @@
+# mqttd-operator chart values (ADR 0055 T8).
+#
+# The operator reconciles MqttdCluster resources IN ITS OWN NAMESPACE only — its
+# RBAC is a namespaced Role, and the controller's watch is deliberately narrowed
+# to match (a cluster-scoped watch under namespaced RBAC produced a 403 storm,
+# 0055-T7). Install one release per namespace that runs brokers. The CRD is
+# cluster-scoped and ships in this chart's crds/ directory; note Helm installs
+# CRDs but does NOT upgrade them — see the NOTES/README upgrade procedure.
+
+image:
+  repository: ghcr.io/mbilling/fss-mqtt-broker-operator
+  # Defaults to .Chart.appVersion when empty. The operator image is cut, signed,
+  # and SBOM-attested by the same release pipeline as the broker (ADR 0045), so
+  # the two share one version train.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# One replica is enough: the operator takes a coordination.k8s.io Lease before
+# acting, so more replicas are safe (cold standbys) but not required.
+replicaCount: 1
+
+# Log verbosity (tracing_subscriber EnvFilter syntax).
+logLevel: info
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

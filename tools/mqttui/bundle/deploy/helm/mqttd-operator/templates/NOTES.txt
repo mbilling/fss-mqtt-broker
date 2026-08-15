@@ -1,0 +1,24 @@
+mqttd-operator {{ .Values.image.tag | default .Chart.AppVersion }} installed in {{ .Release.Namespace }}.
+
+The operator reconciles MqttdCluster resources in THIS namespace only (its RBAC
+is namespaced by design). Create a cluster: mint the Secrets first
+(deploy/helm/mqttd/bootstrap.sh — same prerequisites as the chart), then apply
+the annotated example CR:
+
+  kubectl -n {{ .Release.Namespace }} apply -f deploy/helm/mqttd-operator/example-mqttdcluster.yaml
+  kubectl -n {{ .Release.Namespace }} get mqc mqttd -w   # phase, members, clusterId
+
+Remediations (split-brain fencing, brownout PVC expansion) are ALERT-ONLY until
+you opt in per cluster via spec.remediation — and no remediation can delete data
+(the operator's RBAC has no PVC delete verb; the nightly e2e asserts it).
+
+UPGRADING: `helm upgrade` updates the operator, but Helm never upgrades CRDs it
+installed from crds/ — after upgrading the chart, apply the CRD for the new
+version yourself:
+
+  kubectl apply -f https://raw.githubusercontent.com/mbilling/fss-mqtt-broker/v{{ .Chart.AppVersion }}/deploy/crds/mqttd.io_mqttdclusters.json
+
+CRD stability: mqttd.io/v1alpha1, schema-pinned in CI against the operator's own
+types (a golden test fails on any drift). Pre-1.0 the schema may change with the
+release train; changes are called out in release notes. See docs/OPERATIONS.md
+("Running the operator") for the full posture.

@@ -664,9 +664,14 @@ be found. Each is tracked; none is a silent surprise.
   (ADR 0041 T9). Relatedly, **a browned-out node keeps growing `replicas.redb`** for groups
   it merely follows — the refusal is decided at the session's owner — so headroom must cover
   peer-driven growth too. Disk-full itself fails closed and is crash-tested mid-write.
-- **The Kubernetes operator is not installable.** It is built and end-to-end
-  tested, but no image is published and its manifest is pinned to a kind-local
-  tag. The **Helm chart is the supported path** (ADR 0055 T8).
+- **The Kubernetes operator ships from the next release on.** It is packaged
+  (ADR 0055 T8, issue #252): an install chart (`deploy/helm/mqttd-operator`,
+  CRD included) and an operator image cut by the same signed/reproducible/SBOM
+  release pipeline as the broker — first published at `v0.9.1`, the tag the
+  chart forward-pins (until that tag is pushed, the image is not yet on GHCR).
+  The **Helm chart remains the fully-supported no-operator path**; the
+  `MqttdCluster` CRD is `v1alpha1`, schema-pinned in CI against the operator's
+  own types, and pre-1.0 may change with the release train.
 - **The horizontal scaling curve is unmeasured; the durable path itself now is,
   on one host.** [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)
   publishes end-to-end **acked** QoS 1/2 throughput and latency percentiles against
@@ -802,7 +807,7 @@ be found. Each is tracked; none is a silent surprise.
 | `mqtt-config` | Typed config with secure defaults |
 | `mqtt-bridge` | Outbound bridging to an upstream broker: durable spool, QoS-1 replay |
 | `mqttd` | The server binary: hub routing actor, connections, peer mesh |
-| `mqttd-operator` | Kubernetes operator for the `MqttdCluster` CRD (**not yet packaged for install** — the Helm chart is the supported path) |
+| `mqttd-operator` | Kubernetes operator for the `MqttdCluster` CRD — installable via `deploy/helm/mqttd-operator` (image published per release from `v0.9.1`; the plain Helm chart remains the no-operator path) |
 | `history-check` | Independent checker for recorded client-visible histories (issue #231): re-derives the durability promises from what clients actually saw, with no imports from the broker crates |
 
 ## Build & test

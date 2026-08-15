@@ -274,6 +274,27 @@ mod tests {
         );
     }
 
+    /// The operator Helm chart ships the CRD too (0055-T8, issue #252), as a
+    /// byte-identical copy — JSON is valid YAML, so the chart's `crds/` file is
+    /// the same bytes under a `.yaml` name, and this pin makes drift between
+    /// the installable copy and the generated schema impossible. Regenerate
+    /// both from the same source:
+    /// `cargo run -p mqttd-operator --bin gen_crd | tee deploy/crds/mqttd.io_mqttdclusters.json > deploy/helm/mqttd-operator/crds/mqttdclusters.yaml`
+    #[test]
+    fn the_chart_crd_is_the_same_bytes_as_the_generated_schema() {
+        let generated = serde_json::to_string_pretty(&MqttdCluster::crd()).unwrap();
+        let chart_copy = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/helm/mqttd-operator/crds/mqttdclusters.yaml"
+        ));
+        assert_eq!(
+            chart_copy.trim(),
+            generated.trim(),
+            "the chart's crds/mqttdclusters.yaml drifted from the generated CRD — \
+             regenerate it together with deploy/crds/mqttd.io_mqttdclusters.json"
+        );
+    }
+
     /// Destructive remediations default OFF (ADR 0055: Alert, never Act).
     #[test]
     fn remediation_defaults_are_alert_only() {

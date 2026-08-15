@@ -208,3 +208,46 @@ in its Role exists to forbid.
 
 §3.1's third action is therefore satisfied by construction rather than by the fence, and
 the fence keeps doing what it does: quarantine the PVC by label, delete the pod, once.
+
+## Amendment (2026-08-14): the operator is installable, and the CRD's stability posture is stated (T8, issue #252)
+
+Until now the operator was the honest paradox a review panel called a credibility drag:
+built, end-to-end tested nightly, and impossible to run — no published image, a manifest
+pinned to a kind-local tag. Issue #252 accepted either publishing it or recording
+"development artifact" as a scope decision. Publishing was always this record's own plan
+(T8), so that is what landed:
+
+- **The operator image joins the ADR 0045 release pipeline** — reproducible static musl
+  binary (both arches), cosign-signed image + blobs, SLSA provenance, its own CycloneDX
+  SBOM — `ghcr.io/mbilling/fss-mqtt-broker-operator:X.Y.Z`, cut by the same `vX.Y.Z` tag
+  as the broker. One version train, deliberately: the operator renders the broker's
+  objects, and the render-parity gate already couples the two at every commit.
+- **An install chart, `deploy/helm/mqttd-operator`** — the CRD packaged in `crds/`
+  (byte-identical to the generated schema, pinned by a golden test), the namespaced RBAC
+  the nightly e2e proved sufficient (no cluster-admin, no Secret access, no PVC delete),
+  a single-replica Deployment behind the Lease leader gate, and an annotated secure
+  example `MqttdCluster`. `deploy/operator/operator.yaml` remains what it always was —
+  the dev/e2e manifest — and now says so while pointing at the chart.
+- **A forward pin, gate-proven** (the issue #263 discipline): no operator image predates
+  the next release, so the chart's `appVersion` pins it — and
+  `scripts/check-deploy-image-pin.sh` now holds the operator chart and the compose
+  default to the SAME forward tag. Fixing that gate also surfaced and closed a latent
+  #263 residue: the compose pin used the git-tag form (`:v0.9.1`) while the pipeline
+  publishes registry-form tags (`:0.9.1` — verified against GHCR, where `0.9.0` exists
+  and `v0.9.0` is a 404), so the default would have 404'd on release day and the
+  nightly default-image lane's manifest-inspect skip would have skipped forever. Both
+  artifacts now pin the registry form; the gate maps it to the git tag.
+
+**CRD stability posture, stated** (the issue's second acceptance criterion):
+`mqttd.io/v1alpha1`. Within a release the installed schema is exactly the tested one —
+the golden test regenerates it from the operator's own types and CI fails on any drift,
+chart copy included. Between releases, pre-1.0, `v1alpha1` means what it says: the
+schema may change with the release train, called out in release notes, and Helm's
+own CRD semantics (installed from `crds/`, never upgraded) make the upgrade step
+explicit — documented in OPERATIONS.md and the chart NOTES. The chart-only path remains
+fully supported and is the stability-conservative choice until the CRD graduates.
+
+The acceptance closes fully at the next release tag: the repository side (pipeline,
+chart, gates, docs) is complete, and pushing `v0.9.1` publishes the image that makes
+the chart installable as-is — the same posture, and the same single remaining
+maintainer action, as the compose pin (0047-T12).

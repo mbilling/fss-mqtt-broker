@@ -16,12 +16,19 @@ Every release publishes, for the tagged commit:
 - **A reproducible bridge binary** — `mqtt-bridge`, both targets, checksummed and
   signed exactly like the broker's. The boundary bridge (ADR 0025) used to ship in
   no artifact at all, so running it meant building from source.
-- **Two hardened container images** — `ghcr.io/mbilling/fss-mqtt-broker:X.Y.Z` and
-  `ghcr.io/mbilling/fss-mqtt-broker-bridge:X.Y.Z` (each also `:latest` for a
+- **Three hardened container images** — `ghcr.io/mbilling/fss-mqtt-broker:X.Y.Z`,
+  `ghcr.io/mbilling/fss-mqtt-broker-bridge:X.Y.Z`, and
+  `ghcr.io/mbilling/fss-mqtt-broker-operator:X.Y.Z` (each also `:latest` for a
   non-prerelease), distroless/static (fully-static musl binaries), non-root,
-  multi-arch. The bridge is a **separate image**, not a second entrypoint into the
-  broker's: it is a separate process with its own identity, credentials and failure
-  domain, usually deployed where the broker is not.
+  multi-arch. NOTE the image tag carries **no `v`** — `:0.9.1`, cut by git tag
+  `v0.9.1` (the deploy artifacts pin the image form; `scripts/check-deploy-image-pin.sh`
+  holds the two forms together). The bridge is a **separate image**, not a second
+  entrypoint into the broker's: it is a separate process with its own identity,
+  credentials and failure domain, usually deployed where the broker is not. The
+  operator (ADR 0055 T8) likewise: a control-plane reconciler installed by its own
+  chart (`deploy/helm/mqttd-operator`), not something every broker pod should carry.
+- **A reproducible `mqttd-operator` binary** — both targets, checksummed and signed
+  like the others; the operator image contains exactly this binary.
 - **A reproducible `mqttui` binary** — both targets, checksummed and signed like the
   others. It is a terminal UI for a human at a keyboard, so it ships as a binary and is
   deliberately **not** added to the container images: nothing in a distroless image can use
@@ -33,8 +40,8 @@ Every release publishes, for the tagged commit:
   by digest. All signatures are recorded in the public Rekor transparency log.
 - **Build provenance** — SLSA build-provenance attestations for the binaries and
   the image (what commit, workflow, and inputs produced them).
-- **An SBOM per binary** — CycloneDX `sbom-X.Y.Z.cdx.json`, `sbom-bridge-X.Y.Z.cdx.json`
-  and `sbom-mqttui-X.Y.Z.cdx.json`, each enumerating only *its* transitive graph, so the
+- **An SBOM per binary** — CycloneDX `sbom-X.Y.Z.cdx.json`, `sbom-bridge-X.Y.Z.cdx.json`,
+  `sbom-operator-X.Y.Z.cdx.json` and `sbom-mqttui-X.Y.Z.cdx.json`, each enumerating only *its* transitive graph, so the
   bridge's dependencies are not implied to be in the broker image or vice versa. `mqttui`'s
   is cut from its own lockfile, which is the point of the separate workspace. Attached to
   the release and to the matching image.
