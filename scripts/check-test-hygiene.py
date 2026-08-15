@@ -2332,6 +2332,15 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "an hour of sustained load by design (MQTTD_SOAK_SECS=3600)",
         "nightly",
     ),
+    # Its own `#[ignore]` reason said "nightly tier" and no tier ran it: nightly drives
+    # `--ignored` for `cluster_upgrade` and `cluster_soak` only. The reason was corrected rather
+    # than the workflow extended — a measurement that backs the numbers in
+    # docs/delivery/0049 is worth wiring up, but claiming a tier runs it is the part that
+    # actively misleads, and `None` is what makes the gate say so on every run.
+    "crates/mqttd/tests/backup_bench.rs::export_and_restore_wall_clock_at_stated_fixtures": (
+        "macro-measurement: tens of thousands of fsync'd writes, minutes long",
+        None,
+    ),
     "crates/mqttd/tests/durable_bench.rs::durable_path_floor": (
         "macro-benchmark: minutes long, and only meaningful in --release",
         None,

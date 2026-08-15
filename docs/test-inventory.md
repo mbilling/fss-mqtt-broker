@@ -27,10 +27,12 @@ test), so it is recorded: `--check-inventory` fails when a test becomes ignored 
 file changing, every ignored test must be declared in `IGNORE_ALLOWLIST` with the tier that
 runs it, and `--check-results` fails if the ignored set in an actual run differs from this one.
 
-## `crates/history-check/src/lib.rs` — 2 test(s)
+## `crates/history-check/src/lib.rs` — 4 test(s)
 
 - `tests::a_clean_history_passes_and_roundtrips_jsonl`
+- `tests::a_history_recorded_before_dup_and_qos_still_parses`
 - `tests::each_check_bites`
+- `tests::the_redelivery_check_accepts_the_legal_shapes`
 
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
@@ -219,14 +221,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `connect_refused_surfaces_as_an_error`
 - `the_client_connects_subscribes_and_round_trips_a_publish`
 
-## `crates/mqtt-bridge/tests/engine.rs` — 9 test(s)
+## `crates/mqtt-bridge/tests/engine.rs` — 14 test(s)
 
+- `a_bidirectional_pair_delivers_exactly_one_copy_per_side`
 - `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted`
 - `a_live_retained_publish_crosses_the_boundary_retained`
 - `a_local_message_fans_out_to_multiple_upstreams`
 - `a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit`
 - `a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back`
+- `a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local`
 - `a_retained_message_crosses_the_boundary_and_lands_retained`
+- `a_retained_value_does_not_ping_pong_across_a_both_rule`
+- `a_three_broker_ring_is_terminated_by_the_hop_counter`
+- `hop_count_increments_along_a_chain`
 - `messages_spooled_while_an_upstream_is_down_replay_on_reconnect`
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
@@ -592,8 +599,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 28 test(s)
+## `crates/mqtt-config/src/lib.rs` — 30 test(s)
 
+- `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
 - `tests::a_bad_numeric_env_value_is_a_located_error`
 - `tests::a_crl_without_its_ca_is_rejected`
@@ -616,6 +624,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::per_var_boolean_conventions_are_honoured`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
+- `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
 - `tests::the_refusal_lists_all_unknown_keys`
 - `tests::the_watermark_poll_is_bounded_between_one_second_and_five_minutes`
@@ -702,12 +711,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-storage/src/lib.rs` — 74 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 76 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
 - `data_dir::tests::creates_a_missing_directory`
 - `data_dir::tests::stamps_on_first_use_and_rejects_a_foreign_node`
+- `logged::export_order_tests::the_queue_is_read_before_the_metadata_that_covers_it`
 - `logged::tests::a_pre_0057_record_decodes_with_an_empty_outbound_window`
 - `logged::tests::ack_truncates_and_is_idempotent`
 - `logged::tests::an_unacked_inbound_qos2_id_survives_reopen_and_is_not_reported_as_a_duplicate`
@@ -735,6 +745,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `open::tests::reopens_after_the_first_handle_drops`
 - `persistent_log::tests::a_foreign_schema_version_fails_closed`
 - `persistent_log::tests::append_assigns_monotonic_offsets_per_key`
+- `persistent_log::tests::keys_enumerates_every_live_key_and_forgets_removed_ones`
 - `persistent_log::tests::live_range_and_truncate_keep_offsets_monotonic`
 - `persistent_log::tests::remove_clears_the_key_and_resets_offsets`
 - `persistent_log::tests::state_survives_reopen`
@@ -785,12 +796,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/bin/render_sample.rs` — 0 test(s)
 
 
-## `crates/mqttd-operator/src/lib.rs` — 33 test(s)
+## `crates/mqttd-operator/src/lib.rs` — 34 test(s)
 
 - `controller::tests::an_unknown_kind_has_no_gvk`
 - `controller::tests::every_rendered_kind_has_a_gvk`
 - `controller::tests::the_owner_reference_ties_objects_to_the_cr_by_uid`
 - `crd::tests::remediation_defaults_are_alert_only`
+- `crd::tests::the_chart_crd_is_the_same_bytes_as_the_generated_schema`
 - `crd::tests::the_committed_crd_matches_the_generated_schema`
 - `leader::tests::lease_timestamps_carry_microsecond_precision`
 - `observe::tests::a_healthy_cluster_is_ready_and_quiet`
@@ -824,10 +836,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 295 test(s)
+## `crates/mqttd/src/lib.rs` — 326 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
-- `admission::tests::the_penalty_box_refuses_after_the_threshold_and_decays`
+- `admission::tests::the_penalty_box_refuses_after_the_threshold`
+- `admission::tests::the_penalty_decays_back_to_admission`
 - `admission::tests::the_penalty_table_is_bounded_under_address_spraying`
 - `admission::tests::the_per_ip_cap_is_independent_and_the_table_shrinks_to_empty`
 - `admission::tests::unconfigured_caps_admit_everything`
@@ -839,6 +852,31 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `aliases::tests::outbound_assigns_then_reuses`
 - `aliases::tests::outbound_disabled_when_max_zero`
 - `aliases::tests::outbound_stops_assigning_when_full_but_keeps_existing`
+- `backpressure::tests::an_entry_larger_than_the_whole_byte_cap_is_kept_so_delivery_progresses`
+- `backpressure::tests::message_bytes_counts_topic_payload_and_forwarded_properties`
+- `backpressure::tests::packet_bytes_matches_message_bytes_for_a_publish`
+- `backpressure::tests::the_byte_bound_evicts_before_the_count_bound`
+- `backpressure::tests::the_byte_counter_equals_a_recomputed_sum_after_every_mutation`
+- `backpressure::tests::the_count_bound_still_bites_when_it_is_the_tighter_one`
+- `backpressure::tests::the_default_limits_are_todays_hard_coded_bound`
+- `backup::tests::a_duplicate_client_resolves_to_the_highest_token_whatever_the_file_order`
+- `backup::tests::a_newer_format_version_is_refused_naming_both_versions_and_the_writer_build`
+- `backup::tests::a_partial_restore_needs_the_explicit_opt_in_and_names_what_it_forfeits`
+- `backup::tests::a_restore_into_a_data_dir_that_already_holds_state_is_refused`
+- `backup::tests::a_restore_missing_a_peers_export_is_refused_naming_the_client_ids`
+- `backup::tests::a_restore_reads_the_newest_generation_of_each_node_and_never_merges_two`
+- `backup::tests::a_restored_node_restarts_inertly_and_a_different_set_is_still_refused`
+- `backup::tests::a_retained_snapshot_that_fails_fails_the_run_and_writes_nothing`
+- `backup::tests::an_export_of_a_live_store_round_trips_through_the_importer`
+- `backup::tests::an_export_without_a_valid_trailer_or_still_partial_is_never_imported`
+- `backup::tests::an_incomplete_session_scan_fails_the_run_and_advances_no_timestamp`
+- `backup::tests::base64_round_trips_every_byte_and_length`
+- `backup::tests::exports_from_two_different_clusters_are_refused_naming_both_ids`
+- `backup::tests::retained_recency_is_the_convergence_token_then_file_time_never_the_node_name`
+- `backup::tests::the_cluster_id_is_read_fresh_for_every_export_not_snapshotted_at_startup`
+- `backup::tests::the_exporter_borrows_the_running_handle_and_never_opens_its_own`
+- `backup::tests::the_headers_created_at_is_a_parseable_rfc_3339_instant`
+- `backup::tests::the_utc_stamp_is_sortable_and_correct`
 - `cluster::tests::alive_after_dead_restarts_the_dialer`
 - `cluster::tests::alive_dials_and_dead_aborts_link_and_notifies_hub`
 - `cluster::tests::alive_without_routing_address_is_skipped`
@@ -988,6 +1026,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_restart_after_pubrec_resumes_with_pubrel_under_the_original_id`
 - `hub::tests::a_restart_before_pubrec_republishes_dup_under_the_original_id`
 - `hub::tests::a_restarted_owners_snapshot_exports_committed_tokens_and_readopts_the_record`
+- `hub::tests::a_restored_retained_value_is_retained_state_and_never_touches_a_restored_queue`
 - `hub::tests::a_resumed_session_loses_grants_the_current_policy_denies`
 - `hub::tests::a_retained_commit_in_the_interest_window_reaches_the_fresh_subscriber`
 - `hub::tests::a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact`
@@ -1007,6 +1046,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop`
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
 - `hub::tests::an_expired_retained_value_is_not_replayed_and_is_reaped`
+- `hub::tests::an_inflight_ceiling_caps_the_clients_own_receive_maximum`
 - `hub::tests::an_online_persistent_subscriber_receives_the_wire_send_only_after_the_append_resolves`
 - `hub::tests::an_online_session_whose_group_moved_is_closed_so_it_relocates`
 - `hub::tests::an_orphaned_released_id_is_cleared_by_the_spurious_pubrel_cycle`
@@ -1081,11 +1121,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::shared_subscription_skips_retained_messages`
 - `hub::tests::takeover_replaces_connection_and_ignores_stale_detach`
 - `hub::tests::the_apply_path_stays_silent_once_the_window_has_closed`
+- `hub::tests::the_backlog_byte_bound_sheds_acked_entries_and_counts_them`
 - `hub::tests::the_fanout_and_snapshot_carry_the_deadline`
 - `hub::tests::the_grant_sweep_removes_revoked_subscriptions_without_disconnecting`
 - `hub::tests::the_identity_sweep_evicts_revoked_sessions_and_spares_the_rest`
 - `hub::tests::the_log_truncates_only_through_the_contiguous_acked_prefix`
 - `hub::tests::the_memory_axis_refuses_the_publishers_ack_just_as_the_disk_axis_does`
+- `hub::tests::the_outbound_byte_cap_sheds_qos0_before_the_packet_count_cap`
+- `hub::tests::the_outbound_byte_counter_returns_to_zero_when_the_writer_drains`
 - `hub::tests::the_raw_broadcast_no_longer_warms_caches_under_durable`
 - `hub::tests::the_rehome_scan_is_skipped_while_ownership_has_not_moved`
 - `hub::tests::the_retained_digest_is_order_independent_and_set_sensitive`
@@ -1122,7 +1165,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_watch::tests::the_store_skew_report_is_edge_triggered_with_hysteresis`
 - `store_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 
-## `crates/mqttd/src/main.rs` — 12 test(s)
+## `crates/mqttd/src/main.rs` — 13 test(s)
 
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::changing_the_identity_source_requires_a_restart`
@@ -1131,6 +1174,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::queue_limits_read_overflow_policy_from_config`
 - `tests::requires_restart_masks_the_live_swappable_fields`
 - `tests::runtime_precheck_rejects_what_startup_would_reject`
+- `tests::subscriber_limits_from_config_maps_every_knob`
 - `tests::the_config_and_the_authenticator_agree_on_identity_source_spellings`
 - `tests::the_peer_bus_tls_material_is_file_watched`
 - `tests::unknown_flags_are_caught_and_known_ones_pass`
@@ -1166,6 +1210,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `legacy_handle_path_still_accepts_anonymous_clients`
 - `mtls_identity_is_accepted_even_without_anonymous`
 - `password_credentials_are_rejected_with_bad_credentials`
+
+## `crates/mqttd/tests/backup_bench.rs` — 1 test(s)
+
+- `export_and_restore_wall_clock_at_stated_fixtures` — `#[ignore]`d
+
+## `crates/mqttd/tests/backup_restore.rs` — 4 test(s)
+
+- `a_live_cluster_export_restores_sessions_retained_and_acked_facts`
+- `a_restore_whose_format_stamp_does_not_match_refuses_and_the_node_does_not_start`
+- `a_restored_node_restarts_with_its_own_unchanged_environment`
+- `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death`
 
 ## `crates/mqttd/tests/binary_smoke.rs` — 6 test(s)
 
@@ -1490,7 +1545,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `v5_user_properties_are_forwarded_to_subscribers`
 - `v5_will_user_properties_are_forwarded`
 
-## `crates/mqttd/tests/wire.rs` — 38 test(s)
+## `crates/mqttd/tests/wire.rs` — 41 test(s)
 
 - `a_byte_property_outside_zero_or_one_is_refused`
 - `a_connect_split_into_single_bytes_is_parsed`
@@ -1498,6 +1553,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_hash_sharing_its_level_is_an_invalid_filter`
 - `a_hash_that_is_not_the_last_level_is_an_invalid_filter`
 - `a_leading_bom_in_a_topic_is_preserved_not_stripped`
+- `a_packet_over_the_inbound_ceiling_is_refused`
 - `a_plus_sharing_its_level_is_an_invalid_filter`
 - `a_property_from_another_packet_type_is_refused`
 - `a_property_length_longer_than_the_block_is_malformed`
@@ -1510,6 +1566,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_zero_length_topic_filter_is_refused`
 - `a_zero_subscription_identifier_is_refused`
 - `an_embedded_null_in_a_topic_is_malformed`
+- `an_empty_client_id_with_clean_start_is_assigned_one`
+- `an_empty_client_id_without_clean_start_is_refused`
 - `an_encoded_surrogate_in_a_topic_is_malformed`
 - `an_overlong_utf8_encoding_is_malformed`
 - `an_unknown_property_identifier_is_malformed`
