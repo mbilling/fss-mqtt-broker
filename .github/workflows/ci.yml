@@ -159,6 +159,14 @@ jobs:
           MQTTD_BIN=target/debug/mqttd MQTT_BRIDGE_BIN=target/debug/mqtt-bridge \
             ./scripts/migrate/dual-run-smoke.sh
 
+      # Issue #297: the converters' SEMANTIC oracle — real mosquitto on the source
+      # config vs mqttd on the converted one, seven observable verdicts diffed.
+      # The provenance gate kills fabrication; only a differential run can catch a
+      # key meaning something other than what the converter took it to mean.
+      # Reuses the mosquitto broker installed for the cutover smoke above.
+      - name: Migration differential (mosquitto vs mqttd on the converted config)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/migrate/differential-mosquitto.sh
+
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 

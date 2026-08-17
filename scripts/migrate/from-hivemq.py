@@ -1497,6 +1497,33 @@ def parse_credentials(
                         "ALL, so nothing was emitted. Translate it by hand"
                     )
                     continue
+                # A LITERAL %c OR %i, checked BEFORE the ${{...}} rewrite so a %c this
+                # loop itself produces from ${{clientid}} is never confused with one the
+                # source carried. The file-RBAC extension substitutes only ${{clientid}}
+                # and ${{username}} (its 4.6.16 documentation — the same reference every
+                # other claim in this converter cites), so a %c or %i in a <topic>
+                # matched those BYTES literally. mqttd substitutes %c (client id) and %i
+                # (identity) in EVERY rule's topics with no escape
+                # (crates/mqtt-auth/src/acl.rs), so carrying it across would turn a rule
+                # on one literal topic into a live per-client grant the source never gave
+                # — the same misread the Mosquitto converter refuses on a plain `topic`
+                # line, and until 2026-08-16 this converter emitted it with only a
+                # fail-closed caveat beside it. Refused instead. Found via issue #297.
+                literal = [t for t in ("%c", "%i") if t in perm.topic]
+                if literal:
+                    todos.append(
+                        f"{where}: the topic contains "
+                        + " and ".join(literal)
+                        + " LITERALLY — file-RBAC substitutes only ${{clientid}} and "
+                        "${{username}} (4.6.16 reference), while mqttd substitutes %c "
+                        "(client id) and %i (identity) in EVERY rule's topics with no "
+                        "escape (crates/mqtt-auth/src/acl.rs). Carrying it over would "
+                        "turn a rule on one literal topic into a live per-client grant "
+                        "the source never gave, so NO RULE WAS WRITTEN for it. If a "
+                        "per-client namespace IS what you want, write it as an mqttd "
+                        "rule deliberately; if the topic really is literal, rename it"
+                    )
+                    continue
                 topic = perm.topic.replace("${{clientid}}", "%c").replace(
                     "${{username}}", "%i"
                 )

@@ -2000,13 +2000,26 @@ def convert_authn(tree: dict, conv: Conversion) -> None:
                     "`groups = [...]` — which expresses membership, not per-client topic "
                     "rules. Re-model the policy that way, or keep EMQX for those clients"
                 )
-            if entry.get("jwks") or entry.get("endpoint"):
+            if entry.get("jwks") or entry.get("endpoint") or truthy(entry.get("use_jwks")):
+                # THE ENDPOINT IS NAMED, because "with JWKS" without the URL left the
+                # operator unable to check that the provider this converter is telling
+                # them to reconfigure around is the provider they believe was in force —
+                # the same rule report_unread_authn_keys() already applies to every other
+                # authenticator's server/database/url. Found via issue #297.
+                raw_ep = entry.get("endpoint") or entry.get("jwks")
+                jwks_url = str(raw_ep).strip().strip('"')
+                if not jwks_url or jwks_url.lower() in ("true", "false"):
+                    # `use_jwks`/`jwks` was switched on but no URL accompanied it — say
+                    # so rather than print a boolean where a URL belongs.
+                    jwks_url = "(no URL in the input — only the switch)"
                 conv.todo(
-                    "authentication [jwt] with JWKS: mqttd's JWKS path is the SEPARATE "
-                    "[security.oidc] authenticator (issuer, audience, jwks_refresh_secs, "
+                    f"authentication [jwt] fetched its keys from the JWKS endpoint "
+                    f"{jwks_url}: mqttd's JWKS path is the SEPARATE [security.oidc] "
+                    "authenticator (issuer, audience, jwks_refresh_secs, "
                     "max_stale_secs, groups_claim) — it discovers the JWKS from the "
-                    "issuer rather than taking a URL. Set [security.oidc] issuer to your "
-                    "identity provider; [security.jwt] is for STATIC keys only"
+                    "issuer rather than taking a URL. Set [security.oidc] issuer to the "
+                    "identity provider that serves that endpoint; [security.jwt] is for "
+                    "STATIC keys only"
                 )
             if entry.get("secret") is not None:
                 conv.todo(
@@ -3094,6 +3107,35 @@ PLACEHOLDERS = {
 
 def convert_topic(topic: str, todos: list[str], where: str) -> str | None:
     """EMQX placeholders -> mqttd substitutions. `None` = do not emit this rule."""
+    # A LITERAL %c OR %i, checked BEFORE any placeholder is rewritten so a %c that this
+    # function itself produces from ${clientid} is never confused with one the source
+    # carried. EMQX substitutes nothing of that shape: the vendor's own acl.conf schema
+    # (scripts/migrate/fixtures/emqx-acl-6.2.2.conf, "Supported placeholders are:") lists
+    # ${username}, ${clientid}, ${cert_common_name}, ${client_attrs.NAME} and ${zone} —
+    # `%c`/`%i` are not placeholders in EMQX 5/6, so a topic carrying them matched those
+    # BYTES literally. mqttd substitutes %c (client id) and %i (identity) in EVERY rule's
+    # topics and has no escape (crates/mqtt-auth/src/acl.rs), so carrying the filter across
+    # would turn a rule on one literal topic into a live per-client grant the source never
+    # gave — the same misread the Mosquitto converter refuses on a plain `topic` line, and
+    # until 2026-08-16 this converter emitted it with only a fail-closed caveat beside it.
+    # Refused instead. Found via issue #297.
+    literal = [t for t in ("%c", "%i") if t in topic]
+    if literal:
+        todos.append(
+            f"{where}: the topic {topic!r} contains "
+            + " and ".join(literal)
+            + " LITERALLY — EMQX 5/6 substitutes only ${...} placeholders (the pinned "
+            "acl.conf schema @ 6.2.2 lists them; %c/%i are not among them), while mqttd "
+            "substitutes %c (client id) and %i (identity) in EVERY rule's topics with no "
+            "escape (crates/mqtt-auth/src/acl.rs). Carrying it over would turn a rule on "
+            "one literal topic into a live per-client grant the source never gave, so NO "
+            "RULE WAS WRITTEN for it. If a per-client namespace IS what you want, write "
+            "it as an mqttd rule deliberately; if the topic really is literal, rename it. "
+            "(EMQX 4.x DID substitute %c/%u in its acl.conf — if this file predates EMQX "
+            "5 it is outside this parser's version scope: rewrite those as "
+            "${clientid}/${username} and re-run)"
+        )
+        return None
     out = topic
     for src, dst in PLACEHOLDERS.items():
         out = out.replace(src, dst)

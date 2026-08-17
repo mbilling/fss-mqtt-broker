@@ -307,6 +307,36 @@ name = "MQTT_BRIDGE_BIN"
 default = ""
 help = "Prebuilt mqtt-bridge; this script does NOT build one, it exits 2"
 
+[[task]]
+id = "differential-mosquitto"
+group = "Migration"
+name = "Differential-test the Mosquitto converter against the real vendor broker"
+script = "scripts/migrate/differential-mosquitto.sh"
+# Boots the REAL mosquitto broker and the REAL mqttd binary; builds neither.
+needs_checkout = true
+about = """
+The semantic oracle (issue #297). The provenance gate proves a converted value came from a
+named input key; it cannot prove the key MEANS what the converter took it to mean, and five
+review rounds showed that class does not converge under inspection. So this measures instead
+of reading: the SOURCE mosquitto.conf boots the real vendor broker, the CONVERTED config
+boots mqttd (finished exactly as its own TODOs instruct — re-hashed credentials, the ACL
+path, a data dir), and the same client binaries probe both. Seven verdicts are diffed —
+anonymous access, a wrong password, a valid credential, a permitted and a forbidden publish,
+a permitted and a forbidden subscription — at the ACCEPTED/REFUSED and
+DELIVERED/NOT_DELIVERED level, because reason codes legitimately differ while whether a
+client gets in and a message crosses is exactly the meaning the mappings claim to preserve.
+A divergence is a semantic misread: the converter carried the words and lost the meaning.
+
+Needs the mosquitto BROKER, not just its clients; exits 2 (not 1) if anything is missing,
+so "environment not ready" is never mistaken for "assertion failed".
+"""
+requires = ["mosquitto", "mosquitto_passwd", "mosquitto_pub", "mosquitto_sub", "python3", "curl"]
+duration = "~15s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; this script does NOT build one, it exits 2"
+
 # ── Try it ───────────────────────────────────────────────────────────────────────────
 [[task]]
 id = "cert-audit"
