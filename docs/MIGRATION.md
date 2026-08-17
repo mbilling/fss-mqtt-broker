@@ -122,8 +122,16 @@ MISREADING can produce is a wrong live value with an honest source on it — whi
 - every fixture's provenance re-derived by re-fetching the vendor file and diffing (SHA-256
   for the verbatim ones — [the provenance section](#honesty-about-provenance) has the
   commands);
-- the eight invariants of `scripts/migrate/property_sweep.py` over 136 generated inputs
-  (40 Mosquitto / 56 EMQX / 40 HiveMQ), each one mutation-proved;
+- the eight invariants of `scripts/migrate/property_sweep.py` over 138 generated inputs
+  (40 Mosquitto / 57 EMQX / 41 HiveMQ), each one mutation-proved;
+- for **Mosquitto only**: a **differential lane** against the real vendor broker
+  (`scripts/migrate/differential-mosquitto.sh`) — the source config booted on real
+  `mosquitto`, the converted config booted on `mqttd`, and seven observable verdicts
+  compared (anonymous access, a wrong password, a valid credential, a permitted and a
+  forbidden publish, a permitted and a forbidden subscription). This is the only check on
+  this page that tests a mapping against the vendor's **behaviour** rather than our reading
+  of its documentation; it covers exactly the auth/ACL/bind mappings its seven probes
+  touch, and nothing else;
 - a **fuzz pass** (`--fuzz N`) over mechanically mutated fixtures — random lines deleted, the
   file truncated mid-structure, listener blocks permuted, `enable` flags flipped, transports
   swapped — asserting only that the converter always exits 0 or 1 **with a message**, never
@@ -135,8 +143,11 @@ MISREADING can produce is a wrong live value with an honest source on it — whi
 **Not verified, and no amount of the above changes it:**
 
 - **No live EMQX or HiveMQ broker has ever been run** against these converters, and no
-  ground-truth config produced by one was used. Mosquitto likewise: its mappings come from
-  `mosquitto.conf(5)` @ `v2.0.22`, not from a running broker.
+  ground-truth config produced by one was used. Mosquitto's mappings likewise come from
+  `mosquitto.conf(5)` @ `v2.0.22`, not from a running broker — except for what the
+  differential lane above measures: seven behavioural verdicts on one auth+ACL config,
+  which is a probe, not coverage. Every Mosquitto mapping outside those probes is exactly
+  as unverified as the other two brokers'.
 - **No claim of total coverage over any vendor's schema is made.** A construct a converter
   has never seen is a construct it cannot report. What the restructuring above buys is that
   such a construct cannot produce a *live* security setting either — it can only leave a hole.
@@ -171,7 +182,7 @@ inputs inline. The neighbouring versions were spot-checked by hand —
 
 ### KNOWN GAPS (after round 4)
 
-Every construct known, as of **2026-08-15**, to be **unhandled** or **misread** by a converter,
+Every construct known, as of **2026-08-17**, to be **unhandled** or **misread** by a converter,
 with what the operator must check by hand. This list exists because the provenance gate closes
 fabrication and not misreading (see [above](#what-it-does-not-guarantee-misreading-a-real-input)):
 a construct in this table can still produce a wrong *live* value with an honest `# from:` on it.
@@ -183,7 +194,7 @@ merely *unknown* are not in any table, which is the point of the "no total cover
 | **Mosquitto TLS-PSK listener** (`psk_hint` / `psk_file`) | Mosquitto (+ `mqttui`) | **Not translated.** The listener is *encrypted* and mqttd has no PSK at all, so its bind is emitted **inert on the TLS key** with a TODO, and `psk_file`'s identities are named. Never a plaintext bind | Every PSK device needs a new credential — a certificate CN, or an Argon2id password entry — and the ACL must key on whichever you choose. Until then those clients cannot connect |
 | **Mosquitto anonymous-scoped ACL block** (`topic` lines before the first `user`) | Mosquitto (+ `mqttui`) | Emitted **scoped** to `identities = ["anonymous"]`, the subject mqttd gives an unauthenticated client, with a TODO quoting the man page | Those rules grant nothing until `allow_anonymous` is uncommented (mqttd refuses anonymous by default). If `allow_anonymous` was false in Mosquitto they were already dead — delete them. A real user literally named `anonymous` collides |
 | **A literal `*` in a username** (any source) | all three | **No rule emitted**, with a TODO naming the user. mqttd's `identities` are globs with no escape, so the rule cannot be expressed without widening it | Rename the user, or write rules enumerating the exact identities. The rule is *missing* until you do — deny-by-default means those clients lose access |
-| **A literal `%c`/`%i` in a Mosquitto plain `topic` filter** | Mosquitto (+ `mqttui`) | **No rule emitted**, with a TODO. Mosquitto treats a `topic` filter literally; mqttd substitutes in every rule and has no escape | Decide which you meant. A per-client namespace is expressible deliberately (and fails closed on a value containing `/`, `+` or `#`); a literally-named topic is not |
+| **A literal `%c`/`%i` in a topic** (a Mosquitto plain `topic` filter, an EMQX `acl.conf` `topic_match()`, a HiveMQ file-RBAC `<topic>`) | all three | **No rule emitted**, with a TODO naming the topic. Every source matches those bytes literally (Mosquitto substitutes only in `pattern`; EMQX 5/6 substitutes only `${...}` placeholders; file-RBAC substitutes only `${{clientid}}`/`${{username}}`), while mqttd substitutes in every rule and has no escape. Until issue #297 the EMQX and HiveMQ converters emitted these as substituting rules | Decide which you meant. A per-client namespace is expressible deliberately (and fails closed on a value containing `/`, `+` or `#`); a literally-named topic is not. An EMQX file carrying `%c`/`%u` as *placeholders* is an EMQX 4.x file — outside the parser's version scope; rewrite them as `${clientid}`/`${username}` |
 | **Mosquitto bridge blocks** (`connection`, `address`, `topic`, `bridge_*`, `remote_*`) | Mosquitto (+ `mqttui`) | **Reported per key, each naming its `mqtt-bridge` equivalent.** No bridge config is written — this converter has no `--out-bridge` | Write the `mqtt-bridge` config by hand from those TODOs ([docs/BRIDGE.md](BRIDGE.md)). `[upstreams.tls]` is optional and **absent means plaintext**, so an omitted `ca` silently drops peer verification |
 | **Mosquitto `include_dir`, `plugin`, `plugin_opt_*`** | Mosquitto (+ `mqttui`) | **Contents never read**, reported in those words. A Dynamic Security deployment keeps its whole user/role/ACL policy in a JSON file the converter never opens | Concatenate the included `.conf` files and re-run; export and re-model the dynsec policy. Nothing from either is in the output, and what was never seen cannot be reported |
 | **`message_size_limit` → `max_packet_size`** | Mosquitto (+ `mqttui`) | Mapped, with a NOTE: it is the **nearest** equivalent, not the same quantity (payload vs whole packet). `0` (the vendor's *no limit*) leaves the key unset | If you publish near the limit, raise the cap by your largest topic + MQTT 5 property overhead, or publishes Mosquitto accepted are refused |
@@ -661,7 +672,11 @@ for the record and reported as **inert**, since mqttd implements no `$SYS` tree.
 Placeholders that do translate: `${username}` → `%i`, `${clientid}` → `%c`,
 `${cert_common_name}` → `%i` (**only** equal when the client used mTLS and
 `mtls_identity_source = "cn"`, which the TODO tells you to check). mqttd's `%i`/`%c`
-**fail closed** on an empty value or one containing `/ + #`.
+**fail closed** on an empty value or one containing `/ + #`. A topic carrying a
+**literal** `%c` or `%i` is refused outright — EMQX 5/6 matches those bytes literally
+(the pinned `acl.conf` schema lists its placeholders and `%c`/`%i` are not among them),
+so emitting them into a rule mqttd *substitutes* would grant a per-client namespace the
+source never granted. See [KNOWN GAPS](#known-gaps-after-round-4).
 
 ---
 
@@ -698,7 +713,7 @@ refers to the Enterprise line and the extension SDK.
 | `restrictions/max-connections` (`-1` = unlimited → unset) | `[limits] max_connections` |
 | `tls/client-authentication-mode` = `REQUIRED` | `[tls] client_ca` (mandatory mTLS) — **only when every TLS listener says REQUIRED**; a mixed posture is not a mapping, [see below](#the-two-findings-that-shape-the-output) |
 | File RBAC `<user>` + `<role>` + `<permission>` | ACL `[[rules]]`, flattened onto `identities` |
-| `${{clientid}}` / `${{username}}` | `%c` / `%i` |
+| `${{clientid}}` / `${{username}}` | `%c` / `%i` — those two are file-RBAC's **only** substitutions, so a `<topic>` carrying a **literal** `%c`/`%i` matched those bytes exactly and is refused rather than emitted into a rule mqttd would substitute ([KNOWN GAPS](#known-gaps-after-round-4)) |
 
 `<path>/mqtt</path>` needs no translation: **mqttd accepts a WebSocket upgrade on any
 path** (it checks the `mqtt` subprotocol, not the URI — `crates/mqtt-net/src/ws.rs`),
@@ -1025,20 +1040,52 @@ cargo build                                      # the tests boot the real binar
 MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-emqx.sh
 MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-hivemq.sh
 MQTTD_BIN=target/debug/mqttd ./scripts/migrate/test-from-mosquitto.sh
-MQTTD_BIN=target/debug/mqttd ./scripts/migrate/dual-run-smoke.sh   # needs the mosquitto BROKER
+MQTTD_BIN=target/debug/mqttd ./scripts/migrate/dual-run-smoke.sh          # needs the mosquitto BROKER
+MQTTD_BIN=target/debug/mqttd ./scripts/migrate/differential-mosquitto.sh  # needs the mosquitto BROKER
 ```
 
-**All four scripts run in per-PR CI** — the three converter tests and the dual-run smoke
-(`.github/workflows/ci.yml` installs the Mosquitto broker for the last one). Each of the
-four exits **2** — not 1 — when a binary or the Mosquitto broker is missing, so
-"environment not ready" is never mistaken for "assertion failed"; verified for all four by
-running them with `MQTTD_BIN` pointed at nothing, and for the smoke with `mosquitto` off
-the `PATH`.
+**The first four scripts run in per-PR CI** — the three converter tests and the dual-run
+smoke (`.github/workflows/ci.yml` installs the Mosquitto broker for the smoke). The
+differential lane is **not yet a CI step**; it runs anywhere the Mosquitto broker is
+installed. Each of the five exits **2** — not 1 — when a binary or the Mosquitto broker
+is missing, so "environment not ready" is never mistaken for "assertion failed"; verified
+by running them with `MQTTD_BIN` pointed at nothing, and the broker-needing ones with
+`mosquitto` off the `PATH`.
 
 The converters themselves use the same three-way scheme: **0** with TODOs (a conversion
 with gaps is a successful conversion — the gaps are in the file), **1** for input that
 could not be read at all, and they never exit 2. So `grep -c 'TODO(migrate)'` and not the
 exit status is how you find out how much work is left.
+
+**What the differential lane actually measured.** Executed 2026-08-17 on macOS 14
+(Darwin 23.5.0) with **mqttd 0.9.0** (tree build) against **mosquitto 2.1.2** as the
+oracle — the source config booted on the vendor, the converted config booted on mqttd
+(finished exactly as its own TODOs instruct: re-hashed credentials, the ACL path, a real
+data dir), the same client binaries probing both:
+
+```
+versions under test:
+  vendor oracle: mosquitto version 2.1.2
+  mqttd:         mqttd 0.9.0
+  ok   — vendor verdicts recorded (mosquitto version 2.1.2), and the harness anchors hold
+  ok   — mqttd verdicts recorded, booted from the converted config + its own finishing steps
+         anonymous-connect      REFUSED
+         wrong-password         REFUSED
+         valid-credential       ACCEPTED
+         permitted-publish      DELIVERED
+         publish-outside-acl    NOT_DELIVERED
+         permitted-subscribe    DELIVERED
+         subscribe-outside-acl  NOT_DELIVERED
+  ok   — all 7 verdicts identical: the converted config means what the source config meant
+DIFFERENTIAL OK
+```
+
+The lane was mutation-proved before it was trusted: a broker booted with anonymous access
+switched on records `anonymous-connect ACCEPTED` and the diff fails, and a hand-widened
+ACL (`sensor-1` allowed to publish everywhere) records `publish-outside-acl DELIVERED`
+and the diff fails. Seven probes over one config is a probe of the auth/ACL/bind
+mappings, **not** coverage of `mosquitto.conf(5)` — the [Verified, and not
+verified](#verified-and-not-verified) section carries the same caveat.
 
 `mqttui` lists all of them (`mqttui --list`), and the converters travel inside the
 `mqttui` binary, so they run with no clone at all.

@@ -1606,7 +1606,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `ws_without_mqtt_subprotocol_is_refused`
 - `wss_mtls_pubsub_roundtrip`
 
-## `tools/mqttui/src/main.rs` — 46 test(s)
+## `tools/mqttui/src/main.rs` — 49 test(s)
 
 - `embedded::tests::concurrent_unpacks_never_observe_a_half_written_tree`
 - `embedded::tests::standalone_availability_follows_the_declaration_not_the_file`
@@ -1631,12 +1631,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `migrate::tests::a_dynsec_plugin_is_reported_as_a_file_that_was_not_read`
 - `migrate::tests::a_missing_access_word_means_readwrite`
 - `migrate::tests::a_per_listener_security_collapse_is_reported`
+- `migrate::tests::a_value_the_vendor_schema_forbids_is_refused_not_emitted`
 - `migrate::tests::an_include_dir_says_its_contents_were_not_read`
 - `migrate::tests::an_mtls_mandate_on_a_later_listener_is_not_dropped`
 - `migrate::tests::anonymous_is_a_commented_candidate_not_a_live_setting`
 - `migrate::tests::per_listener_connection_caps_collapse_visibly`
+- `migrate::tests::the_anonymous_advice_names_a_line_the_output_really_has`
 - `migrate::tests::the_default_listener_form_is_read_rather_than_invented`
 - `migrate::tests::the_identity_placeholder_is_translated`
+- `migrate::tests::tls_knobs_with_no_certificate_are_reported_inert_not_as_terminated_tls`
 - `migrate::tests::tls_material_attaches_to_its_own_listener`
 - `migrate::tests::unmapped_settings_become_visible_todos`
 - `migrate::tests::user_blocks_are_regrouped_into_explicit_rules`

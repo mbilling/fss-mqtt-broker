@@ -120,6 +120,27 @@ fn truthy(value: &str) -> bool {
     matches!(value.trim().to_lowercase().as_str(), "true" | "yes" | "1")
 }
 
+/// Every spelling [`truthy`] recognises, in BOTH directions. A value outside this set is not
+/// a boolean at all — and [`truthy`] reads anything it does not recognise as FALSE, so a typo
+/// (`retain_available flase`) silently becomes the OPPOSITE setting. Anything the DIRECT table
+/// reads as a boolean is checked against this list first.
+const BOOL_SPELLINGS: [&str; 6] = ["true", "false", "yes", "no", "1", "0"];
+
+/// Whether `value` is a boolean Mosquitto's own reader would accept.
+fn is_bool(value: &str) -> bool {
+    BOOL_SPELLINGS.contains(&value.trim().to_lowercase().as_str())
+}
+
+/// Whether `value` is a non-negative integer — which every mqttd `[limits]` key is.
+///
+/// ASCII digits only, deliberately: the Python original checks the same way because
+/// `str.isdigit()` is true for the Unicode digits (`٣`, `３`) that TOML does not accept, and a
+/// value that reaches the output has to be a number the BROKER's reader can parse.
+fn is_count(value: &str) -> bool {
+    let text = value.trim();
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
 // ---------------------------------------------------------------------------
 // PROVENANCE OR NOTHING — the load-bearing structure, mirroring the Python original's.
 // ---------------------------------------------------------------------------
@@ -448,6 +469,35 @@ impl Listener {
     }
 }
 
+/// One directive whose value the VENDOR'S OWN SCHEMA does not admit.
+///
+/// Deliberately not a TODO. A TODO is for a construct that was READ and cannot be expressed
+/// in mqttd; this is a value that cannot be read at all — `message_size_limit 10OO` with a
+/// letter O, `retain_available flase`. The difference the operator sees is the EXIT CODE: a
+/// TODO leaves a translated draft behind and exits 0, a malformed source writes NOTHING and
+/// exits 1, because a migration script that trusts `exit 0` is exactly what a config the
+/// broker cannot parse would otherwise be fed to.
+#[derive(Debug, Clone)]
+pub struct Malformed {
+    key: String,
+    value: String,
+    expected: String,
+}
+
+impl Malformed {
+    fn sentence(&self, conf: &str) -> String {
+        let shown = if self.value.trim().is_empty() {
+            "(no value at all)".to_string()
+        } else {
+            comment_safe(&self.value)
+        };
+        format!(
+            "{conf}: `{} {shown}` is not a value it can carry: {}",
+            self.key, self.expected
+        )
+    }
+}
+
 /// The accumulated translation.
 #[derive(Debug, Default)]
 pub struct Conversion {
@@ -472,6 +522,10 @@ pub struct Conversion {
     /// Security-relevant candidates that are NOT activated, rendered commented after their
     /// section.
     deferred: BTreeMap<&'static str, Vec<String>>,
+    /// MALFORMED SOURCE. Collected while parsing and REFUSED in [`run`] before one byte is
+    /// written, because the alternative is a generated file the broker's own TOML reader
+    /// cannot parse sitting beside an exit code that says the migration worked.
+    malformed: Vec<Malformed>,
 }
 
 impl Conversion {
@@ -551,6 +605,15 @@ impl Conversion {
         if !self.notes.contains(&msg) {
             self.notes.push(msg);
         }
+    }
+
+    /// Record a value the vendor's schema forbids. [`run`] refuses the whole conversion.
+    fn malformed_source(&mut self, key: &str, value: &str, expected: String) {
+        self.malformed.push(Malformed {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected,
+        });
     }
 
     fn has(&self, section: &str, key: &str) -> bool {
@@ -783,7 +846,7 @@ const PLUGIN_OPT_NOT_READ: &str = "an option passed to the plugin named above \
 /// Listener-SCOPED TLS keys. Mosquitto scopes every one of these to the `listener` block it
 /// follows, so they are collected per listener and decided across ALL of them in
 /// [`convert_tls`] — never read off `listener[0]` and applied as if global.
-const TLS_KEYS: [&str; 9] = [
+const TLS_KEYS: [&str; 12] = [
     "cafile",
     "capath",
     "certfile",
@@ -791,9 +854,25 @@ const TLS_KEYS: [&str; 9] = [
     "require_certificate",
     "crlfile",
     "tls_version",
+    "ciphers",
+    "ciphers_tls1.3",
+    "dhparamfile",
     "use_identity_as_username",
     "use_subject_as_username",
 ];
+
+// THE LAST THREE ARE KNOBS: settings that TUNE a TLS listener and cannot create one. A
+// listener terminates TLS only with a CERTIFICATE (`certfile`, with `keyfile`) or a PSK, so on
+// a listener with neither, every knob it carried was INERT in Mosquitto too.
+//
+// `ciphers` and `dhparamfile` were in neither TLS_KEYS nor the half-material net until
+// 2026-08-15, so they fell through to "no direct equivalent — check the mqttd configuration
+// table" (a table with nothing in it for either), and `tls_version` on a certificate-less
+// listener was reported as if that listener had terminated TLS: "so it accepted TLS 1.2 AND
+// 1.3", printed beside the LIVE PLAINTEXT bind the same converter wrote for it. That is the
+// dangerous direction — the operator reads it as "encrypted before cutover, not after" and goes
+// looking for TLS this converter lost, when the source was never encrypted. The bind was right;
+// the sentence was not. See TLS_INERT_ORDER, which reports them.
 
 /// Listener-scoped keys that are NOT TLS material: the transport and the connection cap.
 /// Both were read as if global before 2026-08-15 — `protocol` was not read at all, so a
@@ -904,6 +983,21 @@ const TLS_MATERIAL: [&str; 5] = [
     "keyfile",
     "require_certificate",
     "crlfile",
+];
+
+/// What a certificate-less listener's TODO inventories, in the man page's own spelling: the
+/// material half (a CA, a key, a mandate, a CRL) and then the knobs. All of it inert, all of it
+/// named — "TLS settings were present" without the values is not a report.
+const TLS_INERT_ORDER: [&str; 9] = [
+    "cafile",
+    "capath",
+    "keyfile",
+    "require_certificate",
+    "crlfile",
+    "tls_version",
+    "ciphers",
+    "ciphers_tls1.3",
+    "dhparamfile",
 ];
 
 /// transport (from `protocol`) + TLS -> the mqttd bind key. mqttd has FOUR client binds and
@@ -1093,6 +1187,55 @@ pub fn parse_conf(text: &str) -> Conversion {
                     conv.todo(format!("{named}: {PLUGIN_OPT_NOT_READ}"));
                     conv.unread.push(named);
                 } else if let Some((section, mkey, kind)) = direct(key) {
+                    // A VALUE THE VENDOR'S OWN SCHEMA REQUIRES TO BE A NUMBER AND THAT IS NOT
+                    // ONE IS A MALFORMED SOURCE: refused, never emitted. The `int` arm used to
+                    // end in `conv.put` with NO check, so a typo'd `message_size_limit 10OO` (a
+                    // letter O) wrote `max_packet_size = 10OO` into the generated TOML — a
+                    // document `mqttd --check-config` cannot even PARSE, so the validation step
+                    // this converter's own output points the operator at could not run — while
+                    // the converter had already reported success.
+                    //
+                    // The BOOL arm had the same hole in the more dangerous direction: `truthy`
+                    // reads anything it does not recognise as FALSE, so `retain_available flase`
+                    // was taken as TRUE and neither translated nor reported. And the `str` arm
+                    // accepted an EMPTY path, writing `data_dir = ""`. Found 2026-08-15.
+                    if matches!(kind, "int" | "u16") && !is_count(&value) {
+                        conv.malformed_source(
+                            key,
+                            &value,
+                            format!(
+                                "mosquitto.conf(5) @ v2.0.22 documents it as a COUNT and \
+                                 [{section}] {mkey} is an unsigned integer, so there is no \
+                                 number here to carry over"
+                            ),
+                        );
+                        continue;
+                    }
+                    if kind == "retain" && !is_bool(&value) {
+                        conv.malformed_source(
+                            key,
+                            &value,
+                            "mosquitto.conf(5) @ v2.0.22 documents it as [ true | false ] and \
+                             this converter reads it to decide whether retained messages were \
+                             switched OFF. A value that is neither would be read as `true` — \
+                             the PERMISSIVE direction — by any reader that guesses, so it is \
+                             refused instead"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    if kind == "str" && value.trim().is_empty() {
+                        conv.malformed_source(
+                            key,
+                            &value,
+                            format!(
+                                "it names a PATH and [{section}] {mkey} cannot be an empty one \
+                                 (the broker would start with its durable state pointed at \
+                                 nowhere)"
+                            ),
+                        );
+                        continue;
+                    }
                     match kind {
                         "int" => {
                             // ZERO IS THE VENDOR'S SPELLING OF *NO LIMIT* for both packet-size
@@ -1146,22 +1289,20 @@ pub fn parse_conf(text: &str) -> Conversion {
                             }
                         }
                         "u16" => {
-                            if let Ok(n) = value.parse::<u64>() {
-                                conv.put(section, mkey, n.min(65535).to_string());
-                                if n > 65535 {
-                                    conv.todo(format!(
-                                        "{key} {value} exceeds the MQTT 5 16-bit field that \
-                                         [{section}] {mkey} maps to; it was clamped to 65535"
-                                    ));
-                                }
-                            } else {
+                            // `is_count` above guarantees ASCII digits; a run of them too long
+                            // for a u64 clamps like the Python original's arbitrary-precision
+                            // int does, and says so.
+                            let n: u64 = value.trim().parse().unwrap_or(u64::MAX);
+                            conv.put(section, mkey, n.min(65535).to_string());
+                            if n > 65535 {
                                 conv.todo(format!(
-                                    "{key} {value}: not an integer this converter can map"
+                                    "{key} {value} exceeds the MQTT 5 16-bit field that \
+                                     [{section}] {mkey} maps to; it was clamped to 65535"
                                 ));
                             }
                         }
                         "retain" => {
-                            if matches!(value.to_lowercase().as_str(), "false" | "no" | "0") {
+                            if !truthy(&value) {
                                 conv.todo(
                                     "retain_available=false disables retained messages \
                                      entirely; mqttd has no off switch — cap it instead with \
@@ -1492,6 +1633,54 @@ const ANON_IDENTITY: &str = "anonymous";
 /// Mosquitto substitutes only in a `pattern` line and treats a plain `topic` filter literally.
 const SUBSTITUTED: [&str; 2] = ["%c", "%i"];
 
+// The REMEDIATION half of the anonymous-block TODO, one text per posture the generated config
+// actually ends up in.
+//
+// It used to be one unconditional sentence saying `allow_anonymous` "is emitted COMMENTED OUT"
+// in the generated config — but [`convert_scoped_security`] emits that commented candidate ONLY
+// when mosquitto.conf set allow_anonymous TRUE. With `allow_anonymous false` (or the key
+// absent) there is no allow_anonymous line in the output at all, so the advice sent the
+// operator to uncomment a line nobody wrote: they grep the config, find nothing, and are left
+// deciding whether the tool or the advice is wrong. Advice that names a line the converter does
+// not emit costs the reader's trust in the TODOs that ARE right. Found 2026-08-15.
+
+/// mosquitto.conf said `allow_anonymous true`, so the config holds the commented candidate.
+const ANON_ADVICE_CANDIDATE: &str = "they grant NOTHING until anonymous access is switched on \
+     in the generated config, because mqttd refuses anonymous clients by default. \
+     mosquitto.conf DID set allow_anonymous true, so that config carries the line \
+     `# allow_anonymous = true` COMMENTED OUT in its [security] table — activating it is a \
+     security POSTURE change, node-wide for every listener, so this converter does not make \
+     it. Uncomment that exact line to keep these rules working, or give those clients a \
+     credential before cutover and delete the rules";
+
+/// The key was present and its last value was not a true one.
+const ANON_ADVICE_FALSE: &str = "they grant NOTHING, and there is NOTHING in the generated \
+     config to uncomment: mosquitto.conf's last allow_anonymous was not `true`, so these rules \
+     were ALREADY DEAD in Mosquitto too and the generated config carries NO allow_anonymous \
+     line at all (mqttd's own default is false). DELETE them — or, if you really do mean to \
+     open anonymous access, which neither broker was doing, add `allow_anonymous = true` to \
+     [security] yourself";
+
+/// The key never appeared, and the vendor's default is not simply `false`.
+const ANON_ADVICE_UNSET: &str = "they grant NOTHING here, and there is NOTHING in the generated \
+     config to uncomment: it carries NO allow_anonymous line at all and mqttd's default is \
+     false. Whether they granted anything in MOSQUITTO cannot be read off your file either, \
+     because it never set allow_anonymous and mosquitto.conf(5) @ v2.0.22 defaults it to false \
+     'unless no listeners are defined in the configuration file, in which case it is set to \
+     true, but connections are only allowed from the local machine'. So either they were dead \
+     and you should delete them, or they served local anonymous clients — in which case add \
+     `allow_anonymous = true` to [security] yourself (a posture change, node-wide for every \
+     listener), or better, issue those clients a credential";
+
+/// The advice for the posture the generated config ended up in.
+fn anon_advice(posture: &str) -> &'static str {
+    match posture {
+        "candidate" => ANON_ADVICE_CANDIDATE,
+        "false" => ANON_ADVICE_FALSE,
+        _ => ANON_ADVICE_UNSET,
+    }
+}
+
 /// Translate a Mosquitto ACL file.
 ///
 /// Mosquitto's model is **positional**: a `user X` line opens a block and `topic` lines
@@ -1506,7 +1695,7 @@ const SUBSTITUTED: [&str; 2] = ["%c", "%i"];
 /// `crates/mqtt-auth/src/acl.rs`) — strictly broader than the source in both postures. Found
 /// 2026-08-15.
 #[must_use]
-pub fn parse_acl(text: &str) -> (Vec<Rule>, Vec<String>) {
+pub fn parse_acl(text: &str, anon_posture: &str) -> (Vec<Rule>, Vec<String>) {
     let mut rules = Vec::new();
     let mut todos: Vec<String> = Vec::new();
     let mut current_user: Option<String> = None;
@@ -1578,6 +1767,7 @@ pub fn parse_acl(text: &str) -> (Vec<Rule>, Vec<String>) {
         }
     }
     if anonymous_lines > 0 {
+        let advice = anon_advice(anon_posture);
         todos.insert(
             0,
             format!(
@@ -1590,12 +1780,9 @@ pub fn parse_acl(text: &str) -> (Vec<Rule>, Vec<String>) {
                  [\"{ANON_IDENTITY}\"], which is the subject mqttd gives a client that connected \
                  with no credentials (crates/mqtt-auth/src/basic.rs) — NOT as unscoped rules, \
                  which mqttd applies to EVERY authenticated identity and which would be strictly \
-                 broader than your Mosquitto policy. Consequences to check: (1) they grant \
-                 NOTHING until [security] allow_anonymous is set in the generated config, and it \
-                 is emitted COMMENTED OUT because mqttd refuses anonymous clients by default — \
-                 if allow_anonymous was FALSE in mosquitto.conf these rules were already dead \
-                 and you should delete them; (2) if you have a real named user called \
-                 `{ANON_IDENTITY}`, these rules apply to it too — rename that user"
+                 broader than your Mosquitto policy. Consequences to check: (1) {advice}; (2) if \
+                 you have a real named user called `{ANON_IDENTITY}`, these rules apply to it \
+                 too — rename that user"
             ),
         );
     }
@@ -1959,7 +2146,13 @@ pub fn convert_tls(conv: &mut Conversion) -> Vec<String> {
     let mut identity_source: Option<String> = None;
     for lst in &conv.listeners {
         let where_ = lst.where_();
-        if let Some(raw) = lst.tls_get("tls_version") {
+        // A KNOB ONLY MEANS SOMETHING ON A LISTENER THAT TERMINATES TLS. Everything in this
+        // block used to run for every listener, so a listener with `tls_version` and no
+        // certificate was reported as having "accepted TLS 1.2 AND 1.3" — an assertion that the
+        // source encrypted traffic it served in the clear. The certificate-less case is
+        // reported below instead, by the loop that names every inert setting it carried.
+        let terminates_tls = lst.is_tls() || lst.is_psk();
+        if let Some(raw) = lst.tls_get("tls_version").filter(|_| terminates_tls) {
             let version = raw.trim().to_lowercase();
             // mosquitto.conf(5) @ v2.0.22, verbatim: "Configure the minimum version of the
             // TLS protocol to be used for this listener ... In Mosquitto version 1.6.x and
@@ -1999,6 +2192,51 @@ pub fn convert_tls(conv: &mut Conversion) -> Vec<String> {
                      plus 1.2 behind [tls] allow_tls12 = true, and nothing older at all: any \
                      client that can only do 1.1 or 1.0 CANNOT connect after cutover. Find \
                      those clients before you move them"
+                    ),
+                ));
+            }
+        }
+        if terminates_tls {
+            // mqttd's TLS is rustls: the suite set is FIXED, not configurable, so neither list
+            // can be carried over — and neither can be silently dropped, because a `ciphers`
+            // line written to EXCLUDE something has to be checked against what mqttd offers.
+            if let Some(raw) = lst.tls_get("ciphers") {
+                version_msgs.push((
+                    true,
+                    format!(
+                        "{where_} set ciphers {raw}, the OpenSSL cipher list for TLS 1.2 and \
+                     below. mqttd has NO cipher configuration: its TLS is rustls, 1.3 by \
+                     default, and TLS 1.2 only behind [tls] allow_tls12 = true where the suites \
+                     are a hardened ALLOWLIST — the six ECDHE+AEAD suites, no CBC and no static \
+                     RSA (crates/mqtt-net/src/tls.rs). Your list was NOT carried over: if it \
+                     was there to EXCLUDE a weak suite, that suite is already absent; if it was \
+                     there to ADMIT a legacy one, it is gone and those clients fail the \
+                     handshake, which looks like a network fault rather than a policy one. \
+                     Check the list against those six before cutover"
+                    ),
+                ));
+            }
+            if let Some(raw) = lst.tls_get("ciphers_tls1.3") {
+                version_msgs.push((
+                    true,
+                    format!(
+                        "{where_} set ciphers_tls1.3 {raw}, the TLS 1.3 ciphersuite list. mqttd \
+                     does not expose one — rustls offers its own 1.3 suites, all AEAD, and they \
+                     are not configurable — so this was NOT carried over. If the list was there \
+                     to narrow 1.3, that narrowing is gone; nothing weaker is admitted by it"
+                    ),
+                ));
+            }
+            if let Some(raw) = lst.tls_get("dhparamfile") {
+                version_msgs.push((
+                    true,
+                    format!(
+                        "{where_} set dhparamfile {raw}, the Diffie-Hellman parameters for the \
+                     non-EC DHE suites. mqttd offers NO such suite — key agreement is ECDHE, or \
+                     a TLS 1.3 group — so there is nothing for that file to parameterise and it \
+                     was NOT carried over. Nothing is lost by it (forward secrecy is still \
+                     there, from ECDHE), and the file itself is not referenced anywhere in the \
+                     output"
                     ),
                 ));
             }
@@ -2090,17 +2328,25 @@ pub fn convert_tls(conv: &mut Conversion) -> Vec<String> {
         // PLAINTEXT" would be false about it. `convert_psk` reports it, including whatever
         // material it also carried.
         .filter(|l| {
-            !l.is_tls() && !l.is_psk() && TLS_MATERIAL.iter().any(|k| l.tls.contains_key(*k))
+            !l.is_tls() && !l.is_psk() && TLS_INERT_ORDER.iter().any(|k| l.tls.contains_key(*k))
         })
         .map(|l| {
-            let listed: Vec<String> = TLS_MATERIAL
+            let listed: Vec<String> = TLS_INERT_ORDER
                 .iter()
                 .filter_map(|k| l.tls.get(*k).map(|v| format!("{k} {v}")))
                 .collect();
             format!(
-                "{} carried TLS settings ({}) but NO certfile, so Mosquitto served that \
-                 listener as PLAINTEXT and nothing here becomes TLS either. If it was meant \
-                 to be encrypted, it never was — check it before cutover",
+                "{} carried TLS settings ({}) but NO certfile, so it did NOT terminate TLS and \
+                 every one of those settings was INERT — in Mosquitto, before this migration. \
+                 mosquitto.conf(5) @ v2.0.22 needs a certificate for a TLS listener \
+                 (`certfile`, 'Path to the PEM encoded server certificate', with `keyfile`), \
+                 and a version floor, a cipher list or a dhparamfile cannot create one: they \
+                 only constrain a handshake that happens. So do NOT read them as evidence that \
+                 traffic on that listener was encrypted — it was not, and the bind written for \
+                 it below is PLAINTEXT because that is what the source did. If it was MEANT to \
+                 be encrypted then it never was, on either broker: fix that here rather than \
+                 assuming the migration dropped it — issue a certificate, set [tls] cert/key, \
+                 and move the bind onto the TLS key",
                 l.where_(),
                 listed.join(", ")
             )
@@ -2631,6 +2877,32 @@ pub fn run(args: &[String]) -> Result<String, String> {
         )
     })?;
     let mut conv = parse_conf(&text);
+
+    // THE REFUSAL. A directive whose value the vendor's own schema does not admit is not
+    // something to translate "as well as possible": emitting it writes a config the broker
+    // cannot parse, and reporting success while doing so tells a migration script the
+    // translation worked. So nothing is written at all, and every offending key, value and the
+    // file they came from is named. (Mosquitto's own reader refuses these too — a file that
+    // carries one is a file no Mosquitto ran.)
+    if !conv.malformed.is_empty() {
+        let mut msg = format!(
+            "REFUSED: {conf} was NOT translated. {} directive(s) carry a value the vendor's own \
+             schema does not admit:",
+            conv.malformed.len()
+        );
+        for m in &conv.malformed {
+            let _ = write!(msg, "\n  {}", m.sentence(conf));
+        }
+        msg.push_str(
+            "\nNO file was written and no config was validated. Carrying such a value through \
+             would put it straight into the generated TOML — `max_packet_size = 10OO` is not a \
+             document `mqttd --check-config` can even parse, so the check this converter tells \
+             you to run cannot run — and this tool would still have exited 0, which is what a \
+             migration script reads as success. Fix the value(s) in the file above and re-run.",
+        );
+        return Err(msg);
+    }
+
     convert_scoped_security(&mut conv);
     convert_psk(&mut conv);
     convert_listener_caps(&mut conv);
@@ -2696,7 +2968,19 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 )],
             ),
             Some(t) => {
-                let (rules, mut todos) = parse_acl(t);
+                // DERIVED from what this run actually emitted, never assumed: the
+                // commented `allow_anonymous` candidate exists only when mosquitto.conf set
+                // it true, and the advice has to name a line the operator can find.
+                let anon_posture = if conv.deferred.get("security").is_some_and(|lines| {
+                    lines.iter().any(|l| l.starts_with("# allow_anonymous = "))
+                }) {
+                    "candidate"
+                } else if conv.scoped_sites("allow_anonymous").is_empty() {
+                    "unset"
+                } else {
+                    "false"
+                };
+                let (rules, mut todos) = parse_acl(t, anon_posture);
                 if rules.is_empty() {
                     todos.insert(
                         0,
@@ -2760,7 +3044,7 @@ mod tests {
     /// produce a policy that matches a literal `%u` and therefore nothing at all.
     #[test]
     fn the_identity_placeholder_is_translated() {
-        let (rules, _) = parse_acl("pattern read devices/%u/status\n");
+        let (rules, _) = parse_acl("pattern read devices/%u/status\n", "unset");
         assert_eq!(rules[0].topics[0], "devices/%i/status");
     }
 
@@ -2768,7 +3052,7 @@ mod tests {
     /// client ids containing / + or #, which silently denies rather than misfiring.
     #[test]
     fn a_client_id_pattern_is_carried_but_flagged() {
-        let (rules, todos) = parse_acl("pattern read devices/%c/status\n");
+        let (rules, todos) = parse_acl("pattern read devices/%c/status\n", "unset");
         assert_eq!(rules[0].topics[0], "devices/%c/status");
         assert!(todos.iter().any(|t| t.contains("FAIL CLOSED")), "{todos:?}");
     }
@@ -2778,6 +3062,7 @@ mod tests {
     fn user_blocks_are_regrouped_into_explicit_rules() {
         let (rules, _) = parse_acl(
             "user alice\ntopic write up/#\ntopic read down/#\nuser bob\ntopic readwrite b/#\n",
+            "unset",
         );
         assert_eq!(rules.len(), 3);
         assert_eq!(rules[0].identities, vec!["alice"]);
@@ -2804,6 +3089,91 @@ mod tests {
         convert_acl_reference(&mut conv, acl_path.as_deref());
         let rendered = render_config(&conv, &tls_lines);
         (conv, rendered)
+    }
+
+    /// A value the vendor's own schema does not admit must never reach the output. The `int`
+    /// arm emitted it unchecked, so `message_size_limit 10OO` (a letter O) became
+    /// `max_packet_size = 10OO` — a document the broker's TOML reader rejects WHOLE — while the
+    /// converter reported success; and `retain_available flase` was read as `true` by `truthy`
+    /// and neither translated nor reported. Both are refusals now, naming key, value and file.
+    #[test]
+    fn a_value_the_vendor_schema_forbids_is_refused_not_emitted() {
+        let conv = parse_conf(
+            "listener 1883\nmessage_size_limit 10OO\nmax_queued_messages abc\n\
+             retain_available flase\n",
+        );
+        assert_eq!(conv.malformed.len(), 3, "three values, three refusals");
+        let rendered = render_config(&conv, &[]);
+        for forbidden in ["10OO", "abc", "flase"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{forbidden} reached the output: {rendered}"
+            );
+        }
+        let sentence = conv.malformed[0].sentence("/etc/mosquitto/mosquitto.conf");
+        assert!(
+            sentence.contains("/etc/mosquitto/mosquitto.conf")
+                && sentence.contains("`message_size_limit 10OO`"),
+            "the refusal must name the file, the key and the offending value: {sentence}"
+        );
+        // A well-formed neighbour must still be translated — the refusal is not a blanket drop.
+        let ok = parse_conf("listener 1883\nmax_queued_messages 1000\n");
+        assert!(ok.malformed.is_empty());
+        assert!(render_config(&ok, &[]).contains("max_queued_messages = 1000"));
+    }
+
+    /// A listener carrying only TLS KNOBS has no certificate, so it never terminated TLS. The
+    /// bind for it is PLAINTEXT — which is what the source did — but the output used to report
+    /// that the listener "accepted TLS 1.2 AND 1.3" beside it, which an operator reads as
+    /// "encrypted before cutover, not after".
+    #[test]
+    fn tls_knobs_with_no_certificate_are_reported_inert_not_as_terminated_tls() {
+        let (_, out) = convert(
+            "listener 8883 0.0.0.0\ntls_version tlsv1.2\nciphers HIGH\ndhparamfile /dh.pem\n",
+        );
+        assert!(out.contains("plaintext_bind = \"0.0.0.0:8883\""), "{out}");
+        assert!(
+            !out.contains("accepted TLS 1.2 AND 1.3"),
+            "a certificate-less listener is claimed to have terminated TLS: {out}"
+        );
+        assert!(out.contains("did NOT terminate TLS"), "{out}");
+        for named in ["tls_version tlsv1.2", "ciphers HIGH", "dhparamfile /dh.pem"] {
+            assert!(out.contains(named), "{named} went unreported: {out}");
+        }
+        // ...and a listener that DOES terminate TLS keeps its version-floor translation.
+        let (_, tls) = convert(
+            "listener 8883 0.0.0.0\ncertfile /c.crt\nkeyfile /c.key\ntls_version tlsv1.2\n\
+             ciphers HIGH\n",
+        );
+        assert!(tls.contains("accepted TLS 1.2 AND 1.3"), "{tls}");
+        assert!(tls.contains("ciphers HIGH"), "{tls}");
+    }
+
+    /// The anonymous-block TODO's advice has to name a line that is in the output. It said
+    /// `allow_anonymous` "is emitted COMMENTED OUT" unconditionally, and that candidate exists
+    /// only where mosquitto.conf set it TRUE.
+    #[test]
+    fn the_anonymous_advice_names_a_line_the_output_really_has() {
+        let (_, absent) = parse_acl("topic read public/#\n", "false");
+        assert!(
+            absent[0].contains("NO allow_anonymous line at all"),
+            "{}",
+            absent[0]
+        );
+        assert!(
+            !absent[0].contains("`# allow_anonymous = true`"),
+            "the advice points at a line the config does not carry: {}",
+            absent[0]
+        );
+        let (_, candidate) = parse_acl("topic read public/#\n", "candidate");
+        assert!(
+            candidate[0].contains("`# allow_anonymous = true`"),
+            "{}",
+            candidate[0]
+        );
+        // ...and that quoted line is verbatim what the config carries in that posture.
+        let (_, out) = convert("allow_anonymous true\n");
+        assert!(out.contains("# allow_anonymous = true"), "{out}");
     }
 
     #[test]

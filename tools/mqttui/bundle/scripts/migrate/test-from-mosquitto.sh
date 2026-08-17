@@ -277,6 +277,33 @@ grep -qF 'c/%c/x' "$WORK/anon-acl.toml" \
   || { echo "  FAIL — the refused literal filter is not named anywhere"; exit 1; }
 echo "  ok   — an anonymous block is scoped, and constructs mqttd cannot express are refused"
 
+# ── the anonymous-scope TODO must name a line that EXISTS in the output ────────────────
+# Its remediation advice said those rules "grant NOTHING until [security] allow_anonymous is
+# set in the generated config, and it is emitted COMMENTED OUT" — but the converter only
+# writes that commented candidate when mosquitto.conf set allow_anonymous TRUE. The fixture
+# above says `allow_anonymous false`, so there is no such line anywhere in the output and the
+# reader is sent to uncomment something that was never written. Advice that names a line the
+# converter does not emit is how an operator concludes the tool is lying about the rest.
+if grep -qE '^# allow_anonymous = ' "$WORK/anon.toml"; then
+  echo "  FAIL — the allow_anonymous-false fixture unexpectedly carries a commented allow_anonymous candidate; this case no longer tests what it says"; exit 1
+fi
+if grep -qF '`# allow_anonymous = true`' "$WORK/anon-acl.toml"; then
+  echo "  FAIL — the anonymous-scope TODO sends the reader to uncomment a commented allow_anonymous line that is NOT in the generated config (mosquitto.conf said allow_anonymous false, so the converter wrote no such line)"; exit 1
+fi
+grep -qF 'NO allow_anonymous line at all' "$WORK/anon-acl.toml" \
+  || { echo "  FAIL — with allow_anonymous false, the anonymous-scope TODO does not say the generated config contains no allow_anonymous line"; exit 1; }
+# ...and where Mosquitto DID allow anonymous clients, the advice must quote the line that IS
+# written, verbatim, so the operator can find it by grep.
+printf 'persistence_location /v\nlistener 1883\nallow_anonymous true\nacl_file %s\n' \
+  "$WORK/anon-acl" > "$WORK/anontrue.conf"
+python3 scripts/migrate/from-mosquitto.py "$WORK/anontrue.conf" \
+  --out-config "$WORK/anontrue.toml" --out-acl "$WORK/anontrue-acl.toml" >/dev/null
+grep -qF '# allow_anonymous = true' "$WORK/anontrue.toml" \
+  || { echo "  FAIL — allow_anonymous true left no commented candidate in the config"; exit 1; }
+grep -qF '`# allow_anonymous = true`' "$WORK/anontrue-acl.toml" \
+  || { echo "  FAIL — the anonymous-scope TODO does not quote the commented allow_anonymous line the generated config actually holds"; exit 1; }
+echo "  ok   — the anonymous-scope TODO names the allow_anonymous line the output really has, in both postures"
+
 # ── the vendor's sentinels and the vendor's own words ──────────────────────────────────
 # `message_size_limit 0` is mosquitto.conf(5)'s spelling of NO LIMIT ("The default value is 0,
 # which means that all valid MQTT messages are accepted"), and mqttd FLOORS max_packet_size to
@@ -306,6 +333,84 @@ fi
 grep -qF 'not just the payload' "$WORK/msl.toml" \
   || { echo "  FAIL — the NOTE does not state the payload-vs-packet difference"; exit 1; }
 echo "  ok   — the packet-size sentinel and the payload/packet caveat match the man page"
+
+# ── a value the VENDOR'S OWN SCHEMA does not admit: refused, never emitted ─────────────
+# The DIRECT table's `int` arm ended in conv.set() with NO check that the value was a number,
+# so a typo'd `message_size_limit 10OO` (a letter O) wrote `max_packet_size = 10OO` into the
+# generated TOML: a document `mqttd --check-config` cannot even PARSE, so the validation this
+# converter's own output points at could not run — and the converter had already exited 0,
+# which a migration script reads as success. The bool arm flipped the other way: truthy()
+# reads anything it does not recognise as FALSE, so `retain_available flase` was taken as TRUE
+# and neither translated nor reported.
+cat > "$WORK/malformed.conf" <<'CONF'
+persistence_location /v
+listener 1883
+message_size_limit 10OO
+max_queued_messages abc
+retain_available flase
+CONF
+set +e
+python3 scripts/migrate/from-mosquitto.py "$WORK/malformed.conf" \
+  --out-config "$WORK/malformed.toml" >"$WORK/malformed.out" 2>"$WORK/malformed.err"
+malformed_rc=$?
+set -e
+if [[ $malformed_rc -eq 0 ]]; then
+  echo "  FAIL — a mosquitto.conf carrying values the vendor's schema forbids was 'translated' and the tool exited 0, which a migration script reads as success:"
+  grep -nE '^(max_packet_size|max_queued_messages|max_retained_messages) ' "$WORK/malformed.toml" | sed 's/^/         /'
+  exit 1
+fi
+[[ $malformed_rc -eq 1 ]] || { echo "  FAIL — the refusal exited $malformed_rc; the documented contract is 0 translated / 1 unusable input"; exit 1; }
+if [[ -e "$WORK/malformed.toml" ]]; then
+  echo "  FAIL — a config file was written from a malformed source; nothing should be written at all"; exit 1
+fi
+for needle in 'message_size_limit 10OO' 'max_queued_messages abc' 'retain_available flase' "$WORK/malformed.conf"; do
+  grep -qF "$needle" "$WORK/malformed.err" \
+    || { echo "  FAIL — the refusal does not name '$needle', so the operator cannot tell which key, value or file to fix"; exit 1; }
+done
+# A count that IS a number must still be translated — the refusal must not swallow valid input.
+printf 'persistence_location /v\nlistener 1883\nmax_queued_messages 1000\nretain_available false\n' > "$WORK/wellformed.conf"
+python3 scripts/migrate/from-mosquitto.py "$WORK/wellformed.conf" --out-config "$WORK/wellformed.toml" >/dev/null
+grep -qE '^max_queued_messages = 1000$' "$WORK/wellformed.toml" \
+  || { echo "  FAIL — a well-formed count stopped being translated"; exit 1; }
+echo "  ok   — a count that is not a number and a boolean that is not a boolean are refused with nothing written"
+
+# ── TLS KNOBS with NO certificate: plaintext, and the note must SAY plaintext ──────────
+# A listener carrying tls_version / ciphers / dhparamfile but no certfile is NOT a TLS
+# listener — Mosquitto needs a certificate to terminate TLS — so those knobs were INERT. The
+# converter emitted a live PLAINTEXT bind for it (right: it WAS plaintext) beside a TODO
+# saying that listener "accepted TLS 1.2 AND 1.3", which an operator reads as "encrypted
+# before cutover, not after". That is the dangerous direction of the same misreading class as
+# the PSK listener above.
+cat > "$WORK/knobs.conf" <<'CONF'
+persistence_location /v
+listener 8883 0.0.0.0
+tls_version tlsv1.2
+ciphers ECDHE-RSA-AES128-GCM-SHA256
+dhparamfile /etc/mosq/dh.pem
+CONF
+python3 scripts/migrate/from-mosquitto.py "$WORK/knobs.conf" --out-config "$WORK/knobs.toml" >/dev/null
+"$MQTTD_BIN" --check-config --config "$WORK/knobs.toml" >/dev/null 2>&1 \
+  || { echo "  FAIL — the broker REJECTED the config built from a certificate-less TLS-knob listener"; exit 1; }
+grep -q '^plaintext_bind = "0.0.0.0:8883"' "$WORK/knobs.toml" \
+  || { echo "  FAIL — the certificate-less listener lost its plaintext bind; it WAS plaintext and the output must say so"; exit 1; }
+if grep -qF 'accepted TLS 1.2 AND 1.3' "$WORK/knobs.toml"; then
+  echo "  FAIL — the output asserts a listener with NO certfile terminated TLS ('accepted TLS 1.2 AND 1.3') beside a live PLAINTEXT bind; the operator concludes traffic was encrypted before cutover and is not after"; exit 1
+fi
+for needle in 'did NOT terminate TLS' 'was INERT' 'ciphers ECDHE-RSA-AES128-GCM-SHA256' 'dhparamfile /etc/mosq/dh.pem' 'tls_version tlsv1.2'; do
+  grep -qF "$needle" "$WORK/knobs.toml" \
+    || { echo "  FAIL — the certificate-less listener's output does not say '$needle'"; exit 1; }
+done
+# ...and a listener that really DOES terminate TLS must keep its version-floor translation,
+# and its cipher list must be reported rather than dropped.
+printf 'persistence_location /v\nlistener 8883 0.0.0.0\ncertfile /c.crt\nkeyfile /c.key\ntls_version tlsv1.2\nciphers HIGH\ndhparamfile /dh.pem\n' > "$WORK/realtls.conf"
+python3 scripts/migrate/from-mosquitto.py "$WORK/realtls.conf" --out-config "$WORK/realtls.toml" >/dev/null
+grep -qF 'accepted TLS 1.2 AND 1.3' "$WORK/realtls.toml" \
+  || { echo "  FAIL — a listener that really terminates TLS lost its tls_version floor report"; exit 1; }
+for needle in 'ciphers HIGH' 'dhparamfile /dh.pem'; do
+  grep -qF "$needle" "$WORK/realtls.toml" \
+    || { echo "  FAIL — a real TLS listener's '$needle' is dropped without a word"; exit 1; }
+done
+echo "  ok   — inert TLS knobs are reported as inert, and only a listener with a certificate is said to have terminated TLS"
 
 # ── a BRIDGE block: reported, and pointed at the document that has the answer ──────────
 # Every one of these has an exact equivalent in the mqtt-bridge config this repo ships, and all

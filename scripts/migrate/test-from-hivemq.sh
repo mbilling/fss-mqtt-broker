@@ -443,6 +443,38 @@ grep -qF 'alice*bob' "$WORK/star-acl.toml" \
   || fail "the broker rejected the config built from an unbindable listener port"
 ok "an unbindable port and a glob-metacharacter user name are both refused and named"
 
+# ── a LITERAL %c/%i in a file-RBAC <topic>: refused, not turned into a grant ────────────
+# The file-RBAC extension substitutes only ${{clientid}} and ${{username}} (4.6.16
+# reference), so a <topic> carrying %c matched those bytes LITERALLY. mqttd substitutes
+# %c/%i in EVERY rule's topics with no escape, so carrying the filter across turns a rule
+# on one literal topic into a live per-client grant the source never gave. The Mosquitto
+# converter refuses this; until issue #297 this converter emitted it with only a
+# fail-closed caveat beside it.
+cat > "$WORK/literal-credentials.xml" <<'XML'
+<file-rbac><users><user><name>alice</name><password>x</password>
+<roles><id>r1</id></roles></user></users>
+<roles><role><id>r1</id><permissions>
+<permission><topic>c/%c/x</topic></permission>
+<permission><topic>data/${{clientid}}/#</topic></permission>
+</permissions></role></roles></file-rbac>
+XML
+python3 "$CONV" "$WORK/badport.xml" --credentials "$WORK/literal-credentials.xml" \
+  --out-config "$WORK/literal.toml" --out-acl "$WORK/literal-acl.toml" >/dev/null
+# comment lines stripped: the TODO's quote of the refused topic is the PRESCRIBED
+# handling, only a LIVE topics = [...] line is the defect.
+if grep -vE '^\s*#' "$WORK/literal-acl.toml" | grep -q '"c/%c/x"'; then
+  fail "a topic file-RBAC matched LITERALLY (c/%c/x) was emitted as a SUBSTITUTING mqttd rule"
+fi
+grep -qF 'c/%c/x' "$WORK/literal-acl.toml" \
+  || fail "the refused literal topic is not named anywhere in the ACL"
+grep -qF 'LITERALLY' "$WORK/literal-acl.toml" \
+  || fail "the refusal does not state that file-RBAC matched those bytes literally"
+# ...and a real ${{clientid}} substitution must still translate — the refusal must not
+# swallow the construct it exists to protect.
+grep -q '"data/%c/#"' "$WORK/literal-acl.toml" \
+  || fail "a genuine \${{clientid}} substitution stopped translating to %c"
+ok "a literal %c topic is refused and named; \${{clientid}} still translates"
+
 # ── the PROPERTY SWEEP ──────────────────────────────────────────────────────────────────
 # Everything above is example-based: one input, a list of greps. That shape catches a
 # regression exactly where a reviewer already looked and is blind everywhere else — which is

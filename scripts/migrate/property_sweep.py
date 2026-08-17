@@ -1119,6 +1119,27 @@ def emqx_cases() -> list[Case]:
             ],
         )
     )
+    # A literal %c in an acl.conf topic: EMQX 5/6 substitutes only ${...} placeholders (the
+    # pinned schema fixture lists them), so those bytes matched LITERALLY — while mqttd
+    # substitutes %c in every rule's topics with no escape. Emitting it converts a rule on one
+    # literal topic into a live per-client grant. Same class as the Mosquitto plain-`topic`
+    # case above; this converter carried it until issue #297.
+    cases.append(
+        Case(
+            name="emqx ACL topic containing a literal %c",
+            files={
+                "emqx.conf": 'node.data_dir = "/var/lib/emqx"\n'
+                "authorization { no_match = deny, sources = [ { type = file, path = \"acl.conf\" } ] }\n",
+                "acl.conf": '{allow, {username, "bob"}, publish, ["c/%c/x"]}.\n',
+            },
+            argv=["emqx.conf", "--out-config", "out.toml", "--out-acl", "acl.toml"],
+            outputs=["out.toml", "acl.toml"],
+            witnesses=[("the substituting topic, named", ["c/%c/x"])],
+            forbidden=[
+                ("a literal filter emitted as a substituting rule", '"c/%c/x"')
+            ],
+        )
+    )
     # A listener whose `bind` names a host with NO PORT: mqttd cannot bind that, and appending
     # `:1883` invented a port.
     cases.append(
@@ -1364,6 +1385,37 @@ def hivemq_cases() -> list[Case]:
             witnesses=[("the literal-star user, named", ["alice*bob"])],
             forbidden=[
                 ("a literal user name emitted as a glob", 'identities = ["alice*bob"]')
+            ],
+        )
+    )
+    # A literal %c in a file-RBAC <topic>: the extension substitutes only ${{clientid}} and
+    # ${{username}} (4.6.16 reference), so those bytes matched LITERALLY — while mqttd
+    # substitutes %c in every rule's topics with no escape. Same class as the Mosquitto and
+    # EMQX cases; this converter carried it until issue #297.
+    cases.append(
+        Case(
+            name="hivemq file-RBAC topic containing a literal %c",
+            files={
+                "config.xml": "<hivemq><listeners><tcp-listener><port>1883</port>"
+                "</tcp-listener></listeners></hivemq>\n",
+                "credentials.xml": "<file-rbac><users><user><name>bob</name>"
+                "<password>x</password><roles><id>r1</id></roles></user></users>"
+                "<roles><role><id>r1</id><permissions><permission><topic>c/%c/x</topic>"
+                "</permission></permissions></role></roles></file-rbac>\n",
+            },
+            argv=[
+                "config.xml",
+                "--credentials",
+                "credentials.xml",
+                "--out-config",
+                "out.toml",
+                "--out-acl",
+                "acl.toml",
+            ],
+            outputs=["out.toml", "acl.toml"],
+            witnesses=[("the substituting topic, named", ["c/%c/x"])],
+            forbidden=[
+                ("a literal filter emitted as a substituting rule", '"c/%c/x"')
             ],
         )
     )

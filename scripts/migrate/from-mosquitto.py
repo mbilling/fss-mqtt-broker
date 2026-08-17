@@ -55,7 +55,11 @@ Read the output against your own config before deploying it.
     # broker has not been asked to check:
     mqttd --check-config --config mqttd.toml
 
-Exit codes: 0 translated (possibly with TODOs), 1 could not read the input.
+Exit codes: 0 translated (possibly with TODOs), 1 the input could not be USED — it could
+not be read, or a directive carries a value the vendor's own schema does not admit (a count
+that is not a number, a boolean that is not a boolean). The second case writes NOTHING and
+names the key, the value and the file: emitting it would produce TOML the broker cannot parse
+under an exit code that says the migration worked.
 """
 
 from __future__ import annotations
@@ -192,6 +196,30 @@ def comment_safe(text: object) -> str:
 def truthy(value: object) -> bool:
     """Mosquitto's boolean spellings."""
     return str(value).strip().lower() in ("true", "yes", "1")
+
+
+# Every spelling `truthy()` recognises, in BOTH directions. A value outside this set is not a
+# boolean at all — and `truthy()` reads anything it does not recognise as FALSE, so a typo
+# (`retain_available flase`) silently becomes the OPPOSITE setting. Anything the DIRECT table
+# reads as a boolean is checked against this list first.
+BOOL_SPELLINGS = ("true", "false", "yes", "no", "1", "0")
+
+
+def is_bool(value: object) -> bool:
+    """Whether `value` is a boolean Mosquitto's own reader would accept."""
+    return str(value).strip().lower() in BOOL_SPELLINGS
+
+
+def is_count(value: object) -> bool:
+    """Whether `value` is a non-negative integer — which every mqttd [limits] key is.
+
+    Checked per ASCII character rather than with `str.isdigit()`, which is TRUE for the
+    Unicode digits (`٣`, `３`) that `int()` accepts and TOML does NOT: a value that
+    reaches the output has to be a number the BROKER's reader can parse, not merely one
+    Python can.
+    """
+    text = str(value).strip()
+    return bool(text) and all(c in "0123456789" for c in text)
 
 
 # ---------------------------------------------------------------------------
@@ -499,9 +527,37 @@ TLS_KEYS = {
     "require_certificate",
     "crlfile",
     "tls_version",
+    "ciphers",
+    "ciphers_tls1.3",
+    "dhparamfile",
     "use_identity_as_username",
     "use_subject_as_username",
 }
+
+# TLS KNOBS: settings that TUNE a TLS listener and cannot create one. mosquitto.conf(5) @
+# v2.0.22 scopes each to a listener, and a listener terminates TLS only with a CERTIFICATE
+# (`certfile` — "Path to the PEM encoded server certificate", with `keyfile`) or a PSK. So on a
+# listener with neither, every one of these was INERT in Mosquitto too.
+#
+# `ciphers` and `dhparamfile` were not in TLS_KEYS at all until 2026-08-15, so they fell through
+# to "no direct equivalent — check the mqttd configuration table" (a table with nothing in it
+# for either), and `tls_version` on a certificate-less listener was reported as if that listener
+# had terminated TLS: "so it accepted TLS 1.2 AND 1.3", printed beside the LIVE PLAINTEXT bind
+# the same converter wrote for it. That is the dangerous direction — an operator reads it as
+# "encrypted before cutover, not after" and goes looking for the TLS this converter lost, when
+# the truth is the source was never encrypted. The bind was right; the sentence was not.
+TLS_KNOBS = ("tls_version", "ciphers", "ciphers_tls1.3", "dhparamfile")
+
+# What a certificate-less listener's TODO inventories, in the man page's own spelling. The
+# material half (a CA, a key, a mandate, a CRL) plus the knobs: all of it inert, all of it named,
+# because "TLS settings were present" without the values is not a report.
+TLS_INERT_ORDER = (
+    "cafile",
+    "capath",
+    "keyfile",
+    "require_certificate",
+    "crlfile",
+) + TLS_KNOBS
 
 # TLS-PSK. LISTENER-SCOPED, and they decide the listener's TRANSPORT: mosquitto.conf(5) @
 # v2.0.22, verbatim — "The psk_hint option enables pre-shared-key support for this listener and
@@ -725,6 +781,27 @@ class Listener:
 
 
 @dataclass
+class Malformed:
+    """One directive whose value the VENDOR'S OWN SCHEMA does not admit.
+
+    Deliberately not a TODO. A TODO is for a construct that was READ and cannot be expressed
+    in mqttd; this is a value that cannot be read at all — `message_size_limit 10OO` with a
+    letter O, `retain_available flase`. The difference the operator sees is the EXIT CODE: a
+    TODO leaves a translated draft behind and exits 0, a malformed source writes NOTHING and
+    exits 1, because a migration script that trusts `exit 0` is exactly what a config the
+    broker cannot parse would otherwise be fed to.
+    """
+
+    key: str
+    value: str
+    expected: str
+
+    def sentence(self, conf: Path) -> str:
+        shown = comment_safe(self.value) if self.value.strip() else "(no value at all)"
+        return f"{conf}: `{self.key} {shown}` is not a value it can carry: {self.expected}"
+
+
+@dataclass
 class Conversion:
     config: dict[str, dict[str, Emitted]] = field(default_factory=dict)
     listeners: list[Listener] = field(default_factory=list)
@@ -743,6 +820,10 @@ class Conversion:
     # Security-relevant candidates that are NOT activated, rendered commented after their
     # section: `(section, lines)`.
     deferred: dict[str, list[str]] = field(default_factory=dict)
+    # MALFORMED SOURCE. Collected while parsing and REFUSED in main() before one byte is
+    # written, because the alternative is a generated file the broker's own TOML reader
+    # cannot parse sitting beside an exit code that says the migration worked.
+    malformed: list[Malformed] = field(default_factory=list)
 
     def set(
         self,
@@ -784,6 +865,10 @@ class Conversion:
         msg = comment_safe(msg)
         if msg not in self.notes:
             self.notes.append(msg)
+
+    def malformed_source(self, key: str, value: str, expected: str) -> None:
+        """Record a value the vendor's schema forbids. main() refuses the whole run."""
+        self.malformed.append(Malformed(key, value, expected))
 
 
 def parse_mosquitto_conf(text: str, conv: Conversion) -> None:
@@ -940,6 +1025,46 @@ def parse_mosquitto_conf(text: str, conv: Conversion) -> None:
 
         if key in DIRECT:
             section, mkey, kind = DIRECT[key]
+            # A VALUE THE VENDOR'S OWN SCHEMA REQUIRES TO BE A NUMBER AND THAT IS NOT ONE IS A
+            # MALFORMED SOURCE: refused, never emitted. The `int` arm used to end in
+            # conv.set(section, mkey, value) with NO check, so a typo'd
+            # `message_size_limit 10OO` (a letter O) wrote `max_packet_size = 10OO` into the
+            # generated TOML — a document `mqttd --check-config` cannot even PARSE
+            # ("Expected newline or end of document"), so the validation step this converter's
+            # own output, --help and docs point the operator at could not run — while the
+            # converter had already exited 0 and told a migration script to proceed.
+            #
+            # The BOOL arm had the same hole in the more dangerous direction: `truthy()` reads
+            # anything it does not recognise as FALSE, so `retain_available flase` was taken as
+            # TRUE and neither translated nor reported — a silent flip to the permissive
+            # reading. And the `str` arm accepted an EMPTY path, writing `data_dir = ""`.
+            # Found 2026-08-15.
+            if kind in ("int", "u16") and not is_count(value):
+                conv.malformed_source(
+                    key,
+                    value,
+                    f"mosquitto.conf(5) @ v2.0.22 documents it as a COUNT and [{section}] "
+                    f"{mkey} is an unsigned integer, so there is no number here to carry over",
+                )
+                continue
+            if kind == "retain" and not is_bool(value):
+                conv.malformed_source(
+                    key,
+                    value,
+                    "mosquitto.conf(5) @ v2.0.22 documents it as [ true | false ] and this "
+                    "converter reads it to decide whether retained messages were switched "
+                    "OFF. A value that is neither would be read as `true` — the PERMISSIVE "
+                    "direction — by any reader that guesses, so it is refused instead",
+                )
+                continue
+            if kind == "str" and not value.strip():
+                conv.malformed_source(
+                    key,
+                    value,
+                    f"it names a PATH and [{section}] {mkey} cannot be an empty one (the "
+                    "broker would start with its durable state pointed at nowhere)",
+                )
+                continue
             if kind == "int":
                 # ZERO IS THE VENDOR'S SPELLING OF *NO LIMIT* for both packet-size keys —
                 # mosquitto.conf(5) @ v2.0.22 on message_size_limit: "The default value is 0,
@@ -984,17 +1109,14 @@ def parse_mosquitto_conf(text: str, conv: Conversion) -> None:
                         "limit. If both directives were set, the LAST one read is what is below"
                     )
             elif kind == "u16":
-                if value.isdigit():
-                    conv.set(section, mkey, str(min(int(value), 65535)))
-                    if int(value) > 65535:
-                        conv.todo(
-                            f"{key} {value} exceeds the MQTT 5 16-bit field that "
-                            f"[{section}] {mkey} maps to; it was clamped to 65535"
-                        )
-                else:
-                    conv.todo(f"{key} {value}: not an integer this converter can map")
+                conv.set(section, mkey, str(min(int(value), 65535)))
+                if int(value) > 65535:
+                    conv.todo(
+                        f"{key} {value} exceeds the MQTT 5 16-bit field that "
+                        f"[{section}] {mkey} maps to; it was clamped to 65535"
+                    )
             elif kind == "retain":
-                if value.lower() in ("false", "no", "0"):
+                if not truthy(value):
                     conv.todo(
                         "retain_available=false disables retained messages entirely; "
                         "mqttd has no off switch — cap it instead with "
@@ -1229,8 +1351,14 @@ def convert_tls(conv: Conversion) -> list[str]:
     """
     # -- per-listener keys that are not material: version floor and identity source -----
     for lst in conv.listeners:
+        # A KNOB ONLY MEANS SOMETHING ON A LISTENER THAT TERMINATES TLS. Everything in this
+        # block used to run for every listener, so a listener with `tls_version` and no
+        # certificate was reported as having "accepted TLS 1.2 AND 1.3" — an assertion that
+        # the source encrypted traffic it served in the clear. The certificate-less case is
+        # reported below instead, by the loop that names every inert setting it carried.
+        terminates_tls = lst.is_tls or lst.is_psk
         raw = lst.tls.get("tls_version")
-        if raw is not None:
+        if raw is not None and terminates_tls:
             version = raw.strip().lower()
             # mosquitto.conf(5) @ v2.0.22, verbatim: "Configure the minimum version of the
             # TLS protocol to be used for this listener ... In Mosquitto version 1.6.x and
@@ -1262,6 +1390,42 @@ def convert_tls(conv: Conversion) -> list[str]:
                     "1.3, plus 1.2 behind [tls] allow_tls12 = true, and nothing older at "
                     "all: any client that can only do 1.1 or 1.0 CANNOT connect after "
                     "cutover. Find those clients before you move them"
+                )
+        if terminates_tls:
+            # mqttd's TLS is rustls: the suite set is FIXED, not configurable, so neither list
+            # can be carried over and neither can be silently dropped either — a `ciphers` line
+            # written to EXCLUDE something has to be checked against what mqttd offers.
+            raw = lst.tls.get("ciphers")
+            if raw is not None:
+                conv.todo(
+                    f"{lst.where} set ciphers {raw}, the OpenSSL cipher list for TLS 1.2 and "
+                    "below. mqttd has NO cipher configuration: its TLS is rustls, 1.3 by "
+                    "default, and TLS 1.2 only behind [tls] allow_tls12 = true where the "
+                    "suites are a hardened ALLOWLIST — the six ECDHE+AEAD suites, no CBC and "
+                    "no static RSA (crates/mqtt-net/src/tls.rs). Your list was NOT carried "
+                    "over: if it was there to EXCLUDE a weak suite, that suite is already "
+                    "absent; if it was there to ADMIT a legacy one, it is gone and those "
+                    "clients fail the handshake, which looks like a network fault rather than "
+                    "a policy one. Check the list against those six before cutover"
+                )
+            raw = lst.tls.get("ciphers_tls1.3")
+            if raw is not None:
+                conv.todo(
+                    f"{lst.where} set ciphers_tls1.3 {raw}, the TLS 1.3 ciphersuite list. "
+                    "mqttd does not expose one — rustls offers its own 1.3 suites, all AEAD, "
+                    "and they are not configurable — so this was NOT carried over. If the "
+                    "list was there to narrow 1.3, that narrowing is gone; nothing weaker is "
+                    "admitted by it"
+                )
+            raw = lst.tls.get("dhparamfile")
+            if raw is not None:
+                conv.todo(
+                    f"{lst.where} set dhparamfile {raw}, the Diffie-Hellman parameters for the "
+                    "non-EC DHE suites. mqttd offers NO such suite — key agreement is ECDHE, "
+                    "or a TLS 1.3 group — so there is nothing for that file to parameterise "
+                    "and it was NOT carried over. Nothing is lost by it (forward secrecy is "
+                    "still there, from ECDHE), and the file itself is not referenced anywhere "
+                    "in the output"
                 )
         raw = lst.tls.get("use_identity_as_username")
         if raw is not None:
@@ -1321,14 +1485,24 @@ def convert_tls(conv: Conversion) -> list[str]:
         # A PSK listener is EXCLUDED here: it was encrypted, so "Mosquitto served that listener
         # as PLAINTEXT" would be false about it. convert_psk() reports it, including whatever
         # material it also carried.
-        if lst.is_tls or lst.is_psk or not any(k in lst.tls for k in material_keys):
+        if lst.is_tls or lst.is_psk:
+            continue
+        inert = [k for k in TLS_INERT_ORDER if k in lst.tls]
+        if not inert:
             continue
         conv.todo(
             f"{lst.where} carried TLS settings ("
-            + ", ".join(f"{k} {lst.tls[k]}" for k in material_keys if k in lst.tls)
-            + ") but NO certfile, so Mosquitto served that listener as PLAINTEXT and nothing "
-            "here becomes TLS either. If it was meant to be encrypted, it never was — check "
-            "it before cutover"
+            + ", ".join(f"{k} {lst.tls[k]}" for k in inert)
+            + ") but NO certfile, so it did NOT terminate TLS and every one of those settings "
+            "was INERT — in Mosquitto, before this migration. mosquitto.conf(5) @ v2.0.22 "
+            "needs a certificate for a TLS listener (`certfile`, 'Path to the PEM encoded "
+            "server certificate', with `keyfile`), and a version floor, a cipher list or a "
+            "dhparamfile cannot create one: they only constrain a handshake that happens. So "
+            "do NOT read them as evidence that traffic on that listener was encrypted — it "
+            "was not, and the bind written for it below is PLAINTEXT because that is what the "
+            "source did. If it was MEANT to be encrypted then it never was, on either broker: "
+            "fix that here rather than assuming the migration dropped it — issue a certificate, "
+            "set [tls] cert/key, and move the bind onto the TLS key"
         )
     if not tls_listeners:
         return []
@@ -1585,9 +1759,58 @@ ANON_IDENTITY = "anonymous"
 # substitutes only in a `pattern` line and treats a plain `topic` filter literally.
 SUBSTITUTED = ("%c", "%i")
 
+# The REMEDIATION half of the anonymous-block TODO, one text per posture the generated config
+# actually ends up in.
+#
+# It used to be one unconditional sentence saying `allow_anonymous` "is emitted COMMENTED OUT"
+# in the generated config — but convert_scoped_security() emits that commented candidate ONLY
+# when mosquitto.conf set allow_anonymous TRUE. With `allow_anonymous false` (or the key
+# absent) there is no allow_anonymous line in the output at all, so the advice sent the
+# operator to uncomment a line nobody wrote: they grep the config, find nothing, and are left
+# deciding whether the tool or the advice is wrong. Advice that names a line the converter does
+# not emit costs the reader's trust in the TODOs that ARE right. Found 2026-08-15.
+ANON_ADVICE = {
+    # mosquitto.conf said allow_anonymous true, so the config holds the commented candidate.
+    "candidate": (
+        "they grant NOTHING until anonymous access is switched on in the generated config, "
+        "because mqttd refuses anonymous clients by default. mosquitto.conf DID set "
+        "allow_anonymous true, so that config carries the line `# allow_anonymous = true` "
+        "COMMENTED OUT in its [security] table — activating it is a security POSTURE change, "
+        "node-wide for every listener, so this converter does not make it. Uncomment that "
+        "exact line to keep these rules working, or give those clients a credential before "
+        "cutover and delete the rules"
+    ),
+    # The key was present and its last value was not a true one.
+    "false": (
+        "they grant NOTHING, and there is NOTHING in the generated config to uncomment: "
+        "mosquitto.conf's last allow_anonymous was not `true`, so these rules were ALREADY "
+        "DEAD in Mosquitto too and the generated config carries NO allow_anonymous line at "
+        "all (mqttd's own default is false). DELETE them — or, if you really do mean to open "
+        "anonymous access, which neither broker was doing, add `allow_anonymous = true` to "
+        "[security] yourself"
+    ),
+    # The key never appeared, and the vendor's default is not simply `false`.
+    "unset": (
+        "they grant NOTHING here, and there is NOTHING in the generated config to uncomment: "
+        "it carries NO allow_anonymous line at all and mqttd's default is false. Whether they "
+        "granted anything in MOSQUITTO cannot be read off your file either, because it never "
+        "set allow_anonymous and mosquitto.conf(5) @ v2.0.22 defaults it to false 'unless no "
+        "listeners are defined in the configuration file, in which case it is set to true, "
+        "but connections are only allowed from the local machine'. So either they were dead "
+        "and you should delete them, or they served local anonymous clients — in which case "
+        "add `allow_anonymous = true` to [security] yourself (a posture change, node-wide for "
+        "every listener), or better, issue those clients a credential"
+    ),
+}
 
-def parse_acl(text: str) -> tuple[list[dict], list[str]]:
+
+def parse_acl(text: str, anon_posture: str = "unset") -> tuple[list[dict], list[str]]:
     """Translate a Mosquitto ACL file into mqttd rules.
+
+    `anon_posture` is what the GENERATED CONFIG ended up saying about anonymous access —
+    "candidate" (a commented `allow_anonymous` line is in it), "false" or "unset" (no such
+    line exists) — because the advice in the anonymous-block TODO has to name a line the
+    operator can actually find. See ANON_ADVICE.
 
     Mosquitto's model is *positional*: `user X` opens a block, and `topic` lines
     until the next `user` belong to it. `pattern` lines apply to everyone with
@@ -1732,11 +1955,9 @@ def parse_acl(text: str) -> tuple[list[dict], list[str]]:
             f'["{ANON_IDENTITY}"], which is the subject mqttd gives a client that connected '
             "with no credentials (crates/mqtt-auth/src/basic.rs) — NOT as unscoped rules, "
             "which mqttd applies to EVERY authenticated identity and which would be strictly "
-            "broader than your Mosquitto policy. Consequences to check: (1) they grant NOTHING "
-            "until [security] allow_anonymous is set in the generated config, and it is emitted "
-            "COMMENTED OUT because mqttd refuses anonymous clients by default — if "
-            "allow_anonymous was FALSE in mosquitto.conf these rules were already dead and you "
-            "should delete them; (2) if you have a real named user called "
+            "broader than your Mosquitto policy. Consequences to check: (1) "
+            + ANON_ADVICE.get(anon_posture, ANON_ADVICE["unset"])
+            + "; (2) if you have a real named user called "
             f"`{ANON_IDENTITY}`, these rules apply to it too — rename that user",
         )
 
@@ -2041,6 +2262,33 @@ def main() -> int:
 
     conv = Conversion()
     parse_mosquitto_conf(text, conv)
+
+    # THE REFUSAL. A directive whose value the vendor's own schema does not admit is not
+    # something to translate "as well as possible": emitting it writes a config the broker
+    # cannot parse, and doing that under exit 0 tells a migration script the translation
+    # succeeded. So nothing is written at all, and every offending key, value and the file
+    # they came from is named on stderr. (Mosquitto's own reader refuses these too — a file
+    # that carries one is a file no Mosquitto ran.)
+    if conv.malformed:
+        print(
+            f"REFUSED: {args.conf} was NOT translated. "
+            f"{len(conv.malformed)} directive(s) carry a value the vendor's own schema does "
+            "not admit:",
+            file=sys.stderr,
+        )
+        for m in conv.malformed:
+            print(f"  {m.sentence(args.conf)}", file=sys.stderr)
+        print(
+            "NO file was written and no config was validated. Carrying such a value through "
+            "would put it straight into the generated TOML — `max_packet_size = 10OO` is not "
+            "a document `mqttd --check-config` can even parse, so the check this converter "
+            "tells you to run cannot run — and this tool would still have exited 0, which is "
+            "what a migration script reads as success. Fix the value(s) in the file above "
+            "and re-run.",
+            file=sys.stderr,
+        )
+        return 1
+
     convert_scoped_security(conv)
     convert_psk(conv)
     convert_listener_caps(conv)
@@ -2153,7 +2401,18 @@ def main() -> int:
                 f"{policy_effect(ACL_DEFAULT)}. Fix the path (or pass --acl-file) and re-run"
             ]
         else:
-            rules, todos = parse_acl(acl_text)
+            # DERIVED from what this run actually emitted, never assumed: the commented
+            # `allow_anonymous` candidate exists only when mosquitto.conf set it true.
+            if any(
+                line.startswith("# allow_anonymous = ")
+                for line in conv.deferred.get("security", [])
+            ):
+                anon_posture = "candidate"
+            elif conv.scoped.get("allow_anonymous"):
+                anon_posture = "false"
+            else:
+                anon_posture = "unset"
+            rules, todos = parse_acl(acl_text, anon_posture)
             if not rules:
                 todos.insert(
                     0,

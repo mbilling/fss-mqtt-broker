@@ -726,7 +726,7 @@ be found. Each is tracked; none is a silent surprise.
   write a live one without it.** Anything a converter could not derive comes out **commented
   out** beside a TODO naming the decision, so the worst case is a config **you** have to
   finish rather than a live setting nobody derived — that is what makes the output reviewable,
-  and it is enforced by a provenance invariant over 136 generated inputs plus a fuzz pass over
+  and it is enforced by a provenance invariant over 138 generated inputs plus a fuzz pass over
   mutated ones ([the draft contract](docs/MIGRATION.md#what-a-converter-produces-a-draft-where-anything-undecidable-is-inert-and-named)).
   **Read the output before deploying it: none of the above makes it correct, only honest.** What
   the gate does NOT close is **misreading** — a value genuinely derived from a real input key
@@ -1381,7 +1381,7 @@ Validate a rendered config without a cluster: `mqttd --check-config --config <fi
 
 ### Running the demo, migrations and test scripts
 
-There are 37 runnable scripts here — the demo stack, the Mosquitto/EMQX/HiveMQ converters
+There are 38 runnable scripts here — the demo stack, the Mosquitto/EMQX/HiveMQ converters
 and the dual-run cutover smoke, the smoke and conformance suites, the Kubernetes end-to-end
 runs, the benchmark harness. `mqttui` is the
 one place they are listed, explained and started ([ADR 0056](docs/adr/0056-mqttui.md), and

@@ -519,6 +519,57 @@ grep -qF 'names NO host' "$WORK/binds.toml" \
   || fail "the broker rejected the config built from unbindable listener addresses"
 ok "an unbindable address comes out inert, and the reason names the input value"
 
+# ── 11b. a LITERAL %c/%i in an acl.conf topic: refused, not turned into a grant ───────
+# EMQX 5/6 substitutes only ${...} placeholders (the pinned acl.conf schema @ 6.2.2 lists
+# them; %c/%i are not among them), so a topic carrying %c matched those bytes LITERALLY.
+# mqttd substitutes %c/%i in EVERY rule's topics with no escape, so carrying the filter
+# across turns a rule on one literal topic into a live per-client grant the source never
+# gave. The Mosquitto converter refuses this on a plain `topic` line; until issue #297 this
+# converter emitted it with only a fail-closed caveat beside it.
+cat > "$WORK/literal.conf" <<'CONF'
+node.data_dir = "/var/lib/emqx"
+authorization { no_match = deny, sources = [ { type = file, path = "acl.conf" } ] }
+CONF
+cat > "$WORK/literal-acl.conf" <<'CONF'
+{allow, {username, "alice"}, publish, ["c/%c/x"]}.
+{allow, {username, "alice"}, subscribe, ["devices/${clientid}/cmd"]}.
+CONF
+python3 "$CONV" "$WORK/literal.conf" --acl-file "$WORK/literal-acl.conf" \
+  --out-config "$WORK/literal.toml" --out-acl "$WORK/literal-out.toml" >/dev/null 2>&1 \
+  || fail "the converter failed on the literal-%c fixture"
+# comment lines stripped: the TODO's verbatim quote of the refused source rule is the
+# PRESCRIBED handling, only a LIVE topics = [...] line is the defect.
+if grep -vE '^\s*#' "$WORK/literal-out.toml" | grep -q '"c/%c/x"'; then
+  fail "a topic EMQX matched LITERALLY (c/%c/x) was emitted as a SUBSTITUTING mqttd rule"
+fi
+grep -qF "c/%c/x" "$WORK/literal-out.toml" \
+  || fail "the refused literal topic is not named anywhere in the output"
+grep -qF "LITERALLY" "$WORK/literal-out.toml" \
+  || fail "the refusal does not state that EMQX matched those bytes literally"
+# ...and a real ${clientid} placeholder must still translate — the refusal must not
+# swallow the construct it exists to protect.
+grep -q '"devices/%c/cmd"' "$WORK/literal-out.toml" \
+  || fail "a genuine \${clientid} placeholder stopped translating to %c"
+ok "a literal %c topic is refused and named; \${clientid} still translates"
+
+# ── 11c. a JWKS authenticator names its endpoint ──────────────────────────────────────
+# "with JWKS" without the URL left the operator unable to check that the provider the
+# advice reconfigures around is the provider they believe was in force — the same rule
+# report_unread_authn_keys already applies to every other authenticator's server/url.
+cat > "$WORK/jwks.conf" <<'CONF'
+node.data_dir = "/var/lib/emqx"
+authentication = [
+  { mechanism = jwt, use_jwks = true, endpoint = "https://idp.example.com/keys.json" }
+]
+CONF
+python3 "$CONV" "$WORK/jwks.conf" --out-config "$WORK/jwks.toml" >/dev/null 2>&1 \
+  || fail "the converter failed on the JWKS fixture"
+grep -qF 'https://idp.example.com/keys.json' "$WORK/jwks.toml" \
+  || fail "the JWKS endpoint URL is not named anywhere in the output"
+grep -qF '[security.oidc]' "$WORK/jwks.toml" \
+  || fail "the JWKS TODO no longer points at the [security.oidc] path"
+ok "a JWKS authenticator's endpoint is named, beside the [security.oidc] remediation"
+
 # ── 12. THE assertion: the real broker boots on the converted ACL ────────────────────
 # Run twice: once on the vendor fixture's policy, and once on the hostile-strings policy —
 # a backslash identity and a double-quoted topic filter have to survive the broker's own
