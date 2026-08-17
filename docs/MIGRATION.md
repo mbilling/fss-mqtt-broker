@@ -1044,10 +1044,10 @@ MQTTD_BIN=target/debug/mqttd ./scripts/migrate/dual-run-smoke.sh          # need
 MQTTD_BIN=target/debug/mqttd ./scripts/migrate/differential-mosquitto.sh  # needs the mosquitto BROKER
 ```
 
-**The first four scripts run in per-PR CI** — the three converter tests and the dual-run
-smoke (`.github/workflows/ci.yml` installs the Mosquitto broker for the smoke). The
-differential lane is **not yet a CI step**; it runs anywhere the Mosquitto broker is
-installed. Each of the five exits **2** — not 1 — when a binary or the Mosquitto broker
+**All five scripts run in per-PR CI** — the three converter tests, the dual-run smoke,
+and the differential lane (`.github/workflows/ci.yml` installs the Mosquitto broker for
+the smoke, and the differential step reuses it). The differential lane also runs
+anywhere the Mosquitto broker is installed. Each of the five exits **2** — not 1 — when a binary or the Mosquitto broker
 is missing, so "environment not ready" is never mistaken for "assertion failed"; verified
 by running them with `MQTTD_BIN` pointed at nothing, and the broker-needing ones with
 `mosquitto` off the `PATH`.
