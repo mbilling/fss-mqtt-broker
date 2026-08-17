@@ -1553,15 +1553,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `v5_user_properties_are_forwarded_to_subscribers`
 - `v5_will_user_properties_are_forwarded`
 
-## `crates/mqttd/tests/wire.rs` — 43 test(s)
+## `crates/mqttd/tests/wire.rs` — 44 test(s)
 
 - `a_byte_property_outside_zero_or_one_is_refused`
+- `a_complete_publish_over_the_ceiling_is_refused_not_accepted`
 - `a_connect_split_into_single_bytes_is_parsed`
 - `a_duplicated_property_is_refused`
 - `a_hash_sharing_its_level_is_an_invalid_filter`
 - `a_hash_that_is_not_the_last_level_is_an_invalid_filter`
+- `a_header_declaring_an_oversized_packet_is_refused_before_its_body`
 - `a_leading_bom_in_a_topic_is_preserved_not_stripped`
-- `a_packet_over_the_inbound_ceiling_is_refused`
 - `a_plus_sharing_its_level_is_an_invalid_filter`
 - `a_property_from_another_packet_type_is_refused`
 - `a_property_length_longer_than_the_block_is_malformed`

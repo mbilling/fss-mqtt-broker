@@ -740,34 +740,47 @@ async fn malformed_and_protocol_errors_are_told_apart() {
 // had ever actually observed on the wire.
 // ---------------------------------------------------------------------------
 
-/// FLOW-021 / `0x95`: a packet that grows past the inbound ceiling while still
-/// incomplete is refused with Packet too large.
+/// FLOW-021 / `0x95` (issue #292): a fixed header DECLARING a length over the
+/// inbound ceiling is refused from the header alone — before the body is read.
 ///
-/// **Read the shape of this test carefully — it is narrower than its name suggests,
-/// and the narrowness is the finding.** `next_packet` (every TCP/TLS client's path)
-/// tries `Packet::decode` FIRST and only checks the ceiling when decode says
-/// "incomplete". So the ceiling catches a packet that stalls oversized, which is
-/// what this test provokes — but a *complete* oversized packet decodes successfully
-/// and is **accepted**, ceiling and advertised Maximum Packet Size notwithstanding.
-///
-/// The declared-length check that would refuse from the header alone exists in
-/// `take_raw_frame`, used only by the QUIC mux — and `frame.rs`'s own
-/// `oversized_packet_is_rejected_not_buffered` exercises that function, so the
-/// property is tested on the path clients do not use. Filed separately; the memory
-/// is still bounded, so this is "refuses later and less often than it should", not
-/// an unbounded-allocation hole.
+/// Only the five header bytes are sent, and the refusal must arrive anyway: that
+/// is what pins the no-buffering property on the TCP path (the broker cannot be
+/// holding megabytes it was never sent). Before #292 this check lived only in
+/// `take_raw_frame` — the QUIC mux's path — while every TCP/TLS client's
+/// `next_packet` tried decode first and checked the ceiling only on "incomplete",
+/// so a stalling packet was caught late and a complete one not at all (the test
+/// below).
 #[tokio::test]
-async fn a_packet_over_the_inbound_ceiling_is_refused() {
+async fn a_header_declaring_an_oversized_packet_is_refused_before_its_body() {
     let addr = start_broker().await;
     let mut c = connected(addr, "wire-too-large").await;
 
-    // Declare 4 MiB and send 2 MiB of it: the buffer passes the ceiling while the
-    // packet is still incomplete, which is the condition the check actually tests.
     let mut header = vec![0x30]; // PUBLISH
     header.extend_from_slice(&vbi(4 * 1024 * 1024));
-    header.extend_from_slice(&mqtt_str("wire/big"));
-    c.send_bytes(&header).await;
-    c.send_bytes(&vec![b'x'; 2 * 1024 * 1024]).await;
+    c.send_bytes(&header).await; // nothing else: the claim alone condemns it
+
+    c.expect_disconnect_bytes(PACKET_TOO_LARGE).await;
+}
+
+/// The half that used to pass silently (issue #292): a COMPLETE PUBLISH over the
+/// ceiling arrived, decoded, and was accepted — the buffered-length check ran
+/// only while a packet was incomplete, so "complete" meant "exempt". It must be
+/// refused `0x95` like any other oversized packet [MQTT-3.2.2-15].
+///
+/// The write is close-tolerant (issue #306): the refusal this test demands can
+/// land while the offending bytes are still being written, and the resulting
+/// EPIPE **is the broker doing what the test asserts** — a send helper that
+/// unwraps its own write turns the pass condition into a panic.
+#[tokio::test]
+async fn a_complete_publish_over_the_ceiling_is_refused_not_accepted() {
+    let addr = start_broker().await;
+    let mut c = connected(addr, "wire-complete-too-large").await;
+
+    // A well-formed v5 PUBLISH whose total exceeds the 1 MiB default ceiling.
+    let mut body = mqtt_str("wire/big");
+    body.push(0x00); // property length 0
+    body.extend_from_slice(&vec![b'x'; 1024 * 1024 + 2048]);
+    c.send_bytes_tolerating_close(&frame(0x30, &body)).await;
 
     c.expect_disconnect_bytes(PACKET_TOO_LARGE).await;
 }

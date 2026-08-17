@@ -86,9 +86,24 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// - [`NetError::Io`] on a transport error.
     pub async fn next_packet(&mut self) -> Result<Option<Packet>, NetError> {
         loop {
+            // The ceiling is checked against the DECLARED total before any decode
+            // is attempted (issue #292): decode-first meant a complete oversized
+            // packet was accepted — the buffered-length check below never ran once
+            // the bytes were all in. Checking the header's own claim also refuses
+            // an oversized packet before its body is buffered, so the bound holds
+            // without ever holding the offending megabytes. Same arithmetic as
+            // `take_raw_frame`, via the shared helper.
+            if let Some(total) = declared_frame_len(&self.buf)? {
+                if total > max_packet_bytes() {
+                    return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
+                }
+            }
             if let Some(packet) = Packet::decode(&mut self.buf, self.version)? {
                 return Ok(Some(packet));
             }
+            // Belt-and-braces for a header that never completes: the declared
+            // length can only be read once the varint is whole, so a peer
+            // trickling header bytes is still bounded by the buffer ceiling.
             if self.buf.len() > max_packet_bytes() {
                 return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
             }
@@ -138,6 +153,24 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 /// remaining-length varint (1–4 bytes), then `remaining_length` payload bytes. Shared with the
 /// QUIC mux (ADR 0036) for extracting complete outbound packets to route across streams.
 pub(crate) fn take_raw_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, NetError> {
+    let Some(total) = declared_frame_len(buf)? else {
+        return Ok(None); // fixed header not complete yet
+    };
+    if total > max_packet_bytes() {
+        return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
+    }
+    if buf.len() < total {
+        return Ok(None); // whole packet not buffered yet
+    }
+    Ok(Some(buf.split_to(total).freeze()))
+}
+
+/// The total length (fixed header + remaining-length payload) the buffered fixed header
+/// DECLARES, or `Ok(None)` when the header itself is not complete yet. This is the one
+/// place the remaining-length varint is parsed for framing; both the TCP path
+/// ([`FrameReader::next_packet`], issue #292) and the raw-frame path ([`take_raw_frame`])
+/// judge the packet-size ceiling against this claim BEFORE buffering or decoding a body.
+pub(crate) fn declared_frame_len(buf: &BytesMut) -> Result<Option<usize>, NetError> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -163,14 +196,7 @@ pub(crate) fn take_raw_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, NetErr
             )));
         }
     }
-    let total = header_len + remaining;
-    if total > max_packet_bytes() {
-        return Err(NetError::Codec(mqtt_codec::CodecError::PacketTooLarge));
-    }
-    if buf.len() < total {
-        return Ok(None); // whole packet not buffered yet
-    }
-    Ok(Some(buf.split_to(total).freeze()))
+    Ok(Some(header_len + remaining))
 }
 
 /// Writes framed MQTT packets to an [`AsyncWrite`].
