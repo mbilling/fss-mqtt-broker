@@ -200,6 +200,133 @@ async fn v5_will_user_properties_are_forwarded() {
     );
 }
 
+// --- will delay (§3.1.3.2.2, issue #299) ------------------------------------
+
+/// Open a v5 connection whose Will carries a Will Delay Interval, and whose
+/// session lives long enough for the delay to matter.
+async fn connect_with_delayed_will(
+    addr: std::net::SocketAddr,
+    client_id: &str,
+    topic: &str,
+    delay_secs: u32,
+    session_expiry: u32,
+) -> Client {
+    let mut c = Client::open(addr, ProtocolVersion::V5).await;
+    c.send(&Packet::Connect(Connect {
+        properties: Properties(vec![Property::SessionExpiryInterval(session_expiry)]),
+        protocol: ProtocolVersion::V5,
+        clean_session: false,
+        keep_alive: 30,
+        client_id: client_id.to_string(),
+        last_will: Some(LastWill {
+            topic: topic.to_string(),
+            payload: bytes::Bytes::from_static(b"gone"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            properties: Properties(vec![Property::WillDelayInterval(delay_secs)]),
+        }),
+        username: None,
+        password: None,
+    }))
+    .await;
+    match c.recv().await {
+        Packet::ConnAck(a) => assert_eq!(a.code, 0),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    c
+}
+
+/// §3.1.3.2.2: the Will is held for its Will Delay Interval, not published the
+/// instant the connection drops.
+///
+/// This is what the property is FOR: a brief network blip must not announce a
+/// death that did not happen. Found by the Eclipse `paho.mqtt.testing` oracle
+/// (`test_will_delay`, issue #299), which measured the Will arriving at 0.1 s
+/// where 4 s had been asked for.
+#[tokio::test]
+async fn v5_a_will_is_held_for_its_delay_then_published() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "delay-watch").await;
+    watcher.subscribe(1, "wills/delayed", QoS::AtMostOnce).await;
+
+    let dying = connect_with_delayed_will(addr, "delay-dies", "wills/delayed", 3, 300).await;
+    let dropped_at = std::time::Instant::now();
+    drop(dying); // abrupt close — ungraceful, so the Will is owed
+
+    let p = watcher.expect_publish().await;
+    assert_eq!(p.topic, "wills/delayed");
+    assert_eq!(&p.payload[..], b"gone");
+
+    // MEASURED, not merely "it eventually arrives". Asserting only arrival would
+    // pass against a broker that ignores the delay entirely — the very bug this
+    // test exists for. The lower bound is the one that bites: a deadline armed on
+    // TRUNCATED whole seconds fires up to a second early, and only a measured
+    // assertion catches that (CI did, at 2.8s for a 4s delay).
+    let waited = dropped_at.elapsed();
+    assert!(
+        waited >= Duration::from_secs(3),
+        "the will fired after {waited:?}, EARLIER than the 3s delay asked for"
+    );
+    assert!(
+        waited < Duration::from_secs(6),
+        "the will fired after {waited:?}, far later than the 3s delay plus the 1s sweep"
+    );
+}
+
+/// The half that makes the delay worth having: a client that comes back inside
+/// the window cancels its own Will. Without this the feature is only a slower
+/// announcement of a death that did not happen.
+#[tokio::test]
+async fn v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "cancel-watch").await;
+    watcher
+        .subscribe(1, "wills/cancelled", QoS::AtMostOnce)
+        .await;
+
+    let dying = connect_with_delayed_will(addr, "cancel-dies", "wills/cancelled", 3, 300).await;
+    drop(dying);
+
+    // SETTLE(v5-will-delay-cancel-inside-window): this wait POSITIONS the reconnect
+    // inside the 3s will-delay window, after the broker has processed the ungraceful
+    // drop and armed the pending will — reconnecting with no gap can race the detach
+    // and cancel a will that was never armed, proving nothing. There is no observable
+    // for "the will is armed" on the wire (that state is deliberately invisible to
+    // clients), so a fixed fraction of the window is the only honest positioning.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _back = connect_with_delayed_will(addr, "cancel-dies", "wills/cancelled", 3, 300).await;
+
+    // Past when the will would have fired had the reconnect not cancelled it.
+    assert!(
+        matches!(
+            watcher.recv_bounded(Duration::from_secs(5)).await,
+            common::Recv::Quiet
+        ),
+        "a client that returned inside its will delay must not have its will published"
+    );
+}
+
+/// §3.1.3.2.2 publishes on "delay elapsed" OR "session ended", whichever is
+/// FIRST — so a delay longer than the session's own lifetime is bounded by it.
+/// A Will must never outlive the session it describes.
+#[tokio::test]
+async fn v5_a_will_delay_is_bounded_by_the_session_expiry() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "bound-watch").await;
+    watcher.subscribe(1, "wills/bounded", QoS::AtMostOnce).await;
+
+    // Expiry 0: the session ends the moment the connection does, so the will is
+    // due at once however long a delay was requested.
+    let dying = connect_with_delayed_will(addr, "bound-dies", "wills/bounded", 3600, 0).await;
+    drop(dying);
+
+    let p = watcher.expect_publish().await;
+    assert_eq!(
+        p.topic, "wills/bounded",
+        "a session that ends at once publishes its will at once, delay or not"
+    );
+}
+
 // --- session expiry (ADR 0009 phase 1) --------------------------------------
 
 #[tokio::test]
@@ -267,6 +394,99 @@ async fn v5_session_expires_after_interval() {
     )
     .await;
     assert!(!ack.session_present, "the session expired and was swept");
+}
+
+/// §3.14.2.2.2: a Session Expiry Interval on the DISCONNECT **overrides** the one
+/// agreed at CONNECT.
+///
+/// This is the documented way for a client to say "I connected expecting to be
+/// brief, but hold my session — I will be back". Ignoring it fails silently: the
+/// client gets a clean DISCONNECT and only discovers the loss on reconnect, with
+/// its subscriptions and queued messages gone. Found by the Eclipse
+/// `paho.mqtt.testing` oracle (`test_session_expiry`, issue #298).
+#[tokio::test]
+async fn v5_disconnect_session_expiry_overrides_the_connect_value() {
+    let addr = start_broker().await;
+    let (mut sub, _) = Client::connect_v5(
+        addr,
+        "extends-on-exit",
+        false,
+        vec![Property::SessionExpiryInterval(1)],
+    )
+    .await;
+    sub.subscribe(1, "t", QoS::AtMostOnce).await;
+    // Connected for 1s, leaving for 300 — the session must survive on the 300.
+    sub.disconnect_with(vec![Property::SessionExpiryInterval(300)])
+        .await;
+
+    // SETTLE(v5-disconnect-expiry-override): the observable would DESTROY the subject —
+    // the only probe for "did the session survive past the CONNECT's 1s?" is a
+    // reconnect, and a reconnect cancels the pending expiry outright. So the wait must
+    // straddle the CONNECT's 1s window plus the 1s sweep (with loaded-runner margin)
+    // rather than poll it; the same reasoning as `v5-session-expiry-wire` above, on
+    // the DISCONNECT-supplied interval instead.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let (_sub, ack) = Client::connect_v5(
+        addr,
+        "extends-on-exit",
+        false,
+        vec![Property::SessionExpiryInterval(300)],
+    )
+    .await;
+    assert!(
+        ack.session_present,
+        "the DISCONNECT raised the expiry to 300s, so the session must outlive \
+         the 1s agreed at CONNECT [MQTT-3.14.2.2.2]"
+    );
+}
+
+/// The other half of §3.14.2.2.2, and the half that is easy to skip: if the
+/// CONNECT's interval was **0**, a non-zero one on the DISCONNECT is a Protocol
+/// Error. A session that was never meant to outlive its connection cannot be
+/// resurrected on the way out.
+#[tokio::test]
+async fn v5_disconnect_cannot_raise_an_expiry_the_connect_set_to_zero() {
+    let addr = start_broker().await;
+    let (mut sub, _) = Client::connect_v5(
+        addr,
+        "zero-then-nonzero",
+        false,
+        vec![Property::SessionExpiryInterval(0)],
+    )
+    .await;
+    sub.subscribe(1, "t", QoS::AtMostOnce).await;
+    sub.send(&mqtt_codec::Packet::Disconnect(
+        mqtt_codec::packet::Disconnect {
+            reason: 0,
+            properties: mqtt_codec::Properties(vec![Property::SessionExpiryInterval(300)]),
+        },
+    ))
+    .await;
+    // Announced, not merely closed: this is post-CONNACK, so [MQTT-4.13.2] wants
+    // the reason on the wire before the close.
+    match sub.recv().await {
+        mqtt_codec::Packet::Disconnect(d) => assert_eq!(
+            d.reason,
+            mqtt_codec::reason::PROTOCOL_ERROR,
+            "raising a zero expiry on DISCONNECT is a Protocol Error [MQTT-3.14.2.2.2]"
+        ),
+        other => panic!("expected a server DISCONNECT(0x82), got {other:?}"),
+    }
+
+    // And the refusal must not have applied the override: the session is still
+    // expiry-0, so it is gone.
+    let (_sub, ack) = Client::connect_v5(
+        addr,
+        "zero-then-nonzero",
+        false,
+        vec![Property::SessionExpiryInterval(300)],
+    )
+    .await;
+    assert!(
+        !ack.session_present,
+        "the refused override must not have been applied"
+    );
 }
 
 // --- message expiry (ADR 0009 phase 2) --------------------------------------
