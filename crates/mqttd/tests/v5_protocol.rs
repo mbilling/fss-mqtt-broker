@@ -287,7 +287,12 @@ async fn v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay() {
     let dying = connect_with_delayed_will(addr, "cancel-dies", "wills/cancelled", 3, 300).await;
     drop(dying);
 
-    // Back well inside the 3s window.
+    // SETTLE(v5-will-delay-cancel-inside-window): this wait POSITIONS the reconnect
+    // inside the 3s will-delay window, after the broker has processed the ungraceful
+    // drop and armed the pending will — reconnecting with no gap can race the detach
+    // and cancel a will that was never armed, proving nothing. There is no observable
+    // for "the will is armed" on the wire (that state is deliberately invisible to
+    // clients), so a fixed fraction of the window is the only honest positioning.
     tokio::time::sleep(Duration::from_millis(400)).await;
     let _back = connect_with_delayed_will(addr, "cancel-dies", "wills/cancelled", 3, 300).await;
 
@@ -414,10 +419,12 @@ async fn v5_disconnect_session_expiry_overrides_the_connect_value() {
     sub.disconnect_with(vec![Property::SessionExpiryInterval(300)])
         .await;
 
-    // Past the CONNECT's 1s and the 1s sweep, with margin for a loaded runner. The
-    // same generous fixed wait as `v5_session_expires_after_interval`, and for the
-    // same reason: reconnecting earlier would cancel the pending expiry outright,
-    // so the wait has to straddle the window rather than probe it.
+    // SETTLE(v5-disconnect-expiry-override): the observable would DESTROY the subject —
+    // the only probe for "did the session survive past the CONNECT's 1s?" is a
+    // reconnect, and a reconnect cancels the pending expiry outright. So the wait must
+    // straddle the CONNECT's 1s window plus the 1s sweep (with loaded-runner margin)
+    // rather than poll it; the same reasoning as `v5-session-expiry-wire` above, on
+    // the DISCONNECT-supplied interval instead.
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     let (_sub, ack) = Client::connect_v5(
