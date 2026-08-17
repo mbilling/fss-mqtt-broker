@@ -806,3 +806,95 @@ async fn an_empty_client_id_with_clean_start_is_assigned_one() {
     c.send_bytes(&connect_v5_bytes("")).await; // clean start is set by the builder
     c.expect_connack_bytes(0x00).await;
 }
+
+// ---------------------------------------------------------------------------
+// UNSUBACK reason codes (issue #290, [MQTT-3.11.3-1])
+// ---------------------------------------------------------------------------
+
+/// A minimal, VALID v5 UNSUBSCRIBE for `filters`, packet id `pkid`.
+fn unsubscribe_v5_bytes(pkid: u16, filters: &[&str]) -> Vec<u8> {
+    let mut body = pkid.to_be_bytes().to_vec();
+    body.push(0x00); // property length 0
+    for f in filters {
+        body.extend_from_slice(&mqtt_str(f));
+    }
+    frame(0xA2, &body)
+}
+
+/// Issue #290 — a v5 UNSUBACK carries EXACTLY one reason code per requested
+/// filter, in request order [MQTT-3.11.3-1]: `0x00` where a subscription was
+/// removed, `0x11 No subscription existed` where there was nothing to remove,
+/// `0x8F Topic Filter invalid` for a structurally invalid filter. Asserted on
+/// the raw bytes, because the typed client would hide a payload-length mismatch —
+/// the defect was an UNSUBACK whose payload was structurally EMPTY.
+#[tokio::test]
+async fn v5_unsuback_answers_one_reason_code_per_filter_in_order() {
+    let addr = start_broker().await;
+    let mut c = RawClient::open(addr).await;
+    c.send_bytes(&connect_v5_bytes("unsub-codes")).await;
+    c.expect_connack_bytes(0x00).await;
+    c.send_bytes(&subscribe_v5_bytes("a/b")).await;
+    match c.read_outcome(Duration::from_secs(5)).await {
+        RawOutcome::Bytes(b) => assert_eq!(b[0], 0x90, "expected SUBACK, got {b:02x?}"),
+        other => panic!("expected SUBACK, got {other:?}"),
+    }
+
+    // Subscribed, never-subscribed, structurally invalid — one code each, in order.
+    c.send_bytes(&unsubscribe_v5_bytes(7, &["a/b", "never/was", "a/#/b"]))
+        .await;
+    match c.read_outcome(Duration::from_secs(5)).await {
+        RawOutcome::Bytes(b) => assert_eq!(
+            b,
+            vec![0xB0, 0x06, 0x00, 0x07, 0x00, 0x00, 0x11, 0x8F],
+            "UNSUBACK must be pkid 7, empty properties, then exactly \
+             [0x00 removed, 0x11 no subscription existed, 0x8F filter invalid]"
+        ),
+        other => panic!("expected UNSUBACK, got {other:?}"),
+    }
+
+    // The 0x00 above must have MEANT removal: the same filter again is now 0x11.
+    c.send_bytes(&unsubscribe_v5_bytes(8, &["a/b"])).await;
+    match c.read_outcome(Duration::from_secs(5)).await {
+        RawOutcome::Bytes(b) => assert_eq!(
+            b,
+            vec![0xB0, 0x04, 0x00, 0x08, 0x00, 0x11],
+            "re-unsubscribing a removed filter answers 0x11, proving the first \
+             0x00 removed it"
+        ),
+        other => panic!("expected UNSUBACK, got {other:?}"),
+    }
+}
+
+/// The version gate this fix must not break: a v3.1.1 UNSUBACK is EXACTLY
+/// `0xB0 0x02 <pkid>` — no properties, no reason codes — whatever was
+/// unsubscribed. The codes are still computed internally (the removal logic is
+/// shared); the encoder drops them below v5, and this pins that.
+#[tokio::test]
+async fn v311_unsuback_stays_two_bytes_with_no_reason_codes() {
+    let addr = start_broker().await;
+    let mut c = RawClient::open(addr).await;
+    // Hand-assembled v3.1.1 CONNECT: protocol level 4, no properties block.
+    let mut body = mqtt_str("MQTT");
+    body.push(4);
+    body.push(0x02); // clean session
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&mqtt_str("unsub-v311"));
+    c.send_bytes(&frame(0x10, &body)).await;
+    match c.read_outcome(Duration::from_secs(5)).await {
+        RawOutcome::Bytes(b) => assert_eq!(b[0], 0x20, "expected CONNACK, got {b:02x?}"),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    // v3.1.1 UNSUBSCRIBE: pkid + filters, NO property length byte.
+    let mut ubody = 9u16.to_be_bytes().to_vec();
+    ubody.extend_from_slice(&mqtt_str("never/was"));
+    c.send_bytes(&frame(0xA2, &ubody)).await;
+    match c.read_outcome(Duration::from_secs(5)).await {
+        RawOutcome::Bytes(b) => assert_eq!(
+            b,
+            vec![0xB0, 0x02, 0x00, 0x09],
+            "a v3.1.1 UNSUBACK carries the packet id and nothing else"
+        ),
+        other => panic!("expected UNSUBACK, got {other:?}"),
+    }
+}

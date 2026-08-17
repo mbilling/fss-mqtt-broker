@@ -1268,6 +1268,12 @@ pub enum HubCommand {
         client: ClientId,
         /// Topic filters being removed.
         filters: Vec<String>,
+        /// One answer per filter, in request order: `true` when a subscription
+        /// existed and was removed, `false` when there was nothing to remove —
+        /// the v5 UNSUBACK's `0x00` / `0x11 No subscription existed` split
+        /// ([MQTT-3.11.3-1], issue #290). `None` for callers that do not answer
+        /// a client (tests, internal sweeps).
+        reply: Option<oneshot::Sender<Vec<bool>>>,
     },
     /// Route an application message to matching subscribers.
     Publish {
@@ -2701,8 +2707,17 @@ impl Hub {
             HubCommand::SetBrownout { axis, on } => {
                 self.set_brownout_axis(axis, on);
             }
-            HubCommand::Unsubscribe { client, filters } => {
-                self.unsubscribe(&client, &filters).await;
+            HubCommand::Unsubscribe {
+                client,
+                filters,
+                reply,
+            } => {
+                let existed = self.unsubscribe(&client, &filters).await;
+                if let Some(reply) = reply {
+                    // A dropped receiver means the connection died mid-unsubscribe;
+                    // the removal itself already happened either way.
+                    let _ = reply.send(existed);
+                }
             }
             HubCommand::Publish {
                 topic,
@@ -4219,11 +4234,18 @@ impl Hub {
         }
     }
 
-    async fn unsubscribe(&mut self, client: &ClientId, filters: &[String]) {
+    /// Returns, per filter in request order, whether a subscription existed and
+    /// was removed (issue #290). `subs_by_client` is the authority: it keeps the
+    /// full filter string — `$share/` prefix included — for every grant, so one
+    /// `remove` answers ordinary and shared filters alike.
+    async fn unsubscribe(&mut self, client: &ClientId, filters: &[String]) -> Vec<bool> {
+        let mut existed = Vec::with_capacity(filters.len());
         for f in filters {
-            if let Some(map) = self.subs_by_client.get_mut(client) {
-                map.remove(f);
-            }
+            existed.push(
+                self.subs_by_client
+                    .get_mut(client)
+                    .is_some_and(|map| map.remove(f).is_some()),
+            );
             // #198: drop the subscription options with the subscription.
             for map in [&mut self.no_local, &mut self.retain_as_published] {
                 if let Some(set) = map.get_mut(client) {
@@ -4239,11 +4261,14 @@ impl Hub {
                 self.table.unsubscribe(client, f);
             }
         }
-        // An UNSUBACK has no failure codes (v3.1.1); a failed durable removal
+        // A failed durable removal is not surfaced in the UNSUBACK codes: it
         // leaves the subscription durably present — the safe side (no loss,
-        // possible extra deliveries until a later persist succeeds).
+        // possible extra deliveries until a later persist succeeds) — and the
+        // in-memory removal above already answered the client's question
+        // ("did I hold this subscription?"), which is all `0x00`/`0x11` claim.
         let _ = self.persist_subscriptions(client).await;
         self.gossip_interest();
+        existed
     }
 
     /// The highest `QoS` granted to `client` across its filters matching `topic`.
@@ -17981,6 +18006,7 @@ mod tests {
         tx.send(HubCommand::Unsubscribe {
             client: ClientId("g".into()),
             filters: vec!["g/1".into()],
+            reply: None,
         })
         .unwrap();
         match recv_peer(&mut p).await {
