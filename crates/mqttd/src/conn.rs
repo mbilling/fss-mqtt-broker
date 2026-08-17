@@ -2349,11 +2349,58 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 .await?;
         }
         Packet::Unsubscribe(u) => {
-            let _ = hub.send(HubCommand::Unsubscribe {
-                client: client.clone(),
-                filters: u.filters.clone(),
-            });
-            writer.send(&Packet::UnsubAck(u.pkid.into())).await?;
+            // One reason code per filter, in request order [MQTT-3.11.3-1]
+            // (issue #290): a structurally invalid filter answers 0x8F without
+            // reaching the hub (mirroring the SUBSCRIBE path); the rest ask the
+            // hub, whose per-filter answer splits 0x00 Success from 0x11 No
+            // subscription existed. There is deliberately NO ACL gate here —
+            // removing interest needs no permission — so 0x87 stays unreachable
+            // on this path. v3.1.1 keeps its empty UNSUBACK: the codes are
+            // still computed (the removal logic is shared) and the encoder
+            // drops them for anything below v5.
+            let mut reason_codes: Vec<u8> = Vec::with_capacity(u.filters.len());
+            let mut asked: Vec<String> = Vec::new();
+            for f in &u.filters {
+                if subscribable_filter(f) {
+                    // Placeholder; overwritten from the hub's answer below.
+                    reason_codes.push(0x00);
+                    asked.push(f.clone());
+                } else {
+                    // [MQTT-4.7.1] structural validity — includes a malformed
+                    // `$share/...` (bad share name / empty filter), which the
+                    // SUBSCRIBE path also refuses before the hub sees it.
+                    debug!(client = %client.0, filter = %f, "invalid topic filter in UNSUBSCRIBE");
+                    reason_codes.push(mqtt_codec::reason::TOPIC_FILTER_INVALID);
+                }
+            }
+            if !asked.is_empty() {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = hub.send(HubCommand::Unsubscribe {
+                    client: client.clone(),
+                    filters: asked,
+                    reply: Some(reply_tx),
+                });
+                let Ok(existed) = reply_rx.await else {
+                    // Hub gone mid-unsubscribe: the BROKER closes — not a
+                    // graceful client end, exactly as on the SUBSCRIBE path.
+                    return Ok(PacketOutcome::BrokerClose);
+                };
+                // Walk the slots that reached the hub (the 0x00 placeholders),
+                // in order, and mark the ones where nothing was removed.
+                let mut v = existed.iter();
+                for code in &mut reason_codes {
+                    if *code == 0x00 && !v.next().copied().unwrap_or(true) {
+                        *code = mqtt_codec::reason::NO_SUBSCRIPTION_EXISTED;
+                    }
+                }
+            }
+            writer
+                .send(&Packet::UnsubAck(mqtt_codec::packet::UnsubAck {
+                    pkid: u.pkid,
+                    reason_codes,
+                    properties: mqtt_codec::Properties::new(),
+                }))
+                .await?;
         }
         Packet::PingReq => writer.send(&Packet::PingResp).await?,
         Packet::Disconnect(d) => {

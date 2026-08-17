@@ -1553,7 +1553,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `v5_user_properties_are_forwarded_to_subscribers`
 - `v5_will_user_properties_are_forwarded`
 
-## `crates/mqttd/tests/wire.rs` — 41 test(s)
+## `crates/mqttd/tests/wire.rs` — 43 test(s)
 
 - `a_byte_property_outside_zero_or_one_is_refused`
 - `a_connect_split_into_single_bytes_is_parsed`
@@ -1596,6 +1596,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_hand_built_subscribe_and_publish_round_trip`
 - `the_legal_wildcard_filters_are_still_granted`
 - `three_packets_in_one_segment_are_all_processed_in_order`
+- `v311_unsuback_stays_two_bytes_with_no_reason_codes`
+- `v5_unsuback_answers_one_reason_code_per_filter_in_order`
 
 ## `crates/mqttd/tests/ws.rs` — 3 test(s)
 
