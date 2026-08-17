@@ -816,6 +816,28 @@ impl RawClient {
         self.stream.flush().await.unwrap();
     }
 
+    /// Like [`send_bytes`](Self::send_bytes), but a broken pipe / connection reset
+    /// mid-write is ACCEPTED rather than a panic (issues #292/#306): when the send
+    /// itself is what the server refuses — an oversized packet, say — the refusal
+    /// can land while these bytes are still going out, and the resulting `EPIPE`
+    /// *is the behaviour under test* arriving one syscall early. macOS's smaller
+    /// socket buffers surface this deterministically where Linux's usually absorb
+    /// the write; a test whose subject is "the server hangs up on me" must not
+    /// unwrap its own writes. Any other I/O error still panics.
+    pub async fn send_bytes_tolerating_close(&mut self, bytes: &[u8]) {
+        use std::io::ErrorKind;
+        use tokio::io::AsyncWriteExt;
+        let ok_kind =
+            |k: ErrorKind| matches!(k, ErrorKind::BrokenPipe | ErrorKind::ConnectionReset);
+        if let Err(e) = self.stream.write_all(bytes).await {
+            assert!(ok_kind(e.kind()), "unexpected write error: {e:?}");
+            return;
+        }
+        if let Err(e) = self.stream.flush().await {
+            assert!(ok_kind(e.kind()), "unexpected flush error: {e:?}");
+        }
+    }
+
     /// Write `bytes` in `chunk` -sized pieces, flushing and pausing `gap` between each,
     /// so the broker's decoder genuinely sees a partial frame and must buffer it.
     /// `TCP_NODELAY` is set so a small chunk is not coalesced by Nagle into the next.
