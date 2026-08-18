@@ -317,6 +317,18 @@ load; the client-facing cost scales with the rolled pod's share, not the fleet):
   witnessed-release protocol that is deliberately NOT part of this change (issue
   filed; the reasoning is in ADR 0043's as-delivered note). Do not read this bullet
   as "an `Accepted` always means stored" during an ownership move.
+
+  **And the co-subscribed form of that window is wider (issue #305):** when a filter
+  has more than one subscriber, `Accepted` means the message was stored (or
+  delivered) for **at least one** subscriber owed it — not for every one. A publish
+  matching both a live subscriber and a durable session whose group is mid-move is
+  acked on the live delivery while the moved session's copy is stored nowhere, with
+  no refusal, log line, or metric. The sole-subscriber form withholds the ack
+  (fail-closed); the co-subscriber is what hides it, because the ack ledger is one
+  boolean, not per-obligation. Pinned by
+  `a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`,
+  which fails the day the promise is strengthened; the per-obligation ledger is
+  future work recorded in the ADR 0041 amendment (2026-08-17).
 - **A straggler that resumes into the readmission window is rehomed, promptly**
   (issue #284, delivered): a client that resumes in the seconds around the rolled
   pod's readmission can be placed on the group's *interim* owner — the ring hands

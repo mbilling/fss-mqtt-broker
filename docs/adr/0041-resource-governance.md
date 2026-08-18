@@ -517,3 +517,25 @@ un-graceful so the Will fires. v3.1.1 is untouched: its DISCONNECT has no reason
 always decodes as `0`. The graceful-shutdown drain (ADR 0019) remains the one deliberate
 close that is graceful without a client DISCONNECT — the server is going away, not the
 client; the session is retained and the Will withheld.
+
+## Amendment (2026-08-17): what `Accepted` promises on a co-subscribed filter (issue #305)
+
+The ack contract this ADR built (#238's effect-free refusals, T11/T12's cross-node
+verdicts) releases a publish's acknowledgement against **one boolean** —
+`PendingPublish::stored` — not a per-subscriber ledger. On a filter with more than one
+subscriber that narrows the promise, and this amendment states the narrowed form rather
+than letting the broad one stand: **`Accepted` means the message was stored (or
+delivered) for at least one subscriber owed it — not for every one.** Concretely, a
+publish matching both a live subscriber and a durable session whose placement group is
+mid-move (the #294 window) is acked on the live delivery while the moved session's copy
+is stored nowhere — no refusal, no log line, no metric. The sole-subscriber form of the
+same window is withheld (fail-closed, the T5 rule); a co-subscriber is what hides it.
+
+Pinned by `a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`,
+which asserts the current behaviour and therefore FAILS the day the promise is
+strengthened. Strengthening it means a per-obligation ledger — `PendingPublish` growing
+a bounded obligation set, every `stored = true` site discharging a specific obligation,
+and the terminal-verdict composition (first-terminal-wins, third-node withholds)
+extending over the set. That is a redesign of the ack ledger, recorded here as the
+follow-up shape rather than attempted under this issue; it pairs naturally with the
+hub decomposition (#258), which isolates the seams it must touch.

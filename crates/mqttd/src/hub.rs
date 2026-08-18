@@ -16599,6 +16599,141 @@ mod tests {
         }
     }
 
+    /// Issue #305 — the PINNED narrowed promise: `Accepted` means the message was
+    /// stored (or delivered) for **at least one** subscriber owed it, NOT for every
+    /// one. With a co-subscribed filter — one LIVE subscriber and one durable
+    /// session whose group's COMMITTED LEASE has moved with no membership change
+    /// (the unmasked #294 window: nothing arms a settle hold) — the ack is released
+    /// on the live co-subscriber's delivery once the reconcile scan releases the
+    /// moved session's routing, while the moved session's copy is stored nowhere.
+    /// The sole-subscriber form of the same window IS withheld (the `GroupGatedStore`
+    /// tests below); the co-subscriber is what hides it, because
+    /// `PendingPublish::stored` is one boolean, not a per-obligation ledger.
+    ///
+    /// This test asserts the CURRENT behaviour deliberately (issue #305 exit 2:
+    /// state the narrowed claim — README, COMPARISON, OPERATIONS and the ADR 0041
+    /// amendment carry it). If a per-obligation ledger ever strengthens the
+    /// promise, this test FAILS and must be rewritten to assert the withhold —
+    /// that divergence firing is its purpose.
+    #[tokio::test]
+    async fn a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost() {
+        let local = NodeId("rehome-local".into());
+        let remote = NodeId("rehome-remote".into());
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        // The remote is a member from the START: the lease move below is the only
+        // change during the test, so no membership-change settle window masks it.
+        placement
+            .write()
+            .unwrap()
+            .observe(&remote, MemberState::Alive, "r:7000", None);
+        let store = GroupGatedStore::new(placement.clone());
+        let (mut hub, tx) =
+            Hub::with_config_and_placement(local.clone(), store.clone(), Some(placement.clone()));
+        let (_store, _retained, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
+            local.clone(),
+            placement.clone(),
+            false,
+            5,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .await;
+        driver.abort();
+        hub.attach_durable_plane(plane);
+        tokio::spawn(hub.run());
+        // Linked AND settled (a peer that never spoke holds every gated ack).
+        let _peer = connect_peer(&tx, "rehome-remote", 1);
+        peer_gossips_interest(&tx, &remote, &[]);
+        await_routing_settled(&tx).await;
+
+        // The durable co-subscriber: HRW-owned HERE, attaches persistent,
+        // subscribes, and its CLIENT disconnects — offline, persistent, owned.
+        let mover = (0..100_000)
+            .map(|i| format!("co-mover-{i}"))
+            .find(|c| placement.read().unwrap().owner(c) == local)
+            .expect("some client is HRW-owned locally");
+        let mover_id = ClientId(mover.clone());
+        let (_mover_rx, _) = attach(&tx, &mover, 1, false).await;
+        subscribe(&tx, &mover, "co/t");
+        detach(&tx, &mover, 1);
+
+        // The LIVE co-subscriber on the same filter, online throughout.
+        let (mut live_rx, _) = attach(&tx, "co-live", 2, true).await;
+        subscribe(&tx, "co-live", "co/t");
+
+        // The unmasked trigger: the group's COMMITTED lease moves to the remote
+        // (an assigner rebalance / lease-leader change). No member joins or
+        // leaves, so nothing arms a settle window anywhere.
+        commit_lease(&placement, &mover, Some(&remote));
+        assert!(!placement.read().unwrap().owns(&mover));
+
+        // Publish until the ack RELEASES. Pre-release, the fan-out still targets
+        // the moved session here and its gated append refuses NotOwner — the
+        // publisher is honestly withheld (done errors) or held briefly; once the
+        // reconcile scan (~30 ticks) releases the routing, the ack rides the
+        // live co-subscriber's delivery alone — the pinned gap.
+        // Bounded by TIME, not attempts: pre-release withholds return instantly
+        // (the honest NotOwner refusal drops the sender), so a fixed attempt
+        // count burns out long before the ~30-tick reconcile scan releases the
+        // routing. Each await is itself bounded for the held (not refused) shape.
+        let mut accepted = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+        while tokio::time::Instant::now() < deadline {
+            let (done_tx, done_rx) = oneshot::channel();
+            tx.send(HubCommand::Publish {
+                topic: "co/t".into(),
+                payload: Bytes::from_static(b"gap"),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_core::AppProperties::default(),
+                done: Some(done_tx),
+                v5: false,
+                publisher: None,
+            })
+            .unwrap();
+            // Anything else — withheld (Err), held past the bound, or a
+            // non-Accepted outcome — is an honest pre-release answer: keep polling.
+            if let Ok(Ok(PublishOutcome::Accepted)) =
+                tokio::time::timeout(Duration::from_secs(45), done_rx).await
+            {
+                accepted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            accepted,
+            "the ack must eventually release on the live co-subscriber's delivery \
+             (the reconcile scan releases the moved session's routing)"
+        );
+        // The live co-subscriber genuinely got the publish — "at least one"
+        // holds. (Earlier withheld attempts may also have delivered live
+        // copies; `recv_packet` is itself bounded at 300ms, so this drain
+        // terminates on quiet.)
+        let mut delivered = false;
+        while let Some(p) = recv_packet(&mut live_rx).await {
+            if payload_of(&p) == b"gap" {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "the live co-subscriber must receive the publish");
+        // ... and the moved durable session's copy is stored NOWHERE, with the
+        // publisher told Accepted: the co-subscribed gap, pinned.
+        assert!(
+            store
+                .inner
+                .pending(&mover_id, 0, 16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the moved durable session must hold no copy of the ACCEPTED message — \
+             that absence, alongside the Accepted above, is the narrowed promise"
+        );
+    }
+
     // --- issue #284 / 0043-P6: rehome on settle -------------------------------
 
     /// A `SessionStore` that models the CLUSTERED durable store's group gate: every
