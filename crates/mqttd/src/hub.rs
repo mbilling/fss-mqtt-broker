@@ -2035,6 +2035,12 @@ pub struct Hub {
     /// materialize eagerly on their NEW owners and un-materialize on their old
     /// ones, instead of waiting for first touch.
     known_members: BTreeSet<NodeId>,
+    /// The [`Placement::ownership_epoch`] the SWEEP's window-armer last saw (issue
+    /// #294) — distinct from [`ownership_epoch_seen`](Self::ownership_epoch_seen),
+    /// which gates the rehome candidate scan. `None` until the first sweep, so boot
+    /// observes the starting epoch without arming a spurious window on top of the
+    /// boot scan's own.
+    sweep_epoch_seen: Option<u64>,
     /// Live sessions observed hosted here for a group this node does not own (issue
     /// #284), with how many consecutive sweep ticks the condition has held and when
     /// this session was last closed for it. Entries are dropped the moment the
@@ -2478,6 +2484,7 @@ impl Hub {
                 // member set as a "change", which (re)arms the boot window —
                 // harmless overlap with the 8 ticks above.
                 known_members: BTreeSet::new(),
+                sweep_epoch_seen: None,
                 misplaced: HashMap::new(),
                 ownership_epoch_seen: None,
                 peers: HashMap::new(),
@@ -6391,12 +6398,12 @@ impl Hub {
         // groups. Shrink arrives here too (via SWIM eviction), overlapping the
         // `PeerDead` arm — harmless.
         if let Some(placement) = &self.placement {
-            let members: BTreeSet<NodeId> = placement
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .members()
-                .into_iter()
-                .collect();
+            let (members, epoch): (BTreeSet<NodeId>, u64) = {
+                let p = placement
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (p.members().into_iter().collect(), p.ownership_epoch())
+            };
             if members != self.known_members {
                 if !self.known_members.is_empty() {
                     info!(
@@ -6406,6 +6413,30 @@ impl Hub {
                 }
                 self.known_members = members;
                 self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(8);
+            }
+            // Issue #294: a COMMITTED-lease move with no membership change — an
+            // assigner rebalance, a lease-leader change, a paced resize drain —
+            // used to arm nothing anywhere, so `release_moved_sessions` could
+            // release a moved session's routing with no successor claim and a
+            // `matched == 0` fan-out was answered `Stored` for a message nobody
+            // held. The ownership epoch moves on exactly those events (and on
+            // the membership ones above — double-arming is a no-op under max),
+            // and arming HERE inherits the one pairing that makes it safe: the
+            // very next block runs the inherited-session scan while the window
+            // is open, and that scan's completion is what settles held acks.
+            // Every durable node's driver pushes the same lease map within a
+            // reconcile tick, so the window opens cluster-wide — including at a
+            // third-node origin whose fan-out would otherwise conclude "nobody
+            // is owed this" from its stale gossiped interest.
+            if self.sweep_epoch_seen != Some(epoch) {
+                if self.sweep_epoch_seen.is_some() {
+                    info!(
+                        epoch,
+                        "committed ownership moved; eager migration window armed (issue #294)"
+                    );
+                    self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(8);
+                }
+                self.sweep_epoch_seen = Some(epoch);
             }
         }
 
@@ -6637,16 +6668,21 @@ impl Hub {
     /// and as a peer forward alike. Releasing sooner (arming the eager window at the
     /// close, say) would shorten that honest window by widening the dishonest one below.
     ///
-    /// **The release itself is unwitnessed, and that is a pre-existing hole.** It is
-    /// justified by evidence that this node is not the owner, never by evidence that the
-    /// new owner routes the session — so between this release and the owner materialising
-    /// the session on its own scan, NO node advertises its filters and a publish toward it
-    /// can be acked with nothing stored. Reachable with no rehome in the story at all (a
-    /// client disconnects, then its group's lease moves), which is why it is recorded as a
-    /// follow-up rather than patched at the rehome seam: fixing it honestly needs
-    /// per-session hand-off evidence on the peer bus (`PeerMessage::Interest` carries
-    /// FILTERS, not client ids) or a lease-move-aware cluster-wide settle window. See
-    /// 0043-P6. Note the pairing this function already gets right, which any fix must
+    /// **The release itself is unwitnessed** — justified by evidence that this node is
+    /// not the owner, never by evidence that the new owner routes the session. Since
+    /// issue #294 the window that opens is COVERED rather than silent: the sweep watches
+    /// the committed ownership epoch and arms the same scan-paired eager window a
+    /// membership change arms, on every durable node (each one's driver pushes the same
+    /// replicated lease map within a tick). So this release can only run inside an armed
+    /// window, a `matched == 0` fan-out during it is HELD (`routing_unsettled()`), a
+    /// peer's forward is answered `Failed` ("cannot say, retry") instead of `Stored`,
+    /// and the new owner's own armed scan materialises the session within the same
+    /// window. The RESIDUAL, stated: if the owner never claims (dead mid-move, session
+    /// expired there), a publish after the window settles reaches the documented
+    /// no-known-subscriber ack-and-drop arm — closing that fully needs per-session
+    /// hand-off evidence on the peer bus (`PeerMessage::Interest` carries FILTERS, not
+    /// client ids), recorded in ADR 0043's amendment as the exit-1 follow-up. See
+    /// 0043-P6. Note the pairing this function already gets right, which any armer must
     /// preserve: its one call site calls
     /// [`settle_pending_publishes`](Self::settle_pending_publishes) on the very next line
     /// — the only thing that clears a held ack.
@@ -16734,6 +16770,104 @@ mod tests {
         );
     }
 
+    /// Issue #294, the RED-FIRST cell: after `release_moved_sessions` drops a moved
+    /// session's routing, a peer's forward for its filter used to be answered
+    /// `Stored` — the origin then acks its publisher for a message stored NOWHERE.
+    /// The `matched == 0 && routing_unsettled()` gate could not catch it because a
+    /// pure lease move (no membership change: an assigner rebalance, a lease-leader
+    /// change, a paced resize drain) armed no window anywhere.
+    ///
+    /// Now the sweep watches the committed ownership epoch and arms the SAME
+    /// scan-paired window a membership change arms, so the release can only happen
+    /// inside an armed window — and this forward, sent the moment the release is
+    /// OBSERVED (the interest gossip losing the filter), is answered `Failed`
+    /// ("cannot say, retry") rather than the lie. Before the fix this test observes
+    /// `Stored` at the same point, deterministically: the release then happened on
+    /// the slow reconcile with the view already settled.
+    #[tokio::test]
+    async fn a_forward_for_a_just_released_moved_session_is_not_answered_stored() {
+        let local = NodeId("rehome-local".into());
+        let remote = NodeId("rehome-remote".into());
+        let placement = Arc::new(RwLock::new(Placement::new(local.clone(), DEFAULT_REPLICAS)));
+        placement
+            .write()
+            .unwrap()
+            .observe(&remote, MemberState::Alive, "r:7000", None);
+        let store = GroupGatedStore::new(placement.clone());
+        let (mut hub, tx) =
+            Hub::with_config_and_placement(local.clone(), store.clone(), Some(placement.clone()));
+        let (_store, _retained, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
+            local.clone(),
+            placement.clone(),
+            false,
+            5,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .await;
+        driver.abort();
+        hub.attach_durable_plane(plane);
+        tokio::spawn(hub.run());
+        let mut peer = connect_peer(&tx, "rehome-remote", 1);
+        peer_gossips_interest(&tx, &remote, &[]);
+        await_routing_settled(&tx).await;
+
+        // A persistent session, subscribed, whose client then disconnects — the
+        // sole subscriber of its filter, still owned here.
+        let mover = (0..100_000)
+            .map(|i| format!("fw-mover-{i}"))
+            .find(|c| placement.read().unwrap().owner(c) == local)
+            .expect("some client is HRW-owned locally");
+        let (_mover_rx, _) = attach(&tx, &mover, 1, false).await;
+        subscribe(&tx, &mover, "fw/t");
+        detach(&tx, &mover, 1);
+        await_wire_interest(&mut peer, "fw/t", true).await;
+
+        // The pure lease move: committed ownership goes to the remote, membership
+        // untouched. Then wait until the RELEASE is observable on the wire — the
+        // gossiped interest loses the filter (pre-fix: the ~30-tick reconcile;
+        // post-fix: within the armed window's eager scans).
+        commit_lease(&placement, &mover, Some(&remote));
+        await_wire_interest(&mut peer, "fw/t", false).await;
+
+        // A peer forward arriving RIGHT AFTER the release — from a node still
+        // routing on the pre-release interest snapshot. Its verdict must never be
+        // `Stored`: nothing here holds the message, and the session is still owed
+        // it in the group's replicated log.
+        tx.send(HubCommand::RemotePublishAcked {
+            node: remote.clone(),
+            seq: 7,
+            topic: "fw/t".into(),
+            payload: Bytes::from_static(b"owed"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+        })
+        .unwrap();
+        // Read the verdict off the raw peer channel (`recv_peer` skips verdicts).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let verdict = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no PublishVerdict arrived for the forward"
+            );
+            match timeout(Duration::from_millis(300), peer.recv()).await {
+                Ok(Some(PeerMessage::PublishVerdict { seq: 7, verdict })) => break verdict,
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => panic!("peer channel closed before a verdict"),
+            }
+        };
+        assert_ne!(
+            verdict,
+            mqtt_cluster::peer::ForwardVerdict::Stored,
+            "a forward for a just-released moved session must not be answered Stored \
+             — the session is owed the message and nothing anywhere holds it \
+             (issue #294; Failed = 'cannot say, retry' is the honest answer)"
+        );
+    }
+
     // --- issue #284 / 0043-P6: rehome on settle -------------------------------
 
     /// A `SessionStore` that models the CLUSTERED durable store's group gate: every
@@ -17203,15 +17337,15 @@ mod tests {
             "after a rehome close this node still routes the session, so the publisher's \
              ack must be WITHHELD, got {got:?}"
         );
-        // The same fact from the gossip side: no shrunken snapshot followed the close.
-        while let Ok(frame) = peer.try_recv() {
-            if let PeerMessage::Interest { filters } = frame {
-                assert!(
-                    filters.contains(&"mv/284".to_string()),
-                    "the rehome close must not re-gossip a shrunken interest: {filters:?}"
-                );
-            }
-        }
+        // Since issue #294 the lease move arms the eager window, so the release —
+        // and its shrunken gossip — may land within these same ticks. That is the
+        // NEW honest shape: the shrink happens only inside an armed window, where
+        // a zero-match forward is answered `Failed` rather than `Stored` (pinned
+        // by `a_forward_for_a_just_released_moved_session_is_not_answered_stored`)
+        // and local acks stay held, as the probe above just proved. The old pin
+        // here ("no shrunken re-gossip after the close") asserted the pre-#294
+        // mitigation — keep routing so the withhold happens via `NotOwner` — which
+        // the covered window supersedes.
     }
 
     /// Issue #284: the grace. A committed lease that lands elsewhere for a single
@@ -17521,14 +17655,31 @@ mod tests {
             }
         }
 
-        // The control again: the close arms no window, so a zero-match forward is still
-        // answered `Stored`. Every withhold above was the session's own obligation.
-        assert_eq!(
-            forward_verdict_for(&tx, &mut peer, &remote, "nobody/284", &mut seq).await,
-            ForwardVerdict::Stored,
-            "a rehome close must not arm a node-wide settle window (round-2 blocking #1 \
-             stalled every gated ack on the node for up to 30 s that way)"
-        );
+        // The control, updated for issue #294: the lease move DOES arm the eager
+        // window now — deliberately, scan-paired — so a zero-match forward during
+        // it is answered `Failed` (retry). The pin that must survive is the round-2
+        // hazard's actual teeth: the window DRAINS promptly (each armed tick runs
+        // the scan that settles), so within a bounded few seconds the same forward
+        // is answered `Stored` again. An unpaired armer — the round-2 blocking #1
+        // shape, stalling every gated ack for ~30 s — fails this bound.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let v = forward_verdict_for(&tx, &mut peer, &remote, "nobody/284", &mut seq).await;
+            if v == ForwardVerdict::Stored {
+                break;
+            }
+            assert!(
+                matches!(v, ForwardVerdict::Failed),
+                "a zero-match forward during the armed window may only be Failed \
+                 (cannot-say-retry), got {v:?}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the lease-move window never drained: zero-match forwards were still \
+                 not answered Stored after 15 s — the unpaired-armer stall shape"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Feed one peer forward for `topic` and read this node's verdict for it.

@@ -194,3 +194,33 @@ negotiation window.
   bytes, not choosing fewer of them.
 - **Do nothing (status quo):** silently violates the durability contract on the exact
   operation the capability plan advertises.
+
+## Amendment (2026-08-18): a committed-lease move arms the eager window everywhere (issue #294)
+
+`release_moved_sessions` drops a moved session's routing on evidence that *this node* is
+not the owner — never on evidence that the new owner routes the session. When the move
+arrived with a membership change, the change armed eager scan windows on every node and
+the release raced nothing; but a **pure lease move** (assigner rebalance, lease-leader
+change, a paced resize drain outside the eager window) armed nothing anywhere, so the old
+node's release on its ~30-tick reconcile could precede the new owner's claim on *its*
+~30-tick reconcile by most of a minute — and in that gap a publish toward the session
+matched nobody, `routing_unsettled()` was false, and the fan-out was answered `Stored`
+for a message stored nowhere (an origin node then acked its publisher).
+
+Since issue #294 the hub's sweep watches `Placement::ownership_epoch()` — monotone,
+bumped exactly by committed-ownership movement, pushed to every durable node by its own
+driver within a reconcile tick — and an advance arms the **same scan-paired eager
+window** a membership change arms (`takeover_reconcile_ticks`, whose scans call
+`settle_pending_publishes`; arming anything without that pairing stalls held acks, the
+measured #284 hazard). Release and claim therefore happen inside one armed window on
+both nodes, and while it is open the `matched == 0` honesty gate holds local acks and
+answers peer forwards `Failed`. Proven red-first: with the armer disabled, a forward
+sent at the observed moment of release is answered `Stored` (the lie, deterministic);
+with it, `Failed`.
+
+**Residual, stated:** the release is still *unwitnessed* — if the new owner never claims
+inside the window (dead mid-move; session expired on it), a publish after settling
+reaches the documented no-known-subscriber ack-and-drop arm. Closing that requires
+per-session hand-off evidence on the peer bus (`PeerMessage::Interest` carries filters,
+not client ids) — issue #294's exit 1, the witnessed-release frame, recorded here as the
+follow-up shape rather than attempted under this amendment.

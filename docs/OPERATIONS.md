@@ -307,16 +307,22 @@ load; the client-facing cost scales with the rolled pod's share, not the fleet):
   not a promise about acks already given: while a node cannot durably append for a
   group, it answers with silence and the publisher resends (see the rehome bullet
   below for the live-session case).
-  **One window is NOT covered, and it is pre-existing:** a node releases a moved
-  session's routing when it observes that *it* is no longer the owner — never on
-  evidence that the new owner has materialised the session. Between those two facts
-  (an inherited-session scan on the old node, then the new owner claiming the
-  session) a publish can match nobody anywhere and be acked with nothing stored.
-  That is the same hole for a session that was already offline as for one this
-  release closes, it long predates issue #284, and closing it needs a
-  witnessed-release protocol that is deliberately NOT part of this change (issue
-  filed; the reasoning is in ADR 0043's as-delivered note). Do not read this bullet
-  as "an `Accepted` always means stored" during an ownership move.
+  **The lease-move window is now covered (issue #294):** a committed-lease move
+  with no membership change — an assigner rebalance, a lease-leader change, a
+  paced resize drain — arms the same cluster-wide eager window a membership
+  change arms, on every durable node within a reconcile tick. During it, a
+  publish matching nobody is **held** to an honest resolution rather than acked,
+  a peer's forward is answered `Failed` ("cannot say, retry") instead of
+  `Stored`, and the new owner's own armed scan materialises the session inside
+  the same window — so the old node's release and the new owner's claim happen
+  together instead of racing across two 30-second cadences. **The stated
+  residual:** if the owner never claims within the window (dead mid-move, or the
+  session expired there), a later publish reaches the documented
+  no-known-subscriber ack-and-drop arm — closing that needs the per-session
+  witnessed-release protocol (exit 1 in #294, recorded in ADR 0043's 2026-08-18
+  amendment as the follow-up shape). Do not read this bullet as "an `Accepted`
+  always means stored" in that residual case — see also the co-subscribed
+  narrowing above (issue #305).
 
   **And the co-subscribed form of that window is wider (issue #305):** when a filter
   has more than one subscriber, `Accepted` means the message was stored (or
