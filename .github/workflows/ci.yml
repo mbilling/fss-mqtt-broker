@@ -170,6 +170,13 @@ jobs:
       - name: Quickstart smoke (the README's own two-node cluster)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/quickstart-smoke.sh
 
+      # ADR 0063 / issue #251: docs/INTEGRATION.md is the rule-engine replacement
+      # story, and its load-bearing claims (`$share` single delivery incl. a 3.1.1
+      # member, retained skipping shared subscriptions, in-order queue-while-down
+      # replay) are documented recipes — so they are executed, not trusted.
+      - name: Integration blueprint smoke (docs/INTEGRATION.md's external-consumer pattern)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/integration-consumer-smoke.sh
+
       # ADR 0047 T9: the non-Kubernetes reference deployment, actually booted. Reads the
       # values out of deploy/systemd/mqttd.env.example, so a renamed setting in the shipped
       # artifact fails here instead of on somebody's first install. The runner has both
