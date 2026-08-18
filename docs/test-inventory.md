@@ -836,7 +836,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 330 test(s)
+## `crates/mqttd/src/lib.rs` — 331 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -991,6 +991,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_failed_retained_store_write_withholds_the_publishers_ack`
 - `hub::tests::a_failed_shared_enqueue_withholds_the_publishers_ack`
 - `hub::tests::a_foreign_topics_retained_publish_routes_the_commit_to_its_owner`
+- `hub::tests::a_forward_for_a_just_released_moved_session_is_not_answered_stored`
 - `hub::tests::a_full_append_lane_withholds_the_publisher_and_reorders_nothing`
 - `hub::tests::a_group_with_no_committed_lease_is_never_rehomed`
 - `hub::tests::a_handoff_is_retransmitted_until_the_owner_acks`
