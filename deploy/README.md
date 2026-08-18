@@ -55,12 +55,12 @@ containers, a TLS publish on node 3 delivered to a TLS subscriber on node 1, no 
 each broker's TLS volume holding its own key and no other node's, and the missing-secrets
 case failing with a message that names `./bootstrap.sh`.
 
-**One thing neither lane covers:** the image. `compose-smoke.sh` always sets `MQTTD_IMAGE` to
-a build from this repository, so `compose.yaml`'s
-`${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}` default is untested — the published
-`:latest` is v0.9.0, which predates both `mqttd --hash-password` and the `--probe` early exit
-the healthcheck needs. Issue #263; `deploy/compose/README.md` tells a reader who hits it what
-they are looking at.
+**The image is covered too** (the close of issue #263): `compose.yaml`'s default is
+**pinned** to `ghcr.io/mbilling/fss-mqtt-broker:0.9.1` — a published release whose binary
+has every flag these artifacts use — and a nightly lane runs this exact file against that
+published default with no override, while a per-PR gate proves each flag exists in the
+binary at the pinned tag. (`compose-smoke.sh` still also runs per-PR with `MQTTD_IMAGE`
+set to a build from this repository, covering HEAD.)
 
 ## What none of these do for you
 

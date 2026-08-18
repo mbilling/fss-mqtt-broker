@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-mqtt-core = { path = "../mqtt-core", version = "0.9.0" }
+mqtt-core = { path = "../mqtt-core", version = "1.0.0" }
 thiserror.workspace = true
 # Parsing only (ADR 0053): the ring-backed `verify` feature is replaced by the
 # first-party signature check in signed_gossip.rs, on the workspace provider.

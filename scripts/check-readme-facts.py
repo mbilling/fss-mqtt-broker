@@ -228,7 +228,9 @@ def main() -> int:
         policy_docs = [README, ROOT / "docs" / "OPERATIONS.md",
                        ROOT / "CHANGELOG.md", ROOT / "RELEASING.md"]
         for doc in policy_docs:
-            body = doc.read_text(encoding="utf-8")
+            # Collapse all whitespace: prose wraps mid-phrase ("reshapes are\n
+            # permitted"), and a phrase ban that a line break defeats is no ban.
+            body = re.sub(r"\s+", " ", doc.read_text(encoding="utf-8"))
             for phrase in stale_phrases:
                 if phrase in body:
                     problems.append(

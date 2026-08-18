@@ -8,18 +8,19 @@
 //! node is rolled to HEAD **one node at a time** — the operator's motion:
 //! `SIGTERM` (the ADR 0019 graceful stop), swap the binary, restart over the
 //! SAME data dir, wait for `/readyz` re-admission, next node. Then the same
-//! motion **back down** (HEAD → baseline): pre-1.0 a rollback must work too,
-//! and the reopen-across-versions in both directions is what fires the
+//! motion **back down** (HEAD → baseline): ADR 0058 clause 2 promises the roll
+//! in both directions, and the reopen-across-versions is what fires the
 //! ADR 0038 schema gates for real. Acked publishes flow through every phase
 //! of both rolls — mixed-binary windows included — and every ack anywhere in
 //! the story is a hard obligation at the end.
 //!
-//! The BASELINE is a **pinned ref** (`BASELINE_REF`), deliberately bumped —
-//! never floated — so an incompatible reshape of wire or schema FAILS this
-//! test until the baseline is consciously moved with the reshape (pre-1.0's
-//! honest substitute for released-version skew; post-1.0 the baseline becomes
-//! the previous release tag). The baseline binary is built from a git
-//! worktree of that ref into a cached target dir, or supplied prebuilt via
+//! The BASELINE is a **pinned ref** (`BASELINE_REF`) — since the 1.0 freeze,
+//! the previous release's commit, advancing only with each release cut along
+//! ADR 0039's skew policy (previous minor; gateway minor across majors). An
+//! incompatible reshape of wire or schema FAILS this test, and post-freeze the
+//! repair is a migration or a new negotiated frame — never moving the baseline
+//! past the break. The baseline binary is built from a git worktree of that
+//! ref into a cached target dir, or supplied prebuilt via
 //! `MQTTD_BASELINE_BIN` (the nightly tier's path).
 //!
 //! `#[ignore]` in the per-PR profile: building a second binary costs minutes.
@@ -35,23 +36,29 @@ use proc_common::{
     build_topology, establish_subscribers, oracle_acked_facts, proc_over, wait_all_ready,
 };
 
-/// The pinned baseline: the issue #227 retained-expiry merge (#232) — the oldest
-/// ref a HEAD build can interoperate with. #232 reshaped `retained.redb` v1 → v2
-/// (per-value expiry, no pre-1.0 migration path), so a HEAD binary refuses to
-/// reopen any pre-#232 data dir at the ADR 0038 schema gate and the roll fails at
-/// the first swapped node. NOTE the process scar: #232 landed WITHOUT this bump
-/// (2026-08-13) and the breakage surfaced only when this oracle next ran
-/// (2026-08-14, issue #238's proto-7 verification) — a schema reshape's PR must
-/// carry the bump itself. Previous baseline: the issue #92 generation merge
-/// (`e39b6e13…`, SWIM `generation`/`from_generation` reshape). Bump DELIBERATELY,
-/// together with any pre-1.0 wire/schema reshape — and bump this comment's story
-/// with it.
-const BASELINE_REF: &str = "c6b84f23cbda235514c3d237b85f17f955a37714";
+/// The pinned baseline: the **`v0.9.1` release commit** — the previous release,
+/// as ADR 0039's skew policy demands from 1.0 on (0058-T3/T5). The roll this
+/// test proves is exactly the one an operator performs: previous release ↔ the
+/// 1.0 line, both directions, under acked load. From here the ref advances only
+/// with each release cut (RELEASING.md): the previous minor within a major, the
+/// previous major's gateway minor across a boundary — never bumped to absorb a
+/// reshape, because the reshape-in-place motion closed at the freeze.
+/// Pre-1.0 history (kept as the process scar it is): the baseline was a
+/// hand-bumped commit pin — last `c6b84f23…` (the issue #227/#232 retained-expiry
+/// reshape, which landed WITHOUT its bump and broke the next oracle run), before
+/// that `e39b6e13…` (the issue #92 SWIM generation reshape).
+const BASELINE_REF: &str = "0f7042c2d6baa4c46fb2183627a013f365ecad30";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
 /// worktree into a per-ref cached target dir (so repeat runs pay nothing).
+///
+/// Serialized: two tests in this binary need the baseline, and the test
+/// harness runs them on parallel threads — unguarded, both raced into
+/// `git worktree add` and each corrupted the other's checkout.
 fn baseline_binary() -> PathBuf {
+    static BASELINE_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialized = BASELINE_BUILD.lock().unwrap();
     if let Ok(p) = std::env::var("MQTTD_BASELINE_BIN") {
         return PathBuf::from(p);
     }
