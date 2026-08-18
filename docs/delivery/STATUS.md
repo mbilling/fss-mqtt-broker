@@ -71,6 +71,7 @@
 | [0061](../adr/0061-off-loop-durable-appends.md) | Off-loop durable appends: per-session lanes for the publish path | Accepted | [6/6 done](0061-off-loop-durable-appends.md) | — |
 | [0062](../adr/0062-online-backup-and-restore.md) | Online backup and restore: a per-node export with a stated window | Accepted | [11/11 done](0062-online-backup-and-restore.md) | — |
 | [0063](../adr/0063-external-consumer-integration.md) | External integration without a rule engine: the consumer-group pattern | Accepted | [3/3 done](0063-external-consumer-integration.md) | — |
+| [0064](../adr/0064-hub-module-seams.md) | The hub's module seams | Accepted | [1/1 done](0064-hub-module-seams.md) | — |
 
 ## Open and deferred work
 
