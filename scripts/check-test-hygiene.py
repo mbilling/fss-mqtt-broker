@@ -2328,6 +2328,11 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "builds a second broker binary (minutes), which the per-PR profile cannot afford",
         "nightly",
     ),
+    "crates/mqttd/tests/cluster_upgrade.rs::a_rolled_back_binary_reads_a_newer_config_under_warn": (
+        "builds the previous-release binary from BASELINE_REF (minutes) — the 0039-T3 "
+        "config-skew half, riding the same nightly --ignored invocation as the roll",
+        "nightly",
+    ),
     "crates/mqttd/tests/cluster_soak.rs::a_soak_under_sustained_load_shows_no_drift": (
         "an hour of sustained load by design (MQTTD_SOAK_SECS=3600)",
         "nightly",

@@ -208,6 +208,35 @@ def main() -> int:
             f"header says {header.group(1)}"
         )
 
+    # --- the 1.0 freeze is not un-flippable by prose (issue #247) --------
+    # The compatibility promise's *content* is prose, but whether the pre-1.0
+    # escape clause may still appear is derivable: the workspace version says
+    # which regime is in force. From 1.0.0 on, the phrases that granted the
+    # pre-1.0 reshape window must not survive anywhere an operator would read
+    # the policy — a stale sentence would promise the right to break formats
+    # that ADR 0039 has already revoked.
+    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    ver = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', cargo, re.MULTILINE)
+    if ver and int(ver.group(1)) >= 1:
+        stale_phrases = [
+            "reshapes are permitted",
+            "no cross-version compatibility is promised",
+            "formats may change freely",
+            "applies from 1.0.0",
+            "this is pre-1.0",
+        ]
+        policy_docs = [README, ROOT / "docs" / "OPERATIONS.md",
+                       ROOT / "CHANGELOG.md", ROOT / "RELEASING.md"]
+        for doc in policy_docs:
+            body = doc.read_text(encoding="utf-8")
+            for phrase in stale_phrases:
+                if phrase in body:
+                    problems.append(
+                        f"{doc.relative_to(ROOT)} still says '{phrase}' — the "
+                        f"workspace is {ver.group(0).split('\"')[1]}, so the "
+                        "pre-1.0 reshape window is closed (ADR 0039 in force)"
+                    )
+
     if problems:
         fail(problems)
 

@@ -561,7 +561,7 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 
 The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
 and **VerneMQ** — including every cell we lose — is
-[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-14). The one-paragraph
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-18). The one-paragraph
 version:
 
 |  | mqttd's answer |
@@ -646,14 +646,16 @@ be found. Each is tracked; none is a silent surprise.
   (ADR 0041 T9). Relatedly, **a browned-out node keeps growing `replicas.redb`** for groups
   it merely follows — the refusal is decided at the session's owner — so headroom must cover
   peer-driven growth too. Disk-full itself fails closed and is crash-tested mid-write.
-- **The Kubernetes operator ships from the next release on.** It is packaged
+- **The Kubernetes operator is young.** It is packaged
   (ADR 0055 T8, issue #252): an install chart (`deploy/helm/mqttd-operator`,
   CRD included) and an operator image cut by the same signed/reproducible/SBOM
   release pipeline as the broker — first published at `v0.9.1`, the tag the
-  chart forward-pins (until that tag is pushed, the image is not yet on GHCR).
+  chart pins.
   The **Helm chart remains the fully-supported no-operator path**; the
   `MqttdCluster` CRD is `v1alpha1`, schema-pinned in CI against the operator's
-  own types, and pre-1.0 may change with the release train.
+  own types, and — per the Kubernetes alpha-API convention — may change until
+  promoted to `v1beta1`, a promotion act of its own, versioned independently
+  of the broker's semver.
 - **The horizontal scaling curve is unmeasured; the durable path itself now is,
   on one host.** [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)
   publishes end-to-end **acked** QoS 1/2 throughput and latency percentiles against
@@ -767,13 +769,17 @@ be found. Each is tracked; none is a silent surprise.
 - **Released binaries:** `linux/amd64` and `linux/arm64`, statically linked
   against musl, signed with SBOM and SLSA provenance. Other platforms build from
   source; they are not released artifacts and are not tested in CI.
-- **Stability:** this is **pre-1.0**. The compatibility policy of
-  [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) — semver, adjacent
-  version skew, sequential majors — **applies from 1.0.0**. Until then, wire and
-  on-disk schema reshapes are permitted between releases, deliberately, so the
-  cheap moment to fix a format is not missed. MQTT itself is unaffected: clients
-  speak the published 3.1.1 / 5.0 specifications, which this policy does not
-  touch.
+- **Stability:** **v1.0.0 is the compatibility freeze** — the policy of
+  [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) is **in force**:
+  semver defined at the wire/disk layer; **adjacent-release version skew** (a
+  cluster may mix release N and N+1 — the state every rolling upgrade passes
+  through, and the only mixed state supported and tested); sequential majors
+  through a designated gateway minor; patches for the **three most recent minor
+  lines**. A schema bump now ships its migration in the same PR or CI fails
+  (ADR 0058), and the nightly two-binary roll proves the adjacent upgrade in
+  both directions against the previous release. MQTT itself is unaffected:
+  clients speak the published 3.1.1 / 5.0 specifications, which this policy
+  does not touch.
 
 ## Workspace layout
 
@@ -1495,9 +1501,9 @@ one-node-at-a-time motion.
 
 ## Upgrades & versioning
 
-From **1.0.0** ([ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md); until then
+In force since **v1.0.0** ([ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md);
 the pre-release freeze regime of [ADR 0038](docs/adr/0038-prerelease-compatibility-freeze.md)
-applies — formats may change freely, wipe-and-rejoin on schema bumps):
+— formats change freely, wipe-and-rejoin on schema bumps — ended at that tag):
 
 - **Semantic versioning, defined by what breaks**: MAJOR = wire/disk/config breaking;
   MINOR = additive and fully compatible (a mixed cluster of adjacent minors works);

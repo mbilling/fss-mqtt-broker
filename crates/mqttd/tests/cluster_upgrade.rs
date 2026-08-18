@@ -191,8 +191,8 @@ async fn a_rolling_upgrade_and_rollback_lose_no_acked_fact() {
     proc.quiesce().await;
     proc.note("upgrade roll complete: every node on HEAD".into());
 
-    // Roll BACK: HEAD → baseline, one node at a time (pre-1.0 a rollback is
-    // the operator's escape hatch; the baseline binary must reopen dirs HEAD
+    // Roll BACK: HEAD → baseline, one node at a time (ADR 0058 clause 2: the
+    // roll holds in BOTH directions; the baseline binary must reopen dirs HEAD
     // wrote — the ADR 0038 schema gates fire here if a reshape forgot the
     // baseline bump).
     for i in 0..3 {
@@ -213,4 +213,65 @@ async fn a_rolling_upgrade_and_rollback_lose_no_acked_fact() {
     for node in &mut proc.nodes {
         node.kill().await;
     }
+}
+
+/// The config half of the 0039-T3 skew story (ADR 0058 §E residual): an operator
+/// rolls a node BACK, and the rolled-back binary reads the config the newer
+/// release rendered — containing a key it has never heard of. Under the default
+/// posture that boot refuses loudly, naming the key; under the documented hatch
+/// (`MQTTD_CONFIG_UNKNOWN_KEYS=warn`, issue #230) it validates and serves. Run
+/// against the REAL previous release ([`BASELINE_REF`]) via `--check-config`, so
+/// the smoke needs no ports and no cluster — just the released binary's parser
+/// meeting the future's file.
+#[test]
+#[ignore = "builds a second binary from BASELINE_REF; the nightly tier runs it (0044-P4)"]
+fn a_rolled_back_binary_reads_a_newer_config_under_warn() {
+    let baseline = baseline_binary();
+    let path = std::env::temp_dir().join(format!("skew-config-{}.toml", std::process::id()));
+    // A config a NEWER minor would render: everything the baseline knows, plus a
+    // key it does not. Unknown-KEY tolerance is the promise; a changed value
+    // *type* is deliberately outside it (ADR 0058 §E names that residual).
+    std::fs::write(
+        &path,
+        "[node]\nid = \"skew-smoke\"\n[durable]\nenabled = false\nknob_from_the_future = true\n",
+    )
+    .unwrap();
+
+    let run = |warn: bool| {
+        let mut c = std::process::Command::new(&baseline);
+        for (k, _) in std::env::vars() {
+            if k.starts_with("MQTTD_") {
+                c.env_remove(k);
+            }
+        }
+        if warn {
+            c.env("MQTTD_CONFIG_UNKNOWN_KEYS", "warn");
+        }
+        c.arg("--check-config")
+            .arg("--config")
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+
+    let refused = run(false);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "the previous release must refuse an unknown key by default; stderr={}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("knob_from_the_future"),
+        "the refusal must name the key; stderr={}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let warned = run(true);
+    assert!(
+        warned.status.success(),
+        "under warn the previous release must validate the newer config; stderr={}",
+        String::from_utf8_lossy(&warned.stderr)
+    );
+    let _ = std::fs::remove_file(&path);
 }

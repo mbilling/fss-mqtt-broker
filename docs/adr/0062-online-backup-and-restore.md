@@ -182,16 +182,18 @@ the resolution rules below cannot work without, plus one correctness fix:
 **What an older reader does with a v2 file: it refuses**, naming the version it found, the
 version it reads, and the `binary_version` that wrote the file — "restore it with that
 build (or newer)". That is the same gate v2 applies to a v1 file, in the other direction
-("no migration path exists pre-1.0"). v1 never shipped, so this is a stated contract rather
-than a live migration burden; ADR 0058's posture is refuse-loudly, and no pre-1.0 migration
-path is faked.
+("no migration path exists from pre-1.0 formats" — reworded at the 1.0 freeze from
+"pre-1.0"; v2 is the format the v1.0.0 tag froze). v1 never shipped, so this is a stated
+contract rather than a live migration burden; ADR 0058's posture is refuse-loudly, and no
+pre-1.0 migration path is faked. The first post-1.0 format bump ships its migration path
+per ADR 0039 (each major reads one major back).
 
 Refusal semantics, all of them importing nothing:
 
 | Condition | Behaviour |
 |---|---|
 | `format_version` newer than the build | Refuse, naming found, expected, **and the `binary_version` that wrote the file** — "restore with that build" is the actionable instruction (the store gate's "wipe it" makes no sense for a backup) |
-| `format_version` older | Refuse: "no migration path exists pre-1.0" — the established wording. Wired like the empty `MigrationStep` registries, and pinned by a test that forges both directions |
+| `format_version` older | Refuse: "no migration path exists from pre-1.0 formats" — the established wording. Wired like the empty `MigrationStep` registries, and pinned by a test that forges both directions |
 | Unknown record `kind` | Refuse. A silently skipped kind is data loss at the one moment an operator cannot afford it |
 | Unknown *fields* in a known kind | Ignore — additive-field discipline, the same EOF-defaulting contract the session-meta codec spells out |
 | Missing/malformed trailer, or a sha-256 that does not match | Refuse. Two independent guards against a truncated export |

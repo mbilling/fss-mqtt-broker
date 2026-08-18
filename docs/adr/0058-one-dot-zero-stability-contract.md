@@ -41,7 +41,9 @@ machinery landed **now** so that tagging 1.0 flips a sentence, not builds a subs
 5. **Patches change no format of any kind** (ADR 0039 §1, restated as a promise).
 
 Until the v1.0.0 tag, ADR 0038's freeze-and-break regime stands, and the README keeps
-saying so.
+saying so. (Flipped 2026-08-18, 0058-T5: the freeze is cut, the README says the
+contract is in force, and `check-readme-facts.py` refuses the pre-1.0 escape-clause
+phrases whenever the workspace version is ≥ 1.0.0.)
 
 ## Decisions
 

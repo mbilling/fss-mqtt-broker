@@ -296,12 +296,13 @@ impl ReplicatedLog for PersistentLog {
 }
 
 /// The oldest `sessions.redb` version the 1.0 stability contract migrates from (ADR
-/// 0058). Pre-1.0 this equals [`SCHEMA_VERSION`], so the covered range is empty and the
-/// empty [`SESSION_MIGRATIONS`] registry is correct. At the 1.0 tag this pins to the 1.0
-/// schema version, and from then on raising `SCHEMA_VERSION` without adding a
-/// `MigrationStep` fails the coverage test below.
+/// 0058). Pinned to the layout the v1.0.0 tag shipped — a literal, deliberately not
+/// [`SCHEMA_VERSION`], so raising `SCHEMA_VERSION` without adding a `MigrationStep`
+/// fails the coverage test below instead of silently moving the floor with the
+/// ceiling. Raise it only when a release retires migrations per ADR 0039 (each major
+/// migrates from exactly one major back).
 #[cfg(test)]
-const MIGRATE_FLOOR: u32 = SCHEMA_VERSION;
+const MIGRATE_FLOOR: u32 = 2;
 
 #[cfg(test)]
 mod tests {

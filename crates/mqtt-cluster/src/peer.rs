@@ -36,12 +36,11 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// times; proto 6 (ADR 0052) moved the frame body codec from bincode to
 /// postcard — every frame's bytes changed except the frozen `Hello` /
 /// `ProxyHello`, which keep their ADR 0038 T4 pinned layout so any two builds
-/// still discover disagreement politely. Legal exactly because no release
-/// exists yet: until 1.0.0 there is no version compatibility to keep, so
-/// frames are reshaped in place rather than versioned side-by-side. After the
-/// first release this kind of raise is the MAJOR-release act described above,
-/// and additive changes ship as new frames under a raised [`PROTO_MAX`] with
-/// per-link gating.
+/// still discover disagreement politely. Those in-place reshapes were legal
+/// exactly because no release existed yet; that motion closed at the v1.0.0
+/// tag. This floor is now frozen for the 1.x major's lifetime — raising it is
+/// the MAJOR-release act described above, and additive changes ship as new
+/// frames under a raised [`PROTO_MAX`] with per-link gating.
 ///
 /// Proto 7 (0041-T12, issue #238) is the first bump that took the **additive**
 /// route instead: it stays at this floor. See [`PROTO_MAX`].

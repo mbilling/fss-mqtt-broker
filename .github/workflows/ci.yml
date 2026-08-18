@@ -13,6 +13,9 @@ jobs:
   test:
     name: build, test, lint
     runs-on: ubuntu-latest
+    # Hard ceiling ~3x the normal duration: a hung apt mirror once held this
+    # workflow's default 6-hour leash (2026-08-18); no job gets that again.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -65,6 +68,7 @@ jobs:
   docs:
     name: delivery dashboard
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Status dashboard is up to date
@@ -95,6 +99,7 @@ jobs:
   interop:
     name: foreign-client interop (mosquitto + paho)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -198,6 +203,7 @@ jobs:
   mqttui:
     name: mqttui (separate workspace)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -246,6 +252,7 @@ jobs:
   supply-chain:
     name: supply-chain audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -261,6 +268,7 @@ jobs:
   helm:
     name: helm chart (lint + template + kubeconform)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       # This job compiles two crates (mqttd for --check-config, mqttd-operator for
