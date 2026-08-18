@@ -613,6 +613,7 @@ mod tests {
             false,
             None,
             &app,
+            &[],
         );
         assert_eq!(
             packet_bytes(&pkt2),

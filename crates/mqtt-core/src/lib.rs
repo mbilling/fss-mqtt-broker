@@ -53,6 +53,10 @@ pub struct Subscription {
     pub max_qos: QoS,
     /// MQTT 5 no-local: do not echo a client's own publications back to it.
     pub no_local: bool,
+    /// The MQTT 5 Subscription Identifier this subscription was made with, if any
+    /// (issue #266, §3.8.2.1.2). Survives reconnect as session state (§4.1);
+    /// `None` = the subscription carries no id and deliveries attach no property.
+    pub sub_id: Option<u32>,
 }
 
 /// The MQTT 5 **application properties** a publisher sets that the broker forwards to

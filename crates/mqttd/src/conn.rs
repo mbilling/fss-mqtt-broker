@@ -100,7 +100,7 @@ const DISCONNECT_SUBSCRIPTION_IDS_NOT_SUPPORTED: u8 =
 /// advertisement in [`negotiate_v5_properties`] and the SUBSCRIBE refusal in [`serve`].
 /// Flipping it to `true` is step 1 of actually delivering identifiers (see the follow-up
 /// issue), and will turn the two guard tests red on purpose.
-const SUB_IDS_SUPPORTED: bool = false;
+const SUB_IDS_SUPPORTED: bool = true;
 /// Server-advertised MQTT 5.0 wire limits, configurable at startup (ADR 0011/0012/0013).
 /// These are genuinely server-wide (the same maxima are advertised to every connection),
 /// so they live in one process-wide value set once from config rather than per-connection.
@@ -2317,6 +2317,11 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     client: client.clone(),
                     filters: granted,
                     no_local_filters,
+                    // The packet's ONE Subscription Identifier (issue #266,
+                    // §3.8.2.1.2), applying to every filter it granted. The codec
+                    // already refused 0 and duplicates (0008-T7/T10); v3.1.1
+                    // decodes no properties, so this is None there.
+                    sub_id: s.properties.subscription_identifier(),
                     rap_filters,
                     retain_handling,
                     reply: Some(reply_tx),
@@ -3479,11 +3484,13 @@ mod tests {
     // supported." Omitting CONNACK property 0x29 is therefore an affirmative claim of
     // support, not a silence — so a server that does not deliver them must say 0.
 
-    /// The v5 CONNACK carries `Subscription Identifiers Available = 0` (§3.2.2.3.12).
-    /// Asserted on the literal 0, not on `u8::from(SUB_IDS_SUPPORTED)`, so this is a fact
-    /// about the wire rather than a tautology about the constant.
+    /// The v5 CONNACK carries `Subscription Identifiers Available = 1` (§3.2.2.3.12,
+    /// issue #266 — delivery shipped, so the wire says so). Asserted on the literal 1,
+    /// not on `u8::from(SUB_IDS_SUPPORTED)`, so this is a fact about the wire rather
+    /// than a tautology about the constant. This test was #245's tripwire: it went red
+    /// the moment the flag flipped, and holds the new truth now that delivery exists.
     #[tokio::test]
-    async fn v5_connack_advertises_subscription_identifiers_unavailable() {
+    async fn v5_connack_advertises_subscription_identifiers_available() {
         let (mut reader, mut writer, hub_rx) = v5_pipe();
         let _seen = stub_hub(hub_rx);
         writer.send(&connect_v5("c", vec![])).await.unwrap();
@@ -3491,8 +3498,8 @@ mod tests {
             Some(Packet::ConnAck(a)) => assert!(
                 a.properties
                     .0
-                    .contains(&Property::SubscriptionIdentifierAvailable(0)),
-                "v5 CONNACK must advertise 0x29 = 0, got {:?}",
+                    .contains(&Property::SubscriptionIdentifierAvailable(1)),
+                "v5 CONNACK must advertise 0x29 = 1, got {:?}",
                 a.properties.0
             ),
             other => panic!("expected v5 CONNACK, got {other:?}"),
@@ -3546,13 +3553,15 @@ mod tests {
         }
     }
 
-    /// A v5 SUBSCRIBE carrying a Subscription Identifier is a Protocol Error for a server
-    /// that does not support them: §3.2.2.3.12 prescribes DISCONNECT with reason 0xA1
-    /// (Subscription Identifiers not supported), and `[MQTT-4.13.1-1]` makes closing the
-    /// connection the MUST. The next packet read must BE the DISCONNECT — no SUBACK may
-    /// precede it, since the guard runs before the ACL loop.
+    /// A v5 SUBSCRIBE carrying a Subscription Identifier is GRANTED now that the
+    /// server supports them (issue #266) — the 0xA1 DISCONNECT this test used to
+    /// pin (#245's honest refusal) applies only to a server that does not. This
+    /// was the second tripwire: it went red the moment `SUB_IDS_SUPPORTED`
+    /// flipped, and now pins the acceptance — a SUBACK granting the filter, the
+    /// connection open, and the id actually honoured on delivery (the wire half
+    /// is pinned end-to-end in `tests/v5_protocol.rs`).
     #[tokio::test]
-    async fn v5_subscribe_with_a_subscription_identifier_disconnects_instead_of_subacking() {
+    async fn v5_subscribe_with_a_subscription_identifier_is_granted() {
         let (mut reader, mut writer, hub_rx) = v5_pipe();
         let _seen = stub_hub(hub_rx);
         writer.send(&connect_v5("c", vec![])).await.unwrap();
@@ -3574,17 +3583,16 @@ mod tests {
             .await
             .unwrap();
         match recv(&mut reader).await {
-            Some(Packet::Disconnect(d)) => assert_eq!(
-                d.reason, 0xA1,
-                "0xA1, not the 0xA2 that means Wildcard Subscriptions not supported"
-            ),
-            other => panic!("expected DISCONNECT 0xa1, got {other:?}"),
+            Some(Packet::SubAck(a)) => {
+                assert_eq!(a.pkid, 1);
+                assert_eq!(
+                    a.return_codes,
+                    vec![QoS::AtLeastOnce as u8],
+                    "the id-bearing filter is granted at its requested QoS"
+                );
+            }
+            other => panic!("expected a granting SUBACK, got {other:?}"),
         }
-        assert_eq!(
-            recv(&mut reader).await,
-            None,
-            "[MQTT-4.13.1-1]: the connection must close"
-        );
     }
 
     /// A malformed `$share/...` filter is answered with 0x80 in the SUBACK

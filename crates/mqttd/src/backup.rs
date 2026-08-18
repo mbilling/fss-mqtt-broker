@@ -1701,6 +1701,7 @@ async fn import_session_once(
             filter: s.filter.clone(),
             max_qos: qos_from_u8(s.max_qos),
             no_local: s.no_local,
+            sub_id: None,
         })
         .collect();
     store.set_subscriptions(client, &subs).await?;

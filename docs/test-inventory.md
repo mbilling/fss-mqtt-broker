@@ -711,7 +711,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-storage/src/lib.rs` — 76 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 77 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
@@ -738,6 +738,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `logged::tests::reserve_packet_ids_advances_a_durable_high_water`
 - `logged::tests::session_expiry_persists_and_enumerates`
 - `logged::tests::session_meta_encoding_is_byte_identical_when_nothing_is_unacked`
+- `logged::tests::session_meta_sub_id_tail_roundtrips_and_stays_absent_without_ids`
 - `logged::tests::state_lives_in_the_log_not_the_store`
 - `logged::tests::subscriptions_roundtrip_replace_and_survive_remove`
 - `logged::tests::the_session_owner_is_durable_across_the_log`
@@ -926,7 +927,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::v311_receive_maximum_defaults_to_unlimited`
 - `conn::tests::v5_client_connects_subscribes_and_disconnects`
 - `conn::tests::v5_connack_advertises_exactly_the_four_negotiated_properties`
-- `conn::tests::v5_connack_advertises_subscription_identifiers_unavailable`
+- `conn::tests::v5_connack_advertises_subscription_identifiers_available`
 - `conn::tests::v5_enhanced_auth_hmac_succeeds`
 - `conn::tests::v5_enhanced_auth_unknown_method_is_rejected`
 - `conn::tests::v5_enhanced_auth_wrong_proof_is_rejected`
@@ -939,7 +940,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::v5_reauthentication_wrong_proof_disconnects`
 - `conn::tests::v5_receive_maximum_exceeded_disconnects_0x93`
 - `conn::tests::v5_receive_maximum_is_advertised_and_forwarded`
-- `conn::tests::v5_subscribe_with_a_subscription_identifier_disconnects_instead_of_subacking`
+- `conn::tests::v5_subscribe_with_a_subscription_identifier_is_granted`
 - `conn::tests::wildcard_publish_topic_closes_connection`
 - `health::tests::a_first_cold_start_is_ready_alone`
 - `health::tests::a_lone_single_node_is_healthy_without_durable`
@@ -1531,7 +1532,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_without_client_cert_is_not_authorized_under_deny_anonymous`
 - `without_a_crl_the_same_certificate_is_accepted`
 
-## `crates/mqttd/tests/v5_protocol.rs` — 21 test(s)
+## `crates/mqttd/tests/v5_protocol.rs` — 24 test(s)
 
 - `a_client_supplied_id_is_not_reassigned`
 - `a_zero_length_client_id_is_assigned_and_returned`
@@ -1552,6 +1553,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `v5_session_expires_after_interval`
 - `v5_shared_subscription_round_robins_one_member_each`
 - `v5_shared_subscription_skips_retained_but_ordinary_gets_it`
+- `v5_subscription_identifier_replace_and_retained_replay`
+- `v5_subscription_identifier_survives_reconnect`
+- `v5_subscription_identifiers_are_attached_per_matching_subscription`
 - `v5_user_properties_are_forwarded_to_subscribers`
 - `v5_will_user_properties_are_forwarded`
 

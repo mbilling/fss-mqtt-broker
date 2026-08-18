@@ -367,9 +367,22 @@ impl Properties {
     /// Whether this block carries a Subscription Identifier (`0x0B`) at all (MQTT 5.0
     /// §3.8.2.1.2 on SUBSCRIBE, §3.3.2.3.8 on PUBLISH).
     ///
-    /// Deliberately a predicate rather than a getter: the broker uses this to **refuse**
-    /// identifiers, not to read them (issue #245). A `subscription_identifiers()` returning
-    /// the repeatable PUBLISH multiset belongs with the code that delivers them.
+    /// The packet's Subscription Identifier, if one is present. SUBSCRIBE carries at
+    /// most one (`decode_for` rejects duplicates there, 0008-T7), and it applies to
+    /// every filter in the packet (§3.8.2.1.2) — so the first match IS the value
+    /// (issue #266). The repeatable PUBLISH multiset still belongs with the code
+    /// that delivers them (the broker attaches ids; it never reads them off a
+    /// publish).
+    #[must_use]
+    pub fn subscription_identifier(&self) -> Option<u32> {
+        self.0.iter().find_map(|p| match p {
+            Property::SubscriptionIdentifier(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// Whether any Subscription Identifier is present — the refusal predicate the
+    /// publisher-side `0x82` guard uses ([MQTT-3.3.4-6], issues #245/#266).
     #[must_use]
     pub fn has_subscription_identifier(&self) -> bool {
         self.0

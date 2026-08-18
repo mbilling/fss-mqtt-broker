@@ -789,6 +789,7 @@ impl Hub {
                         job.retain,
                         job.message_expiry,
                         &job.message.app,
+                        &self.matching_sub_ids(&job.client, &job.message.topic),
                     ));
                     if let Some(m) = &self.metrics {
                         m.publish_delivered(qos_num(job.message.qos));
