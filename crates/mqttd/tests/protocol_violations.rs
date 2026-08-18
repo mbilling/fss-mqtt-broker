@@ -124,20 +124,22 @@ async fn unmapped_topic_alias_reference_closes_connection() {
     c.expect_disconnect(0x94).await;
 }
 
-// --- subscription-identifier violations (issue #245, MQTT 5.0 §3.2.2.3.12) --
+// --- subscription-identifier rules (issues #245 -> #266, MQTT 5.0 §3.2.2.3.12) --
 //
-// This server does not deliver Subscription Identifiers, and §3.2.2.3.12 makes an absent
-// CONNACK property 0x29 mean "supported" — so it advertises 0 and refuses any use of them.
+// Since issue #266 this server DELIVERS Subscription Identifiers (CONNACK 0x29 = 1),
+// so a SUBSCRIBE using one is no longer a violation. What remains in this file's
+// jurisdiction: the zero-value codec refusal below, and the publisher-side 0x82
+// ([MQTT-3.3.4-6]) covered by the paho conformance lane.
 
-/// A v5 SUBSCRIBE carrying a Subscription Identifier is refused with DISCONNECT 0xA1
-/// (Subscription Identifiers not supported), per §3.2.2.3.12's own prescription plus
-/// `[MQTT-4.13.1-1]` (closing is the MUST). Then, honouring this file's contract — "without
-/// corrupting broker state" — a normal subscriber and publisher still work end to end,
-/// proving the refusal aborted before any subscription state was recorded.
+/// A v5 SUBSCRIBE carrying a Subscription Identifier is GRANTED (issue #266 —
+/// this was #245's 0xA1 refusal pin, re-pinned to the delivered truth), and a
+/// co-existing identifier-free subscriber on the same filter receives its copy
+/// WITHOUT the identifier while the id-bearing one receives it WITH — the
+/// per-subscription attribution in one test.
 #[tokio::test]
-async fn v5_subscribe_with_subscription_identifier_disconnects_0xa1() {
+async fn v5_subscribe_with_subscription_identifier_is_granted_and_attributed() {
     let addr = start_broker().await;
-    let mut c = Client::connect_v5_ok(addr, "subid-refused").await;
+    let mut c = Client::connect_v5_ok(addr, "subid-tagged").await;
     c.send(&Packet::Subscribe(Subscribe {
         properties: Properties(vec![Property::SubscriptionIdentifier(5)]),
         pkid: 1,
@@ -148,10 +150,12 @@ async fn v5_subscribe_with_subscription_identifier_disconnects_0xa1() {
         }],
     }))
     .await;
-    c.expect_disconnect(0xA1).await;
+    match c.recv().await {
+        Packet::SubAck(a) => assert_eq!(a.return_codes, vec![QoS::AtLeastOnce as u8]),
+        other => panic!("expected a granting SUBACK, got {other:?}"),
+    }
 
-    // The broker is healthy and holds no state from the refused SUBSCRIBE.
-    let mut sub = Client::connect_v5_ok(addr, "subid-ok").await;
+    let mut sub = Client::connect_v5_ok(addr, "subid-plain").await;
     assert_eq!(
         sub.subscribe(1, "subid/t", QoS::AtMostOnce)
             .await
@@ -162,10 +166,23 @@ async fn v5_subscribe_with_subscription_identifier_disconnects_0xa1() {
     let mut pubr = Client::connect_v5_ok(addr, "subid-pub").await;
     pubr.publish("subid/t", b"hello", QoS::AtMostOnce, None, vec![])
         .await;
+    let ids = |p: &mqtt_codec::packet::Publish| -> Vec<u32> {
+        p.properties
+            .0
+            .iter()
+            .filter_map(|prop| match prop {
+                Property::SubscriptionIdentifier(i) => Some(*i),
+                _ => None,
+            })
+            .collect()
+    };
+    let tagged = c.expect_publish().await;
+    assert_eq!(ids(&tagged), vec![5], "the id-bearing subscription's copy carries it");
+    let plain = sub.expect_publish().await;
     assert_eq!(
-        sub.expect_publish().await.payload,
-        bytes::Bytes::from_static(b"hello"),
-        "delivery still works after the refusal"
+        ids(&plain),
+        Vec::<u32>::new(),
+        "the identifier-free subscription's copy carries none"
     );
 }
 
