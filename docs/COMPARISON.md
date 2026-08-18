@@ -36,7 +36,9 @@ next to the sensor and kilobytes matter. **Choose VerneMQ when** you want
 Erlang-ecosystem clustering and can accept node-local queue durability and EULA'd
 production binaries.
 
-**Do not choose mqttd (yet) if** you need a built-in dashboard, a rule engine, MQTT-SN
+**Do not choose mqttd (yet) if** you need a built-in dashboard, a rule engine (the
+replacement — an external consumer group you operate — is documented and CI-tested in
+[INTEGRATION.md](INTEGRATION.md), but it is code, not SQL), MQTT-SN
 or CoAP gateways, an HTTP management API — or a broker with a production track record:
 mqttd has a released version (`v0.9.0`) but **no production users**. What it offers
 against that last, honestly disqualifying-for-some fact is verifiability: reproducible
@@ -112,7 +114,7 @@ logged; the same is not uniformly true elsewhere (e.g. NanoMQ defaults to
 | Metrics | Prometheus + OTLP push + k8s probes | `$SYS` topics | dashboard + Prometheus + `$SYS` | HTTP API + Prometheus endpoint + limited `$SYS` events | Prometheus + `vmq-admin` |
 | Dashboard / UI | ✖ **by design** — signal-driven ops, read-only health listener; a provisioned Grafana demo ships instead (ADR 0020 posture) | ✖ | ✅ | ✖ | ✖ (CLI + HTTP mgmt API) |
 | HTTP management API | ✖ **by design** (same decision) | ⚠️ dynsec over MQTT topics | ✅ | ✅ | ✅ |
-| Rule engine | ✖ not planned — boundary bridge + standard integrations instead | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
+| Rule engine | ✖ by design — a documented, CI-tested **external-consumer pattern** instead ([INTEGRATION.md](INTEGRATION.md), ADR 0063): `$share` consumer groups on durable session queues feed Kafka/webhooks at-least-once, deduped at the sink; transforms are code you run, not SQL the broker runs | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |
 | MQTT-SN / CoAP gateways | ✖ | ✖ (separate projects) | ✅ (SN, CoAP, LwM2M, …) | ✖ (DDS/SOME-IP/ZMQ instead) | ✖ |
 | Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container | k8s discovery in image |

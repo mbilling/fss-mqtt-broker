@@ -380,6 +380,29 @@ default = ""
 help = "Prebuilt broker; empty builds one first"
 
 [[task]]
+id = "integration-consumer"
+group = "Try it"
+name = "Run the external-consumer integration blueprint's claims"
+script = "scripts/integration-consumer-smoke.sh"
+about = """
+Executes docs/INTEGRATION.md — the rule-engine replacement story (ADR 0063) — against
+the real broker with stock mosquitto clients: a `$share` consumer group (one MQTT 5
+member, one 3.1.1) splits a QoS 1 stream with single delivery; a retained value skips
+the group but reaches the documented plain-subscribe bootstrap; and with every member
+disconnected, QoS 1 publishes queue in the durable session and replay in order on
+reconnect.
+
+It exists so the integration blueprint cannot silently rot: if the documented pattern
+stops working, this fails.
+"""
+requires = ["mosquitto_pub", "mosquitto_sub", "python3", "curl"]
+duration = "~30s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+
+[[task]]
 id = "deploy-smoke"
 group = "Try it"
 name = "Boot the three-node compose/systemd reference deployment"

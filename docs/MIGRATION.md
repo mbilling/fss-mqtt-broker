@@ -581,8 +581,10 @@ Every one of these is a `TODO(migrate)` line naming what you must decide:
 - **The SQL rule engine, and data integration** (`connectors` / `actions` / `sources`,
   ex-`bridges.*`). mqttd is a broker, not an integration platform. Only *MQTT-type*
   connectors have an analogue (`mqtt-bridge`); every Kafka / HTTP / JDBC / S3 sink must
-  become a client-side consumer you own. **A rule you forget is a data pipeline that
-  silently stops.**
+  become a client-side consumer you own — and that consumer has a designed, CI-tested
+  shape: the external-consumer blueprint in [INTEGRATION.md](INTEGRATION.md) (ADR 0063),
+  including the rule-construct-by-construct mapping table. **A rule you forget is a
+  data pipeline that silently stops.**
 - **Gateways** (CoAP, LwM2M, MQTT-SN, STOMP, ExProto, GBT32960, OCPP). mqttd speaks
   MQTT 3.1.1/5 over TCP, TLS, WS, WSS and QUIC only.
 - **`exhook` and `plugins`.** There is no hook API and no plugin ABI. An
