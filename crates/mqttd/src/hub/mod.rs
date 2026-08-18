@@ -62,6 +62,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+mod policy;
+pub use policy::BrownoutAxis;
+use policy::*;
 mod retained;
 use retained::{
     chunk_retained, retained_digest, retained_value_id, RetainedMutation, RetainedWindow,
@@ -640,30 +643,6 @@ struct PendingOut {
     /// longer appears here: it refuses the publish rather than sending an unrecorded
     /// copy — 0041-T11, issue #238.)
     offset: Option<Offset>,
-}
-
-/// A resource whose watermark can put the broker into brownout (ADR 0041).
-///
-/// Separate axes because they are independent watchers with independent watermarks, and
-/// the effective state is their OR. Collapsing them into one flag would let the disk
-/// watcher's "I am fine now" lift a brownout that memory pressure is still asking for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BrownoutAxis {
-    /// On-disk store bytes over `MQTTD_STORE_MAX_BYTES` (T5).
-    Disk,
-    /// Process resident memory over `MQTTD_MEMORY_MAX_BYTES` (T8).
-    Memory,
-}
-
-impl BrownoutAxis {
-    /// The metric label — also the word used in logs and `/statusz`.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Disk => "disk",
-            Self::Memory => "memory",
-        }
-    }
 }
 
 /// The outcome an append lane reports back to the loop (issue #242 / ADR 0061).
@@ -2419,11 +2398,6 @@ impl Hub {
         self.metrics = Some(metrics);
     }
 
-    /// Attach the shared brownout status the `/statusz` body reads (ADR 0054).
-    pub fn attach_brownout_status(&mut self, status: Arc<crate::health::BrownoutStatus>) {
-        self.brownout_status = Some(status);
-    }
-
     /// Set the per-subscriber in-memory bounds before [`run`](Self::run) (issue #241).
     ///
     /// Startup-only, like the other `attach_*` setters: a reload reports the `limits`
@@ -2431,54 +2405,6 @@ impl Hub {
     /// queues that are already at it.
     pub fn set_subscriber_limits(&mut self, limits: SubscriberLimits) {
         self.subscriber_limits = limits;
-    }
-
-    /// Record that `axis` is (or is no longer) over its watermark, and recompute the
-    /// effective brownout state as the OR across axes (ADR 0041 T5/T8).
-    ///
-    /// The per-axis gauge always follows its own axis, so an operator can see *which*
-    /// resource is under pressure. The aggregate — the flag that refuses growth writes,
-    /// and the `/statusz` state — flips only when the OR changes, so a second axis going
-    /// over while the first already has is not logged as a fresh brownout, and the first
-    /// recovering does not lift a brownout the second is still asking for.
-    fn set_brownout_axis(&mut self, axis: BrownoutAxis, on: bool) {
-        if on {
-            self.brownout_axes.insert(axis);
-        } else {
-            self.brownout_axes.remove(&axis);
-        }
-        // Per-axis visibility, regardless of whether the aggregate moved.
-        if let Some(m) = &self.metrics {
-            m.set_brownout(axis.as_str(), on);
-        }
-
-        let effective = !self.brownout_axes.is_empty();
-        if effective != self.brownout {
-            if effective {
-                warn!(
-                    axis = axis.as_str(),
-                    "watermark exceeded: BROWNOUT — growth writes refused (ADR 0041)"
-                );
-            } else {
-                info!(
-                    axis = axis.as_str(),
-                    "back under every watermark: brownout lifted (ADR 0041)"
-                );
-            }
-            // ADR 0054: brownout is a STATE, not just symptoms — flip the shared
-            // /statusz flag on every aggregate transition.
-            if let Some(s) = &self.brownout_status {
-                s.set(effective);
-            }
-        } else if on {
-            // Already browned out on another axis: worth a line, because the operator
-            // needs to fix BOTH before growth writes resume.
-            warn!(
-                axis = axis.as_str(),
-                "a second resource is over its watermark; brownout continues (ADR 0041)"
-            );
-        }
-        self.brownout = effective;
     }
 
     /// Replace the wall-clock source before [`run`](Self::run). Production uses the
@@ -4232,49 +4158,6 @@ impl Hub {
         self.is_persistent(client) && delivered_qos != QoS::AtMostOnce
     }
 
-    /// PLAN, DECIDE, COMMIT (issue #238): the refusal a fan-out that owes a durable
-    /// append would hit, decided BEFORE the fan-out takes any side effect.
-    ///
-    /// This is what makes a refusal EFFECT-FREE, and therefore what makes the
-    /// publisher's retry idempotent: nothing is retained, nothing is appended, nothing
-    /// reaches a subscriber's wire and no peer forward leaves, so a resend (a v3.1.1
-    /// client's mandatory one included) re-decides a decision with no residue rather
-    /// than duplicating half a fan-out.
-    ///
-    /// Atomicity: the decision is FROZEN across the plan-and-submit span — this
-    /// `self.brownout` read through the last lane submission
-    /// ([`Hub::submit_append`], issue #242) — because the whole span runs inside ONE
-    /// dispatch: `run()` awaits each dispatch to completion, so its internal awaits
-    /// never interleave another command, and `self.brownout` is written only by the
-    /// `SetBrownout` handler, i.e. by another command. The off-loop half executes
-    /// only data frozen into its [`AppendJob`], against a worker that structurally
-    /// cannot read hub state, and reports in a vocabulary ([`LaneOutcome`]) that
-    /// cannot even express a refusal. A flag flip queued behind this dispatch
-    /// therefore governs the NEXT publish, never this one's admitted jobs — every
-    /// interleaving linearizes to "publish committed first, then the flag flipped".
-    /// Anything that splits the span across commands, lets a watcher write
-    /// `brownout` directly, or lets a lane decide policy breaks this silently; the
-    /// `debug_assert!` in [`submit_append`](Self::submit_append) and
-    /// [`AppendDone`](HubCommand::AppendDone) being the ONLY writer of completion
-    /// state are the tripwires.
-    fn plan_refusal(&self, owes_durable: bool) -> Option<PublishRefusal> {
-        (owes_durable && self.brownout).then_some(PublishRefusal::Brownout)
-    }
-
-    /// Count a refusal the publisher is TOLD about. Deliberately NOT
-    /// `publish_dropped`: the publisher can act on the answer, so counting it as a
-    /// loss would over-report losses that never happened (see the metric's own
-    /// rustdoc). A refusal nobody is told about is the opposite case, and
-    /// [`durable_append`](Self::durable_append) counts that one as the drop it is.
-    fn count_refusal(&self, r: PublishRefusal) {
-        if let Some(m) = &self.metrics {
-            match r {
-                PublishRefusal::Brownout => m.quota_rejected("brownout-publish"),
-                PublishRefusal::RetainedQuota => m.quota_rejected("retained"),
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)] // the delivery fields, plus the two subscription options
     async fn deliver_local(
         &mut self,
@@ -5091,21 +4974,6 @@ impl Hub {
             }
         }
         all_durable
-    }
-
-    /// Whether this publish's shared selection would land on a LOCAL member that owes a
-    /// durable append — the shared half of the PLAN pass (issue #238).
-    ///
-    /// PEEKS the selection rather than making it: `select_shared` advances the group's
-    /// round-robin cursor, and a publish that is about to be refused must not consume a
-    /// member's turn. Remote members are excluded because their durability is decided on
-    /// their own node, by its own plan pass.
-    fn shared_plan_owes_durable(&self, topic: &str, qos: QoS) -> bool {
-        self.shared_candidates(topic).into_iter().any(|(key, cs)| {
-            self.peek_shared(&key, &cs).is_some_and(|c| {
-                c.node.is_none() && self.owes_durable(&c.client, min_qos(qos, c.qos))
-            })
-        })
     }
 
     /// Re-select within a shared group after the chosen member's node refused
