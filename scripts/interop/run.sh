@@ -140,17 +140,19 @@ SUB_ARGS=(-V mqttv5 -q 1 -F '%p|%P')
 PUB_ARGS=(-V mqttv5 -q 1 -D publish user-property zone kitchen)
 roundtrip "v5 round-trip + User Property survives" "$MQTT" "iop5/a" "hello-v5" "hello-v5|zone:kitchen"
 
-# ADR 0030 / issue #245: a v5 SUBSCRIBE carrying a Subscription Identifier must be refused
-# (DISCONNECT 0xA1). The mosquitto CLI *can* drive this — `-D subscribe
-# subscription-identifier N` is accepted at parse time (a bogus property name is rejected
-# with "Invalid property name"; this one is not), so it belongs in this lane and not only in
-# the Paho one. An earlier draft of this work claimed the CLI could not request an identifier
-# and skipped the case. A refused subscriber receives nothing; a broker that silently accepted
-# the identifier (the pre-#245 behaviour) would deliver the payload.
-mosquitto_pub -h 127.0.0.1 -p "$MQTT" -V 5 -t 'subid/refused' -m 'must-not-arrive' -r >/dev/null 2>&1 || true
+# Issue #266 (was #245's refusal): a v5 SUBSCRIBE carrying a Subscription Identifier is
+# now GRANTED and delivers — this check was #245's tripwire in this lane (it expected no
+# delivery, and went red the moment delivery shipped), rewritten to pin the acceptance.
+# mosquitto_sub's %P renders only user properties (verified empirically — a user property
+# prints, the identifier does not), so the ID-level round-trip through a foreign client is
+# the Paho suite's test_subscribe_identifiers, and the byte-level property is pinned in
+# crates/mqttd/tests/v5_protocol.rs; what mosquitto can honestly attest here is that the
+# id-bearing SUBSCRIBE is accepted and its retained replay arrives.
+mosquitto_pub -h 127.0.0.1 -p "$MQTT" -V 5 -t 'subid/kept' -m 'arrives-with-id' -r >/dev/null 2>&1 || true
 got="$(mosquitto_sub -h 127.0.0.1 -p "$MQTT" -V 5 \
-  -D subscribe subscription-identifier 3 -t 'subid/refused' -C 1 -W 2 2>/dev/null || true)"
-expect "v5 SUBSCRIBE with a Subscription Identifier is refused (no delivery)" "" "$got"
+  -D subscribe subscription-identifier 3 -t 'subid/kept' -C 1 -W 2 2>/dev/null || true)"
+expect "v5 SUBSCRIBE with a Subscription Identifier is accepted and delivers" \
+  "arrives-with-id" "$got"
 
 # Server-auth TLS 1.3: OpenSSL client ↔ rustls server.
 SUB_ARGS=(--cafile "$WORK/pki/ca.crt" --tls-version tlsv1.3 -q 1)
