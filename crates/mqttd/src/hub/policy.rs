@@ -10,6 +10,9 @@
 //! refusal is TOLD to each protocol version lives with `PublishRefusal` in
 //! `hub/mod.rs`; what the store did lives in the lanes (ADR 0061).
 
+#[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
+// siblings share one type/state vocabulary by design, and enumerating it would
+// re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 
 /// A resource whose watermark can put the broker into brownout (ADR 0041).

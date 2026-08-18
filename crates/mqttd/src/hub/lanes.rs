@@ -2,7 +2,7 @@
 //! (issue #258 slice 3: moved verbatim from `hub/mod.rs`, no logic edits).
 //!
 //! **The invariant this module owns:** nothing the store must answer runs on the
-//! hub loop. Every durable append (and the QoS 2 outbound records and packet-id
+//! hub loop. Every durable append (and the `QoS` 2 outbound records and packet-id
 //! reservations that precede an online send) is FROZEN into an [`AppendJob`] at
 //! plan time — on-loop, policy decided (`hub/policy.rs`), gate recorded — and
 //! executed by a per-session lane worker that may see only the job, the store,
@@ -10,9 +10,12 @@
 //! make append order structural; `LaneOutcome` cannot even express a refusal
 //! (policy is on-loop); completions return as `AppendDone` and the on-loop
 //! continuation (`AppendThen`) is the only writer of gates and dedup state.
-//! Workers spawn via `Hub::spawn_owned` into the hub's owned JoinSet — a task
+//! Workers spawn via `Hub::spawn_owned` into the hub's owned `JoinSet` — a task
 //! holding the store past node stop keeps redb's exclusive lock (ADR 0061 §8).
 
+#[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
+// siblings share one type/state vocabulary by design, and enumerating it would
+// re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 
 /// The outcome an append lane reports back to the loop (issue #242 / ADR 0061).

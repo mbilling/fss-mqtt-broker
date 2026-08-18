@@ -14,6 +14,9 @@
 //! this module holds the types, helpers, and the `impl Hub` methods that are the
 //! only writers of those fields.
 
+#[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
+// siblings share one type/state vocabulary by design, and enumerating it would
+// re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 
 /// One client's fresh-subscription retained-delivery window (issue #219).

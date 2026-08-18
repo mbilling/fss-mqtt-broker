@@ -123,7 +123,7 @@ host, with their limits stated
 See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
 [`docs/adr/`](docs/adr/) for the decisions behind it, and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (63 ADRs, per-task status).
+record of exactly what is built (64 ADRs, per-task status).
 
 ## The runnable map: mqttui
 

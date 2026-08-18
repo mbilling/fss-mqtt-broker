@@ -11,9 +11,12 @@
 //! (`fn`, not `async fn`): the compiler is the guard that no store await creeps
 //! back onto the loop (ADR 0061). Shared groups select exactly one member per
 //! message with in-group re-selection on refusal; backlog bounds are enforced
-//! here against `crate::backpressure`'s limits, shedding QoS 0 rather than
+//! here against `crate::backpressure`'s limits, shedding `QoS` 0 rather than
 //! queueing without bound.
 
+#[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
+// siblings share one type/state vocabulary by design, and enumerating it would
+// re-couple every future hub change to six import lists. Scoped to these files.
 use super::*;
 
 impl Hub {

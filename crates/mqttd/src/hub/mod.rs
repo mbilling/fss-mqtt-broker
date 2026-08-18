@@ -66,6 +66,9 @@ mod forwarding;
 use forwarding::{ForwardKind, ForwardObligation, PendingPublish};
 mod delivery;
 mod lanes;
+#[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
+// siblings share one type/state vocabulary by design, and enumerating it would
+// re-couple every future hub change to six import lists. Scoped to these files.
 use lanes::*;
 pub use lanes::{AppendJob, AppendThen, LaneJob, LaneOutcome, LaneWork};
 mod policy;
@@ -5145,16 +5148,6 @@ impl Hub {
             }
         }
     }
-
-    /// The sweep-tick half of acked forwards (ADR 0042 T9, exhibit ⑤): retransmit
-    /// unanswered forwards whose target link is up (same seq — duplicates are
-    /// legal at `QoS` 1), and drive takeover re-routes: a forward whose target
-    /// DIED re-forwards to whichever peers now advertise matching interest (the
-    /// dead owner's successor, once it materializes inherited sessions —
-    /// exhibit ⑥); with no such interest for [`REROUTE_GRACE_TICKS`] ticks the
-    /// obligation is moot (the interest genuinely ended) and the ack releases.
-    // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
-    // splitting it would scatter the obligation lifecycle.
 
     fn peer_connected(
         &mut self,
