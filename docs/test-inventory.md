@@ -836,7 +836,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 329 test(s)
+## `crates/mqttd/src/lib.rs` — 330 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -968,6 +968,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
 - `hub::tests::a_cleared_retained_topic_is_not_resurrected_after_a_restart`
 - `hub::tests::a_cleared_topic_stays_cleared_for_a_peer_that_missed_the_clear`
+- `hub::tests::a_co_subscribed_filter_releases_the_ack_while_a_moved_durable_copy_is_lost`
 - `hub::tests::a_committed_clear_back_fills_as_a_tombstone_and_fences`
 - `hub::tests::a_committed_retained_publish_fans_out_with_its_token`
 - `hub::tests::a_crashed_hub_releases_the_store_so_the_node_can_restart`
