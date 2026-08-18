@@ -83,11 +83,6 @@ const DISCONNECT_SERVER_SHUTTING_DOWN: u8 = reason::SERVER_SHUTTING_DOWN;
 const DISCONNECT_TOPIC_ALIAS_INVALID: u8 = reason::TOPIC_ALIAS_INVALID;
 /// DISCONNECT reason (v5): the client exceeded the server's Receive Maximum (ADR 0012 §3).
 const DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED: u8 = reason::RECEIVE_MAXIMUM_EXCEEDED;
-/// DISCONNECT reason (v5): the client used Subscription Identifiers, which this server does
-/// not support (MQTT 5.0 §3.2.2.3.12, `[MQTT-4.13.1-1]`). `0xA1` — **not** `0xA2`, which is
-/// Wildcard Subscriptions not supported.
-const DISCONNECT_SUBSCRIPTION_IDS_NOT_SUPPORTED: u8 =
-    reason::SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED;
 
 /// Whether this server supports MQTT 5 Subscription Identifiers (issue #245).
 ///
@@ -2235,29 +2230,15 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             });
         }
         Packet::Subscribe(s) => {
-            // MQTT 5.0 §3.2.2.3.12: "If the Server receives a SUBSCRIBE packet containing
-            // Subscription Identifier and it does not support Subscription Identifiers,
-            // this is a Protocol Error. The Server uses DISCONNECT with Reason Code of
-            // 0xA1 (Subscription Identifiers not supported)." Note DISCONNECT, not a
-            // SUBACK: SUBACK 0xA1 is for a server that supports the feature and declines
-            // one filter. Closing is the MUST ([MQTT-4.13.1-1]); the DISCONNECT packet
-            // carrying the reason is the SHOULD, and we send it (issue #245).
+            // Subscription Identifiers are SUPPORTED and delivered (issue #266), so an
+            // identifier-bearing SUBSCRIBE is ordinary input — the packet's one id is
+            // extracted below and rides the hub command (§3.8.2.1.2). #245's 0xA1
+            // refusal arm lived here while the feature did not exist; with
+            // SUB_IDS_SUPPORTED true it was dead code that still counted as an
+            // emission site for the reason-code provocation gate, so it is REMOVED
+            // rather than left behind a constant that can never be false again.
+            // (The zero-value id is still a codec-level Protocol Error, 0008-T10.)
             //
-            // Deliberately BEFORE the ACL loop: a Protocol Error precedes authorization,
-            // so the client gets one 0xA1 rather than a mix of per-filter 0x80s — which
-            // also means an identifier-bearing SUBSCRIBE to a forbidden topic records no
-            // `acl.deny.subscribe` audit entry.
-            //
-            // `is_v5 &&` is belt-and-braces: `decode_subscribe` only decodes properties
-            // for v5, so a v4 SUBSCRIBE can never carry one — but DISCONNECT is a v5-only
-            // packet, so the gate stays explicit.
-            if is_v5 && !SUB_IDS_SUPPORTED && s.properties.has_subscription_identifier() {
-                warn!(client = %client.0,
-                      "SUBSCRIBE carries a Subscription Identifier, which this server does not support; DISCONNECT 0xA1");
-                disconnect(writer, DISCONNECT_SUBSCRIPTION_IDS_NOT_SUPPORTED).await?;
-                // A broker-initiated close (the client did not DISCONNECT): the Will fires.
-                return Ok(PacketOutcome::BrokerClose);
-            }
             // ACL gate per filter (ADR 0004 step 3): denied filters answer
             // 0x80 [MQTT-3.9.3] and never reach the hub; granted filters get
             // the requested QoS [MQTT-3.8.4-5/6].
