@@ -238,9 +238,9 @@ NO_EQUIVALENT: dict[str, str] = {
     "mqtt/wildcard-subscriptions/enabled": "wildcard subscriptions cannot be switched "
     "off. Deny the wildcards you object to in the ACL policy instead",
     "mqtt/shared-subscriptions/enabled": "shared subscriptions cannot be switched off",
-    "mqtt/subscription-identifier/enabled": "subscription identifiers are accepted in "
-    "SUBSCRIBE but are NOT echoed on delivery (a stated gap, docs/COMPARISON.md); there "
-    "is nothing to enable or disable",
+    "mqtt/subscription-identifier/enabled": "subscription identifiers are fully "
+    "supported and delivered per subscription (issue #266); there is nothing to "
+    "enable or disable",
     "mqtt/retained-messages/enabled": "retained messages cannot be switched off; cap "
     "them with [limits] max_retained_messages, or deny retained topics in the ACL",
     "mqtt/queued-messages/strategy": "handled — see the queue_overflow mapping",

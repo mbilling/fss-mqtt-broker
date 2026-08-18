@@ -1428,7 +1428,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `unmapped_topic_alias_reference_closes_connection`
 - `v311_subscribe_and_publish_are_unaffected_by_the_identifier_refusal`
 - `v5_client_publish_carrying_a_subscription_identifier_is_protocol_error`
-- `v5_subscribe_with_subscription_identifier_disconnects_0xa1`
+- `v5_subscribe_with_subscription_identifier_is_granted_and_attributed`
 - `v5_subscribe_with_subscription_identifier_zero_disconnects_with_protocol_error`
 
 ## `crates/mqttd/tests/qos1.rs` — 6 test(s)

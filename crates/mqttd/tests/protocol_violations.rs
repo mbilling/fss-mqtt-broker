@@ -177,7 +177,11 @@ async fn v5_subscribe_with_subscription_identifier_is_granted_and_attributed() {
             .collect()
     };
     let tagged = c.expect_publish().await;
-    assert_eq!(ids(&tagged), vec![5], "the id-bearing subscription's copy carries it");
+    assert_eq!(
+        ids(&tagged),
+        vec![5],
+        "the id-bearing subscription's copy carries it"
+    );
     let plain = sub.expect_publish().await;
     assert_eq!(
         ids(&plain),

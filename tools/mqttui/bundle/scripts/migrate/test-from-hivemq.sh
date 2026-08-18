@@ -85,7 +85,7 @@ ok "the ACL is deny-by-default, roles are flattened onto both users, and \${{..}
 # ── 6. the TODO(migrate) markers that must be present ────────────────────────────────
 # The issue's acceptance criterion: "expected output + TODO markers out".
 todo 'JAVA KEYSTORE'                "$WORK/mqttd.toml"  # JKS cannot become PEM
-todo 'subscription identifiers'     "$WORK/mqttd.toml"  # a stated mqttd gap
+todo 'subscription identifiers'     "$WORK/mqttd.toml"  # supported; the key is a no-op
 todo 'no byte-rate limiter'         "$WORK/mqttd.toml"  # incoming-bandwidth-throttling
 todo 'cannot cap the maximum'       "$WORK/mqttd.toml"  # max-qos
 todo 'no telemetry'                 "$WORK/mqttd.toml"  # anonymous-usage-statistics
