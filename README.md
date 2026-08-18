@@ -307,13 +307,12 @@ v5-framed packets with properties. The semantics are implemented, not just the c
   ([ADR 0030](docs/adr/0030-user-property-forwarding.md)).
 - **Enhanced authentication** — the v5 `AUTH` exchange, e.g. challenge/response
   ([ADR 0013](docs/adr/0013-enhanced-authentication.md)).
-- **Subscription identifiers** — declined outright rather than half-implemented, and the
-  CONNACK says so rather than implying otherwise (see Limitations for the other v5 items
-  that are deferred, e.g. server-initiated re-authentication): MQTT 5.0 §3.2.2.3.12 makes an
-  absent `0x29` mean "supported", so mqttd advertises `Subscription Identifiers
-  Available = 0`, refuses a SUBSCRIBE that carries one with DISCONNECT `0xA1`, and
-  refuses a client PUBLISH that carries one with `0x82` (`[MQTT-3.3.4-6]`). See
-  [Limitations](#limitations).
+- **Subscription identifiers** — delivered (issue #266): one packet carries every
+  matching subscription's id (`[MQTT-3.3.4-4]`), an id-less match attaches none,
+  retained and offline replay carry them, and the id survives reconnect as session
+  state (persisted per subscription). The CONNACK advertises `0x29 = 1`; a client
+  PUBLISH carrying an identifier is still refused with `0x82` (`[MQTT-3.3.4-6]`) —
+  ids are the broker's to attach, never a publisher's to inject.
 - Reason codes and DISCONNECT with reason on protocol/quota violations.
 
 Both protocol versions round-trip against two independent foreign clients
@@ -570,7 +569,7 @@ version:
 | Durable sessions | Quorum-replicated **by default**; acked QoS 1/2 survives node loss (proven under SIGKILL/partition harnesses), and covers a message **in flight to a connected subscriber** as well as one queued for a disconnected one — the durable append happens before the wire send ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124), reproduced against the real binary under SIGKILL). Those appends — and the QoS 2 outbound-id records and packet-id reservations that precede an online wire send — run **off the hub loop** in per-session lanes (ADR 0061, issue #242): a placement group with a degraded follower set delays only its own sessions' publishes and deliveries (bounded by the 5 s replication RPC timeout per lane job, 256 queued jobs per session, then the newest publish is withheld and retried) — never other groups' publishes, connects, or subscribes, with the residuals named in the ADR (the *ack* path's store writes — truncation, QoS 2 phase advances, id clears — still run on-loop, watched by the dispatch histogram's `ack` class, as does one publish-path corner: the eviction truncate past a 10 000-entry per-session backlog) — and time-on-loop is exported as `mqttd_hub_dispatch_seconds` so a regression pages before 3 a.m. does. A group too thin to keep the promise **refuses** new durable writes by default (the min-replicas floor, `MQTTD_MIN_REPLICAS=majority`: a majority of the members the node knows about, capped at R) rather than acking on one copy; a node that has never known peers still serves fully. Above the (off-by-default) store or memory watermark the broker likewise **refuses the publisher** rather than acking a message it will not store — v5 gets `0x97 Quota exceeded`, v3.1.1 gets no ack and a close — including when the refusing session owner is a *peer* node: the refusal crosses the peer bus as a verdict (during a rolling upgrade, a link to an older build degrades to a withheld ack and a close). Nothing acked is lost; whether the message is re-sent is the *application's* decision — a v5 reason ≥ `0x80` completes the packet-id lifecycle (no client library retransmits it) and a clean-session v3.1.1 publisher resends nothing (ADR 0041 §5/T11/T12, counted as `quota_rejections_total{reason="brownout-publish"}`). The arms that still ack-and-drop, stated where the claim is: the **default** `drop-oldest` offline-queue overflow, which truncates the oldest *already-acked* entries out of a session's durable queue at the cap (counted `publish_dropped{reason="queue-overflow"}`); its opt-in `reject-newest` sibling, which acks and sheds the newest; for retained *values* only, a v3.1.1 retained publish over the retained quota or under brownout (delivered live, not retained); a publish for a durable session whose owner is gone, acked-and-dropped by the no-known-subscriber path; and — on a **co-subscribed filter** — a publish acked on one subscriber's storage while a mid-move durable co-subscriber's copy is stored nowhere (issue #305: `Accepted` means stored for **at least one** subscriber owed the message, not every one; the sole-subscriber form withholds, and the gap is pinned by a test that fails the day the promise strengthens). Mosquitto/NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's durable sessions are opt-in. |
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
-| Where we lose | No dashboard, rule engine (the replacement — a CI-tested external-consumer pattern — is the blueprint in [docs/INTEGRATION.md](docs/INTEGRATION.md)), HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, no subscription-identifier delivery — and the CONNACK says so (`0x29 = 0`), so clients fail fast rather than silently — and **no production track record**: the matrix says so in as many words. |
+| Where we lose | No dashboard, rule engine (the replacement — a CI-tested external-consumer pattern — is the blueprint in [docs/INTEGRATION.md](docs/INTEGRATION.md)), HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, and **no production track record**: the matrix says so in as many words. |
 
 ## Before production — a checklist
 
@@ -604,23 +603,6 @@ error? the [troubleshooting guide](docs/TROUBLESHOOTING.md).
 The gaps worth knowing before you evaluate this, stated here rather than left to
 be found. Each is tracked; none is a silent surprise.
 
-- **Subscription identifiers are not delivered — and this is now a hard refusal, not a
-  silent degradation.** No identifier is ever attached to an outbound PUBLISH. MQTT 5.0
-  §3.2.2.3.12 says that an *absent* CONNACK property `0x29` means identifiers **are**
-  supported, so staying quiet was an affirmative false claim: a client library that keys
-  its message callbacks on the identifier would lose its demux with no way to detect it.
-  The CONNACK therefore advertises `Subscription Identifiers Available = 0`; a SUBSCRIBE
-  carrying one is answered with DISCONNECT `0xA1` and closed (§3.2.2.3.12 prescribes
-  exactly that, and `[MQTT-4.13.1-1]` makes the close mandatory); a client PUBLISH
-  carrying one is answered with DISCONNECT `0x82` (`[MQTT-3.3.4-6]`). **This is a break
-  for a client that ignores `0x29` and sends an identifier anyway** — such a client is now
-  disconnected where it previously got a working-but-silently-degraded subscription.
-  Whether a given client library reads the byte is its own business and we do not assert it
-  here; the conformance lane exercises the refusal against Eclipse Paho, and
-  `mosquitto_sub -V 5 -D subscribe subscription-identifier N` can drive it too. That trade is the spec's, and it is the
-  point: failing fast beats losing messages quietly. Delivery is tracked
-  (ADR [0030](docs/adr/0030-user-property-forwarding.md) §1 "As delivered",
-  [0010](docs/adr/0010-shared-subscriptions.md)-T7).
 
 - **Memory has a watermark, not a ceiling.** `MQTTD_MEMORY_MAX_BYTES` puts the
   broker into brownout above it — growth writes refused; subscriber acks, reads,

@@ -20,6 +20,30 @@
 use super::*;
 
 impl Hub {
+    /// The Subscription Identifiers a delivery of `topic` to `client` must carry
+    /// ([MQTT-3.3.4-3..5], issue #266): the ids of EVERY subscription of this
+    /// client whose filter matches, in one packet (order insignificant, duplicates
+    /// legal if the client reused an id); none when only id-less subscriptions
+    /// match. Resolved at SEND time from the live map, which also satisfies the
+    /// retransmission one-way door (§3.8.4: a resend may use the new set and never
+    /// reverts — always-current resolution cannot revert). Shared filters resolve
+    /// through their inner filter; per-client keying makes "never another
+    /// session's id" structural. Stated residual (delivery notes): a client
+    /// holding BOTH an ordinary and a shared match on one topic receives two
+    /// copies that each carry the union rather than only their own cause's id.
+    pub(super) fn matching_sub_ids(&self, client: &ClientId, topic: &str) -> Vec<u32> {
+        let Some(ids) = self.sub_ids.get(client) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .filter(|(f, _)| {
+                let effective = parse_shared(f).map_or(f.as_str(), |(_, inner)| inner);
+                mqtt_core::topic_matches(effective, topic)
+            })
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
     /// Apply a message on this node: store/clear retained state and deliver to local
     /// ordinary subscribers. Does **not** forward or run shared selection — used both
     /// for local publishes (via
@@ -768,6 +792,7 @@ impl Hub {
                 retain,
                 message_expiry,
                 &message.app,
+                &self.matching_sub_ids(client, &message.topic),
             ));
             return;
         }
@@ -887,6 +912,7 @@ impl Hub {
                 retain,
                 message_expiry,
                 &message.app,
+                &self.matching_sub_ids(client, &message.topic),
             ));
             if let Some(m) = &self.metrics {
                 m.publish_delivered(0);
@@ -948,6 +974,7 @@ impl Hub {
             retain,
             message_expiry,
             &message.app,
+            &self.matching_sub_ids(client, &message.topic),
         ));
         QosSend::Sent
     }

@@ -105,6 +105,7 @@ async fn export_and_restore_wall_clock_at_stated_fixtures() {
                     filter: format!("bench/{i}/#"),
                     max_qos: QoS::AtLeastOnce,
                     no_local: false,
+                    sub_id: None,
                 }],
             )
             .await

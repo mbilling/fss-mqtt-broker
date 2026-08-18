@@ -768,10 +768,31 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
     // with nothing unacknowledged therefore encodes exactly the bytes the pre-#238 build
     // wrote, so nothing about the common record changes. An older record ends before this
     // and decodes with every held id treated as ACKED — the pre-#238 behaviour.
-    if !m.unacked_received_qos2.is_empty() {
+    let has_sub_ids = m.subscriptions.iter().any(|s| s.sub_id.is_some());
+    if !m.unacked_received_qos2.is_empty() || has_sub_ids {
+        // The unacked block is FORCED present (count may be 0) whenever the
+        // sub-id block follows, so the two conditional tails stay deterministically
+        // distinguishable — a decoder reads them strictly in order.
         let un = u32::try_from(m.unacked_received_qos2.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&un.to_be_bytes());
         for id in m.unacked_received_qos2.iter().take(un as usize) {
+            out.extend_from_slice(&id.to_be_bytes());
+        }
+    }
+    // Appended after the unacked block (issue #266), ONLY when an id exists: a
+    // session whose subscriptions carry no ids encodes byte-identically to the
+    // pre-#266 record. An older build ignores unread trailing bytes, so rollback
+    // loses the ids (deliveries revert to id-less) and never corrupts.
+    if has_sub_ids {
+        let with: Vec<_> = m
+            .subscriptions
+            .iter()
+            .filter_map(|s| s.sub_id.map(|id| (&s.filter, id)))
+            .collect();
+        let sn = u32::try_from(with.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&sn.to_be_bytes());
+        for (f, id) in with.into_iter().take(sn as usize) {
+            put_str(&mut out, f);
             out.extend_from_slice(&id.to_be_bytes());
         }
     }
@@ -895,6 +916,8 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
             filter,
             max_qos,
             no_local,
+            // Filled from the sub-id tail below, when one was recorded (issue #266).
+            sub_id: None,
         });
     }
     let rn = r.u32()? as usize;
@@ -943,6 +966,18 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
             unacked_received_qos2.insert(r.u16()?);
         }
     }
+    // The sub-id tail (issue #266): present only when a subscription carried one;
+    // the forced-present unacked block above keeps the read order deterministic.
+    if !r.is_empty() {
+        let sn = r.u32()? as usize;
+        for _ in 0..sn {
+            let f = r.string()?;
+            let id = r.u32()?;
+            if let Some(sub) = subscriptions.iter_mut().find(|s| s.filter == f) {
+                sub.sub_id = Some(id);
+            }
+        }
+    }
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
@@ -986,6 +1021,7 @@ mod tests {
             filter: filter.to_string(),
             max_qos,
             no_local,
+            sub_id: None,
         }
     }
 
@@ -1622,6 +1658,7 @@ mod tests {
                 filter: "a/#".into(),
                 max_qos: QoS::AtLeastOnce,
                 no_local: true,
+                sub_id: None,
             }],
             received_qos2: [4u16, 7].into_iter().collect(),
             last_packet_id: 42,
@@ -1691,6 +1728,60 @@ mod tests {
         // omitted when empty, so the common record's bytes do not change at all.
         with.unacked_received_qos2.clear();
         assert_eq!(encode_session_meta(&with), without);
+    }
+
+    /// Issue #266's sub-id tail: (a) ids round-trip per filter; (b) an id-less
+    /// meta encodes byte-identically to the pre-#266 record (no tail at all);
+    /// (c) with ids but nothing unacked, the forced-present unacked block keeps
+    /// the two conditional tails deterministically ordered.
+    #[test]
+    fn session_meta_sub_id_tail_roundtrips_and_stays_absent_without_ids() {
+        use super::{encode_session_meta, SessionMeta};
+        use std::collections::{BTreeMap, BTreeSet};
+        let meta = |with_id: bool| SessionMeta {
+            subscriptions: vec![
+                sub("a/b", QoS::AtLeastOnce, false),
+                Subscription {
+                    filter: "c/#".into(),
+                    max_qos: QoS::AtMostOnce,
+                    no_local: false,
+                    sub_id: if with_id { Some(42) } else { None },
+                },
+            ],
+            received_qos2: BTreeSet::new(),
+            last_packet_id: 3,
+            session_expiry_at: None,
+            owner: None,
+            outbound_qos2: BTreeMap::new(),
+            unacked_received_qos2: BTreeSet::new(),
+        };
+        // (a) round-trip, per filter; id-less stays None.
+        let encoded = encode_session_meta(&meta(true));
+        let decoded = decode_session_meta(&encoded).unwrap();
+        assert_eq!(
+            decoded
+                .subscriptions
+                .iter()
+                .map(|s| (s.filter.as_str(), s.sub_id))
+                .collect::<Vec<_>>(),
+            vec![("a/b", None), ("c/#", Some(42))],
+            "ids round-trip per filter; id-less subscriptions stay None"
+        );
+        // (b) no ids => byte-identical (no tail): two independent id-less metas agree,
+        // and the with-id encoding is strictly longer.
+        let baseline = encode_session_meta(&meta(false));
+        assert_eq!(baseline, encode_session_meta(&meta(false)));
+        assert!(
+            encoded.len() > baseline.len(),
+            "the sub-id tail appends; without ids the record is untouched"
+        );
+        assert_eq!(
+            &encoded[..baseline.len()],
+            &baseline[..],
+            "the id-less encoding is a strict PREFIX of the with-id one"
+        );
+        // (c) the forced unacked block decodes as empty, in order.
+        assert!(decoded.unacked_received_qos2.is_empty());
     }
 }
 

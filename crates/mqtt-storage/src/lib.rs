@@ -1140,6 +1140,7 @@ mod tests {
             filter: f.to_string(),
             max_qos: QoS::AtMostOnce,
             no_local: false,
+            sub_id: None,
         };
         store
             .set_subscriptions(&c, &[sub("a/#"), sub("b/+")])

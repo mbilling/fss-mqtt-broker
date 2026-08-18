@@ -775,3 +775,157 @@ async fn a_zero_length_id_without_clean_start_is_refused() {
         "zero-length id + persistent session must be refused"
     );
 }
+
+// --- Subscription Identifiers, delivered (issue #266) ------------------------
+
+/// [MQTT-3.3.4-3]: a publication caused by an id-bearing subscription carries the
+/// id; [MQTT-3.3.4-4]: one copy carries EVERY matching subscription's id; and an
+/// id-less co-subscriber's copy carries none at all (not a zero) — three clients,
+/// one publish, three different answers.
+#[tokio::test]
+async fn v5_subscription_identifiers_are_attached_per_matching_subscription() {
+    let addr = start_broker().await;
+
+    // One subscriber, two overlapping id-bearing filters: one copy, both ids.
+    let mut both = Client::connect_v5_ok(addr, "sid-both").await;
+    both.subscribe_with_id(1, "sid/+", QoS::AtMostOnce, 7).await;
+    both.subscribe_with_id(2, "sid/x", QoS::AtMostOnce, 9).await;
+    // One subscriber, one id.
+    let mut one = Client::connect_v5_ok(addr, "sid-one").await;
+    one.subscribe_with_id(1, "sid/#", QoS::AtMostOnce, 3).await;
+    // One subscriber, no id: its copy must carry NO identifier property.
+    let mut none = Client::connect_v5_ok(addr, "sid-none").await;
+    none.subscribe(1, "sid/x", QoS::AtMostOnce).await;
+
+    let mut pubr = Client::connect_v5_ok(addr, "sid-pub").await;
+    pubr.publish("sid/x", b"m", QoS::AtMostOnce, None, vec![])
+        .await;
+
+    let ids = |p: &mqtt_codec::packet::Publish| -> Vec<u32> {
+        let mut v: Vec<u32> = p
+            .properties
+            .0
+            .iter()
+            .filter_map(|prop| match prop {
+                Property::SubscriptionIdentifier(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let p = both.expect_publish().await;
+    assert_eq!(
+        ids(&p),
+        vec![7, 9],
+        "one copy, every matching id [MQTT-3.3.4-4]"
+    );
+    let p = one.expect_publish().await;
+    assert_eq!(
+        ids(&p),
+        vec![3],
+        "the causing subscription's id [MQTT-3.3.4-3]"
+    );
+    let p = none.expect_publish().await;
+    assert_eq!(
+        ids(&p),
+        Vec::<u32>::new(),
+        "an id-less subscription attaches no identifier property at all"
+    );
+}
+
+/// §3.8.4 replace-don't-merge and the removal trigger: re-SUBSCRIBE of the same
+/// filter with a NEW id delivers the new id; re-SUBSCRIBE with NO id removes it.
+/// Retained delivery on subscribe carries the id too (the highest-risk omission).
+#[tokio::test]
+async fn v5_subscription_identifier_replace_and_retained_replay() {
+    let addr = start_broker().await;
+    let mut pubr = Client::connect_v5_ok(addr, "sidr-pub").await;
+    pubr.publish_retained("sidr/t", b"kept").await;
+
+    let ids = |p: &mqtt_codec::packet::Publish| -> Vec<u32> {
+        p.properties
+            .0
+            .iter()
+            .filter_map(|prop| match prop {
+                Property::SubscriptionIdentifier(i) => Some(*i),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut sub = Client::connect_v5_ok(addr, "sidr-sub").await;
+    // Retained replay on an id-bearing subscribe carries the id.
+    sub.subscribe_with_id(1, "sidr/t", QoS::AtMostOnce, 5).await;
+    let p = sub.expect_publish().await;
+    assert!(p.retain, "the retained replay");
+    assert_eq!(ids(&p), vec![5], "retained-on-subscribe carries the id");
+
+    // Replace: same filter, new id — live delivery carries only the new id.
+    sub.subscribe_with_id(2, "sidr/t", QoS::AtMostOnce, 6).await;
+    let _ = sub.expect_publish().await; // retained replays again on re-subscribe
+    pubr.publish("sidr/t", b"live1", QoS::AtMostOnce, None, vec![])
+        .await;
+    let p = sub.expect_publish().await;
+    assert_eq!(ids(&p), vec![6], "replace-don't-merge [MQTT-3.8.4-3]");
+
+    // Remove: same filter, NO id — delivery carries none.
+    sub.subscribe(3, "sidr/t", QoS::AtMostOnce).await;
+    let _ = sub.expect_publish().await; // retained replay again
+    pubr.publish("sidr/t", b"live2", QoS::AtMostOnce, None, vec![])
+        .await;
+    let p = sub.expect_publish().await;
+    assert_eq!(
+        ids(&p),
+        Vec::<u32>::new(),
+        "an absent id on re-subscribe REMOVES the stored id"
+    );
+}
+
+/// §4.1 Session State (issue #266): the Subscription Identifier survives a
+/// reconnect exactly like the subscription it belongs to — an offline-queued
+/// message replays with the id the subscription was made with.
+#[tokio::test]
+async fn v5_subscription_identifier_survives_reconnect() {
+    let addr = start_broker().await;
+    let (mut sub, _) = Client::connect_v5(
+        addr,
+        "sid-durable",
+        false,
+        vec![Property::SessionExpiryInterval(300)],
+    )
+    .await;
+    sub.subscribe_with_id(1, "sidd/t", QoS::AtLeastOnce, 11)
+        .await;
+    sub.disconnect().await;
+
+    let mut pubr = Client::connect_v5_ok(addr, "sidd-pub").await;
+    pubr.publish("sidd/t", b"queued", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    // Drain the publisher's PUBACK so nothing is left owed on that side.
+    let _ = pubr.recv().await;
+
+    let (mut sub, ack) = Client::connect_v5(
+        addr,
+        "sid-durable",
+        false,
+        vec![Property::SessionExpiryInterval(300)],
+    )
+    .await;
+    assert!(ack.session_present);
+    let p = sub.expect_publish().await;
+    assert_eq!(&p.payload[..], b"queued");
+    let ids: Vec<u32> = p
+        .properties
+        .0
+        .iter()
+        .filter_map(|prop| match prop {
+            Property::SubscriptionIdentifier(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![11],
+        "the replayed message carries the surviving id"
+    );
+}

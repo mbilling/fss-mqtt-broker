@@ -125,14 +125,6 @@ import re, subprocess, sys
 # name -> why it does not pass. Each entry is a claim that must stay true. The script
 # fails if one of these PASSES, so an entry cannot quietly outlive its reason.
 EXPECTED = {
-    "test_subscribe_identifiers": (
-        "LEGAL DIFFERENCE, deliberate and advertised: the broker does not implement "
-        "Subscription Identifiers and says so in every v5 CONNACK "
-        "(`SubscriptionIdentifierAvailable = 0`, issue #245), which §3.2.2.3.12 requires "
-        "of a server that lacks them. The suite assumes support without reading the "
-        "advertisement. This entry stays until the feature is built, not until the test "
-        "is silenced."
-    ),
     "test_subscribe_failure": (
         "SUITE CONFIGURATION we decline to make: the test wants a SUBACK failure for "
         "`test/nosubscribe`, which the suite's reference broker hardcodes. Our answer "

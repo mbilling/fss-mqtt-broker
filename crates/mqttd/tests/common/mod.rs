@@ -641,6 +641,31 @@ impl Client {
     }
 
     /// Subscribe to one filter and return the SUBACK.
+    /// [`subscribe`](Self::subscribe) with a Subscription Identifier on the packet
+    /// (issue #266): the one id applies to every filter in it (§3.8.2.1.2).
+    pub async fn subscribe_with_id(
+        &mut self,
+        pkid: u16,
+        filter: &str,
+        qos: QoS,
+        id: u32,
+    ) -> SubAck {
+        self.send(&Packet::Subscribe(Subscribe {
+            properties: Properties(vec![Property::SubscriptionIdentifier(id)]),
+            pkid,
+            filters: vec![SubscribeFilter {
+                options: mqtt_codec::SubscriptionOptions::default(),
+                path: filter.into(),
+                qos,
+            }],
+        }))
+        .await;
+        match self.recv().await {
+            Packet::SubAck(a) => a,
+            other => panic!("expected SUBACK, got {other:?}"),
+        }
+    }
+
     pub async fn subscribe(&mut self, pkid: u16, filter: &str, qos: QoS) -> SubAck {
         self.send(&Packet::Subscribe(Subscribe {
             properties: Properties::new(),

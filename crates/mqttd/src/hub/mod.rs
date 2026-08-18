@@ -1011,6 +1011,11 @@ pub enum HubCommand {
         /// The subset of `filters` subscribed with **No Local** set (#198), so the hub can
         /// suppress echoing a client's own publish back to it on those filters.
         no_local_filters: Vec<String>,
+        /// The packet's Subscription Identifier (issue #266). One per SUBSCRIBE,
+        /// applying to EVERY filter in it (§3.8.2.1.2) — a per-packet option, never
+        /// a per-filter vector. `None` for v3.1.1 and for a v5 SUBSCRIBE carrying
+        /// no identifier (replace-don't-merge then removes any stored id).
+        sub_id: Option<u32>,
         /// The subset of `filters` subscribed with **Retain As Published** set (#198), so a
         /// message matching them keeps the RETAIN flag it was published with.
         rap_filters: Vec<String>,
@@ -1650,6 +1655,14 @@ pub struct Hub {
     /// message is not delivered back to the connection that published it on such a filter —
     /// the unforgeable loop-prevention primitive the boundary bridge relies on (ADR 0059/0025).
     no_local: HashMap<ClientId, HashSet<String>>,
+    /// Per-session Subscription Identifiers (issue #266, §3.8.2.1.2): `filter -> id`
+    /// for every subscription made with one. Absence means the subscription carries
+    /// no id (obligation: a match on only id-less subscriptions attaches NO property).
+    /// Keyed by the FULL filter string (`$share/...` included), like
+    /// [`subs_by_client`](Self::subs_by_client). Replace-don't-merge
+    /// [MQTT-3.8.4-3]: a re-SUBSCRIBE of the filter with a different or ABSENT id
+    /// overwrites or removes the entry.
+    sub_ids: HashMap<ClientId, HashMap<String, u32>>,
     /// Filters each client subscribed with **Retain As Published** set (MQTT 5 §3.8.3.1,
     /// #198): a message forwarded because it matched such a filter keeps the RETAIN flag it
     /// was published with, instead of the flag being cleared [MQTT-3.3.1-9]. This is what lets
@@ -2010,6 +2023,7 @@ impl Hub {
                 retained_antientropy_tick: 0,
                 subs_by_client: HashMap::new(),
                 no_local: HashMap::new(),
+                sub_ids: HashMap::new(),
                 retain_as_published: HashMap::new(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
@@ -2213,6 +2227,7 @@ impl Hub {
                 client,
                 filters,
                 no_local_filters,
+                sub_id,
                 rap_filters,
                 retain_handling,
                 reply,
@@ -2221,6 +2236,7 @@ impl Hub {
                     &client,
                     filters,
                     no_local_filters,
+                    sub_id,
                     rap_filters,
                     retain_handling,
                     reply,
@@ -3119,6 +3135,14 @@ impl Hub {
             } else {
                 self.table.subscribe(client.clone(), s.filter.clone());
             }
+            if let Some(id) = s.sub_id {
+                // Restored session state (issue #266, §4.1): the id survives
+                // reconnect exactly like the subscription it belongs to.
+                self.sub_ids
+                    .entry(client.clone())
+                    .or_default()
+                    .insert(s.filter.clone(), id);
+            }
             self.subs_by_client
                 .entry(client.clone())
                 .or_default()
@@ -3273,6 +3297,7 @@ impl Hub {
                         false,
                         None,
                         &p.message.app,
+                        &self.matching_sub_ids(&client, &p.message.topic),
                     ),
                     OutState::AwaitingPubComp => Packet::PubRel((*pkid).into()),
                 };
@@ -3361,6 +3386,7 @@ impl Hub {
                                 false,
                                 None,
                                 &qm.message.app,
+                                &self.matching_sub_ids(&client, &qm.message.topic),
                             )
                         };
                         let _ = outbound.send(packet);
@@ -3446,11 +3472,13 @@ impl Hub {
     // Quota check, per-filter grant/deny, retained replay and its two now-counted
     // drop paths (#87 item 5) — one linear flow over the subscribe request.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)] // a subscription's full option set (#198 + #266)
     async fn subscribe(
         &mut self,
         client: &ClientId,
         filters: Vec<(String, QoS)>,
         no_local_filters: Vec<String>,
+        sub_id: Option<u32>,
         rap_filters: Vec<String>,
         retain_handling: Vec<u8>,
         reply: Option<oneshot::Sender<Vec<bool>>>,
@@ -3532,6 +3560,25 @@ impl Hub {
                 .entry(client.clone())
                 .or_default()
                 .insert(f.clone(), *q);
+            // Subscription Identifier, replace-don't-merge [MQTT-3.8.4-3] (issue
+            // #266): the packet's one id applies to every filter it granted; a
+            // re-SUBSCRIBE without one REMOVES a stored id rather than keeping it.
+            match sub_id {
+                Some(id) => {
+                    self.sub_ids
+                        .entry(client.clone())
+                        .or_default()
+                        .insert(f.clone(), id);
+                }
+                None => {
+                    if let Some(ids) = self.sub_ids.get_mut(client) {
+                        ids.remove(f);
+                        if ids.is_empty() {
+                            self.sub_ids.remove(client);
+                        }
+                    }
+                }
+            }
             if let Some((group, filter)) = parse_shared(f) {
                 debug!(client = %client.0, group, filter, qos = *q as u8, "shared subscribe");
                 self.shared.subscribe(client.clone(), group, filter, *q);
@@ -3684,6 +3731,12 @@ impl Hub {
                     .is_some_and(|map| map.remove(f).is_some()),
             );
             // #198: drop the subscription options with the subscription.
+            if let Some(ids) = self.sub_ids.get_mut(client) {
+                ids.remove(f);
+                if ids.is_empty() {
+                    self.sub_ids.remove(client);
+                }
+            }
             for map in [&mut self.no_local, &mut self.retain_as_published] {
                 if let Some(set) = map.get_mut(client) {
                     set.remove(f);
@@ -5108,6 +5161,7 @@ impl Hub {
                 filter: f.clone(),
                 max_qos: *q,
                 no_local: false,
+                sub_id: self.sub_ids.get(client).and_then(|m| m.get(f)).copied(),
             })
             .collect();
         match self.store.set_subscriptions(client, &subs).await {
@@ -5123,6 +5177,7 @@ impl Hub {
     fn drop_subscriptions(&mut self, client: &ClientId) {
         self.subs_by_client.remove(client);
         self.no_local.remove(client);
+        self.sub_ids.remove(client);
         self.retain_as_published.remove(client);
         self.table.remove_client(client);
         self.shared.remove_client(client);
@@ -5455,9 +5510,15 @@ pub(crate) fn publish_packet(
     retain: bool,
     message_expiry: Option<u32>,
     app: &AppProperties,
+    sub_ids: &[u32],
 ) -> Packet {
     use mqtt_codec::Property;
     let mut properties = mqtt_codec::Properties::new();
+    // The ids of every matching subscription, in this one packet
+    // ([MQTT-3.3.4-4], issue #266); empty = the property is absent entirely.
+    for id in sub_ids {
+        properties.0.push(Property::SubscriptionIdentifier(*id));
+    }
     if let Some(secs) = message_expiry {
         properties.0.push(Property::MessageExpiryInterval(secs));
     }
@@ -6107,6 +6168,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: Vec::new(),
             retain_handling: Vec::new(),
@@ -6143,6 +6205,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![(filter.into(), qos)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: Vec::new(),
             retain_handling: Vec::new(),
@@ -7670,6 +7733,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId("pub-nl".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: vec!["t/#".into()],
             rap_filters: Vec::new(),
             retain_handling: Vec::new(),
@@ -7679,6 +7743,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId("other".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: Vec::new(),
             retain_handling: Vec::new(),
@@ -7725,6 +7790,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId("rap-sub".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: vec!["t/#".into()],
             retain_handling: Vec::new(),
@@ -7734,6 +7800,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId("plain-sub".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: Vec::new(),
             retain_handling: Vec::new(),
@@ -7799,6 +7866,7 @@ mod tests {
         let sub = |client: &str, handling: u8| HubCommand::Subscribe {
             client: ClientId(client.into()),
             filters: vec![("rh/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: Vec::new(),
             retain_handling: vec![handling],
@@ -7844,6 +7912,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId("rap-sub2".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: vec!["t/#".into()],
             retain_handling: Vec::new(),
@@ -7880,6 +7949,7 @@ mod tests {
         tx.send(HubCommand::Subscribe {
             client: ClientId("pub-plain".into()),
             filters: vec![("t/#".into(), QoS::AtMostOnce)],
+            sub_id: None,
             no_local_filters: Vec::new(),
             rap_filters: Vec::new(),
             retain_handling: Vec::new(),
@@ -12457,6 +12527,7 @@ mod tests {
                     filter: "mv/t".into(),
                     max_qos: QoS::AtLeastOnce,
                     no_local: false,
+                    sub_id: None,
                 }],
             )
             .await
