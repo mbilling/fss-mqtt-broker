@@ -36,6 +36,27 @@ pub struct SpooledMessage {
 
 const SPOOL: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("spool");
 
+/// `spool*.redb`'s on-disk layout version (ADR 0038 T2 / ADR 0058). Version 1 is the
+/// layout the v1.0.0 tag shipped: the `spool` table of hand-encoded records
+/// ([`encode`]/[`decode`] below). Gated on open like the broker's four stores — a spool written by a
+/// newer layout refuses to open instead of being misread. Files from before the gate
+/// existed carry no stamp and are adopted as version 1 (their layout IS version 1);
+/// `gate_or_migrate` stamps them on first open.
+pub const SPOOL_SCHEMA_VERSION: u32 = 1;
+
+/// In-place migrations for `spool*.redb` (ADR 0058). Empty by design at 1.0 — the
+/// first post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the
+/// coverage test fails.
+const SPOOL_MIGRATIONS: &[mqtt_storage::schema::MigrationStep] = &[];
+
+/// Oldest `spool*.redb` version the contract migrates from (ADR 0058). Pinned to the
+/// layout the v1.0.0 tag shipped — a literal, not [`SPOOL_SCHEMA_VERSION`], so a
+/// version raise without its `MigrationStep` fails the coverage test rather than
+/// moving the floor with the ceiling. Raised only when a release retires migrations
+/// (ADR 0039).
+#[cfg(test)]
+const SPOOL_MIGRATE_FLOOR: u32 = 1;
+
 /// A bounded FIFO spool, in memory or disk-backed.
 #[derive(Debug)]
 pub struct Spool {
@@ -110,6 +131,10 @@ impl Spool {
     /// [`SpoolError::Backend`] if the database cannot be opened.
     pub fn on_disk(path: &Path, cap: usize) -> Result<Self, SpoolError> {
         let db = mqtt_storage::open::create_with_lock_retry(path).map_err(backend)?;
+        // The ADR 0058 schema gate: refuse a spool stamped by a newer layout instead
+        // of misreading it; stamp fresh (and pre-gate) files as the current version.
+        mqtt_storage::schema::gate_or_migrate(&db, "spool", SPOOL_SCHEMA_VERSION, SPOOL_MIGRATIONS)
+            .map_err(backend)?;
         // Find the highest existing key so new pushes continue past it.
         let next = {
             let tx = db.begin_read().map_err(backend)?;
@@ -404,6 +429,54 @@ fn decode(buf: &[u8]) -> Option<SpooledMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0058 T2: the spool migration registry must cover the contract range, so a
+    /// future schema bump without its migration fails here, not at an operator's upgrade.
+    #[test]
+    fn the_migration_registry_covers_the_contract_range() {
+        mqtt_storage::schema::assert_migrations_cover(
+            SPOOL_MIGRATE_FLOOR,
+            SPOOL_SCHEMA_VERSION,
+            SPOOL_MIGRATIONS,
+        )
+        .expect("spool migration registry has a gap");
+    }
+
+    /// ADR 0038 T2: a spool stamped by a foreign (newer) layout version refuses to
+    /// open, naming both versions — never silently misreading bytes.
+    #[test]
+    fn a_foreign_schema_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.redb");
+        drop(Spool::on_disk(&path, 4).unwrap()); // stamped current
+        {
+            let db = redb::Database::create(&path).unwrap();
+            mqtt_storage::schema::force_version(&db, 999).unwrap();
+        }
+        let err = Spool::on_disk(&path, 4).unwrap_err().to_string();
+        assert!(err.contains("v999") && err.contains("expects v1"), "{err}");
+    }
+
+    /// The adoption path the gate promises: a spool written before the gate existed
+    /// (no schema stamp) opens, keeps its messages, and is stamped as version 1.
+    #[test]
+    fn an_unstamped_pre_gate_spool_is_adopted_with_its_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.redb");
+        {
+            // Write a message the pre-gate way: raw table, no stamp.
+            let db = redb::Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(SPOOL).unwrap();
+                t.insert(0u64, encode(&msg("t/held", b"kept")).as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let spool = Spool::on_disk(&path, 4).unwrap();
+        assert_eq!(spool.drain().unwrap().len(), 1, "pre-gate message survives");
+    }
 
     fn msg(topic: &str, payload: &[u8]) -> SpooledMessage {
         SpooledMessage {

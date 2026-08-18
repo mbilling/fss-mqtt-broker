@@ -21,11 +21,13 @@ one hand-maintained catalogue for exactly that reason (see
 ## Versioning
 
 Semantic versioning, with the compatibility guarantees of
-[ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) applying **from
-1.0.0**. Before then this is pre-1.0: wire and on-disk schema reshapes are
-permitted between releases, deliberately, so the cheap moment to fix a format is
-not missed. MQTT itself is unaffected — clients speak the published 3.1.1 and 5.0
-specifications, which this policy does not touch.
+[ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) **in force since
+v1.0.0**: adjacent-release version skew (N ↔ N+1, the rolling-upgrade state),
+sequential majors through a gateway minor, patches for the three most recent
+minor lines, and every schema bump shipping its migration in the same PR.
+The pre-1.0 reshape window closed at that tag. MQTT itself is unaffected —
+clients speak the published 3.1.1 and 5.0 specifications, which this policy
+does not touch.
 
 Release mechanics — signing, SBOM, provenance, and how to verify a downloaded
 binary — are in [RELEASING.md](RELEASING.md).

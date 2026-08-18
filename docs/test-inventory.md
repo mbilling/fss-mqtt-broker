@@ -162,7 +162,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::wrong_audience_is_rejected_when_audience_is_configured`
 - `token::tests::wrong_issuer_is_rejected_when_issuer_is_configured`
 
-## `crates/mqtt-bridge/src/lib.rs` — 48 test(s)
+## `crates/mqtt-bridge/src/lib.rs` — 51 test(s)
 
 - `client::tests::bridge_subscriptions_set_no_local_and_retain_as_published`
 - `config::tests::a_both_rule_with_a_remap_is_rejected`
@@ -208,9 +208,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::reconnects_are_per_side`
 - `spool::tests::a_disk_spool_enforces_the_cap`
 - `spool::tests::a_disk_spool_survives_a_reopen_and_replays`
+- `spool::tests::a_foreign_schema_version_fails_closed`
+- `spool::tests::an_unstamped_pre_gate_spool_is_adopted_with_its_messages`
 - `spool::tests::encode_decode_round_trips_the_retain_flag`
 - `spool::tests::in_memory_spool_is_bounded_drop_oldest_and_replays_in_order`
 - `spool::tests::the_codec_round_trips_a_message_with_user_properties`
+- `spool::tests::the_migration_registry_covers_the_contract_range`
 - `spool::tests::the_refuse_policy_keeps_what_it_accepted_and_rejects_the_newcomer`
 
 ## `crates/mqtt-bridge/src/main.rs` — 0 test(s)
@@ -1300,8 +1303,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rolling_replacement_swaps_a_node_without_loss`
 - `seeded_fault_schedules_hold_the_catalog_post_quiesce`
 
-## `crates/mqttd/tests/cluster_upgrade.rs` — 1 test(s)
+## `crates/mqttd/tests/cluster_upgrade.rs` — 2 test(s)
 
+- `a_rolled_back_binary_reads_a_newer_config_under_warn` — `#[ignore]`d
 - `a_rolling_upgrade_and_rollback_lose_no_acked_fact` — `#[ignore]`d
 
 ## `crates/mqttd/tests/config_watch.rs` — 2 test(s)

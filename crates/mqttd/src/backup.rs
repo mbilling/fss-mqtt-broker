@@ -92,8 +92,10 @@ pub const FORMAT: &str = "mqttd-backup";
 ///
 /// An older (v1) reader meeting a v2 file refuses with "`format_version` 2 is NEWER than
 /// this build reads (1) … restore it with that build (or newer)"; this build meeting a v1 file
-/// refuses with "no migration path exists pre-1.0" (ADR 0058 — there is no pre-1.0
-/// migration path, and a backup is the last place to invent one). Neither imports anything.
+/// refuses with "no migration path exists from pre-1.0 formats" (ADR 0058 — v2 is the format
+/// the v1.0.0 tag froze, v1 never shipped, and a backup is the last place to invent a
+/// migration). The first post-1.0 format bump ships its migration path per ADR 0039 (each
+/// major reads one major back). Neither direction imports anything.
 pub const FORMAT_VERSION: u32 = 2;
 
 /// The suffix of a completed export.
@@ -922,8 +924,8 @@ pub fn load(path: &Path) -> Result<RestorePlan, String> {
 /// - a `format_version` newer than this build (naming found, expected, and the
 ///   `binary_version` that wrote the file, because "restore with that build" is the
 ///   actionable instruction);
-/// - a `format_version` older ("no migration path exists pre-1.0" — the established
-///   wording);
+/// - a `format_version` older ("no migration path exists from pre-1.0 formats" — the
+///   established wording);
 /// - two exports of one node id that share a `created_unix_ms`;
 /// - exports from **two different clusters** (`cluster_id`), naming both ids;
 /// - an unknown record `kind` (a silently skipped kind is data loss at the one moment an
@@ -1342,7 +1344,7 @@ fn check_format(head: &HeadOnly, path: &Path) -> Result<(), String> {
     if head.format_version < FORMAT_VERSION {
         return Err(format!(
             "restore: {name}: format_version {} is older than this build reads ({}); no \
-             migration path exists pre-1.0. Nothing was imported",
+             migration path exists from pre-1.0 formats. Nothing was imported",
             head.format_version, FORMAT_VERSION
         ));
     }
@@ -2711,7 +2713,7 @@ mod tests {
         std::fs::write(&path, file_with(&header_line(0, "0.0.1"), &[], &[])).unwrap();
         let err = load(&path).expect_err("an older format version must refuse");
         assert!(
-            err.contains("no migration path exists pre-1.0"),
+            err.contains("no migration path exists from pre-1.0 formats"),
             "the established wording: {err}"
         );
 

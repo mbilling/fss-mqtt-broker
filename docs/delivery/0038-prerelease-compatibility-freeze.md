@@ -59,6 +59,12 @@ Two postures, per the ADR:
   (ADR 0039: minors bump `PROTO_MAX` additively; raising `PROTO_MIN` is a major).
   Field additions and new frames ship under a `PROTO_MAX` bump.
 
+The inventory below is the **1.0-frozen surface** (0058-T5 final audit, run at the
+v1.0.0 cut). "Since" records the proto that introduced the frame; protos 1–5 are
+retired pre-release history (`PROTO_MIN` = 6 — every frame's body bytes were reshaped
+by the proto-6 postcard succession, ADR 0052, except the two frozen frames), so a 1.x
+link speaks frames 0–23 at the floor and 24–25 only when the link negotiated proto 7.
+
 | # | Frame | Posture | Since | Carries |
 |---|-------|---------|-------|---------|
 | 0 | `Hello` | **frozen** | proto 1 | node id + spoken protocol range (ADR 0038) |
@@ -75,10 +81,18 @@ Two postures, per the ADR:
 | 11 | `RaftRpc` | versioned | proto 1 | opaque serialized Raft RPC (lease consensus) |
 | 12 | `RaftRpcReply` | versioned | proto 1 | opaque serialized Raft RPC response |
 | 13 | `ReplicaRead` | versioned | proto 1 | takeover recovery-read request (workstream F) |
-| 14 | `ReplicaReadReply` | versioned | proto 1 | watermark + `Vec<ReplicaEntryWire>` stored entries (ADR 0018 §3b) |
+| 14 | `ReplicaReadReply` | versioned | proto 1 | watermark + completeness verdict + `Vec<ReplicaEntryWire>` stored entries (ADR 0018 §3b, reshaped proto 5) |
 | 15 | `RetainedCommit` | versioned | proto 1 | owner-routed retained mutation, acked + dedup'd on `seq` (ADR 0037 §1, T8) |
 | 16 | `RetainedUpdate` | versioned | proto 1 | committed retained value fan-out with token (ADR 0037 P4) |
 | 17 | `RetainedCommitAck` | versioned | proto 1 | owner's dedup-idempotent commit ack (ADR 0037 T8) |
+| 18 | `PublishAcked` | versioned | proto 3 | acknowledged cross-node forward: the sender holds the publisher's `QoS` 1 ack until answered (ADR 0042 T9 ⑤) |
+| 19 | `PublishAck` | versioned | proto 3 | durability-gated answer to `PublishAcked` (`ok` bool; bytes frozen as the proto-6 answer — proto 7 links answer with `PublishVerdict`) |
+| 20 | `ReplicaKeys` | versioned | proto 3 | takeover scan's request for every replica log key the receiver holds (ADR 0042 T9 ⑥) |
+| 21 | `ReplicaKeysReply` | versioned | proto 3 | the keys the replica holds locally (names only; values via `ReplicaRead`) |
+| 22 | `ReplicaCatchUp` | versioned | proto 5 | request that `key`'s owner re-commit its committed log, closing the requester's gap (ADR 0043 P1) |
+| 23 | `ReplicaCatchUpTo` | versioned | proto 5 | decommission drain's owner re-commit of `key` to one specific target node (ADR 0043 P3) |
+| 24 | `PublishVerdict` | versioned | **proto 7** | per-forward durability *verdict* (`ForwardVerdict`), answering both acked forward kinds — distinguishes refused-under-policy from failed (0041-T12, issue #238) |
+| 25 | `SharedDeliverAcked` | versioned | **proto 7** | answerable targeted shared delivery: `SharedDeliver` + correlating `seq`, publisher's ack gated on the verdict (0041-T12) |
 
 Named multi-field entry shapes: `RetainedWireEntry` (T3), `SharedGroupWire` /
 `SharedMemberWire`, `ReplicaEntryWire`, and the shared `WireAppProps`

@@ -73,15 +73,17 @@ not cut unless both are green:
   `the_migration_registry_covers_the_contract_range` test in CI — so the disk contract
   cannot be broken by omission.
 - **Wire:** the nightly two-binary rolling-upgrade test (`cluster_upgrade.rs`,
-  `BASELINE_REF`) is the **wire oracle**. Pre-1.0 the baseline is bumped by hand with each
-  reshape (see the pre-commit checklist). **From `1.0.0`, `BASELINE_REF` pins to the
-  previous release and advances only along ADR 0039's skew policy** — the previous minor
-  within a major, the previous major's *gateway minor* across a major boundary. A reshape
-  that breaks the roll turns the nightly red before it can reach a tag.
+  `BASELINE_REF`) is the **wire oracle**. **`BASELINE_REF` pins to the previous release
+  and advances only along ADR 0039's skew policy** — the previous minor within a major,
+  the previous major's *gateway minor* across a major boundary. A reshape that breaks
+  the roll turns the nightly red before it can reach a tag.
 
-When cutting `1.0.0`: pin `BASELINE_REF` to the `1.0.0` commit, set each store's
-`MIGRATE_FLOOR` to its current `SCHEMA_VERSION`, and flip the wipe-and-rejoin language in
-this file and the README to the contract (0058-T5).
+The `1.0.0` cut (0058-T5) is done: every store's `MIGRATE_FLOOR` is a pinned literal
+(the four broker stores and the bridge spool), `BASELINE_REF` points at the previous
+release, and the wipe-and-rejoin language in this file and the README reads as the
+contract above. **When cutting each subsequent release**: advance `BASELINE_REF` to the
+release just tagged, and if the release bumped a `SCHEMA_VERSION`, its `MigrationStep`
+must already be in the registry (the coverage tests refuse the bump without it).
 
 ## Cutting a release
 

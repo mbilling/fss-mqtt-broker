@@ -79,8 +79,13 @@ ok "every artifact flag is on the checked list ($(echo "$used_flags" | tr '\n' '
 
 # ── 3. the tag's binary parses every flag ────────────────────────────────────────────
 if git rev-parse -q --verify "refs/tags/$GIT_TAG" >/dev/null; then
+  # Read the file once, then grep the variable: `git show | grep -q` under
+  # pipefail fails on a MATCH near the top of a large file — grep's early exit
+  # SIGPIPEs git, and the pipeline reports git's death, not grep's success.
+  # (Found the first time this branch ever ran, the day v0.9.1 made a pin real.)
+  tag_main_rs="$(git show "$GIT_TAG:$MAIN_RS")"
   for f in "${REQUIRED_FLAGS[@]}"; do
-    git show "$GIT_TAG:$MAIN_RS" | grep -q -- "\"$f\"" \
+    grep -q -- "\"$f\"" <<<"$tag_main_rs" \
       || fail "the pinned tag $GIT_TAG does not parse '$f' ($MAIN_RS at that tag) — the artifacts would break against their own default image"
   done
   ok "released: $GIT_TAG parses every checked flag"

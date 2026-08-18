@@ -275,8 +275,10 @@ ordinary replace motion — wipe its data dir and give it seeds so it JOINS
 `helm upgrade` with a new image tag rolls one pod at a time (OrderedReady +
 RollingUpdate + PDB `maxUnavailable: 1`); each pod drains via `preStop` before its
 restart and rejoins behind the caught-up watermark. Version-skew rules are
-[ADR 0039](adr/0039-versioning-and-upgrade-policy.md) (pre-1.0: no cross-version
-compatibility is promised; post-1.0: adjacent releases negotiate). A roll still pays
+[ADR 0039](adr/0039-versioning-and-upgrade-policy.md), in force since v1.0.0:
+**adjacent releases only** (a cluster may mix release N and N+1 — the state every
+rolling upgrade passes through, and the only mixed state supported and tested);
+the peer handshake fails anything wider closed at `Hello`. A roll still pays
 the decommission drain on every pod (the `preStop` hook cannot tell a roll from a
 shrink — the recorded operator-shaped follow-up, ADR 0047's 2026-08-04 amendment), but
 the cost is **measured, per-pod-local, and not a fleet-wide reconnect storm**
@@ -696,7 +698,7 @@ restore is done, so the next incident starts from the safe default.
 Every refusal imports **nothing** and exits non-zero. The **data dir** is judged first,
 before a file is opened: store files with no `restored-from` stamp to explain them, or a
 stamp naming a different source. Then the **set**: a `format_version` newer than this build
-(naming the build that wrote the file) or older ("no migration path exists pre-1.0"); two
+(naming the build that wrote the file) or older ("no migration path exists from pre-1.0 formats"); two
 exports of one node with the same `created_unix_ms`; a missing or malformed trailer, a
 sha-256 that does not match the bytes, a trailer saying the export was incomplete, or an
 unknown record kind; exports from two different clusters, naming both ids; and finally a

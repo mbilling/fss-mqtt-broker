@@ -332,7 +332,7 @@ Every refusal imports **nothing** and exits non-zero, and each names what is wro
 - **`format_version N is NEWER than this build reads`** — the file was written by the mqttd
   build the message names. Restore it with that build (or newer); there is no downgrade
   path, and none is faked.
-- **`no migration path exists pre-1.0`** — the file is older than this build's format.
+- **`no migration path exists from pre-1.0 formats`** — the file is older than this build's format.
 - **`sha256 mismatch`** or **`no trailer`** — the export is truncated or altered. A run that
   died mid-write leaves a `.ndjson.partial` file, which is deliberately invisible to a
   restore; take a fresh backup.

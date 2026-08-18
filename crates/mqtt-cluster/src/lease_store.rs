@@ -51,9 +51,13 @@ pub const LEASE_SCHEMA_VERSION: u32 = 1;
 /// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
 /// test fails.
 const LEASE_MIGRATIONS: &[mqtt_storage::schema::MigrationStep] = &[];
-/// Oldest `lease.redb` version the contract migrates from (ADR 0058); pre-1.0 == current.
+/// Oldest `lease.redb` version the contract migrates from (ADR 0058). Pinned to the
+/// layout the v1.0.0 tag shipped — a literal, not [`LEASE_SCHEMA_VERSION`], so a
+/// version raise without its `MigrationStep` fails the coverage test rather than
+/// moving the floor with the ceiling. Raised only when a release retires migrations
+/// (ADR 0039).
 #[cfg(test)]
-const LEASE_MIGRATE_FLOOR: u32 = LEASE_SCHEMA_VERSION;
+const LEASE_MIGRATE_FLOOR: u32 = 1;
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");

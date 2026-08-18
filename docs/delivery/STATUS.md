@@ -46,7 +46,7 @@
 | [0036](../adr/0036-quic-transport.md) | MQTT-over-QUIC transport (multi-stream) | Accepted | [10/11 done](0036-quic-transport.md) | 1 deferred |
 | [0037](../adr/0037-durable-retained-messages.md) | Durable single-owner retained messages (clock-free convergence) | Accepted | [14/14 done](0037-durable-retained-messages.md) | — |
 | [0038](../adr/0038-prerelease-compatibility-freeze.md) | Pre-release compatibility freeze (versioned wire, stamped schemas, final codecs) | Accepted | [4/4 done](0038-prerelease-compatibility-freeze.md) | — |
-| [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [2/3 done](0039-versioning-and-upgrade-policy.md) | 1 deferred |
+| [0039](../adr/0039-versioning-and-upgrade-policy.md) | Release versioning and upgrade policy (semver, adjacent skew, sequential majors) | Accepted | [3/3 done](0039-versioning-and-upgrade-policy.md) | — |
 | [0040](../adr/0040-revocation-reaches-live-state.md) | Revocation reaches live state (eviction on reload) | Accepted | [5/5 done](0040-revocation-reaches-live-state.md) | — |
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [13/17 done](0041-resource-governance.md) | 4 open |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [9/9 done](0042-durable-plane-stress-harness.md) | — |
@@ -65,7 +65,7 @@
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [10/12 done](0055-kubernetes-operator.md) | 2 open |
 | [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [5/6 done](0057-durable-outbound-inflight.md) | 1 open |
-| [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [4/5 done](0058-one-dot-zero-stability-contract.md) | 1 open |
+| [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [5/5 done](0058-one-dot-zero-stability-contract.md) | — |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 open |
 | [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/8 done](0060-bridge-durability-and-ack-contract.md) | 1 open |
 | [0061](../adr/0061-off-loop-durable-appends.md) | Off-loop durable appends: per-session lanes for the publish path | Accepted | [6/6 done](0061-off-loop-durable-appends.md) | — |
@@ -121,10 +121,6 @@
 
 - `0036-T11` 💤 deferred: Follow-on — 1-RTT resumption tuning (ticket lifetime / resumption policy under mTLS-on-every-connection) — 1-RTT session resumption is quinn/rustls-provided and replay-safe (0-RTT stays disabled, T1); explicit ticket-lifetime/policy tuning is a follow-on, separate from migration. Distinct from migration — resumption is a NEW connection reusing crypto, not a live connection surviving a path change.
 
-**0039 — Release versioning and upgrade policy (semver, adjacent skew, sequential majors)**
-
-- `0039-T3` 💤 deferred: At 1.0 — skew test in CI (adjacent-pair rolling-upgrade smoke) once two releases exist; blocked until then — "Needs two released versions to exist — impossible before 1.0 by definition. THE MACHINERY NOW EXISTS (ADR 0044 P3, 2026-07-17): cluster_upgrade::a_rolling_upgrade_and_rollback_lose_no_acked_fact rolls a live cluster between a pinned baseline binary and HEAD one node at a time in both directions under the acked-facts oracle; at 1.0 this task is that test pointed at two release tags plus a scheduled CI job. Until then the pinned baseline doubles as the pre-release compatibility tripwire."
-
 **0041 — Resource governance (admission caps, per-client quotas, bounded state)**
 
 - `0041-T6` ⬜ planned: Per-session byte bound on the offline queue — MQTTD_MAX_QUEUED_BYTES beside the count bound, first-reached wins, same queue_overflow semantics, counted; SIZING.md updated (2026-08-04 amendment) — "Still open, and issue #241 deliberately did NOT claim it: T10 byte-bounded the IN-MEMORY flow-control backlog and left MQTTD_MAX_QUEUED_BYTES unclaimed for this task, so the name keeps meaning the offline (disk) queue. Why it was not folded in: ReplicatedSessionStore::enqueue_with_expiry enforces the count cap from log.live_range() — O(1), never materializing the queue — so an exact byte total needs a PERSISTED per-session counter that stays exact across append, truncate, crash recovery, quorum replication and on nodes that merely FOLLOW a group. MemorySessionStore could do it trivially, which is the trap: a byte knob exact on the ephemeral backend and absent on the durable default is worse than no knob, because the operator's number would silently mean nothing on the deployment that matters. Mosquitto's max_queued_bytes is THIS task, not T10 — COMPARISON's row states the axis split so the parity claim is not overread."
@@ -149,7 +145,7 @@
 
 - `0051-T8` ⬜ planned: Migration from NanoMQ — scripts/migrate/from-nanomq.py (listeners, TLS, auth, bridge config → common-subset TOML) + guide + fixture tests; same three converter rules
 - `0051-T10` ⬜ planned: The bridge made assessable — a demo/ second security zone (Mosquitto upstream + mqtt-bridge with directional rules), a walkthrough doc, and the Grafana screenshot into the README
-- `0051-T11` ⛔ blocked: The 1.0.0 freeze — after the bake window, run the ADR 0038 wire/schema review consciously, run the 0039-T3 skew smoke against two real tags, then the maintainer cuts the freeze tag — "Needs v0.9.0 shipped (T4), a bake window survived, and a second tag (0.9.x/0.10) to make the 0039-T3 adjacent-skew smoke real — impossible before two releases exist by definition."
+- `0051-T11` ⛔ blocked: The 1.0.0 freeze — after the bake window, run the ADR 0038 wire/schema review consciously, run the 0039-T3 skew smoke against two real tags, then the maintainer cuts the freeze tag — "Everything but the tag itself is done (2026-08-18): v0.9.1 shipped (the second release), the 0039-T3 skew smoke is real (BASELINE_REF = the v0.9.1 commit, nightly rolls the actual release pair, plus the rolled-back-binary-reads-newer-config-under-warn smoke), the ADR 0038 review walked the full 26-frame inventory (0058-T5), floors pinned, language flipped, guard armed. The one remaining act is the maintainer's signed v1.0.0 tag on the freeze commit — the ceremony 0051-T11 exists to name."
 
 **0053 — One crypto provider: aws-lc-rs everywhere, ring evicted**
 
@@ -163,10 +159,6 @@
 **0057 — Durable outbound in-flight state: exactly-once across a broker crash**
 
 - `0057-T3` ⬜ planned: "Restore: rebuild `pending` from the table, resume at PUBLISH+DUP or PUBREL under the original id, seed the allocator past restored ids"
-
-**0058 — The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin**
-
-- `0058-T5` ⬜ planned: "The freeze flip at the v1.0.0 tag: README/RELEASING language, final surface audit"
 
 **0059 — Bridge HA topology and message ordering**
 

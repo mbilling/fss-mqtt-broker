@@ -1,6 +1,8 @@
 //! The `MqttdCluster` custom resource ([ADR 0055](../../../docs/adr/0055-kubernetes-operator.md) §2).
 //!
-//! `v1alpha1` says what it means: this schema may break until the broker's 1.0.
+//! `v1alpha1` says what it means (the Kubernetes alpha-API convention): this
+//! schema may change until promoted to `v1beta1` — a promotion act of its own,
+//! versioned independently of the broker's semver, which froze at v1.0.0.
 //! The spec deliberately mirrors the Helm chart's contract (same TOML config
 //! template, same by-path secret references, same persistence knobs) — the
 //! render-parity test (0055-T2) keeps the two deployment paths identical.

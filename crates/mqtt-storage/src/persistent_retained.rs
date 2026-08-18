@@ -39,9 +39,12 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// post-1.0 schema bump lands its `MigrationStep` here in the same PR, or the coverage
 /// test fails.
 const RETAINED_MIGRATIONS: &[crate::schema::MigrationStep] = &[];
-/// Oldest `retained.redb` version the contract migrates from (ADR 0058); pre-1.0 == current.
+/// Oldest `retained.redb` version the contract migrates from (ADR 0058). Pinned to the
+/// layout the v1.0.0 tag shipped — a literal, not [`SCHEMA_VERSION`], so a version
+/// raise without its `MigrationStep` fails the coverage test rather than moving the
+/// floor with the ceiling. Raised only when a release retires migrations (ADR 0039).
 #[cfg(test)]
-const RETAINED_MIGRATE_FLOOR: u32 = SCHEMA_VERSION;
+const RETAINED_MIGRATE_FLOOR: u32 = 2;
 
 const RETAINED: TableDefinition<&str, &[u8]> = TableDefinition::new("retained");
 
