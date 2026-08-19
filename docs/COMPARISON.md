@@ -1,10 +1,10 @@
 # How mqttd compares — Mosquitto · EMQX · NanoMQ · VerneMQ
 
-**Dated 2026-08-18.** Versions compared: **mqttd** `v0.9.1` (released — signed,
-reproducible, SBOM-attested; the last pre-1.0 release — `v1.0.0` is the
-[ADR 0039](adr/0039-versioning-and-upgrade-policy.md) compatibility freeze:
-adjacent-release version skew, migrations shipped with every schema bump, patches
-for the three most recent minor lines) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
+**Dated 2026-08-19.** Versions compared: **mqttd** `v1.0.0` (released — signed,
+reproducible, SBOM-attested; the [ADR 0039](adr/0039-versioning-and-upgrade-policy.md)
+compatibility promise is **in force** from this tag: adjacent-release version skew,
+migrations shipped with every schema bump, patches for the three most recent minor
+lines) · **Mosquitto** 2.0.22 / 2.1.2 (cells note where the lines
 differ) · **EMQX** 6.2.2 (documentation cells; the benchmark ran 5.8.6, the last
 Apache-licensed line — its results are **not yet published in-tree**, and issue #244
 tracks the publishable multi-host run) · **NanoMQ** 0.25.5 ·
@@ -43,7 +43,7 @@ production binaries.
 replacement — an external consumer group you operate — is documented and CI-tested in
 [INTEGRATION.md](INTEGRATION.md), but it is code, not SQL), MQTT-SN
 or CoAP gateways, an HTTP management API — or a broker with a production track record:
-mqttd has released versions (`v0.9.1` current) but **no production users**. What it offers
+mqttd has released versions (`v1.0.0` current) but **no production users**. What it offers
 against that last, honestly disqualifying-for-some fact is verifiability: reproducible
 builds, signed artifacts, SBOM, continuous fuzzing, and conformance CI against foreign
 clients — trust that can be checked instead of assumed.
@@ -209,6 +209,8 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-08-19 — `v1.0.0` released: the header compares it, and the ADR 0039 promise
+  moves from "what the freeze will put in force" to **in force**.
 - 2026-08-18 — Version refresh for the `v0.9.1` release and the 1.0 freeze: header
   now compares `v0.9.1` and states the ADR 0039 promise that `v1.0.0` puts in force;
   the watermark-poll and write-buffering knobs shipped in `v0.9.1`, so their
