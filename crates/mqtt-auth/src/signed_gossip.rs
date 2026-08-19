@@ -415,8 +415,9 @@ mod tests {
     const NOW: i64 = 1_750_000_000;
 
     struct Ca {
-        cert: rcgen::Certificate,
-        key: rcgen::KeyPair,
+        // rcgen 0.14: the issuer half (DN, key usages, signing key) travels as one
+        // value; `CertifiedIssuer` keeps the certificate beside it for `.der()`.
+        issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     }
 
     fn new_ca() -> Ca {
@@ -427,8 +428,9 @@ mod tests {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let cert = params.self_signed(&key).unwrap();
-        Ca { cert, key }
+        Ca {
+            issuer: rcgen::CertifiedIssuer::self_signed(params, key).unwrap(),
+        }
     }
 
     /// Mint a CA-signed leaf from prepared `params`, returning its DER and a signer.
@@ -442,7 +444,7 @@ mod tests {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, cn);
-        let cert = params.signed_by(&key, &ca.cert, &ca.key).unwrap();
+        let cert = params.signed_by(&key, &ca.issuer).unwrap();
         let signer = GossipSigner::from_pkcs8_der(&key.serialize_der()).unwrap();
         (cert.der().to_vec(), signer)
     }
@@ -471,7 +473,14 @@ mod tests {
         let (cert, signer) = leaf(&ca, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"membership update");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"membership update", &sig, NOW, None),
+            verify(
+                ca.issuer.der(),
+                &cert,
+                b"membership update",
+                &sig,
+                NOW,
+                None
+            ),
             Ok(plain("node-a"))
         );
     }
@@ -482,7 +491,7 @@ mod tests {
         let (cert, signer) = leaf(&ca, "node-ed", &rcgen::PKCS_ED25519);
         let sig = signer.sign(b"payload");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"payload", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"payload", &sig, NOW, None),
             Ok(plain("node-ed"))
         );
     }
@@ -493,7 +502,7 @@ mod tests {
         let (cert, signer) = leaf(&ca, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"original");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"tampered", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"tampered", &sig, NOW, None),
             Err(VerifyError::Signature)
         );
     }
@@ -506,7 +515,7 @@ mod tests {
         let sig = signer.sign(b"msg");
         // Present the real cert but verify against a different CA: chain check fails.
         assert_eq!(
-            verify(other_ca.cert.der(), &cert, b"msg", &sig, NOW, None),
+            verify(other_ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Err(VerifyError::Chain)
         );
     }
@@ -520,7 +529,7 @@ mod tests {
         // node-a's key. (This is the forged-identity vector, caught at the signature.)
         let sig_b = signer_b.sign(b"msg");
         assert_eq!(
-            verify(ca.cert.der(), &cert_a, b"msg", &sig_b, NOW, None),
+            verify(ca.issuer.der(), &cert_a, b"msg", &sig_b, NOW, None),
             Err(VerifyError::Signature)
         );
     }
@@ -530,7 +539,7 @@ mod tests {
         let ca = new_ca();
         assert_eq!(
             verify(
-                ca.cert.der(),
+                ca.issuer.der(),
                 b"not a certificate",
                 b"msg",
                 b"sig",
@@ -558,7 +567,7 @@ mod tests {
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Err(VerifyError::Expired)
         );
     }
@@ -572,7 +581,7 @@ mod tests {
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Err(VerifyError::Expired)
         );
     }
@@ -597,7 +606,7 @@ mod tests {
                 .collect(),
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
         };
-        params.signed_by(&ca.cert, &ca.key).unwrap().der().to_vec()
+        params.signed_by(&ca.issuer).unwrap().der().to_vec()
     }
 
     #[test]
@@ -607,9 +616,9 @@ mod tests {
         params.serial_number = Some(rcgen::SerialNumber::from(7u64));
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
-        let crl = RevocationList::from_der(&crl_der(&ca, &[7]), ca.cert.der()).unwrap();
+        let crl = RevocationList::from_der(&crl_der(&ca, &[7]), ca.issuer.der()).unwrap();
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, Some(&crl)),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, Some(&crl)),
             Err(VerifyError::Revoked)
         );
     }
@@ -621,9 +630,9 @@ mod tests {
         params.serial_number = Some(rcgen::SerialNumber::from(8u64));
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
-        let crl = RevocationList::from_der(&crl_der(&ca, &[7]), ca.cert.der()).unwrap();
+        let crl = RevocationList::from_der(&crl_der(&ca, &[7]), ca.issuer.der()).unwrap();
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, Some(&crl)),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, Some(&crl)),
             Ok(plain("node-a"))
         );
     }
@@ -633,7 +642,7 @@ mod tests {
         let ca = new_ca();
         let other_ca = new_ca();
         assert_eq!(
-            RevocationList::from_der(&crl_der(&other_ca, &[7]), ca.cert.der()),
+            RevocationList::from_der(&crl_der(&other_ca, &[7]), ca.issuer.der()),
             Err(CrlError::Chain)
         );
     }
@@ -642,7 +651,7 @@ mod tests {
     fn garbage_crl_bytes_do_not_panic() {
         let ca = new_ca();
         assert_eq!(
-            RevocationList::from_der(b"not a crl", ca.cert.der()),
+            RevocationList::from_der(b"not a crl", ca.issuer.der()),
             Err(CrlError::Parse)
         );
     }
@@ -661,7 +670,7 @@ mod tests {
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Ok(VerifiedGossip {
                 cn: "node-a".to_string(),
                 failure_domain: Some("rack-a".to_string()),
@@ -680,7 +689,7 @@ mod tests {
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Ok(plain("node-a"))
         );
     }
@@ -695,7 +704,7 @@ mod tests {
         let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
         let sig = signer.sign(b"msg");
         assert_eq!(
-            verify(ca.cert.der(), &cert, b"msg", &sig, NOW, None),
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Err(VerifyError::BadFailureDomain)
         );
     }

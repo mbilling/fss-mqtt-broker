@@ -37,8 +37,8 @@ const V4: ProtocolVersion = ProtocolVersion::V311;
 struct ClusterPki {
     dir: PathBuf,
     ca_path: PathBuf,
-    ca_cert: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    // rcgen 0.14: issuer + its certificate travel as one value.
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl ClusterPki {
@@ -59,16 +59,11 @@ impl ClusterPki {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
         let ca_path = dir.join("ca.pem");
-        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
-        ClusterPki {
-            dir,
-            ca_path,
-            ca_cert,
-            ca_key,
-        }
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        ClusterPki { dir, ca_path, ca }
     }
 
     /// Mint a leaf signed by this CA whose Subject CN is `cn`. The leaf also
@@ -85,9 +80,7 @@ impl ClusterPki {
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
         ];
-        let leaf = params
-            .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
-            .unwrap();
+        let leaf = params.signed_by(&leaf_key, &self.ca).unwrap();
 
         let cert_path = self.dir.join(format!("{cn}-cert.pem"));
         let key_path = self.dir.join(format!("{cn}-key.pem"));
@@ -109,9 +102,7 @@ impl ClusterPki {
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
         ];
-        let leaf = params
-            .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
-            .unwrap();
+        let leaf = params.signed_by(&leaf_key, &self.ca).unwrap();
         let cert_path = self.dir.join(format!("{cn}-cert.pem"));
         let key_path = self.dir.join(format!("{cn}-key.pem"));
         std::fs::write(&cert_path, leaf.pem()).unwrap();
@@ -134,7 +125,7 @@ impl ClusterPki {
             }],
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
         };
-        let crl = crl_params.signed_by(&self.ca_cert, &self.ca_key).unwrap();
+        let crl = crl_params.signed_by(&self.ca).unwrap();
         let crl_path = self.dir.join("crl.pem");
         std::fs::write(&crl_path, crl.pem().unwrap()).unwrap();
         crl_path

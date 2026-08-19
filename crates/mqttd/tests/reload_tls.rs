@@ -40,12 +40,12 @@ fn gen_pki() -> Pem {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_cert = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let mut leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert).unwrap();
 
     Pem {
         ca: ca_cert.pem(),
