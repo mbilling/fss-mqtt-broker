@@ -1,6 +1,6 @@
 # ADR 0069 — Scorecard remediation: a solution per check, honestly bounded
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-19
 - **Delivery:** [docs/delivery/0069-scorecard-remediation.md](../delivery/0069-scorecard-remediation.md)
 - **Related:** [ADR 0065](0065-security-legibility.md) (T1 put the scorecard in CI;

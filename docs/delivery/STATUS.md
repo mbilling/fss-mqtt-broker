@@ -76,7 +76,7 @@
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Accepted | [3/3 done](0066-threat-model-and-hardening-baseline.md) | — |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [3/4 done](0068-fips-cryptographic-option.md) | 1 open |
-| [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [6/7 done](0069-scorecard-remediation.md) | 1 open |
+| [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Accepted | [7/7 done](0069-scorecard-remediation.md) | — |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 
 ## Open and deferred work
@@ -181,10 +181,6 @@
 **0068 — A FIPS 140-3 cryptographic option**
 
 - `0068-T4` ⬜ planned: "Release-pipeline fips artifact set (signed, SBOM, provenance) + docs/compliance/crypto-policy.md with the exact validated-module claim" — "HALF DONE (2026-08-19): docs/compliance/crypto-policy.md ships — the exact claim (module validated, product not certified), the approved surface, runtime verification channels, and the honest boundaries including the sharpest one: Argon2id password hashing is NOT FIPS-approved, so strictly-approved deployments authenticate via mTLS/OIDC and leave passwords unconfigured — stated rather than laundered. REMAINING: the release-pipeline artifact set, gated on its own spike — the release targets are musl-static and aws-lc-fips-sys on musl is unproven; the artifact must also pin the exact aws-lc-fips-sys version + CMVP certificate number at build time (the policy doc deliberately quotes no number from memory)."
-
-**0069 — Scorecard remediation: a solution per check, honestly bounded**
-
-- `0069-T7` ⬜ planned: "Maintainer: bestpractices.dev registration and passing-level self-certification" — "Reduced to paste-through (2026-08-19): docs/compliance/openssf-best-practices.md holds every passing-level criterion with its answer and evidence URL, plus the honest silver/gold gaps not to claim (two-person review at bus factor 1) and the badge snippet for the README. The remaining act is the maintainer's browser login at bestpractices.dev (~15 min) — the one step no token can perform."
 
 **0070 — Usage documentation is owned by stakeholders, not by features**
 
