@@ -77,6 +77,7 @@
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Proposed | [0/4 done](0067-compliance-framework-mappings.md) | 4 open |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [0/4 done](0068-fips-cryptographic-option.md) | 4 open |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [0/7 done](0069-scorecard-remediation.md) | 7 open |
+| [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 
 ## Open and deferred work
 
@@ -200,3 +201,14 @@
 - `0069-T5` ⬜ planned: "Security-Policy: SECURITY.md gains the advisory-form, advisories-page, and timeline links"
 - `0069-T6` ⬜ planned: "Maintainer: main-branch ruleset (require PR + status checks, no force-push/deletion), solo-compatible"
 - `0069-T7` ⬜ planned: "Maintainer: bestpractices.dev registration and passing-level self-certification"
+
+**0070 — Usage documentation is owned by stakeholders, not by features**
+
+- `0070-T1` ⬜ planned: "docs/README.md index (every doc, its stakeholder, one line) + the README persona fork; orphans routed" — "Fixes the recorded orphans: HARDENING.md (zero inbound links outside ADRs), THREAT-MODEL.md (one), TEST-PLAN.md (one)."
+- `0070-T2` ⬜ planned: "CLIENT-GUIDE.md: session/expiry semantics, the emitted reason-code catalogue (held to the CI-gated list), flow-control and refusal behaviour, worked client examples" — "The largest gap: the application developer has zero dedicated surface today; the reason-code catalogue exists only as scripts/check-reason-codes.py's gated list."
+- `0070-T3` ⬜ planned: "Generated CONFIGURATION.md from the config code, CI-checked like STATUS.md; README's env list reduces to a routed summary" — "Kills the drift class measured at 100 MQTTD_* vars in code vs 83 in README."
+- `0070-T4` ⬜ planned: "Shipped alerting: PrometheusRule in the chart + production dashboards + a runbook section per alert" — "OPERATIONS.md's 20+ alert rules are prose today; dashboards exist only inside the experimental demo."
+- `0070-T5` ⬜ planned: "Kubernetes surface: helm chart READMEs, values reference, MqttdCluster CRD reference"
+- `0070-T6` ⬜ planned: "ARCHITECTURE.md for contributors (the main.rs module-doc map and hub seams, promoted to prose)"
+- `0070-T7` ⬜ planned: "EVALUATION.md one-pager; MIGRATION.md gains per-source entry points; CAPABILITY-PLAN refreshed or retired"
+- `0070-T8` ⬜ planned: "The index gate: docs/README.md completeness check joins check-readme-facts.py; version stamps on every stakeholder doc"
