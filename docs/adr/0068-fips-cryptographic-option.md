@@ -1,6 +1,6 @@
 # ADR 0068 — A FIPS 140-3 cryptographic option
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-19
 - **Delivery:** [docs/delivery/0068-fips-cryptographic-option.md](../delivery/0068-fips-cryptographic-option.md)
 - **Related:** [ADR 0053](0053-single-crypto-provider-aws-lc-rs.md) (the single-provider

@@ -75,7 +75,7 @@
 | [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [4/6 done](0065-security-legibility.md) | 2 open |
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Accepted | [3/3 done](0066-threat-model-and-hardening-baseline.md) | — |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
-| [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [3/4 done](0068-fips-cryptographic-option.md) | 1 open |
+| [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Accepted | [4/4 done](0068-fips-cryptographic-option.md) | — |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Accepted | [7/7 done](0069-scorecard-remediation.md) | — |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 
@@ -177,10 +177,6 @@
 
 - `0065-T5` ⬜ planned: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI"
 - `0065-T6` ⬜ planned: "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run."
-
-**0068 — A FIPS 140-3 cryptographic option**
-
-- `0068-T4` ⬜ planned: "Release-pipeline fips artifact set (signed, SBOM, provenance) + docs/compliance/crypto-policy.md with the exact validated-module claim" — "HALF DONE (2026-08-19): docs/compliance/crypto-policy.md ships — the exact claim (module validated, product not certified), the approved surface, runtime verification channels, and the honest boundaries including the sharpest one: Argon2id password hashing is NOT FIPS-approved, so strictly-approved deployments authenticate via mTLS/OIDC and leave passwords unconfigured — stated rather than laundered. REMAINING: the release-pipeline artifact set, gated on its own spike — the release targets are musl-static and aws-lc-fips-sys on musl is unproven; the artifact must also pin the exact aws-lc-fips-sys version + CMVP certificate number at build time (the policy doc deliberately quotes no number from memory)."
 
 **0070 — Usage documentation is owned by stakeholders, not by features**
 

@@ -37,9 +37,14 @@ A **build variant, not a default** (ADR 0068). What changes:
 The **module** carries the validation: AWS-LC's FIPS 140-3 CMVP validation
 belongs to AWS-LC, referenced from the aws-lc-rs FIPS documentation. **The
 product is not itself FIPS-certified**, and this document never says otherwise.
-When fips release artifacts ship (0068-T4), each will name the exact
-`aws-lc-fips-sys` version it embeds and the CMVP certificate number that
-version's module holds — pinned at build time, not quoted from memory.
+Fips release artifacts ship from the same pipeline as everything else
+(`mqttd-fips-<version>-<target>`, checksummed, cosign-signed,
+provenance-attested, **byte-reproducible** — proven by the same clean-rebuild
+comparison as the standard binaries), accompanied by
+`fips-module-<version>.txt` naming the exact `aws-lc-fips-sys` version the
+binaries embed (from the tagged lockfile) and pointing at the module's
+authoritative CMVP documentation — pinned at build time, not quoted from
+memory.
 
 ## Honest boundaries
 
@@ -50,10 +55,11 @@ version's module holds — pinned at build time, not quoted from memory.
   is deliberate: Argon2id is the right password hash, and swapping it for an
   approved-but-weaker construction to launder a checkbox would be the kind of
   overclaim this document exists to prevent.
-- The **platform matrix is narrower**: the FIPS module builds where AWS-LC
-  supports it (the validated platforms are Linux; the variant also compiles on
-  macOS for development). The standard musl-static release targets need their
-  own fips build spike before fips artifacts ship — recorded in 0068-T4.
+- The **platform matrix held**: the FIPS module builds on both musl-static
+  release targets (proven 2026-08-20 — build, execution, and byte-identical
+  rebuild on x86_64 and aarch64; the one gap was kernel UAPI headers on
+  Debian's musl-gcc, shimmed with `-idirafter` in the release recipe). The
+  validated platforms remain Linux; macOS compiles for development.
 - The build toolchain grows: **cmake and Go** are required to compile the FIPS
   module.
 - Operator obligations do not shrink: the [hardening baseline](../HARDENING.md)
