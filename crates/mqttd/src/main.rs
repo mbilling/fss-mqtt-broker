@@ -544,6 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
         metrics.clone(),
     )?;
+    let audit_for_shutdown = policy.audit.clone();
     reloader.attach_config_stamp(config_stamp.clone());
 
     // Fold the cluster-bus gossip CRL (ADR 0022 T7) into the same validate-before-swap
@@ -867,6 +868,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_id,
         decommission_slot,
         Some(metrics.clone()),
+        audit_for_shutdown,
     )
     .await;
     // Push a final OTLP batch so the last counters are not lost on exit (no-op without
@@ -3955,6 +3957,7 @@ async fn graceful_shutdown(
     node_id: NodeId,
     decommission_slot: Arc<std::sync::OnceLock<Arc<mqtt_cluster::decommission::DrainStatus>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    audit: Arc<dyn mqtt_observability::AuditSink>,
 ) {
     connections.close(); // no more spawns once the accept loops stop
     tokio::select! {
@@ -4010,13 +4013,20 @@ async fn graceful_shutdown(
     shutdown.cancel();
     // 3. Wait for connections to drain, bounded by the grace deadline; a second signal
     //    escalates to immediate exit.
-    tokio::select! {
-        () = connections.wait() => info!("all client connections drained"),
+    let drain_outcome = tokio::select! {
+        () = connections.wait() => {
+            info!("all client connections drained");
+            "drained"
+        }
         () = tokio::time::sleep(grace) => {
             warn!("drain grace elapsed; forcing shutdown with connections still open");
+            "grace-elapsed"
         }
-        () = wait_for_shutdown_signal() => warn!("second signal; forcing immediate shutdown"),
-    }
+        () = wait_for_shutdown_signal() => {
+            warn!("second signal; forcing immediate shutdown");
+            "second-signal"
+        }
+    };
     // 4. Stop the lease-group driver loop, then the consensus core, cleanly (in-flight
     //    durable writes are already fsync'd). Stopping the driver first avoids it issuing
     //    lease RPCs against a raft that is shutting down.
@@ -4027,6 +4037,17 @@ async fn graceful_shutdown(
     if let Some(plane) = plane {
         let _ = plane.raft().shutdown().await;
     }
+    // 5. Close the audit chain (ADR 0066 T3): the LAST record of a graceful stop,
+    //    carrying the closing head. The SIEM-side invariant this enables: every
+    //    chain ends with `audit.shutdown`, and every genesis follows one — a chain
+    //    that just stops is a crash or a suppression, and either is worth an alert.
+    //    Nothing records after this: connections are drained (or abandoned to the
+    //    process exit) and the plane is stopped.
+    audit.record(
+        "audit.shutdown",
+        None,
+        &format!("graceful shutdown ({drain_outcome}); this record closes the chain"),
+    );
     info!("shutdown complete");
 }
 

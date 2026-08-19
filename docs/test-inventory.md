@@ -700,13 +700,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 11 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 12 test(s)
 
 - `metrics::tests::counters_and_gauges_move_and_render`
 - `metrics::tests::hub_dispatch_and_append_lane_metrics_render`
 - `metrics::tests::no_unbounded_label_keys_are_used`
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
+- `tests::a_restart_is_a_new_chain_not_a_truncation`
 - `tests::audit_log_hash_chains_recorded_events`
 - `tests::chain_advances_and_is_order_sensitive`
 - `tests::field_boundaries_are_unambiguous`
@@ -1231,8 +1232,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_restored_node_restarts_with_its_own_unchanged_environment`
 - `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death`
 
-## `crates/mqttd/tests/binary_smoke.rs` — 6 test(s)
+## `crates/mqttd/tests/binary_smoke.rs` — 7 test(s)
 
+- `a_graceful_stop_closes_the_audit_chain`
 - `binary_serves_a_plaintext_pubsub_roundtrip`
 - `durable_on_with_no_data_dir_refuses_to_start`
 - `max_connections_cap_refuses_at_accept_and_recovers`
