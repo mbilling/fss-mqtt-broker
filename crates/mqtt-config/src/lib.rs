@@ -826,7 +826,9 @@ impl Config {
     /// malformed TOML always fail regardless of policy.
     fn parse_toml(s: &str, env_policy: Option<UnknownConfigKeys>) -> Result<Self, ConfigError> {
         let mut unknown: Vec<String> = Vec::new();
-        let de = toml::de::Deserializer::new(s);
+        // toml 1.x: constructing the deserializer parses the document, so the
+        // syntax-error case surfaces here rather than inside serde_ignored.
+        let de = toml::de::Deserializer::parse(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
         let mut cfg: Config = serde_ignored::deserialize(de, |path| {
             unknown.push(path.to_string());
         })
