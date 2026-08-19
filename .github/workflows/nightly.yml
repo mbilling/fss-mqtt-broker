@@ -59,6 +59,26 @@ jobs:
       - name: cluster_stress sweep
         run: MQTTD_STRESS_SEEDS=8 cargo test -p mqttd --test cluster_stress -- --nocapture
 
+  fips-protocol:
+    name: protocol suites against the fips binary
+    runs-on: ubuntu-latest
+    # ADR 0068 T3, the nightly half: the client-visible protocol behaviour must
+    # be identical under the validated module — proven by running the real
+    # suites against a fips-built broker, not asserted.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: fips-nightly
+      - name: v5 protocol, TLS, and process smoke under fips
+        run: |
+          cargo test -p mqttd --features fips \
+            --test v5_protocol --test tls --test binary_smoke -- --nocapture 2>&1 | tail -40
+
   upgrade:
     name: two-binary rolling upgrade
     runs-on: ubuntu-latest

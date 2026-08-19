@@ -23,6 +23,12 @@ aws-lc-rs = { workspace = true }
 # mqtt-storage / mqtt-cluster / mqttd; not a new supply-chain crate.
 async-trait = "0.1"
 
+[features]
+# FIPS 140-3 build variant (ADR 0068): swaps the crypto to the validated
+# AWS-LC module across the whole graph. A variant, not a default: heavier
+# build (cmake + Go), narrower platform matrix.
+fips = ["aws-lc-rs/fips"]
+
 [dev-dependencies]
 rcgen.workspace = true
 # The trait is async, so its tests need a runtime — even for verifiers that never await.

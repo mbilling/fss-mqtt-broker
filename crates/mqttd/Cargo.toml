@@ -46,6 +46,12 @@ tokio-rustls.workspace = true
 rustix = { version = "1", features = ["process"] }
 
 
+[features]
+# FIPS 140-3 build variant (ADR 0068): swaps the crypto to the validated
+# AWS-LC module across the whole graph. A variant, not a default: heavier
+# build (cmake + Go), narrower platform matrix.
+fips = ["aws-lc-rs/fips", "mqtt-net/fips", "mqtt-auth/fips", "mqtt-cluster/fips", "mqtt-observability/fips"]
+
 [dev-dependencies]
 # The independent history checker (issue #231): the out-of-process harness records
 # client-visible events and verifies them in-test through code that shares nothing

@@ -289,7 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // from `std::env` directly — the env surface is mapped once, in `mqtt_config`.
     let config = Arc::new(load_config()?);
     let node_id = NodeId(config.node.id.clone());
-    info!(version = env!("CARGO_PKG_VERSION"), node = %node_id.0, "starting mqttd");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        node = %node_id.0,
+        crypto = mqtt_net::tls::crypto_module(),
+        "starting mqttd"
+    );
     log_effective_config(&config);
 
     // ADR 0046 T4: the running config, shared with the policy reload closures so a `SIGHUP` /
@@ -345,6 +350,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mqtt_observability::metrics::Metrics::new(version)
         },
     );
+    // ADR 0068 runtime visibility: the metric half (the startup banner and
+    // /statusz are the other two).
+    metrics.set_crypto_module(mqtt_net::tls::crypto_module());
 
     // Build and spawn the routing hub with its session store (durable opt-in, or
     // the bounded in-memory default). The store is shared with connections for the

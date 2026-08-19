@@ -123,7 +123,29 @@ impl rustls::server::StoresServerSessions for ExpiringSessionCache {
 /// exactly one crypto stack; naming it here keeps every broker-built TLS config
 /// unambiguous and provider-stable regardless of process-default installation order.
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    let p = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // ADR 0068: a fips build that silently ran non-approved crypto would be
+    // worse than no fips build. This is the one seam every TLS configuration
+    // flows through (ADR 0002's single audited build site), so the check here
+    // covers client, server, peer, and QUIC alike.
+    #[cfg(feature = "fips")]
+    assert!(
+        p.fips(),
+        "fips build: the crypto provider is not the FIPS-validated module"
+    );
+    p
+}
+
+/// The crypto module this build runs — for the startup log, `/statusz`, and
+/// anything else that must let an auditor verify the RUNNING binary rather
+/// than trust the artifact's name (ADR 0068).
+#[must_use]
+pub fn crypto_module() -> &'static str {
+    if cfg!(feature = "fips") {
+        "aws-lc-rs (FIPS mode)"
+    } else {
+        "aws-lc-rs"
+    }
 }
 
 /// Build a server-side acceptor from PEM files.
@@ -277,6 +299,17 @@ pub fn server_config_versions(
     if client_ca.is_none() && crl.is_some() {
         return Err(NetError::Tls(
             "a CRL (MQTTD_TLS_CRL) requires client-certificate auth (set MQTTD_TLS_CLIENT_CA)"
+                .to_string(),
+        ));
+    }
+    // ADR 0068: the fips variant serves the approved posture only — the
+    // TLS 1.2 opt-in (and with it the unsafe-features hatch) is refused at
+    // startup rather than silently narrowed.
+    #[cfg(feature = "fips")]
+    if tls12 != Tls12::Off {
+        return Err(NetError::Tls(
+            "fips build: the TLS 1.2 opt-in (MQTTD_TLS_ALLOW_TLS12) is not available — \
+             this variant serves TLS 1.3 with the FIPS-approved suites only"
                 .to_string(),
         ));
     }
@@ -545,7 +578,10 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// These pin the STANDARD build's posture; the fips variant deliberately
+// changes it (no 1.2 opt-in at all, no ChaCha20/X25519 — not approved), and
+// `fips_posture_tests` below pins THAT instead.
+#[cfg(all(test, not(feature = "fips")))]
 mod tls12_hardening_tests {
     use super::*;
 
@@ -685,5 +721,62 @@ mod tls12_hardening_tests {
         assert!(!legacy.require_ems, "the unsafe opt-in relaxes exactly EMS");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, feature = "fips"))]
+mod fips_posture_tests {
+    use super::*;
+
+    /// ADR 0068: the provider in a fips build IS the validated module — the
+    /// assertion in [`provider`] would abort otherwise, but pin it as a test
+    /// so the property is observed, not implied.
+    #[test]
+    fn the_provider_is_in_fips_mode() {
+        assert!(provider().fips(), "fips build without a FIPS provider");
+        assert_eq!(crypto_module(), "aws-lc-rs (FIPS mode)");
+    }
+
+    /// The approved posture: no ChaCha20-Poly1305, no X25519 — their absence
+    /// is what distinguishes the validated module's suite set.
+    #[test]
+    fn non_approved_algorithms_are_absent() {
+        let p = provider();
+        for cs in &p.cipher_suites {
+            let name = format!("{:?}", cs.suite());
+            assert!(
+                !name.contains("CHACHA20"),
+                "non-approved suite present: {name}"
+            );
+        }
+        for g in &p.kx_groups {
+            let name = format!("{:?}", g.name());
+            assert!(
+                !name.contains("X25519") || name.contains("MLKEM"),
+                "check kx group: {name}"
+            );
+        }
+    }
+
+    /// The TLS 1.2 opt-in is refused at configuration time, naming the reason.
+    #[test]
+    fn the_tls12_opt_in_is_refused() {
+        let dir = std::env::temp_dir().join(format!("fips-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let err = server_config_versions(&cert_path, &key_path, None, None, 0, Tls12::Hardened)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fips build"), "wrong refusal: {err}");
+        // And the approved posture builds fine.
+        server_config_versions(&cert_path, &key_path, None, None, 0, Tls12::Off).unwrap();
     }
 }
