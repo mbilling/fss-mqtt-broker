@@ -75,6 +75,15 @@ for pkg in "${PACKAGES[@]}"; do
     # AWS-LC module. An ISOLATED target dir (still under target/, so the repro
     # proof's `cargo clean` covers it) keeps the feature-flagged build from
     # overwriting the standard binary's path — order-independent by construction.
+    #
+    # The FIPS module's entropy code includes Linux kernel UAPI headers
+    # (linux/random.h), which Debian's musl-gcc wrapper keeps off its include
+    # path by design. Kernel UAPI headers are libc-agnostic, so append the
+    # distro's header dirs with -idirafter: musl's own headers always win, and
+    # only the kernel interfaces resolve from the glibc locations.
+    KERNEL_INC="-idirafter /usr/include/$(uname -m)-linux-gnu -idirafter /usr/include"
+    CFLAGS_VAR="CFLAGS_${TARGET//-/_}"
+    export "${CFLAGS_VAR}=${!CFLAGS_VAR:-} ${KERNEL_INC}"
     cargo build --release --locked --target "$TARGET" -p mqttd --features fips \
       --target-dir "${REPO_ROOT}/target/fips-build" >&2
     cp "${REPO_ROOT}/target/fips-build/${TARGET}/release/mqttd" \
