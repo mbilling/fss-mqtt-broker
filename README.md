@@ -1,5 +1,10 @@
 # mqttd — a security-first, cluster-native MQTT broker
 
+[![CI](https://img.shields.io/github/actions/workflow/status/mbilling/fss-mqtt-broker/ci.yml?branch=main&label=CI)](https://github.com/mbilling/fss-mqtt-broker/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mbilling/fss-mqtt-broker)](https://github.com/mbilling/fss-mqtt-broker/releases)
+[![Release date](https://img.shields.io/github/release-date/mbilling/fss-mqtt-broker)](https://github.com/mbilling/fss-mqtt-broker/releases/latest)
+[![Last commit](https://img.shields.io/github/last-commit/mbilling/fss-mqtt-broker)](https://github.com/mbilling/fss-mqtt-broker/commits/main)
+[![Maintained](https://img.shields.io/maintenance/yes/2026)](SUPPORT.md)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/mbilling/fss-mqtt-broker/badge)](https://scorecard.dev/viewer/?uri=github.com/mbilling/fss-mqtt-broker)
 
 > An MQTT 3.1.1 + 5.0 broker built to be the most cyber-secure
