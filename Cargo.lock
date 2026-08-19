@@ -1999,6 +1999,7 @@ dependencies = [
 name = "mqtt-observability"
 version = "1.0.0"
 dependencies = [
+ "aws-lc-rs",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
