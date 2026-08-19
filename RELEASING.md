@@ -33,7 +33,7 @@ Every release publishes, for the tagged commit:
   others. It is a terminal UI for a human at a keyboard, so it ships as a binary and is
   deliberately **not** added to the container images: nothing in a distroless image can use
   a TUI, and putting one there would grow the runtime attack surface for no one. It is also
-  published to crates.io as its own crate (step 7 below), from its own workspace, so
+  published to crates.io as its own crate (step 8 below), from its own workspace, so
   `ratatui` never enters the broker's dependency graph.
 - **Keyless signatures** — every binary, checksum, and the SBOM is
   cosign-signed via GitHub OIDC (no long-lived key); the image is cosign-signed
@@ -95,7 +95,12 @@ must already be in the registry (the coverage tests refuse the bump without it).
 3. **Confirm the readiness checklist** in
    [ADR 0044](docs/adr/0044-release-readiness-assurance.md) is satisfied — the
    release is gated on it.
-4. **Tag and push** an annotated, signed tag on the release commit:
+4. **Re-stamp the versioned claims documents** (ADR 0067 T4): the "Verified
+   against" headers in `docs/THREAT-MODEL.md`, `docs/HARDENING.md`,
+   `docs/AUDIT-SCHEMA.md` and `docs/compliance/*.md` are re-verified against the
+   release and re-dated — a claims document that drifts from the product is a
+   liability, so drift is a doc bug, fixed before the tag.
+5. **Tag and push** an annotated, signed tag on the release commit:
 
    ```sh
    git tag -s -a v0.1.0 -m "mqttd 0.1.0"
@@ -105,12 +110,12 @@ must already be in the registry (the coverage tests refuse the bump without it).
    > `-s` signs the tag with your git signing key; the pipeline's artifact
    > signing is separate (keyless cosign) and always runs.
 
-5. **Watch the `Release` workflow.** On success it has: pushed the multi-arch
+6. **Watch the `Release` workflow.** On success it has: pushed the multi-arch
    image, signed every asset, attested provenance, generated the SBOM, and
    created the GitHub Release with all assets attached.
-6. **Sanity-check** by running the [verify steps](#verifying-a-release) against
+7. **Sanity-check** by running the [verify steps](#verifying-a-release) against
    the published release yourself.
-7. **Publish `mqttui` to crates.io** — a *manual* step, deliberately. It is the one part of
+8. **Publish `mqttui` to crates.io** — a *manual* step, deliberately. It is the one part of
    a release that cannot be undone: crates.io versions are permanent and cannot be
    re-uploaded, so it is not automated behind a tag push. CI has already proven the crate
    packs and builds from its own tarball on every PR (`cargo publish --dry-run`), so this

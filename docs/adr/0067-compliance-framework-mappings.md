@@ -1,6 +1,6 @@
 # ADR 0067 — Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-19
 - **Delivery:** [docs/delivery/0067-compliance-framework-mappings.md](../delivery/0067-compliance-framework-mappings.md)
 - **Related:** [ADR 0065](0065-security-legibility.md) (the artifacts these mappings
