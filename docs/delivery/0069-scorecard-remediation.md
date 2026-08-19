@@ -1,7 +1,7 @@
 ---
 adr: "0069"
 title: "Scorecard remediation: a solution per check, honestly bounded"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0069-T1
     title: "Token-Permissions: top-level read everywhere, write only at job level where the act needs it"
@@ -35,8 +35,9 @@ tasks:
     evidence: "Ruleset 'main: PRs with green checks, no force-push, no deletion' (id 21061777) created via the API and ACTIVE on the default branch: pull requests required (zero approving reviews — the solo-compatible posture the ADR specified; self-approval theatre stays out), all seven CI checks required (build/test/lint, docs, interop, mqttui, supply-chain, helm, fips), force-push and deletion blocked, bypass_actors empty and current_user_can_bypass: never — the token that created the rule cannot step around it. The merge automation already complied (it only ever merges green PRs). Expected scorecard read: Tier 1 satisfied outright; the reviewer-requiring tiers stay honestly out of reach at bus factor 1."
   - id: 0069-T7
     title: "Maintainer: bestpractices.dev registration and passing-level self-certification"
-    status: planned
-    notes: "Reduced to paste-through (2026-08-19): docs/compliance/openssf-best-practices.md holds every passing-level criterion with its answer and evidence URL, plus the honest silver/gold gaps not to claim (two-person review at bus factor 1) and the badge snippet for the README. The remaining act is the maintainer's browser login at bestpractices.dev (~15 min) — the one step no token can perform."
+    status: done
+    date: 2026-08-20
+    evidence: "Registered and PASSING at 100%: https://www.bestpractices.dev/projects/14161 (confirmed via the projects API: badge_percentage_0 = 100). The maintainer performed the login-and-publish step from the paste-through answer sheet (docs/compliance/openssf-best-practices.md), which now records the published project id; the badge sits beside the Scorecard badge in the README. Every criterion answer was drafted against repository evidence during the registration session — including the honest N/As (no CVEs ever assigned; no memory-unsafe code produced) and the silver/gold gaps deliberately not claimed at bus factor 1."
 ---
 
 # Delivery — ADR 0069: Scorecard remediation
@@ -58,10 +59,13 @@ time and people, not commits). Target after T1–T7: ≈ 8.
 | 0069-T4 | ✅ done | 2026-08-19 | "All three Dockerfiles pin the base by DIGEST (gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f... — the multi-arch index digest, confirmed against the registry from two independent paths), with the rationale comment: the tag names the intent, the digest IS the base. The operator-e2e.sh quote that made the checker's shell parser give up ('reached EOF without closing quote' at the escaped-dot jsonpath inside nested quotes) is rewritten as a go-template label read — bash -n parses, the vendored bundle re-vendored, and the checker can now finish reading the tree instead of reporting 'possibly incomplete results'." |
 | 0069-T5 | ✅ done | 2026-08-19 | "SECURITY.md gains 'The links, in one place': the private advisory form URL, the published advisories page, SUPPORT.md for versions/timelines, the per-release VEX directory, and docs/compliance/ — the linked content the checker (and a reporter at 2 a.m.) looks for." |
 | 0069-T6 | ✅ done | 2026-08-19 | "Ruleset 'main: PRs with green checks, no force-push, no deletion' (id 21061777) created via the API and ACTIVE on the default branch: pull requests required (zero approving reviews — the solo-compatible posture the ADR specified; self-approval theatre stays out), all seven CI checks required (build/test/lint, docs, interop, mqttui, supply-chain, helm, fips), force-push and deletion blocked, bypass_actors empty and current_user_can_bypass: never — the token that created the rule cannot step around it. The merge automation already complied (it only ever merges green PRs). Expected scorecard read: Tier 1 satisfied outright; the reviewer-requiring tiers stay honestly out of reach at bus factor 1." |
-| 0069-T7 | ⬜ planned | — | "Reduced to paste-through (2026-08-19): docs/compliance/openssf-best-practices.md holds every passing-level criterion with its answer and evidence URL, plus the honest silver/gold gaps not to claim (two-person review at bus factor 1) and the badge snippet for the README. The remaining act is the maintainer's browser login at bestpractices.dev (~15 min) — the one step no token can perform." |
+| 0069-T7 | ✅ done | 2026-08-20 | "Registered and PASSING at 100%: https://www.bestpractices.dev/projects/14161 (confirmed via the projects API: badge_percentage_0 = 100). The maintainer performed the login-and-publish step from the paste-through answer sheet (docs/compliance/openssf-best-practices.md), which now records the published project id; the badge sits beside the Scorecard badge in the README. Every criterion answer was drafted against repository evidence during the registration session — including the honest N/As (no CVEs ever assigned; no memory-unsafe code produced) and the silver/gold gaps deliberately not claimed at bus factor 1." |
 <!-- /status-table:0069 -->
 
 ## Changelog
+
+- **2026-08-20** — T7 done: bestpractices.dev project 14161, passing at 100%.
+  ADR 0069 complete (7/7); status Accepted.
 
 - **2026-08-19** — T6 done via the API (ruleset active, bypass never); T7
   reduced to a paste-through answer sheet — the login is the last human step.

@@ -6,6 +6,7 @@
 [![Last commit](https://img.shields.io/github/last-commit/mbilling/fss-mqtt-broker)](https://github.com/mbilling/fss-mqtt-broker/commits/main)
 [![Maintained](https://img.shields.io/maintenance/yes/2026)](SUPPORT.md)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/mbilling/fss-mqtt-broker/badge)](https://scorecard.dev/viewer/?uri=github.com/mbilling/fss-mqtt-broker)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14161/badge)](https://www.bestpractices.dev/projects/14161)
 
 > An MQTT 3.1.1 + 5.0 broker built to be the most cyber-secure
 > broker available, designed to scale horizontally, with a 100% open feature

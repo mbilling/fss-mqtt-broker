@@ -70,8 +70,6 @@ Two-person review and role separation fail on bus factor 1 — the same honesty
 the threat model records. The passing level does not require them; do not claim
 them at higher levels until a second maintainer exists.
 
-After publishing, add the badge beside the Scorecard badge in the README:
-
-```markdown
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>)
-```
+**Published 2026-08-20: project 14161, passing (100%).** The badge lives beside
+the Scorecard badge in the README; the live record is
+<https://www.bestpractices.dev/projects/14161>.
