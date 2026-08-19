@@ -30,10 +30,13 @@ tasks:
     evidence: "SECURITY.md gains 'The links, in one place': the private advisory form URL, the published advisories page, SUPPORT.md for versions/timelines, the per-release VEX directory, and docs/compliance/ — the linked content the checker (and a reporter at 2 a.m.) looks for."
   - id: 0069-T6
     title: "Maintainer: main-branch ruleset (require PR + status checks, no force-push/deletion), solo-compatible"
-    status: planned
+    status: done
+    date: 2026-08-19
+    evidence: "Ruleset 'main: PRs with green checks, no force-push, no deletion' (id 21061777) created via the API and ACTIVE on the default branch: pull requests required (zero approving reviews — the solo-compatible posture the ADR specified; self-approval theatre stays out), all seven CI checks required (build/test/lint, docs, interop, mqttui, supply-chain, helm, fips), force-push and deletion blocked, bypass_actors empty and current_user_can_bypass: never — the token that created the rule cannot step around it. The merge automation already complied (it only ever merges green PRs). Expected scorecard read: Tier 1 satisfied outright; the reviewer-requiring tiers stay honestly out of reach at bus factor 1."
   - id: 0069-T7
     title: "Maintainer: bestpractices.dev registration and passing-level self-certification"
     status: planned
+    notes: "Reduced to paste-through (2026-08-19): docs/compliance/openssf-best-practices.md holds every passing-level criterion with its answer and evidence URL, plus the honest silver/gold gaps not to claim (two-person review at bus factor 1) and the badge snippet for the README. The remaining act is the maintainer's browser login at bestpractices.dev (~15 min) — the one step no token can perform."
 ---
 
 # Delivery — ADR 0069: Scorecard remediation
@@ -54,11 +57,14 @@ time and people, not commits). Target after T1–T7: ≈ 8.
 | 0069-T3 | ✅ done | 2026-08-19 | "Both OSV hits dispositioned in the VEX with evidence, per the security/vex README rule: GHSA-h395-gr6q-cpjc (jsonwebtoken) is not_affected/component_not_present — the advisory's range ends at 10.3.0 and we ship 11.0.0; a scanner range-matching bug, now machine-readably answered. RUSTSEC-2026-0235 (rkyv) is not_affected/vulnerable_code_not_in_execute_path — the chain is openraft -> byte-unit -> rust_decimal -> rkyv (verified in Cargo.lock; NOT trimmable without forking upstream config, checked), and zero rkyv API call sites exist in the tree; no archive is ever constructed or read. anyhow was already dispositioned (0065-T3). All three scanner hits now have machine-readable answers shipping with every release." |
 | 0069-T4 | ✅ done | 2026-08-19 | "All three Dockerfiles pin the base by DIGEST (gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f... — the multi-arch index digest, confirmed against the registry from two independent paths), with the rationale comment: the tag names the intent, the digest IS the base. The operator-e2e.sh quote that made the checker's shell parser give up ('reached EOF without closing quote' at the escaped-dot jsonpath inside nested quotes) is rewritten as a go-template label read — bash -n parses, the vendored bundle re-vendored, and the checker can now finish reading the tree instead of reporting 'possibly incomplete results'." |
 | 0069-T5 | ✅ done | 2026-08-19 | "SECURITY.md gains 'The links, in one place': the private advisory form URL, the published advisories page, SUPPORT.md for versions/timelines, the per-release VEX directory, and docs/compliance/ — the linked content the checker (and a reporter at 2 a.m.) looks for." |
-| 0069-T6 | ⬜ planned | — |  |
-| 0069-T7 | ⬜ planned | — |  |
+| 0069-T6 | ✅ done | 2026-08-19 | "Ruleset 'main: PRs with green checks, no force-push, no deletion' (id 21061777) created via the API and ACTIVE on the default branch: pull requests required (zero approving reviews — the solo-compatible posture the ADR specified; self-approval theatre stays out), all seven CI checks required (build/test/lint, docs, interop, mqttui, supply-chain, helm, fips), force-push and deletion blocked, bypass_actors empty and current_user_can_bypass: never — the token that created the rule cannot step around it. The merge automation already complied (it only ever merges green PRs). Expected scorecard read: Tier 1 satisfied outright; the reviewer-requiring tiers stay honestly out of reach at bus factor 1." |
+| 0069-T7 | ⬜ planned | — | "Reduced to paste-through (2026-08-19): docs/compliance/openssf-best-practices.md holds every passing-level criterion with its answer and evidence URL, plus the honest silver/gold gaps not to claim (two-person review at bus factor 1) and the badge snippet for the README. The remaining act is the maintainer's browser login at bestpractices.dev (~15 min) — the one step no token can perform." |
 <!-- /status-table:0069 -->
 
 ## Changelog
+
+- **2026-08-19** — T6 done via the API (ruleset active, bypass never); T7
+  reduced to a paste-through answer sheet — the login is the last human step.
 
 - **2026-08-19** — T1-T5 (every repository task) shipped in one pass; T6/T7
   remain the maintainer's settings-and-registration acts.

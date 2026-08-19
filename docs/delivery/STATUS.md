@@ -76,7 +76,7 @@
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Accepted | [3/3 done](0066-threat-model-and-hardening-baseline.md) | — |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [3/4 done](0068-fips-cryptographic-option.md) | 1 open |
-| [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [5/7 done](0069-scorecard-remediation.md) | 2 open |
+| [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [6/7 done](0069-scorecard-remediation.md) | 1 open |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 
 ## Open and deferred work
@@ -184,8 +184,7 @@
 
 **0069 — Scorecard remediation: a solution per check, honestly bounded**
 
-- `0069-T6` ⬜ planned: "Maintainer: main-branch ruleset (require PR + status checks, no force-push/deletion), solo-compatible"
-- `0069-T7` ⬜ planned: "Maintainer: bestpractices.dev registration and passing-level self-certification"
+- `0069-T7` ⬜ planned: "Maintainer: bestpractices.dev registration and passing-level self-certification" — "Reduced to paste-through (2026-08-19): docs/compliance/openssf-best-practices.md holds every passing-level criterion with its answer and evidence URL, plus the honest silver/gold gaps not to claim (two-person review at bus factor 1) and the badge snippet for the README. The remaining act is the maintainer's browser login at bestpractices.dev (~15 min) — the one step no token can perform."
 
 **0070 — Usage documentation is owned by stakeholders, not by features**
 
