@@ -26,10 +26,11 @@ tasks:
   - id: 0065-T5
     title: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI"
     status: planned
+    notes: "HALF DONE (2026-08-19, delivered as 0069-T2): CodeQL for Rust runs on every PR, main push, and a weekly cron (.github/workflows/codeql.yml), findings in code scanning. REMAINING: OSS-Fuzz onboarding — an application PR to google/oss-fuzz (project.yaml + build.sh wrapping the six cargo-fuzz targets) plus a maintainer contact email; an external act with upstream review, not a repo commit."
   - id: 0065-T6
     title: "Funded third-party security audit, findings published in-repo with their fixes"
     status: planned
-    notes: "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run."
+    notes: "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run. Precondition now met (v1.0.0 shipped 2026-08-19); the remaining act is the maintainer's funding/commissioning decision (OSTIF-style), with the audit surface documents ready: THREAT-MODEL, HARDENING, AUDIT-SCHEMA, crypto-policy, the compliance mappings."
 ---
 
 # Delivery — ADR 0065: Security legibility
@@ -49,11 +50,15 @@ export statements, automated dependency inflow, external validation.
 | 0065-T2 | ✅ done | 2026-08-19 | ".github/dependabot.yml: cargo (workspace root AND tools/mqttui's separate lockfile) + github-actions ecosystems, weekly, grouped (one PR per ecosystem per week — per-patch-bump noise trains reviewers to rubber-stamp), bounded open-PR limits; security updates bypass the schedule per Dependabot's built-in behaviour. Deliberate exclusions recorded in the file itself: deploy/ image pins advance with OUR release train (check-deploy-image-pin.sh gates them, RELEASING.md moves them), and the Python interop tooling has no manifest to watch (noted with the instruction to add a pip entry if scripts/ ever grows one)." |
 | 0065-T3 | ✅ done | 2026-08-19 | "security/vex/statements.json (OpenVEX 0.2.0) is the reviewed source of truth with @VERSION@/@TIMESTAMP@ placeholders; the release pipeline stamps it (json.loads refuses a malformed doc) into assets/vex-<version>.openvex.json, which the existing cosign loop signs and gh release uploads beside the SBOMs — no extra wiring, by construction. First real disposition shipped, with the evidence rule applied: RUSTSEC-2026-0190 (anyhow Error::downcast_mut unsoundness) is not_affected/vulnerable_code_not_in_execute_path — anyhow enters the tree ONLY through prost-derive (verified against Cargo.lock's dependent graph), a compile-time proc-macro shipping no code into the broker, and no code in the repository calls downcast_mut (tree-wide search, zero hits). cargo audit at authoring time: 0 vulnerabilities, this one warning. The evidence rule itself is codified in security/vex/README.md: a bare not_affected without justification + impact_statement + recorded analysis is a review rejection." |
 | 0065-T4 | ✅ done | 2026-08-19 | "SUPPORT.md: the ADR 0039 policy as a dated, procurement-quotable table — three supported minor lines with the rotation rule, the 1.0.x row seeded (v1.0.0, 2026-08-19), pre-1.0 releases explicitly unsupported with v0.9.1 named as the upgrade entry into the 1.0 line; what 'supported' means stated precisely (adjacent skew + nightly proof, migrate-in-place per ADR 0058, security fixes on every supported line as signed releases). Export control: publicly-available open-source with standard crypto is not subject to the EAR per SS734.7(a)(3) (86 FR 16482), with the conventional ECCN 5D002/TSU self-classification named for procurement paperwork and an explicit not-legal-advice scope." |
-| 0065-T5 | ⬜ planned | — |  |
-| 0065-T6 | ⬜ planned | — | "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run." |
+| 0065-T5 | ⬜ planned | — | "HALF DONE (2026-08-19, delivered as 0069-T2): CodeQL for Rust runs on every PR, main push, and a weekly cron (.github/workflows/codeql.yml), findings in code scanning. REMAINING: OSS-Fuzz onboarding — an application PR to google/oss-fuzz (project.yaml + build.sh wrapping the six cargo-fuzz targets) plus a maintainer contact email; an external act with upstream review, not a repo commit." |
+| 0065-T6 | ⬜ planned | — | "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run. Precondition now met (v1.0.0 shipped 2026-08-19); the remaining act is the maintainer's funding/commissioning decision (OSTIF-style), with the audit surface documents ready: THREAT-MODEL, HARDENING, AUDIT-SCHEMA, crypto-policy, the compliance mappings." |
 <!-- /status-table:0065 -->
 
 ## Changelog
+
+- **2026-08-20** — Reconciliation: T5's CodeQL half was delivered by 0069-T2;
+  what remains of T5 (OSS-Fuzz application) and T6 (funded audit) are external
+  acts, both preconditions now met.
 
 - **2026-08-19** — ADR proposed and delivery opened, from the post-1.0-freeze
   enterprise-readiness review: the assurance program exists (SBOM, SLSA, cosign,
