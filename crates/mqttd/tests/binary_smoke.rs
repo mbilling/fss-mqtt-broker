@@ -477,3 +477,122 @@ async fn a_graceful_stop_closes_the_audit_chain() {
         "an audit record followed the closing record; tail was: {after}"
     );
 }
+
+/// ADR 0066 T3, the export end to end: with `MQTTD_AUDIT_SYSLOG` set, the real
+/// binary ships its audit chain to a TCP listener as RFC 5424 frames whose MSG
+/// is one JSON object per record — genesis, an auth record from a real client
+/// connect, and the closing `audit.shutdown` — and the exported stream VERIFIES:
+/// replaying the records through [`mqtt_observability::AuditChain`] reproduces
+/// every emitted head. This is the external-anchoring model proven end to end:
+/// what the SIEM holds is enough to detect any rewrite.
+#[tokio::test]
+async fn the_audit_export_ships_a_verifiable_chain() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let syslog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let syslog_addr = syslog.local_addr().unwrap().to_string();
+    let collector = std::thread::spawn(move || {
+        let (mut s, _) = syslog.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut buf = Vec::new();
+        loop {
+            if String::from_utf8_lossy(&buf).contains("audit.shutdown") {
+                break;
+            }
+            let mut chunk = [0u8; 4096];
+            match std::io::Read::read(&mut s, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
+        .env("MQTTD_NODE_ID", "audit-export")
+        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+        .env("MQTTD_ALLOW_ANONYMOUS", "1")
+        .env("MQTTD_DURABLE_SESSIONS", "0")
+        .env("MQTTD_SHUTDOWN_GRACE", "5")
+        .env("MQTTD_AUDIT_SYSLOG", &syslog_addr)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the mqttd binary");
+    let mut guard = ChildGuard(child);
+    wait_until_listening(addr).await;
+
+    // One real client connect produces an auth.success record between genesis
+    // and shutdown, so the verified chain is not vacuously genesis-only.
+    let c = Client::connect(addr, "audit-client").await;
+    drop(c);
+
+    let pid = guard.0.id();
+    assert!(Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("spawn kill")
+        .success());
+    for _ in 0..100 {
+        if guard.0.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let stream = collector.join().unwrap();
+    // Parse the JSON objects out of the octet-counted frames.
+    let mut records = Vec::new();
+    for part in stream.split('{').skip(1) {
+        let json: serde_json::Value = serde_json::from_str(&format!(
+            "{{{}",
+            part.split('}').next().unwrap_or("").to_owned() + "}"
+        ))
+        .unwrap_or(serde_json::Value::Null);
+        if json.is_object() {
+            records.push(json);
+        }
+    }
+    assert!(
+        records.len() >= 3,
+        "expected genesis + at least one record + shutdown; stream was:\n{stream}"
+    );
+    assert_eq!(
+        records[0]["kind"], "audit.genesis",
+        "first record is genesis"
+    );
+    let boot = records[0]["boot"].as_str().expect("genesis boot id");
+
+    // Replay: the genesis head must equal the boot-derived genesis, and every
+    // subsequent head must reproduce from (kind, subject, detail) alone.
+    let mut chain = mqtt_observability::AuditChain::with_boot(boot);
+    assert_eq!(
+        records[0]["head"].as_str().unwrap(),
+        chain.head_hex(),
+        "genesis head must derive from the announced boot id"
+    );
+    let mut last_kind = String::new();
+    for rec in &records[1..] {
+        let kind = rec["kind"].as_str().unwrap();
+        let subject = rec["subject"].as_str().map(ToString::to_string);
+        let detail = rec["detail"].as_str().unwrap_or("");
+        chain.append(kind, subject, detail);
+        assert_eq!(
+            rec["head"].as_str().unwrap(),
+            chain.head_hex(),
+            "head mismatch at seq {:?} — the exported stream does not verify",
+            rec["seq"]
+        );
+        last_kind = kind.to_string();
+    }
+    assert_eq!(
+        last_kind, "audit.shutdown",
+        "the chain must close with the shutdown record"
+    );
+}

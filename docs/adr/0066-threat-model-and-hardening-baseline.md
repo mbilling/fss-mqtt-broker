@@ -1,6 +1,6 @@
 # ADR 0066 — Threat model, hardening baseline, and SIEM-consumable audit
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-19
 - **Delivery:** [docs/delivery/0066-threat-model-and-hardening-baseline.md](../delivery/0066-threat-model-and-hardening-baseline.md)
 - **Related:** [ADR 0003](0003-gossip-authentication.md), [ADR 0005](0005-session-affinity.md),

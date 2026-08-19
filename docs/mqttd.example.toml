@@ -291,6 +291,16 @@ ready_min_members = 1
 # check-config gate strict.
 # config_unknown_keys = "refuse"
 
+[audit]
+# SIEM export of the audit chain (ADR 0066 T3): every security-relevant record —
+# auth results, ACL denials, admin acts, the boot genesis and the closing shutdown
+# record — as RFC 5424 syslog over TCP, one JSON object per record. Unset = no
+# export (the records still land in the broker log). The export never blocks the
+# broker: past its bounded queue it sheds-and-counts (audit_export_dropped), and a
+# shed is visible downstream as a seq gap. Format, kind vocabulary, SIEM alert
+# invariants and the verification procedure: docs/AUDIT-SCHEMA.md.
+# syslog = "127.0.0.1:6514"
+
 [backup]
 # ONLINE backup + restore (ADR 0062, issue #249). Taken from the LIVE node: nothing stops,
 # no client is disconnected, no second store handle is opened. What it guarantees is a

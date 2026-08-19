@@ -2004,6 +2004,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus-client",
+ "serde_json",
  "tokio",
  "tracing",
 ]

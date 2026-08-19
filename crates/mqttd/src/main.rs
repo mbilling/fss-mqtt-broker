@@ -1168,7 +1168,16 @@ fn client_policy(
     shutdown: tokio_util::sync::CancellationToken,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<(Arc<conn::ConnPolicy>, reload::Reloader), Box<dyn std::error::Error>> {
-    let audit: Arc<dyn AuditSink> = Arc::new(AuditLog::new());
+    // ADR 0066 T3: with an export endpoint configured, every audit record —
+    // genesis and the closing shutdown record included — also ships to the SIEM
+    // as RFC 5424 syslog (shed-and-count, never blocking the broker).
+    let audit: Arc<dyn AuditSink> = match live.read().expect("config lock").audit.syslog.clone() {
+        Some(addr) => {
+            info!(%addr, "audit export: shipping the audit chain as RFC 5424 syslog");
+            Arc::new(AuditLog::with_syslog(&addr, Some(metrics.clone())))
+        }
+        None => Arc::new(AuditLog::new()),
+    };
     // Build the initial policy, and a closure that re-reads the configured files on reload
     // (ADR 0032). The closure returns the freshly-built (authorizer, authenticator) or an
     // error string that aborts the swap — validate-before-swap lives in `reload::Reloader`.
@@ -4048,6 +4057,9 @@ async fn graceful_shutdown(
         None,
         &format!("graceful shutdown ({drain_outcome}); this record closes the chain"),
     );
+    // Give a configured export the chance to deliver the closing record before
+    // the process exits (no-op without an exporter).
+    audit.flush(Duration::from_secs(3));
     info!("shutdown complete");
 }
 

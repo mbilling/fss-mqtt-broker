@@ -518,8 +518,8 @@ about = """
 The second independent oracle: Paho reaches the control-plane semantics the Mosquitto CLI
 cannot — v5 reason codes, SUBACK granted-QoS, CONNACK session-present, User Properties,
 retained-flag fidelity and session resume. It also pins the broker's capability
-advertisement: the CONNACK says Subscription Identifiers Available = 0, and a SUBSCRIBE
-that uses one is refused with DISCONNECT 0xA1 rather than silently degraded (issue #245).
+advertisement: the CONNACK says Subscription Identifiers Available = 1, and a delivered
+message carries the subscription's identifier, read back by Paho's own decoder (issue #266).
 """
 requires = ["python3"]
 duration = "~15s"
@@ -845,3 +845,21 @@ HEAD). CI runs it on every PR; running it locally needs only git.
 requires = ["git"]
 duration = "~1s"
 hidden = true
+
+[[task]]
+id = "audit-verify"
+group = "Conformance"
+name = "Verify an exported audit stream (chain, genesis, seq, closure)"
+script = "scripts/audit-verify.py"
+about = """
+The SIEM-side half of the audit trail (ADR 0066 T3): given the exported RFC 5424
+stream (or bare JSON lines), reproves the SHA-256 hash chain with no secret and no
+access to the broker — every head must reproduce from the records themselves, each
+chain's genesis must derive from its announced boot id, sequence numbers must be
+contiguous, and every chain must close with audit.shutdown. Run with --self-test to
+check the verifier against a golden vector generated from the broker's own Rust
+implementation; run with a captured stream to audit a deployment. Exit 0 means the
+stream is the one the broker wrote and nothing was cut from its tail.
+"""
+requires = ["python3"]
+duration = "~1s"

@@ -43,6 +43,8 @@ pub struct Config {
     pub runtime: Runtime,
     /// Online backup + restore (ADR 0062).
     pub backup: Backup,
+    /// Audit-trail export (ADR 0066 T3).
+    pub audit: Audit,
     /// The unknown key paths the last parse IGNORED under
     /// [`UnknownConfigKeys::Warn`] (issue #230) — carried here so the caller can
     /// log them loudly without a signature change. Never serialized; empty under
@@ -401,6 +403,17 @@ pub struct Durable {
 /// cluster backup is the set of every node's export. Off by default (`every_secs = 0`),
 /// because a scheduled backup with no destination would be a promise the broker cannot
 /// keep; `mqttd --backup` triggers one on demand whenever `dir` is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Audit {
+    /// RFC 5424 syslog endpoint for the audit-chain export (`MQTTD_AUDIT_SYSLOG`),
+    /// `host:port` over TCP. Unset = no export; the chain still lands in the broker
+    /// log either way. The export sheds-and-counts when the endpoint is slower than
+    /// the audit rate — see docs/AUDIT-SCHEMA.md for the record format, the SIEM
+    /// boundary invariant, and the verification procedure.
+    pub syslog: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Backup {
@@ -1222,6 +1235,9 @@ impl Config {
         });
 
         // -- backup (ADR 0062) --
+        on!("MQTTD_AUDIT_SYSLOG", v, {
+            self.audit.syslog = Some(v);
+        });
         on!("MQTTD_BACKUP_DIR", v, {
             self.backup.dir = Some(v);
         });

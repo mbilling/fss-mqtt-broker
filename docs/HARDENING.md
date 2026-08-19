@@ -104,7 +104,7 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 
 | # | Lvl | Control | Knob / default | Verify |
 |---|-----|---------|----------------|--------|
-| H-8.1 | L1 | Broker logs are shipped and retained (they carry the audit chain) | log shipper of choice; the audit records are `target: audit` tracing lines | the SIEM/store shows `audit chain genesis` at each boot |
+| H-8.1 | L1 | The audit chain reaches the SIEM | `MQTTD_AUDIT_SYSLOG` (RFC 5424/TCP, see [AUDIT-SCHEMA](AUDIT-SCHEMA.md)) or a log shipper carrying the `target: audit` lines | the SIEM shows `audit.genesis` at each boot; `scripts/audit-verify.py` over a captured stream exits 0 |
 | H-8.2 | L1 | The chain-boundary invariant is alerted on | SIEM rule | rule exists: a chain ending **without** `audit.shutdown`, or a genesis **not** preceded by one, raises an alert (crash or suppression) |
 | H-8.3 | L2 | Metrics scraped; refusal/drop counters dashboarded | `MQTTD_METRICS_BIND` or `MQTTD_OTLP_ENDPOINT` | dashboards show `publish_dropped_*`, gossip drop counters, brownout state |
 | H-8.4 | L2 | `/readyz` drives load-balancer membership | orchestrator wiring | draining/browned-out/quorumless nodes leave rotation automatically |
