@@ -1,0 +1,45 @@
+# ADR 0065 T2: the inbound half of dependency hygiene. The gates (cargo-deny,
+# cargo-audit, the full test battery) already refuse bad dependencies; this
+# produces the stream of update PRs those gates judge, so a fixed vulnerability
+# reaches us by automation rather than by someone noticing an audit failure.
+#
+# Grouped and weekly on purpose: a PR per patch bump is noise that trains
+# reviewers to rubber-stamp. Security updates ignore the schedule and arrive
+# immediately (Dependabot's built-in behaviour).
+#
+# NOT covered here, deliberately:
+#   - deploy/ image pins — they advance with OUR release train (RELEASING.md),
+#     not with upstream; check-deploy-image-pin.sh gates them.
+#   - the Python interop tooling — no manifest exists (CI installs paho inline);
+#     if scripts/ ever grows a requirements.txt, add a pip ecosystem entry.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /tools/mqttui
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      mqttui-dependencies:
+        patterns: ["*"]
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 2

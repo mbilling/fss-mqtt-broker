@@ -1,0 +1,19 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/mbilling/fss-mqtt-broker/security/vex/mqttd-@VERSION@",
+  "author": "mqttd maintainers (https://github.com/mbilling/fss-mqtt-broker)",
+  "timestamp": "@TIMESTAMP@",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": { "name": "RUSTSEC-2026-0190" },
+      "products": [
+        { "@id": "pkg:github/mbilling/fss-mqtt-broker@@VERSION@" },
+        { "@id": "pkg:cargo/mqttd@@VERSION@" }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "anyhow 1.0.102 (unsoundness in Error::downcast_mut) enters the dependency tree solely through prost-derive, a procedural macro that runs at compile time and ships no code into the built broker; additionally, no code in this repository calls Error::downcast_mut (verified by tree-wide search, recorded in docs/delivery/0065-security-legibility.md)."
+    }
+  ]
+}

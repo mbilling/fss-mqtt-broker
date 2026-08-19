@@ -72,7 +72,7 @@
 | [0062](../adr/0062-online-backup-and-restore.md) | Online backup and restore: a per-node export with a stated window | Accepted | [11/11 done](0062-online-backup-and-restore.md) | — |
 | [0063](../adr/0063-external-consumer-integration.md) | External integration without a rule engine: the consumer-group pattern | Accepted | [3/3 done](0063-external-consumer-integration.md) | — |
 | [0064](../adr/0064-hub-module-seams.md) | The hub's module seams | Accepted | [1/1 done](0064-hub-module-seams.md) | — |
-| [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [0/6 done](0065-security-legibility.md) | 6 open |
+| [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [4/6 done](0065-security-legibility.md) | 2 open |
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Proposed | [0/3 done](0066-threat-model-and-hardening-baseline.md) | 3 open |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Proposed | [0/4 done](0067-compliance-framework-mappings.md) | 4 open |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [0/4 done](0068-fips-cryptographic-option.md) | 4 open |
@@ -173,10 +173,6 @@
 
 **0065 — Security legibility: scorecard, VEX, dependency automation, lifecycle statements**
 
-- `0065-T1` ⬜ planned: "OpenSSF Scorecard action + badge; remediate what it flags (pinned digests, token permissions)"
-- `0065-T2` ⬜ planned: "Dependency-update automation (Renovate or Dependabot) over crates, actions, and Python tooling, grouped and gated"
-- `0065-T3` ⬜ planned: "OpenVEX per release, emitted by the pipeline beside the SBOMs, with an evidence rule for every 'not affected'"
-- `0065-T4` ⬜ planned: "SUPPORT.md — the ADR 0039 lifecycle as a dated table — plus the export-control (ECCN) statement"
 - `0065-T5` ⬜ planned: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI"
 - `0065-T6` ⬜ planned: "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run."
 
