@@ -19,7 +19,7 @@ aws-lc-rs = { workspace = true }
 async-trait = "0.1"
 openraft = { version = "0.9.24", features = ["serde"] }
 # On-disk persistence for the lease consensus store (ADR 0018 phase 2).
-redb = "2"
+redb = "4"
 
 [dev-dependencies]
 tempfile = "3"

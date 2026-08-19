@@ -16,7 +16,7 @@ bytes = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
 # Embedded, pure-Rust ACID engine backing the on-disk durable log (ADR 0018).
-redb = "2"
+redb = "4"
 tokio = { workspace = true }
 
 [dev-dependencies]

@@ -31,7 +31,7 @@ serde.workspace = true
 toml.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
-redb = "2"
+redb = "4"
 
 [dev-dependencies]
 mqttd = { path = "../mqttd", version = "1.0.0" }

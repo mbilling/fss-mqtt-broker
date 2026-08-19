@@ -12,7 +12,7 @@ opentelemetry = "0.32.0"
 # from its own dedicated thread (no Tokio reactor), so the async client cannot run there.
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
-prometheus-client = "0.22"
+prometheus-client = "0.25"
 tracing.workspace = true
 
 [dev-dependencies]

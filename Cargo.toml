@@ -50,7 +50,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # async runtime
 tokio = { version = "1", features = ["full"] }
 # error handling
-thiserror = "1"
+thiserror = "2"
 # bytes for zero-copy wire buffers
 bytes = "1"
 # tracing / observability
@@ -64,9 +64,9 @@ serde = { version = "1", features = ["derive"] }
 # become the SECOND provider after the OTLP/reqwest chain pulled aws-lc-rs in anyway.
 aws-lc-rs = "1"
 # X.509 parsing for mTLS identity extraction (ADR 0004)
-x509-parser = "0.16"
+x509-parser = "0.18"
 # ACL policy files (ADR 0004 step 3)
-toml = "0.8"
+toml = "1.1"
 # Collects the PATHS of config keys the strict structs do not know (issue #230 /
 # ADR 0058 T4): one tolerant pass reports every unknown key at once, and the
 # refuse/warn policy is applied to the complete list — replacing the 17 per-struct
@@ -92,10 +92,10 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging"] }
 rustls-pki-types = "1"
 # test-only PKI: integration tests mint throwaway CAs instead of skipping verification
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # WebSocket transport (ADR 0035): the HTTP Upgrade handshake + WS frame codec only — TLS is
 # done by our own rustls (no tungstenite TLS feature), so there is one TLS stack in the broker.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Stream/Sink adapters for the WebSocket byte-stream shim (already in-tree transitively).
 futures-util = "0.3"
 # QUIC transport (ADR 0036): MQTT-over-QUIC on the same aws-lc-rs provider as the rest
@@ -103,7 +103,7 @@ futures-util = "0.3"
 # aws-lc-rs through feature unification).
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 # Micro-benchmarks (ADR 0044 P6): dev-only, statistical timing of the hot paths.
-criterion = "0.5"
+criterion = "0.8"
 
 # Test/dev builds keep file:line panic locations but drop full debuginfo:
 # the workspace's ~30 integration-test binaries at debug=2 exceed 20 GiB of
