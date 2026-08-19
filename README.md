@@ -1,5 +1,7 @@
 # mqttd — a security-first, cluster-native MQTT broker
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/mbilling/fss-mqtt-broker/badge)](https://scorecard.dev/viewer/?uri=github.com/mbilling/fss-mqtt-broker)
+
 > An MQTT 3.1.1 + 5.0 broker built to be the most cyber-secure
 > broker available, designed to scale horizontally, with a 100% open feature
 > set.

@@ -1,0 +1,41 @@
+name: OpenSSF Scorecard
+
+# ADR 0065 T1: the checklist enterprise OSS-intake tooling actually runs, run by
+# us first. Results publish to the OpenSSF API (the README badge) and to code
+# scanning as SARIF, so a regression in any checked practice is visible where
+# maintainers already look.
+on:
+  schedule:
+    - cron: "26 4 * * 1"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Needed to upload the SARIF results to code scanning.
+      security-events: write
+      # Needed to publish results to the OpenSSF REST API (the badge).
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Run analysis
+        uses: ossf/scorecard-action@55891bbd73f2425e97637d96e306fc9d491d0b21 # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publishing is what makes the badge live and the results auditable
+          # by anyone — the point of the exercise.
+          publish_results: true
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+        with:
+          sarif_file: results.sarif
