@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
@@ -68,7 +68,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml pins the version; install the matching static-musl target.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -157,7 +157,7 @@ jobs:
 
       # SLSA build provenance for the binary — what commit/workflow produced it.
       - name: Attest binary provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             out/${{ steps.stage.outputs.name }}
@@ -166,7 +166,7 @@ jobs:
             out/${{ steps.stage.outputs.operator_name }}
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.arch }}
           path: out/*
@@ -174,15 +174,15 @@ jobs:
 
       # ── Single-arch image, pushed by digest to GHCR ──
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build and push single-arch image by digest
         id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
@@ -195,7 +195,7 @@ jobs:
       # per arch — a file-per-arch artifact is the correct handoff.)
       - name: Build and push single-arch BRIDGE image by digest
         id: push_bridge
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.bridge
@@ -206,7 +206,7 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
       - name: Build and push single-arch OPERATOR image by digest
         id: push_operator
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.operator
@@ -222,19 +222,19 @@ jobs:
           echo "${{ steps.push_bridge.outputs.digest }}" > "bridge-digests/${{ matrix.arch }}"
           echo "${{ steps.push_operator.outputs.digest }}" > "operator-digests/${{ matrix.arch }}"
       - name: Upload image digest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digest-${{ matrix.arch }}
           path: digests/${{ matrix.arch }}
           retention-days: 7
       - name: Upload bridge image digest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bridge-digest-${{ matrix.arch }}
           path: bridge-digests/${{ matrix.arch }}
           retention-days: 7
       - name: Upload operator image digest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: operator-digest-${{ matrix.arch }}
           path: operator-digests/${{ matrix.arch }}
@@ -252,18 +252,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Set version
         id: v
@@ -275,25 +275,25 @@ jobs:
           else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Download binary artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-*
           path: assets
           merge-multiple: true
       - name: Download image digests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: digest-*
           path: digests
           merge-multiple: true
       - name: Download bridge image digests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: bridge-digest-*
           path: bridge-digests
           merge-multiple: true
       - name: Download operator image digests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: operator-digest-*
           path: operator-digests
@@ -440,13 +440,13 @@ jobs:
           COSIGN_YES: "true"
         run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${{ steps.manifest.outputs.digest }}"
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
       - name: Attest image SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
@@ -460,13 +460,13 @@ jobs:
           COSIGN_YES: "true"
         run: cosign sign --yes "${REGISTRY}/${BRIDGE_IMAGE_NAME}@${{ steps.bridge_manifest.outputs.digest }}"
       - name: Attest bridge image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }}
           subject-digest: ${{ steps.bridge_manifest.outputs.digest }}
           push-to-registry: true
       - name: Attest bridge image SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }}
           subject-digest: ${{ steps.bridge_manifest.outputs.digest }}
@@ -480,13 +480,13 @@ jobs:
           COSIGN_YES: "true"
         run: cosign sign --yes "${REGISTRY}/${OPERATOR_IMAGE_NAME}@${{ steps.operator_manifest.outputs.digest }}"
       - name: Attest operator image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }}
           subject-digest: ${{ steps.operator_manifest.outputs.digest }}
           push-to-registry: true
       - name: Attest operator image SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }}
           subject-digest: ${{ steps.operator_manifest.outputs.digest }}

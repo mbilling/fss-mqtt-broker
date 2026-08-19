@@ -24,11 +24,11 @@ jobs:
       # Needed to publish results to the OpenSSF REST API (the badge).
       id-token: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run analysis
-        uses: ossf/scorecard-action@55891bbd73f2425e97637d96e306fc9d491d0b21 # v2.4.4
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
         with:
           results_file: results.sarif
           results_format: sarif
@@ -36,6 +36,6 @@ jobs:
           # by anyone — the point of the exercise.
           publish_results: true
       - name: Upload to code scanning
-        uses: github/codeql-action/upload-sarif@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4
         with:
           sarif_file: results.sarif
