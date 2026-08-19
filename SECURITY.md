@@ -27,6 +27,14 @@ A good report includes:
 If you found it with the in-repo fuzz harness (see below), the crashing input
 under `fuzz/artifacts/` is the ideal reproducer.
 
+## The links, in one place
+
+- **Report privately**: <https://github.com/mbilling/fss-mqtt-broker/security/advisories/new>
+- **Published advisories**: <https://github.com/mbilling/fss-mqtt-broker/security/advisories>
+- **Supported versions and fix timelines**: [SUPPORT.md](SUPPORT.md)
+- **Per-release VEX (is mqttd affected by CVE-X?)**: [security/vex/](security/vex/)
+- **Compliance evidence** (CRA, IEC 62443, SOC 2/ISO): [docs/compliance/](docs/compliance/)
+
 ## What to expect
 
 This is a pre-1.0 project maintained on a best-effort basis; these are targets,

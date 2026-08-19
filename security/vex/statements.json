@@ -6,14 +6,52 @@
   "version": 1,
   "statements": [
     {
-      "vulnerability": { "name": "RUSTSEC-2026-0190" },
+      "vulnerability": {
+        "name": "RUSTSEC-2026-0190"
+      },
       "products": [
-        { "@id": "pkg:github/mbilling/fss-mqtt-broker@@VERSION@" },
-        { "@id": "pkg:cargo/mqttd@@VERSION@" }
+        {
+          "@id": "pkg:github/mbilling/fss-mqtt-broker@@VERSION@"
+        },
+        {
+          "@id": "pkg:cargo/mqttd@@VERSION@"
+        }
       ],
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "anyhow 1.0.102 (unsoundness in Error::downcast_mut) enters the dependency tree solely through prost-derive, a procedural macro that runs at compile time and ships no code into the built broker; additionally, no code in this repository calls Error::downcast_mut (verified by tree-wide search, recorded in docs/delivery/0065-security-legibility.md)."
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-h395-gr6q-cpjc"
+      },
+      "products": [
+        {
+          "@id": "pkg:github/mbilling/fss-mqtt-broker@@VERSION@"
+        },
+        {
+          "@id": "pkg:cargo/mqttd@@VERSION@"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "component_not_present",
+      "impact_statement": "The advisory's affected range for jsonwebtoken ends at 10.3.0 (introduced 0, fixed 10.3.0 per OSV); this product ships jsonwebtoken 11.0.0, which is outside the affected range \u2014 the vulnerable component version is not present. Scanners flagging it are mis-matching the range; recorded in docs/delivery/0069-scorecard-remediation.md."
+    },
+    {
+      "vulnerability": {
+        "name": "RUSTSEC-2026-0235"
+      },
+      "products": [
+        {
+          "@id": "pkg:github/mbilling/fss-mqtt-broker@@VERSION@"
+        },
+        {
+          "@id": "pkg:cargo/mqttd@@VERSION@"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "rkyv 0.7 (out-of-bounds reads when validating untrusted archives containing Rc/Arc) enters the tree only as openraft -> byte-unit -> rust_decimal -> rkyv; no code in this product or that dependency chain deserializes rkyv archives, and no rkyv archive from any source \u2014 let alone an untrusted one \u2014 is ever constructed or read (tree-wide search: zero rkyv API call sites outside the vendored crates' own internals). The edge is not trimmable without forking upstream configuration; recorded in docs/delivery/0069-scorecard-remediation.md."
     }
   ]
 }
