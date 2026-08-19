@@ -1,0 +1,56 @@
+name: "spike: fips on the musl release targets"
+
+# ADR 0068 T4's gating question, answered by building rather than believing:
+# does the FIPS variant build (and rebuild byte-identically) on the exact
+# release targets, in the exact release recipe? Runs on pushes to its spike
+# branch only; deleted (or demoted to a nightly assurance lane) once the
+# verdict is wired into release.yml.
+on:
+  push:
+    branches: [claude/0068-musl-fips]
+
+permissions:
+  contents: read
+
+jobs:
+  fips-musl:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
+        with:
+          toolchain: "1.97.0"
+          targets: ${{ matrix.target }}
+      - name: Install musl C toolchain
+        run: sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 install -y --no-install-recommends musl-tools
+      - name: Build the fips variant via the release recipe
+        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd-fips
+      - name: The binary executes and is static
+        run: |
+          BIN=target/${{ matrix.target }}/release/mqttd-fips
+          file "$BIN"
+          "$BIN" --version
+          ldd "$BIN" 2>&1 | head -2 || true # "not a dynamic executable" is the desired answer
+      - name: Byte-reproducibility of the fips build
+        run: |
+          BIN=target/${{ matrix.target }}/release/mqttd-fips
+          sha256sum "$BIN" | awk '{print $1}' > first.sha256
+          cargo clean
+          scripts/release/build-repro.sh ${{ matrix.target }} mqttd-fips
+          sha256sum "$BIN" | awk '{print $1}' > second.sha256
+          if ! diff -q first.sha256 second.sha256; then
+            echo "::error title=FIPS reproducibility::rebuild was not byte-identical — ship WITHOUT the repro claim or fix the module build"
+            paste first.sha256 second.sha256
+            exit 1
+          fi
+          echo "fips build is byte-reproducible: $(cat first.sha256)"

@@ -70,7 +70,16 @@ if [ "${#PACKAGES[@]}" -eq 0 ]; then
   PACKAGES=(mqttd mqtt-bridge)
 fi
 for pkg in "${PACKAGES[@]}"; do
-  if [ "$pkg" = "mqttui" ]; then
+  if [ "$pkg" = "mqttd-fips" ]; then
+    # The FIPS variant (ADR 0068 T4): the same broker built with the validated
+    # AWS-LC module. An ISOLATED target dir (still under target/, so the repro
+    # proof's `cargo clean` covers it) keeps the feature-flagged build from
+    # overwriting the standard binary's path — order-independent by construction.
+    cargo build --release --locked --target "$TARGET" -p mqttd --features fips \
+      --target-dir "${REPO_ROOT}/target/fips-build" >&2
+    cp "${REPO_ROOT}/target/fips-build/${TARGET}/release/mqttd" \
+       "${REPO_ROOT}/target/${TARGET}/release/mqttd-fips"
+  elif [ "$pkg" = "mqttui" ]; then
     # mqttui is a SEPARATE workspace with its own lockfile (ADR 0056 §1) — the boundary is
     # the lockfile, so that a terminal UI's dependency tree can never reach the broker's.
     # It is therefore built through its own manifest, which is what makes `--locked` bind
