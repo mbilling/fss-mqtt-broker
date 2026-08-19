@@ -765,6 +765,28 @@ names. The cost is the reason it is no longer the only path: stopping a node mea
 decommission drain, whose measured per-pod cost is issue #248's, and during it the cluster
 runs one replica short. Use it deliberately, not as routine DR.
 
+## Shipping the audit trail to a SIEM
+
+The audit chain (auth results, ACL denials, admin acts — hash-chained per boot)
+exports as RFC 5424 syslog over TCP with `audit.syslog = "host:port"`
+(`MQTTD_AUDIT_SYSLOG`), one JSON object per record. Ship to a localhost relay
+(rsyslog/vector/fluent-bit) that owns the TLS hop to your collector.
+
+Three things to wire on the SIEM side, all specified in
+[AUDIT-SCHEMA.md](AUDIT-SCHEMA.md):
+
+- **The boundary alert**: every chain must end with `audit.shutdown` and every
+  genesis must follow one — a chain that just stops is a crash or a suppression.
+- **De-duplication on `(boot, seq)`**: delivery is at-least-once across
+  reconnects.
+- **Verification**: `scripts/audit-verify.py <captured stream>` reproves the
+  whole chain with no secret — run it when the trail's integrity is questioned,
+  not just believed.
+
+The export never blocks the broker: past the bounded queue it sheds-and-counts
+(`audit_export_dropped` — alert on non-zero; the shed is also visible downstream
+as a `seq` gap).
+
 ## Monitoring for the operator (and humans)
 
 The signals the future controller will reconcile on — equally useful today as alert

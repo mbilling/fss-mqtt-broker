@@ -156,6 +156,7 @@ struct OtelInstruments {
     retained_divergence: OtelCounter<u64>,
     retained_apply_failed: OtelCounter<u64>,
     retained_queue_dropped: OtelCounter<u64>,
+    audit_export_dropped: OtelCounter<u64>,
     brownout: OtelGauge<i64>,
     store_max_bytes: OtelGauge<i64>,
     process_resident_bytes: OtelGauge<i64>,
@@ -229,6 +230,7 @@ impl OtelInstruments {
             retained_divergence: meter.u64_counter("retained_divergence").build(),
             retained_apply_failed: meter.u64_counter("retained_apply_failed").build(),
             retained_queue_dropped: meter.u64_counter("retained_queue_dropped").build(),
+            audit_export_dropped: meter.u64_counter("audit_export_dropped").build(),
             brownout: meter.i64_gauge("brownout").build(),
             store_max_bytes: meter.i64_gauge("store_max_bytes").build(),
             process_resident_bytes: meter.i64_gauge("process_resident_bytes").build(),
@@ -326,6 +328,7 @@ pub struct Metrics {
     retained_divergence_total: Counter,
     retained_apply_failed_total: Counter,
     retained_queue_dropped_total: Counter,
+    audit_export_dropped_total: Counter,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
     /// (`disk`, `memory`), 0 otherwise. The rejection counters record symptoms; this
     /// gauge is the condition itself — an idle browned-out broker is visible.
@@ -697,6 +700,15 @@ impl Metrics {
              means a partition outlasted the queue's capacity",
         );
 
+        let audit_export_dropped_total = register_counter(
+            &mut registry,
+            "audit_export_dropped",
+            "Audit records the SIEM exporter shed because its bounded queue was full \
+             (ADR 0066 T3): the chain itself is intact at the source, and the export's \
+             seq gap makes the shed detectable downstream — non-zero means the export \
+             endpoint is slower than the audit rate",
+        );
+
         let brownout = register_gauge_family(
             &mut registry,
             "brownout",
@@ -879,6 +891,7 @@ impl Metrics {
             retained_divergence_total,
             retained_apply_failed_total,
             retained_queue_dropped_total,
+            audit_export_dropped_total,
             brownout,
             store_max_bytes,
             process_resident_bytes,
@@ -1594,6 +1607,12 @@ impl Metrics {
     pub fn retained_queue_dropped(&self) {
         self.retained_queue_dropped_total.inc();
         self.otel.retained_queue_dropped.add(1, &[]);
+    }
+
+    /// One audit record shed by the SIEM exporter's bounded queue (ADR 0066 T3).
+    pub fn audit_export_dropped(&self) {
+        self.audit_export_dropped_total.inc();
+        self.otel.audit_export_dropped.add(1, &[]);
     }
 
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;

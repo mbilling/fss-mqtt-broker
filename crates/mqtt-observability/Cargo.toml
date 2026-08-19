@@ -15,6 +15,7 @@ opentelemetry = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "metrics"] }
 prometheus-client = "0.25"
+serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

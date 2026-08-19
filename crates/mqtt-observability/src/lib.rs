@@ -4,6 +4,7 @@
 //! flow into a **hash-chained** audit log so that any after-the-fact tampering
 //! with the record is detectable.
 
+pub mod audit_export;
 pub mod metrics;
 
 /// A single audit record describing a security-relevant event.
@@ -116,6 +117,14 @@ pub trait AuditSink: Send + Sync + std::fmt::Debug {
     /// Record one event. `subject` is the principal it pertains to (an identity
     /// or client id); `detail` MUST NOT contain secrets.
     fn record(&self, kind: &str, subject: Option<&str>, detail: &str);
+
+    /// Wait for any configured export to deliver everything recorded so far
+    /// (bounded by `timeout`). Default no-op: only exporting sinks have
+    /// anything to wait for. Called once, at the end of graceful shutdown, so
+    /// the closing `audit.shutdown` record reaches the SIEM before exit.
+    fn flush(&self, timeout: std::time::Duration) {
+        let _ = timeout;
+    }
 }
 
 /// The production [`AuditSink`]: appends to a tamper-evident [`AuditChain`]
@@ -126,6 +135,7 @@ pub trait AuditSink: Send + Sync + std::fmt::Debug {
 pub struct AuditLog {
     boot_id: String,
     chain: std::sync::Mutex<AuditChain>,
+    export: Option<audit_export::AuditExporter>,
 }
 
 impl Default for AuditLog {
@@ -144,6 +154,23 @@ impl AuditLog {
     /// (and no TLS key, and no token) can be trusted either.
     #[must_use]
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// An audit log that additionally exports every record — genesis and the
+    /// closing `audit.shutdown` included — as RFC 5424 syslog to `addr`
+    /// (ADR 0066 T3). The export is a copy of the stream, never a gate on it:
+    /// see [`audit_export`] for the shed-and-count delivery policy.
+    ///
+    /// # Panics
+    /// As [`AuditLog::new`] (system randomness), or if the writer thread
+    /// cannot be spawned.
+    #[must_use]
+    pub fn with_syslog(addr: &str, metrics: Option<std::sync::Arc<metrics::Metrics>>) -> Self {
+        Self::build(Some(audit_export::AuditExporter::syslog(addr, metrics)))
+    }
+
+    fn build(export: Option<audit_export::AuditExporter>) -> Self {
         let mut raw = [0u8; 16];
         aws_lc_rs::rand::fill(&mut raw).expect("system randomness for the audit boot id");
         let boot_id = hex(&raw);
@@ -154,9 +181,16 @@ impl AuditLog {
             head = %chain.head_hex(),
             "audit chain genesis"
         );
+        if let Some(exp) = &export {
+            exp.enqueue(
+                "audit.genesis",
+                &record_json("audit.genesis", &boot_id, None, None, &chain.head_hex(), ""),
+            );
+        }
         Self {
             boot_id,
             chain: std::sync::Mutex::new(chain),
+            export,
         }
     }
 
@@ -196,7 +230,52 @@ impl AuditSink for AuditLog {
             head = %head,
             "{detail}"
         );
+        if let Some(exp) = &self.export {
+            exp.enqueue(
+                kind,
+                &record_json(kind, &self.boot_id, Some(seq), subject, &head, detail),
+            );
+        }
     }
+
+    fn flush(&self, timeout: std::time::Duration) {
+        if let Some(exp) = &self.export {
+            if !exp.flush(timeout) {
+                tracing::warn!(
+                    dropped = exp.dropped(),
+                    "audit export flush timed out — the SIEM may be missing the tail \
+                     (chain intact at source)"
+                );
+            }
+        }
+    }
+}
+
+/// The export record: one JSON object, the exact shape
+/// `scripts/audit-verify.py` replays (docs/AUDIT-SCHEMA.md). `seq` is absent
+/// on the genesis pseudo-record — genesis announces the chain, it is not IN it.
+fn record_json(
+    kind: &str,
+    boot: &str,
+    seq: Option<u64>,
+    subject: Option<&str>,
+    head: &str,
+    detail: &str,
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("boot".into(), boot.into());
+    if let Some(seq) = seq {
+        obj.insert("seq".into(), seq.into());
+    }
+    obj.insert("kind".into(), kind.into());
+    if let Some(subject) = subject {
+        obj.insert("subject".into(), subject.into());
+    }
+    obj.insert("head".into(), head.into());
+    if !detail.is_empty() {
+        obj.insert("detail".into(), detail.into());
+    }
+    serde_json::Value::Object(obj).to_string()
 }
 
 /// A test [`AuditSink`] that buffers every event in memory.
