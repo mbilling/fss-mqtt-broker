@@ -14,6 +14,12 @@ clustering and security vocabulary — are defined at first use or in the
 
 ### Try it in two minutes
 
+You need Docker, plus the standard mosquitto clients for the pub/sub half
+(`brew install mosquitto` on macOS, `apt install mosquitto-clients` on
+Debian/Ubuntu — Windows is covered in its own block below).
+
+**macOS / Linux:**
+
 ```sh
 docker run -d --name mqttd -p 1883:1883 \
   -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 \
@@ -23,6 +29,22 @@ docker run -d --name mqttd -p 1883:1883 \
 mosquitto_sub -h 127.0.0.1 -p 1883 -t 'sensors/+/temp' &
 mosquitto_pub -h 127.0.0.1 -p 1883 -t 'sensors/kitchen/temp' -m '21.5C'
 ```
+
+**Windows (PowerShell)** — same demo, paste-safe: no `\` continuations, no `&`
+backgrounding (both fail in PowerShell), and the clients are called by full path
+because mosquitto's installer does not add itself to `PATH`:
+
+```powershell
+winget install --id EclipseFoundation.Mosquitto -e   # one-time: installs mosquitto_pub/sub
+
+docker run -d --name mqttd -p 1883:1883 -e MQTTD_PLAINTEXT_BIND=0.0.0.0:1883 -e MQTTD_ALLOW_ANONYMOUS=1 -e MQTTD_DATA_DIR=/var/lib/mqttd -v mqttd-data:/var/lib/mqttd ghcr.io/mbilling/fss-mqtt-broker:latest
+
+$mq = "$Env:ProgramFiles\mosquitto"
+Start-Process "$mq\mosquitto_sub.exe" -ArgumentList '-h 127.0.0.1 -p 1883 -t sensors/+/temp'
+& "$mq\mosquitto_pub.exe" -h 127.0.0.1 -p 1883 -t sensors/kitchen/temp -m 21.5C
+```
+
+The subscriber opens in its own window; `21.5C` arrives there.
 
 That is **plaintext with anonymous clients** — a first look, never a deployment. The
 named volume is what makes it honest: durable sessions are on by default, and durable-on
