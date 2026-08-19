@@ -157,7 +157,7 @@ jobs:
 
       # SLSA build provenance for the binary — what commit/workflow produced it.
       - name: Attest binary provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             out/${{ steps.stage.outputs.name }}
@@ -256,7 +256,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -440,13 +440,13 @@ jobs:
           COSIGN_YES: "true"
         run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${{ steps.manifest.outputs.digest }}"
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
       - name: Attest image SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
@@ -460,13 +460,13 @@ jobs:
           COSIGN_YES: "true"
         run: cosign sign --yes "${REGISTRY}/${BRIDGE_IMAGE_NAME}@${{ steps.bridge_manifest.outputs.digest }}"
       - name: Attest bridge image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }}
           subject-digest: ${{ steps.bridge_manifest.outputs.digest }}
           push-to-registry: true
       - name: Attest bridge image SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BRIDGE_IMAGE_NAME }}
           subject-digest: ${{ steps.bridge_manifest.outputs.digest }}
@@ -480,13 +480,13 @@ jobs:
           COSIGN_YES: "true"
         run: cosign sign --yes "${REGISTRY}/${OPERATOR_IMAGE_NAME}@${{ steps.operator_manifest.outputs.digest }}"
       - name: Attest operator image provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }}
           subject-digest: ${{ steps.operator_manifest.outputs.digest }}
           push-to-registry: true
       - name: Attest operator image SBOM
-        uses: actions/attest-sbom@10926c72720ffc3f7b666661c8e55b1344e2a365 # v2
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPERATOR_IMAGE_NAME }}
           subject-digest: ${{ steps.operator_manifest.outputs.digest }}

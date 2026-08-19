@@ -29,7 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # 8 seeds ≈ 8 full spawn/kill/restart schedules (serialized by design).
       - name: cluster_proc sweep
         run: MQTTD_PROC_SEEDS=8 MQTTD_PROC_HISTORY_DIR=$PWD/target/proc-histories cargo test -p mqttd --test cluster_proc -- --nocapture
@@ -54,7 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The ADR 0042 soak profile: widen the seeded fault schedules.
       - name: cluster_stress sweep
         run: MQTTD_STRESS_SEEDS=8 cargo test -p mqttd --test cluster_stress -- --nocapture
@@ -70,7 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: rolling upgrade + rollback (ADR 0044 P3)
         run: cargo test -p mqttd --test cluster_upgrade -- --ignored --nocapture
 
@@ -83,7 +83,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: soak (RSS / FD / p99 drift)
         run: MQTTD_SOAK_SECS=3600 cargo test -p mqttd --test cluster_soak -- --ignored --nocapture
 
@@ -96,7 +96,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Print current criterion numbers for comparison against
       # docs/benchmarks/BASELINE.md. A meaningful shift is investigated and the
       # baseline updated with the commit that moved it (the per-PR perf_gate
@@ -142,7 +142,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # 12 minutes per target. The first corpus dir (gitignored, ephemeral in
@@ -172,13 +172,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install helm
-        uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: v3.16.3
       - name: Install kind
-        uses: helm/kind-action@0b5c88445f37b7e12a2ce1ecca7805b9046a74db # v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
       # ADR 0047 T5: stand up the chart as a real 3-node cluster in kind, prove it forms, drains
@@ -200,9 +200,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install kind
-        uses: helm/kind-action@0b5c88445f37b7e12a2ce1ecca7805b9046a74db # v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
       # ADR 0055 T7: the runtime proof for the reconciler. Creates a cluster from
@@ -222,7 +222,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install mosquitto clients
         run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
       # ADR 0050 T4 — the acceptance bar: drive the real mqttd binary against a pinned
@@ -267,7 +267,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: the toolchain under test really is ${{ matrix.toolchain }}
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
@@ -302,7 +302,7 @@ jobs:
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install musl C toolchain + mosquitto clients
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools mosquitto-clients
       - name: image smoke (nonroot data dir, restart durability, read-only rootfs)
