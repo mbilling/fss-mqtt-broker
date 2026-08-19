@@ -18,6 +18,12 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 quinn.workspace = true
 
+[features]
+# FIPS 140-3 build variant (ADR 0068): swaps the crypto to the validated
+# AWS-LC module across the whole graph. A variant, not a default: heavier
+# build (cmake + Go), narrower platform matrix.
+fips = ["rustls/fips", "tokio-rustls/fips", "quinn/rustls-aws-lc-rs-fips"]
+
 [dev-dependencies]
 rcgen.workspace = true
 

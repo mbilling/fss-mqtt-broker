@@ -26,6 +26,14 @@ struct VersionLabel {
     version: String,
 }
 
+/// `{module}` label for `crypto_module_info` (ADR 0068): which crypto module
+/// the running binary uses — the metric half of the fips build's runtime
+/// visibility (version line and startup log are the other two).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct CryptoModuleLabel {
+    module: String,
+}
+
 /// `{protocol}` label — a bounded set: `3.1.1` or `5`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ProtocolLabel {
@@ -329,6 +337,7 @@ pub struct Metrics {
     retained_apply_failed_total: Counter,
     retained_queue_dropped_total: Counter,
     audit_export_dropped_total: Counter,
+    crypto_module_info: Family<CryptoModuleLabel, Gauge>,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
     /// (`disk`, `memory`), 0 otherwise. The rejection counters record symptoms; this
     /// gauge is the condition itself — an idle browned-out broker is visible.
@@ -837,6 +846,14 @@ impl Metrics {
 
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
+        let crypto_module_info = Family::<CryptoModuleLabel, Gauge>::default();
+        registry.register(
+            "crypto_module_info",
+            "The crypto module this binary runs (ADR 0068): aws-lc-rs, or the \
+             FIPS-validated module in a fips build — so an auditor verifies the \
+             RUNNING binary, not the artifact's name",
+            crypto_module_info.clone(),
+        );
         build_info
             .get_or_create(&VersionLabel {
                 version: version.to_string(),
@@ -892,6 +909,7 @@ impl Metrics {
             retained_apply_failed_total,
             retained_queue_dropped_total,
             audit_export_dropped_total,
+            crypto_module_info,
             brownout,
             store_max_bytes,
             process_resident_bytes,
@@ -1607,6 +1625,16 @@ impl Metrics {
     pub fn retained_queue_dropped(&self) {
         self.retained_queue_dropped_total.inc();
         self.otel.retained_queue_dropped.add(1, &[]);
+    }
+
+    /// Record which crypto module this binary runs (ADR 0068) — called once at
+    /// startup with `mqtt_net::tls::crypto_module()`'s answer.
+    pub fn set_crypto_module(&self, module: &str) {
+        self.crypto_module_info
+            .get_or_create(&CryptoModuleLabel {
+                module: module.to_string(),
+            })
+            .set(1);
     }
 
     /// One audit record shed by the SIEM exporter's bounded queue (ADR 0066 T3).

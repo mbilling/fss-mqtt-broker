@@ -70,6 +70,29 @@ jobs:
       - name: The tests that ran and passed are the ones the inventory accounts for
         run: python3 scripts/check-test-hygiene.py --check-results test-output.txt --only root
 
+  fips:
+    name: fips variant (compile + posture tests)
+    runs-on: ubuntu-latest
+    # ADR 0068 T3: an untested variant is a liability with a certificate on it.
+    # Per-PR: the whole graph compiles in fips mode and the posture tests run
+    # (provider IS the validated module, non-approved algorithms absent, the
+    # TLS 1.2 opt-in refused). The nightly tier runs protocol suites against
+    # the fips binary. Toolchain: aws-lc-fips-sys needs cmake + Go, both on
+    # the runner image.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; `with:` selects the toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: fips
+      - name: fips graph compiles
+        run: cargo check -p mqttd --features fips --all-targets
+      - name: fips posture tests
+        run: cargo test -p mqtt-net --lib --features fips
+
   docs:
     name: delivery dashboard
     runs-on: ubuntu-latest
@@ -119,7 +142,9 @@ jobs:
         # each time saved only by the job leash). Retries + per-connection
         # timeouts turn a dead mirror into a fast fallback instead of a stall.
         run: |
-          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          # DPkg::Lock::Timeout bounds the OTHER hang mode: apt silently waiting
+          # on the dpkg lock a boot-time unattended-upgrades run still holds.
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=120"
           sudo apt-get $APT update && sudo apt-get $APT install -y mosquitto-clients
       - name: Install Paho
         run: python3 -m pip install --quiet paho-mqtt
@@ -169,7 +194,7 @@ jobs:
       # clients this job already installs; the script exits 2 (not 1) if it is missing.
       - name: Install the mosquitto broker (incumbent stand-in for the cutover smoke)
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y mosquitto
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=120 install -y mosquitto
           sudo systemctl stop mosquitto || true
       - name: Dual-run cutover smoke (mqttd <-> Mosquitto through mqtt-bridge)
         run: |

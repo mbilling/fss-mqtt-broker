@@ -21,6 +21,12 @@ openraft = { version = "0.9.24", features = ["serde"] }
 # On-disk persistence for the lease consensus store (ADR 0018 phase 2).
 redb = "2"
 
+[features]
+# FIPS 140-3 build variant (ADR 0068): swaps the crypto to the validated
+# AWS-LC module across the whole graph. A variant, not a default: heavier
+# build (cmake + Go), narrower platform matrix.
+fips = ["aws-lc-rs/fips"]
+
 [dev-dependencies]
 tempfile = "3"
 criterion = { workspace = true }

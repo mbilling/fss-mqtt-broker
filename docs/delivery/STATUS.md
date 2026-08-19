@@ -75,7 +75,7 @@
 | [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [4/6 done](0065-security-legibility.md) | 2 open |
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Accepted | [3/3 done](0066-threat-model-and-hardening-baseline.md) | — |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
-| [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [0/4 done](0068-fips-cryptographic-option.md) | 4 open |
+| [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [3/4 done](0068-fips-cryptographic-option.md) | 1 open |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [0/7 done](0069-scorecard-remediation.md) | 7 open |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 
@@ -180,10 +180,7 @@
 
 **0068 — A FIPS 140-3 cryptographic option**
 
-- `0068-T1` ⬜ planned: "Spike: workspace `fips` feature building on the supported platforms; record the toolchain and platform-matrix cost"
-- `0068-T2` ⬜ planned: "The fips provider seam: FIPS-mode rustls provider, startup refusal of non-approved config, runtime visibility (version line, log, metric)"
-- `0068-T3` ⬜ planned: "CI lanes: per-PR fips compile; nightly protocol suites against the fips binary"
-- `0068-T4` ⬜ planned: "Release-pipeline fips artifact set (signed, SBOM, provenance) + docs/compliance/crypto-policy.md with the exact validated-module claim"
+- `0068-T4` ⬜ planned: "Release-pipeline fips artifact set (signed, SBOM, provenance) + docs/compliance/crypto-policy.md with the exact validated-module claim" — "HALF DONE (2026-08-19): docs/compliance/crypto-policy.md ships — the exact claim (module validated, product not certified), the approved surface, runtime verification channels, and the honest boundaries including the sharpest one: Argon2id password hashing is NOT FIPS-approved, so strictly-approved deployments authenticate via mTLS/OIDC and leave passwords unconfigured — stated rather than laundered. REMAINING: the release-pipeline artifact set, gated on its own spike — the release targets are musl-static and aws-lc-fips-sys on musl is unproven; the artifact must also pin the exact aws-lc-fips-sys version + CMVP certificate number at build time (the policy doc deliberately quotes no number from memory)."
 
 **0069 — Scorecard remediation: a solution per check, honestly bounded**
 

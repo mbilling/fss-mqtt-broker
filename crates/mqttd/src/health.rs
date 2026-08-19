@@ -418,9 +418,10 @@ impl HealthState {
         let (node_id, cluster) = self.identity.as_ref()?;
         let report = self.readiness().await;
         let mut s = format!(
-            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"founder\":{},\"ready\":{},\"live\":{}",
+            "{{\"node_id\":\"{}\",\"version\":\"{}\",\"crypto\":\"{}\",\"founder\":{},\"ready\":{},\"live\":{}",
             json_escape(node_id),
             env!("CARGO_PKG_VERSION"),
+            mqtt_net::tls::crypto_module(),
             cluster.founder(),
             report.ready,
             report.live,

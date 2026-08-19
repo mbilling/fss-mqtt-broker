@@ -2523,8 +2523,13 @@ def run_the_suite(only: str | None) -> str:
         # the harness prints `running N tests` / `test result:` on stdout, so capturing them
         # separately puts every section header after every result — which reads exactly like
         # every binary having lost its summary. The interleaving IS the data.
+        # `--test-threads=1` for the HARNESS (not the build): the multi-threaded
+        # harness can interleave two tests' report lines MID-LINE, and a mangled
+        # `test <name> ... ok` reads to this parser as a test that never passed
+        # (seen live 2026-08-19: 49/49 green, one ok-line shredded, gate red).
+        # Single-threaded output is deterministic; the runtime cost is seconds.
         out = subprocess.run(
-            ["cargo", "test", *WORKSPACES[which], "--no-fail-fast"],
+            ["cargo", "test", *WORKSPACES[which], "--no-fail-fast", "--", "--test-threads=1"],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
