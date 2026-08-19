@@ -175,8 +175,8 @@
 
 **0065 — Security legibility: scorecard, VEX, dependency automation, lifecycle statements**
 
-- `0065-T5` ⬜ planned: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI"
-- `0065-T6` ⬜ planned: "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run."
+- `0065-T5` ⬜ planned: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI" — "HALF DONE (2026-08-19, delivered as 0069-T2): CodeQL for Rust runs on every PR, main push, and a weekly cron (.github/workflows/codeql.yml), findings in code scanning. REMAINING: OSS-Fuzz onboarding — an application PR to google/oss-fuzz (project.yaml + build.sh wrapping the six cargo-fuzz targets) plus a maintainer contact email; an external act with upstream review, not a repo commit."
+- `0065-T6` ⬜ planned: "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run. Precondition now met (v1.0.0 shipped 2026-08-19); the remaining act is the maintainer's funding/commissioning decision (OSTIF-style), with the audit surface documents ready: THREAT-MODEL, HARDENING, AUDIT-SCHEMA, crypto-policy, the compliance mappings."
 
 **0068 — A FIPS 140-3 cryptographic option**
 
