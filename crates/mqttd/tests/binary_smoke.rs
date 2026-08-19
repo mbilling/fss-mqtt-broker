@@ -397,3 +397,83 @@ fn scopeguard(path: std::path::PathBuf) -> impl Drop {
     }
     G(path)
 }
+
+/// ADR 0066 T3: a graceful stop CLOSES the audit chain — the last audit record is
+/// `audit.shutdown`, carrying the closing head. This is what lets a SIEM enforce
+/// "every chain ends with a shutdown record, and every genesis follows one": a
+/// chain that just stops is a crash or a suppression, either worth an alert. The
+/// genesis line at boot is asserted too, so the pair the invariant needs — open
+/// announcement, closing record — is pinned end to end on the real binary.
+#[tokio::test]
+async fn a_graceful_stop_closes_the_audit_chain() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mqttd"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MQTTD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
+        .env("MQTTD_NODE_ID", "audit-close")
+        .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
+        .env("MQTTD_ALLOW_ANONYMOUS", "1")
+        .env("MQTTD_DURABLE_SESSIONS", "0")
+        .env("MQTTD_SHUTDOWN_GRACE", "5")
+        // The tracing subscriber writes to STDOUT; capture that, not stderr.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the mqttd binary");
+    let mut guard = ChildGuard(child);
+    wait_until_listening(addr).await;
+
+    let pid = guard.0.id();
+    let sent = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("spawn kill");
+    assert!(sent.success(), "kill -TERM failed");
+
+    // Bounded wait for the graceful exit (no connections, so the drain is instant).
+    let mut status = None;
+    for _ in 0..100 {
+        if let Some(s) = guard.0.try_wait().expect("try_wait") {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let status = status.expect("mqttd never exited after SIGTERM");
+    assert!(
+        status.success(),
+        "graceful stop must exit 0, got {status:?}"
+    );
+
+    let mut stdout = String::new();
+    guard
+        .0
+        .stdout
+        .take()
+        .expect("stdout piped")
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(
+        stdout.contains("audit chain genesis"),
+        "boot must announce the chain genesis; stdout was:\n{stdout}"
+    );
+    let closing = stdout
+        .lines()
+        .rfind(|l| l.contains("audit.shutdown"))
+        .unwrap_or_else(|| panic!("no audit.shutdown record; stdout was:\n{stdout}"));
+    assert!(
+        closing.contains("drained") && closing.contains("head"),
+        "the closing record must carry the drain outcome and the chain head; got: {closing}"
+    );
+    // The invariant itself: no audit-target record follows the closing one.
+    let after = stdout.split("audit.shutdown").last().unwrap_or("");
+    assert!(
+        !after.contains("audit:") || !after.contains("seq"),
+        "an audit record followed the closing record; tail was: {after}"
+    );
+}

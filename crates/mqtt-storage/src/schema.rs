@@ -1,12 +1,13 @@
 //! Schema-version gate for persistent `redb` stores (ADR 0038 T2).
 //!
-//! Every store opens through [`gate`]: a fresh file is stamped with the store's
-//! current layout version; a matching stamp passes; **any other version refuses to
-//! open** with an error naming found-vs-expected. Pre-1.0 there are no migrations —
-//! the documented recovery for a version bump is wipe-and-rejoin (the durable plane
-//! rebuilds a node's replicated state from its peers) — but the stamp is what makes
-//! post-1.0 migrations writable at all: a future build gets a version to dispatch
-//! on instead of guessing at bytes.
+//! Every store opens through [`gate`] or [`gate_or_migrate`]: a fresh file is
+//! stamped with the store's current layout version; a matching stamp passes; a
+//! **newer** stamp refuses to open naming found-vs-expected; an older stamp is
+//! migrated in place, one committed step per version (ADR 0058 — since the
+//! v1.0.0 freeze, wipe-and-rejoin is over: a schema bump ships its
+//! `MigrationStep` in the same PR or the per-store coverage tests refuse it).
+//! The stamp is what makes that possible at all: a future build gets a version
+//! to dispatch on instead of guessing at bytes.
 //!
 //! **Release rule (ADR 0039)**: store versions bump only in MAJOR releases, and each
 //! major ships migrations from exactly **one** major back — sequential upgrades

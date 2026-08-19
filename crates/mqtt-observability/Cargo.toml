@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The workspace's one crypto provider (ADR 0053): SHA-256 for the audit chain.
+aws-lc-rs = { workspace = true }
 opentelemetry = "0.32.0"
 # OTLP/HTTP export (ADR 0020 T9). Blocking reqwest client: the SDK PeriodicReader pushes
 # from its own dedicated thread (no Tokio reactor), so the async client cannot run there.
