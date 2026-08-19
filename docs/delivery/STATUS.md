@@ -72,6 +72,10 @@
 | [0062](../adr/0062-online-backup-and-restore.md) | Online backup and restore: a per-node export with a stated window | Accepted | [11/11 done](0062-online-backup-and-restore.md) | — |
 | [0063](../adr/0063-external-consumer-integration.md) | External integration without a rule engine: the consumer-group pattern | Accepted | [3/3 done](0063-external-consumer-integration.md) | — |
 | [0064](../adr/0064-hub-module-seams.md) | The hub's module seams | Accepted | [1/1 done](0064-hub-module-seams.md) | — |
+| [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [0/6 done](0065-security-legibility.md) | 6 open |
+| [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Proposed | [0/3 done](0066-threat-model-and-hardening-baseline.md) | 3 open |
+| [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Proposed | [0/4 done](0067-compliance-framework-mappings.md) | 4 open |
+| [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [0/4 done](0068-fips-cryptographic-option.md) | 4 open |
 
 ## Open and deferred work
 
@@ -167,3 +171,32 @@
 **0060 — Bridge durability and acknowledgement contract**
 
 - `0060-T8` ⬜ planned: "Fast path waits for the downstream PUBACK: correlate the destination's pkid back to the source obligation, closing the dispatch->ack window (ADR 0060 §5.1-5.2)"
+
+**0065 — Security legibility: scorecard, VEX, dependency automation, lifecycle statements**
+
+- `0065-T1` ⬜ planned: "OpenSSF Scorecard action + badge; remediate what it flags (pinned digests, token permissions)"
+- `0065-T2` ⬜ planned: "Dependency-update automation (Renovate or Dependabot) over crates, actions, and Python tooling, grouped and gated"
+- `0065-T3` ⬜ planned: "OpenVEX per release, emitted by the pipeline beside the SBOMs, with an evidence rule for every 'not affected'"
+- `0065-T4` ⬜ planned: "SUPPORT.md — the ADR 0039 lifecycle as a dated table — plus the export-control (ECCN) statement"
+- `0065-T5` ⬜ planned: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI"
+- `0065-T6` ⬜ planned: "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run."
+
+**0066 — Threat model, hardening baseline, and SIEM-consumable audit**
+
+- `0066-T1` ⬜ planned: "docs/THREAT-MODEL.md — STRIDE over the five surfaces, every row naming its mechanism + ADR or its accepted risk; kept current by the frozen-surface checklist"
+- `0066-T2` ⬜ planned: "docs/HARDENING.md — numbered, levelled baseline items, each with knob, default, and verification command"
+- `0066-T3` ⬜ planned: "Audit-log SIEM export (RFC 5424 syslog and/or OTLP), documented schema, honest integrity story" — "The one product change in the record; the export is a copy of the ADR 0004 tamper-evident stream, never its replacement."
+
+**0067 — Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001**
+
+- `0067-T1` ⬜ planned: "docs/compliance/iec-62443.md — 4-1 SDL mapping + 4-2 component-requirement mapping with achievable security levels and honest gaps"
+- `0067-T2` ⬜ planned: "docs/compliance/eu-cra.md — Annex I essential-requirements checklist against shipped facts + the reporting-duty runbook" — "Time-sensitive: the CRA's actively-exploited-vulnerability reporting duty applies from September 2026; full obligations December 2027."
+- `0067-T3` ⬜ planned: "docs/compliance/soc2-iso27001.md — feature → control → pullable-evidence map for customer assessments"
+- `0067-T4` ⬜ planned: "The mappings join the release checklist: 'verified against' headers re-stamped per release, drift treated as a doc bug"
+
+**0068 — A FIPS 140-3 cryptographic option**
+
+- `0068-T1` ⬜ planned: "Spike: workspace `fips` feature building on the supported platforms; record the toolchain and platform-matrix cost"
+- `0068-T2` ⬜ planned: "The fips provider seam: FIPS-mode rustls provider, startup refusal of non-approved config, runtime visibility (version line, log, metric)"
+- `0068-T3` ⬜ planned: "CI lanes: per-PR fips compile; nightly protocol suites against the fips binary"
+- `0068-T4` ⬜ planned: "Release-pipeline fips artifact set (signed, SBOM, provenance) + docs/compliance/crypto-policy.md with the exact validated-module claim"
