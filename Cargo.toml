@@ -64,7 +64,7 @@ serde = { version = "1", features = ["derive"] }
 # become the SECOND provider after the OTLP/reqwest chain pulled aws-lc-rs in anyway.
 aws-lc-rs = "1"
 # X.509 parsing for mTLS identity extraction (ADR 0004)
-x509-parser = "0.16"
+x509-parser = "0.18"
 # ACL policy files (ADR 0004 step 3)
 toml = "0.8"
 # Collects the PATHS of config keys the strict structs do not know (issue #230 /
