@@ -74,7 +74,7 @@
 | [0064](../adr/0064-hub-module-seams.md) | The hub's module seams | Accepted | [1/1 done](0064-hub-module-seams.md) | — |
 | [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [4/6 done](0065-security-legibility.md) | 2 open |
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Accepted | [3/3 done](0066-threat-model-and-hardening-baseline.md) | — |
-| [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Proposed | [0/4 done](0067-compliance-framework-mappings.md) | 4 open |
+| [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [3/4 done](0068-fips-cryptographic-option.md) | 1 open |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [0/7 done](0069-scorecard-remediation.md) | 7 open |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
@@ -177,13 +177,6 @@
 
 - `0065-T5` ⬜ planned: "OSS-Fuzz onboarding for the six fuzz targets; CodeQL beside clippy in CI"
 - `0065-T6` ⬜ planned: "Funded third-party security audit, findings published in-repo with their fixes" — "Sequenced last deliberately: an audit of the 1.0 line after the freeze (ADR 0058) audits the surface enterprises will actually run."
-
-**0067 — Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001**
-
-- `0067-T1` ⬜ planned: "docs/compliance/iec-62443.md — 4-1 SDL mapping + 4-2 component-requirement mapping with achievable security levels and honest gaps"
-- `0067-T2` ⬜ planned: "docs/compliance/eu-cra.md — Annex I essential-requirements checklist against shipped facts + the reporting-duty runbook" — "Time-sensitive: the CRA's actively-exploited-vulnerability reporting duty applies from September 2026; full obligations December 2027."
-- `0067-T3` ⬜ planned: "docs/compliance/soc2-iso27001.md — feature → control → pullable-evidence map for customer assessments"
-- `0067-T4` ⬜ planned: "The mappings join the release checklist: 'verified against' headers re-stamped per release, drift treated as a doc bug"
 
 **0068 — A FIPS 140-3 cryptographic option**
 

@@ -32,6 +32,16 @@ unsupported; `v0.9.1` is the designated upgrade entry into the 1.0 line.)
   supported line, shipped as signed releases with SBOM and SLSA provenance
   ([RELEASING.md](RELEASING.md) documents artifact verification).
 
+## Compliance evidence
+
+For vendor-risk and regulatory reviews, the mapping documents live in
+[`docs/compliance/`](docs/compliance/): [EU CRA readiness](docs/compliance/eu-cra.md)
+(with the Article 14 reporting runbook), [IEC 62443](docs/compliance/iec-62443.md)
+(4-1 SDL and 4-2 component requirements), and the
+[SOC 2 / ISO 27001 evidence map](docs/compliance/soc2-iso27001.md). Each is
+version-stamped and re-verified per release; none claims a certification the
+project does not hold.
+
 ## Export control
 
 mqttd contains cryptographic functionality (TLS 1.3 via rustls/AWS-LC, HMAC-
