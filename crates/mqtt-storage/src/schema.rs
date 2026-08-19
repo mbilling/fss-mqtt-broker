@@ -27,9 +27,11 @@ const VERSION_KEY: &str = "version";
 pub enum SchemaError {
     /// The on-disk layout differs from what this build reads and writes.
     #[error(
-        "{store}: on-disk schema is v{found} but this build expects v{expected}; no \
-         migration path exists pre-1.0 — wipe the store and let the node rejoin \
-         (the durable plane rebuilds replicated state from peers)"
+        "{store}: on-disk schema is v{found} but this build expects v{expected}; \
+         a NEWER stamp means an older binary must never touch this store — run the \
+         build that wrote it (or newer); an OLDER stamp with no migration step means \
+         upgrading through the intermediate release first (sequential majors, \
+         ADR 0039/0058). Do not wipe the store."
     )]
     Mismatch {
         /// The store being opened (its conventional file name).
