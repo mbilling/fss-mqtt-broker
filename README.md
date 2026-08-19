@@ -561,7 +561,7 @@ README's own cluster commands. Security reporting is in [SECURITY.md](SECURITY.m
 
 The full, versioned, honesty-ruled matrix against **Mosquitto**, **EMQX**, **NanoMQ**,
 and **VerneMQ** — including every cell we lose — is
-[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-18). The one-paragraph
+[`docs/COMPARISON.md`](docs/COMPARISON.md) (dated 2026-08-19). The one-paragraph
 version:
 
 |  | mqttd's answer |
@@ -649,8 +649,8 @@ be found. Each is tracked; none is a silent surprise.
 - **The Kubernetes operator is young.** It is packaged
   (ADR 0055 T8, issue #252): an install chart (`deploy/helm/mqttd-operator`,
   CRD included) and an operator image cut by the same signed/reproducible/SBOM
-  release pipeline as the broker — first published at `v0.9.1`, the tag the
-  chart pins.
+  release pipeline as the broker — first published at `v0.9.1`, riding the
+  release train (the chart pins the current release).
   The **Helm chart remains the fully-supported no-operator path**; the
   `MqttdCluster` CRD is `v1alpha1`, schema-pinned in CI against the operator's
   own types, and — per the Kubernetes alpha-API convention — may change until

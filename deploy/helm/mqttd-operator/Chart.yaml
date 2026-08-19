@@ -10,15 +10,13 @@ type: application
 # Chart version — bumped on chart changes. appVersion tracks the operator image
 # tag, which is cut by the SAME release pipeline as the broker (one version train).
 #
-# FORWARD PIN (issue #252, same discipline as the compose default image, #263):
-# v0.9.1 does not exist yet — no operator image was ever published before it, so
-# there is no older tag this chart COULD pin. scripts/check-deploy-image-pin.sh
-# gates that this appVersion equals the compose pin (one forward tag for the whole
-# repo) and that the pin stays an exact vX.Y.Z; pushing the v0.9.1 release tag
-# publishes ghcr.io/mbilling/fss-mqtt-broker-operator:0.9.1 (signed, SBOM'd,
-# reproducible) and makes this chart installable as-is.
+# PINNED RELEASE (issue #252, same discipline as the compose default image, #263):
+# the operator image first published at v0.9.1 and rides the broker's release
+# train; this appVersion names a published, signed, SBOM'd tag.
+# scripts/check-deploy-image-pin.sh gates that it equals the compose pin (one
+# tag for the whole repo) and stays an exact X.Y.Z — never a floating name.
 version: 0.1.0
-appVersion: "0.9.1"
+appVersion: "1.0.0"
 home: https://github.com/mbilling/fss-mqtt-broker
 sources:
   - https://github.com/mbilling/fss-mqtt-broker

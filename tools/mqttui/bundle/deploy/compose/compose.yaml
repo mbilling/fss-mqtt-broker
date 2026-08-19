@@ -45,7 +45,7 @@ x-broker: &broker
   # gate scripts/check-deploy-image-pin.sh enforces both properties, and the nightly
   # default-image lane runs this file against the tag as published. When you change the
   # pin here, change bootstrap.sh's to match (the gate holds them together).
-  image: ${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:0.9.1}
+  image: ${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:1.0.0}
   restart: unless-stopped
   # The image is distroless and already runs as uid 65532; this is belt-and-braces
   # for hosts whose daemon is configured otherwise.

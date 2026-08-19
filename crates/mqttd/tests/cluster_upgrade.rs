@@ -36,18 +36,20 @@ use proc_common::{
     build_topology, establish_subscribers, oracle_acked_facts, proc_over, wait_all_ready,
 };
 
-/// The pinned baseline: the **`v0.9.1` release commit** — the previous release,
+/// The pinned baseline: the **`v1.0.0` release commit** — the previous release,
 /// as ADR 0039's skew policy demands from 1.0 on (0058-T3/T5). The roll this
 /// test proves is exactly the one an operator performs: previous release ↔ the
 /// 1.0 line, both directions, under acked load. From here the ref advances only
 /// with each release cut (RELEASING.md): the previous minor within a major, the
 /// previous major's gateway minor across a boundary — never bumped to absorb a
 /// reshape, because the reshape-in-place motion closed at the freeze.
+/// Previous baseline: the `v0.9.1` release commit (`0f7042c2…`), which proved
+/// the roll INTO the 1.0 line before the freeze tag was cut.
 /// Pre-1.0 history (kept as the process scar it is): the baseline was a
 /// hand-bumped commit pin — last `c6b84f23…` (the issue #227/#232 retained-expiry
 /// reshape, which landed WITHOUT its bump and broke the next oracle run), before
 /// that `e39b6e13…` (the issue #92 SWIM generation reshape).
-const BASELINE_REF: &str = "0f7042c2d6baa4c46fb2183627a013f365ecad30";
+const BASELINE_REF: &str = "101554fcabae36cd271570ece037cd7f9764f296";
 
 /// The baseline `mqttd` binary: `MQTTD_BASELINE_BIN` if set (nightly / CI
 /// supplies a prebuilt one), else built from [`BASELINE_REF`] via a git
