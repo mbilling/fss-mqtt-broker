@@ -12,6 +12,10 @@
 #     not with upstream; check-deploy-image-pin.sh gates them.
 #   - the Python interop tooling — no manifest exists (CI installs paho inline);
 #     if scripts/ ever grows a requirements.txt, add a pip ecosystem entry.
+# Groups carry MINOR + PATCH only. A semver-major arrives as its own PR, alone,
+# because a major is an API/behaviour change someone must actually read — the
+# first weekly sweep proved it by burying redb 2->4 (the storage engine!) and a
+# toml major among 19 routine bumps, breaking three jobs at once.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -20,8 +24,17 @@ updates:
       interval: weekly
       day: monday
     groups:
-      rust-dependencies:
+      rust-minor-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # The storage engine's container format is part of the ADR 0039/0058
+      # compatibility contract: a rolling upgrade must reopen stores in BOTH
+      # directions, so a redb MAJOR is a broker-MAJOR act (format-compat
+      # analysis, migration, BASELINE_REF story) taken deliberately in its own
+      # ADR-backed PR — never by sweep. Minors/patches within the major flow.
+      - dependency-name: redb
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: cargo
@@ -30,9 +43,10 @@ updates:
       interval: weekly
       day: monday
     groups:
-      mqttui-dependencies:
+      mqttui-minor-patch:
         patterns: ["*"]
-    open-pull-requests-limit: 2
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 3
 
   - package-ecosystem: github-actions
     directory: /
@@ -40,6 +54,7 @@ updates:
       interval: weekly
       day: monday
     groups:
-      actions:
+      actions-minor-patch:
         patterns: ["*"]
-    open-pull-requests-limit: 2
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 3
