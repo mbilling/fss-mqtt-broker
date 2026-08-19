@@ -257,6 +257,15 @@ jobs:
         with:
           toolchain: stable
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # The action's default cosign moved to the bundle-by-default line
+          # (v3+/v4), which errors on our --output-signature/--output-certificate
+          # invocation ('create bundle file: open : no such file or directory').
+          # The .sig/.pem artifact format is a PUBLISHED contract (RELEASING.md's
+          # verify one-liners), so the cosign RELEASE pins to the v2 line the
+          # green pipeline always used; migrating to sigstore bundles is its own
+          # deliberate change to pipeline + verification docs together.
+          cosign-release: 'v2.6.5'
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
