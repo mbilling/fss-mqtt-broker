@@ -378,7 +378,7 @@ wait_for 240 "the re-founded pod to come back" \
 
 # Containment: PVC quarantined by LABEL, never deleted.
 wait_for 300 "the re-founder's PVC to be quarantined" \
-  bash -c "kubectl -n $NS get pvc data-e2e-0 -o jsonpath='{.metadata.labels.mqttd\\.io/quarantined}' | grep -q true"
+  bash -c "kubectl -n $NS get pvc data-e2e-0 -o go-template='{{index .metadata.labels \"mqttd.io/quarantined\"}}' | grep -q true"
 kubectl -n "$NS" get pvc data-e2e-0 >/dev/null || fail "the PVC was DELETED — data must never be destroyed"
 
 # And the verdict holds: the fence fires ONCE, so the incident stays visible instead of

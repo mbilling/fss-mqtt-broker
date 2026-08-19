@@ -16,12 +16,17 @@ on:
   push:
     branches: [main]
 
+# Least privilege at top level (OpenSSF Scorecard token-permissions, ADR 0069
+# T1); the writes this workflow genuinely needs are granted on the one job
+# that performs them.
 permissions:
-  contents: write # create/update the rolling release
-  id-token: write # keyless cosign signing via GitHub OIDC
+  contents: read
 
 jobs:
   publish:
+    permissions:
+      contents: write # create/update the rolling release
+      id-token: write # keyless cosign signing via GitHub OIDC
     name: sign + publish the rolling examples bundle
     runs-on: ubuntu-latest
     steps:

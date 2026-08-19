@@ -76,7 +76,7 @@
 | [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Accepted | [3/3 done](0066-threat-model-and-hardening-baseline.md) | — |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Accepted | [4/4 done](0067-compliance-framework-mappings.md) | — |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [3/4 done](0068-fips-cryptographic-option.md) | 1 open |
-| [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [0/7 done](0069-scorecard-remediation.md) | 7 open |
+| [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [5/7 done](0069-scorecard-remediation.md) | 2 open |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 
 ## Open and deferred work
@@ -184,11 +184,6 @@
 
 **0069 — Scorecard remediation: a solution per check, honestly bounded**
 
-- `0069-T1` ⬜ planned: "Token-Permissions: top-level read everywhere, write only at job level where the act needs it"
-- `0069-T2` ⬜ planned: "CodeQL on pull requests (the SAST check; the analysis half of 0065-T5)"
-- `0069-T3` ⬜ planned: "Vulnerabilities: rkyv edge trimmed or dispositioned; jsonwebtoken false positive recorded in the VEX" — "jsonwebtoken GHSA-h395-gr6q-cpjc: affected range ends 10.3.0, shipped 11.0.0 — a scanner false positive the VEX exists to silence. rkyv 0.7 arrives via byte-unit -> rust_decimal; no rkyv archive is ever deserialized."
-- `0069-T4` ⬜ planned: "Pinned-Dependencies: digest-pin distroless bases in every Dockerfile; fix the operator-e2e.sh quote that breaks the checker's parser"
-- `0069-T5` ⬜ planned: "Security-Policy: SECURITY.md gains the advisory-form, advisories-page, and timeline links"
 - `0069-T6` ⬜ planned: "Maintainer: main-branch ruleset (require PR + status checks, no force-push/deletion), solo-compatible"
 - `0069-T7` ⬜ planned: "Maintainer: bestpractices.dev registration and passing-level self-certification"
 

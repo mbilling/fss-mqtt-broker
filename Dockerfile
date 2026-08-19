@@ -17,7 +17,9 @@
 # Build (from repo root, after staging the binary):
 #   cp target/<musl-triple>/release/mqttd dist/mqttd
 #   docker build -t mqttd:dev .
-FROM gcr.io/distroless/static-debian12:nonroot
+# Digest-pinned (ADR 0069 T4): the tag names the intent, the digest IS the
+# base — a mutated tag upstream cannot silently change what we ship.
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
 
 # OCI metadata — the source of truth for provenance readers. `revision`/`version`
 # are filled by the release pipeline via --build-arg.
