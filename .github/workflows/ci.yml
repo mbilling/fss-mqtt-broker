@@ -142,7 +142,9 @@ jobs:
         # each time saved only by the job leash). Retries + per-connection
         # timeouts turn a dead mirror into a fast fallback instead of a stall.
         run: |
-          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          # DPkg::Lock::Timeout bounds the OTHER hang mode: apt silently waiting
+          # on the dpkg lock a boot-time unattended-upgrades run still holds.
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=120"
           sudo apt-get $APT update && sudo apt-get $APT install -y mosquitto-clients
       - name: Install Paho
         run: python3 -m pip install --quiet paho-mqtt
@@ -192,7 +194,7 @@ jobs:
       # clients this job already installs; the script exits 2 (not 1) if it is missing.
       - name: Install the mosquitto broker (incumbent stand-in for the cutover smoke)
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y mosquitto
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o DPkg::Lock::Timeout=120 install -y mosquitto
           sudo systemctl stop mosquitto || true
       - name: Dual-run cutover smoke (mqttd <-> Mosquitto through mqtt-bridge)
         run: |
