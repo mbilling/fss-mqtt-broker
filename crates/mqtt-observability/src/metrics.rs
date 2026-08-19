@@ -1735,9 +1735,21 @@ mod tests {
             out.contains("mqttd_build_info{version=\"1.2.3\"} 1"),
             "build_info missing:\n{out}"
         );
-        // Registered metrics carry their HELP/TYPE lines (the `_total` counter suffix is
-        // added to the sample line, not the metric family name).
+        // Plain (unlabelled) metrics carry their HELP/TYPE lines from boot.
         assert!(out.contains("# TYPE mqttd_connections_active gauge"));
+        // prometheus-client 0.25: a label FAMILY with no observed series is omitted
+        // entirely — no HELP/TYPE until the first observation. Operators scraping a
+        // fresh broker will not see e.g. publish_received before the first PUBLISH;
+        // dashboards must treat the series as absent-until-first-event.
+        assert!(
+            !out.contains("mqttd_publish_received"),
+            "an unobserved family rendered — upstream reverted the empty-family \
+             omission, revisit this pin:\n{out}"
+        );
+        // Once a series exists, the family renders fully (the `_total` counter
+        // suffix is added to the sample line, not the metric family name).
+        m.publish_received(1);
+        let out = m.render();
         assert!(out.contains("# HELP mqttd_publish_received "));
         assert!(out.contains("# TYPE mqttd_publish_received counter"));
         // The OpenMetrics exposition terminates with the EOF marker.
