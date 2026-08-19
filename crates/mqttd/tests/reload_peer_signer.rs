@@ -66,7 +66,7 @@ impl GossipVerify for CapturingCaVerifier {
 }
 
 /// Mint a throwaway cluster CA and return `(dir, ca_der)`.
-fn mint_ca(tag: &str) -> (PathBuf, rcgen::Certificate, rcgen::KeyPair) {
+fn mint_ca(tag: &str) -> (PathBuf, rcgen::CertifiedIssuer<'static, rcgen::KeyPair>) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UNIQUE: AtomicU64 = AtomicU64::new(0);
     let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
@@ -77,18 +77,18 @@ fn mint_ca(tag: &str) -> (PathBuf, rcgen::Certificate, rcgen::KeyPair) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-    (dir, ca_cert, ca_key)
+    let ca_cert = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+    (dir, ca_cert)
 }
 
 /// Mint a CA-signed leaf for CN `cn`, returning `(cert_pem, key_pem)`.
-fn mint_leaf(ca_cert: &rcgen::Certificate, ca_key: &rcgen::KeyPair, cn: &str) -> (String, String) {
+fn mint_leaf(ca: &rcgen::CertifiedIssuer<'static, rcgen::KeyPair>, cn: &str) -> (String, String) {
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
-    let leaf = params.signed_by(&leaf_key, ca_cert, ca_key).unwrap();
+    let leaf = params.signed_by(&leaf_key, ca).unwrap();
     (leaf.pem(), leaf_key.serialize_pem())
 }
 
@@ -119,11 +119,11 @@ fn ok_policy() -> reload::BuildResult {
 /// reload, keeping the running signer, and is retried until the write settles.
 #[test]
 fn a_leaf_rotated_on_disk_is_signing_gossip_within_one_watch_tick() {
-    let (dir, ca_cert, ca_key) = mint_ca("hot");
+    let (dir, ca_cert) = mint_ca("hot");
     let ca_der = ca_cert.der().to_vec();
     let cert_path = dir.join("node.crt");
     let key_path = dir.join("node.key");
-    let (old_cert_pem, old_key_pem) = mint_leaf(&ca_cert, &ca_key, "node-a");
+    let (old_cert_pem, old_key_pem) = mint_leaf(&ca_cert, "node-a");
     std::fs::write(&cert_path, &old_cert_pem).unwrap();
     std::fs::write(&key_path, &old_key_pem).unwrap();
 
@@ -168,7 +168,7 @@ fn a_leaf_rotated_on_disk_is_signing_gossip_within_one_watch_tick() {
     );
 
     // Rotate on disk (what cert-manager / a re-mounted Secret does), then one watch tick.
-    let (new_cert_pem, new_key_pem) = mint_leaf(&ca_cert, &ca_key, "node-a");
+    let (new_cert_pem, new_key_pem) = mint_leaf(&ca_cert, "node-a");
     std::fs::write(&cert_path, &new_cert_pem).unwrap();
     std::fs::write(&key_path, &new_key_pem).unwrap();
     let new_der = mqtt_net::tls::first_cert_der(&cert_path).unwrap();

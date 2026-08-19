@@ -44,7 +44,7 @@ struct Pki {
 /// in this file — plain TLS, mTLS, CRL revocation, resumption, the 1.2 opt-in — runs
 /// ECDSA P-256 certificates end to end in CI. That is the documented, CI-tested curve;
 /// RSA ≥ 2048 is also accepted by the verifier (webpki).
-fn mint_pki(tag: &str) -> (Pki, rcgen::Certificate, rcgen::KeyPair) {
+fn mint_pki(tag: &str) -> (Pki, rcgen::CertifiedIssuer<'static, rcgen::KeyPair>) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UNIQUE: AtomicU64 = AtomicU64::new(0);
     let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
@@ -54,7 +54,7 @@ fn mint_pki(tag: &str) -> (Pki, rcgen::Certificate, rcgen::KeyPair) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_cert = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let mut leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
@@ -62,7 +62,7 @@ fn mint_pki(tag: &str) -> (Pki, rcgen::Certificate, rcgen::KeyPair) {
         rcgen::ExtendedKeyUsagePurpose::ServerAuth,
         rcgen::ExtendedKeyUsagePurpose::ClientAuth,
     ];
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert).unwrap();
 
     let pki = Pki {
         ca: dir.join("ca.pem"),
@@ -72,7 +72,7 @@ fn mint_pki(tag: &str) -> (Pki, rcgen::Certificate, rcgen::KeyPair) {
     std::fs::write(&pki.ca, ca_cert.pem()).unwrap();
     std::fs::write(&pki.cert, leaf_cert.pem()).unwrap();
     std::fs::write(&pki.key, leaf_key.serialize_pem()).unwrap();
-    (pki, ca_cert, ca_key)
+    (pki, ca_cert)
 }
 
 /// A test-side TLS connector trusting `ca`, optionally presenting a client cert.
@@ -233,7 +233,7 @@ async fn tls_connect(
 
 #[tokio::test]
 async fn tls_pubsub_roundtrip() {
-    let (pki, _, _) = mint_pki("roundtrip");
+    let (pki, _) = mint_pki("roundtrip");
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, None).unwrap();
     let addr = start_tls_node(acceptor).await;
     let connector = test_connector(&pki.ca, None);
@@ -254,7 +254,7 @@ async fn tls_pubsub_roundtrip() {
 
 #[tokio::test]
 async fn mtls_listener_rejects_clients_without_certificates() {
-    let (pki, _, _) = mint_pki("mtls");
+    let (pki, _) = mint_pki("mtls");
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, Some(&pki.ca)).unwrap();
     let addr = start_tls_node(acceptor).await;
 
@@ -295,7 +295,7 @@ async fn mtls_listener_rejects_clients_without_certificates() {
 
 #[tokio::test]
 async fn plaintext_client_on_tls_port_is_rejected() {
-    let (pki, _, _) = mint_pki("plaintext-reject");
+    let (pki, _) = mint_pki("plaintext-reject");
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, None).unwrap();
     let addr = start_tls_node(acceptor).await;
 
@@ -333,8 +333,7 @@ async fn plaintext_client_on_tls_port_is_rejected() {
 /// (ADR 0004 step 5) requires each node's certificate CN to equal its node id.
 fn node_peer_tls(
     ca_pem: &Path,
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    ca: &rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     node_id: &str,
 ) -> PeerTls {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -353,7 +352,7 @@ fn node_peer_tls(
         rcgen::ExtendedKeyUsagePurpose::ServerAuth,
         rcgen::ExtendedKeyUsagePurpose::ClientAuth,
     ];
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key, ca).unwrap();
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.pem()).unwrap();
@@ -376,9 +375,9 @@ fn node_peer_tls(
 /// Two-node cluster whose peer links run mutual TLS; returns client addresses
 /// and node B's peer-listener address (for the rejection test).
 async fn start_mtls_cluster() -> (SocketAddr, SocketAddr, SocketAddr) {
-    let (pki, ca_cert, ca_key) = mint_pki("cluster");
-    let tls_a = node_peer_tls(&pki.ca, &ca_cert, &ca_key, "mtls-a");
-    let tls_b = node_peer_tls(&pki.ca, &ca_cert, &ca_key, "mtls-b");
+    let (pki, ca_cert) = mint_pki("cluster");
+    let tls_a = node_peer_tls(&pki.ca, &ca_cert, "mtls-a");
+    let tls_b = node_peer_tls(&pki.ca, &ca_cert, "mtls-b");
 
     let peer_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -550,8 +549,7 @@ async fn start_identity_node(
 
 /// Mint a client leaf signed by the test CA with an explicit Common Name.
 fn mint_client_cert(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    ca: &rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     cn: &str,
     dir_tag: &str,
 ) -> (PathBuf, PathBuf) {
@@ -564,7 +562,7 @@ fn mint_client_cert(
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key, ca).unwrap();
     let cert_path = dir.join("client-cert.pem");
     let key_path = dir.join("client-key.pem");
     std::fs::write(&cert_path, cert.pem()).unwrap();
@@ -577,8 +575,8 @@ fn mint_client_cert(
 /// full pub/sub session works over the same connection pair.
 #[tokio::test]
 async fn mtls_common_name_identity_is_admitted_under_deny_anonymous() {
-    let (pki, ca_cert, ca_key) = mint_pki("cn-identity");
-    let (client_cert, client_key) = mint_client_cert(&ca_cert, &ca_key, "device-7", "admit");
+    let (pki, ca_cert) = mint_pki("cn-identity");
+    let (client_cert, client_key) = mint_client_cert(&ca_cert, "device-7", "admit");
     let addr = start_identity_node(
         &pki,
         mqtt_auth::mtls::IdentitySource::default(),
@@ -601,8 +599,7 @@ async fn mtls_common_name_identity_is_admitted_under_deny_anonymous() {
 /// Mint a client leaf whose CN and dNSName SAN deliberately **disagree**, so a test can
 /// tell which field the broker actually read (ADR 0004 T11).
 fn mint_client_cert_with_san(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    ca: &rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     cn: &str,
     san: Option<&str>,
     dir_tag: &str,
@@ -620,7 +617,7 @@ fn mint_client_cert_with_san(
             vec![rcgen::SanType::DnsName(san.to_string().try_into().unwrap())];
     }
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key, ca).unwrap();
     let cert_path = dir.join("client-cert.pem");
     let key_path = dir.join("client-key.pem");
     std::fs::write(&cert_path, cert.pem()).unwrap();
@@ -651,10 +648,9 @@ fn acl_scoped_to(subject: &str) -> Arc<dyn mqtt_auth::Authorizer> {
 /// through, which it could not do if the broker had read the (deliberately different) CN.
 #[tokio::test]
 async fn a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn() {
-    let (pki, ca_cert, ca_key) = mint_pki("san-identity");
+    let (pki, ca_cert) = mint_pki("san-identity");
     let (client_cert, client_key) = mint_client_cert_with_san(
         &ca_cert,
-        &ca_key,
         "cn-that-must-not-be-used",
         Some("device-7.fleet.example"),
         "admit",
@@ -684,10 +680,9 @@ async fn a_san_configured_listener_derives_the_identity_from_the_san_not_the_cn(
 /// The CONNECT is refused with 0x05, exactly as for a client presenting no certificate.
 #[tokio::test]
 async fn a_san_configured_listener_refuses_a_cn_only_certificate() {
-    let (pki, ca_cert, ca_key) = mint_pki("san-no-fallback");
+    let (pki, ca_cert) = mint_pki("san-no-fallback");
     let (client_cert, client_key) = mint_client_cert_with_san(
         &ca_cert,
-        &ca_key,
         "device-7.fleet.example", // the very name the ACL grants — but in the wrong field
         None,
         "refuse",
@@ -734,7 +729,7 @@ async fn a_san_configured_listener_refuses_a_cn_only_certificate() {
 /// listener (no client CA, so no identity) refuses the CONNECT with 0x05.
 #[tokio::test]
 async fn tls_without_client_cert_is_not_authorized_under_deny_anonymous() {
-    let (pki, _, _) = mint_pki("cn-deny");
+    let (pki, _) = mint_pki("cn-deny");
     // Server-only TLS: handshake succeeds, but no identity is available.
     let acceptor = mqtt_net::tls::server_acceptor(&pki.cert, &pki.key, None).unwrap();
     let (hub, hub_tx) = Hub::with_config(
@@ -830,14 +825,13 @@ fn client_leaf(
     dir: &Path,
     name: &str,
     serial: u64,
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    ca: &rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 ) -> (PathBuf, PathBuf) {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params.serial_number = Some(rcgen::SerialNumber::from(serial));
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key, ca).unwrap();
     let cert_path = dir.join(format!("{name}.pem"));
     let key_path = dir.join(format!("{name}.key"));
     std::fs::write(&cert_path, cert.pem()).unwrap();
@@ -860,7 +854,7 @@ fn mint_crl_pki(tag: &str) -> CrlPki {
         rcgen::KeyUsagePurpose::KeyCertSign,
         rcgen::KeyUsagePurpose::CrlSign,
     ];
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_cert = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
     let ca_path = dir.join("ca.pem");
     std::fs::write(&ca_path, ca_cert.pem()).unwrap();
 
@@ -868,7 +862,7 @@ fn mint_crl_pki(tag: &str) -> CrlPki {
     let server_key = rcgen::KeyPair::generate().unwrap();
     let mut sp = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     sp.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-    let server_cert = sp.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+    let server_cert = sp.signed_by(&server_key, &ca_cert).unwrap();
     let server_cert_path = dir.join("server.pem");
     let server_key_path = dir.join("server.key");
     std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
@@ -876,9 +870,8 @@ fn mint_crl_pki(tag: &str) -> CrlPki {
 
     // Two client leaves with distinct serials; the CRL revokes the first.
     let revoked_serial = 0x1001;
-    let (revoked_cert, revoked_key) =
-        client_leaf(&dir, "revoked", revoked_serial, &ca_cert, &ca_key);
-    let (valid_cert, valid_key) = client_leaf(&dir, "valid", 0x1002, &ca_cert, &ca_key);
+    let (revoked_cert, revoked_key) = client_leaf(&dir, "revoked", revoked_serial, &ca_cert);
+    let (valid_cert, valid_key) = client_leaf(&dir, "valid", 0x1002, &ca_cert);
 
     // CRL listing the revoked serial, signed by the CA. Wide validity window so the test is
     // time-independent (webpki checks list membership, not wall-clock expiry, but keep it sane).
@@ -895,7 +888,7 @@ fn mint_crl_pki(tag: &str) -> CrlPki {
         }],
         key_identifier_method: rcgen::KeyIdMethod::Sha256,
     };
-    let crl = crl_params.signed_by(&ca_cert, &ca_key).unwrap();
+    let crl = crl_params.signed_by(&ca_cert).unwrap();
     let crl_path = dir.join("crl.pem");
     std::fs::write(&crl_path, crl.pem().unwrap()).unwrap();
 
@@ -1143,7 +1136,7 @@ async fn a_crl_reload_evicts_the_live_session_of_a_revoked_cert() {
 /// and the first connection is asserted Full so the check cannot pass vacuously.
 #[tokio::test]
 async fn a_reconnecting_client_resumes_its_tls_session() {
-    let (pki, _ca, _key) = mint_pki("resume");
+    let (pki, _ca) = mint_pki("resume");
     let acceptor =
         mqtt_net::tls::server_acceptor_full(&pki.cert, &pki.key, None, None, 1024).unwrap();
     let addr = start_tls_node(acceptor).await;
@@ -1198,7 +1191,7 @@ async fn a_reconnecting_client_resumes_its_tls_session() {
 /// does what it says for the fleets that need it, on that listener only.
 #[tokio::test]
 async fn tls12_is_refused_by_default_and_admitted_only_by_opt_in() {
-    let (pki, _ca, _key) = mint_pki("tls12");
+    let (pki, _ca) = mint_pki("tls12");
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_file_iter(&pki.ca).unwrap() {
         roots.add(cert.unwrap()).unwrap();
