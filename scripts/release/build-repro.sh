@@ -86,6 +86,7 @@ for pkg in "${PACKAGES[@]}"; do
     export "${CFLAGS_VAR}=${!CFLAGS_VAR:-} ${KERNEL_INC}"
     cargo build --release --locked --target "$TARGET" -p mqttd --features fips \
       --target-dir "${REPO_ROOT}/target/fips-build" >&2
+    mkdir -p "${REPO_ROOT}/target/${TARGET}/release"
     cp "${REPO_ROOT}/target/fips-build/${TARGET}/release/mqttd" \
        "${REPO_ROOT}/target/${TARGET}/release/mqttd-fips"
   elif [ "$pkg" = "mqttui" ]; then
