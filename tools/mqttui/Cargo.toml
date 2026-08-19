@@ -28,7 +28,7 @@ toml = "1.1"
 # T2: the terminal UI. These are the crates ADR 0056 §1 exists to keep out of the broker's
 # dependency graph — they live here, in this workspace's lockfile, and nowhere else.
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 # T7: the demo, Kubernetes and compose examples travel INSIDE the binary — measured at
 # 190 KB compressed for the whole surface, so this costs nothing worth discussing and buys
 # offline operation, version-locking to the binary that was tested with it, and executing
