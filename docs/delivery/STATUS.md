@@ -73,7 +73,7 @@
 | [0063](../adr/0063-external-consumer-integration.md) | External integration without a rule engine: the consumer-group pattern | Accepted | [3/3 done](0063-external-consumer-integration.md) | — |
 | [0064](../adr/0064-hub-module-seams.md) | The hub's module seams | Accepted | [1/1 done](0064-hub-module-seams.md) | — |
 | [0065](../adr/0065-security-legibility.md) | Security legibility: scorecard, VEX, dependency automation, lifecycle statements | Proposed | [4/6 done](0065-security-legibility.md) | 2 open |
-| [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Proposed | [0/3 done](0066-threat-model-and-hardening-baseline.md) | 3 open |
+| [0066](../adr/0066-threat-model-and-hardening-baseline.md) | Threat model, hardening baseline, and SIEM-consumable audit | Proposed | [1/3 done](0066-threat-model-and-hardening-baseline.md) | 2 open |
 | [0067](../adr/0067-compliance-framework-mappings.md) | Compliance framework mappings: IEC 62443, EU CRA, SOC 2 / ISO 27001 | Proposed | [0/4 done](0067-compliance-framework-mappings.md) | 4 open |
 | [0068](../adr/0068-fips-cryptographic-option.md) | A FIPS 140-3 cryptographic option | Proposed | [0/4 done](0068-fips-cryptographic-option.md) | 4 open |
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Proposed | [0/7 done](0069-scorecard-remediation.md) | 7 open |
@@ -179,7 +179,6 @@
 
 **0066 — Threat model, hardening baseline, and SIEM-consumable audit**
 
-- `0066-T1` ⬜ planned: "docs/THREAT-MODEL.md — STRIDE over the five surfaces, every row naming its mechanism + ADR or its accepted risk; kept current by the frozen-surface checklist"
 - `0066-T2` ⬜ planned: "docs/HARDENING.md — numbered, levelled baseline items, each with knob, default, and verification command"
 - `0066-T3` ⬜ planned: "Audit-log SIEM export (RFC 5424 syslog and/or OTLP), documented schema, honest integrity story" — "The one product change in the record; the export is a copy of the ADR 0004 tamper-evident stream, never its replacement."
 
