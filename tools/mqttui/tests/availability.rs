@@ -209,7 +209,8 @@ struct Manifest {
 
 fn read_manifest(root: &Path) -> Manifest {
     let text = std::fs::read_to_string(root.join("tools/mqttui/tasks.toml")).expect("tasks.toml");
-    let value: toml::Value = text.parse().expect("tasks.toml parses");
+    // toml 1.x: `Value: FromStr` parses a single VALUE; a document parses as `Table`.
+    let value: toml::Table = text.parse().expect("tasks.toml parses");
     let tasks = value["task"]
         .as_array()
         .expect("[[task]] array")
