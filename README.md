@@ -104,6 +104,7 @@ dashboard** — operations are signals and files, on purpose
 [Where it stands](#where-it-stands) · [What works today](#what-works-today) ·
 [Security](#security) · [Clustering](#clustering) ·
 [Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
+[Enterprise readiness](#enterprise-readiness) ·
 [**Limitations**](#limitations) · [Install](#install) ·
 [Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
 [Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
@@ -600,6 +601,41 @@ version:
 | Revocation | A policy reload **evicts live sessions and flows** (CRL'd cert, removed user, tightened grant — ADR 0040). Not documented by any compared broker. |
 | Licensing | Apache-2.0 including signed, reproducible binaries. EMQX is BSL 1.1 (clustering commercial) since 5.9; VerneMQ's production binaries are EULA-paid. |
 | Where we lose | No dashboard, rule engine (the replacement — a CI-tested external-consumer pattern — is the blueprint in [docs/INTEGRATION.md](docs/INTEGRATION.md)), HTTP admin API (by design — signal-driven ops), no MQTT-SN/CoAP, and **no production track record**: the matrix says so in as many words. |
+
+## Enterprise readiness
+
+The evaluator's shelf, built as a deliberate program (ADRs 0065–0069) after
+v1.0.0: every artifact below is version-stamped, re-verified per release
+(RELEASING.md's checklist), and honest about what it does not claim.
+
+| Artifact | What it gives you |
+|---|---|
+| [Threat model](docs/THREAT-MODEL.md) | STRIDE over the five trust surfaces; every mitigation cites its ADR and enforcement site, every accepted risk is quoted from the record that accepted it. |
+| [Hardening baseline](docs/HARDENING.md) | 34 checkable L1/L2 items, each with the knob, the shipped default, and a verification an auditor can run — starting with `grep INSECURE:` (the broker announces its own insecure postures). |
+| [Audit trail schema](docs/AUDIT-SCHEMA.md) | The SIEM contract: hash-chained records with boot-boundary alert invariants, and `scripts/audit-verify.py` reproves a captured stream with no secret. |
+| [EU CRA readiness](docs/compliance/eu-cra.md) | Annex I mapped to checkable shipped facts, plus the Article 14 reporting runbook. |
+| [IEC 62443 mapping](docs/compliance/iec-62443.md) | 4-1 SDL practices and 4-2 component requirements with honest SL-C reads — the OT procurement language. |
+| [SOC 2 / ISO 27001 map](docs/compliance/soc2-iso27001.md) | Feature → control → pullable evidence, for the customer's own audit; no certification implied. |
+| [Crypto policy](docs/compliance/crypto-policy.md) | Exactly what each build's cryptography is — including the FIPS variant (`mqttd-fips` release binaries, byte-reproducible, module claim pinned at build time) and the honest Argon2id boundary. |
+| Supply chain, per release | CycloneDX SBOM per binary, [OpenVEX dispositions](security/vex/), SLSA provenance, keyless cosign signatures — verification one-liners in [RELEASING.md](RELEASING.md). |
+| Posture, continuously scored | The OpenSSF Scorecard and Best Practices badges at the top of this file are live results, not decoration: CodeQL and Dependabot run in CI, and `main` is ruleset-protected ([self-certification record](docs/compliance/openssf-best-practices.md)). |
+
+What is deliberately **not** claimed: no certification of any kind is held
+(the mappings accelerate *your* assessment), no third-party audit has run yet
+(funded audit planned — ADR 0065), and the bus-factor/track-record reality is
+stated in the threat model rather than papered over.
+
+### The documents at the repository root
+
+| File | What it is |
+|---|---|
+| [SECURITY.md](SECURITY.md) | How to report a vulnerability privately, what to expect, and how fixes ship — with every security link in one place. |
+| [SUPPORT.md](SUPPORT.md) | The support lifecycle as a dated table (three minor lines, adjacent-skew upgrades) plus the export-control (ECCN) statement for procurement. |
+| [RELEASING.md](RELEASING.md) | What a release contains and the runbook that cuts one — including the one-command verification of signatures, SBOMs, and reproducible builds. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to build and test, the review bar, and the two repo conventions (ADR/delivery discipline) a change is held to. |
+| [CHANGELOG.md](CHANGELOG.md) | Deliberately a pointer: GitHub Releases is the canonical changelog, and this file explains why and where everything else lives. |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | The community standard contributors and maintainers are held to. |
+| [LICENSE](LICENSE) | Apache-2.0 — including the signed release binaries. |
 
 ## Before production — a checklist
 
