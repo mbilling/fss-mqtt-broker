@@ -112,47 +112,40 @@ dashboard** — operations are signals and files, on purpose
 
 ## Where it stands
 
-MQTT **3.1.1 and 5.0** are served — over TCP, TLS 1.3, WebSocket
-(`ws://`/`wss://`), and QUIC. The v5 semantics are in place (session/message
-expiry, topic aliases, flow control, shared subscriptions, User Properties,
-enhanced `AUTH`), not just the wire codec. Transport security
-(TLS 1.3 + mutually-authenticated cluster bus), authenticated gossip membership
-with dynamic cross-node routing, and a full identity/authorization stack
-([mTLS](docs/GLOSSARY.md#security-and-pki)-CN / password /
-[JWT](docs/GLOSSARY.md#security-and-pki) → topic
-[ACLs](docs/GLOSSARY.md#security-and-pki) → tamper-evident audit) are in place.
-**Durable, consensus-backed replicated session storage** (an
-[openraft](https://github.com/databendlabs/openraft) lease group + epoch-fenced
-quorum replication — the [glossary](docs/GLOSSARY.md#mqttd-clustering-and-durability)
-defines lease, epoch and quorum) is **on by default** and proven over a real
-cluster, with **cross-node takeover** (a replica serves a session after its
-owner dies) and **data-safe elastic resize** (grow, shrink, and rolling
-replacement without losing an acknowledged fact). That covers a QoS 1/2 message
-**already in flight to a connected subscriber**, not just one queued for a
-disconnected one — the durable record is written before the packet reaches the
-wire, so a crash in that window redelivers rather than loses it
-([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124)). At QoS 2 the
-packet id and handshake phase are persisted too, so the redelivery resumes
-**under the id the subscriber already knows** — exactly-once holds across a
-broker crash, not only a client reconnect
-([#130](https://github.com/mbilling/fss-mqtt-broker/issues/130)). Prometheus metrics, resource
-governance (connection caps, per-client quotas, publish-rate limits, bounded
-queues), and a continuous-assurance program (out-of-process fault/upgrade
-harness, hour-long soak, fuzzing of every attacker-reachable parser, recorded
-performance baselines, and two independent foreign-client conformance oracles)
-all ship. **v0.9.0 is released** — signed, reproducible,
-[SBOM](docs/GLOSSARY.md#supply-chain)-attested — and the
-known gaps are listed
-in [**Limitations**](#limitations) rather than left to be discovered — the
-largest are that the total-memory watermark is backpressure rather than a hard
-ceiling (the container limit remains the real bound), the Kubernetes operator
-is not packaged for installation, and the horizontal scaling curve has not been
-measured — the durable path's end-to-end throughput and latency now are, on one
-host, with their limits stated
+**v1.0.0 is released** — signed, reproducible, [SBOM](docs/GLOSSARY.md#supply-chain)-attested,
+with the [ADR 0039](docs/adr/0039-versioning-and-upgrade-policy.md) compatibility
+promise in force. In place today:
+
+- **Protocol**: MQTT 3.1.1 + 5.0 over TCP, TLS 1.3, WebSocket, and QUIC — full
+  v5 semantics (session/message expiry, aliases, flow control, shared
+  subscriptions, User Properties, enhanced `AUTH`), not just the wire codec.
+- **Security**: [mTLS](docs/GLOSSARY.md#security-and-pki)-CN / password /
+  [JWT](docs/GLOSSARY.md#security-and-pki)/OIDC identity → deny-by-default topic
+  [ACLs](docs/GLOSSARY.md#security-and-pki) → tamper-evident audit; a mutually
+  authenticated cluster bus and authenticated gossip membership.
+- **Durability, on by default**: consensus-backed replicated sessions
+  ([openraft](https://github.com/databendlabs/openraft) lease group,
+  epoch-fenced quorum replication — terms in the
+  [glossary](docs/GLOSSARY.md#mqttd-clustering-and-durability)), cross-node
+  takeover, and data-safe elastic resize. An acked QoS 1/2 message survives the
+  loss of the node that accepted it, **including one already in flight** — the
+  durable record is written before the packet reaches the wire
+  ([#124](https://github.com/mbilling/fss-mqtt-broker/issues/124)), and QoS 2
+  redelivery resumes under the packet id the subscriber already knows
+  ([#130](https://github.com/mbilling/fss-mqtt-broker/issues/130)).
+- **Operations**: Prometheus/OTLP metrics, resource governance (caps, quotas,
+  rate limits, bounded queues), Helm chart + Kubernetes operator, online
+  backup/restore — and a continuous-assurance program (fault/upgrade/soak
+  harnesses, fuzzing, foreign-client conformance oracles, published baselines).
+
+The largest known gaps, stated rather than discovered (full list:
+[**Limitations**](#limitations)): the memory watermark is backpressure, not a
+hard ceiling (the container limit is the real bound), and the horizontal
+scaling curve is unmeasured — the durable path's throughput/latency *is*
+measured on one host, limits printed beside every number
 ([docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)).
 
-See [`docs/CAPABILITY-PLAN.md`](docs/CAPABILITY-PLAN.md) for the product vision,
-[`docs/adr/`](docs/adr/) for the decisions behind it, and the
+See [`docs/adr/`](docs/adr/) for the decisions and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
 record of exactly what is built (70 ADRs, per-task status).
 
@@ -226,13 +219,10 @@ binary — are marked `-` in the list with the reason, rather than left to fail.
   opted into and is loudly logged.
 - **Open == Enterprise.** One Apache-2.0 codebase, no gated features. Only
   support, SLAs, and certified builds are paid.
-- **Horizontal scalability by design.** Shared-nothing nodes; no coordinator on
-  the publish hot path. The *shape* of the scaling curve is still not measured —
-  doing so honestly needs multi-host hardware
-  ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) T3), so this remains a
-  statement about the architecture, not a benchmarked result. What **is** measured
-  is a single fixed 3-node point on one host, with the limits printed beside every
-  number: [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md).
+- **Horizontal scalability by design.** Shared-nothing nodes, no coordinator on
+  the publish hot path — an architectural statement, not yet a benchmarked
+  curve: what is measured is one 3-node point on one host, limits printed
+  beside every number ([docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)).
 - **Memory safety.** Rust, `#![forbid(unsafe_code)]` across crates.
 
 ## What's different about it
@@ -241,18 +231,12 @@ Four things this does that the brokers it is usually compared against do not.
 The full matrix — including every cell we lose — is
 [`docs/COMPARISON.md`](docs/COMPARISON.md).
 
-- **Durable sessions are on by default**, quorum-replicated, with an acked QoS
-  1/2 message surviving the loss of the node that accepted it — whether it was
-  queued for a disconnected subscriber *or already in flight to a connected
-  one*. And when a group is too thin to keep that promise, the durable write is
-  **refused** rather than acked on one copy: a group holding fewer copies than a
-  majority of the members the node knows about — capped at the replication
-  factor — takes no new durable writes by default, and QoS≥1 publishers get no
-  ack and redeliver. One scope caveat, stated where the claim is: the floor
-  covers writes that reach a group this node leases; a publish for a durable
-  session whose owner is *gone* is still acked and dropped by the
-  no-known-subscriber path (see [Limitations](#limitations)). Mosquitto and
-  NanoMQ are single-node; VerneMQ documents queue loss on node death; EMQX's
+- **Durable sessions are on by default**, quorum-replicated: an acked QoS 1/2
+  message survives the loss of the node that accepted it — queued *or already
+  in flight*. When a group is too thin to keep that promise, the write is
+  **refused**, never acked on one copy (publishers redeliver). The one scope
+  caveat lives in [Limitations](#limitations). For contrast: Mosquitto and
+  NanoMQ are single-node, VerneMQ documents queue loss on node death, EMQX's
   durable sessions are opt-in.
 - **A policy reload evicts live sessions.** Revoke a certificate, remove a user,
   or tighten a grant, and the *already-connected* client is cut — not left
@@ -610,8 +594,7 @@ v1.0.0. Every artifact is version-stamped and re-verified per release
 certification of any kind is held (the mappings accelerate *your* assessment),
 no third-party audit has run yet (a funded audit is planned — ADR 0065), and
 the bus-factor/track-record reality is stated in the threat model rather than
-papered over. Each topic below is its own heading, so the GitHub outline jumps
-straight to it.
+papered over.
 
 ### Threat model and hardening baseline
 
