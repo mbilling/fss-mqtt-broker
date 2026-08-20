@@ -76,9 +76,11 @@ impl BrownoutStatus {
     }
 }
 
-/// Cap on the bytes read while looking for the request line — a crude guard against
-/// a client that streams forever without sending `\r\n`.
-const MAX_REQUEST_LINE: usize = 8 * 1024;
+/// Cap on the bytes read while consuming the request HEAD (request line + every
+/// header, through the terminating blank line) — a crude guard against a client
+/// that streams forever. Generous: real probes and Prometheus-family scrapers
+/// send well under 2 KiB of headers.
+const MAX_REQUEST_HEAD: usize = 32 * 1024;
 
 /// What the health server needs to answer probes: a handle to ping the hub, and the
 /// readiness inputs (live membership and, when durable, the lease-group endpoint).
@@ -658,22 +660,36 @@ async fn route(state: &HealthState, path: &str) -> (u16, String, &'static str) {
     }
 }
 
-/// Read the request line and return its path (query string stripped). `None` for a
-/// malformed line, a non-`GET`/`HEAD` method, a connection that closes first, or an
-/// over-long line.
+/// Read the ENTIRE request head — request line plus every header, through the
+/// terminating blank line — and return the request line's path (query string
+/// stripped). `None` for a malformed line, a non-`GET`/`HEAD` method, a
+/// connection that closes first, or an over-long head.
+///
+/// Consuming the whole head (not just the first line) is load-bearing, not
+/// pedantry (issue #364): this server responds and closes, and closing a socket
+/// with UNREAD data in its receive buffer sends RST, not FIN — which clobbers
+/// the buffered response on the client. Whether a client survived was a race on
+/// how its headers were segmented: `curl`'s two short headers usually share the
+/// first segment and win; a Prometheus-family scraper's five headers over a real
+/// network always lose, so every scrape failed with "connection reset by peer"
+/// while curl said 200. GET/HEAD carry no body, so the head is the whole request.
 async fn read_request_target(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 256];
+    let mut chunk = [0u8; 1024];
     loop {
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-            return Ok(parse_request_line(&buf[..pos]));
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let line_end = buf[..end + 2]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(end);
+            return Ok(parse_request_line(&buf[..line_end]));
         }
-        if buf.len() > MAX_REQUEST_LINE {
+        if buf.len() > MAX_REQUEST_HEAD {
             return Ok(None);
         }
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
-            return Ok(None); // closed before a full request line
+            return Ok(None); // closed before a full request head
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -1119,5 +1135,57 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"status\":\"ok\""));
         assert!(response.contains("\"members\":1"));
+    }
+
+    /// The server consumes the FULL request head before responding (issue #364):
+    /// responding after the request line alone and closing leaves the client's
+    /// still-in-flight headers unread, which turns the close into a TCP RST that
+    /// clobbers the buffered response — real Prometheus-family scrapers (whose
+    /// header block lands in later segments over a real network) failed on every
+    /// scrape with "connection reset by peer" while curl raced through.
+    ///
+    /// Asserted directly: with the request line sent but the head unterminated,
+    /// the server must NOT have responded yet; once the header block and blank
+    /// line arrive, the response comes back complete and the socket closes
+    /// cleanly at EOF (readable to the end — an RST would error the read).
+    #[tokio::test]
+    async fn waits_for_the_full_request_head_before_responding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1);
+        tokio::spawn(super::serve(listener, state));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // Request line + one header, head NOT yet terminated.
+        stream
+            .write_all(b"GET /livez HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let early = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut probe)).await;
+        assert!(
+            early.is_err(),
+            "server responded before the request head was complete"
+        );
+
+        // The rest of a Prometheus-scraper-shaped head, then the blank line.
+        stream
+            .write_all(
+                b"User-Agent: prom-scraper/1.0\r\nAccept: text/plain\r\n\
+                  Accept-Encoding: gzip\r\nX-Prometheus-Scrape-Timeout-Seconds: 2\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            LIVE_TIMEOUT + Duration::from_secs(1),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("response within timeout")
+        .expect("clean EOF, not a reset");
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains("\"live\":true"));
     }
 }
