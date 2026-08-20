@@ -48,6 +48,11 @@ else
 fi
 LANE_B_PUBS=600 # total publishers; per-rung rate = 600 * 1000/I
 LANE_B_SUBS=300 # total subscribers, ONE shared group ($share/g1)
+# Publisher in-flight window. Without it each QoS1 publisher is a WINDOW-1
+# closed loop whose send rate tracks the broker's ack rate — the ladder then
+# degenerates into a saturation probe that can never offer above it (measured:
+# every rung identical). 100 matches bench/run.sh's saturate posture.
+LANE_B_INFLIGHT=100
 LANE_B_REF_RUNG=50000
 BENCH_IMG="emqx/emqtt-bench:0.6.3"
 
@@ -212,7 +217,7 @@ lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 			port=$([ "$posture" = mtls ] && echo 8883 || echo 1883)
 			drun "$di" "pub-$di-$bi" "-v /opt/bench-certs:/opt/bench-certs:ro $BENCH_IMG \
 				pub -h $host -p $port -c $pubs_per -t 'bench/%i' -q 1 -s 256 \
-				-I $interval --payload-hdrs ts $args"
+				-I $interval -F $LANE_B_INFLIGHT --payload-hdrs ts $args"
 		done
 	done
 	sleep "$LANE_B_SECS"
