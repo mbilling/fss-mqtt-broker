@@ -1,0 +1,44 @@
+#cloud-config
+# Load-generator host. Docker + the pinned emqtt-bench image carry lanes B/C;
+# driver 1 additionally builds the durable_bench driver from a pinned ref of the
+# repository (lane A and the barrier probes have no released artifact). The build
+# runs in the background so it overlaps cluster bring-up; run.sh waits on the
+# marker file before lane A.
+
+package_update: true
+packages:
+  - curl
+  - jq
+  - chrony
+  - sysstat
+  - docker.io
+  - git
+  - build-essential
+  - pkg-config
+
+write_files:
+  - path: /etc/sysctl.d/99-bench-driver.conf
+    permissions: "0644"
+    content: |
+      ${indent(6, sysctl_conf)}
+
+runcmd:
+  - sysctl --system
+  - systemctl enable --now docker
+  - docker pull emqx/emqtt-bench:0.6.3
+%{ if build_bench ~}
+  - |
+    nohup bash -c '
+      set -e
+      export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
+      curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+      . /root/.cargo/env
+      git clone https://github.com/mbilling/fss-mqtt-broker /opt/mqtt-broker
+      cd /opt/mqtt-broker
+      git checkout ${bench_git_ref}
+      cargo test --release -p mqttd --test durable_bench --no-run --locked
+      BIN=$(ls -t target/release/deps/durable_bench-* | grep -v "\.d$" | head -1)
+      printf "%s\n" "$BIN" > /run/bench-driver-build-done
+    ' > /var/log/bench-build.log 2>&1 &
+%{ endif ~}
+  - touch /run/bench-cloudinit-done

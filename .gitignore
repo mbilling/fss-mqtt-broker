@@ -32,3 +32,13 @@ dist-e2e-operator
 # the CA private key, per-node leaves, and the SHARED GOSSIP KEY (extensionless, so the
 # *.key/*.pem globs above do NOT cover it). Kept on the admin box; never committed.
 mqttd-pki/
+
+# Scale-curve rig (bench/scale, ADR 0048 T3): per-run scratch (cluster PKI, swim
+# keys, inventories, raw results) and terraform's local state — cloud state and
+# secrets never enter git.
+bench/scale/.runs/
+bench/scale/terraform/.terraform/
+bench/scale/terraform/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
