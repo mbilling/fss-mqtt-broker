@@ -530,13 +530,23 @@ pass "the ACL confines a device to its own subtree (128 for another's, granted f
 #    shared leaf, a missing clientAuth EKU, or a CN that is not the node id, the peer links
 #    are dropped and nothing crosses.
 OUT="$WORK/xnode.out"
-mosquitto_sub -h 127.0.0.1 -p "$P3" "${MOSQ_TLS[@]}" -t 'devices/+/up/#' -C 1 -W 20 \
+mosquitto_sub -h 127.0.0.1 -p "$P3" "${MOSQ_TLS[@]}" -t 'devices/+/up/#' -C 1 -W 45 \
   -u backend -P "$BACKEND_PW" -i xnode-sub > "$OUT" 2>/dev/null &
 SUB_PID=$!
-sleep 2
-mosquitto_pub -h 127.0.0.1 -p "$P1" "${MOSQ_TLS[@]}" -t 'devices/device-a/up/temp' -m 'crossed' -q 1 \
-  -u device-a -P "$DEVICE_A_PW" -i xnode-pub >/dev/null 2>&1 \
-  || fail "the cross-node publish was not accepted"
+# Interest propagation across three nodes is gossip-paced; a fixed sleep is a
+# guess that loses on a loaded runner (seen twice in CI: the single shot fired
+# before node 1 knew node 3's subscriber existed, and the sub timed out).
+# Bounded poll instead: publish idempotently until the copy lands or the
+# window closes — the subscriber takes exactly one copy (-C 1) either way.
+delivered=false
+for attempt in $(seq 1 15); do
+  mosquitto_pub -h 127.0.0.1 -p "$P1" "${MOSQ_TLS[@]}" -t 'devices/device-a/up/temp' -m 'crossed' -q 1 \
+    -u device-a -P "$DEVICE_A_PW" -i "xnode-pub-$attempt" >/dev/null 2>&1 \
+    || fail "the cross-node publish was not accepted (attempt $attempt)"
+  sleep 2
+  if grep -q crossed "$OUT" 2>/dev/null; then delivered=true; break; fi
+done
+[ "$delivered" = true ] || true # the final grep below is the assertion
 wait "$SUB_PID" 2>/dev/null || true
 grep -q crossed "$OUT" || fail "a message published on node 1 never reached a subscriber on node 3 \
 (with peer mTLS on, this is also how a wrongly-shaped cluster-bus certificate presents)"
