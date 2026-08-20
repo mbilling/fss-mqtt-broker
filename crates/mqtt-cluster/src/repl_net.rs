@@ -307,6 +307,7 @@ impl ReplicaTransport for PeerReplicaTransport {
                 inner.pending.remove(&req_id);
                 return false;
             }
+            tracing::debug!(replica = %replica.0, req_id, "replicate: queued to link");
         }
 
         // Resolved by complete_ack (the replica replied) or fail_node (link

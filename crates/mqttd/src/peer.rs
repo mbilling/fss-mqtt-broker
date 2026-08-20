@@ -469,11 +469,26 @@ where
 
     let conn_id = PEER_CONN_ID.fetch_add(1, Ordering::Relaxed);
     let (out_tx, mut out_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+    // The CONTROL lane (issue #358): raft RPCs and replication acks are small and
+    // deadline-bound (500 ms heartbeat / 5 s replication RPC), while the bulk lane
+    // carries forwarded publishes, shared deliveries, retained snapshots — frames
+    // up to 16 MiB. One FIFO for both meant a heartbeat could sit behind megabytes
+    // of data until openraft's deadline passed: elections churned on healthy links
+    // and spread-ownership durable appends starved. Two queues, one socket — the
+    // pump drains control first; the wire format is untouched.
+    let (ctl_tx, mut ctl_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+    // The pump keeps WEAK sender handles so inbound durable-plane requests can
+    // spawn their handling and route the reply straight back onto the link's
+    // lanes — never through the hub command queue (issue #358). Weak, so the
+    // pump does not hold its own receivers open: when the hub drops this link
+    // (takeover, disconnect), the lanes still close and the pump still exits.
+    let (reply_ctl, reply_bulk) = (ctl_tx.downgrade(), out_tx.downgrade());
     if hub
         .send(HubCommand::PeerConnected {
             node: remote.clone(),
             conn_id,
             tx: out_tx,
+            ctl: ctl_tx,
             cert_serial,
             proto,
         })
@@ -488,7 +503,10 @@ where
         &mut buf,
         &hub,
         &remote,
+        &mut ctl_rx,
         &mut out_rx,
+        &reply_ctl,
+        &reply_bulk,
         plane.as_ref(),
     )
     .await;
@@ -499,13 +517,17 @@ where
     result.map(|()| LinkOutcome::Closed)
 }
 
+#[allow(clippy::too_many_arguments)] // one straight-line link loop; a struct would hide the shape
 async fn pump<R, W>(
     rh: &mut R,
     wh: &mut W,
     buf: &mut BytesMut,
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
+    ctl_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     out_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
+    reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
+    reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
     plane: Option<&DurablePlane>,
 ) -> Result<(), std::io::Error>
 where
@@ -513,11 +535,29 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
+        // `biased` makes the polling order the PRIORITY order: control frames
+        // (raft RPCs, replication acks — small by construction) always drain
+        // before bulk data. Starving bulk is not a concern — control traffic is
+        // a few frames per heartbeat interval, not a stream. Inbound reads sit
+        // between the lanes so a flood in either direction cannot starve the
+        // other side's acks.
         tokio::select! {
+            biased;
+            maybe_ctl = ctl_rx.recv() => {
+                match maybe_ctl {
+                    Some(msg) => match write_frame(wh, &msg).await {
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            warn!(error = %e, "dropping oversized/unencodable peer control frame");
+                        }
+                        other => other?,
+                    },
+                    None => return Ok(()), // taken over or hub gone
+                }
+            }
             inbound = read_frame(rh, buf) => {
                 match inbound? {
                     None => return Ok(()), // peer closed
-                    Some(msg) => forward_inbound(msg, hub, remote, plane),
+                    Some(msg) => forward_inbound(msg, hub, remote, plane, reply_ctl, reply_bulk),
                 }
             }
             maybe_out = out_rx.recv() => {
@@ -527,12 +567,17 @@ where
                     // severing every message on the link (and a link-up back-fill that
                     // dies on send would die again on every reconnect). Other I/O
                     // errors still end the link as before.
-                    Some(msg) => match write_frame(wh, &msg).await {
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                            warn!(error = %e, "dropping oversized/unencodable peer frame");
+                    Some(msg) => {
+                        if let PeerMessage::Replicate { req_id, .. } = &msg {
+                            tracing::debug!(req_id, peer = %remote.0, "replicate: writing to wire");
                         }
-                        other => other?,
-                    },
+                        match write_frame(wh, &msg).await {
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                                warn!(error = %e, "dropping oversized/unencodable peer frame");
+                            }
+                            other => other?,
+                        }
+                    }
                     None => return Ok(()), // taken over or hub gone
                 }
             }
@@ -548,24 +593,54 @@ fn forward_inbound(
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
     plane: Option<&DurablePlane>,
+    reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
+    reply_bulk: &mpsc::WeakUnboundedSender<PeerMessage>,
 ) {
     match msg {
-        // Durable-plane REPLIES resolve a pending wait inside the plane and never
-        // touch hub state — route them DIRECTLY, bypassing the hub command queue
-        // (ADR 0042 T9, exhibit ⑩). Through the queue they deadlock-by-queue: an
-        // on-loop durable append awaits exactly these acks, which would sit queued
-        // behind the very dispatch that is waiting — every such append then fails
-        // at the RPC timeout ("no replication quorum" on a healthy cluster).
-        frame @ (PeerMessage::ReplicateAck { .. }
+        // EVERY durable-plane frame routes DIRECTLY to the plane, bypassing the
+        // hub command queue. Replies were first (ADR 0042 T9, exhibit ⑩): an
+        // on-loop durable append awaits exactly these acks, which would sit
+        // queued behind the very dispatch that is waiting. REQUESTS followed
+        // (issue #358): under spread ownership every node is a leader AND a
+        // follower — a hub loop that (transitively) waits on its own append
+        // quorum cannot dispatch the inbound `Replicate`s the OTHER leaders'
+        // quorums need, and the three loops starve each other until the 5 s RPC
+        // bound fires (measured: frames on the wire in µs, dequeued from the
+        // follower's hub queue 5–10 s later, on an idle cluster). The plane
+        // handles frames without touching hub state, so nothing here needs the
+        // loop; replies ride back on the link's lanes directly — consensus
+        // replies and acks on the control lane, data-bearing replies on bulk.
+        frame @ (PeerMessage::Replicate { .. }
+        | PeerMessage::ReplicateAck { .. }
+        | PeerMessage::RaftRpc { .. }
+        | PeerMessage::RaftRpcReply { .. }
+        | PeerMessage::ReplicaRead { .. }
         | PeerMessage::ReplicaReadReply { .. }
-        | PeerMessage::ReplicaKeysReply { .. }
-        | PeerMessage::RaftRpcReply { .. })
+        | PeerMessage::ReplicaCatchUp { .. }
+        | PeerMessage::ReplicaCatchUpTo { .. }
+        | PeerMessage::ReplicaKeys { .. }
+        | PeerMessage::ReplicaKeysReply { .. })
             if plane.is_some() =>
         {
             if let Some(plane) = plane {
                 let plane = plane.clone();
+                let ctl = reply_ctl.clone();
+                let bulk = reply_bulk.clone();
                 tokio::spawn(async move {
-                    let _ = plane.handle(frame).await;
+                    if let Some(reply) = plane.handle(frame).await {
+                        let lane = match &reply {
+                            PeerMessage::RaftRpcReply { .. } | PeerMessage::ReplicateAck { .. } => {
+                                &ctl
+                            }
+                            _ => &bulk,
+                        };
+                        // A dead upgrade means the hub already dropped this link
+                        // (takeover/disconnect) — the reply has nowhere to go, and
+                        // the peer's RPC timeout is the designed recovery.
+                        if let Some(lane) = lane.upgrade() {
+                            let _ = lane.send(reply);
+                        }
+                    }
                 });
             }
         }
@@ -815,5 +890,85 @@ async fn read_frame<R: AsyncRead + Unpin>(
         if n == 0 {
             return Ok(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// The control lane is drained before the bulk lane (issue #358): with both
+    /// queues pre-loaded, every control frame must reach the wire before any bulk
+    /// frame — a raft heartbeat's 500 ms deadline cannot survive queueing behind
+    /// a data backlog, which is exactly what churned elections on healthy links.
+    #[tokio::test]
+    async fn control_frames_jump_the_bulk_queue() {
+        let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+        let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+
+        // Bulk backlog FIRST, then the control frame — arrival order must lose
+        // to lane priority.
+        for i in 0..3 {
+            out_tx
+                .send(PeerMessage::Interest {
+                    filters: vec![format!("bulk/{i}")],
+                })
+                .unwrap();
+        }
+        ctl_tx
+            .send(PeerMessage::RaftRpc {
+                req_id: 42,
+                payload: vec![1, 2, 3],
+            })
+            .unwrap();
+
+        let remote = NodeId("peer-under-test".into());
+        let reply_ctl = ctl_tx.downgrade();
+        let reply_bulk = out_tx.downgrade();
+        let pump_task = tokio::spawn(async move {
+            let (mut rh, mut wh) = tokio::io::split(theirs);
+            let mut buf = BytesMut::new();
+            pump(
+                &mut rh,
+                &mut wh,
+                &mut buf,
+                &hub_tx,
+                &remote,
+                &mut ctl_rx,
+                &mut out_rx,
+                &reply_ctl,
+                &reply_bulk,
+                None,
+            )
+            .await
+        });
+
+        let mut buf = BytesMut::new();
+        let first = read_frame(&mut ours, &mut buf)
+            .await
+            .expect("read")
+            .expect("frame");
+        assert!(
+            matches!(first, PeerMessage::RaftRpc { req_id: 42, .. }),
+            "the control frame must be written before the pre-queued bulk backlog, got {first:?}"
+        );
+        for i in 0..3 {
+            let next = read_frame(&mut ours, &mut buf)
+                .await
+                .expect("read")
+                .expect("frame");
+            assert!(
+                matches!(&next, PeerMessage::Interest { filters } if filters == &vec![format!("bulk/{i}")]),
+                "bulk frames follow in order, got {next:?}"
+            );
+        }
+
+        // Dropping the lane senders ends the pump cleanly.
+        drop(ctl_tx);
+        drop(out_tx);
+        pump_task.await.expect("pump task").expect("pump exits Ok");
     }
 }
