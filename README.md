@@ -605,37 +605,84 @@ version:
 ## Enterprise readiness
 
 The evaluator's shelf, built as a deliberate program (ADRs 0065–0069) after
-v1.0.0: every artifact below is version-stamped, re-verified per release
-(RELEASING.md's checklist), and honest about what it does not claim.
+v1.0.0. Every artifact is version-stamped and re-verified per release
+(RELEASING.md's checklist). What is deliberately **not** claimed: no
+certification of any kind is held (the mappings accelerate *your* assessment),
+no third-party audit has run yet (a funded audit is planned — ADR 0065), and
+the bus-factor/track-record reality is stated in the threat model rather than
+papered over. Each topic below is its own heading, so the GitHub outline jumps
+straight to it.
 
-| Artifact | What it gives you |
-|---|---|
-| [Threat model](docs/THREAT-MODEL.md) | STRIDE over the five trust surfaces; every mitigation cites its ADR and enforcement site, every accepted risk is quoted from the record that accepted it. |
-| [Hardening baseline](docs/HARDENING.md) | 34 checkable L1/L2 items, each with the knob, the shipped default, and a verification an auditor can run — starting with `grep INSECURE:` (the broker announces its own insecure postures). |
-| [Audit trail schema](docs/AUDIT-SCHEMA.md) | The SIEM contract: hash-chained records with boot-boundary alert invariants, and `scripts/audit-verify.py` reproves a captured stream with no secret. |
-| [EU CRA readiness](docs/compliance/eu-cra.md) | Annex I mapped to checkable shipped facts, plus the Article 14 reporting runbook. |
-| [IEC 62443 mapping](docs/compliance/iec-62443.md) | 4-1 SDL practices and 4-2 component requirements with honest SL-C reads — the OT procurement language. |
-| [SOC 2 / ISO 27001 map](docs/compliance/soc2-iso27001.md) | Feature → control → pullable evidence, for the customer's own audit; no certification implied. |
-| [Crypto policy](docs/compliance/crypto-policy.md) | Exactly what each build's cryptography is — including the FIPS variant (`mqttd-fips` release binaries, byte-reproducible, module claim pinned at build time) and the honest Argon2id boundary. |
-| Supply chain, per release | CycloneDX SBOM per binary, [OpenVEX dispositions](security/vex/), SLSA provenance, keyless cosign signatures — verification one-liners in [RELEASING.md](RELEASING.md). |
-| Posture, continuously scored | The OpenSSF Scorecard and Best Practices badges at the top of this file are live results, not decoration: CodeQL and Dependabot run in CI, and `main` is ruleset-protected ([self-certification record](docs/compliance/openssf-best-practices.md)). |
+### Threat model and hardening baseline
 
-What is deliberately **not** claimed: no certification of any kind is held
-(the mappings accelerate *your* assessment), no third-party audit has run yet
-(funded audit planned — ADR 0065), and the bus-factor/track-record reality is
-stated in the threat model rather than papered over.
+[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) is the one-document answer to
+"what is your threat model?" — STRIDE over the five trust surfaces, every
+mitigation citing its ADR and enforcement site, every accepted risk quoted
+from the record that accepted it. [docs/HARDENING.md](docs/HARDENING.md) is
+its checkable companion: 34 L1/L2 items, each with the knob, the shipped
+default, and a verification an auditor can run — starting with
+`grep INSECURE:`, because the broker announces its own insecure postures.
+
+### Audit trail, SIEM-ready
+
+[docs/AUDIT-SCHEMA.md](docs/AUDIT-SCHEMA.md) is the contract a SIEM parser is
+written against: hash-chained records, the complete event vocabulary, and the
+boundary invariants to alert on. `scripts/audit-verify.py` reproves a captured
+stream with no secret — tamper-evidence you can check, not believe.
+
+### Compliance mappings — EU CRA, IEC 62443, SOC 2 / ISO 27001
+
+Claims documents held to the repository's evidence discipline, in
+[docs/compliance/](docs/compliance/): [EU CRA readiness](docs/compliance/eu-cra.md)
+(Annex I mapped to checkable facts, plus the Article 14 reporting runbook),
+[IEC 62443](docs/compliance/iec-62443.md) (4-1 SDL and 4-2 component
+requirements with honest SL-C reads — the OT procurement language), and the
+[SOC 2 / ISO 27001 evidence map](docs/compliance/soc2-iso27001.md)
+(feature → control → pullable artifact, for *your* audit).
+
+### Cryptography and the FIPS variant
+
+[docs/compliance/crypto-policy.md](docs/compliance/crypto-policy.md) states
+exactly what each build's cryptography is: one audited provider (AWS-LC),
+TLS 1.3 by default — and the **fips build variant**, shipping as
+`mqttd-fips` release binaries (byte-reproducible, module claim pinned at build
+time), with the honest boundary stated: Argon2id password hashing is not a
+FIPS-approved algorithm, so strictly-approved deployments authenticate with
+mTLS or OIDC.
+
+### Supply chain, per release
+
+Every release publishes a CycloneDX SBOM per binary,
+[OpenVEX dispositions](security/vex/) (the machine-readable "is mqttd affected
+by CVE-X?"), SLSA build provenance, and keyless cosign signatures —
+verification one-liners in [RELEASING.md](RELEASING.md).
+
+### Continuously scored posture
+
+The OpenSSF Scorecard and Best Practices badges at the top of this file are
+live results, not decoration: CodeQL and Dependabot run in CI, `main` is
+ruleset-protected (PRs + green checks required, force-push and deletion
+blocked), and the best-practices
+[self-certification record](docs/compliance/openssf-best-practices.md) is
+kept in-tree.
 
 ### The documents at the repository root
 
-| File | What it is |
-|---|---|
-| [SECURITY.md](SECURITY.md) | How to report a vulnerability privately, what to expect, and how fixes ship — with every security link in one place. |
-| [SUPPORT.md](SUPPORT.md) | The support lifecycle as a dated table (three minor lines, adjacent-skew upgrades) plus the export-control (ECCN) statement for procurement. |
-| [RELEASING.md](RELEASING.md) | What a release contains and the runbook that cuts one — including the one-command verification of signatures, SBOMs, and reproducible builds. |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to build and test, the review bar, and the two repo conventions (ADR/delivery discipline) a change is held to. |
-| [CHANGELOG.md](CHANGELOG.md) | Deliberately a pointer: GitHub Releases is the canonical changelog, and this file explains why and where everything else lives. |
-| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | The community standard contributors and maintainers are held to. |
-| [LICENSE](LICENSE) | Apache-2.0 — including the signed release binaries. |
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability privately, what
+  to expect, and how fixes ship, with every security link in one place.
+- [SUPPORT.md](SUPPORT.md) — the support lifecycle as a dated table (three
+  minor lines, adjacent-skew upgrades) plus the export-control (ECCN)
+  statement for procurement.
+- [RELEASING.md](RELEASING.md) — what a release contains and the runbook that
+  cuts one, including one-command verification of signatures, SBOMs, and
+  reproducible builds.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to build and test, the review bar,
+  and the repo conventions a change is held to.
+- [CHANGELOG.md](CHANGELOG.md) — deliberately a pointer: GitHub Releases is
+  the canonical changelog, and this file explains why.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — the community standard
+  contributors and maintainers are held to.
+- [LICENSE](LICENSE) — Apache-2.0, including the signed release binaries.
 
 ## Before production — a checklist
 
