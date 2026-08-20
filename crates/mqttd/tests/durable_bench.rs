@@ -126,6 +126,12 @@ struct Cfg {
     log_level: String,
     /// How long the readiness gate waits for the cluster to become measurable.
     preflight: Duration,
+    /// `MQTTD_BENCH_SPREAD=1`: sessions are spread round-robin across ALL nodes'
+    /// HRW-owned groups and every client connects to its own session's owner —
+    /// the scaling-curve shape (ADR 0048 §2), where the cluster carries the load
+    /// collectively. Off (default): every session is pinned to node 0, the
+    /// single-owner floor measurement this file has always made.
+    spread: bool,
 }
 
 impl Cfg {
@@ -142,13 +148,14 @@ impl Cfg {
             node_workers: env_usize("MQTTD_BENCH_NODE_WORKERS", 2),
             log_level: env_string("MQTTD_BENCH_LOG", "warn"),
             preflight: Duration::from_secs(env_usize("MQTTD_BENCH_PREFLIGHT_SECS", 120) as u64),
+            spread: env_usize("MQTTD_BENCH_SPREAD", 0) == 1,
         }
     }
 
     fn describe(&self) -> String {
         format!(
             "publishers={} window={} (={}, in flight) subs={} payload={}B warmup={}s measure={}s reps={} \
-             node_workers={} RUST_LOG={} profile={}",
+             node_workers={} RUST_LOG={} profile={} placement={}",
             self.publishers,
             self.window,
             self.publishers * self.window,
@@ -159,7 +166,12 @@ impl Cfg {
             self.reps,
             self.node_workers,
             self.log_level,
-            profile()
+            profile(),
+            if self.spread {
+                "spread (sessions across all owners)"
+            } else {
+                "pinned (all sessions owned by node 0)"
+            }
         )
     }
 }
@@ -223,6 +235,38 @@ fn ring_over(ids: &[String]) -> Placement {
         ring.observe(&NodeId(id.clone()), MemberState::Alive, "127.0.0.1:1", None);
     }
     ring
+}
+
+/// `n` client ids spread round-robin across ALL nodes: id k is HRW-owned by node
+/// `k % nodes.len()` (in endpoint order), so the load lands on every owner evenly —
+/// the scaling-curve shape. Returns `(client_id, endpoint_index)` pairs so the caller
+/// can connect each client to the node that owns its session.
+fn ids_spread(ring: &Placement, nodes: &[String], prefix: &str, n: usize) -> Vec<(String, usize)> {
+    let mut out: Vec<Option<String>> = vec![None; n];
+    let mut filled = 0usize;
+    for k in 0..400_000u32 {
+        let candidate = format!("{prefix}{k}");
+        let owner = ring.hrw_owner(group_of(&candidate)).0;
+        let Some(ni) = nodes.iter().position(|id| *id == owner) else {
+            continue;
+        };
+        // Fill the round-robin slots reserved for this node, in order.
+        if let Some(slot) = (0..n).find(|s| s % nodes.len() == ni && out[*s].is_none()) {
+            out[slot] = Some(candidate);
+            filled += 1;
+            if filled == n {
+                return out
+                    .into_iter()
+                    .enumerate()
+                    .map(|(s, id)| (id.expect("all slots filled"), s % nodes.len()))
+                    .collect();
+            }
+        }
+    }
+    panic!(
+        "could not spread {n} client ids across {} nodes under prefix {prefix}",
+        nodes.len()
+    );
 }
 
 /// `n` client ids whose placement group `node` HRW-owns — computed before anything
@@ -1063,31 +1107,75 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
         cl.endpoints[1 % cl.endpoints.len()].client
     };
 
-    // Subscriber sessions pinned to node 0's HRW-owned groups, fresh ids per run so
-    // no state from an earlier arm confounds this one.
-    let sub_ids = ids_owned_by(&ring, &owner_id, &format!("bs-{tag}-"), cfg.subs);
+    let node_ids: Vec<String> = cl.endpoints.iter().map(|e| e.id.clone()).collect();
     let topics: Vec<String> = (0..cfg.subs).map(|i| format!("bench/{tag}/{i}")).collect();
-    // PUBLISHER ids are pinned to the group owned by the node they attach to. This is
-    // not cosmetic: an inbound QoS 2 PUBLISH writes a dedup record in the PUBLISHER's
-    // own placement group, and on this build a publisher attached to a node that does
-    // not own that group fails closed — "QoS2 dedup store write failed; withholding
-    // PUBREC (fail closed) … not the owning node for this group" — and the connection
-    // then hangs with no error to the client. Pinning keeps the QoS 2 arm measurable;
-    // the defect itself is reported, not worked around silently.
-    let pub_node_id = cl
-        .endpoints
-        .iter()
-        .find(|e| e.client == pub_addr)
-        .map(|e| e.id.clone())
-        .expect("publisher endpoint");
-    let pub_ids = ids_owned_by(&ring, &pub_node_id, &format!("bp-{tag}-"), cfg.publishers);
+    // Session placement. Pinned (default): subscriber sessions in node 0's HRW-owned
+    // groups, publishers in the groups owned by the node they attach to — the
+    // single-owner floor. Spread (`MQTTD_BENCH_SPREAD=1`): both populations
+    // round-robin across ALL nodes' owned groups, and EVERY client connects to its
+    // own session's owner — the scaling-curve shape.
+    //
+    // In both modes a PUBLISHER attaches to the node that owns its own id's group.
+    // This is not cosmetic: an inbound QoS 2 PUBLISH writes a dedup record in the
+    // PUBLISHER's own placement group, and on this build a publisher attached to a
+    // node that does not own that group fails closed — "QoS2 dedup store write
+    // failed; withholding PUBREC (fail closed) … not the owning node for this
+    // group" — and the connection then hangs with no error to the client. Pinning
+    // keeps the QoS 2 arm measurable; the defect itself is reported, not worked
+    // around silently.
+    let (sub_ids, sub_addrs, pub_ids, pub_addrs) = if cfg.spread {
+        let subs = ids_spread(&ring, &node_ids, &format!("bs-{tag}-"), cfg.subs);
+        let pubs = ids_spread(&ring, &node_ids, &format!("bp-{tag}-"), cfg.publishers);
+        let mut per_node = vec![0usize; node_ids.len()];
+        for (_, ni) in &subs {
+            per_node[*ni] += 1;
+        }
+        let sub_counts = per_node.clone();
+        per_node.fill(0);
+        for (_, ni) in &pubs {
+            per_node[*ni] += 1;
+        }
+        println!(
+            "    spread placement: subs per node {sub_counts:?}, publishers per node \
+             {per_node:?} (node order: {node_ids:?})"
+        );
+        let sub_addrs: Vec<SocketAddr> = subs
+            .iter()
+            .map(|(_, ni)| cl.endpoints[*ni].client)
+            .collect();
+        let pub_addrs: Vec<SocketAddr> = pubs
+            .iter()
+            .map(|(_, ni)| cl.endpoints[*ni].client)
+            .collect();
+        (
+            subs.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            sub_addrs,
+            pubs.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            pub_addrs,
+        )
+    } else {
+        let sub_ids = ids_owned_by(&ring, &owner_id, &format!("bs-{tag}-"), cfg.subs);
+        let pub_node_id = cl
+            .endpoints
+            .iter()
+            .find(|e| e.client == pub_addr)
+            .map(|e| e.id.clone())
+            .expect("publisher endpoint");
+        let pub_ids = ids_owned_by(&ring, &pub_node_id, &format!("bp-{tag}-"), cfg.publishers);
+        (
+            sub_ids,
+            vec![owner_addr; cfg.subs],
+            pub_ids,
+            vec![pub_addr; cfg.publishers],
+        )
+    };
 
     let mut subs = Vec::new();
     for i in 0..cfg.subs {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some((mut c, _)) = common::Client::connect_v311_within(
-                owner_addr,
+                sub_addrs[i],
                 &sub_ids[i],
                 !arm.durable_subs,
                 Duration::from_secs(20),
@@ -1111,43 +1199,58 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     }
 
     // Interest warm-up: cross-node interest is eventually consistent, so a publish
-    // from the PUBLISHERS' node must be observed to arrive before the clock starts.
+    // from EVERY node that will publish to a topic must be observed to arrive before
+    // the clock starts. Pinned mode has one such node (`pub_addr`); spread mode warms
+    // from each distinct node whose publishers target the topic.
     for i in 0..cfg.subs {
-        let warm = format!("warm-{tag}-{i}").into_bytes();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Some((mut p, _)) = common::Client::connect_v311_within(
-                pub_addr,
-                &format!("warmpub-{tag}-{i}"),
-                true,
-                Duration::from_secs(20),
-            )
-            .await
-            {
-                p.publish(&topics[i], &warm, QoS::AtLeastOnce, Some(1), vec![])
-                    .await;
-                let _ = p.recv_bounded(Duration::from_secs(5)).await;
-            }
-            let mut seen = false;
-            while let common::Recv::Packet(pkt) =
-                subs[i].recv_bounded(Duration::from_millis(700)).await
-            {
-                if let Packet::Publish(pb) = pkt {
-                    if let Some(pkid) = pb.pkid {
-                        subs[i].puback(pkid).await;
-                    }
-                    if pb.payload.as_ref() == warm.as_slice() {
-                        seen = true;
+        let mut warm_from: Vec<SocketAddr> = (0..cfg.publishers)
+            .filter(|k| k % cfg.subs == i)
+            .map(|k| pub_addrs[k])
+            .collect();
+        if warm_from.is_empty() {
+            // More subscribers than publishers: nothing will publish here, but the
+            // pinned lane has always warmed every topic — keep that behavior.
+            warm_from.push(pub_addr);
+        }
+        warm_from.sort_unstable_by_key(std::string::ToString::to_string);
+        warm_from.dedup();
+        for (w, warm_addr) in warm_from.into_iter().enumerate() {
+            let warm = format!("warm-{tag}-{i}-{w}").into_bytes();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some((mut p, _)) = common::Client::connect_v311_within(
+                    warm_addr,
+                    &format!("warmpub-{tag}-{i}-{w}"),
+                    true,
+                    Duration::from_secs(20),
+                )
+                .await
+                {
+                    p.publish(&topics[i], &warm, QoS::AtLeastOnce, Some(1), vec![])
+                        .await;
+                    let _ = p.recv_bounded(Duration::from_secs(5)).await;
+                }
+                let mut seen = false;
+                while let common::Recv::Packet(pkt) =
+                    subs[i].recv_bounded(Duration::from_millis(700)).await
+                {
+                    if let Packet::Publish(pb) = pkt {
+                        if let Some(pkid) = pb.pkid {
+                            subs[i].puback(pkid).await;
+                        }
+                        if pb.payload.as_ref() == warm.as_slice() {
+                            seen = true;
+                        }
                     }
                 }
+                if seen {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "arm {tag}: interest from {warm_addr} to sub {i} never converged"
+                );
             }
-            if seen {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "arm {tag}: interest from the publisher node to sub {i} never converged"
-            );
         }
     }
 
@@ -1174,7 +1277,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     let mut pubs = Vec::new();
     for k in 0..cfg.publishers {
         pubs.push(tokio::spawn(publisher(
-            pub_addr,
+            pub_addrs[k],
             pub_ids[k].clone(),
             topics[k % cfg.subs].clone(),
             arm.qos,
@@ -1361,7 +1464,7 @@ async fn durable_path_floor() {
     }
 
     let mut cl = cluster(&cfg).await;
-    let arms = [
+    let all_arms = [
         Arm {
             label: "qos1-durable-owner",
             qos: QoS::AtLeastOnce,
@@ -1387,6 +1490,25 @@ async fn durable_path_floor() {
             via_owner: true,
         },
     ];
+    // In spread mode every client already connects to its own session's owner, so a
+    // deliberate "publisher on a non-owner node" arm is meaningless — publishes still
+    // cross nodes whenever subscriber interest lives elsewhere, which is the point of
+    // the spread measurement. The omission is printed, not silent. (This is a matrix
+    // definition, not an environmental skip: the arm does not exist in this mode.)
+    let arms: Vec<Arm> = all_arms
+        .into_iter()
+        .filter(|a| {
+            let keep = !cfg.spread || a.via_owner;
+            if !keep {
+                println!(
+                    "  arm {} has no spread-mode equivalent: the owner/relay distinction \
+                     does not exist when each client attaches to its own session's owner",
+                    a.label
+                );
+            }
+            keep
+        })
+        .collect();
 
     let mut all: Vec<(&'static str, Vec<RunStats>)> =
         arms.iter().map(|a| (a.label, Vec::new())).collect();
@@ -1426,6 +1548,37 @@ async fn durable_path_floor() {
                 } else {
                     format!("INVALID: {}", st.violations().join("; "))
                 }
+            );
+            // One machine-readable line per rep, additive to the human tables above —
+            // the multi-host curve summarizer parses these instead of scraping prose.
+            println!(
+                "RESULT {}",
+                serde_json::json!({
+                    "test": "durable_path_floor",
+                    "arm": arm.label,
+                    "rep": rep,
+                    "nodes": cl.endpoints.len(),
+                    "spread": cfg.spread,
+                    "external": cl.external,
+                    "publishers": cfg.publishers,
+                    "window": cfg.window,
+                    "subs": cfg.subs,
+                    "payload": cfg.payload,
+                    "measure_secs": cfg.measure.as_secs(),
+                    "msgs_per_s": st.rate,
+                    "completed": st.completed,
+                    "delivered": st.delivered,
+                    "p50_ms": ms(st.p50),
+                    "p95_ms": ms(st.p95),
+                    "p99_ms": ms(st.p99),
+                    "p999_ms": ms(st.p999),
+                    "max_ms": ms(st.max),
+                    "stalls_1s": st.stalls_1s,
+                    "append_mean_ms": st.append_mean_ms,
+                    "append_p99_ms": st.append_p99_ms,
+                    "violations": st.violations(),
+                    "caveats": st.caveats(),
+                })
             );
             all[ai].1.push(st);
             // SETTLE(bench-inter-arm-quiesce): a MEASUREMENT boundary, not a wait for a state.

@@ -34,7 +34,9 @@ Four specific things they do **not** bound:
    and would manufacture false evidence against the broker (the
    [7-node single-host post-mortem](../postmortems/2026-07-14-ha-bridge-durable-refused.md)
    is what taught that). There is no node-count curve in this document. There is a
-   single fixed 3-node point.
+   single fixed 3-node point. *(2026-08-20: the multi-host rig and method for that
+   curve now exist — `bench/scale/run.sh` and `docs/benchmarks/SCALE-CURVE.md` —
+   with no published run yet.)*
 3. **Anything about competitors.** No cross-broker number appears here; that is
    `bench/`'s job and ADR 0048 T4's.
 4. **Connection scale.** Every number here was measured at **at most ~32 concurrent
@@ -583,6 +585,15 @@ honesty rules (ADR 0048 §2 / 0048-T3): one small host **per node**, independent
 disks, and a flat curve published as a finding rather than buried. This harness can
 drive it (`MQTTD_BENCH_BROKERS` with 1, 3, then 5 endpoints), but the curve is not
 this document's claim and is not made anywhere in this repository.
+
+*Update 2026-08-20:* that separate exercise now has its rig and its record
+template — `bench/scale/run.sh` (Hetzner, one host and one disk per node, per-host
+barrier probes) and `docs/benchmarks/SCALE-CURVE.md`, which stays explicitly
+unfilled until a real run. The harness grew the curve's workload shape as
+`MQTTD_BENCH_SPREAD=1` (sessions spread across all owners instead of pinned to
+node 0), and exercising it immediately surfaced
+[#358](https://github.com/mbilling/fss-mqtt-broker/issues/358) — durable acks
+stalling on groups owned by non-founder nodes — before any money was spent.
 
 ## Reproducing everything above
 

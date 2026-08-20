@@ -863,3 +863,104 @@ stream is the one the broker wrote and nothing was cut from its tail.
 """
 requires = ["python3"]
 duration = "~1s"
+
+[[task]]
+id = "scale-curve"
+group = "Benchmark"
+name = "Run the multi-host scaling curve on Hetzner Cloud (PAID)"
+script = "bench/scale/run.sh"
+about = """
+The ADR 0048 §2 curve: fresh 1-, 3- and 5-node clusters on real Hetzner hosts (one
+broker, one local NVMe disk per host), the same workload at every size, results for
+docs/benchmarks/SCALE-CURVE.md. Start with `smoke` (one node, <€0.50) before `full`
+(~€2). Needs HCLOUD_TOKEN from a DEDICATED Hetzner project in the environment and an
+SSH keypair — read bench/scale/README.md first. Teardown is trapped on every exit
+path; after any run, verify zero servers remain.
+"""
+requires = ["terraform", "jq", "ssh"]
+duration = "~30m smoke, ~4-5h full"
+caution = "Creates PAID cloud servers under your HCLOUD_TOKEN. Ctrl-C tears down; kill -9 does not — run teardown.sh after one."
+
+[[task]]
+id = "scale-teardown"
+group = "Benchmark"
+name = "Destroy any leftover scale-curve cloud resources"
+script = "bench/scale/teardown.sh"
+about = """
+The leak sweeper for bench/scale: terraform destroy from local state, then an audit of
+everything labeled purpose=mqttd-bench-scale (add --force to delete what the audit
+finds; needs the hcloud CLI). Run it after a killed run, a dead laptop, or before
+reading the invoice — exit 0 with "nothing leaked" means you are not paying for
+anything.
+"""
+requires = ["terraform"]
+duration = "~2m"
+
+[[task]]
+id = "scale-summarize"
+group = "Benchmark"
+name = "Render the scale-curve markdown from a run's raw results"
+script = "bench/scale/summarize-curve.py"
+about = """
+Merges a bench/scale run's raw results (rates summed across drivers, latency
+histograms merged bucket-wise and reported as upper bounds, broker counters
+cross-checked ±2%, driver-limited rungs excluded from knee detection) into the
+markdown tables for docs/benchmarks/SCALE-CURVE.md. Refuses to render the durable
+curve for any size missing its per-host barrier probes. Takes the run's results
+directory: `summarize-curve.py bench/scale/.runs/<stamp>/results`.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
+id = "scale-bootstrap"
+group = "Benchmark"
+name = "Bootstrap one scale-curve cluster (internal step of scale-curve)"
+script = "bench/scale/bootstrap-cluster.sh"
+about = """
+Mints the per-size secrets locally (cluster PKI via deploy/systemd/gen-certs.sh, one
+swim key, a separate client CA), pushes them over SSH, and performs the founder-first
+start + arm sequence. run.sh calls this with the run directory and terraform's
+inventory JSON; there is nothing to run by hand.
+"""
+hidden = true
+requires = ["jq", "ssh"]
+
+[[task]]
+id = "scale-lanes"
+group = "Benchmark"
+name = "Drive the measurement lanes against one cluster size (internal step of scale-curve)"
+script = "bench/scale/run-curve.sh"
+about = """
+Per-size lane driver: preflight snapshot, per-host barrier probes, durable closed-loop
+lane, the $share fan-out ladder, and the idle-connection lane, with CPU sampling and
+/metrics snapshots around every rung. Invoked by run.sh with an inventory; not run by
+hand.
+"""
+hidden = true
+requires = ["jq", "ssh"]
+
+[[task]]
+id = "scale-collect"
+group = "Benchmark"
+name = "Collect host logs off a scale-curve cluster (internal step of scale-curve)"
+script = "bench/scale/collect.sh"
+about = """
+Pulls broker journals, cloud-init logs and final /metrics off every host right before
+a size is destroyed — the only way to diagnose a broker-side stall after the servers
+are gone. Invoked by run.sh; not run by hand.
+"""
+hidden = true
+requires = ["jq", "ssh"]
+
+[[task]]
+id = "scale-lib"
+group = "Benchmark"
+name = "Shared helpers for bench/scale (sourced, not executed)"
+script = "bench/scale/lib.sh"
+about = """
+ssh/scp wrappers with a per-run known_hosts file, inventory accessors over terraform's
+JSON output, bounded wait loops, and the OpenSSL picker (macOS LibreSSL cannot mint
+the PKI). Sourced by every bench/scale script; running it directly does nothing.
+"""
+hidden = true
