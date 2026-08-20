@@ -4,6 +4,11 @@
 # material the shipped config fails closed by design, and bootstrap-cluster.sh
 # starts it only after pushing them.
 
+# The operator's key rides in here rather than as an hcloud_ssh_key resource:
+# API registration 409s when the key already exists in the project.
+ssh_authorized_keys:
+  - ${ssh_public_key}
+
 package_update: true
 packages:
   - curl

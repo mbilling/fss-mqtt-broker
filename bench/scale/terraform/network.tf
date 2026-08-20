@@ -26,8 +26,8 @@ resource "hcloud_network_subnet" "bench" {
   ip_range     = "10.99.1.0/24"
 }
 
-resource "hcloud_ssh_key" "admin" {
-  name       = "mqttd-bench-admin"
-  public_key = file(pathexpand(var.ssh_public_key_path))
-  labels     = local.common_labels
-}
+# NOTE: no hcloud_ssh_key resource, deliberately. Registering the key via the
+# API 409s ("SSH key not unique") whenever the operator already uploaded the
+# same key in the console — the first live run died exactly there. The public
+# key is injected through cloud-init (`ssh_authorized_keys`) instead, which is
+# indifferent to the project's key inventory.

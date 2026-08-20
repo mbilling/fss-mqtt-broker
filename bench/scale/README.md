@@ -16,8 +16,12 @@ workflows.
 2. **A Read & Write API token** for that project → `export HCLOUD_TOKEN=...` in
    the shell that runs the rig. Never committed, never a CI secret.
 3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key
-   (say `~/.ssh/hetzner`), `export SSH_KEY=~/.ssh/hetzner` — the rig uploads
-   `${SSH_KEY}.pub` via Terraform and dials every host with that identity.
+   (say `~/.ssh/hetzner`), `export SSH_KEY=~/.ssh/hetzner` — the rig injects
+   `${SSH_KEY}.pub` into every host via cloud-init and dials with that identity.
+   The key is never registered with the hcloud API, so it may freely also exist
+   in the project's console inventory. (Because no project key is attached to
+   the servers, Hetzner emails a root password per server — ignore it; the
+   cloud-init key is already in place.)
 4. Laptop tools: `terraform` ≥ 1.7 (or OpenTofu), `jq`, and — on macOS —
    `openssl@3` (`brew install openssl@3`; the system LibreSSL cannot mint the
    cluster PKI and `deploy/systemd/gen-certs.sh` refuses it loudly). The

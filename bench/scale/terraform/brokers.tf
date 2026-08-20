@@ -18,7 +18,6 @@ resource "hcloud_server" "broker" {
   image              = var.image
   location           = var.location
   placement_group_id = hcloud_placement_group.brokers.id
-  ssh_keys           = [hcloud_ssh_key.admin.id]
   firewall_ids       = [hcloud_firewall.bench.id]
   labels             = merge(local.common_labels, { role = "broker" })
 
@@ -28,8 +27,9 @@ resource "hcloud_server" "broker" {
   }
 
   user_data = templatefile("${path.module}/templates/cloud-init-broker.yaml.tftpl", {
-    mqttd_version = var.mqttd_version
-    mqttd_sha256  = var.mqttd_sha256
+    ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+    mqttd_version  = var.mqttd_version
+    mqttd_sha256   = var.mqttd_sha256
     # The SHIPPED unit, verbatim — the rig reuses the reference deployment
     # artifact instead of restating it, and a drop-in carries the bench deltas.
     mqttd_service_unit = file("${path.module}/../../../deploy/systemd/mqttd.service")
