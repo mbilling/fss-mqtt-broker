@@ -844,7 +844,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 331 test(s)
+## `crates/mqttd/src/lib.rs` — 332 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1160,6 +1160,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
+- `peer::tests::control_frames_jump_the_bulk_queue`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`
 - `reload::tests::a_config_reload_swaps_live_and_keeps_it_on_any_failure`
 - `reload::tests::a_failed_reload_keeps_the_running_policy`
