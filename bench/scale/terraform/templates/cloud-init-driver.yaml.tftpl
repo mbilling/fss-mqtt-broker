@@ -5,6 +5,10 @@
 # runs in the background so it overlaps cluster bring-up; run.sh waits on the
 # marker file before lane A.
 
+# Key via cloud-init, not hcloud_ssh_key — see cloud-init-broker.yaml.tftpl.
+ssh_authorized_keys:
+  - ${ssh_public_key}
+
 package_update: true
 packages:
   - curl

@@ -14,7 +14,6 @@ resource "hcloud_server" "driver" {
   server_type  = var.driver_server_type
   image        = var.image
   location     = var.location
-  ssh_keys     = [hcloud_ssh_key.admin.id]
   firewall_ids = [hcloud_firewall.bench.id]
   labels       = merge(local.common_labels, { role = "driver" })
 
@@ -24,9 +23,10 @@ resource "hcloud_server" "driver" {
   }
 
   user_data = templatefile("${path.module}/templates/cloud-init-driver.yaml.tftpl", {
-    build_bench   = count.index == 0
-    bench_git_ref = var.bench_git_ref
-    sysctl_conf   = file("${path.module}/files/sysctl-driver.conf")
+    ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+    build_bench    = count.index == 0
+    bench_git_ref  = var.bench_git_ref
+    sysctl_conf    = file("${path.module}/files/sysctl-driver.conf")
   })
 
   depends_on = [hcloud_network_subnet.bench]
