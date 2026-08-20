@@ -45,6 +45,19 @@ pump spawns each frame (`handle_durable_frame`), so a slow replica fsync does no
 next raft heartbeat frame at the dispatch level. The amplifier is the sheer count of
 per-message fsyncs and the contention they create, not in-order frame processing.
 
+> **Correction (2026-08-21, issue #358):** the paragraph above analyzed only the
+> **inbound** half of the link, where dispatch is indeed spawned per frame. The
+> **outbound** half was a single unprioritized FIFO per peer pair — one queue and
+> one flush-per-frame write loop shared by forwarded publishes, retained
+> snapshots (up to 16 MiB), replication data, *and* raft RPCs — so an
+> AppendEntries heartbeat with a 500 ms deadline could sit behind megabytes of
+> bulk data. Under spread-ownership durable load this churned lease-group
+> elections on healthy links (measured live on real hosts: ~2 elections/min,
+> `min peer links` flat) and starved replication acks into 5–10 s stalls. Fixed
+> by a control-priority lane in the link pump: raft RPCs and replication acks
+> drain first; same socket, same wire format. The send side is now covered by
+> the same reasoning this note applied to the receive side.
+
 ## Decision
 
 **Group-commit the follower replica apply.** Coalesce a burst of replication ops into a single

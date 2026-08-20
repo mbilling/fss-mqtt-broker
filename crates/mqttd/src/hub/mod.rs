@@ -1205,6 +1205,9 @@ pub enum HubCommand {
         conn_id: u64,
         /// Channel to send messages to that peer.
         tx: PeerOutbound,
+        /// The link's control lane: drained before `tx` by the link pump, for
+        /// raft RPCs and replication acks (issue #358).
+        ctl: PeerOutbound,
         /// The remote leaf certificate's serial from the mTLS handshake
         /// (ADR 0040 T4); `None` on a plaintext mesh.
         cert_serial: Option<Vec<u8>>,
@@ -1550,6 +1553,10 @@ struct Misplaced {
 struct Peer {
     conn_id: u64,
     tx: PeerOutbound,
+    /// The link's CONTROL lane (issue #358): raft RPCs and replication acks jump
+    /// the bulk queue here, so a heartbeat is never behind a retained snapshot.
+    /// Same TCP connection — the pump drains this receiver first (`biased`).
+    ctl: PeerOutbound,
     /// The peer-bus protocol version this LINK negotiated (ADR 0038). Frame choice
     /// is gated on it, not on what this build supports: the codec is strict, so
     /// sending a variant the peer does not know leaves it with an unknown variant
@@ -2545,10 +2552,11 @@ impl Hub {
                 node,
                 conn_id,
                 tx,
+                ctl,
                 cert_serial,
                 proto,
             } => {
-                self.peer_connected(node.clone(), conn_id, tx, cert_serial, proto);
+                self.peer_connected(node.clone(), conn_id, tx, ctl, cert_serial, proto);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -5209,6 +5217,7 @@ impl Hub {
         node: NodeId,
         conn_id: u64,
         tx: PeerOutbound,
+        ctl: PeerOutbound,
         cert_serial: Option<Vec<u8>>,
         proto: u32,
     ) {
@@ -5239,16 +5248,19 @@ impl Hub {
                 groups: self.shared_snapshot(),
             });
         }
-        // Register the link with the durable plane (consensus + replication) so its
-        // RPCs to this peer route over the same channel.
+        // Register the link with the durable plane: consensus RPCs ride the CONTROL
+        // lane (drained first by the pump — issue #358: a raft heartbeat behind a
+        // 16 MiB retained snapshot blows its 500 ms deadline and churns elections),
+        // bulk replication data rides the ordinary lane.
         if let Some(plane) = &self.durable_plane {
-            plane.register(&node, tx.clone());
+            plane.register(&node, ctl.clone(), tx.clone());
         }
         self.peers.insert(
             node,
             Peer {
                 conn_id,
                 tx,
+                ctl,
                 cert_serial,
                 interest_synced: false,
                 proto,
@@ -5347,15 +5359,31 @@ impl Hub {
     /// Route a durable-plane frame from `node`: spawn its handling (so a slow raft
     /// dispatch never blocks the actor loop) and send any reply back over the peer's
     /// link. A no-op when no durable plane is attached.
+    ///
+    /// Reply routing (issue #358): consensus replies and replication acks are the
+    /// frames a peer is actively BLOCKED on — openraft's 500 ms `AppendEntries`
+    /// deadline, the 5 s replication RPC bound — so they take the control lane past
+    /// any bulk backlog. Data-bearing replies (replica reads, key lists, catch-up)
+    /// stay on the bulk lane: putting multi-megabyte frames on the control lane
+    /// would recreate the very head-of-line blocking it exists to prevent.
     fn handle_durable_frame(&self, node: &NodeId, frame: PeerMessage) {
         let Some(plane) = self.durable_plane.clone() else {
             return;
         };
-        let reply_to = self.peers.get(node).map(|p| p.tx.clone());
+        // Queue-transit visibility (issue #358): the delta between the sender's
+        // "queued to link" stamp and this one is the whole link+hub-queue path.
+        if let PeerMessage::Replicate { req_id, .. } = &frame {
+            debug!(req_id, from = %node.0, "replicate: dequeued from hub queue");
+        }
+        let reply_to = self.peers.get(node).map(|p| (p.tx.clone(), p.ctl.clone()));
         tokio::spawn(async move {
             if let Some(reply) = plane.handle(frame).await {
-                if let Some(tx) = reply_to {
-                    let _ = tx.send(reply);
+                if let Some((tx, ctl)) = reply_to {
+                    let lane = match &reply {
+                        PeerMessage::RaftRpcReply { .. } | PeerMessage::ReplicateAck { .. } => &ctl,
+                        _ => &tx,
+                    };
+                    let _ = lane.send(reply);
                 }
             }
         });
@@ -6399,6 +6427,7 @@ mod tests {
         tx.send(HubCommand::PeerConnected {
             node: NodeId(node.into()),
             conn_id,
+            ctl: peer_tx.clone(), // tests observe both lanes through one receiver
             tx: peer_tx,
             cert_serial: None,
             // The current ceiling: a test peer speaks what this build speaks, so the
@@ -6422,6 +6451,7 @@ mod tests {
         tx.send(HubCommand::PeerConnected {
             node: NodeId(node.into()),
             conn_id,
+            ctl: peer_tx.clone(), // tests observe both lanes through one receiver
             tx: peer_tx,
             cert_serial: None,
             proto,

@@ -260,12 +260,25 @@ impl DurablePlane {
         !r.entries(key).is_empty() && r.complete(key) && r.group_current(group, &set)
     }
 
-    /// Register a peer's outbound link channel for *both* planes — consensus
+    /// Register a peer's outbound link channels for *both* planes — consensus
     /// (keyed by the peer's [`raft_id`]) and replication (keyed by its [`NodeId`]).
     /// Called when a peer link is established.
-    pub fn register(&self, node: &NodeId, tx: mpsc::UnboundedSender<PeerMessage>) {
-        self.network.register(raft_id(node), tx.clone());
-        self.transport.register(node.clone(), tx);
+    ///
+    /// The two planes get DIFFERENT lanes of the same link (issue #358): consensus
+    /// RPCs go to `ctl`, which the link pump drains before bulk traffic — a raft
+    /// heartbeat carries a 500 ms deadline and must never queue behind a forwarded
+    /// publish backlog or a 16 MiB retained snapshot. Replication data (`Replicate`
+    /// and the read/catch-up family) is exactly such bulk, so it keeps the ordinary
+    /// lane; its ACKS come back on the remote side's control lane via the hub's
+    /// reply routing.
+    pub fn register(
+        &self,
+        node: &NodeId,
+        ctl: mpsc::UnboundedSender<PeerMessage>,
+        bulk: mpsc::UnboundedSender<PeerMessage>,
+    ) {
+        self.network.register(raft_id(node), ctl);
+        self.transport.register(node.clone(), bulk);
     }
 
     /// Fail a peer on both planes when its link drops, so in-flight consensus RPCs
@@ -587,8 +600,8 @@ mod tests {
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
         // Each plane reaches the other peer via the other's outbound channel.
-        p1.register(&n("node-2"), out1_tx.clone());
-        p2.register(&n("node-1"), out2_tx.clone());
+        p1.register(&n("node-2"), out1_tx.clone(), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone(), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -678,8 +691,8 @@ mod tests {
         let (io1, io2) = tokio::io::duplex(256 * 1024);
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
-        p1.register(&n("node-2"), out1_tx.clone());
-        p2.register(&n("node-1"), out2_tx.clone());
+        p1.register(&n("node-2"), out1_tx.clone(), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone(), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
@@ -741,8 +754,8 @@ mod tests {
         let (io1, io2) = tokio::io::duplex(256 * 1024);
         let (out1_tx, out1_rx) = mpsc::unbounded_channel();
         let (out2_tx, out2_rx) = mpsc::unbounded_channel();
-        p1.register(&n("node-2"), out1_tx.clone());
-        p2.register(&n("node-1"), out2_tx.clone());
+        p1.register(&n("node-2"), out1_tx.clone(), out1_tx.clone());
+        p2.register(&n("node-1"), out2_tx.clone(), out2_tx.clone());
         spawn_link(p1.clone(), io1, out1_tx, out1_rx);
         spawn_link(p2.clone(), io2, out2_tx, out2_rx);
 
