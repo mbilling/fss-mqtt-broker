@@ -21,6 +21,10 @@ case "$MODE" in
 smoke)
 	SIZES=(1)
 	export SMOKE=1
+	# One driver: smoke proves the pipeline, not the 50k load, and a fresh
+	# Hetzner project's default dedicated-core limit (~16) does not fit the
+	# full 2-driver rig beside a broker (4 + 2x8 = 20 cores). 4 + 8 = 12 fits.
+	DRIVER_COUNT="${DRIVER_COUNT:-1}"
 	;;
 full)
 	shift || true
@@ -82,6 +86,7 @@ for N in "${SIZES[@]}"; do
 		${MQTTD_VERSION:+-var mqttd_version="$MQTTD_VERSION"} \
 		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
 		${SSH_KEY:+-var ssh_public_key_path="${SSH_KEY}.pub"} \
+		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "terraform apply failed for size $N"

@@ -28,12 +28,18 @@ workflows.
    `hcloud` CLI is optional but lets `teardown.sh` audit by label.
 5. Sanity-check current CCX23/CCX33 pricing and availability in `fsn1`
    (fallbacks: `nbg1`, `hel1` via the `location` variable).
+6. **Dedicated-core limit.** A fresh project's default cap (~16 dedicated
+   cores) fits `smoke` (1×CCX23 + 1×CCX33 = 12) but NOT the full curve —
+   5×CCX23 + 2×CCX33 = **36 cores** at the 5-node point. Before `full`,
+   request a limit increase in the console (Limits → dedicated vCPUs, ≥40);
+   a run that trips the cap fails at `terraform apply` with
+   `dedicated core limit exceeded` and tears itself down, costing cents.
 
 ## Cost
 
 | run | servers | ≈ wall time | ≈ cost |
 |---|---|---|---|
-| `smoke` | 1×CCX23 + 2×CCX33 | 20–30 min | <€0.50 |
+| `smoke` | 1×CCX23 + 1×CCX33 | 20–30 min | <€0.50 |
 | `full` (1+3+5) | up to 5×CCX23 + 2×CCX33, one size at a time | 4–5 h | €1.50–2 |
 | forgotten 5-node stack | — | per day | ≈€8.50 |
 
