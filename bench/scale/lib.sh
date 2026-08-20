@@ -18,7 +18,13 @@ die() {
 
 # ssh/scp with a per-run known_hosts file: fresh servers mean fresh host keys,
 # and polluting the operator's global known_hosts with short-lived IPs helps no one.
+# SSH_KEY=<path to private key> selects a non-default identity (e.g. ~/.ssh/hetzner);
+# run.sh derives the uploaded public key from it as ${SSH_KEY}.pub.
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=15)
+if [ -n "${SSH_KEY:-}" ]; then
+	[ -f "$SSH_KEY" ] || die "SSH_KEY=$SSH_KEY does not exist"
+	SSH_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+fi
 rssh() { # rssh <public-ip> <command...>
 	local ip="$1"
 	shift

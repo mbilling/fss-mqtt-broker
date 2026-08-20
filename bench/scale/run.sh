@@ -81,6 +81,7 @@ for N in "${SIZES[@]}"; do
 		-var node_count="$N" -var run_label="$STAMP" \
 		${MQTTD_VERSION:+-var mqttd_version="$MQTTD_VERSION"} \
 		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
+		${SSH_KEY:+-var ssh_public_key_path="${SSH_KEY}.pub"} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "terraform apply failed for size $N"

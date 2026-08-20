@@ -15,8 +15,9 @@ workflows.
    drivers).
 2. **A Read & Write API token** for that project → `export HCLOUD_TOKEN=...` in
    the shell that runs the rig. Never committed, never a CI secret.
-3. **An SSH keypair**; point the `ssh_public_key_path` Terraform variable at the
-   public half if it is not `~/.ssh/id_ed25519.pub`.
+3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key
+   (say `~/.ssh/hetzner`), `export SSH_KEY=~/.ssh/hetzner` — the rig uploads
+   `${SSH_KEY}.pub` via Terraform and dials every host with that identity.
 4. Laptop tools: `terraform` ≥ 1.7 (or OpenTofu), `jq`, and — on macOS —
    `openssl@3` (`brew install openssl@3`; the system LibreSSL cannot mint the
    cluster PKI and `deploy/systemd/gen-certs.sh` refuses it loudly). The
