@@ -1,0 +1,34 @@
+# Local live-observation stack for bench/scale runs (opt-in: OBSERVE=1 ./run.sh …).
+#
+# Runs on the OPERATOR's machine, not in the cloud: Prometheus receives
+# remote-written samples from a Grafana Alloy container on driver-1 (which
+# scrapes every broker over the PRIVATE network), arriving through a reverse
+# SSH tunnel the rig opens. Grafana serves the demo stack's mqttd dashboards.
+#
+# Nothing here touches the measurement path: the brokers only ever see
+# /metrics GETs from inside the private network, same as the collector's.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+      - --storage.tsdb.retention.time=2d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ../../../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../../demo/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

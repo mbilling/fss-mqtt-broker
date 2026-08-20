@@ -105,6 +105,11 @@ for N in "${SIZES[@]}"; do
 	}
 	INVENTORY="$RUN/inventory-$N.json"
 	(cd "$TFDIR" && "$TF" output -json inventory) >"$INVENTORY"
+	# Hetzner recycles public IPs BETWEEN SIZES of the same run; a host key
+	# recorded for the previous size's server at the same address makes
+	# accept-new refuse the new one. Every size starts with fresh servers,
+	# so it starts with a fresh slate.
+	: >"$RUN/known_hosts"
 	say "applied: $(jq -r '.brokers | length' "$INVENTORY") brokers + $(jq -r '.drivers | length' "$INVENTORY") drivers"
 
 	# cloud-init must have finished everywhere (it verifies the release binary's
@@ -142,8 +147,17 @@ for N in "${SIZES[@]}"; do
 		rssh "$(jq -r '.drivers[0].public_ip' "$INVENTORY")" "test -s /run/bench-driver-build-done"
 
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	# OBSERVE=1: live Grafana on the laptop, fed by an Alloy scraper on
+	# driver-1 through a reverse tunnel (bench/scale/observe.sh). Off by
+	# default so the unobserved measurement path stays byte-identical.
+	if [ "${OBSERVE:-0}" = 1 ]; then
+		"$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" || warn "observe attach failed — continuing unobserved"
+	fi
 	"$SCALE_DIR/run-curve.sh" "$RUN" "$INVENTORY"
 	"$SCALE_DIR/collect.sh" "$RUN" "$INVENTORY"
+	if [ "${OBSERVE:-0}" = 1 ]; then
+		"$SCALE_DIR/observe.sh" detach || true
+	fi
 
 	say "destroying size $N before the next point (fresh clusters only)"
 	(cd "$TFDIR" && "$TF" destroy -auto-approve \

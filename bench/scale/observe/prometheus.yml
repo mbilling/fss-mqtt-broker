@@ -1,0 +1,6 @@
+# Local Prometheus for bench/scale live observation. It scrapes NOTHING —
+# every sample arrives via remote_write from the Alloy agent on driver-1,
+# through the rig's reverse SSH tunnel. (An empty scrape config is valid.)
+global:
+  scrape_interval: 15s
+scrape_configs: []

@@ -964,3 +964,20 @@ JSON output, bounded wait loops, and the OpenSSL picker (macOS LibreSSL cannot m
 the PKI). Sourced by every bench/scale script; running it directly does nothing.
 """
 hidden = true
+
+[[task]]
+id = "scale-observe"
+group = "Benchmark"
+name = "Live Grafana for a scale-curve run (laptop + reverse tunnel)"
+script = "bench/scale/observe.sh"
+about = """
+Opt-in live observation of a bench/scale run (OBSERVE=1, or attach by hand): a
+local docker compose runs Grafana (:3000, the demo mqttd dashboards) and
+Prometheus (:9090, remote-write receiver); a Grafana Alloy container on
+driver-1 scrapes every broker over the PRIVATE network at 2s and remote-writes
+through a reverse SSH tunnel the rig opens. Zero agents and zero load on the
+measured broker hosts — the brokers only ever see /metrics GETs from inside
+the private net, same as the collector's.
+"""
+requires = ["docker", "ssh"]
+duration = "runs alongside a bench/scale run"
