@@ -122,15 +122,23 @@ jq -s '.' "$OUT"/preflight/broker*.json >/dev/null 2>&1 || warn "statusz not all
 say "[$N nodes] barrier probes on every broker host"
 BIN_PATH=$(rssh "$(driver_pub_ip 0)" "cat /run/bench-driver-build-done")
 [ -n "$BIN_PATH" ] || die "driver-1 build marker is empty — durable_bench binary missing"
+# Older markers held a path relative to the checkout — anchor it either way.
+case "$BIN_PATH" in /*) ;; *) BIN_PATH="/opt/mqtt-broker/$BIN_PATH" ;; esac
 BIN_NAME=$(basename "$BIN_PATH")
+# A real transient unit, not `nohup … &` over ssh — a backgrounded process
+# whose stdin is the ssh channel dies with the session.
 rssh "$(driver_pub_ip 0)" \
-	"cd $(dirname "$BIN_PATH") && (pgrep -f 'http.server 8093' >/dev/null || nohup python3 -m http.server 8093 >/dev/null 2>&1 &)"
+	"systemctl is-active bench-probe-server >/dev/null 2>&1 || systemd-run --unit bench-probe-server --working-directory=$(dirname "$BIN_PATH") python3 -m http.server 8093"
+# The server needs a beat to bind before anyone fetches from it.
+wait_for "probe file server on driver-1" 60 \
+	rssh "$(driver_pub_ip 0)" "curl -sfI -o /dev/null http://localhost:8093/$BIN_NAME"
 DRIVER1_PRIV=$(inv '.drivers[0].private_ip')
 mkdir -p "$OUT/probes"
 probe_one() {
 	local i="$1" ip
 	ip=$(broker_pub_ip "$i")
-	rssh "$ip" "curl -sf -o /usr/local/bin/durable_bench http://$DRIVER1_PRIV:8093/$BIN_NAME && chmod +x /usr/local/bin/durable_bench"
+	wait_for "probe binary fetch on broker $i" 120 \
+		rssh "$ip" "curl -sf -o /usr/local/bin/durable_bench http://$DRIVER1_PRIV:8093/$BIN_NAME && chmod +x /usr/local/bin/durable_bench"
 	# TMPDIR on the data-dir filesystem: the probe must measure the volume the
 	# broker commits on, not the OS temp mount.
 	rssh "$ip" "TMPDIR=/var/lib/mqttd-probe MQTTD_BENCH_BARRIER_OPS=$BARRIER_OPS /usr/local/bin/durable_bench device_barrier_floor --ignored --nocapture" \

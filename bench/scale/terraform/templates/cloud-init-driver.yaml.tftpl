@@ -5,9 +5,13 @@
 # runs in the background so it overlaps cluster bring-up; run.sh waits on the
 # marker file before lane A.
 
-# Key via cloud-init, not hcloud_ssh_key — see cloud-init-broker.yaml.tftpl.
+# Key via cloud-init, not hcloud_ssh_key — see cloud-init-broker.yaml.tftpl,
+# including the expired-root-password trap chpasswd/runcmd defuse below.
 ssh_authorized_keys:
   - ${ssh_public_key}
+
+chpasswd:
+  expire: false
 
 package_update: true
 packages:
@@ -27,6 +31,24 @@ write_files:
       ${indent(6, sysctl_conf)}
 
 runcmd:
+  - chage -d now root && passwd -l root
+  # Deterministic private-NIC config — see cloud-init-broker.yaml.tftpl.
+  - |
+    for i in $(seq 1 90); do
+      IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2}' | while read -r n; do
+        ip -o -4 addr show dev "$n" | grep -q . || { echo "$n"; break; }
+      done)
+      [ -n "$IFACE" ] && break
+      sleep 2
+    done
+    if [ -n "$IFACE" ]; then
+      printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      dhcp4: true\n' "$IFACE" \
+        > /etc/netplan/60-bench-private.yaml
+      chmod 600 /etc/netplan/60-bench-private.yaml
+      netplan apply
+    else
+      echo "no unconfigured NIC appeared for the private network (${private_ip})" >&2
+    fi
   - sysctl --system
   - systemctl enable --now docker
   - docker pull emqx/emqtt-bench:0.6.3
@@ -41,7 +63,7 @@ runcmd:
       cd /opt/mqtt-broker
       git checkout ${bench_git_ref}
       cargo test --release -p mqttd --test durable_bench --no-run --locked
-      BIN=$(ls -t target/release/deps/durable_bench-* | grep -v "\.d$" | head -1)
+      BIN=$(ls -t /opt/mqtt-broker/target/release/deps/durable_bench-* | grep -v "\.d$" | head -1)
       printf "%s\n" "$BIN" > /run/bench-driver-build-done
     ' > /var/log/bench-build.log 2>&1 &
 %{ endif ~}
