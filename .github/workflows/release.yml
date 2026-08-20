@@ -84,7 +84,7 @@ jobs:
         # mqttui is named explicitly: it lives in its own workspace with its own lockfile
         # (ADR 0056 §1), so it is not part of the default package set. mqttd-operator is
         # a workspace member (same lockfile) shipped as its own binary + image (0055-T8).
-        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator
+        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator mqttd-fips
 
       # Independent proof of byte-reproducibility: fully clean and rebuild from
       # the same tag, then assert the two binaries are identical.
@@ -97,6 +97,7 @@ jobs:
             echo "target/${{ matrix.target }}/release/mqttd"
             echo "target/${{ matrix.target }}/release/mqtt-bridge"
             echo "target/${{ matrix.target }}/release/mqttd-operator"
+            echo "target/${{ matrix.target }}/release/mqttd-fips"
             echo "tools/mqttui/target/${{ matrix.target }}/release/mqttui"
           }
           paths | while read -r b; do
@@ -106,7 +107,7 @@ jobs:
           # tools/mqttui/target, so leaving it would re-checksum the very same file and the
           # comparison would pass without a rebuild having happened — a check that cannot
           # fail is worse than no check, because it reports the property it never tested.
-          cargo clean
+          cargo clean # also removes target/fips-build (nested under target/)
           cargo clean --manifest-path tools/mqttui/Cargo.toml
           for b in $(paths); do
             if [ -e "$b" ]; then
@@ -114,7 +115,7 @@ jobs:
               exit 1
             fi
           done
-          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator
+          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator mqttd-fips
           paths | while read -r b; do
             sha256sum "$b" | awk '{print $1}' >> second.sha256
           done
@@ -123,7 +124,7 @@ jobs:
             paste first.sha256 second.sha256
             exit 1
           fi
-          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttui\n') first.sha256
+          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttd-fips\nmqttui\n') first.sha256
 
       - name: Stage artifact + checksum
         id: stage
@@ -133,6 +134,7 @@ jobs:
           BRIDGE_NAME="mqtt-bridge-${VERSION}-${{ matrix.target }}"
           UI_NAME="mqttui-${VERSION}-${{ matrix.target }}"
           OPERATOR_NAME="mqttd-operator-${VERSION}-${{ matrix.target }}"
+          FIPS_NAME="mqttd-fips-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
           cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
@@ -141,6 +143,9 @@ jobs:
           # the runtime attack surface for something nothing in the image can use.
           cp "tools/mqttui/target/${{ matrix.target }}/release/mqttui" "out/${UI_NAME}"
           cp "target/${{ matrix.target }}/release/mqttd-operator" "out/${OPERATOR_NAME}"
+          # The fips variant (ADR 0068 T4): a binary artifact only — the container
+          # images stay single-variant; a fips image is its own future decision.
+          cp "target/${{ matrix.target }}/release/mqttd-fips" "out/${FIPS_NAME}"
           # The container images copy from dist/<binary> (arch-native).
           cp "target/${{ matrix.target }}/release/mqttd" dist/mqttd
           cp "target/${{ matrix.target }}/release/mqtt-bridge" dist/mqtt-bridge
@@ -149,10 +154,12 @@ jobs:
           ( cd out && sha256sum "${BRIDGE_NAME}" > "${BRIDGE_NAME}.sha256" )
           ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
           ( cd out && sha256sum "${OPERATOR_NAME}" > "${OPERATOR_NAME}.sha256" )
+          ( cd out && sha256sum "${FIPS_NAME}" > "${FIPS_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"
           echo "operator_name=${OPERATOR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "fips_name=${FIPS_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # SLSA build provenance for the binary — what commit/workflow produced it.
@@ -164,6 +171,7 @@ jobs:
             out/${{ steps.stage.outputs.bridge_name }}
             out/${{ steps.stage.outputs.ui_name }}
             out/${{ steps.stage.outputs.operator_name }}
+            out/${{ steps.stage.outputs.fips_name }}
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -426,6 +434,26 @@ jobs:
           out.write_text(doc)
           print(f"VEX: {out} ({len(doc)} bytes)")
           PY
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+
+      # ── The exact validated-module claim, pinned at build time (ADR 0068 T4) ──
+      # The crypto-policy document deliberately quotes no certificate number from
+      # memory; this asset names the exact aws-lc-fips-sys version the fips
+      # binaries embed (from the tagged lockfile) and where its module's CMVP
+      # status is authoritatively documented.
+      - name: Emit fips module info
+        run: |
+          FIPS_SYS=$(grep -A1 'name = "aws-lc-fips-sys"' Cargo.lock | grep version | head -1 | cut -d'"' -f2)
+          {
+            echo "mqttd-fips ${VERSION} — validated-module claim"
+            echo "aws-lc-fips-sys: ${FIPS_SYS} (pinned by the tagged Cargo.lock)"
+            echo "module: AWS-LC FIPS; CMVP status and security policy:"
+            echo "  https://github.com/aws/aws-lc/blob/main/crypto/fipsmodule/FIPS.md"
+            echo "The MODULE carries the validation; the product is not itself certified."
+            echo "Policy: docs/compliance/crypto-policy.md at this tag."
+          } > "assets/fips-module-${VERSION}.txt"
+          cat "assets/fips-module-${VERSION}.txt"
         env:
           VERSION: ${{ steps.v.outputs.version }}
 
