@@ -14,8 +14,58 @@ permissions:
   contents: read
 
 jobs:
+  # ── What changed? Docs-only diffs skip the build/test lanes (ADR-free
+  # plumbing): a change touching ONLY prose (root *.md, docs/** except the
+  # gate-input test-inventory, .github markdown) needs the docs gates, not a
+  # 25-minute pipeline. Jobs skipped by this condition report conclusion
+  # `skipped`, which SATISFIES the main ruleset's required checks — unlike
+  # workflow-level path filters, which would leave required checks missing and
+  # block the merge. Fail-open: any ambiguity (odd event shape, rename, empty
+  # diff) counts as code.
+  changes:
+    name: what changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; echo "no usable base — fail open"; exit 0
+          fi
+          FILES=$(git diff --name-only "$BASE"...HEAD || true)
+          if [ -z "$FILES" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; echo "empty diff — fail open"; exit 0
+          fi
+          echo "$FILES"
+          CODE=false
+          while IFS= read -r f; do
+            case "$f" in
+              docs/test-inventory.md) CODE=true; break ;;      # a gate INPUT, not prose
+              docs/*) ;;                                        # prose
+              *.md) case "$f" in */*) CODE=true; break ;; *) ;; esac ;;  # root-level .md only
+              .github/*.md|.github/ISSUE_TEMPLATE/*) ;;         # templates/prose
+              LICENSE) ;;
+              *) CODE=true; break ;;
+            esac
+          done <<< "$FILES"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "verdict: code=$CODE"
+
   test:
     name: build, test, lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Hard ceiling ~3x the normal duration: a hung apt mirror once held this
     # workflow's default 6-hour leash (2026-08-18); no job gets that again.
@@ -72,6 +122,8 @@ jobs:
 
   fips:
     name: fips variant (compile + posture tests)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # ADR 0068 T3: an untested variant is a liability with a certificate on it.
     # Per-PR: the whole graph compiles in fips mode and the posture tests run
@@ -126,6 +178,8 @@ jobs:
 
   interop:
     name: foreign-client interop (mosquitto + paho)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -239,6 +293,8 @@ jobs:
 
   mqttui:
     name: mqttui (separate workspace)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -289,6 +345,8 @@ jobs:
 
   supply-chain:
     name: supply-chain audit
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -307,6 +365,8 @@ jobs:
 
   helm:
     name: helm chart (lint + template + kubeconform)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
