@@ -21,10 +21,14 @@ case "$MODE" in
 smoke)
 	SIZES=(1)
 	export SMOKE=1
-	# One driver: smoke proves the pipeline, not the 50k load, and a fresh
-	# Hetzner project's default dedicated-core limit (~16) does not fit the
-	# full 2-driver rig beside a broker (4 + 2x8 = 20 cores). 4 + 8 = 12 fits.
+	# One driver: smoke proves the pipeline, not the 50k load. And SHARED-vCPU
+	# types: a fresh Hetzner project's dedicated-core limit can be below 12,
+	# and smoke's job (terraform, cloud-init, PKI, lanes, teardown) does not
+	# need dedicated cores — only the published measurement runs do, and those
+	# require the limit increase the README describes anyway. Overridable.
 	DRIVER_COUNT="${DRIVER_COUNT:-1}"
+	BROKER_TYPE="${BROKER_TYPE:-cpx32}"
+	DRIVER_TYPE="${DRIVER_TYPE:-cpx42}"
 	;;
 full)
 	shift || true
@@ -57,6 +61,12 @@ teardown() {
 			"Destroy with: bench/scale/teardown.sh" >&2
 		exit "$rc"
 	fi
+	# A failed run's evidence dies with its servers — pull journals/cloud-init
+	# logs off every host FIRST (best-effort, bounded by ssh's own timeouts).
+	if [ "$rc" -ne 0 ] && [ -n "${CURRENT_SIZE:-}" ] && [ -f "$RUN/inventory-$CURRENT_SIZE.json" ]; then
+		say "capturing failure evidence off the hosts before destroying them"
+		"$SCALE_DIR/collect.sh" "$RUN" "$RUN/inventory-$CURRENT_SIZE.json" || true
+	fi
 	say "tearing down (trap; exit code was $rc)"
 	if ! (cd "$TFDIR" && "$TF" destroy -auto-approve \
 		-var node_count="${CURRENT_SIZE:-1}" -var run_label="$STAMP" >>"$RUN/teardown.log" 2>&1); then
@@ -87,6 +97,8 @@ for N in "${SIZES[@]}"; do
 		${BENCH_GIT_REF:+-var bench_git_ref="$BENCH_GIT_REF"} \
 		${SSH_KEY:+-var ssh_public_key_path="${SSH_KEY}.pub"} \
 		${DRIVER_COUNT:+-var driver_count="$DRIVER_COUNT"} \
+		${BROKER_TYPE:+-var broker_server_type="$BROKER_TYPE"} \
+		${DRIVER_TYPE:+-var driver_server_type="$DRIVER_TYPE"} \
 		>"$RUN/tf-apply-$N.log" 2>&1) || {
 		tail -30 "$RUN/tf-apply-$N.log" >&2
 		die "terraform apply failed for size $N"
@@ -97,10 +109,31 @@ for N in "${SIZES[@]}"; do
 
 	# cloud-init must have finished everywhere (it verifies the release binary's
 	# checksum; a failure there surfaces here, loudly).
-	for ip in $(jq -r '.brokers[].public_ip, .drivers[].public_ip' "$INVENTORY"); do
+	# Exit 2 = "degraded done": recoverable warnings only — and Hetzner's own
+	# vendor-data trips deprecation warnings on every boot, so 2 is the NORMAL
+	# outcome here. Exit 1 (error) is a real failure — most often the private-net
+	# attach race (cloud-init's init-local boots while the network attachment is
+	# still settling and Tracebacks on the half-written metadata). A reboot after
+	# `cloud-init clean` re-runs everything against settled metadata, so each
+	# host gets exactly one such retry before the run gives up.
+	CI_OK='cloud-init status --wait >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ]'
+	for pair in $(jq -r '(.brokers[], .drivers[]) | "\(.public_ip)=\(.private_ip)"' "$INVENTORY"); do
+		ip="${pair%%=*}" priv="${pair##*=}"
 		wait_for "ssh on $ip" 300 rssh "$ip" "true"
-		rssh "$ip" "cloud-init status --wait >/dev/null" ||
-			die "cloud-init failed on $ip — check /var/log/cloud-init-output.log there"
+		if ! rssh "$ip" "$CI_OK"; then
+			warn "cloud-init errored on $ip — one clean+reboot retry (private-net attach race)"
+			rssh "$ip" "cloud-init clean --logs; reboot" || true
+			# cloud-init clean makes the next boot regenerate SSH HOST KEYS; drop
+			# the stale entry or every reconnect is refused as a key mismatch.
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			sleep 15
+			wait_for "ssh on $ip (after retry reboot)" 300 rssh "$ip" "true"
+			rssh "$ip" "$CI_OK" ||
+				die "cloud-init failed on $ip even after a clean reboot — check /var/log/cloud-init-output.log there"
+		fi
+		# The lanes ride the private network; do not proceed until this host's
+		# private address is actually configured.
+		wait_for "private ip $priv on $ip" 180 rssh "$ip" "ip -4 addr show | grep -qF $priv"
 	done
 
 	# lane A's driver binary: wait for driver-1's background cargo build.

@@ -28,6 +28,7 @@ resource "hcloud_server" "broker" {
 
   user_data = templatefile("${path.module}/templates/cloud-init-broker.yaml.tftpl", {
     ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+    private_ip     = local.broker_ips[count.index]
     mqttd_version  = var.mqttd_version
     mqttd_sha256   = var.mqttd_sha256
     # The SHIPPED unit, verbatim — the rig reuses the reference deployment

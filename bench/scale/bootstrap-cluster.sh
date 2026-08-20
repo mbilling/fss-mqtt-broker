@@ -131,7 +131,7 @@ done
 # Founder: no seeds, floor 1 (or it can never come up alone).
 push_node 0 1 ""
 rssh "$(broker_pub_ip 0)" "systemctl restart mqttd"
-wait_ready 0 120
+wait_ready 0 300
 say "founder $(broker_node_id 0) is READY"
 
 for ((i = 1; i < N; i++)); do
