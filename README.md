@@ -1644,8 +1644,19 @@ on the machine it was run on, an acked durable QoS 1 publish costs ~28 ms at p50
 the same publish to a **clean** session costs ~0.03 ms — the price of the guarantee — and
 the durable rate is pinned by that host's per-volume disk barrier, not by the broker's
 CPU. It is **single-host and dev-grade**: three broker processes and the load driver on
-8 cores and one disk. It is **not** the multi-host result, and it deliberately publishes
-no throughput-vs-node-count curve (ADR 0048 §2).
+8 cores and one disk.
+
+**The multi-host scaling curve** (ADR 0048 §2 — the same workload against real 1-, 3- and
+5-node clusters, one dedicated host and one disk per broker) is published in
+[docs/benchmarks/SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md), measured against the
+signed `v1.0.1` release. In one line each: `$share` fan-out scaled ~4.6× from one node to
+five with the p99 bound *tightening* (100→25 ms) and every rung driver-limited (floors,
+not capacities); durable QoS 1 runs at ~2.0k acked msg/s on one node (p99 0.82 ms
+uncontended) and ~0.6k across a 3-node quorum — the measured price of ack-after-quorum,
+with ownership capacity bounded by the voter cap, not node count; 50k connections cost a
+flat 19.3 KiB each at every size. The curve publishes its own defects: it caught, fixed
+and re-measured #358 (v1.0.0's durable stall in production topology) and isolated the
+still-open 5-node formation instability (#368).
 
 ## Architecture decisions
 
