@@ -175,6 +175,27 @@ lane_a() { # lane_a <name> <publishers> <window> <subs>
 }
 lane_a sat 48 8 48
 lane_a lat "$N" 1 "$N"
+# ADR 0072 tier showcase: the SAME saturating workload with the publisher
+# selecting a weaker ack per message (mqttd-durability property, MQTT 5).
+# Same brokers, same sessions-spread shape — only the ack's meaning moves.
+lane_a_tier() { # lane_a_tier <tier>
+	local t="$1"
+	snapshot_metrics "$OUT/laneA" "before-tier-$t"
+	start_cpu_sampling "$OUT/laneA/cpu-tier-$t" $((A_REPS * (A_SECS + A_WARMUP + 10)))
+	rssh "$(driver_pub_ip 0)" \
+		"MQTTD_BENCH_BROKERS=$BROKERS_LIST MQTTD_BENCH_HEALTH=$HEALTH_LIST MQTTD_BENCH_NODE_IDS=$IDS_LIST \
+		 MQTTD_BENCH_SPREAD=1 MQTTD_BENCH_TIER=$t MQTTD_BENCH_PUBLISHERS=48 MQTTD_BENCH_WINDOW=8 \
+		 MQTTD_BENCH_SUBS=48 MQTTD_BENCH_SECS=$A_SECS MQTTD_BENCH_WARMUP_SECS=$A_WARMUP \
+		 MQTTD_BENCH_REPS=$A_REPS $BIN_PATH durable_path_floor --ignored --nocapture" \
+		>"$OUT/laneA/tier-$t.txt" 2>&1 || warn "lane A tier $t exited nonzero — kept output"
+	stop_cpu_sampling
+	snapshot_metrics "$OUT/laneA" "after-tier-$t"
+	say "  lane A tier $t done"
+}
+if [ "${SMOKE:-0}" != 1 ]; then
+	lane_a_tier local
+	lane_a_tier relaxed
+fi
 
 # ── switch the brokers to the non-durable posture for lanes B and C ──────────
 say "[$N nodes] switching brokers to non-durable posture (lanes B/C parity)"
