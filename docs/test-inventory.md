@@ -844,7 +844,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 332 test(s)
+## `crates/mqttd/src/lib.rs` — 333 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -964,6 +964,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::statusz_reports_the_derived_write_floor_and_its_source`
 - `health::tests::the_healthy_majority_is_not_quarantined_by_foreign_gossip`
 - `health::tests::unknown_paths_are_404`
+- `health::tests::waits_for_the_full_request_head_before_responding`
 - `http_auth::tests::a_non_password_credential_abstains_without_calling_the_hook`
 - `http_auth::tests::an_http_url_is_refused_unless_explicitly_allowed`
 - `http_auth::tests::an_unreachable_hook_fails_closed`
