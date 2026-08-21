@@ -28,6 +28,9 @@ fi
 rssh() { # rssh <public-ip> <command...>
 	local ip="$1"
 	shift
+	# Refuse to fall back to ~/.ssh/known_hosts: an unset RUN once made rig ssh
+	# traffic rewrite the operator's DEFAULT known_hosts (evicting github.com).
+	[ -n "${RUN:-}" ] || die "rssh called with RUN unset — refusing to touch the default known_hosts"
 	ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" "root@$ip" "$@"
 }
 rscp() { # rscp <src...> <public-ip>:<dst>  (or <public-ip>:<src> <dst>)

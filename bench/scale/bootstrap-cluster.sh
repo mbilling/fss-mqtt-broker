@@ -16,6 +16,7 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 RUN="${1:?usage: bootstrap-cluster.sh <run-dir> <inventory.json> <durable|clean>}"
+# shellcheck disable=SC2034 # consumed by lib.sh's inv() helper
 INVENTORY="${2:?inventory.json}"
 MODE="${3:?durable|clean}"
 

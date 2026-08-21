@@ -59,6 +59,9 @@ runcmd:
       export HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
       curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
       . /root/.cargo/env
+      # The attach-race retry (cloud-init clean + reboot) re-runs this script;
+      # a partial clone from the first boot must not wedge the second.
+      rm -rf /opt/mqtt-broker
       git clone https://github.com/mbilling/fss-mqtt-broker /opt/mqtt-broker
       cd /opt/mqtt-broker
       git checkout ${bench_git_ref}
