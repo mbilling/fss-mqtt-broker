@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 260 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 261 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -249,6 +249,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_log::tests::a_durable_session_log_survives_a_full_restart_via_persisted_replicas`
 - `cluster_log::tests::a_foreign_replica_schema_version_fails_closed`
 - `cluster_log::tests::a_groups_fence_does_not_reject_another_groups_older_epoch`
+- `cluster_log::tests::a_local_tier_append_returns_on_the_owners_durability_alone`
 - `cluster_log::tests::a_replica_keeps_the_newer_version_of_an_offset`
 - `cluster_log::tests::an_empty_recommit_still_requires_a_write_quorum`
 - `cluster_log::tests::an_empty_recovered_log_still_fences_the_old_owner`
@@ -845,7 +846,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 333 test(s)
+## `crates/mqttd/src/lib.rs` — 335 test(s)
 
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1035,6 +1036,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_rehome_close_publishes_the_clients_will`
 - `hub::tests::a_rehomed_finite_expiry_session_reports_its_unpersisted_deadline`
 - `hub::tests::a_rehomed_session_is_not_closed_again_within_the_cooldown`
+- `hub::tests::a_relaxed_publish_acks_while_its_append_is_still_parked`
 - `hub::tests::a_remote_retained_commit_is_committed_by_the_owner`
 - `hub::tests::a_remote_retained_update_applies_monotonically_per_topic`
 - `hub::tests::a_reopened_cache_holding_a_value_the_cluster_cleared_drops_it`
@@ -1137,6 +1139,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::takeover_replaces_connection_and_ignores_stale_detach`
 - `hub::tests::the_apply_path_stays_silent_once_the_window_has_closed`
 - `hub::tests::the_backlog_byte_bound_sheds_acked_entries_and_counts_them`
+- `hub::tests::the_durability_property_is_inert_without_the_operator_opt_in`
 - `hub::tests::the_fanout_and_snapshot_carry_the_deadline`
 - `hub::tests::the_grant_sweep_removes_revoked_subscriptions_without_disconnecting`
 - `hub::tests::the_identity_sweep_evicts_revoked_sessions_and_spares_the_rest`

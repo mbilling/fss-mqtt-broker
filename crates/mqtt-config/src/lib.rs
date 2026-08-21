@@ -395,6 +395,16 @@ pub struct Durable {
     /// explicitly off (`enabled = false`) never needs it: the lightweight in-memory
     /// store is an explicit choice already.
     pub allow_ephemeral: bool,
+    /// Opt in to **per-message durability selection** (`MQTTD_ALLOW_RELAXED_PUBLISH`,
+    /// presence = on; ADR 0072): an MQTT 5 publisher may weaken ITS OWN ack's
+    /// meaning per message via the `mqttd-durability` user property
+    /// (`local` = ack after the owner's fsync without the quorum wait;
+    /// `relaxed` = ack after accept+submit, durability best-effort). **Off by
+    /// default**: without it the property is ignored and every publish gets the
+    /// full ack-after-quorum path — strictly stronger than requested, never
+    /// weaker. The reservation this delivers is ADR 0018's: a relaxed mode "MAY
+    /// be offered later as an opt-in, loudly logged".
+    pub allow_relaxed_publish: bool,
 }
 
 /// Online backup + restore of the durable state ([ADR 0062](../../../docs/adr/0062-online-backup-and-restore.md)).
@@ -471,6 +481,7 @@ impl Default for Durable {
             store_max_bytes: None,
             min_replicas: MinReplicas::Majority,
             allow_ephemeral: false,
+            allow_relaxed_publish: false,
         }
     }
 }
@@ -1140,6 +1151,11 @@ impl Config {
         if get("MQTTD_ALLOW_EPHEMERAL_DURABILITY").is_some() {
             self.durable.allow_ephemeral = true;
         }
+        // Same presence-=-on rule (ADR 0072): weakening ack semantics, even
+        // publisher-requested, must not hinge on parsing "false".
+        if get("MQTTD_ALLOW_RELAXED_PUBLISH").is_some() {
+            self.durable.allow_relaxed_publish = true;
+        }
 
         // -- limits --
         on!("MQTTD_MAX_CONNECTIONS", v, {
@@ -1537,6 +1553,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_MIN_REPLICAS",
     "MQTTD_STORE_MAX_BYTES",
     "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
+    "MQTTD_ALLOW_RELAXED_PUBLISH",
     // limits
     "MQTTD_MAX_CONNECTIONS",
     "MQTTD_MAX_CONNECTIONS_PER_IP",
@@ -2024,7 +2041,8 @@ mod tests {
             "MQTTD_ALLOW_ANONYMOUS"
             | "MQTTD_OIDC_ALLOW_HTTP"
             | "MQTTD_RESTORE_PARTIAL_ACCEPT_DATA_LOSS"
-            | "MQTTD_ALLOW_EPHEMERAL_DURABILITY" => "1",
+            | "MQTTD_ALLOW_EPHEMERAL_DURABILITY"
+            | "MQTTD_ALLOW_RELAXED_PUBLISH" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
@@ -2158,8 +2176,9 @@ mod tests {
         assert_eq!(
             seen.len(),
             // 79 before #249 (which itself included #241's four backlog/in-flight knobs)
-            // plus this change's six MQTTD_BACKUP_* / MQTTD_RESTORE_* variables.
-            85,
+            // plus this change's six MQTTD_BACKUP_* / MQTTD_RESTORE_* variables,
+            // plus MQTTD_ALLOW_RELAXED_PUBLISH (ADR 0072).
+            86,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

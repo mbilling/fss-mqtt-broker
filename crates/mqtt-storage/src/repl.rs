@@ -78,6 +78,62 @@ pub enum ReplError {
     Backend(String),
 }
 
+/// The publisher-selected durability tier of one append (ADR 0072): what the
+/// ack the caller is gating on will MEAN. Selected per message via the
+/// `mqttd-durability` MQTT 5 user property, honored only when the operator
+/// opted in (`MQTTD_ALLOW_RELAXED_PUBLISH`); everything else is [`Quorum`].
+///
+/// Not a CAP-theorem mode: partition behavior is unchanged. This trades
+/// durability strength for ack latency, per message, at the publisher's
+/// explicit request.
+///
+/// [`Quorum`]: DurabilityTier::Quorum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DurabilityTier {
+    /// Today's contract, the default: the ack means fsync'd on a majority of
+    /// the replica set, cluster-wide.
+    #[default]
+    Quorum,
+    /// Ack once the OWNER's own copy is durable (one fsync, no quorum wait);
+    /// replication to followers continues best-effort. Losing the owner's disk
+    /// before replication completes loses the message.
+    Local,
+    /// Ack after accept+submit: every durable write is queued and proceeds —
+    /// full quorum semantics, best-effort — but the ack does not wait for any
+    /// of it. Handled above the store layer (the ack gate); at this layer it
+    /// appends exactly like [`Quorum`](DurabilityTier::Quorum).
+    Relaxed,
+}
+
+impl DurabilityTier {
+    /// The `mqttd-durability` user-property value naming this tier, and
+    /// [`parse`](Self::parse)'s accepted spellings.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quorum => "quorum",
+            Self::Local => "local",
+            Self::Relaxed => "relaxed",
+        }
+    }
+
+    /// Parse a property value. Unknown values read as `None` — the caller
+    /// falls back to [`Quorum`](Self::Quorum), never to something weaker than
+    /// the publisher could have meant.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "quorum" => Some(Self::Quorum),
+            "local" => Some(Self::Local),
+            "relaxed" => Some(Self::Relaxed),
+            _ => None,
+        }
+    }
+}
+
+/// The `mqttd-durability` user-property key (ADR 0072).
+pub const DURABILITY_PROPERTY: &str = "mqttd-durability";
+
 /// One record in a key's log, together with the offset the log assigned it on
 /// [`append`](ReplicatedLog::append).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +161,20 @@ pub trait ReplicatedLog: Send + Sync + std::fmt::Debug {
     /// must not release a QoS≥1 PUBACK. A non-owner returns [`ReplError::NotOwner`];
     /// a writer that cannot reach quorum returns [`ReplError::NoQuorum`].
     async fn append(&self, key: &Self::Key, record: Vec<u8>) -> Result<Offset, ReplError>;
+
+    /// [`append`](Self::append) with a publisher-selected durability tier
+    /// (ADR 0072). The default ignores the tier and performs the full
+    /// quorum-durable append — a backend without tiers can never be WEAKER
+    /// than asked. A clustered backend maps [`DurabilityTier::Local`] to
+    /// "return once the owner's own copy is durable; replicate best-effort".
+    async fn append_tiered(
+        &self,
+        key: &Self::Key,
+        record: Vec<u8>,
+        _tier: DurabilityTier,
+    ) -> Result<Offset, ReplError> {
+        self.append(key, record).await
+    }
 
     /// Read entries with offset strictly greater than `after`, up to `limit`, in
     /// offset order. `after = 0` starts from the beginning of the retained log.

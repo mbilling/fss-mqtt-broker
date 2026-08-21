@@ -80,6 +80,11 @@ impl From<ReplError> for StorageError {
 pub struct ReplicatedSessionStore<L: ReplicatedLog<Key = String>> {
     log: L,
     limits: QueueLimits,
+    /// ADR 0072: when true, a message carrying the `mqttd-durability` user
+    /// property selects its append's durability tier (the operator's
+    /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in). Off = every append is
+    /// quorum-durable regardless of the property.
+    tier_selection: bool,
 }
 
 impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
@@ -88,12 +93,25 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
         Self {
             log,
             limits: QueueLimits::default(),
+            tier_selection: false,
         }
+    }
+
+    /// Honor per-message durability tiers (ADR 0072) — the operator's
+    /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in, threaded to the store.
+    #[must_use]
+    pub fn with_tier_selection(mut self, on: bool) -> Self {
+        self.tier_selection = on;
+        self
     }
 
     /// Wrap `log` with explicit per-session queue limits.
     pub fn with_limits(log: L, limits: QueueLimits) -> Self {
-        Self { log, limits }
+        Self {
+            log,
+            limits,
+            tier_selection: false,
+        }
     }
 
     fn queue_key(client: &ClientId) -> String {
@@ -237,9 +255,26 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             }
         }
 
+        // ADR 0072: the message's own `mqttd-durability` property selects the
+        // append's tier — only when the operator opted in, and never weaker
+        // than asked (unknown values fall back to the quorum default). The
+        // property rides IN the record, so a remote-owned append derives the
+        // same tier on the owning node with no extra plumbing.
+        let tier = if self.tier_selection {
+            message
+                .app
+                .user_properties
+                .iter()
+                .rev() // last occurrence wins, matching wire order semantics
+                .find(|(k, _)| k == crate::repl::DURABILITY_PROPERTY)
+                .and_then(|(_, v)| crate::repl::DurabilityTier::parse(v))
+                .unwrap_or_default()
+        } else {
+            crate::repl::DurabilityTier::Quorum
+        };
         let offset = self
             .log
-            .append(&qkey, encode_queued(message, expiry_at))
+            .append_tiered(&qkey, encode_queued(message, expiry_at), tier)
             .await?;
         Ok(Enqueued::Stored { offset, evicted })
     }

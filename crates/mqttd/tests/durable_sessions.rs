@@ -136,6 +136,7 @@ async fn start_durable_node_capped(
         &std::collections::BTreeMap::new(),
         None,
         commit_delay,
+        false,
     )
     .await;
     let plane_observer = plane.clone();

@@ -31,7 +31,7 @@ use crate::lease_store::LeaseStore;
 use crate::placement::{group_of_key, Placement};
 use crate::NodeId;
 use async_trait::async_trait;
-use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
+use mqtt_storage::repl::{DurabilityTier, LogEntry, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -470,6 +470,22 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> ReplicatedLog for Gr
         // over and under the same placement-lock acquisition — see the note there for why
         // a separate pre-check here was a race. This is the ONLY caller that gates.
         self.log_for_key(key, true).await?.append(key, record).await
+    }
+
+    async fn append_tiered(
+        &self,
+        key: &String,
+        record: Vec<u8>,
+        tier: DurabilityTier,
+    ) -> Result<Offset, ReplError> {
+        // The min-replicas write floor still gates EVERY tier: `Local` weakens
+        // what the ack waits for, not which replica sets are allowed to accept
+        // writes — a group below the floor refuses relaxed publishes too
+        // (ADR 0072; the floor is an operator safety rail, not a latency knob).
+        self.log_for_key(key, true)
+            .await?
+            .append_tiered(key, record, tier)
+            .await
     }
 
     async fn read(
