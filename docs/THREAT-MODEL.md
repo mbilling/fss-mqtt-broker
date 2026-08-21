@@ -1,6 +1,6 @@
 # Threat model
 
-**Verified against `v1.0.1` (2026-08-21).** This is the one-document answer to "what
+**Verified against `v1.0.2` (2026-08-21).** This is the one-document answer to "what
 is your threat model?" (ADR 0066 T1). It consolidates — it does not invent: every
 mitigation row names the ADR that decided it and the code that enforces it, and every
 accepted risk is quoted from the record that accepted it. The maintenance rule: a PR
