@@ -20,8 +20,7 @@
 //! the hub actor's serial command loop. Wiring it into `mqttd`'s peer pump is the
 //! final integration step (4f).
 
-use crate::cluster_log::{ReplOp, ReplicaState};
-use crate::lease::Epoch;
+use crate::cluster_log::ReplicaState;
 use crate::lease_group::LeaseRaft;
 use crate::node_registry::raft_id;
 use crate::peer::PeerMessage;
@@ -35,7 +34,22 @@ use tokio::sync::{mpsc, oneshot};
 
 /// One queued replica write: the holder's `op` at `epoch`, plus a one-shot to return
 /// whether it was accepted (durably applied / not fenced) to the waiting frame.
-type ReplicaWrite = (Epoch, ReplOp, oneshot::Sender<bool>);
+/// Shared with the owner path (ADR 0071): [`crate::cluster_log::DurableWrite`].
+type ReplicaWrite = crate::cluster_log::DurableWrite;
+
+/// Counters the durable-write serializer publishes (ADR 0071): enough to see
+/// batching working (ops/batches = mean batch size) and the queue moving,
+/// without pulling an observability dependency into this crate — `mqttd` polls
+/// these into its Prometheus registry.
+#[derive(Debug, Default)]
+pub struct WriterStats {
+    /// Fsync'd batches committed (each is exactly one `Durability::Immediate` txn).
+    pub batches: std::sync::atomic::AtomicU64,
+    /// Ops applied across all batches (owner appends + follower replica applies).
+    pub ops: std::sync::atomic::AtomicU64,
+    /// Largest single batch since boot.
+    pub max_batch: std::sync::atomic::AtomicU64,
+}
 
 /// Serves a [`PeerMessage::ReplicaCatchUp`] request on the **owner** side
 /// ([ADR 0043](../../../docs/adr/0043-elastic-cluster-resize.md) P1): re-commit
@@ -85,6 +99,8 @@ pub struct DurablePlane {
     /// the writer outlives the plane and the file lock is never released, so a restart
     /// over the same data dir cannot reopen it (ADR 0018 phase 5 / ADR 0019 shutdown).
     _writer: Arc<AbortOnDrop>,
+    /// The serializer's counters (ADR 0071), polled into metrics by `mqttd`.
+    writer_stats: Arc<WriterStats>,
 }
 
 /// Aborts a spawned task when dropped — used to bound the replica-writer's lifetime to the
@@ -114,7 +130,8 @@ impl DurablePlane {
         replicas: Arc<Mutex<ReplicaState>>,
         placement: Arc<RwLock<Placement>>,
     ) -> Self {
-        let (replica_tx, writer) = spawn_replica_writer(replicas.clone());
+        let writer_stats = Arc::new(WriterStats::default());
+        let (replica_tx, writer) = spawn_replica_writer(replicas.clone(), writer_stats.clone());
         Self {
             raft,
             network,
@@ -124,7 +141,24 @@ impl DurablePlane {
             catch_up: Arc::new(Mutex::new(None)),
             placement,
             _writer: Arc::new(AbortOnDrop(writer)),
+            writer_stats,
         }
+    }
+
+    /// A sender into the node-wide durable-write serializer, for the OWNER path
+    /// (ADR 0071): `ClusterLog::with_owner_writer` routes local acks through it
+    /// so concurrent owner appends and follower replica applies group-commit
+    /// into shared fsync'd transactions.
+    #[must_use]
+    pub fn owner_writer(&self) -> mpsc::UnboundedSender<crate::cluster_log::DurableWrite> {
+        self.replica_tx.clone()
+    }
+
+    /// The serializer's counters (ADR 0071) — batches, ops, max batch size —
+    /// for the metrics poller.
+    #[must_use]
+    pub fn writer_stats(&self) -> Arc<WriterStats> {
+        self.writer_stats.clone()
     }
 
     /// Wire the owner-side catch-up server (ADR 0043 P1) — the group-routed
@@ -454,10 +488,12 @@ impl DurablePlane {
 /// redb handle for a clean restart); the loop also exits on its own when every sender drops.
 fn spawn_replica_writer(
     replicas: Arc<Mutex<ReplicaState>>,
+    stats: Arc<WriterStats>,
 ) -> (
     mpsc::UnboundedSender<ReplicaWrite>,
     tokio::task::AbortHandle,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
     let (tx, mut rx) = mpsc::unbounded_channel::<ReplicaWrite>();
     let join = tokio::spawn(async move {
         while let Some(first) = rx.recv().await {
@@ -474,6 +510,9 @@ fn spawn_replica_writer(
             }
             // Run the (fsyncing) batch apply off the async worker; one fsync for the burst.
             let n = replies.len();
+            stats.batches.fetch_add(1, Relaxed);
+            stats.ops.fetch_add(n as u64, Relaxed);
+            stats.max_batch.fetch_max(n as u64, Relaxed);
             let replicas = replicas.clone();
             let results = tokio::task::spawn_blocking(move || {
                 replicas
@@ -821,6 +860,91 @@ mod tests {
 
         p1.raft().shutdown().await.unwrap();
         p2.raft().shutdown().await.unwrap();
+    }
+
+    /// ADR 0071: OWNER-side local acks routed through the plane's shared writer
+    /// group-commit with each other and with follower replica applies. A mixed
+    /// concurrent burst — 30 owner writes via `owner_writer()` + 20 follower
+    /// `Replicate` frames — must all be accepted, all be durably applied, and
+    /// the writer's counters must show real coalescing (fewer fsync'd batches
+    /// than ops; at rest the ratio would be 1:1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn owner_writes_group_commit_with_follower_applies() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = node("owner-burst-node").await;
+
+        let mut tasks: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
+        for i in 0..30u8 {
+            let writer = p.owner_writer();
+            tasks.push(tokio::spawn(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let op = ReplOp::Append {
+                    key: format!("own/{i}"),
+                    offset: 1,
+                    seq: 1,
+                    record: vec![i],
+                };
+                writer.send((1, op, tx)).expect("writer alive");
+                rx.await.unwrap_or(false)
+            }));
+        }
+        for i in 0..20u8 {
+            let plane = p.clone();
+            tasks.push(tokio::spawn(async move {
+                let frame = PeerMessage::Replicate {
+                    req_id: 1000 + u64::from(i),
+                    epoch: 1,
+                    op: ReplOp::Append {
+                        key: format!("fol/{i}"),
+                        offset: 1,
+                        seq: 1,
+                        record: vec![i],
+                    },
+                };
+                match plane.handle(frame).await {
+                    Some(PeerMessage::ReplicateAck { accepted, .. }) => accepted,
+                    _ => false,
+                }
+            }));
+        }
+        let mut accepted = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 50,
+            "every owner write and follower apply accepted"
+        );
+
+        {
+            let replicas = p.replicas.lock().unwrap();
+            for i in 0..30u8 {
+                assert_eq!(replicas.entries(&format!("own/{i}")).len(), 1);
+            }
+            for i in 0..20u8 {
+                assert_eq!(replicas.entries(&format!("fol/{i}")).len(), 1);
+            }
+        }
+
+        let stats = p.writer_stats();
+        assert_eq!(
+            stats.ops.load(Relaxed),
+            50,
+            "all 50 ops flowed through the ONE writer"
+        );
+        assert!(
+            stats.batches.load(Relaxed) < 50,
+            "a concurrent burst must coalesce: {} batches for 50 ops",
+            stats.batches.load(Relaxed)
+        );
+        assert!(
+            stats.max_batch.load(Relaxed) >= 2,
+            "at least one real batch formed"
+        );
+
+        p.raft().shutdown().await.unwrap();
     }
 
     /// ADR 0027: a burst of `Replicate` frames handled concurrently is all accepted and

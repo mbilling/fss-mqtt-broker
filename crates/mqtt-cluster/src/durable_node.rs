@@ -150,13 +150,19 @@ pub async fn build_durable_node(
     // One group-routed log, shared: the session store replicates queue/meta keys
     // through it, and the retained keyspace (ADR 0037) commits `r/<topic>` keys through
     // the same leases, epochs, and replica links — one durable plane, two keyspaces.
-    let group_log = Arc::new(GroupRoutedLog::new(
-        node_id.clone(),
-        placement.clone(),
-        transport.clone(),
-        lease_source,
-        replicas.clone(),
-    ));
+    let group_log = Arc::new(
+        GroupRoutedLog::new(
+            node_id.clone(),
+            placement.clone(),
+            transport.clone(),
+            lease_source,
+            replicas.clone(),
+        )
+        // ADR 0071: owner-side local acks group-commit through the plane's
+        // durable-write serializer — one fsync per concurrent batch across all
+        // groups (and shared with the follower's replica applies).
+        .with_owner_writer(plane.owner_writer()),
+    );
     // The plane serves inbound catch-up requests (ADR 0043 P1) through the store's
     // group routing: a hollow replica asks, the owner re-commits the key's log.
     plane.set_catch_up_source(group_log.clone());
