@@ -190,6 +190,16 @@ lane_a_tier() { # lane_a_tier <tier>
 		>"$OUT/laneA/tier-$t.txt" 2>&1 || warn "lane A tier $t exited nonzero — kept output"
 	stop_cpu_sampling
 	snapshot_metrics "$OUT/laneA" "after-tier-$t"
+	# The tier's true face is LATENCY below saturation: under closed-loop
+	# saturation the lanes flow-control every tier back to the durable
+	# pipeline's rate, so sat throughput converges — but the uncontended ack
+	# RTT is what the publisher actually bought (relaxed ≈ hub round trip).
+	rssh "$(driver_pub_ip 0)" \
+		"MQTTD_BENCH_BROKERS=$BROKERS_LIST MQTTD_BENCH_HEALTH=$HEALTH_LIST MQTTD_BENCH_NODE_IDS=$IDS_LIST \
+		 MQTTD_BENCH_SPREAD=1 MQTTD_BENCH_TIER=$t MQTTD_BENCH_PUBLISHERS=$N MQTTD_BENCH_WINDOW=1 \
+		 MQTTD_BENCH_SUBS=$N MQTTD_BENCH_SECS=$A_SECS MQTTD_BENCH_WARMUP_SECS=$A_WARMUP \
+		 MQTTD_BENCH_REPS=$A_REPS $BIN_PATH durable_path_floor --ignored --nocapture" \
+		>"$OUT/laneA/tier-$t-lat.txt" 2>&1 || warn "lane A tier $t lat exited nonzero — kept output"
 	say "  lane A tier $t done"
 }
 if [ "${SMOKE:-0}" != 1 ]; then
