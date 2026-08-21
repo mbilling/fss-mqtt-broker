@@ -133,6 +133,10 @@ pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone + 'static>
     /// Per-group cached log + recovery markers, built lazily and rebuilt when the
     /// lease epoch advances. Cached so a group's offset state is stable across calls.
     groups: Mutex<BTreeMap<GroupId, Arc<GroupEntry<T>>>>,
+    /// The node-wide durable-write serializer (ADR 0071), handed to every group's
+    /// `ClusterLog` so owner local acks group-commit with each other (and with the
+    /// follower's replica applies) instead of paying one fsync each.
+    owner_writer: Option<tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>>,
 }
 
 impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> std::fmt::Debug
@@ -164,7 +168,19 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             leases,
             local_replicas,
             groups: Mutex::new(BTreeMap::new()),
+            owner_writer: None,
         }
+    }
+
+    /// Route every group's owner-side local acks through the node-wide
+    /// durable-write serializer (ADR 0071) — see [`ClusterLog::with_owner_writer`].
+    #[must_use]
+    pub fn with_owner_writer(
+        mut self,
+        writer: tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>,
+    ) -> Self {
+        self.owner_writer = Some(writer);
+        self
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, BTreeMap<GroupId, Arc<GroupEntry<T>>>> {
@@ -284,8 +300,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                             // The owner's self-ack is durable (ADR 0042 T8): it
                             // counts toward quorum only once the op is applied to
                             // this node's own replica copy — the same copy its
-                            // recovery reads consult after a restart.
-                            .with_local_store(self.local_replicas.clone()),
+                            // recovery reads consult after a restart. With a
+                            // writer attached (ADR 0071) those applies
+                            // group-commit through the shared serializer.
+                            .with_local_store(self.local_replicas.clone())
+                            .maybe_owner_writer(self.owner_writer.clone()),
                         ),
                         recovered: Mutex::new(BTreeSet::new()),
                         replica_set: replica_set.clone(),

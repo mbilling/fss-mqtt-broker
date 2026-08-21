@@ -506,6 +506,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (hub_tx, store, retained_store, durable_plane, lease_driver) =
         start_hub(&config, &node_id, &placement, &metrics, &brownout_status).await?;
 
+    // ADR 0071: poll the durable-write serializer's counters into Prometheus.
+    // Counters are inc'd by delta so the exposed series stay true counters.
+    if let Some(plane) = &durable_plane {
+        let stats = plane.writer_stats();
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (mut seen_batches, mut seen_ops) = (0u64, 0u64);
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let batches = stats.batches.load(Relaxed);
+                let ops = stats.ops.load(Relaxed);
+                m.durable_writer_progress(
+                    batches - seen_batches,
+                    ops - seen_ops,
+                    stats.max_batch.load(Relaxed),
+                );
+                (seen_batches, seen_ops) = (batches, ops);
+            }
+        });
+    }
+
     // Health endpoints for orchestrators (opt-in via MQTTD_HEALTH_BIND), serving
     // /livez (hub responsive) and /readyz (mesh + durable-store ready). Keep a plane
     // handle to stop openraft cleanly on shutdown.

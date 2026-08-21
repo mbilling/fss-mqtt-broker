@@ -170,7 +170,10 @@ running).
   found at any size.
 - **One durable append still costs ~one disk barrier** on the owner path (no
   owner-side group commit — the known lever for raising Curve 1's ceiling,
-  ADR 0027's remaining half).
+  ADR 0027's remaining half). *(2026-08-21: that lever has since been pulled —
+  ADR 0071 batches owner appends through the shared writer; measured +57%
+  durable QoS1 / +68% QoS2 on a dev machine at modest fan-in. These curve
+  numbers predate it; the next curve run re-measures.)*
 - Lane B p99s are bucket bounds; cross-driver clock skew bounds the finest
   readable bucket.
 - Multi-tenant NVMe variance (3.3× across nominally identical hosts) is real

@@ -337,6 +337,13 @@ pub struct Metrics {
     retained_apply_failed_total: Counter,
     retained_queue_dropped_total: Counter,
     audit_export_dropped_total: Counter,
+    /// Durable-write serializer (ADR 0071): fsync'd batches committed and ops
+    /// applied across them (owner appends + follower replica applies share one
+    /// writer). ops/batches = mean group-commit batch size.
+    durable_writer_batches_total: Counter,
+    durable_writer_ops_total: Counter,
+    /// Largest single batch since boot — how deep the coalescing gets under load.
+    durable_writer_max_batch: Gauge,
     crypto_module_info: Family<CryptoModuleLabel, Gauge>,
     /// Brownout STATE (ADR 0054): 1 while growth writes are refused on `axis`
     /// (`disk`, `memory`), 0 otherwise. The rejection counters record symptoms; this
@@ -718,6 +725,27 @@ impl Metrics {
              endpoint is slower than the audit rate",
         );
 
+        let durable_writer_batches_total = register_counter(
+            &mut registry,
+            "durable_writer_batches",
+            "Fsync'd batches the node-wide durable-write serializer committed \
+             (ADR 0071): each batch is one Durability::Immediate transaction \
+             covering owner appends and follower replica applies that arrived \
+             while the previous fsync ran",
+        );
+        let durable_writer_ops_total = register_counter(
+            &mut registry,
+            "durable_writer_ops",
+            "Durable ops applied across all serializer batches (ADR 0071); \
+             divided by durable_writer_batches this is the mean group-commit \
+             batch size — 1.0 at rest, rising under load as coalescing pays",
+        );
+        let durable_writer_max_batch = register_gauge(
+            &mut registry,
+            "durable_writer_max_batch",
+            "Largest single group-commit batch since boot (ADR 0071)",
+        );
+
         let brownout = register_gauge_family(
             &mut registry,
             "brownout",
@@ -909,6 +937,9 @@ impl Metrics {
             retained_apply_failed_total,
             retained_queue_dropped_total,
             audit_export_dropped_total,
+            durable_writer_batches_total,
+            durable_writer_ops_total,
+            durable_writer_max_batch,
             crypto_module_info,
             brownout,
             store_max_bytes,
@@ -1641,6 +1672,17 @@ impl Metrics {
     pub fn audit_export_dropped(&self) {
         self.audit_export_dropped_total.inc();
         self.otel.audit_export_dropped.add(1, &[]);
+    }
+
+    /// Advance the durable-write serializer's counters (ADR 0071) by the deltas a
+    /// poll observed, and refresh the max-batch gauge. Deltas, so the exposed
+    /// series stay true monotonic counters over a poll-based source.
+    pub fn durable_writer_progress(&self, batches: u64, ops: u64, max_batch: u64) {
+        self.durable_writer_batches_total.inc_by(batches);
+        self.durable_writer_ops_total.inc_by(ops);
+        self.durable_writer_max_batch.set(clamp_gauge(
+            usize::try_from(max_batch).unwrap_or(usize::MAX),
+        ));
     }
 
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;
