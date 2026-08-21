@@ -322,6 +322,7 @@ async fn start_stress_node_in_zone(
         &std::collections::BTreeMap::new(),
         Some(data_dir), // on-disk state: a kill leaves it for the restart (T4)
         None,
+        false,
     )
     .await;
     // The hub's session-store seam, wrapped for write-error injection (T4):

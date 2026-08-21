@@ -1693,6 +1693,10 @@ pub struct Hub {
     /// The durable-plane endpoint (consensus + replication), when durable sessions
     /// are enabled (ADR 0007). `None` for the single-node / non-durable default.
     durable_plane: Option<DurablePlane>,
+    /// ADR 0072: honor the `mqttd-durability` user property on PUBLISH — the
+    /// operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in. Off = the property is
+    /// ignored and every ack keeps its full quorum-durable meaning.
+    allow_relaxed_publish: bool,
     /// Retained message storage. An `Arc` (not a `Box`) so the online backup task can
     /// hold a READ handle on the same store the hub writes (ADR 0062) — one redb handle,
     /// borrowed, never a second open on a dir this process already locks (ADR 0061).
@@ -2039,6 +2043,7 @@ impl Hub {
                 inflight: HashMap::new(),
                 store,
                 durable_plane: None,
+                allow_relaxed_publish: false,
                 retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
@@ -2094,6 +2099,12 @@ impl Hub {
     /// Attach the durable-plane endpoint (consensus + replication) before
     /// [`run`](Self::run). Enables routing of [`HubCommand::DurableFrame`]s and
     /// peer (de)registration on the plane. Only set when durable sessions are on.
+    /// Honor per-message durability tiers (ADR 0072) — the operator's
+    /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in, threaded to the ack gate.
+    pub fn set_allow_relaxed_publish(&mut self, on: bool) {
+        self.allow_relaxed_publish = on;
+    }
+
     pub fn attach_durable_plane(&mut self, plane: DurablePlane) {
         self.durable_plane = Some(plane);
     }
@@ -2308,6 +2319,30 @@ impl Hub {
                 let gate = done.map(|done| {
                     self.register_pending(done, &topic, &payload, qos, retain, message_expiry, &app)
                 });
+                // ADR 0072: the publisher may weaken ITS OWN ack per message via
+                // `mqttd-durability` — only under the operator's opt-in. `relaxed`
+                // releases the ack at local_done (everything still runs); `local`
+                // is honored inside the store's append; v3.1.1 can't carry the
+                // property, so it always gets the full quorum path. The property
+                // itself is forwarded unaltered (MQTT-3.3.2-17).
+                let tier = if self.allow_relaxed_publish {
+                    app.user_properties
+                        .iter()
+                        .rev()
+                        .find(|(k, _)| k == mqtt_storage::repl::DURABILITY_PROPERTY)
+                        .and_then(|(_, v)| mqtt_storage::repl::DurabilityTier::parse(v))
+                        .unwrap_or_default()
+                } else {
+                    mqtt_storage::repl::DurabilityTier::Quorum
+                };
+                if let Some(m) = &self.metrics {
+                    m.publish_tier(tier.as_str());
+                }
+                if tier == mqtt_storage::repl::DurabilityTier::Relaxed {
+                    if let Some(id) = gate {
+                        self.pending_mark_relaxed(id);
+                    }
+                }
                 // Time the synchronous on-loop fan-out (plan + lane submissions +
                 // peer forward) as the hub's per-publish on-loop latency (ADR
                 // 0020-T4; since issue #242 the durable appends themselves run
@@ -5198,11 +5233,12 @@ impl Hub {
     fn try_complete_pending(&mut self, id: u64) {
         let complete = self.pending_publishes.get(&id).is_some_and(|p| {
             p.local_done
-                && p.appends_outstanding == 0
-                && !p.awaiting_retained
-                && !p.awaiting_settle
-                && p.awaiting.is_empty()
-                && p.reroute_grace.unwrap_or(0) == 0
+                && (p.relaxed // ADR 0072: relaxed acks at submit; obligations still run
+                    || (p.appends_outstanding == 0
+                        && !p.awaiting_retained
+                        && !p.awaiting_settle
+                        && p.awaiting.is_empty()
+                        && p.reroute_grace.unwrap_or(0) == 0))
         });
         if complete {
             if let Some(p) = self.pending_publishes.remove(&id) {
@@ -12575,6 +12611,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             None,
             None,
+            false,
         )
         .await;
         driver.abort();
@@ -12658,6 +12695,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             None,
             None,
+            false,
         )
         .await;
         driver.abort();
@@ -12789,6 +12827,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             None,
             None,
+            false,
         )
         .await;
         driver.abort();
@@ -13120,6 +13159,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             None,
             None,
+            false,
         )
         .await;
         driver.abort();
@@ -14782,6 +14822,120 @@ mod tests {
             }
             out
         }
+    }
+
+    /// ADR 0072 — RELAXED tier: with the operator opt-in, a publish carrying
+    /// `mqttd-durability: relaxed` acks at accept+submit, NOT after the durable
+    /// append. The append is parked in the store; the ack must arrive anyway;
+    /// releasing the store completes the (still-running) append — the write is
+    /// weakened in ack MEANING only, never skipped.
+    #[tokio::test]
+    async fn a_relaxed_publish_acks_while_its_append_is_still_parked() {
+        let store = ParkingStore::new();
+        let release = store.park("r");
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store.clone());
+        hub.set_allow_relaxed_publish(true);
+        tokio::spawn(hub.run());
+
+        let (_rx, _) = attach(&tx, "r", 1, false).await;
+        subscribe_qos(&tx, "r", "rt/t", QoS::AtLeastOnce);
+        detach(&tx, "r", 1);
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "rt/t".into(),
+            payload: Bytes::from_static(b"fast"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties {
+                user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
+                ..Default::default()
+            },
+            done: Some(done_tx),
+            v5: true,
+            publisher: None,
+        })
+        .unwrap();
+
+        // The ack arrives while the append is STILL parked.
+        let out = timeout(Duration::from_millis(500), done_rx)
+            .await
+            .expect("a relaxed publish must ack at submit, not after the parked append")
+            .unwrap();
+        assert_eq!(out, PublishOutcome::Accepted);
+        assert!(
+            store.ops().iter().all(|(op, _)| op != "enqueue"),
+            "the append must not have completed yet — the ack outran it by design"
+        );
+
+        // The write still happens: releasing the store lands the enqueue.
+        release.send(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if store
+                .ops()
+                .iter()
+                .any(|(op, d)| op == "enqueue" && d == "r fast")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relaxed publish's append must still complete after release"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// ADR 0072 — the `mqttd-durability` property is INERT without the operator
+    /// opt-in: the identical relaxed-tagged publish keeps the full
+    /// ack-after-durable behavior (stronger than asked, never weaker). This is
+    /// the default-path guarantee: no property parsing changes any ack unless
+    /// `MQTTD_ALLOW_RELAXED_PUBLISH` is set.
+    #[tokio::test]
+    async fn the_durability_property_is_inert_without_the_operator_opt_in() {
+        let store = ParkingStore::new();
+        let release = store.park("s");
+        let tx = start_hub_with_arc(store.clone());
+
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "st/t", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+
+        let (done_tx, mut done_rx) = oneshot::channel();
+        tx.send(HubCommand::Publish {
+            topic: "st/t".into(),
+            payload: Bytes::from_static(b"strict"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties {
+                user_properties: vec![("mqttd-durability".into(), "relaxed".into())],
+                ..Default::default()
+            },
+            done: Some(done_tx),
+            v5: true,
+            publisher: None,
+        })
+        .unwrap();
+
+        // SETTLE(inert-property-negative-window): proving an ack did NOT arrive has
+        // no observable to poll — the assertion is the continued absence itself. The
+        // window only needs to be long enough that an early-release bug would fire
+        // within it; a slow machine shortens the effective window, which can only
+        // make this negative check MORE tolerant, never a false failure.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "without MQTTD_ALLOW_RELAXED_PUBLISH the property must not weaken the ack"
+        );
+        release.send(true).unwrap();
+        let out = timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("released append completes the strict publish")
+            .unwrap();
+        assert_eq!(out, PublishOutcome::Accepted);
     }
 
     /// Issue #242 — the head-of-line acceptance criterion (RED before the fix): a

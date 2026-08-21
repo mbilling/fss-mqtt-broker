@@ -1707,6 +1707,7 @@ async fn start_hub(
                 &domains,
                 data_dir.as_deref().map(Path::new),
                 None, // no commit-latency fault injection in production (ADR 0026)
+                config.durable.allow_relaxed_publish, // ADR 0072 operator opt-in
             )
             .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
@@ -2248,6 +2249,8 @@ fn wire_hub(
     hub.attach_metrics(metrics.clone());
     hub.attach_brownout_status(brownout_status.clone());
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
+    // ADR 0072: per-message durability tiers, only under the operator's opt-in.
+    hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);
     Ok(())
 }
 

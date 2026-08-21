@@ -74,6 +74,12 @@ pub(super) struct PendingPublish {
     /// publish re-delivers locally against the just-materialized subscriptions
     /// (exhibit ⑥'s ack-into-the-void window; duplicates are legal at `QoS` 1).
     pub(super) awaiting_settle: bool,
+    /// ADR 0072: the publisher selected the RELAXED tier (and the operator opted
+    /// in), so the ack releases at `local_done` — every obligation SUBMITTED,
+    /// nothing awaited. The appends, forwards and retained commit all still run;
+    /// only the ack's meaning is weakened, at the publisher's explicit request.
+    /// A refusal decided at the plan pass (brownout) still refuses.
+    pub(super) relaxed: bool,
 }
 
 /// One outstanding cross-node obligation of a gated publish (ADR 0042 T9 exhibit ⑤;
@@ -405,9 +411,18 @@ impl Hub {
                 // no takeovers, and holding its boot-time acks would just delay
                 // every early publish for nothing.
                 awaiting_settle: self.routing_unsettled(),
+                relaxed: false,
             },
         );
         id
+    }
+
+    /// Mark a pending publish RELAXED (ADR 0072): its ack releases at
+    /// `local_done` instead of waiting for the durability obligations.
+    pub(super) fn pending_mark_relaxed(&mut self, id: u64) {
+        if let Some(p) = self.pending_publishes.get_mut(&id) {
+            p.relaxed = true;
+        }
     }
 
     /// The local fan-out obligation resolved OK (durable appends included).

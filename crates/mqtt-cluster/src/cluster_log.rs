@@ -34,7 +34,7 @@ use crate::lease_raft::GroupId;
 use crate::placement::group_of_key;
 use crate::NodeId;
 use async_trait::async_trait;
-use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
+use mqtt_storage::repl::{DurabilityTier, LogEntry, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use std::collections::BTreeMap;
@@ -1286,6 +1286,26 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
     type Key = String;
 
     async fn append(&self, key: &String, record: Vec<u8>) -> Result<Offset, ReplError> {
+        self.append_tiered(key, record, DurabilityTier::Quorum)
+            .await
+    }
+
+    async fn append_tiered(
+        &self,
+        key: &String,
+        record: Vec<u8>,
+        tier: DurabilityTier,
+    ) -> Result<Offset, ReplError> {
+        // ADR 0072: `Local` returns once the owner's OWN durable copy has the
+        // op (required acks = 1, and the local ack only counts when durable —
+        // ADR 0042 T8 — so this is single-copy durability, not zero-copy);
+        // replication to followers continues detached, best-effort. `Relaxed`
+        // is an ACK-GATE tier handled above this layer; here it appends with
+        // full quorum semantics, exactly like `Quorum`.
+        let required = match tier {
+            DurabilityTier::Local => 1,
+            DurabilityTier::Quorum | DurabilityTier::Relaxed => self.quorum,
+        };
         let mut state = self.state.lock().await;
         let ks = state.entry(key.clone()).or_default();
         // Offset is committed + 1: a failed append leaves no committed hole, and a
@@ -1303,17 +1323,18 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
             record,
         };
 
-        // Fan out to every follower **concurrently** and commit as soon as a quorum
-        // has accepted — the leader's own copy is one ack, counted only once it is
-        // DURABLY applied to the node's own replica copy (ADR 0042 T8): an acked
-        // entry is then on ≥ quorum durable copies, which a quorum recovery-read —
-        // including a restarted owner reading its own copy — is guaranteed to
-        // intersect. A slow or wedged replica no longer serializes the append:
-        // once quorum is met the remaining deliveries are abandoned (their frames
-        // were already sent, so a reachable replica still applies them for
-        // best-effort spread; the transport reaps the in-flight entry on timeout).
+        // Fan out to every follower **concurrently** and commit as soon as the
+        // required acks have accepted — the leader's own copy is one ack, counted
+        // only once it is DURABLY applied to the node's own replica copy (ADR 0042
+        // T8): an acked entry is then on ≥ required durable copies, which a quorum
+        // recovery-read — including a restarted owner reading its own copy — is
+        // guaranteed to intersect (for the quorum tier). A slow or wedged replica
+        // no longer serializes the append: once the requirement is met the
+        // remaining deliveries are abandoned (their frames were already sent, so a
+        // reachable replica still applies them for best-effort spread; the
+        // transport reaps the in-flight entry on timeout).
         let mut acks = usize::from(self.local_ack(self.lease.epoch, &op).await);
-        if acks < self.quorum {
+        if acks < required {
             let mut inflight = tokio::task::JoinSet::new();
             for follower in &self.followers {
                 let transport = self.transport.clone();
@@ -1322,19 +1343,34 @@ impl<T: ReplicaTransport + Clone + 'static> ReplicatedLog for ClusterLog<T> {
                 let op = op.clone();
                 inflight.spawn(async move { transport.deliver(&follower, epoch, &op).await });
             }
-            while acks < self.quorum {
+            while acks < required {
                 match inflight.join_next().await {
                     Some(Ok(true)) => acks += 1,
                     // A reject/unreachable, or a delivery task that failed — keep
                     // waiting for the other followers.
                     Some(Ok(false) | Err(_)) => {}
-                    // Every follower has reported; quorum was not reached.
+                    // Every follower has reported; the requirement was not reached.
                     None => break,
                 }
             }
+            // Abandoning the JoinSet cancels frames not yet SENT; a Local-tier
+            // append that never entered the loop must still start its
+            // replication. Spawn the fan-out detached so it completes
+            // best-effort — the entry reaching followers is what lets a later
+            // owner recover it if this node's disk dies.
+        } else if required < self.quorum {
+            for follower in &self.followers {
+                let transport = self.transport.clone();
+                let follower = follower.clone();
+                let epoch = self.lease.epoch;
+                let op = op.clone();
+                tokio::spawn(async move {
+                    let _ = transport.deliver(&follower, epoch, &op).await;
+                });
+            }
         }
 
-        if acks >= self.quorum {
+        if acks >= required {
             ks.committed = offset;
             Ok(offset)
         } else {
@@ -1902,6 +1938,99 @@ mod tests {
         let all = log.read(&k, 0, 100).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(&all[0].record, b"kept");
+    }
+
+    /// ADR 0072 — the LOCAL tier: an append whose publisher chose
+    /// `mqttd-durability: local` returns once the owner's own durable copy has
+    /// it (required acks = 1), WITHOUT waiting for any follower — here both
+    /// followers' deliveries are slow — and replication still completes
+    /// best-effort afterwards (the detached fan-out). The quorum tier on the
+    /// same log still waits for a follower ack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_local_tier_append_returns_on_the_owners_durability_alone() {
+        use mqtt_storage::repl::DurabilityTier;
+
+        /// Every follower delivery applies after a long delay, and counts arrivals.
+        #[derive(Clone)]
+        struct SlowFollowers {
+            delivered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl ReplicaTransport for SlowFollowers {
+            async fn deliver(&self, _replica: &NodeId, _epoch: Epoch, _op: &ReplOp) -> bool {
+                // SETTLE(local-tier-slow-followers): the delay IS the fault under test —
+                // followers slower than the local-tier ack window. Nothing to poll for;
+                // a slower machine only makes the injected followers slower, which is
+                // still a valid instance of the fault.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                self.delivered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+        }
+
+        let local = n("a");
+        let set = vec![n("a"), n("b"), n("c")]; // R=3, quorum=2
+        let lease = OwnershipLease {
+            holder: local.clone(),
+            epoch: 1,
+        };
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = ClusterLog::new(
+            local,
+            lease,
+            &set,
+            SlowFollowers {
+                delivered: delivered.clone(),
+            },
+        )
+        // A durable local store: the local tier's single ack must be DURABLE
+        // (ADR 0042 T8) — local means single-copy, never zero-copy.
+        .with_local_store(std::sync::Arc::new(std::sync::Mutex::new(
+            ReplicaState::new(),
+        )));
+
+        // Local tier: returns well before any 400 ms follower delivery resolves.
+        let k = "x".to_string();
+        let started = std::time::Instant::now();
+        let offset = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            log.append_tiered(&k, b"v".to_vec(), DurabilityTier::Local),
+        )
+        .await
+        .expect("a local-tier append must not wait for slow followers")
+        .unwrap();
+        assert_eq!(offset, 1);
+        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+        assert_eq!(
+            delivered.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no follower delivery had resolved when the local-tier ack returned"
+        );
+        assert_eq!(log.read(&k, 0, 10).await.unwrap().len(), 1, "committed");
+
+        // Best-effort replication still completes: the detached fan-out reaches
+        // both followers shortly after.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while delivered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached fan-out must still deliver to every follower"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Control: the same log's QUORUM append waits for a follower (>=400 ms).
+        let started = std::time::Instant::now();
+        let offset = log
+            .append_tiered(&k, b"w".to_vec(), DurabilityTier::Quorum)
+            .await
+            .unwrap();
+        assert_eq!(offset, 2);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(350),
+            "the quorum tier still waits on a follower ack"
+        );
     }
 
     /// A wedged follower (its delivery never completes — a half-open link) does not

@@ -79,6 +79,7 @@
 | [0069](../adr/0069-scorecard-remediation.md) | Scorecard remediation: a solution per check, honestly bounded | Accepted | [7/7 done](0069-scorecard-remediation.md) | — |
 | [0070](../adr/0070-stakeholder-documentation.md) | Usage documentation is owned by stakeholders, not by features | Proposed | [0/8 done](0070-stakeholder-documentation.md) | 8 open |
 | [0071](../adr/0071-owner-side-group-commit.md) | # 0071. Owner-side group commit: one durable-write serializer per node | Accepted | [2/3 done](0071-owner-side-group-commit.md) | 1 open |
+| [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 open |
 
 ## Open and deferred work
 
@@ -188,3 +189,7 @@
 **0071 — # 0071. Owner-side group commit: one durable-write serializer per node**
 
 - `0071-T3` ⬜ planned: Single-node backend (PersistentLog / sessions.redb) batching — "The non-cluster backend still commits one Immediate txn per append; its run() closure is the seam. Worth doing when single-node durable throughput matters as much as clustered."
+
+**0072 — # 0072. Per-message durability selection: the `mqttd-durability` user property**
+
+- `0072-T2` ⬜ planned: Policy bounding — per-principal/per-topic limits on which tiers may be requested (ACL vocabulary) — "The ADR's alternatives note: an operator may want relaxed forbidden for some topics/principals even with the global opt-in on. Composes with T1; needs ACL surface design."

@@ -95,6 +95,7 @@ pub async fn build_durable_node(
     failure_domains: &BTreeMap<NodeId, FailureDomain>,
     data_dir: Option<&std::path::Path>,
     commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
+    allow_relaxed_publish: bool,
 ) -> (
     Arc<dyn SessionStore>,
     Arc<dyn DurableRetained>,
@@ -166,7 +167,11 @@ pub async fn build_durable_node(
     // The plane serves inbound catch-up requests (ADR 0043 P1) through the store's
     // group routing: a hollow replica asks, the owner re-commits the key's log.
     plane.set_catch_up_source(group_log.clone());
-    let store: Arc<dyn SessionStore> = Arc::new(ReplicatedSessionStore::new(group_log.clone()));
+    let store: Arc<dyn SessionStore> = Arc::new(
+        // ADR 0072: per-message durability tiers, only under the operator's
+        // explicit opt-in (`MQTTD_ALLOW_RELAXED_PUBLISH`).
+        ReplicatedSessionStore::new(group_log.clone()).with_tier_selection(allow_relaxed_publish),
+    );
     let retained: Arc<dyn DurableRetained> = Arc::new(ReplicatedRetained::new(group_log.clone()));
 
     // --- driver: membership + lease assignment over the live placement ---
@@ -689,8 +694,17 @@ mod tests {
     async fn single_node_durable_store_bootstraps_and_serves() {
         let node = NodeId("durable-solo".to_string());
         let placement = Arc::new(RwLock::new(Placement::new(node.clone(), DEFAULT_REPLICAS)));
-        let (store, retained, _plane, _driver) =
-            build_durable_node(node, placement, true, 5, &BTreeMap::new(), None, None).await;
+        let (store, retained, _plane, _driver) = build_durable_node(
+            node,
+            placement,
+            true,
+            5,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+        )
+        .await;
 
         let client = ClientId("c".to_string());
         let msg = Message::new(
@@ -782,6 +796,7 @@ mod tests {
             &BTreeMap::new(),
             Some(dir.path()),
             None,
+            false,
         )
         .await;
         wait_writable(&store, &client, &msg).await;
@@ -812,6 +827,7 @@ mod tests {
             &BTreeMap::new(),
             Some(dir.path()),
             None,
+            false,
         )
         .await;
         // Becoming writable again proves the persisted lease store reopened (no

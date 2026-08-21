@@ -46,6 +46,12 @@ struct QosLabel {
     qos: String,
 }
 
+/// `{tier}` label — the ADR 0072 durability tiers: `quorum`, `local`, `relaxed`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TierLabel {
+    tier: String,
+}
+
 /// `{reason}` label — a small fixed set of reason classes (never free-form text).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ReasonLabel {
@@ -337,6 +343,10 @@ pub struct Metrics {
     retained_apply_failed_total: Counter,
     retained_queue_dropped_total: Counter,
     audit_export_dropped_total: Counter,
+    /// Publisher-selected durability tiers on gated publishes (ADR 0072), by
+    /// tier (`quorum`, `local`, `relaxed`) — non-default tiers appear only
+    /// under the operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in.
+    publish_tier_total: Family<TierLabel, Counter>,
     /// Durable-write serializer (ADR 0071): fsync'd batches committed and ops
     /// applied across them (owner appends + follower replica applies share one
     /// writer). ops/batches = mean group-commit batch size.
@@ -725,6 +735,15 @@ impl Metrics {
              endpoint is slower than the audit rate",
         );
 
+        let publish_tier_total = register_family(
+            &mut registry,
+            "publish_tier",
+            "Gated publishes by publisher-selected durability tier (ADR 0072): \
+             quorum (the default full ack-after-quorum), local (ack after the \
+             owner's fsync), relaxed (ack at accept+submit). Non-default tiers \
+             require the operator's MQTTD_ALLOW_RELAXED_PUBLISH opt-in",
+        );
+
         let durable_writer_batches_total = register_counter(
             &mut registry,
             "durable_writer_batches",
@@ -937,6 +956,7 @@ impl Metrics {
             retained_apply_failed_total,
             retained_queue_dropped_total,
             audit_export_dropped_total,
+            publish_tier_total,
             durable_writer_batches_total,
             durable_writer_ops_total,
             durable_writer_max_batch,
@@ -1672,6 +1692,15 @@ impl Metrics {
     pub fn audit_export_dropped(&self) {
         self.audit_export_dropped_total.inc();
         self.otel.audit_export_dropped.add(1, &[]);
+    }
+
+    /// One gated publish at `tier` (ADR 0072): `quorum`, `local`, or `relaxed`.
+    pub fn publish_tier(&self, tier: &str) {
+        self.publish_tier_total
+            .get_or_create(&TierLabel {
+                tier: tier.to_string(),
+            })
+            .inc();
     }
 
     /// Advance the durable-write serializer's counters (ADR 0071) by the deltas a
