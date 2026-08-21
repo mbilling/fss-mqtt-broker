@@ -308,15 +308,32 @@ def main() -> None:
             tier_rows.append((n, label, rate, p99, "; ".join(sorted(set(verdicts))) or "all reps valid"))
     if any(label != "quorum" for _, label, *_ in tier_rows):
         print("\n## Durability tiers (ADR 0072) — same workload, publisher-selected ack meaning\n")
-        print("| nodes | tier (what the ack means) | acked msg/s | exact p99 ms | verdicts |")
+        print(
+            "Saturating throughput converges across tiers by design — the session"
+        )
+        print(
+            "lanes flow-control every tier to the durable pipeline's rate — so the"
+        )
+        print(
+            "tier's real face is the UNCONTENDED ack latency (window 1), shown last.\n"
+        )
+        print("| nodes | tier (what the ack means) | acked msg/s (sat) | p99 ms (sat) | p99 ms (uncontended) |")
         print("|---|---|---|---|---|")
         meaning = {
             "quorum": "fsync'd on a majority, cluster-wide",
             "local": "fsync'd on the owner (single-copy)",
             "relaxed": "accepted + submitted",
         }
-        for n, label, rate, p99, v in tier_rows:
-            print(f"| {n} | `{label}` — {meaning[label]} | {rate} | {p99} | {v} |")
+        lat_name = {"quorum": "lat", "local": "tier-local-lat", "relaxed": "tier-relaxed-lat"}
+        for n, label, rate, p99, _v in tier_rows:
+            d = dict(found)[n]
+            lat_reps = [
+                r
+                for r in lane_a_results(d, lat_name[label])
+                if r.get("arm") == "qos1-durable-owner"
+            ]
+            lat_p99 = median_over_valid(lat_reps, "p99_ms")[0] if lat_reps else "—"
+            print(f"| {n} | `{label}` — {meaning[label]} | {rate} | {p99} | {lat_p99} |")
 
     # Curve 2 — $share ladder
     print("\n## Curve 2 — non-durable $share fan-out (latency = bucket upper bounds)\n")
