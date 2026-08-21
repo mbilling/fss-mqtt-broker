@@ -292,6 +292,32 @@ def main() -> None:
         print()
         print(xychart("durable QoS1 acked msg/s vs nodes", c1_x, c1_y, "acked msg/s"))
 
+    # Durability tiers (ADR 0072): same saturating workload, publisher-selected ack meaning
+    tier_rows = []
+    for n, d in found:
+        for name, label in (("sat", "quorum"), ("tier-local", "local"), ("tier-relaxed", "relaxed")):
+            reps = [
+                r
+                for r in lane_a_results(d, name)
+                if r.get("arm") == "qos1-durable-owner"
+            ]
+            if not reps:
+                continue
+            rate, verdicts = median_over_valid(reps, "msgs_per_s")
+            p99, _ = median_over_valid(reps, "p99_ms")
+            tier_rows.append((n, label, rate, p99, "; ".join(sorted(set(verdicts))) or "all reps valid"))
+    if any(label != "quorum" for _, label, *_ in tier_rows):
+        print("\n## Durability tiers (ADR 0072) — same workload, publisher-selected ack meaning\n")
+        print("| nodes | tier (what the ack means) | acked msg/s | exact p99 ms | verdicts |")
+        print("|---|---|---|---|---|")
+        meaning = {
+            "quorum": "fsync'd on a majority, cluster-wide",
+            "local": "fsync'd on the owner (single-copy)",
+            "relaxed": "accepted + submitted",
+        }
+        for n, label, rate, p99, v in tier_rows:
+            print(f"| {n} | `{label}` — {meaning[label]} | {rate} | {p99} | {v} |")
+
     # Curve 2 — $share ladder
     print("\n## Curve 2 — non-durable $share fan-out (latency = bucket upper bounds)\n")
     c2 = {}

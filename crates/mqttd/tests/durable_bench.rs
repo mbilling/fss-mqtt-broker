@@ -132,6 +132,13 @@ struct Cfg {
     /// collectively. Off (default): every session is pinned to node 0, the
     /// single-owner floor measurement this file has always made.
     spread: bool,
+    /// `MQTTD_BENCH_TIER=local|relaxed` (ADR 0072): publishers connect as MQTT 5
+    /// and stamp every PUBLISH with `mqttd-durability: <tier>`; spawned brokers
+    /// get `MQTTD_ALLOW_RELAXED_PUBLISH=1` (external brokers must set it
+    /// themselves). The measured ack RTT then means what the tier says it
+    /// means — the point of the measurement. `None` (default): v3.1.1
+    /// publishers, full quorum acks, byte-identical to the historical lanes.
+    tier: Option<String>,
 }
 
 impl Cfg {
@@ -149,13 +156,17 @@ impl Cfg {
             log_level: env_string("MQTTD_BENCH_LOG", "warn"),
             preflight: Duration::from_secs(env_usize("MQTTD_BENCH_PREFLIGHT_SECS", 120) as u64),
             spread: env_usize("MQTTD_BENCH_SPREAD", 0) == 1,
+            tier: std::env::var("MQTTD_BENCH_TIER").ok().filter(|t| {
+                matches!(t.as_str(), "local" | "relaxed")
+                    || panic!("MQTTD_BENCH_TIER must be 'local' or 'relaxed', got {t:?}")
+            }),
         }
     }
 
     fn describe(&self) -> String {
         format!(
             "publishers={} window={} (={}, in flight) subs={} payload={}B warmup={}s measure={}s reps={} \
-             node_workers={} RUST_LOG={} profile={} placement={}",
+             node_workers={} RUST_LOG={} profile={} placement={} tier={}",
             self.publishers,
             self.window,
             self.publishers * self.window,
@@ -171,7 +182,8 @@ impl Cfg {
                 "spread (sessions across all owners)"
             } else {
                 "pinned (all sessions owned by node 0)"
-            }
+            },
+            self.tier.as_deref().unwrap_or("quorum (default acks)"),
         )
     }
 }
@@ -308,6 +320,13 @@ fn spawn_node(node: &mut ProcNode, cfg: &Cfg) {
         .env("MQTTD_DATA_DIR", &node.data_dir)
         .env("MQTTD_HEALTH_BIND", node.health_addr.to_string())
         .env("MQTTD_SHUTDOWN_GRACE", "0")
+        // ADR 0072: PRESENCE = on, so the var must be wholly absent on default
+        // lanes — an empty value would still enable it.
+        .envs(
+            cfg.tier
+                .as_ref()
+                .map(|_| ("MQTTD_ALLOW_RELAXED_PUBLISH", "1")),
+        )
         .env("RUST_LOG", &cfg.log_level)
         .env("TOKIO_WORKER_THREADS", cfg.node_workers.to_string())
         .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
@@ -818,6 +837,7 @@ struct PubResult {
 /// publishes until `stop`. Packet id `k` is re-issued the moment its ack lands, so
 /// exactly `window` publishes are outstanding for the whole run and the offered
 /// rate equals the achieved rate by construction.
+#[allow(clippy::too_many_arguments)] // one measurement task, mirrors run_publisher
 async fn publisher(
     addr: SocketAddr,
     id: String,
@@ -826,9 +846,27 @@ async fn publisher(
     window: usize,
     payload_len: usize,
     stop: Instant,
+    tier: Option<String>,
 ) -> PubResult {
-    match common::Client::connect_v311_within(addr, &id, true, Duration::from_secs(20)).await {
-        Some((c, _)) => run_publisher(c, id, topic, qos, window, payload_len, stop).await,
+    // A tier lane (ADR 0072) publishes as MQTT 5 — the `mqttd-durability`
+    // property does not exist in v3.1.1 — and stamps every PUBLISH with it.
+    // The measured ack RTT then IS the selected tier's ack latency.
+    let connected = if tier.is_some() {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            common::Client::connect_v5(addr, &id, true, vec![]),
+        )
+        .await
+        .ok()
+        .filter(|(_, ack)| ack.code == 0)
+        .map(|(c, _)| c)
+    } else {
+        common::Client::connect_v311_within(addr, &id, true, Duration::from_secs(20))
+            .await
+            .map(|(c, _)| c)
+    };
+    match connected {
+        Some(c) => run_publisher(c, id, topic, qos, window, payload_len, stop, tier).await,
         None => PubResult {
             samples: Vec::new(),
             errors: 1,
@@ -842,6 +880,7 @@ async fn publisher(
 /// The publishing loop over an ALREADY-CONNECTED client. Split out so an experiment
 /// can pay the CONNECT cost *before* starting its clock — under a fault, a CONNECT can
 /// itself take seconds, and charging that to throughput measures the wrong thing.
+#[allow(clippy::too_many_arguments)] // one straight-line measurement loop
 async fn run_publisher(
     mut c: common::Client,
     id: String,
@@ -850,11 +889,23 @@ async fn run_publisher(
     window: usize,
     payload_len: usize,
     stop: Instant,
+    tier: Option<String>,
 ) -> PubResult {
     let mut out = PubResult {
         samples: Vec::with_capacity(1 << 14),
         errors: 0,
         diagnosis: None,
+    };
+    // ADR 0072: every publish of a tier lane carries the selector property.
+    let props = |t: &Option<String>| -> Vec<mqtt_codec::Property> {
+        t.as_ref()
+            .map(|t| {
+                vec![mqtt_codec::Property::UserProperty(
+                    "mqttd-durability".into(),
+                    t.clone(),
+                )]
+            })
+            .unwrap_or_default()
     };
     let payload = vec![b'x'; payload_len];
     let mut sent_at: Vec<Option<Instant>> = vec![None; window];
@@ -864,7 +915,8 @@ async fn run_publisher(
 
     for (slot, at) in sent_at.iter_mut().enumerate().take(window) {
         let pkid = u16::try_from(slot + 1).expect("window fits u16");
-        c.publish(&topic, &payload, qos, Some(pkid), vec![]).await;
+        c.publish(&topic, &payload, qos, Some(pkid), props(&tier))
+            .await;
         *at = Some(Instant::now());
         in_flight += 1;
     }
@@ -883,7 +935,8 @@ async fn run_publisher(
                     out.samples.push((now, now.duration_since(t)));
                     in_flight -= 1;
                     if now < stop {
-                        c.publish(&topic, &payload, qos, Some(a.pkid), vec![]).await;
+                        c.publish(&topic, &payload, qos, Some(a.pkid), props(&tier))
+                            .await;
                         sent_at[slot] = Some(Instant::now());
                         in_flight += 1;
                     }
@@ -901,7 +954,8 @@ async fn run_publisher(
                     out.samples.push((now, now.duration_since(t)));
                     in_flight -= 1;
                     if now < stop {
-                        c.publish(&topic, &payload, qos, Some(a.pkid), vec![]).await;
+                        c.publish(&topic, &payload, qos, Some(a.pkid), props(&tier))
+                            .await;
                         sent_at[slot] = Some(Instant::now());
                         in_flight += 1;
                     }
@@ -1284,6 +1338,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
             cfg.window,
             cfg.payload,
             stop,
+            cfg.tier.clone(),
         )));
     }
 
@@ -1559,6 +1614,7 @@ async fn durable_path_floor() {
                     "rep": rep,
                     "nodes": cl.endpoints.len(),
                     "spread": cfg.spread,
+                    "tier": cfg.tier.as_deref().unwrap_or("quorum"),
                     "external": cl.external,
                     "publishers": cfg.publishers,
                     "window": cfg.window,
@@ -2174,7 +2230,9 @@ async fn isolation_phase(
     for (n, (id, topic, conn)) in conns.into_iter().enumerate() {
         let handle = tokio::spawn(async move {
             match conn {
-                Some(c) => run_publisher(c, id, topic, QoS::AtLeastOnce, window, 256, stop).await,
+                Some(c) => {
+                    run_publisher(c, id, topic, QoS::AtLeastOnce, window, 256, stop, None).await
+                }
                 None => PubResult {
                     samples: Vec::new(),
                     errors: 1,
