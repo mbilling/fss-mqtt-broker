@@ -8,6 +8,7 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 RUN="${1:?usage: collect.sh <run-dir> <inventory.json>}"
+# shellcheck disable=SC2034 # consumed by lib.sh's inv() helper
 INVENTORY="${2:?inventory.json}"
 
 N=$(broker_count)

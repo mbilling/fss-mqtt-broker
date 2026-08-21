@@ -122,17 +122,33 @@ for N in "${SIZES[@]}"; do
 	# `cloud-init clean` re-runs everything against settled metadata, so each
 	# host gets exactly one such retry before the run gives up.
 	CI_OK='cloud-init status --wait >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ]'
+	# True once <ip> presents a kernel boot id that is non-empty and differs
+	# from <old> — i.e. the machine has verifiably completed its reboot. Probes
+	# use a THROWAWAY known_hosts: a poll that lands in the pre-reboot window
+	# would re-record the old host key and poison every post-reboot connect.
+	boot_id_changed() {
+		local now
+		now=$(ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null \
+			"root@$1" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
+		[ -n "$now" ] && [ "$now" != "$2" ]
+	}
 	for pair in $(jq -r '(.brokers[], .drivers[]) | "\(.public_ip)=\(.private_ip)"' "$INVENTORY"); do
 		ip="${pair%%=*}" priv="${pair##*=}"
 		wait_for "ssh on $ip" 300 rssh "$ip" "true"
 		if ! rssh "$ip" "$CI_OK"; then
 			warn "cloud-init errored on $ip — one clean+reboot retry (private-net attach race)"
+			OLD_BOOT=$(rssh "$ip" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)
 			rssh "$ip" "cloud-init clean --logs; reboot" || true
 			# cloud-init clean makes the next boot regenerate SSH HOST KEYS; drop
 			# the stale entry or every reconnect is refused as a key mismatch.
 			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
-			sleep 15
-			wait_for "ssh on $ip (after retry reboot)" 300 rssh "$ip" "true"
+			# The reboot takes seconds to sever ssh — a fast reconnect reaches the
+			# OLD boot and reads its error status as the retry's verdict. Nothing
+			# counts until the kernel boot id has actually changed.
+			wait_for "reboot of $ip (new boot id)" 300 boot_id_changed "$ip" "$OLD_BOOT"
+			# Drop whatever key a pre-reboot poll may have re-recorded; the next
+			# rssh accepts the NEW boot's key fresh.
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
 			rssh "$ip" "$CI_OK" ||
 				die "cloud-init failed on $ip even after a clean reboot — check /var/log/cloud-init-output.log there"
 		fi

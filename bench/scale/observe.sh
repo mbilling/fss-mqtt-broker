@@ -38,25 +38,48 @@ attach)
 	say "observe: starting local Grafana(:3000) + Prometheus(:9090)"
 	(cd "$OBS_DIR" && docker compose up -d --quiet-pull 2>/dev/null || docker compose up -d)
 
-	# Alloy config for THIS size: scrape every broker over the private net,
-	# remote_write to the tunnel's local end on the driver.
+	DRIVER_IP=$(driver_pub_ip 0)
+
+	# CURL-BRIDGE (issue #364): the released broker's health server RSTs any
+	# client that sends normal request headers — real Prometheus clients cannot
+	# scrape it over a network, while curl wins the race. Until the fix ships,
+	# a loop on driver-1 curls every broker's /metrics into files that a
+	# well-behaved python http.server serves to Alloy. Remove with #364.
+	BRIDGE="$RUN/prom-bridge.sh"
+	{
+		echo '#!/bin/sh'
+		echo 'mkdir -p /var/lib/bench-prom'
+		echo 'while true; do'
+		jq -r '.brokers[] | "  curl -sf --max-time 2 http://\(.health)/metrics -o /var/lib/bench-prom/\(.node_id).tmp && mv /var/lib/bench-prom/\(.node_id).tmp /var/lib/bench-prom/\(.node_id).prom"' "$INVENTORY"
+		echo '  sleep 2'
+		echo 'done'
+	} >"$BRIDGE"
+	rscp "$BRIDGE" "root@$DRIVER_IP:/opt/prom-bridge.sh"
+	rssh "$DRIVER_IP" "chmod +x /opt/prom-bridge.sh; \
+		systemctl reset-failed bench-prom-bridge bench-prom-files 2>/dev/null; \
+		systemctl stop bench-prom-bridge bench-prom-files 2>/dev/null; \
+		systemd-run --unit bench-prom-bridge /opt/prom-bridge.sh; \
+		systemd-run --unit bench-prom-files python3 -m http.server 8096 --directory /var/lib/bench-prom" \
+		>/dev/null 2>&1 || true
+
+	# Alloy scrapes the bridge's files (one path per broker, instance label kept).
 	ALLOY_CFG="$RUN/alloy-config.alloy"
 	{
-		echo 'prometheus.scrape "brokers" {'
-		echo '  targets = ['
-		jq -r '.brokers[] | "    { __address__ = \"\(.health)\", instance = \"\(.node_id)\" },"' "$INVENTORY"
-		echo '  ]'
-		echo '  metrics_path    = "/metrics"'
-		echo '  scrape_interval = "2s"'
-		echo '  scrape_timeout  = "2s"'
-		echo '  forward_to      = [prometheus.remote_write.laptop.receiver]'
-		echo '}'
+		i=0
+		while IFS=$'\t' read -r node_id; do
+			echo "prometheus.scrape \"broker_$i\" {"
+			echo "  targets         = [{ __address__ = \"localhost:8096\", instance = \"$node_id\" }]"
+			echo "  metrics_path    = \"/$node_id.prom\""
+			echo '  scrape_interval = "2s"'
+			echo '  scrape_timeout  = "2s"'
+			echo '  forward_to      = [prometheus.remote_write.laptop.receiver]'
+			echo '}'
+			i=$((i + 1))
+		done < <(jq -r '.brokers[].node_id' "$INVENTORY")
 		echo 'prometheus.remote_write "laptop" {'
 		echo '  endpoint { url = "http://localhost:9094/api/v1/write" }'
 		echo '}'
 	} >"$ALLOY_CFG"
-
-	DRIVER_IP=$(driver_pub_ip 0)
 	say "observe: starting Alloy on driver-1 ($DRIVER_IP)"
 	rscp "$ALLOY_CFG" "root@$DRIVER_IP:/opt/alloy-config.alloy"
 	rssh "$DRIVER_IP" "docker rm -f bench-alloy >/dev/null 2>&1 || true; \
