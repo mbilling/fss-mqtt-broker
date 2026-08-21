@@ -870,6 +870,7 @@ mod tests {
     /// than ops; at rest the ratio would be 1:1).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn owner_writes_group_commit_with_follower_applies() {
+        use std::sync::atomic::Ordering::Relaxed;
         let p = node("owner-burst-node").await;
 
         let mut tasks: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
@@ -927,7 +928,6 @@ mod tests {
             }
         }
 
-        use std::sync::atomic::Ordering::Relaxed;
         let stats = p.writer_stats();
         assert_eq!(
             stats.ops.load(Relaxed),
