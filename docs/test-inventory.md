@@ -241,7 +241,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 259 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 260 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -305,6 +305,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `durable_node::tests::single_node_durable_store_bootstraps_and_serves`
 - `durable_plane::tests::deliver_to_unregistered_peer_is_unreachable`
 - `durable_plane::tests::lease_group_ready_tracks_leadership_and_voter_membership`
+- `durable_plane::tests::owner_writes_group_commit_with_follower_applies`
 - `durable_plane::tests::plane_carries_consensus_and_replication_over_the_wire`
 - `durable_plane::tests::reads_carry_completeness_and_catch_up_reaches_the_source`
 - `durable_plane::tests::recovery_read_returns_a_replicas_log_over_the_wire`
