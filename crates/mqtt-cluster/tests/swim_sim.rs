@@ -288,6 +288,7 @@ fn sim_cfg() -> Config {
         gossip_fanout: 8,
         gossip_multiplier: 4,
         awareness_max: 8,
+        isolation_rounds: 5,
     }
 }
 

@@ -190,6 +190,7 @@ struct OtelInstruments {
     foundings: OtelCounter<u64>,
     config_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
+    swim_isolated: OtelGauge<i64>,
     peer_proto_min: OtelGauge<i64>,
     peer_proto_max: OtelGauge<i64>,
 }
@@ -266,6 +267,7 @@ impl OtelInstruments {
             foundings: meter.u64_counter("foundings").build(),
             config_info: meter.i64_gauge("config_info").build(),
             swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
+            swim_isolated: meter.i64_gauge("swim_isolated").build(),
             peer_proto_min: meter.i64_gauge("peer_proto_min").build(),
             peer_proto_max: meter.i64_gauge("peer_proto_max").build(),
         }
@@ -403,6 +405,7 @@ pub struct Metrics {
     /// 1 = steady state, 2 = a rotation window is open. Alert when it stays > 1
     /// longer than a rotation should take.
     swim_keys_accepted: Gauge,
+    swim_isolated: Gauge,
     /// The peer-bus protocol range this build speaks (ADR 0038/0054) — a mixed-
     /// version fleet is visible per node.
     peer_proto_min: Gauge,
@@ -880,6 +883,14 @@ impl Metrics {
             "SWIM gossip keys currently accepted (ADR 0054 T3): 1 steady, 2 = a \
              rotation window is open",
         );
+        let swim_isolated = register_gauge(
+            &mut registry,
+            "swim_isolated",
+            "1 while this node's own SWIM probes go unanswered past the isolation \
+             threshold (issue #368): its membership view is unconfirmed and peers \
+             are likely evicting it — a one-way network failure looks exactly like \
+             this and like nothing else",
+        );
         let peer_proto_min = register_gauge(
             &mut registry,
             "peer_proto_min",
@@ -981,6 +992,7 @@ impl Metrics {
             config_info,
             config_info_prev: std::sync::Mutex::new(None),
             swim_keys_accepted,
+            swim_isolated,
             peer_proto_min,
             peer_proto_max,
         }
@@ -1530,6 +1542,14 @@ impl Metrics {
         self.otel
             .config_info
             .record(1, &[KeyValue::new("checksum", checksum.to_string())]);
+    }
+
+    /// Record whether this node currently considers itself SWIM-isolated
+    /// (issue #368): its own probes go unanswered while inbound gossip still
+    /// paints a fresh-looking view.
+    pub fn set_swim_isolated(&self, isolated: bool) {
+        self.swim_isolated.set(i64::from(isolated));
+        self.otel.swim_isolated.record(i64::from(isolated), &[]);
     }
 
     /// Record how many SWIM gossip keys this node accepts (rotation posture).

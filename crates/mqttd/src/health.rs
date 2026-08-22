@@ -120,6 +120,12 @@ pub struct HealthState {
     /// networking configured, foreign-cluster gossip seen)`. `None` when the guard is
     /// off or this is not a cluster node. See [`Self::refound_quarantined`].
     refound: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// SWIM isolation flag (issue #368), written by the gossip driver: set while this
+    /// node's own probes go unanswered past the isolation threshold, meaning its
+    /// membership view is UNCONFIRMED (the one-way-failure shape where the view keeps
+    /// looking healthy while peers evict us). Surfaced on `/statusz` so an operator
+    /// reading the evictee sees the contradiction the counts alone hide.
+    swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl std::fmt::Debug for HealthState {
@@ -210,6 +216,7 @@ impl HealthState {
             metrics: None,
             identity: None,
             refound: None,
+            swim_isolated: None,
             backup: None,
             brownout: None,
             stores: None,
@@ -263,6 +270,18 @@ impl HealthState {
     #[must_use]
     pub fn with_refound_guard(mut self, evidence: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.refound = Some(evidence);
+        self
+    }
+
+    /// Surface the SWIM isolation flag (issue #368) on `/statusz`.
+    ///
+    /// `flag` is written by the gossip driver when this node's own probes go
+    /// unanswered past the isolation threshold. Statusz-only: readiness is NOT
+    /// gated on it (the lease-group and membership gates already fail closed;
+    /// this flag explains WHY, on the one node whose own view cannot).
+    #[must_use]
+    pub fn with_swim_isolated(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.swim_isolated = Some(flag);
         self
     }
 
@@ -443,6 +462,15 @@ impl HealthState {
                 s,
                 ",\"quarantine\":{{\"active\":true,\"reason\":\"refounded-beside-live-cluster\"}}"
             );
+        }
+        // SWIM isolation (issue #368): the one node whose membership view looks
+        // healthiest may be the one nobody can hear. Reported here because every
+        // OTHER signal on this node (members, lease detail) is exactly the stale
+        // view the flag impeaches.
+        if let Some(flag) = &self.swim_isolated {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                s.push_str(",\"swim_isolated\":true");
+            }
         }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
