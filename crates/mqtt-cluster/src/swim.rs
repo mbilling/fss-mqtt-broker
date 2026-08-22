@@ -88,6 +88,12 @@ pub struct Config {
     /// a locally-degraded node slows its own failure detection. `0` disables awareness
     /// (timeouts never scale).
     pub awareness_max: u8,
+    /// Consecutive fully-failed probe rounds (direct AND indirect unanswered) after
+    /// which this node considers itself [`isolated`](Swim::isolated) (issue #368).
+    /// Round-robin probing means the failures are against *distinct* targets, so the
+    /// threshold trades detection delay against false positives from a run of
+    /// genuinely-dead targets. Clamped to `>= 1`.
+    pub isolation_rounds: u32,
 }
 
 impl Default for Config {
@@ -103,6 +109,7 @@ impl Default for Config {
             gossip_fanout: 6,
             gossip_multiplier: 3,
             awareness_max: 8,
+            isolation_rounds: 5,
         }
     }
 }
@@ -334,6 +341,14 @@ pub struct Swim {
     /// ADR 0019 §2). While leaving we stop refuting `Dead` claims about ourselves so the
     /// announced departure sticks rather than being overridden by self-refutation.
     leaving: bool,
+    /// Consecutive probe rounds of ours that concluded with NO ack, direct or
+    /// indirect (issue #368). Distinct from `awareness`, which deliberately does
+    /// **not** rise on unanswered probes (the target may simply be dead): this
+    /// counter exists precisely for the case awareness cannot see — a one-way
+    /// network failure where our outbound datagrams vanish while inbound gossip
+    /// keeps painting a fresh-looking `Alive` view. Reset by any ack of any
+    /// probe of ours.
+    failed_probe_rounds: u32,
 }
 
 impl Swim {
@@ -377,6 +392,7 @@ impl Swim {
             bootstrapped: false,
             awareness: 0,
             leaving: false,
+            failed_probe_rounds: 0,
         }
     }
 
@@ -400,6 +416,25 @@ impl Swim {
             .filter(|m| m.state == MemberState::Alive)
             .cloned()
             .collect()
+    }
+
+    /// Consecutive probe rounds of ours that concluded unanswered (see
+    /// [`isolated`](Self::isolated)).
+    #[must_use]
+    pub fn failed_probe_rounds(&self) -> u32 {
+        self.failed_probe_rounds
+    }
+
+    /// True while this node's own probes have gone unanswered for at least
+    /// `isolation_rounds` consecutive rounds (issue #368): every claim in the local
+    /// membership view is then UNCONFIRMED by us — under a one-way network failure
+    /// (outbound lost, inbound intact) the view keeps looking fresh and fully
+    /// `Alive` while the rest of the cluster is busy evicting us. Readers of the
+    /// view (statusz, operators, tooling) should treat it as suspect while this
+    /// holds. Cleared by any ack of any probe of ours.
+    #[must_use]
+    pub fn isolated(&self) -> bool {
+        self.failed_probe_rounds >= self.cfg.isolation_rounds.max(1)
     }
 
     fn xorshift(&mut self) -> u64 {
@@ -826,6 +861,10 @@ impl Swim {
                 // (the target may simply be dead), so blaming our local health would
                 // wrongly slow detection of genuinely-dead peers (ADR 0016 §2). Only
                 // self-refutation, an unambiguous "others cannot reach us", raises it.
+                // The isolation counter (issue #368) is the accumulation that resolves
+                // the ambiguity: one silent target means nothing, but a consecutive
+                // RUN of silent round-robin targets means the silence is ours.
+                self.failed_probe_rounds = self.failed_probe_rounds.saturating_add(1);
                 let target = p.target.clone();
                 self.probe = None;
                 self.declare(&target, MemberState::Suspect, now, out);
@@ -970,6 +1009,7 @@ impl Swim {
                     if p.target.0 == target {
                         self.probe = None;
                         self.lower_awareness(); // an indirect probe still succeeded
+                        self.failed_probe_rounds = 0; // our PingReq reached a helper
                     }
                 }
             }
@@ -993,6 +1033,7 @@ impl Swim {
             if p.seq == seq {
                 self.probe = None;
                 self.lower_awareness(); // a clean round (ADR 0016 §2)
+                self.failed_probe_rounds = 0; // our outbound path demonstrably works
                 return;
             }
         }
@@ -1057,6 +1098,7 @@ mod tests {
             gossip_fanout: 8,
             gossip_multiplier: 3,
             awareness_max: 8,
+            isolation_rounds: 3,
         }
     }
 
@@ -1338,6 +1380,72 @@ mod tests {
                 .any(|u| u.id == "a" && u.state == MemberState::Alive),
             "a leaving node does not queue an Alive refutation about itself"
         );
+    }
+
+    /// Drive one full probe round against a silent network at round-start `t`
+    /// (`fast_cfg` timings: ack deadline +20, indirect deadline +40), then deliver
+    /// inbound gossip re-aliving `b` at incarnation `inc` — the #368 shape where
+    /// our outbound datagrams vanish while inbound keeps the view looking fresh.
+    fn fail_round_against_fresh_gossip(s: &mut Swim, t: u64, inc: u64) {
+        let mut out = Vec::new();
+        s.tick(t); //          Ping goes out (and vanishes)
+        s.tick(t + 21); //     ack deadline -> indirect escalation (no helpers)
+        s.tick(t + 41); //     indirect deadline -> the round concludes unanswered
+        s.apply_update(&alive_update("b", "b:1", inc), t + 50, &mut out);
+    }
+
+    #[test]
+    fn a_run_of_unanswered_probe_rounds_marks_the_node_isolated_while_gossip_keeps_the_view_fresh()
+    {
+        // Issue #368's one-way failure: outbound lost, inbound intact. The local
+        // view stays fully Alive and current-looking the whole time — isolation
+        // is the signal that none of it is confirmed by us.
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0); // bootstrap
+        for round in 1..=3u64 {
+            fail_round_against_fresh_gossip(&mut s, round * 100, round);
+            assert_eq!(
+                member_state(&s, "b"),
+                Some(MemberState::Alive),
+                "inbound gossip keeps the view deceptively fresh"
+            );
+            assert_eq!(s.failed_probe_rounds(), u32::try_from(round).unwrap());
+            assert_eq!(
+                s.isolated(),
+                round >= 3,
+                "isolation trips at the configured 3 consecutive rounds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_ack_of_our_probe_clears_isolation() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0);
+        for round in 1..=3u64 {
+            fail_round_against_fresh_gossip(&mut s, round * 100, round);
+        }
+        assert!(s.isolated());
+
+        // Round 4: the network heals and b's ack gets through.
+        let actions = s.tick(400);
+        let seq = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { msg, .. } => match &msg.kind {
+                    Kind::Ping { seq } => Some(*seq),
+                    _ => None,
+                },
+                Action::StateChange { .. } => None,
+            })
+            .expect("round 4 sends a Ping");
+        s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 401);
+        assert!(!s.isolated(), "one confirmed round trip clears isolation");
+        assert_eq!(s.failed_probe_rounds(), 0);
     }
 
     #[test]

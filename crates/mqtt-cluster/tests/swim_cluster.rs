@@ -123,6 +123,7 @@ fn cfg() -> Config {
         gossip_fanout: 8,
         gossip_multiplier: 4,
         awareness_max: 8,
+        isolation_rounds: 5,
     }
 }
 
@@ -312,6 +313,7 @@ async fn spawn_node_inner(
         seq_alloc,
         Some(reject),
         identity,
+        None, // no isolation flag in this harness
         shutdown,
     ));
     (

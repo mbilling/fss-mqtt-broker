@@ -157,6 +157,33 @@ for N in "${SIZES[@]}"; do
 		wait_for "private ip $priv on $ip" 180 rssh "$ip" "ip -4 addr show | grep -qF $priv"
 	done
 
+	# Private-net truth gate (issue #368): an address can be PRESENT while the
+	# interface is ONE-WAY — outbound dead, inbound fine — the shape that let a
+	# cleanly-formed cluster evict one node minutes later on three separate
+	# runs (always the host whose private-net attach raced; the address check
+	# above cannot see it). Verify actual pairwise reachability from every
+	# host, heal the SOURCE host (outbound is the broken side) with the same
+	# clean+reboot retry once, and fail the run fast if it stays one-way —
+	# minutes here instead of an unmeasurable hour later.
+	ALL_PRIVS=$(jq -r '[(.brokers[], .drivers[]) | .private_ip] | join(" ")' "$INVENTORY")
+	mesh_ok() { # mesh_ok <public-ip> — prints the first unreachable private ip
+		rssh "$1" "for t in $ALL_PRIVS; do ping -c1 -W2 \$t >/dev/null 2>&1 || { echo \$t; exit 1; }; done"
+	}
+	for ip in $(jq -r '(.brokers[], .drivers[]) | .public_ip' "$INVENTORY"); do
+		if ! BAD=$(mesh_ok "$ip"); then
+			warn "private-net mesh FAILED from $ip (cannot reach ${BAD:-?}) — one clean+reboot retry (one-way attach, issue #368)"
+			OLD_BOOT=$(rssh "$ip" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)
+			rssh "$ip" "cloud-init clean --logs; reboot" || true
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			wait_for "reboot of $ip (new boot id)" 300 boot_id_changed "$ip" "$OLD_BOOT"
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			wait_for "cloud-init after mesh retry on $ip" 300 rssh "$ip" "$CI_OK"
+			BAD=$(mesh_ok "$ip") ||
+				die "private-net STILL one-way from $ip (cannot reach ${BAD:-?}) after a clean reboot — Hetzner attach fault; tear down and re-apply"
+		fi
+	done
+	say "private-net mesh verified: every host reaches every private address"
+
 	# lane A's driver binary: wait for driver-1's background cargo build.
 	say "waiting for driver-1's durable_bench build (overlaps with nothing else now)"
 	wait_for "durable_bench build on driver-1" 1800 \

@@ -74,12 +74,20 @@ pub async fn maintain_peer_links(
                 p.observe(&ev.id, ev.state, &ev.peer_addr, ev.domain.as_deref());
             }
         }
+        // Membership transitions log at WARN when they carry operational weight
+        // (issue #368): a 40-minute asymmetric split was invisible at the default
+        // RUST_LOG=warn because eviction and recovery logged at info. Transitions
+        // are edge-triggered and bounded by cluster size — no flooding lever.
+        let previous = member_states.insert(ev.id.clone(), ev.state);
         if let Some(m) = &metrics {
-            member_states.insert(ev.id.clone(), ev.state);
             publish_member_gauges(m, &member_states);
         }
         match ev.state {
             MemberState::Alive => {
+                if matches!(previous, Some(MemberState::Suspect | MemberState::Dead)) {
+                    warn!(peer = %ev.id.0, was = ?previous,
+                        "membership: peer RECOVERED to alive");
+                }
                 // One link per pair: only the smaller-id node dials (the same
                 // tie-break the handshake enforces, applied early to avoid churn).
                 if local.0 >= ev.id.0 {
@@ -119,12 +127,16 @@ pub async fn maintain_peer_links(
                     .0
                     .insert(ev.id.clone(), (ev.peer_addr.clone(), handle));
             }
-            MemberState::Suspect => {}
+            MemberState::Suspect => {
+                // No routing action (a transiently slow node loses nothing), but
+                // say it: suspicion is the first observable step of every eviction.
+                warn!(peer = %ev.id.0, "membership: peer SUSPECT (probes unanswered; routing continues pending refutation or timeout)");
+            }
             MemberState::Dead => {
                 if let Some((_, h)) = dialers.0.remove(&ev.id) {
                     h.abort();
                 }
-                info!(peer = %ev.id.0, "membership: peer dead; dropping link");
+                warn!(peer = %ev.id.0, "membership: peer DEAD; dropping link and routing state");
                 let _ = hub.send(HubCommand::PeerDead { node: ev.id });
             }
         }

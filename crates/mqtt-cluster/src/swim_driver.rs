@@ -77,9 +77,35 @@ pub async fn run(
     mut seq_alloc: Option<SeqAlloc>,
     reject: Option<RejectCounter>,
     identity: Option<std::sync::Arc<crate::cluster_identity::ClusterIdentity>>,
+    isolated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     let start = Instant::now();
+    // Publish isolation flips (issue #368): the flag is read by /statusz and the
+    // metrics gauge, and the transition logs are the operator's only WARN-level
+    // trace of a one-way network failure — the state machine's own view keeps
+    // looking healthy under exactly that failure, which is the point.
+    let mut was_isolated = false;
+    let publish_isolation = |swim: &Swim, was: &mut bool| {
+        let now_isolated = swim.isolated();
+        if now_isolated != *was {
+            *was = now_isolated;
+            if let Some(flag) = &isolated {
+                flag.store(now_isolated, std::sync::atomic::Ordering::Relaxed);
+            }
+            if now_isolated {
+                tracing::warn!(
+                    failed_probe_rounds = swim.failed_probe_rounds(),
+                    "SWIM isolation: this node's own probes are going unanswered while \
+                     inbound gossip still arrives — the local membership view is \
+                     UNCONFIRMED (one-way network failure?); peers are likely evicting \
+                     this node (issue #368)"
+                );
+            } else {
+                tracing::warn!("SWIM isolation cleared: a probe of ours was acked again");
+            }
+        }
+    };
     // Count one dropped-gossip event under its bounded reason class, if a sink is set.
     let count_reject = |reason: &'static str| {
         if let Some(r) = &reject {
@@ -107,6 +133,8 @@ pub async fn run(
                 for action in swim.tick(now) {
                     apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc, identity.as_deref()).await;
                 }
+                // Probe rounds conclude on ticks — isolation can only TRIP here.
+                publish_isolation(&swim, &mut was_isolated);
             }
             recv = socket.recv_from(&mut buf) => {
                 let Ok((n, src)) = recv else { continue };
@@ -209,6 +237,8 @@ pub async fn run(
                 for action in swim.handle(msg, now) {
                     apply(&socket, action, &events, auth.as_ref(), &mut seq_alloc, identity.as_deref()).await;
                 }
+                // Acks land in handle() — isolation can only CLEAR here.
+                publish_isolation(&swim, &mut was_isolated);
             }
         }
     }

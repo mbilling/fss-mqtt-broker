@@ -59,6 +59,7 @@ fn swim_cfg() -> SwimConfig {
         gossip_fanout: 8,
         gossip_multiplier: 4,
         awareness_max: 8,
+        isolation_rounds: 5,
     }
 }
 
@@ -212,6 +213,7 @@ async fn start_durable_node_capped(
             None, // no anti-replay sequencing in this test
             None, // no reject sink in this test
             None, // no cluster identity in this harness
+            None, // no isolation flag in this test
             std::future::pending(),
         ))
         .abort_handle(),

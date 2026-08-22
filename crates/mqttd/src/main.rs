@@ -462,6 +462,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || config.cluster.swim.bind.is_some()
         || !config.cluster.swim.seeds.is_empty();
     let foreign_cluster_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // SWIM isolation flag (issue #368): written by the gossip driver while this
+    // node's own probes go unanswered; read by /statusz and the swim_isolated gauge.
+    let swim_isolated = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Config stamp (ADR 0054 T3): checksum + generation of the applied config,
     // recorded at startup and on every successful reload.
     let config_stamp = Arc::new(mqttd::reload::ConfigStamp::default());
@@ -547,6 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &backup_status,
         // Arm the guard only for a cluster node that has not opted out.
         (cluster_configured && config.cluster.refound_guard).then(|| foreign_cluster_seen.clone()),
+        cluster_configured.then(|| swim_isolated.clone()),
     )
     .await?;
 
@@ -659,6 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster_identity.clone(),
         swim_key_fps.clone(),
         foreign_cluster_seen.clone(),
+        swim_isolated.clone(),
         &mut reloader,
     )
     .await?;
@@ -2055,6 +2060,7 @@ async fn start_health(
     swim_key_fps: &Arc<std::sync::OnceLock<Vec<String>>>,
     backup_status: &Arc<mqttd::backup::BackupStatus>,
     refound_evidence: Option<Arc<std::sync::atomic::AtomicBool>>,
+    swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<
     (
         Arc<std::sync::atomic::AtomicBool>,
@@ -2103,6 +2109,10 @@ async fn start_health(
     let state = state.with_backup_status(backup_status.clone());
     let state = match refound_evidence {
         Some(evidence) => state.with_refound_guard(evidence),
+        None => state,
+    };
+    let state = match swim_isolated {
+        Some(flag) => state.with_swim_isolated(flag),
         None => state,
     };
     let draining = state.draining_handle();
@@ -2615,6 +2625,8 @@ async fn start_swim(
     // Set on the first FOREIGN-cluster datagram — the evidence the re-found
     // self-quarantine keys on (issue #92 follow-up).
     foreign_cluster_seen: Arc<std::sync::atomic::AtomicBool>,
+    // Written by the driver while this node's own probes go unanswered (issue #368).
+    swim_isolated: Arc<std::sync::atomic::AtomicBool>,
     // Attached when signed gossip is on (issue #269): the signing identity is rebuilt
     // from the re-read leaf/key in the same atomic reload as the peer TLS contexts.
     reloader: &mut reload::Reloader,
@@ -2787,8 +2799,26 @@ async fn start_swim(
         seq_alloc,
         Some(reject),
         Some(cluster_identity),
+        Some(swim_isolated.clone()),
         shutdown.clone().cancelled_owned(),
     ));
+    // Mirror the isolation flag into the swim_isolated gauge (issue #368) so the
+    // scrape plane sees what /statusz sees. 5 s matches the durable-writer poller.
+    tokio::spawn({
+        let metrics = metrics.clone();
+        let stop = shutdown.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    _ = tick.tick() => metrics.set_swim_isolated(
+                        swim_isolated.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                }
+            }
+        }
+    });
     tokio::spawn(cluster::maintain_peer_links(
         event_rx,
         node_id.clone(),
