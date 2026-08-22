@@ -16,6 +16,12 @@
 #
 # SMOKE=1 shrinks every knob to prove the pipeline for cents; the numbers from
 # a smoke run are for the pipeline, never for the doc.
+#
+# LANES=<subset of ABC> (default ABC) runs only the named lanes — e.g. LANES=B
+# reruns the fan-out ladder alone (a driver-count experiment does not need to
+# pay for lane A's hour). Skipping lane A also skips its barrier probes; a
+# lane-B/C-only result dir is therefore NOT a Curve 1 point and the summarizer
+# will render it as such.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -27,6 +33,11 @@ N=$(broker_count)
 D=$(driver_count)
 OUT="$RUN/results/nodes=$N"
 mkdir -p "$OUT"
+
+LANES="${LANES:-ABC}"
+case "$LANES" in
+*[!ABC]* | "") die "LANES must be a non-empty subset of ABC (got: $LANES)" ;;
+esac
 
 # ── knobs (each SMOKE value proves the path, not the number) ─────────────────
 if [ "${SMOKE:-0}" = 1 ]; then
@@ -124,6 +135,11 @@ jq -s '.' "$OUT"/preflight/broker*.json >/dev/null 2>&1 || warn "statusz not all
 # ── 1. barrier probes on every broker host (DURABLE-PATH.md's prerequisite) ──
 # The durable_bench test binary carries the probes; driver-1 built it and serves
 # it over the private network so each broker can fetch it LAN-fast.
+# The guard spans sections 1 and 2 (probes gate Curve 1 only; both bodies keep
+# their top-level indentation to keep this diff reviewable).
+if [[ "$LANES" != *A* ]]; then
+	say "[$N nodes] LANES=$LANES — skipping barrier probes and lane A"
+else
 say "[$N nodes] barrier probes on every broker host"
 BIN_PATH=$(rssh "$(driver_pub_ip 0)" "cat /run/bench-driver-build-done")
 [ -n "$BIN_PATH" ] || die "driver-1 build marker is empty — durable_bench binary missing"
@@ -207,15 +223,41 @@ if [ "${SMOKE:-0}" != 1 ]; then
 	lane_a_tier relaxed
 fi
 
+# Past-the-voter-cap variant: at N > MQTTD_LEASE_VOTERS' default (5), durable
+# ownership capacity is architecturally flat (ADR 0021/0049) — the default run
+# above MEASURES that flat line. This variant then re-forms the cluster with
+# the cap raised to N (data dirs wiped first: the voter set is committed Raft
+# state, so only a fresh formation honestly measures the larger cap) and runs
+# the same sat/lat shape — the actually-new question at this size: what does a
+# majority-of-N quorum cost over a majority-of-5?
+if [ "$N" -gt 5 ] && [ "${SMOKE:-0}" != 1 ]; then
+	say "[$N nodes] lane A voters variant: fresh formation with MQTTD_LEASE_VOTERS=$N"
+	wipe_broker_data() {
+		rssh "$(broker_pub_ip "$1")" "systemctl stop mqttd; rm -rf /var/lib/mqttd/*"
+	}
+	every_broker wipe_broker_data
+	EXTRA_BROKER_ENV="MQTTD_LEASE_VOTERS=$N" \
+		"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	lane_a "sat-voters$N" 48 8 48
+	lane_a "lat-voters$N" "$N" 1 "$N"
+	say "  lane A voters variant done"
+fi
+fi # LANES *A*
+
 # ── switch the brokers to the non-durable posture for lanes B and C ──────────
-say "[$N nodes] switching brokers to non-durable posture (lanes B/C parity)"
-"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" clean
+if [[ "$LANES" == *B* || "$LANES" == *C* ]]; then
+	say "[$N nodes] switching brokers to non-durable posture (lanes B/C parity)"
+	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" clean
+fi
 
 # ── 3. lane B — $share fan-out ladder ────────────────────────────────────────
 # ONE shared subscription group over everything the publishers emit: the ADR
 # 0015 mechanism, end to end. Populations are split evenly across drivers and
 # round-robin across brokers; the TOTAL population and ladder are identical at
 # every cluster size (the §2 "same workload" rule).
+if [[ "$LANES" != *B* ]]; then
+	say "[$N nodes] LANES=$LANES — skipping lane B"
+else
 say "[$N nodes] lane B: \$share fan-out ladder (${LANE_B_RUNGS[*]} msg/s)"
 lane_b_rung() { # lane_b_rung <total-rate> <posture:plain|mtls>
 	local rate="$1" posture="$2"
@@ -277,8 +319,12 @@ done
 if [ "${SMOKE:-0}" != 1 ]; then
 	lane_b_rung "$LANE_B_REF_RUNG" mtls
 fi
+fi # LANES *B*
 
 # ── 4. lane C — idle connection fan-out ──────────────────────────────────────
+if [[ "$LANES" != *C* ]]; then
+	say "[$N nodes] LANES=$LANES — skipping lane C"
+else
 say "[$N nodes] lane C: $LANE_C_CONNS idle connections"
 lane_c() { # lane_c <total-conns> <posture>
 	local total="$1" posture="$2"
@@ -328,6 +374,7 @@ lane_c "$LANE_C_CONNS" plain
 if [ "${SMOKE:-0}" != 1 ]; then
 	lane_c 10000 mtls
 fi
+fi # LANES *C*
 
 # ── 5. host facts for the disclosure block ───────────────────────────────────
 mkdir -p "$OUT/env"
