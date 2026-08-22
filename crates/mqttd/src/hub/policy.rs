@@ -144,8 +144,11 @@ impl Hub {
     /// member's turn. Remote members are excluded because their durability is decided on
     /// their own node, by its own plan pass.
     pub(super) fn shared_plan_owes_durable(&self, topic: &str, qos: QoS) -> bool {
-        self.shared_candidates(topic).into_iter().any(|(key, cs)| {
-            self.peek_shared(&key, &cs).is_some_and(|c| {
+        // `plan_shared` is pure (issue #376): it reads the cursor without advancing
+        // it, so this peek consumes no member's turn — same property `peek_shared`
+        // gave the owned path, without materializing every candidate to check one.
+        self.plan_shared(topic).into_iter().any(|p| {
+            p.chosen.is_some_and(|c| {
                 c.node.is_none() && self.owes_durable(&c.client, min_qos(qos, c.qos))
             })
         })
