@@ -96,6 +96,7 @@ pub async fn build_durable_node(
     data_dir: Option<&std::path::Path>,
     commit_delay: Option<Arc<std::sync::atomic::AtomicU64>>,
     allow_relaxed_publish: bool,
+    ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
 ) -> (
     Arc<dyn SessionStore>,
     Arc<dyn DurableRetained>,
@@ -144,7 +145,8 @@ pub async fn build_durable_node(
         transport.clone(),
         replicas.clone(),
         placement.clone(),
-    );
+    )
+    .with_ownership_domain_all(ownership_domain_all.clone());
 
     // --- durable store over the shared transport ---
     let lease_source = LocalLeaseSource::new(lease_store.clone(), local);
@@ -196,6 +198,7 @@ pub async fn build_durable_node(
         MembershipReconciler::new(local, can_bootstrap, voter_cap),
         LeaseAssigner::new(placement),
         domains,
+        ownership_domain_all,
         CatchUp {
             node: node_id,
             transport,
@@ -418,6 +421,7 @@ async fn run_driver(
     reconciler: MembershipReconciler,
     assigner: LeaseAssigner,
     domains: BTreeMap<RaftNodeId, FailureDomain>,
+    ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
     catch_up: CatchUp,
 ) {
     // A one-tick debounce: only act once the desired set is stable across a tick, so
@@ -484,17 +488,25 @@ async fn run_driver(
             }
             // Restrict only once the voter set has held steady for a couple of ticks;
             // otherwise fall back to eligible (empty set) to avoid bootstrap churn.
-            let voter_nodes: BTreeSet<NodeId> = if voter_stable_ticks >= VOTER_STABLE_TICKS {
-                let p = placement
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                p.members()
-                    .into_iter()
-                    .filter(|n| voter_rids.contains(&raft_id(n)))
-                    .collect()
-            } else {
-                BTreeSet::new()
-            };
+            // ADR 0073: under the cluster-wide scale-out capability no restriction is
+            // pushed at all — ownership spans every admitted member (the empty set is
+            // Placement's fall-back-to-eligible), and the committed lease map remains
+            // the serving truth either way. The flag dropping (a rolled-back binary
+            // joining) restores ADR 0049's restriction after the usual settle ticks.
+            let voter_nodes: BTreeSet<NodeId> =
+                if ownership_domain_all.load(std::sync::atomic::Ordering::Relaxed) {
+                    BTreeSet::new()
+                } else if voter_stable_ticks >= VOTER_STABLE_TICKS {
+                    let p = placement
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    p.members()
+                        .into_iter()
+                        .filter(|n| voter_rids.contains(&raft_id(n)))
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
             placement
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -703,6 +715,7 @@ mod tests {
             None,
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
 
@@ -797,6 +810,7 @@ mod tests {
             Some(dir.path()),
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         wait_writable(&store, &client, &msg).await;
@@ -828,6 +842,7 @@ mod tests {
             Some(dir.path()),
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         // Becoming writable again proves the persisted lease store reopened (no

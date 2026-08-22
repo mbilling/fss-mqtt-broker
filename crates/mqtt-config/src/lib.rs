@@ -405,6 +405,23 @@ pub struct Durable {
     /// weaker. The reservation this delivers is ADR 0018's: a relaxed mode "MAY
     /// be offered later as an opt-in, loudly logged".
     pub allow_relaxed_publish: bool,
+    /// Durable **ownership domain** (`MQTTD_OWNERSHIP_DOMAIN`, ADR 0073):
+    /// `"members"` (default) lets every admitted member own durable groups once the
+    /// whole cluster advertises the capability (peer proto >= 8) — capacity scales
+    /// with nodes; `"voters"` keeps ADR 0049's restriction to the lease-voter set —
+    /// the loud opt-out escape hatch, and the automatic posture whenever ANY member
+    /// (e.g. a rolled-back binary) lacks the capability.
+    pub ownership_domain: OwnershipDomain,
+}
+
+/// The durable ownership domain (`durable.ownership_domain`, ADR 0073).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnershipDomain {
+    /// Every admitted member may own durable groups (capability-gated cluster-wide).
+    Members,
+    /// Ownership restricted to the lease-voter set (ADR 0049's posture).
+    Voters,
 }
 
 /// Online backup + restore of the durable state ([ADR 0062](../../../docs/adr/0062-online-backup-and-restore.md)).
@@ -482,6 +499,7 @@ impl Default for Durable {
             min_replicas: MinReplicas::Majority,
             allow_ephemeral: false,
             allow_relaxed_publish: false,
+            ownership_domain: OwnershipDomain::Members,
         }
     }
 }
@@ -1156,6 +1174,17 @@ impl Config {
         if get("MQTTD_ALLOW_RELAXED_PUBLISH").is_some() {
             self.durable.allow_relaxed_publish = true;
         }
+        on!("MQTTD_OWNERSHIP_DOMAIN", v, {
+            self.durable.ownership_domain = match v.as_str() {
+                "members" => OwnershipDomain::Members,
+                "voters" => OwnershipDomain::Voters,
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "MQTTD_OWNERSHIP_DOMAIN must be 'members' or 'voters', got {other:?}"
+                    )))
+                }
+            };
+        });
 
         // -- limits --
         on!("MQTTD_MAX_CONNECTIONS", v, {
@@ -1554,6 +1583,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_STORE_MAX_BYTES",
     "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
     "MQTTD_ALLOW_RELAXED_PUBLISH",
+    "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",
     "MQTTD_MAX_CONNECTIONS_PER_IP",
@@ -2017,6 +2047,30 @@ mod tests {
         }
     }
 
+    /// ADR 0073: `MQTTD_OWNERSHIP_DOMAIN` accepts exactly "members" (the default)
+    /// and "voters" (the escape hatch); anything else is refused naming the values.
+    #[test]
+    fn ownership_domain_parses_both_values_and_refuses_others() {
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_OWNERSHIP_DOMAIN", "voters")]))
+            .unwrap();
+        assert_eq!(c.durable.ownership_domain, super::OwnershipDomain::Voters);
+        c.overlay_from(getter(&[("MQTTD_OWNERSHIP_DOMAIN", "members")]))
+            .unwrap();
+        assert_eq!(c.durable.ownership_domain, super::OwnershipDomain::Members);
+        let err = Config::default()
+            .overlay_from(getter(&[("MQTTD_OWNERSHIP_DOMAIN", "domains")]))
+            .expect_err("an unknown domain must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("members") && msg.contains("voters"), "{msg}");
+        // And the TOML side round-trips the same enum.
+        let c = Config::from_toml(
+            "[node]\ndata_dir = \"/tmp/x\"\n[durable]\nownership_domain = \"voters\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.durable.ownership_domain, super::OwnershipDomain::Voters);
+    }
+
     #[test]
     fn an_unset_env_leaves_file_and_defaults_intact() {
         // Overlaying an empty environment changes nothing.
@@ -2047,6 +2101,8 @@ mod tests {
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
             "MQTTD_MTLS_IDENTITY_SOURCE" => "san-dns",
+            // Default is "members" (ADR 0073), so only the escape hatch *changes* it.
+            "MQTTD_OWNERSHIP_DOMAIN" => "voters",
             // The default is the derived `majority` posture (#239), so only an
             // explicit integer *changes* it.
             "MQTTD_MIN_REPLICAS" => "2",
@@ -2177,8 +2233,9 @@ mod tests {
             seen.len(),
             // 79 before #249 (which itself included #241's four backlog/in-flight knobs)
             // plus this change's six MQTTD_BACKUP_* / MQTTD_RESTORE_* variables,
-            // plus MQTTD_ALLOW_RELAXED_PUBLISH (ADR 0072).
-            86,
+            // plus MQTTD_ALLOW_RELAXED_PUBLISH (ADR 0072),
+            // plus MQTTD_OWNERSHIP_DOMAIN (ADR 0073).
+            87,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

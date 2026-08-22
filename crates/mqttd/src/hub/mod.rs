@@ -1697,6 +1697,19 @@ pub struct Hub {
     /// operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in. Off = the property is
     /// ignored and every ack keeps its full quorum-durable meaning.
     allow_relaxed_publish: bool,
+    /// ADR 0073: the cluster-wide scale-out ownership capability. `Some((flag,
+    /// enabled))` on a cluster node: `enabled` is the operator's
+    /// `durable.ownership_domain = "members"` choice; `flag` is the shared verdict
+    /// this hub recomputes each sweep — true iff enabled AND every placement
+    /// member's last-negotiated peer proto >= [`mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN`].
+    /// The durable driver reads it to widen ownership; the plane reads it for
+    /// readiness; /statusz reports it.
+    ownership_domain: Option<(Arc<std::sync::atomic::AtomicBool>, bool)>,
+    /// The last peer-bus proto each member NEGOTIATED, surviving link flaps
+    /// (updated on link attach, removed only on confirmed death) — a transient
+    /// redial must not flap the ownership domain and mass-migrate 256 groups
+    /// (ADR 0073). Distinct from `peers` (live links only).
+    known_peer_protos: HashMap<NodeId, u32>,
     /// Retained message storage. An `Arc` (not a `Box`) so the online backup task can
     /// hold a READ handle on the same store the hub writes (ADR 0062) — one redb handle,
     /// borrowed, never a second open on a dir this process already locks (ADR 0061).
@@ -2044,6 +2057,8 @@ impl Hub {
                 store,
                 durable_plane: None,
                 allow_relaxed_publish: false,
+                ownership_domain: None,
+                known_peer_protos: HashMap::new(),
                 retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
@@ -2103,6 +2118,18 @@ impl Hub {
     /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in, threaded to the ack gate.
     pub fn set_allow_relaxed_publish(&mut self, on: bool) {
         self.allow_relaxed_publish = on;
+    }
+
+    /// Wire the ADR 0073 scale-out ownership capability: `flag` is shared with the
+    /// durable driver and plane; `enabled` is the operator's
+    /// `durable.ownership_domain = "members"` choice (false = the "voters" escape
+    /// hatch — the flag then never sets and ADR 0049's restriction holds).
+    pub fn set_ownership_domain(
+        &mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+        enabled: bool,
+    ) {
+        self.ownership_domain = Some((flag, enabled));
     }
 
     pub fn attach_durable_plane(&mut self, plane: DurablePlane) {
@@ -2183,6 +2210,7 @@ impl Hub {
                     let started = Instant::now();
                     self.sweep_expired_sessions().await;
                     self.refresh_gauges().await;
+                    self.refresh_ownership_domain();
                     // Retransmit an unanswered retained handoff (T8 — same seq, the
                     // owner dedups), then retry queued retained mutations (ADR 0037
                     // §5): covers heals with no link event — a lease landing locally,
@@ -5120,6 +5148,52 @@ impl Hub {
     /// Refresh the broker state gauges (sessions, subscriptions, retained, inflight)
     /// from the in-memory maps. Run on the session sweep tick so the gauges track
     /// state cheaply without recomputing on every command (ADR 0020-T4).
+    /// Recompute the ADR 0073 scale-out ownership capability: every placement
+    /// member must have last negotiated peer proto >=
+    /// [`mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN`] (this node's own build
+    /// trivially qualifies). Conservative by construction: an unknown proto — a
+    /// member seen in gossip whose link has not yet completed its first
+    /// handshake, or a rolled-back binary — reads as not-capable, and the whole
+    /// cluster holds ADR 0049's voter-bounded domain until it clears. Transitions
+    /// are edge-logged; the committed lease map keeps arbitrating actual serving
+    /// throughout, so a flip is a placement-preference change, never a
+    /// serving-truth change.
+    fn refresh_ownership_domain(&self) {
+        let Some((flag, enabled)) = &self.ownership_domain else {
+            return;
+        };
+        let all_capable = *enabled
+            && self.placement.as_ref().is_some_and(|p| {
+                let members: Vec<NodeId> = {
+                    let p = p.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    p.members_snapshot()
+                        .into_iter()
+                        .map(|(id, _, _)| id)
+                        .collect()
+                };
+                members.iter().all(|id| {
+                    *id == self.node_id
+                        || self.known_peer_protos.get(id).copied().unwrap_or(0)
+                            >= mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN
+                })
+            });
+        let was = flag.swap(all_capable, std::sync::atomic::Ordering::Relaxed);
+        if was != all_capable {
+            if all_capable {
+                info!(
+                    "durable ownership domain EXPANDED to all members (ADR 0073): every \
+                     member advertises the scale-out capability"
+                );
+            } else {
+                warn!(
+                    "durable ownership domain RESTRICTED to the lease voters (ADR 0049 \
+                     posture): a member lacks the scale-out capability (rolled-back \
+                     binary, or a first handshake still pending)"
+                );
+            }
+        }
+    }
+
     async fn refresh_gauges(&self) {
         let Some(m) = &self.metrics else { return };
         // Distinct sessions = connected clients plus offline persistent ones.
@@ -5291,6 +5365,9 @@ impl Hub {
         if let Some(plane) = &self.durable_plane {
             plane.register(&node, ctl.clone(), tx.clone());
         }
+        // ADR 0073: remember the negotiated proto across link flaps (removed only
+        // on confirmed death) — the ownership-domain capability check reads this.
+        self.known_peer_protos.insert(node.clone(), proto);
         self.peers.insert(
             node,
             Peer {
@@ -5337,6 +5414,7 @@ impl Hub {
     /// link's pump on whichever side still holds the socket open.
     async fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
+        self.known_peer_protos.remove(node);
         let had_interest = self.remote_interest.remove(node).is_some();
         self.remote_shared.remove(node);
         // Acked forwards to the dead node re-route to its successor once it
@@ -12612,6 +12690,7 @@ mod tests {
             None,
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         driver.abort();
@@ -12696,6 +12775,7 @@ mod tests {
             None,
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         driver.abort();
@@ -12828,6 +12908,7 @@ mod tests {
             None,
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         driver.abort();
@@ -13160,6 +13241,7 @@ mod tests {
             None,
             None,
             false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         driver.abort();
@@ -16027,6 +16109,84 @@ mod tests {
             vec![b"m1".to_vec(), b"m2".to_vec(), b"m3-qos0".to_vec()],
             "admission order is wire order — the QoS 0 never overtakes a staged \
              QoS 2 (#242 finding A)"
+        );
+    }
+
+    /// ADR 0073: the ownership-domain capability sweep. The flag rises only when the
+    /// operator kept "members" AND every placement member's last-negotiated peer
+    /// proto carries the capability; an unknown proto (link not yet handshaken, or a
+    /// rolled-back binary) holds the conservative voter domain; transitions are
+    /// edge-driven both directions.
+    #[tokio::test]
+    async fn the_ownership_domain_flag_needs_every_member_capable_and_the_operator_choice() {
+        use mqtt_cluster::swim::MemberState;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let placement = Arc::new(RwLock::new(Placement::new(
+            NodeId("od-local".into()),
+            mqtt_cluster::placement::DEFAULT_REPLICAS,
+        )));
+        placement.write().unwrap().observe(
+            &NodeId("od-peer".into()),
+            MemberState::Alive,
+            "peer:7000",
+            None,
+        );
+        let (mut hub, _tx) = Hub::with_config_and_placement(
+            NodeId("od-local".into()),
+            Arc::new(MemorySessionStore::new()),
+            Some(placement),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+
+        // Operator escape hatch: with "voters" chosen, capability never matters.
+        hub.set_ownership_domain(flag.clone(), false);
+        hub.known_peer_protos.insert(
+            NodeId("od-peer".into()),
+            mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN,
+        );
+        hub.refresh_ownership_domain();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "the escape hatch pins voters"
+        );
+
+        // Enabled, but the peer's proto is unknown → conservative false.
+        hub.set_ownership_domain(flag.clone(), true);
+        hub.known_peer_protos.clear();
+        hub.refresh_ownership_domain();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "unknown proto reads not-capable"
+        );
+
+        // The peer negotiated an OLD proto (a rolled-back binary) → still false.
+        hub.known_peer_protos.insert(
+            NodeId("od-peer".into()),
+            mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN - 1,
+        );
+        hub.refresh_ownership_domain();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "an old peer holds the voter domain"
+        );
+
+        // Every member capable (self is trivially capable) → the flag rises…
+        hub.known_peer_protos.insert(
+            NodeId("od-peer".into()),
+            mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN,
+        );
+        hub.refresh_ownership_domain();
+        assert!(flag.load(Ordering::Relaxed), "all capable: domain expands");
+
+        // …and a not-capable member joining drops it again (rollback correctness).
+        hub.known_peer_protos.insert(
+            NodeId("od-peer".into()),
+            mqtt_cluster::peer::PROTO_OWNERSHIP_DOMAIN - 1,
+        );
+        hub.refresh_ownership_domain();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a rollback restores the voter domain"
         );
     }
 }

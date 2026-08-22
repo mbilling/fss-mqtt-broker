@@ -1,7 +1,7 @@
 # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path
 
 Date: 2026-08-22
-Status: Proposed
+Status: Accepted (2026-08-22, with the implementation refinement recorded in §Decision — the write-forwarding mechanism the proposal sketched turned out to be unnecessary)
 
 ## Context
 
@@ -71,24 +71,32 @@ group, one membership plane, no domains, no stairs, no re-sharding.
 **Make every admitted member a servable durable owner; keep the bounded voter
 set as the control plane that grants and arbitrates leases.** Concretely:
 
-### 1. Learners act on leases through the leader
+### 1. Learners serve leases — and implementation found no forwarding was needed
 
-The lease log is already replicated to learners (ADR 0021: "every node can
-read current lease assignments"). What a learner-owner lacked was the *write*
-path: lease claim/renewal/epoch operations are raft writes, and a non-voter
-cannot propose locally. The fix is standard raft practice: **forward the
-proposal to the lease leader over the existing mesh**, wait for commit, read
-the committed result from the local replica of the log. Voters vote; owners
-merely *ask*. The hot path is untouched: appends and acks run under an
-already-committed lease against the group's own replica set, exactly as today.
+The proposal sketched leader-forwarded lease writes. Implementation revealed
+the architecture is already fully leader-push (ADR 0007 §3): the lease-group
+**leader** assigns every group's lease toward its HRW placement owner
+(`LeaseAssigner::reconcile` is the ONLY production lease write), the
+assignment replicates to every node — learners included — and each owner
+reads its epoch from its **own applied lease store** (`LocalLeaseSource`).
+Owners never write. There was never a missing learner write path; what
+voter-bounded ownership in practice were exactly two gates, both now
+conditional on the capability:
 
-- Serving gate: an owner (voter or learner) serves a group's sessions iff the
-  *committed* lease map names it AND its lease term is current. The 0049
-  fail-closed behavior stays: no committed lease, no service, retryable 0x88.
-- Renewal liveness: a learner-owner that cannot reach the leader for a term
-  renewal lets the lease lapse and stops serving — indistinguishable, by
-  design, from today's voter losing quorum. Fail-closed is preserved; only
-  the set of nodes that can *hold* a lease grows.
+- **The assignment domain** (ADR 0049's `Placement.voters` restriction): under
+  the cluster-wide capability the durable driver pushes no restriction, so HRW
+  spreads ownership — and therefore the leader's lease assignments — over
+  every admitted member.
+- **Readiness** (`lease_group_ready` required *this node is a voter*): under
+  the capability a learner-owner is ready whenever a leader exists (leases can
+  be assigned to it; it reads epochs locally). Leaderlessness still fails
+  readiness for everyone.
+
+Serving-truth is unchanged and does all the arbitration: a node serves a
+group iff the **committed lease map** names it (epoch-fenced — a stale owner
+is fenced by its replicas at the newer epoch, so there is no time-based
+renewal to keep alive). The 0049 fail-closed behavior stays: no committed
+lease, no service, retryable 0x88.
 
 ### 2. Ownership hashes over all admitted members again
 
@@ -102,21 +110,37 @@ motion any join causes today. No stairs: every added node adds owner capacity.
 ### 3. The 0049 observability contract extends to learner-owners
 
 `durable_recovery_failures_total`, `lease_quorum_ack_ms`, and the /readyz
-body's durable-serviceability block apply to every owner. One new signal:
-**`lease_forward_failures_total`** — a learner-owner's failed lease proposals
-(the new way to be green-but-degraded), the direct fingerprint of "owner
-cannot reach the control plane", alertable exactly like the 0049 pair.
+body's durable-serviceability block apply to every owner unchanged. (The
+proposal's `lease_forward_failures_total` died with the forwarding it was to
+watch — there are no learner lease writes to fail.) The new surface is the
+**domain itself**: `/statusz`'s lease block reports
+`"ownership_domain": "members" | "voters"` — the in-force domain, not the
+configured wish — and the hub edge-logs every expansion (info) and
+restriction (warn, naming the likely cause: a rolled-back binary or a pending
+first handshake).
 
 ### 4. Mixed versions cannot split ownership
 
 An old node computes owners over voters; a new node over everyone — two HRW
-domains in one cluster would dual-own groups. The expansion therefore gates on
-a **cluster-wide capability**, not a local flag: ownership stays voter-bounded
-until every member advertises the new peer-proto capability (ADR 0038's
-version surface), and the flip is committed *through the lease log itself* (a
-control record), so every node changes domain at the same lease epoch. Rolling
-upgrades (BASELINE_REF oracle) see voter-bounded ownership until the roll
-completes, then one committed flip — never two simultaneous truths.
+domains in one cluster could dual-own groups. The expansion therefore gates on
+a **cluster-wide capability**: peer-bus proto 8 (ADR 0038's version surface;
+the degenerate additive bump — no new frames, the version itself is the
+marker). Each node's hub recomputes the verdict every sweep from the
+last-*negotiated* proto of every placement member (link-flap-immune: the value
+survives a redial and is forgotten only on confirmed death); any member
+unknown or below 8 — a rolled-back binary, a first handshake still pending —
+holds the whole cluster at ADR 0049's voter domain. The proposal's
+committed-log-record flip was dropped in implementation as both unnecessary
+and rollback-unsafe (a record type the previous release cannot decode):
+single-truth does not require a synchronized flip, because divergent
+`group_owner` computations are only routing *hints* and assignment *drift* —
+the lease-group **leader** is the single assigner, and the **committed lease
+map** (which every version reads identically, holders being plain node ids)
+is the only serving truth. A conservative flip window costs at most one
+reassignment churn, never dual service. Rolling upgrades (BASELINE_REF
+oracle) therefore see voter-bounded ownership for the whole mixed window,
+expansion only after the roll completes — and a rollback shrinks the domain
+again automatically.
 
 ## What this does NOT promise ("infinite", honestly)
 
@@ -170,10 +194,10 @@ completes, then one committed flip — never two simultaneous truths.
 
 ## Delivery
 
-Staged so every step is independently shippable and falsifiable —
 [docs/delivery/0073-scale-out-durable-ownership.md](../delivery/0073-scale-out-durable-ownership.md):
-T1 leader-forwarded lease operations for learners (behind the capability, off);
-T2 the committed ownership-domain flip + mixed-version oracle coverage;
-T3 placement over all members + migration soak; T4 the measured curve
-(7/10-node, capped-vs-uncapped A/B) and the SCALE-CURVE.md/COMPARISON.md
-publication that makes the scale-out claim with evidence.
+T1 (the capability-gated domain + learner readiness + the end-to-end
+falsifier) and T2 (the mixed-version conservatism, unit-tested edge by edge)
+shipped together with this ADR's acceptance; T3 (grow/shrink migration soak
+at scale) and T4 (the measured 7/10-node capped-vs-uncapped A/B and the
+SCALE-CURVE.md/COMPARISON.md publication) remain planned — T4 gated on the
+Hetzner quota raise.

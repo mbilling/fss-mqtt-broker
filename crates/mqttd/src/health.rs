@@ -517,13 +517,22 @@ impl HealthState {
                 floor_source,
             );
         }
-        // Lease group (durable mode): role, epoch, voter identities, readiness.
+        // Lease group (durable mode): role, epoch, voter identities, readiness —
+        // and which OWNERSHIP DOMAIN is in force (ADR 0073): "members" while the
+        // whole cluster holds the scale-out capability, "voters" otherwise
+        // (ADR 0049's posture, including the operator escape hatch and any
+        // mixed-version window).
         if let Some(plane) = &self.durable {
             let (is_leader, epoch) = plane.lease_role();
             let _ = write!(
                 s,
-                ",\"lease\":{{\"leader\":{is_leader},\"epoch\":{epoch},\"group_ready\":{},\"voters\":[",
-                plane.lease_group_ready()
+                ",\"lease\":{{\"leader\":{is_leader},\"epoch\":{epoch},\"group_ready\":{},\"ownership_domain\":\"{}\",\"voters\":[",
+                plane.lease_group_ready(),
+                if plane.ownership_domain_all() {
+                    "members"
+                } else {
+                    "voters"
+                }
             );
             for (i, v) in plane.voter_ids().iter().enumerate() {
                 if i > 0 {

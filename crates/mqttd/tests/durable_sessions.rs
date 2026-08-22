@@ -98,7 +98,7 @@ impl DurableNode {
 async fn start_durable_node(id: &str, swim_seeds: Vec<String>) -> DurableNode {
     // Cap 5: every node in these small (≤5) clusters votes, preserving the original
     // all-voters behaviour these tests assert (ADR 0021).
-    start_durable_node_capped(id, swim_seeds, 5, None).await
+    start_durable_node_capped(id, swim_seeds, 5, None, false).await
 }
 
 /// As [`start_durable_node`], but injects a per-commit latency into the lease store —
@@ -109,7 +109,7 @@ async fn start_durable_node_cfg(
     swim_seeds: Vec<String>,
     commit_delay: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 ) -> DurableNode {
-    start_durable_node_capped(id, swim_seeds, 5, commit_delay).await
+    start_durable_node_capped(id, swim_seeds, 5, commit_delay, false).await
 }
 
 /// As [`start_durable_node_cfg`], but with an explicit bounded voter cap `N` (ADR 0021)
@@ -121,6 +121,7 @@ async fn start_durable_node_capped(
     swim_seeds: Vec<String>,
     voter_cap: usize,
     commit_delay: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    scale_out: bool,
 ) -> DurableNode {
     let node_id = NodeId(id.to_string());
     let can_bootstrap = swim_seeds.is_empty();
@@ -138,6 +139,9 @@ async fn start_durable_node_capped(
         None,
         commit_delay,
         false,
+        // ADR 0073: the scale-out ownership flag, PRE-SET for the falsifier test
+        // (the hub sweep that computes it in production has its own unit test).
+        Arc::new(std::sync::atomic::AtomicBool::new(scale_out)),
     )
     .await;
     let plane_observer = plane.clone();
@@ -954,11 +958,11 @@ async fn a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_fail
     use mqtt_cluster::node_registry::raft_id;
     use std::collections::BTreeSet;
 
-    let a = start_durable_node_capped("bv-a", vec![], 3, None).await; // founder
-    let b = start_durable_node_capped("bv-b", vec![a.swim_addr.clone()], 3, None).await;
-    let c = start_durable_node_capped("bv-c", vec![a.swim_addr.clone()], 3, None).await;
-    let nd = start_durable_node_capped("bv-d", vec![a.swim_addr.clone()], 3, None).await;
-    let ne = start_durable_node_capped("bv-e", vec![a.swim_addr.clone()], 3, None).await;
+    let a = start_durable_node_capped("bv-a", vec![], 3, None, false).await; // founder
+    let b = start_durable_node_capped("bv-b", vec![a.swim_addr.clone()], 3, None, false).await;
+    let c = start_durable_node_capped("bv-c", vec![a.swim_addr.clone()], 3, None, false).await;
+    let nd = start_durable_node_capped("bv-d", vec![a.swim_addr.clone()], 3, None, false).await;
+    let ne = start_durable_node_capped("bv-e", vec![a.swim_addr.clone()], 3, None, false).await;
     let nodes = [&a, &b, &c, &nd, &ne];
 
     // SWIM converges: every node sees all five members.
@@ -1123,4 +1127,111 @@ async fn a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_fail
     };
     assert_eq!(pending.len(), 1);
     assert_eq!(&pending[0].message.payload[..], b"voter-owned");
+}
+
+/// ADR 0073's falsifier: with the scale-out ownership capability held cluster-wide
+/// (the flag pre-set on every node — production computes it from peer protos, unit-
+/// tested in the hub), a **three-node cluster with a voter cap of 1** spreads durable
+/// ownership across ALL members — and a LEARNER-owned session's durable enqueue
+/// COMMITS end to end: the lease leader assigns the group lease to the learner, the
+/// learner reads its epoch from its own replicated lease store, and the append
+/// reaches replica quorum. This is exactly the serving path the 2026-07-14
+/// post-mortem proved missing under ADR 0049; under 0073 it is load-bearing.
+/// The learner also reports `lease_group_ready` (a leader exists; voter membership
+/// is no longer a readiness requirement under the capability).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_scale_out_domain_owns_sessions_on_learners_that_serve() {
+    use mqtt_cluster::lease_raft::RaftNodeId;
+    use mqtt_cluster::node_registry::raft_id;
+    use std::collections::BTreeSet;
+
+    let a = start_durable_node_capped("so-a", vec![], 1, None, true).await; // founder
+    let b = start_durable_node_capped("so-b", vec![a.swim_addr.clone()], 1, None, true).await;
+    let c = start_durable_node_capped("so-c", vec![a.swim_addr.clone()], 1, None, true).await;
+    let nodes = [&a, &b, &c];
+
+    // SWIM converges: every node sees all three members.
+    wait_until(Duration::from_secs(30), || {
+        nodes
+            .iter()
+            .all(|n| n.placement.read().unwrap().member_count() == 3)
+    })
+    .await;
+    // The lease group bounds its voter set to ONE — two members are learners.
+    wait_until(Duration::from_secs(45), || {
+        nodes.iter().all(|n| n.plane.voter_count() == 1)
+    })
+    .await;
+    let voter_rids: BTreeSet<RaftNodeId> = a
+        .plane
+        .raft()
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect();
+    let learner_ids: BTreeSet<NodeId> = nodes
+        .iter()
+        .filter(|n| !voter_rids.contains(&raft_id(&n.node_id)))
+        .map(|n| n.node_id.clone())
+        .collect();
+    assert_eq!(learner_ids.len(), 2, "cap 1 of 3 leaves two learners");
+
+    // Under the scale-out flag the driver pushes NO voter restriction, so HRW
+    // spreads ownership over all three members — some session must own on a
+    // learner (under ADR 0049 alone, zero of these could).
+    let sample: Vec<ClientId> = (0..600).map(|i| ClientId(format!("so-sess-{i}"))).collect();
+    wait_until(Duration::from_secs(45), || {
+        nodes.iter().all(|n| {
+            let p = n.placement.read().unwrap();
+            p.voter_ids().is_empty() // the restriction is genuinely lifted everywhere
+                && sample.iter().any(|cl| learner_ids.contains(&p.owner(&cl.0)))
+        })
+    })
+    .await;
+
+    // A learner reports ready: a leader exists, and under the capability voter
+    // membership stopped being a readiness requirement (ADR 0073).
+    let learner = nodes
+        .iter()
+        .find(|n| learner_ids.contains(&n.node_id))
+        .unwrap();
+    wait_until(Duration::from_secs(30), || {
+        learner.plane.lease_group_ready()
+    })
+    .await;
+
+    // THE serving path: pick a session owned by that learner and durably enqueue
+    // it THERE. The lease leader must assign the group's lease to the learner and
+    // the learner must commit against replica quorum — end to end.
+    let client = {
+        let p = learner.placement.read().unwrap();
+        sample
+            .iter()
+            .find(|cl| p.owner(&cl.0) == learner.node_id)
+            .cloned()
+            .expect("some sampled session owns on this learner")
+    };
+    let msg = Message::new(
+        "t".to_string(),
+        bytes::Bytes::from_static(b"learner-owned"),
+        QoS::AtLeastOnce,
+        false,
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if learner.store.enqueue(&client, &msg).await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the learner-owned durable enqueue never committed — the 0049 dead end is back"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // And it is really recorded durable, readable back from the learner owner.
+    let pending = learner.store.pending(&client, 0, 100).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(&pending[0].message.payload[..], b"learner-owned");
 }

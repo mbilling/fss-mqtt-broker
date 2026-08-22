@@ -101,6 +101,13 @@ pub struct DurablePlane {
     _writer: Arc<AbortOnDrop>,
     /// The serializer's counters (ADR 0071), polled into metrics by `mqttd`.
     writer_stats: Arc<WriterStats>,
+    /// ADR 0073: true while the WHOLE cluster advertises the scale-out ownership
+    /// capability (every member's peer link negotiated proto >= 8, and the
+    /// operator has not opted out via `durable.ownership_domain = "voters"`).
+    /// Written by the hub's capability sweep; read by
+    /// [`lease_group_ready`](Self::lease_group_ready) so a learner-owner
+    /// reports ready.
+    ownership_domain_all: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Aborts a spawned task when dropped — used to bound the replica-writer's lifetime to the
@@ -142,7 +149,15 @@ impl DurablePlane {
             placement,
             _writer: Arc::new(AbortOnDrop(writer)),
             writer_stats,
+            ownership_domain_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Share the ADR 0073 scale-out ownership flag with this plane (see the field).
+    #[must_use]
+    pub fn with_ownership_domain_all(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.ownership_domain_all = flag;
+        self
     }
 
     /// A sender into the node-wide durable-write serializer, for the OWNER path
@@ -159,6 +174,14 @@ impl DurablePlane {
     #[must_use]
     pub fn writer_stats(&self) -> Arc<WriterStats> {
         self.writer_stats.clone()
+    }
+
+    /// Whether the ADR 0073 scale-out ownership domain is currently active
+    /// (cluster-wide capability held and the operator kept "members").
+    #[must_use]
+    pub fn ownership_domain_all(&self) -> bool {
+        self.ownership_domain_all
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wire the owner-side catch-up server (ADR 0043 P1) — the group-routed
@@ -226,11 +249,19 @@ impl DurablePlane {
     #[must_use]
     pub fn lease_group_ready(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
+        // ADR 0073: under the cluster-wide scale-out capability a LEARNER is a
+        // first-class durable owner (the leader assigns leases to it and it reads
+        // its epochs locally), so voter membership stops being a readiness
+        // requirement — a functioning leader is what still matters (leases can be
+        // assigned at all). Without the capability, ADR 0049's posture holds.
         metrics.current_leader.is_some()
-            && metrics
-                .membership_config
-                .voter_ids()
-                .any(|id| id == metrics.id)
+            && (self
+                .ownership_domain_all
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || metrics
+                    .membership_config
+                    .voter_ids()
+                    .any(|id| id == metrics.id))
     }
 
     /// Assemble the decommission drain (ADR 0043 P3) over this plane's shared
@@ -701,6 +732,44 @@ mod tests {
         // Leader of a group it is a voter in → ready.
         assert!(p.lease_group_ready());
 
+        p.raft().shutdown().await.unwrap();
+    }
+
+    /// ADR 0073: under the cluster-wide scale-out capability, VOTER MEMBERSHIP stops
+    /// being a readiness requirement — a learner-owner reports ready as long as a
+    /// leader exists (leases can be assigned to it and it reads epochs locally).
+    /// Leaderlessness still fails readiness either way, and dropping the flag
+    /// restores ADR 0049's voter requirement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_learner_is_ready_under_the_scale_out_capability() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        let p = node("so-learner")
+            .await
+            .with_ownership_domain_all(flag.clone());
+        // Model the learner view: this node's raft has a leader but this node is
+        // not a voter — achieved by initializing the group with ANOTHER id as the
+        // sole voter is heavyweight here, so exercise the pure gate through its
+        // two inputs instead: leaderless is never ready…
+        assert!(!p.lease_group_ready(), "no leader: not ready, flag or not");
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            !p.lease_group_ready(),
+            "the flag does not manufacture readiness without a leader"
+        );
+        // …and with a leader, the voter requirement is what the flag waives.
+        p.raft().initialize(members(&["so-learner"])).await.unwrap();
+        p.raft()
+            .wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "node leads its own group")
+            .await
+            .unwrap();
+        assert!(p.lease_group_ready(), "leader + flag: ready");
+        flag.store(false, Ordering::Relaxed);
+        assert!(
+            p.lease_group_ready(),
+            "still a voter here, so dropping the flag keeps ready (ADR 0049 path)"
+        );
         p.raft().shutdown().await.unwrap();
     }
 

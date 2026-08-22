@@ -188,7 +188,7 @@ use mqtt_cluster::placement::{self, Placement, WriteFloor};
 use mqtt_cluster::swim::Swim;
 use mqtt_cluster::swim_auth::SwimAuth;
 use mqtt_cluster::{swim_driver, NodeId};
-use mqtt_config::{Config, ConfigError, Jwt, MinReplicas};
+use mqtt_config::{Config, ConfigError, Jwt, MinReplicas, OwnershipDomain};
 use mqtt_net::tls;
 use mqtt_observability::{AuditLog, AuditSink};
 use mqtt_storage::logged::ReplicatedSessionStore;
@@ -1703,6 +1703,12 @@ async fn start_hub(
             .map(|(node, domain)| (NodeId(node.clone()), domain.clone()))
             .collect();
         log_durability_mode(config, founder, voter_cap, domains.len());
+        // ADR 0073: the scale-out ownership flag, shared by the durable driver
+        // (widens placement), the plane (readiness), and the hub (the capability
+        // sweep that computes it). Starts false; the hub raises it only once every
+        // member advertises peer proto >= 8 AND the operator kept the default
+        // `durable.ownership_domain = "members"`.
+        let ownership_domain_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (store, durable_retained, plane, driver) =
             mqtt_cluster::durable_node::build_durable_node(
                 node_id.clone(),
@@ -1713,6 +1719,7 @@ async fn start_hub(
                 data_dir.as_deref().map(Path::new),
                 None, // no commit-latency fault injection in production (ADR 0026)
                 config.durable.allow_relaxed_publish, // ADR 0072 operator opt-in
+                ownership_domain_all.clone(),
             )
             .await;
         let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
@@ -1725,6 +1732,10 @@ async fn start_hub(
         }
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
+        hub.set_ownership_domain(
+            ownership_domain_all,
+            config.durable.ownership_domain == OwnershipDomain::Members,
+        );
         hub.attach_durable_plane(plane);
         // Durable retained (ADR 0037): retained mutations also commit through the
         // topic's group lease-owner, so retained state converges instead of diverging.

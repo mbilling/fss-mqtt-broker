@@ -66,7 +66,18 @@ pub const PROTO_MIN: u32 = 6;
 /// and repairable only by bumping `BASELINE_REF` past the reshape, which retires the
 /// guard that was supposed to catch it. The additive route needs no `BASELINE_REF`
 /// bump and is what a MINOR may do post-1.0 as well.
-pub const PROTO_MAX: u32 = 7;
+///
+/// Proto 8 (ADR 0073) is the degenerate additive case: **no new frames at all** —
+/// the version itself is the capability marker. A node speaking 8 computes durable
+/// ownership over ALL admitted members once every member's link negotiated ≥ 8;
+/// any proto-7 member in the mesh (a rolled-back binary) reads as not-capable and
+/// the whole cluster holds ADR 0049's voter-bounded domain — one ownership rule in
+/// force at a time, degrading toward the conservative one.
+pub const PROTO_MAX: u32 = 8;
+
+/// The peer-bus proto at which a build computes durable ownership over all admitted
+/// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
+pub const PROTO_OWNERSHIP_DOMAIN: u32 = 8;
 
 /// Negotiate a link's protocol version from both sides' announced ranges
 /// (ADR 0038): the newest version both can speak, or `None` when the ranges are
@@ -1100,10 +1111,13 @@ mod tests {
         // verdict frames on every link) fails here rather than only in a live mesh.
         assert_eq!(negotiate_proto((PROTO_MIN, PROTO_MAX), (6, 6)), Some(6));
         assert_eq!(negotiate_proto((6, 6), (PROTO_MIN, PROTO_MAX)), Some(6));
+        // A proto-7 peer (a pre-0073 build) negotiates 7 and keeps its verdict
+        // frames; the capability marker only exists at 8.
+        assert_eq!(negotiate_proto((PROTO_MIN, PROTO_MAX), (6, 7)), Some(7));
         assert_eq!(
             negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
-            Some(7),
-            "this build must speak proto 7 to its peers"
+            Some(8),
+            "this build must announce the proto-8 scale-out capability (ADR 0073)"
         );
     }
 
